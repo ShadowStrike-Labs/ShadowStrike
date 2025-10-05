@@ -66,10 +66,10 @@
     <ClCompile Include="src\Utils\ProcessUtils.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="src\Utils\CryptoUtils.cpp">
+    <ClCompile Include="external\pugixml\pugixml.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="external\pugixml\pugixml.cpp">
+    <ClCompile Include="src\Utils\CryptoUtils.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
   </ItemGroup>
@@ -122,10 +122,10 @@
     <ClInclude Include="src\Utils\ProcessUtils.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
-    <ClInclude Include="src\Utils\CryptoUtils.hpp">
+    <ClInclude Include="external\pugixml\pugixml.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
-    <ClInclude Include="external\pugixml\pugixml.hpp">
+    <ClInclude Include="src\Utils\CryptoUtils.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
   </ItemGroup>

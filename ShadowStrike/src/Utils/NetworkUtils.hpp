@@ -592,6 +592,14 @@ namespace ShadowStrike {
 			bool IsHttpTraffic(const std::vector<uint8_t>& data) noexcept;
 			bool IsHttpsTraffic(const std::vector<uint8_t>& data) noexcept;
 			bool IsDnsTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsFtpTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsSshTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsSmtpTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsImapTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsPop3Traffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsTelnetTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsRdpTraffic(const std::vector<uint8_t>& data) noexcept;
+			bool IsSmbTraffic(const std::vector<uint8_t>& data) noexcept;
 
 			// --- Proxy Detection and Configuration ---
 			bool GetSystemProxySettings(ProxyInfo& proxy, Error* err = nullptr) noexcept;

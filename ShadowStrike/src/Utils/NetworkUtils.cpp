@@ -7,7 +7,9 @@
 #include <fstream>
 #include <WinInet.h>
 #include <dhcpcsdk.h>
+#include <wincrypt.h>
 
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "WinInet.lib")
 #pragma comment(lib, "dhcpcsvc.lib")
 
@@ -693,14 +695,57 @@ namespace ShadowStrike {
 					std::wstring hostStr(hostname);
 					PDNS_RECORD pDnsRecord = nullptr;
 
+					DWORD flags = DNS_QUERY_STANDARD;
+
+					if(!options.recursionDesired) {
+						flags |= DNS_QUERY_NO_RECURSION;
+					}
+					if (options.dnssec) {
+						flags |= DNS_QUERY_DNSSEC_OK;
+					}
+					if (!options.useSystemDns && !options.customDnsServers.empty()) {
+						flags |= DNS_QUERY_NO_HOSTS_FILE;
+					}
+
+					// Prepare custom DNS servers if specified
+					PIP4_ARRAY pDnsServers = nullptr;
+					std::vector<IP4_ADDRESS> dnsServerAddresses;
+					
+					if (!options.customDnsServers.empty() && !options.useSystemDns) {
+						for (const auto& dnsServer : options.customDnsServers) {
+							if (dnsServer.IsIPv4()) {
+								auto* ipv4 = dnsServer.AsIPv4();
+								if (ipv4) {
+									dnsServerAddresses.push_back(Internal::HostToNetwork32(ipv4->ToUInt32()));
+								}
+							}
+						}
+
+						if (!dnsServerAddresses.empty()) {
+							size_t structSize = sizeof(IP4_ARRAY) + (dnsServerAddresses.size() - 1) * sizeof(IP4_ADDRESS);
+							pDnsServers = reinterpret_cast<PIP4_ARRAY>(malloc(structSize));
+							if (pDnsServers) {
+								pDnsServers->AddrCount = static_cast<DWORD>(dnsServerAddresses.size());
+								for (size_t i = 0; i < dnsServerAddresses.size(); ++i) {
+									pDnsServers->AddrArray[i] = dnsServerAddresses[i];
+								}
+							}
+						}
+					}
+
 					DNS_STATUS status = ::DnsQuery_W(
 						hostStr.c_str(),
 						static_cast<WORD>(type),
-						DNS_QUERY_STANDARD,
-						nullptr,
+						flags,
+						pDnsServers,
 						&pDnsRecord,
 						nullptr
 					);
+
+					// Cleanup custom DNS servers
+					if (pDnsServers) {
+						free(pDnsServers);
+					}
 
 					if (status != 0) {
 						Internal::SetError(err, status, L"DnsQuery_W failed");
@@ -1189,19 +1234,20 @@ namespace ShadowStrike {
 			// ============================================================================
 			// Connection and Port Information
 			// ============================================================================
-
 			bool GetActiveConnections(std::vector<ConnectionInfo>& connections, ProtocolType protocol, Error* err) noexcept {
 				try {
 					connections.clear();
 
 					if (protocol == ProtocolType::TCP) {
+						// IPv4 TCP Connections
 						ULONG size = 0;
+#pragma warning(suppress: 6387)
 						::GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-						
+
 						std::vector<uint8_t> buffer(size);
 						if (::GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
 							auto* pTable = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buffer.data());
-							
+
 							for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::TCP;
@@ -1211,66 +1257,92 @@ namespace ShadowStrike {
 								conn.remotePort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable->table[i].dwRemotePort));
 								conn.state = static_cast<TcpState>(pTable->table[i].dwState);
 								conn.processId = pTable->table[i].dwOwningPid;
-								
+
 								connections.push_back(std::move(conn));
 							}
 						}
 
-						// IPv6 connections
+						// IPv6 TCP Connections
 						size = 0;
+#pragma warning(suppress: 6387)
 						::GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
 						buffer.resize(size);
-						
+
 						if (::GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
 							auto* pTable6 = reinterpret_cast<PMIB_TCP6TABLE_OWNER_PID>(buffer.data());
-							
+
 							for (DWORD i = 0; i < pTable6->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::TCP;
-								
+
 								std::array<uint8_t, 16> localBytes, remoteBytes;
 								std::memcpy(localBytes.data(), pTable6->table[i].ucLocalAddr, 16);
 								std::memcpy(remoteBytes.data(), pTable6->table[i].ucRemoteAddr, 16);
-								
+
 								conn.localAddress = IpAddress(IPv6Address(localBytes));
 								conn.localPort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable6->table[i].dwLocalPort));
 								conn.remoteAddress = IpAddress(IPv6Address(remoteBytes));
 								conn.remotePort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable6->table[i].dwRemotePort));
 								conn.state = static_cast<TcpState>(pTable6->table[i].dwState);
 								conn.processId = pTable6->table[i].dwOwningPid;
-								
+
 								connections.push_back(std::move(conn));
 							}
 						}
 					}
 					else if (protocol == ProtocolType::UDP) {
+						// IPv4 UDP Connections
 						ULONG size = 0;
+#pragma warning(suppress: 6387)
 						::GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-						
+
 						std::vector<uint8_t> buffer(size);
 						if (::GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
 							auto* pTable = reinterpret_cast<PMIB_UDPTABLE_OWNER_PID>(buffer.data());
-							
+
 							for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
 								ConnectionInfo conn;
 								conn.protocol = ProtocolType::UDP;
 								conn.localAddress = IpAddress(IPv4Address(Internal::NetworkToHost32(pTable->table[i].dwLocalAddr)));
 								conn.localPort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable->table[i].dwLocalPort));
 								conn.processId = pTable->table[i].dwOwningPid;
-								
+
+								connections.push_back(std::move(conn));
+							}
+						}
+
+						// IPv6 UDP Connections
+						size = 0;
+#pragma warning(suppress: 6387)
+						::GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+						buffer.resize(size);
+
+						if (::GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+							auto* pTable6 = reinterpret_cast<PMIB_UDP6TABLE_OWNER_PID>(buffer.data());
+
+							for (DWORD i = 0; i < pTable6->dwNumEntries; ++i) {
+								ConnectionInfo conn;
+								conn.protocol = ProtocolType::UDP;
+
+								std::array<uint8_t, 16> localBytes;
+								std::memcpy(localBytes.data(), pTable6->table[i].ucLocalAddr, 16);
+
+								conn.localAddress = IpAddress(IPv6Address(localBytes));
+								conn.localPort = Internal::NetworkToHost16(static_cast<uint16_t>(pTable6->table[i].dwLocalPort));
+								conn.processId = pTable6->table[i].dwOwningPid;
+
 								connections.push_back(std::move(conn));
 							}
 						}
 					}
 
 					return true;
-
-				} catch (...) {
+				}
+				catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetActiveConnections");
 					return false;
 				}
 			}
-
 			bool GetConnectionsByProcess(uint32_t processId, std::vector<ConnectionInfo>& connections, Error* err) noexcept {
 				std::vector<ConnectionInfo> allConnections;
 				if (!GetActiveConnections(allConnections, ProtocolType::TCP, err)) {
@@ -1592,47 +1664,99 @@ namespace ShadowStrike {
 			// Network Statistics
 			// ============================================================================
 
+		//Total statistics for all adapters
 			bool GetNetworkStatistics(NetworkStatistics& stats, Error* err) noexcept {
 				try {
 					stats = NetworkStatistics{};
 					stats.timestamp = std::chrono::system_clock::now();
 
-					MIB_IFROW ifRow{};
-					ifRow.dwIndex = 0; // 0 = all interfaces
+					//Get all adapters
+					ULONG bufferSize = 0;
+					if (::GetIfTable(nullptr, &bufferSize, FALSE) != ERROR_INSUFFICIENT_BUFFER) {
+						Internal::SetError(err, ::GetLastError(), L"Failed to get interface table size");
+						return false;
+					}
 
-					if (::GetIfEntry(&ifRow) == NO_ERROR) {
-						stats.bytesSent = ifRow.dwOutOctets;
-						stats.bytesReceived = ifRow.dwInOctets;
-						stats.packetsSent = ifRow.dwOutUcastPkts + ifRow.dwOutNUcastPkts;
-						stats.packetsReceived = ifRow.dwInUcastPkts + ifRow.dwInNUcastPkts;
-						stats.errorsSent = ifRow.dwOutErrors;
-						stats.errorsReceived = ifRow.dwInErrors;
-						stats.droppedPackets = ifRow.dwInDiscards + ifRow.dwOutDiscards;
+					std::vector<uint8_t> buffer(bufferSize);
+					auto* pIfTable = reinterpret_cast<PMIB_IFTABLE>(buffer.data());
+
+					if (::GetIfTable(pIfTable, &bufferSize, FALSE) != NO_ERROR) {
+						Internal::SetError(err, ::GetLastError(), L"Failed to get interface table");
+						return false;
+					}
+
+					//Collect the all statistics of all adapters
+					for (DWORD i = 0; i < pIfTable->dwNumEntries; ++i) {
+						const auto& ifRow = pIfTable->table[i];
+
+						stats.bytesSent += ifRow.dwOutOctets;
+						stats.bytesReceived += ifRow.dwInOctets;
+						stats.packetsSent += ifRow.dwOutUcastPkts + ifRow.dwOutNUcastPkts;
+						stats.packetsReceived += ifRow.dwInUcastPkts + ifRow.dwInNUcastPkts;
+						stats.errorsSent += ifRow.dwOutErrors;
+						stats.errorsReceived += ifRow.dwInErrors;
+						stats.droppedPackets += ifRow.dwInDiscards + ifRow.dwOutDiscards;
 					}
 
 					return true;
-
-				} catch (...) {
+				}
+				catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetNetworkStatistics");
 					return false;
 				}
 			}
 
+			//Statistics for a specific adapter by name
 			bool GetNetworkStatistics(const std::wstring& adapterName, NetworkStatistics& stats, Error* err) noexcept {
-				// For specific adapter, enumerate and find matching name
-				std::vector<NetworkAdapterInfo> adapters;
-				if (!GetNetworkAdapters(adapters, err)) {
+				try {
+					stats = NetworkStatistics{};
+					stats.timestamp = std::chrono::system_clock::now();
+
+					//Get the adapters and find the one matching the name
+					std::vector<NetworkAdapterInfo> adapters;
+					if (!GetNetworkAdapters(adapters, err)) {
+						return false;
+					}
+
+					DWORD targetIndex = 0;
+					bool found = false;
+
+					for (const auto& adapter : adapters) {
+						if (adapter.friendlyName == adapterName) {
+							targetIndex = adapter.interfaceIndex; // Assuming interfaceIndex is the same as dwIndex in MIB_IFROW
+							found = true;
+							break;
+						}
+					}
+
+					if (!found) {
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Adapter not found");
+						return false;
+					}
+
+					//Get statistics for the specific adapter
+					MIB_IFROW ifRow{};
+					ifRow.dwIndex = targetIndex;
+
+					if (::GetIfEntry(&ifRow) != NO_ERROR) {
+						Internal::SetError(err, ::GetLastError(), L"Failed to get interface entry");
+						return false;
+					}
+
+					stats.bytesSent = ifRow.dwOutOctets;
+					stats.bytesReceived = ifRow.dwInOctets;
+					stats.packetsSent = ifRow.dwOutUcastPkts + ifRow.dwOutNUcastPkts;
+					stats.packetsReceived = ifRow.dwInUcastPkts + ifRow.dwInNUcastPkts;
+					stats.errorsSent = ifRow.dwOutErrors;
+					stats.errorsReceived = ifRow.dwInErrors;
+					stats.droppedPackets = ifRow.dwInDiscards + ifRow.dwOutDiscards;
+
+					return true;
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetNetworkStatistics");
 					return false;
 				}
-
-				for (const auto& adapter : adapters) {
-					if (adapter.friendlyName == adapterName) {
-						return GetNetworkStatistics(stats, err);
-					}
-				}
-
-				Internal::SetError(err, ERROR_NOT_FOUND, L"Adapter not found");
-				return false;
 			}
 
 			bool CalculateBandwidth(const NetworkStatistics& previous, const NetworkStatistics& current, BandwidthInfo& bandwidth) noexcept {
@@ -1843,19 +1967,224 @@ namespace ShadowStrike {
 				return false;
 			}
 
+			// RFC 3492 compliant Punycode implementation
+			namespace PunycodeConstants {
+				constexpr uint32_t BASE = 36;
+				constexpr uint32_t TMIN = 1;
+				constexpr uint32_t TMAX = 26;
+				constexpr uint32_t SKEW = 38;
+				constexpr uint32_t DAMP = 700;
+				constexpr uint32_t INITIAL_BIAS = 72;
+				constexpr uint32_t INITIAL_N = 0x80;
+				constexpr wchar_t DELIMITER = L'-';
+				constexpr std::wstring_view PREFIX = L"xn--";
+			}
+
+			namespace {
+				inline uint32_t AdaptBias(uint32_t delta, uint32_t numpoints, bool firsttime) noexcept {
+					if (numpoints == 0) return 0;
+
+					delta = firsttime ? delta / PunycodeConstants::DAMP : delta >> 1;
+					delta += delta / numpoints;
+
+					uint32_t k = 0;
+					while (delta > ((PunycodeConstants::BASE - PunycodeConstants::TMIN) * PunycodeConstants::TMAX) / 2) {
+						delta /= PunycodeConstants::BASE - PunycodeConstants::TMIN;
+						k += PunycodeConstants::BASE;
+					}
+
+					return k + (((PunycodeConstants::BASE - PunycodeConstants::TMIN + 1) * delta) /
+						(delta + PunycodeConstants::SKEW));
+				}
+
+				inline wchar_t EncodeDigit(uint32_t d) noexcept {
+					return static_cast<wchar_t>(d + 22 + 75 * (d < 26));
+				}
+
+				inline uint32_t DecodeDigit(wchar_t c) noexcept {
+					if (c >= L'0' && c <= L'9') return c - L'0' + 26;
+					if (c >= L'A' && c <= L'Z') return c - L'A';
+					if (c >= L'a' && c <= L'z') return c - L'a';
+					return PunycodeConstants::BASE;
+				}
+
+				inline bool IsBasicCodePoint(wchar_t c) noexcept {
+					return c < 0x80;
+				}
+			}
+
 			std::wstring PunycodeEncode(std::wstring_view domain) noexcept {
-				// Simplified punycode encoding - full implementation would be complex
-				if (!IsInternationalDomain(domain)) {
+				try {
+					// Quick check - if all ASCII, no encoding needed
+					if (!IsInternationalDomain(domain)) {
+						return std::wstring(domain);
+					}
+
+					std::wstring result;
+					result.reserve(domain.length() * 2);
+
+					// Extract and copy basic code points
+					size_t basicCount = 0;
+					for (wchar_t c : domain) {
+						if (IsBasicCodePoint(c)) {
+							result += c;
+							++basicCount;
+						}
+					}
+
+					size_t handledCount = basicCount;
+
+					// Add delimiter if we have basic characters
+					if (handledCount > 0) {
+						result += PunycodeConstants::DELIMITER;
+					}
+
+					uint32_t n = PunycodeConstants::INITIAL_N;
+					uint32_t delta = 0;
+					uint32_t bias = PunycodeConstants::INITIAL_BIAS;
+
+					// Process non-basic code points
+					while (handledCount < domain.length()) {
+						// Find next code point to encode
+						uint32_t m = 0x10FFFF;
+						for (wchar_t c : domain) {
+							uint32_t codepoint = static_cast<uint32_t>(c);
+							if (codepoint >= n && codepoint < m) {
+								m = codepoint;
+							}
+						}
+
+						// Increase delta
+						delta += (m - n) * (handledCount + 1);
+						n = m;
+
+						// Encode all occurrences of this code point
+						for (wchar_t c : domain) {
+							uint32_t codepoint = static_cast<uint32_t>(c);
+
+							if (codepoint < n) {
+								++delta;
+							}
+							else if (codepoint == n) {
+								uint32_t q = delta;
+
+								for (uint32_t k = PunycodeConstants::BASE; ; k += PunycodeConstants::BASE) {
+									uint32_t t;
+									if (k <= bias) {
+										t = PunycodeConstants::TMIN;
+									}
+									else if (k >= bias + PunycodeConstants::TMAX) {
+										t = PunycodeConstants::TMAX;
+									}
+									else {
+										t = k - bias;
+									}
+
+									if (q < t) break;
+
+									result += EncodeDigit(t + (q - t) % (PunycodeConstants::BASE - t));
+									q = (q - t) / (PunycodeConstants::BASE - t);
+								}
+
+								result += EncodeDigit(q);
+								bias = AdaptBias(delta, handledCount + 1, handledCount == basicCount);
+								delta = 0;
+								++handledCount;
+							}
+						}
+
+						++delta;
+						++n;
+					}
+
+					return std::wstring(PunycodeConstants::PREFIX) + result;
+
+				}
+				catch (...) {
+					// Fallback on error
 					return std::wstring(domain);
 				}
-				return L"xn--" + std::wstring(domain);
 			}
 
 			std::wstring PunycodeDecode(std::wstring_view punycode) noexcept {
-				if (punycode.substr(0, 4) == L"xn--") {
-					return std::wstring(punycode.substr(4));
+				try {
+					// Check for punycode prefix
+					if (punycode.substr(0, PunycodeConstants::PREFIX.length()) != PunycodeConstants::PREFIX) {
+						return std::wstring(punycode);
+					}
+
+					// Remove prefix
+					std::wstring_view encoded = punycode.substr(PunycodeConstants::PREFIX.length());
+
+					std::wstring result;
+					result.reserve(encoded.length());
+
+					// Find delimiter position
+					size_t delimiterPos = encoded.rfind(PunycodeConstants::DELIMITER);
+
+					// Copy basic code points
+					if (delimiterPos != std::wstring_view::npos) {
+						result.append(encoded.substr(0, delimiterPos));
+						encoded = encoded.substr(delimiterPos + 1);
+					}
+
+					uint32_t n = PunycodeConstants::INITIAL_N;
+					uint32_t i = 0;
+					uint32_t bias = PunycodeConstants::INITIAL_BIAS;
+
+					// Decode non-basic code points
+					for (size_t pos = 0; pos < encoded.length(); ) {
+						uint32_t oldi = i;
+						uint32_t w = 1;
+
+						for (uint32_t k = PunycodeConstants::BASE; ; k += PunycodeConstants::BASE) {
+							if (pos >= encoded.length()) {
+								return std::wstring(punycode); // Invalid encoding
+							}
+
+							uint32_t digit = DecodeDigit(encoded[pos++]);
+							if (digit >= PunycodeConstants::BASE) {
+								return std::wstring(punycode); // Invalid digit
+							}
+
+							i += digit * w;
+
+							uint32_t t;
+							if (k <= bias) {
+								t = PunycodeConstants::TMIN;
+							}
+							else if (k >= bias + PunycodeConstants::TMAX) {
+								t = PunycodeConstants::TMAX;
+							}
+							else {
+								t = k - bias;
+							}
+
+							if (digit < t) break;
+
+							w *= (PunycodeConstants::BASE - t);
+						}
+
+						bias = AdaptBias(i - oldi, result.length() + 1, oldi == 0);
+						n += i / (result.length() + 1);
+						i %= (result.length() + 1);
+
+						// Insert decoded character
+						if (n > 0x10FFFF) {
+							return std::wstring(punycode); // Invalid code point
+						}
+
+						result.insert(result.begin() + i, static_cast<wchar_t>(n));
+						++i;
+					}
+
+					return result;
+
 				}
-				return std::wstring(punycode);
+				catch (...) {
+					// Fallback on error
+					return std::wstring(punycode);
+				}
 			}
 
 			// ============================================================================
@@ -1903,23 +2232,141 @@ namespace ShadowStrike {
 			bool GetMacAddress(const IpAddress& ipAddress, MacAddress& mac, Error* err) noexcept {
 				try {
 					if (ipAddress.IsIPv4()) {
+						// IPv4 - Use SendARP
 						auto* ipv4 = ipAddress.AsIPv4();
 						ULONG macAddr[2] = {};
 						ULONG macAddrLen = 6;
 
-						if (::SendARP(Internal::HostToNetwork32(ipv4->ToUInt32()), 0, macAddr, &macAddrLen) == NO_ERROR) {
-							std::array<uint8_t, 6> bytes;
-							std::memcpy(bytes.data(), macAddr, 6);
-							mac = MacAddress(bytes);
-							return true;
+						DWORD result = ::SendARP(Internal::HostToNetwork32(ipv4->ToUInt32()), 0, macAddr, &macAddrLen);
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"SendARP failed");
+							return false;
 						}
+
+						if (macAddrLen != 6) {
+							Internal::SetError(err, ERROR_INVALID_DATA, L"Invalid MAC address length");
+							return false;
+						}
+
+						std::array<uint8_t, 6> bytes;
+						std::memcpy(bytes.data(), macAddr, 6);
+						mac = MacAddress(bytes);
+						return true;
+					}
+					else if (ipAddress.IsIPv6()) {
+						// IPv6 - Use GetIpNetTable2
+						PMIB_IPNET_TABLE2 pTable = nullptr;
+
+						DWORD result = ::GetIpNetTable2(AF_INET6, &pTable);
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpNetTable2 failed");
+							return false;
+						}
+
+						// RAII wrapper for cleanup
+						struct TableDeleter {
+							void operator()(PMIB_IPNET_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPNET_TABLE2, TableDeleter> tableGuard(pTable);
+
+						// Get IPv6 bytes for comparison
+						auto* ipv6 = ipAddress.AsIPv6();
+						std::array<uint8_t, 16> targetBytes = ipv6->bytes;
+
+						// Search for matching IPv6 address
+						for (ULONG i = 0; i < pTable->NumEntries; ++i) {
+							const auto& row = pTable->Table[i];
+
+							// Compare IPv6 addresses
+							if (std::memcmp(row.Address.Ipv6.sin6_addr.u.Byte, targetBytes.data(), 16) == 0) {
+								// Check if physical address is valid
+								if (row.PhysicalAddressLength != 6) {
+									continue; // Skip non-Ethernet entries
+								}
+
+								// Check if entry is reachable
+								if (row.State != NlnsReachable && row.State != NlnsStale && row.State != NlnsPermanent) {
+									continue; // Skip unreachable entries
+								}
+
+								std::array<uint8_t, 6> bytes;
+								std::memcpy(bytes.data(), row.PhysicalAddress, 6);
+								mac = MacAddress(bytes);
+								return true;
+							}
+						}
+
+						Internal::SetError(err, ERROR_NOT_FOUND, L"MAC address not found in neighbor table");
+						return false;
 					}
 
-					Internal::SetError(err, ERROR_NOT_FOUND, L"MAC address not found");
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address type");
 					return false;
 
-				} catch (...) {
+				}
+				catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetMacAddress");
+					return false;
+				}
+			}
+
+			//Helper to refresh neighbor cache by sending a ping
+			bool RefreshNeighborCache(const IpAddress& ipAddress, Error* err) noexcept {
+				try {
+					if (ipAddress.IsIPv6()) {
+						//We can fill the neighbor cache by sending an ICMPv6 echo request
+						HANDLE hIcmpFile = ::Icmp6CreateFile();
+						if (hIcmpFile == INVALID_HANDLE_VALUE) {
+							Internal::SetError(err, ::GetLastError(), L"Failed to create ICMPv6 handle");
+							return false;
+						}
+
+						struct IcmpDeleter {
+							void operator()(HANDLE h) const {
+								if (h != INVALID_HANDLE_VALUE) ::IcmpCloseHandle(h);
+							}
+						};
+						std::unique_ptr<std::remove_pointer_t<HANDLE>, IcmpDeleter> icmpGuard(hIcmpFile);
+
+						auto* ipv6 = ipAddress.AsIPv6();
+						std::array<uint8_t, 16> targetBytes = ipv6->bytes;
+
+						sockaddr_in6 sourceAddr{};
+						sourceAddr.sin6_family = AF_INET6;
+
+						sockaddr_in6 destAddr{};
+						destAddr.sin6_family = AF_INET6;
+						std::memcpy(&destAddr.sin6_addr, targetBytes.data(), 16);
+
+						constexpr size_t REPLY_BUFFER_SIZE = sizeof(ICMPV6_ECHO_REPLY) + 32;
+						uint8_t replyBuffer[REPLY_BUFFER_SIZE] = {};
+
+						uint8_t sendData[32] = {};
+
+						// Send ping to populate neighbor cache
+						::Icmp6SendEcho2(hIcmpFile, nullptr, nullptr, nullptr,
+							&sourceAddr, &destAddr,
+							sendData, sizeof(sendData),
+							nullptr, replyBuffer, REPLY_BUFFER_SIZE, 1000);
+
+						// Give system time to update neighbor table
+						::Sleep(100);
+					}
+					else if (ipAddress.IsIPv4()) {
+						//for ipv4 sendarp already updates the neighbor cache
+						auto* ipv4 = ipAddress.AsIPv4();
+						ULONG macAddr[2] = {};
+						ULONG macAddrLen = 6;
+						::SendARP(Internal::HostToNetwork32(ipv4->ToUInt32()), 0, macAddr, &macAddrLen);
+					}
+
+					return true;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in RefreshNeighborCache");
 					return false;
 				}
 			}
@@ -1975,6 +2422,8 @@ namespace ShadowStrike {
 			// Network Interface Control
 			// ============================================================================
 
+			//***************************************************************************
+			//Maybe we can use in the future
 			bool EnableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
 				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
 				return false; // Requires admin rights and netsh or WMI
@@ -1984,6 +2433,7 @@ namespace ShadowStrike {
 				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
 				return false; // Requires admin rights and netsh or WMI
 			}
+			//***************************************************************************
 
 			bool FlushDnsCache(Error* err) noexcept {
 				// DnsFlushResolverCache may not be available on all Windows versions
@@ -2032,41 +2482,513 @@ namespace ShadowStrike {
 				try {
 					routes.clear();
 
+					// IPv4 Routing Table
 					ULONG size = 0;
+#pragma warning(suppress: 6387)
 					::GetIpForwardTable(nullptr, &size, FALSE);
 
 					std::vector<uint8_t> buffer(size);
-					if (::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE) == NO_ERROR) {
+					DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+
+					if (result == NO_ERROR) {
 						auto* pTable = reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data());
 
 						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							const auto& row = pTable->table[i];
+
 							RouteEntry entry;
-							entry.destination = IpAddress(IPv4Address(Internal::NetworkToHost32(pTable->table[i].dwForwardDest)));
-							entry.netmask = IpAddress(IPv4Address(Internal::NetworkToHost32(pTable->table[i].dwForwardMask)));
-							entry.gateway = IpAddress(IPv4Address(Internal::NetworkToHost32(pTable->table[i].dwForwardNextHop)));
-							entry.interfaceIndex = pTable->table[i].dwForwardIfIndex;
-							entry.metric = pTable->table[i].dwForwardMetric1;
+							entry.destination = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwForwardDest)));
+							entry.netmask = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwForwardMask)));
+							entry.gateway = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwForwardNextHop)));
+							entry.interfaceIndex = row.dwForwardIfIndex;
+							entry.metric = row.dwForwardMetric1;
 
 							routes.push_back(std::move(entry));
 						}
 					}
 
+					// IPv6 Routing Table
+					PMIB_IPFORWARD_TABLE2 pTable6 = nullptr;
+					result = ::GetIpForwardTable2(AF_INET6, &pTable6);
+
+					if (result != NO_ERROR) {
+						// IPv4 routes varsa onlarý döndür, IPv6 hata veriyorsa sorun deðil
+						return !routes.empty();
+					}
+
+					// RAII wrapper for cleanup
+					struct TableDeleter {
+						void operator()(PMIB_IPFORWARD_TABLE2 p) const {
+							if (p) ::FreeMibTable(p);
+						}
+					};
+					std::unique_ptr<MIB_IPFORWARD_TABLE2, TableDeleter> tableGuard(pTable6);
+
+					for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+						const auto& row = pTable6->Table[i];
+
+						RouteEntry entry;
+
+						// Destination IPv6 address
+						std::array<uint8_t, 16> destBytes;
+						std::memcpy(destBytes.data(), row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte, 16);
+						entry.destination = IpAddress(IPv6Address(destBytes));
+
+						// IPv6 uses prefix length instead of netmask
+						// Convert prefix length to netmask representation
+						uint8_t prefixLen = row.DestinationPrefix.PrefixLength;
+						std::array<uint8_t, 16> maskBytes = {};
+						for (uint8_t j = 0; j < prefixLen / 8; ++j) {
+							maskBytes[j] = 0xFF;
+						}
+						if (prefixLen % 8) {
+							maskBytes[prefixLen / 8] = static_cast<uint8_t>(0xFF << (8 - (prefixLen % 8)));
+						}
+						entry.netmask = IpAddress(IPv6Address(maskBytes));
+
+						// Gateway (NextHop) IPv6 address
+						std::array<uint8_t, 16> gwBytes;
+						std::memcpy(gwBytes.data(), row.NextHop.Ipv6.sin6_addr.u.Byte, 16);
+						entry.gateway = IpAddress(IPv6Address(gwBytes));
+
+						entry.interfaceIndex = row.InterfaceIndex;
+						entry.metric = row.Metric;
+
+						routes.push_back(std::move(entry));
+					}
+
 					return true;
 
-				} catch (...) {
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetRoutingTable");
+					return false;
+				}
+			}
+
+			//routing table for specific family
+			bool GetRoutingTable(std::vector<RouteEntry>& routes, ADDRESS_FAMILY family, Error* err) noexcept {
+				try {
+					routes.clear();
+
+					if (family == AF_INET) {
+						// IPv4 only
+						ULONG size = 0;
+#pragma warning(suppress: 6387)
+						::GetIpForwardTable(nullptr, &size, FALSE);
+
+						std::vector<uint8_t> buffer(size);
+						DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpForwardTable failed");
+							return false;
+						}
+
+						auto* pTable = reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data());
+
+						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							const auto& row = pTable->table[i];
+
+							RouteEntry entry;
+							entry.destination = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwForwardDest)));
+							entry.netmask = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwForwardMask)));
+							entry.gateway = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwForwardNextHop)));
+							entry.interfaceIndex = row.dwForwardIfIndex;
+							entry.metric = row.dwForwardMetric1;
+
+							routes.push_back(std::move(entry));
+						}
+					}
+					else if (family == AF_INET6) {
+						// IPv6 only
+						PMIB_IPFORWARD_TABLE2 pTable6 = nullptr;
+						DWORD result = ::GetIpForwardTable2(AF_INET6, &pTable6);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpForwardTable2 failed");
+							return false;
+						}
+
+						struct TableDeleter {
+							void operator()(PMIB_IPFORWARD_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPFORWARD_TABLE2, TableDeleter> tableGuard(pTable6);
+
+						for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+							const auto& row = pTable6->Table[i];
+
+							RouteEntry entry;
+
+							std::array<uint8_t, 16> destBytes;
+							std::memcpy(destBytes.data(), row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte, 16);
+							entry.destination = IpAddress(IPv6Address(destBytes));
+
+							uint8_t prefixLen = row.DestinationPrefix.PrefixLength;
+							std::array<uint8_t, 16> maskBytes = {};
+							for (uint8_t j = 0; j < prefixLen / 8; ++j) {
+								maskBytes[j] = 0xFF;
+							}
+							if (prefixLen % 8) {
+								maskBytes[prefixLen / 8] = static_cast<uint8_t>(0xFF << (8 - (prefixLen % 8)));
+							}
+							entry.netmask = IpAddress(IPv6Address(maskBytes));
+
+							std::array<uint8_t, 16> gwBytes;
+							std::memcpy(gwBytes.data(), row.NextHop.Ipv6.sin6_addr.u.Byte, 16);
+							entry.gateway = IpAddress(IPv6Address(gwBytes));
+
+							entry.interfaceIndex = row.InterfaceIndex;
+							entry.metric = row.Metric;
+
+							routes.push_back(std::move(entry));
+						}
+					}
+					else {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid address family");
+						return false;
+					}
+
+					return true;
+
+				}
+				catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetRoutingTable");
 					return false;
 				}
 			}
 
 			bool AddRoute(const IpAddress& destination, uint8_t prefixLength, const IpAddress& gateway, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
+				try {
+					// Check if both addresses are same IP version
+					if (destination.IsIPv4() != gateway.IsIPv4()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Destination and gateway must be same IP version");
+						return false;
+					}
+
+					if (destination.IsIPv4()) {
+						// IPv4 Route Addition
+						MIB_IPFORWARDROW route = {};
+
+						auto* destIpv4 = destination.AsIPv4();
+						auto* gwIpv4 = gateway.AsIPv4();
+
+						route.dwForwardDest = Internal::HostToNetwork32(destIpv4->ToUInt32());
+						route.dwForwardNextHop = Internal::HostToNetwork32(gwIpv4->ToUInt32());
+
+						// Convert prefix length to netmask
+						if (prefixLength > 32) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid prefix length for IPv4");
+							return false;
+						}
+
+						uint32_t mask = prefixLength == 0 ? 0 : (~0U << (32 - prefixLength));
+						route.dwForwardMask = Internal::HostToNetwork32(mask);
+
+						route.dwForwardPolicy = 0;
+						route.dwForwardIfIndex = 0; // Let system choose interface
+						route.dwForwardType = MIB_IPROUTE_TYPE_INDIRECT;
+						route.dwForwardProto = MIB_IPPROTO_NETMGMT;
+						route.dwForwardAge = 0;
+						route.dwForwardNextHopAS = 0;
+						route.dwForwardMetric1 = 1;
+						route.dwForwardMetric2 = static_cast<DWORD>(-1);
+						route.dwForwardMetric3 = static_cast<DWORD>(-1);
+						route.dwForwardMetric4 = static_cast<DWORD>(-1);
+						route.dwForwardMetric5 = static_cast<DWORD>(-1);
+
+						DWORD result = ::CreateIpForwardEntry(&route);
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"CreateIpForwardEntry failed");
+							return false;
+						}
+
+						return true;
+					}
+					else if (destination.IsIPv6()) {
+						// IPv6 Route Addition
+						MIB_IPFORWARD_ROW2 route = {};
+						::InitializeIpForwardEntry(&route);
+
+						auto* destIpv6 = destination.AsIPv6();
+						auto* gwIpv6 = gateway.AsIPv6();
+
+						// Destination prefix
+						route.DestinationPrefix.Prefix.si_family = AF_INET6;
+						const auto& destBytes = destIpv6->bytes;
+						std::memcpy(route.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte, destBytes.data(), 16);
+						route.DestinationPrefix.PrefixLength = prefixLength;
+
+						if (prefixLength > 128) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid prefix length for IPv6");
+							return false;
+						}
+
+						// Next hop (gateway)
+						route.NextHop.si_family = AF_INET6;
+						const auto& gwBytes = gwIpv6->bytes;
+						std::memcpy(route.NextHop.Ipv6.sin6_addr.u.Byte, gwBytes.data(), 16);
+
+						route.Protocol = MIB_IPPROTO_NETMGMT;
+						route.Metric = 1;
+						route.ValidLifetime = 0xFFFFFFFF; // Infinite
+						route.PreferredLifetime = 0xFFFFFFFF; // Infinite
+
+						DWORD result = ::CreateIpForwardEntry2(&route);
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"CreateIpForwardEntry2 failed");
+							return false;
+						}
+
+						return true;
+					}
+
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address type");
+					return false;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in AddRoute");
+					return false;
+				}
 			}
 
 			bool DeleteRoute(const IpAddress& destination, uint8_t prefixLength, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
+				try {
+					if (destination.IsIPv4()) {
+						// IPv4 Route Deletion
+						MIB_IPFORWARDROW route = {};
+
+						auto* destIpv4 = destination.AsIPv4();
+						route.dwForwardDest = Internal::HostToNetwork32(destIpv4->ToUInt32());
+
+						// Convert prefix length to netmask
+						if (prefixLength > 32) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid prefix length for IPv4");
+							return false;
+						}
+
+						uint32_t mask = prefixLength == 0 ? 0 : (~0U << (32 - prefixLength));
+						route.dwForwardMask = Internal::HostToNetwork32(mask);
+
+						// Find matching route in table
+						ULONG size = 0;
+#pragma warning(suppress: 6387)
+						::GetIpForwardTable(nullptr, &size, FALSE);
+
+						std::vector<uint8_t> buffer(size);
+						DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpForwardTable failed");
+							return false;
+						}
+
+						auto* pTable = reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data());
+						bool found = false;
+
+						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							const auto& row = pTable->table[i];
+
+							if (row.dwForwardDest == route.dwForwardDest &&
+								row.dwForwardMask == route.dwForwardMask) {
+
+								result = ::DeleteIpForwardEntry(&pTable->table[i]);
+								if (result != NO_ERROR) {
+									Internal::SetError(err, result, L"DeleteIpForwardEntry failed");
+									return false;
+								}
+
+								found = true;
+								break;
+							}
+						}
+
+						if (!found) {
+							Internal::SetError(err, ERROR_NOT_FOUND, L"Route not found");
+							return false;
+						}
+
+						return true;
+					}
+					else if (destination.IsIPv6()) {
+						// IPv6 Route Deletion
+						MIB_IPFORWARD_ROW2 route = {};
+						::InitializeIpForwardEntry(&route);
+
+						auto* destIpv6 = destination.AsIPv6();
+
+						route.DestinationPrefix.Prefix.si_family = AF_INET6;
+						const auto& destBytes = destIpv6->bytes;
+						std::memcpy(route.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte, destBytes.data(), 16);
+						route.DestinationPrefix.PrefixLength = prefixLength;
+
+						if (prefixLength > 128) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid prefix length for IPv6");
+							return false;
+						}
+
+						// Find and delete the route
+						PMIB_IPFORWARD_TABLE2 pTable6 = nullptr;
+						DWORD result = ::GetIpForwardTable2(AF_INET6, &pTable6);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpForwardTable2 failed");
+							return false;
+						}
+
+						struct TableDeleter {
+							void operator()(PMIB_IPFORWARD_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPFORWARD_TABLE2, TableDeleter> tableGuard(pTable6);
+
+						bool found = false;
+
+						for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+							const auto& row = pTable6->Table[i];
+
+							if (row.DestinationPrefix.PrefixLength == prefixLength &&
+								std::memcmp(row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte,
+									destBytes.data(), 16) == 0) {
+
+								result = ::DeleteIpForwardEntry2(&pTable6->Table[i]);
+								if (result != NO_ERROR) {
+									Internal::SetError(err, result, L"DeleteIpForwardEntry2 failed");
+									return false;
+								}
+
+								found = true;
+								break;
+							}
+						}
+
+						if (!found) {
+							Internal::SetError(err, ERROR_NOT_FOUND, L"Route not found");
+							return false;
+						}
+
+						return true;
+					}
+
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address type");
+					return false;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in DeleteRoute");
+					return false;
+				}
+			}
+
+			//Route modification
+			bool ModifyRoute(const IpAddress& destination, uint8_t prefixLength,
+				const IpAddress& newGateway, uint32_t newMetric, Error* err) noexcept {
+				try {
+					if (destination.IsIPv4() != newGateway.IsIPv4()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"IP version mismatch");
+						return false;
+					}
+
+					if (destination.IsIPv4()) {
+						// IPv4 Route Modification
+						ULONG size = 0;
+#pragma warning(suppress: 6387)
+						::GetIpForwardTable(nullptr, &size, FALSE);
+
+						std::vector<uint8_t> buffer(size);
+						DWORD result = ::GetIpForwardTable(reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data()), &size, FALSE);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpForwardTable failed");
+							return false;
+						}
+
+						auto* pTable = reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data());
+						auto* destIpv4 = destination.AsIPv4();
+
+						uint32_t destAddr = Internal::HostToNetwork32(destIpv4->ToUInt32());
+						uint32_t mask = prefixLength == 0 ? 0 : (~0U << (32 - prefixLength));
+						uint32_t netmask = Internal::HostToNetwork32(mask);
+
+						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							auto& row = pTable->table[i];
+
+							if (row.dwForwardDest == destAddr && row.dwForwardMask == netmask) {
+								auto* gwIpv4 = newGateway.AsIPv4();
+								row.dwForwardNextHop = Internal::HostToNetwork32(gwIpv4->ToUInt32());
+								row.dwForwardMetric1 = newMetric;
+
+								result = ::SetIpForwardEntry(&row);
+								if (result != NO_ERROR) {
+									Internal::SetError(err, result, L"SetIpForwardEntry failed");
+									return false;
+								}
+
+								return true;
+							}
+						}
+
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Route not found");
+						return false;
+					}
+					else if (destination.IsIPv6()) {
+						// IPv6 Route Modification
+						PMIB_IPFORWARD_TABLE2 pTable6 = nullptr;
+						DWORD result = ::GetIpForwardTable2(AF_INET6, &pTable6);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpForwardTable2 failed");
+							return false;
+						}
+
+						struct TableDeleter {
+							void operator()(PMIB_IPFORWARD_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPFORWARD_TABLE2, TableDeleter> tableGuard(pTable6);
+
+						auto* destIpv6 = destination.AsIPv6();
+						const auto& destBytes = destIpv6->bytes;
+
+						for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+							auto& row = pTable6->Table[i];
+
+							if (row.DestinationPrefix.PrefixLength == prefixLength &&
+								std::memcmp(row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte,
+									destBytes.data(), 16) == 0) {
+
+								auto* gwIpv6 = newGateway.AsIPv6();
+								const auto& gwBytes = gwIpv6->bytes;
+								std::memcpy(row.NextHop.Ipv6.sin6_addr.u.Byte, gwBytes.data(), 16);
+								row.Metric = newMetric;
+
+								result = ::SetIpForwardEntry2(&row);
+								if (result != NO_ERROR) {
+									Internal::SetError(err, result, L"SetIpForwardEntry2 failed");
+									return false;
+								}
+
+								return true;
+							}
+						}
+
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Route not found");
+						return false;
+					}
+
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address type");
+					return false;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ModifyRoute");
+					return false;
+				}
 			}
 
 			// ============================================================================
@@ -2077,22 +2999,28 @@ namespace ShadowStrike {
 				try {
 					entries.clear();
 
+					// IPv4 ARP Table
 					ULONG size = 0;
+#pragma warning(suppress: 6387)
 					::GetIpNetTable(nullptr, &size, FALSE);
 
 					std::vector<uint8_t> buffer(size);
-					if (::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE) == NO_ERROR) {
+					DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+
+					if (result == NO_ERROR) {
 						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
 
 						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
-							ArpEntry entry;
-							entry.ipAddress = IpAddress(IPv4Address(Internal::NetworkToHost32(pTable->table[i].dwAddr)));
-							entry.interfaceIndex = pTable->table[i].dwIndex;
-							entry.isStatic = (pTable->table[i].Type == MIB_IPNET_TYPE_STATIC);
+							const auto& row = pTable->table[i];
 
-							if (pTable->table[i].dwPhysAddrLen == 6) {
+							ArpEntry entry;
+							entry.ipAddress = IpAddress(IPv4Address(Internal::NetworkToHost32(row.dwAddr)));
+							entry.interfaceIndex = row.dwIndex;
+							entry.isStatic = (row.Type == MIB_IPNET_TYPE_STATIC);
+
+							if (row.dwPhysAddrLen == 6) {
 								std::array<uint8_t, 6> macBytes;
-								std::memcpy(macBytes.data(), pTable->table[i].bPhysAddr, 6);
+								std::memcpy(macBytes.data(), row.bPhysAddr, 6);
 								entry.macAddress = MacAddress(macBytes);
 							}
 
@@ -2100,66 +3028,841 @@ namespace ShadowStrike {
 						}
 					}
 
+					// IPv6 NDP Table
+					PMIB_IPNET_TABLE2 pTable6 = nullptr;
+					result = ::GetIpNetTable2(AF_INET6, &pTable6);
+
+					if (result != NO_ERROR) {
+						// IPv4 entries varsa onlarý döndür, IPv6 yoksa sorun deðil
+						return !entries.empty();
+					}
+
+					struct TableDeleter {
+						void operator()(PMIB_IPNET_TABLE2 p) const {
+							if (p) ::FreeMibTable(p);
+						}
+					};
+					std::unique_ptr<MIB_IPNET_TABLE2, TableDeleter> tableGuard(pTable6);
+
+					for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+						const auto& row = pTable6->Table[i];
+
+						ArpEntry entry;
+
+						// IPv6 address
+						std::array<uint8_t, 16> ipBytes;
+						std::memcpy(ipBytes.data(), row.Address.Ipv6.sin6_addr.u.Byte, 16);
+						entry.ipAddress = IpAddress(IPv6Address(ipBytes));
+
+						entry.interfaceIndex = row.InterfaceIndex;
+						entry.isStatic = (row.State == NlnsPermanent);
+
+						// MAC address
+						if (row.PhysicalAddressLength == 6) {
+							std::array<uint8_t, 6> macBytes;
+							std::memcpy(macBytes.data(), row.PhysicalAddress, 6);
+							entry.macAddress = MacAddress(macBytes);
+						}
+
+						entries.push_back(std::move(entry));
+					}
+
 					return true;
 
-				} catch (...) {
+				}
+				catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetArpTable");
 					return false;
 				}
 			}
 
 			bool AddArpEntry(const IpAddress& ipAddress, const MacAddress& macAddress, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
+				try {
+					const auto& macBytes = macAddress.bytes;
+
+					if (macBytes.size() != 6) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid MAC address length");
+						return false;
+					}
+
+					if (ipAddress.IsIPv4()) {
+						// IPv4 ARP Entry
+						MIB_IPNETROW row = {};
+
+						auto* ipv4 = ipAddress.AsIPv4();
+						row.dwAddr = Internal::HostToNetwork32(ipv4->ToUInt32());
+						row.dwIndex = 0; // Will need to find appropriate interface
+						row.dwPhysAddrLen = 6;
+						std::memcpy(row.bPhysAddr, macBytes.data(), 6);
+						row.Type = MIB_IPNET_TYPE_STATIC;
+
+						// Find appropriate interface index
+						ULONG tableSize = 0;
+#pragma warning(suppress: 6387)
+						::GetIpNetTable(nullptr, &tableSize, FALSE);
+
+						std::vector<uint8_t> buffer(tableSize);
+						if (::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &tableSize, FALSE) == NO_ERROR) {
+							auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
+							if (pTable->dwNumEntries > 0) {
+								// Use first interface index as default
+								row.dwIndex = pTable->table[0].dwIndex;
+							}
+						}
+
+						if (row.dwIndex == 0) {
+							Internal::SetError(err, ERROR_NOT_FOUND, L"No valid interface found");
+							return false;
+						}
+
+						DWORD result = ::CreateIpNetEntry(&row);
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"CreateIpNetEntry failed");
+							return false;
+						}
+
+						return true;
+					}
+					else if (ipAddress.IsIPv6()) {
+						// IPv6 NDP Entry
+						MIB_IPNET_ROW2 row = {};
+
+						auto* ipv6 = ipAddress.AsIPv6();
+						const auto& ipBytes = ipv6->bytes;
+
+						row.Address.si_family = AF_INET6;
+						std::memcpy(row.Address.Ipv6.sin6_addr.u.Byte, ipBytes.data(), 16);
+
+						row.PhysicalAddressLength = 6;
+						std::memcpy(row.PhysicalAddress, macBytes.data(), 6);
+
+						row.State = NlnsPermanent;
+						row.IsRouter = FALSE;
+						row.IsUnreachable = FALSE;
+
+						// Find appropriate interface
+						PMIB_IPNET_TABLE2 pTable6 = nullptr;
+						DWORD result = ::GetIpNetTable2(AF_INET6, &pTable6);
+
+						if (result == NO_ERROR && pTable6 && pTable6->NumEntries > 0) {
+							row.InterfaceIndex = pTable6->Table[0].InterfaceIndex;
+							row.InterfaceLuid = pTable6->Table[0].InterfaceLuid;
+							::FreeMibTable(pTable6);
+						}
+						else {
+							if (pTable6) ::FreeMibTable(pTable6);
+							Internal::SetError(err, ERROR_NOT_FOUND, L"No valid IPv6 interface found");
+							return false;
+						}
+
+						result = ::CreateIpNetEntry2(&row);
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"CreateIpNetEntry2 failed");
+							return false;
+						}
+
+						return true;
+					}
+
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address type");
+					return false;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in AddArpEntry");
+					return false;
+				}
 			}
 
 			bool DeleteArpEntry(const IpAddress& ipAddress, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
+				try {
+					if (ipAddress.IsIPv4()) {
+						// IPv4 ARP Entry Deletion
+						ULONG size = 0;
+#pragma warning(suppress: 6387)
+						::GetIpNetTable(nullptr, &size, FALSE);
+
+						std::vector<uint8_t> buffer(size);
+						DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpNetTable failed");
+							return false;
+						}
+
+						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
+						auto* ipv4 = ipAddress.AsIPv4();
+						uint32_t targetAddr = Internal::HostToNetwork32(ipv4->ToUInt32());
+
+						bool found = false;
+
+						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							if (pTable->table[i].dwAddr == targetAddr) {
+								result = ::DeleteIpNetEntry(&pTable->table[i]);
+								if (result != NO_ERROR) {
+									Internal::SetError(err, result, L"DeleteIpNetEntry failed");
+									return false;
+								}
+								found = true;
+								break;
+							}
+						}
+
+						if (!found) {
+							Internal::SetError(err, ERROR_NOT_FOUND, L"ARP entry not found");
+							return false;
+						}
+
+						return true;
+					}
+					else if (ipAddress.IsIPv6()) {
+						// IPv6 NDP Entry Deletion
+						PMIB_IPNET_TABLE2 pTable6 = nullptr;
+						DWORD result = ::GetIpNetTable2(AF_INET6, &pTable6);
+
+						if (result != NO_ERROR) {
+							Internal::SetError(err, result, L"GetIpNetTable2 failed");
+							return false;
+						}
+
+						struct TableDeleter {
+							void operator()(PMIB_IPNET_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPNET_TABLE2, TableDeleter> tableGuard(pTable6);
+
+						auto* ipv6 = ipAddress.AsIPv6();
+						const auto& targetBytes = ipv6->bytes;
+
+						bool found = false;
+
+						for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+							if (std::memcmp(pTable6->Table[i].Address.Ipv6.sin6_addr.u.Byte,
+								targetBytes.data(), 16) == 0) {
+
+								result = ::DeleteIpNetEntry2(&pTable6->Table[i]);
+								if (result != NO_ERROR) {
+									Internal::SetError(err, result, L"DeleteIpNetEntry2 failed");
+									return false;
+								}
+								found = true;
+								break;
+							}
+						}
+
+						if (!found) {
+							Internal::SetError(err, ERROR_NOT_FOUND, L"NDP entry not found");
+							return false;
+						}
+
+						return true;
+					}
+
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address type");
+					return false;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in DeleteArpEntry");
+					return false;
+				}
 			}
 
 			bool FlushArpCache(Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
+				try {
+					bool success = true;
+
+					// Flush IPv4 ARP Cache
+					ULONG size = 0;
+#pragma warning(suppress: 6387)
+					::GetIpNetTable(nullptr, &size, FALSE);
+
+					std::vector<uint8_t> buffer(size);
+					DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+
+					if (result == NO_ERROR) {
+						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
+
+						// Delete all dynamic entries (keep static ones)
+						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							if (pTable->table[i].Type != MIB_IPNET_TYPE_STATIC) {
+								result = ::DeleteIpNetEntry(&pTable->table[i]);
+								if (result != NO_ERROR) {
+									success = false;
+								}
+							}
+						}
+					}
+
+					// Flush IPv6 NDP Cache
+					PMIB_IPNET_TABLE2 pTable6 = nullptr;
+					result = ::GetIpNetTable2(AF_INET6, &pTable6);
+
+					if (result == NO_ERROR) {
+						struct TableDeleter {
+							void operator()(PMIB_IPNET_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPNET_TABLE2, TableDeleter> tableGuard(pTable6);
+
+						// Delete all non-permanent entries
+						for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+							if (pTable6->Table[i].State != NlnsPermanent) {
+								result = ::DeleteIpNetEntry2(&pTable6->Table[i]);
+								if (result != NO_ERROR) {
+									success = false;
+								}
+							}
+						}
+					}
+
+					if (!success) {
+						Internal::SetError(err, ERROR_PARTIAL_COPY, L"Some entries could not be flushed");
+						return false;
+					}
+
+					return true;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in FlushArpCache");
+					return false;
+				}
+			}
+
+			
+			bool FlushArpCache(uint32_t interfaceIndex, Error* err) noexcept {
+				try {
+					bool success = true;
+
+					// Flush IPv4 ARP Cache for specific interface
+					ULONG size = 0;
+#pragma warning(suppress: 6387)
+					::GetIpNetTable(nullptr, &size, FALSE);
+
+					std::vector<uint8_t> buffer(size);
+					DWORD result = ::GetIpNetTable(reinterpret_cast<PMIB_IPNETTABLE>(buffer.data()), &size, FALSE);
+
+					if (result == NO_ERROR) {
+						auto* pTable = reinterpret_cast<PMIB_IPNETTABLE>(buffer.data());
+
+						for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+							if (pTable->table[i].dwIndex == interfaceIndex &&
+								pTable->table[i].Type != MIB_IPNET_TYPE_STATIC) {
+
+								result = ::DeleteIpNetEntry(&pTable->table[i]);
+								if (result != NO_ERROR) {
+									success = false;
+								}
+							}
+						}
+					}
+
+					// Flush IPv6 NDP Cache for specific interface
+					PMIB_IPNET_TABLE2 pTable6 = nullptr;
+					result = ::GetIpNetTable2(AF_INET6, &pTable6);
+
+					if (result == NO_ERROR) {
+						struct TableDeleter {
+							void operator()(PMIB_IPNET_TABLE2 p) const {
+								if (p) ::FreeMibTable(p);
+							}
+						};
+						std::unique_ptr<MIB_IPNET_TABLE2, TableDeleter> tableGuard(pTable6);
+
+						for (ULONG i = 0; i < pTable6->NumEntries; ++i) {
+							if (pTable6->Table[i].InterfaceIndex == interfaceIndex &&
+								pTable6->Table[i].State != NlnsPermanent) {
+
+								result = ::DeleteIpNetEntry2(&pTable6->Table[i]);
+								if (result != NO_ERROR) {
+									success = false;
+								}
+							}
+						}
+					}
+
+					if (!success) {
+						Internal::SetError(err, ERROR_PARTIAL_COPY, L"Some entries could not be flushed");
+						return false;
+					}
+
+					return true;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in FlushArpCache");
+					return false;
+				}
 			}
 
 			// ============================================================================
 			// Network Security (SSL/TLS)
 			// ============================================================================
+			namespace {
+				// Helper to convert FILETIME to system_clock::time_point
+				inline std::chrono::system_clock::time_point FileTimeToTimePoint(const FILETIME& ft) noexcept {
+					ULARGE_INTEGER uli;
+					uli.LowPart = ft.dwLowDateTime;
+					uli.HighPart = ft.dwHighDateTime;
+
+					// FILETIME is 100-nanosecond intervals since January 1, 1601 UTC
+					// Convert to system_clock epoch (January 1, 1970 UTC)
+					constexpr uint64_t EPOCH_DIFFERENCE = 116444736000000000ULL;
+
+					if (uli.QuadPart < EPOCH_DIFFERENCE) {
+						return std::chrono::system_clock::time_point{};
+					}
+
+					uint64_t microseconds = (uli.QuadPart - EPOCH_DIFFERENCE) / 10;
+					return std::chrono::system_clock::time_point{
+						std::chrono::microseconds(microseconds)
+					};
+				}
+
+				// Helper to extract Common Name from certificate subject
+				inline std::wstring ExtractCommonName(const wchar_t* subject) noexcept {
+					if (!subject) return L"";
+
+					std::wstring str(subject);
+					size_t cnPos = str.find(L"CN=");
+					if (cnPos == std::wstring::npos) return L"";
+
+					cnPos += 3; // Skip "CN="
+					size_t endPos = str.find(L',', cnPos);
+
+					if (endPos == std::wstring::npos) {
+						return str.substr(cnPos);
+					}
+
+					return str.substr(cnPos, endPos - cnPos);
+				}
+
+				// Helper to check if hostname matches certificate CN or SAN
+				inline bool MatchesHostname(std::wstring_view certName, std::wstring_view hostname) noexcept {
+					// Exact match
+					if (Internal::EqualsIgnoreCase(certName, hostname)) {
+						return true;
+					}
+
+					// Wildcard match (e.g., *.example.com matches www.example.com)
+					if (certName.size() >= 2 && certName[0] == L'*' && certName[1] == L'.') {
+						std::wstring_view wildcardDomain = certName.substr(2);
+
+						// Find first dot in hostname
+						size_t dotPos = hostname.find(L'.');
+						if (dotPos != std::wstring_view::npos && dotPos + 1 < hostname.size()) {
+							std::wstring_view hostDomain = hostname.substr(dotPos + 1);
+							return Internal::EqualsIgnoreCase(wildcardDomain, hostDomain);
+						}
+					}
+
+					return false;
+				}
+			}
 
 			bool GetSslCertificate(std::wstring_view hostname, uint16_t port, SslCertificateInfo& certInfo, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"SSL certificate retrieval not fully implemented");
-				return false; // Would require OpenSSL or WinHTTP certificate APIs
+				try {
+					certInfo = SslCertificateInfo{};
+
+					// Open WinHTTP session
+					HINTERNET hSession = ::WinHttpOpen(
+						L"ShadowStrike-AntiVirus/1.0",
+						WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+						WINHTTP_NO_PROXY_NAME,
+						WINHTTP_NO_PROXY_BYPASS,
+						0
+					);
+
+					if (!hSession) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed", L"GetSslCertificate");
+						return false;
+					}
+
+					// RAII cleanup for session
+					struct SessionDeleter {
+						void operator()(HINTERNET h) const { if (h) ::WinHttpCloseHandle(h); }
+					};
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> sessionGuard(hSession);
+
+					// Connect to server
+					std::wstring hostStr(hostname);
+					HINTERNET hConnect = ::WinHttpConnect(hSession, hostStr.c_str(), port, 0);
+
+					if (!hConnect) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpConnect failed", L"GetSslCertificate");
+						return false;
+					}
+
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> connectGuard(hConnect);
+
+					// Open HTTPS request
+					HINTERNET hRequest = ::WinHttpOpenRequest(
+						hConnect,
+						L"HEAD",
+						L"/",
+						nullptr,
+						WINHTTP_NO_REFERER,
+						WINHTTP_DEFAULT_ACCEPT_TYPES,
+						WINHTTP_FLAG_SECURE
+					);
+
+					if (!hRequest) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpOpenRequest failed", L"GetSslCertificate");
+						return false;
+					}
+
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> requestGuard(hRequest);
+
+					// Configure security options
+					DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+						SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+						SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+
+					if (!::WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+						&securityFlags, sizeof(securityFlags))) {
+						Internal::SetError(err, ::GetLastError(), L"Failed to set security flags", L"GetSslCertificate");
+						return false;
+					}
+
+					// Set timeouts (5 seconds for each phase)
+					::WinHttpSetTimeouts(hRequest, 5000, 5000, 5000, 5000);
+
+					// Send request
+					if (!::WinHttpSendRequest(hRequest,
+						WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+						WINHTTP_NO_REQUEST_DATA, 0,
+						0, 0)) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpSendRequest failed", L"GetSslCertificate");
+						return false;
+					}
+
+					// Receive response
+					if (!::WinHttpReceiveResponse(hRequest, nullptr)) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpReceiveResponse failed", L"GetSslCertificate");
+						return false;
+					}
+
+					// Query certificate info
+					PCCERT_CONTEXT pCertContext = nullptr;
+					DWORD certSize = sizeof(pCertContext);
+
+					if (!::WinHttpQueryOption(hRequest,
+						WINHTTP_OPTION_SERVER_CERT_CONTEXT,
+						&pCertContext,
+						&certSize)) {
+						Internal::SetError(err, ::GetLastError(), L"Failed to retrieve certificate", L"GetSslCertificate");
+						return false;
+					}
+
+					if (!pCertContext) {
+						Internal::SetError(err, ERROR_INVALID_DATA, L"Certificate context is null", L"GetSslCertificate");
+						return false;
+					}
+
+					// RAII cleanup for certificate
+					struct CertDeleter {
+						void operator()(PCCERT_CONTEXT p) const { if (p) ::CertFreeCertificateContext(p); }
+					};
+					std::unique_ptr<const CERT_CONTEXT, CertDeleter> certGuard(pCertContext);
+
+					// Extract subject
+					DWORD subjectLen = ::CertGetNameStringW(
+						pCertContext,
+						CERT_NAME_SIMPLE_DISPLAY_TYPE,
+						0,
+						nullptr,
+						nullptr,
+						0
+					);
+
+					if (subjectLen > 1) {
+						std::vector<wchar_t> subjectBuf(subjectLen);
+						::CertGetNameStringW(
+							pCertContext,
+							CERT_NAME_SIMPLE_DISPLAY_TYPE,
+							0,
+							nullptr,
+							subjectBuf.data(),
+							subjectLen
+						);
+						certInfo.subject = subjectBuf.data();
+					}
+
+					// Extract issuer
+					DWORD issuerLen = ::CertGetNameStringW(
+						pCertContext,
+						CERT_NAME_SIMPLE_DISPLAY_TYPE,
+						CERT_NAME_ISSUER_FLAG,
+						nullptr,
+						nullptr,
+						0
+					);
+
+					if (issuerLen > 1) {
+						std::vector<wchar_t> issuerBuf(issuerLen);
+						::CertGetNameStringW(
+							pCertContext,
+							CERT_NAME_SIMPLE_DISPLAY_TYPE,
+							CERT_NAME_ISSUER_FLAG,
+							nullptr,
+							issuerBuf.data(),
+							issuerLen
+						);
+						certInfo.issuer = issuerBuf.data();
+					}
+
+					// Extract serial number
+					DWORD serialSize = pCertContext->pCertInfo->SerialNumber.cbData;
+					if (serialSize > 0) {
+						std::wostringstream oss;
+						oss << std::hex << std::uppercase << std::setfill(L'0');
+
+						// Serial number is stored in little-endian, display in big-endian
+						for (DWORD i = serialSize; i > 0; --i) {
+							oss << std::setw(2) << static_cast<int>(pCertContext->pCertInfo->SerialNumber.pbData[i - 1]);
+							if (i > 1) oss << L':';
+						}
+
+						certInfo.serialNumber = oss.str();
+					}
+
+					// Extract validity dates
+					certInfo.validFrom = FileTimeToTimePoint(pCertContext->pCertInfo->NotBefore);
+					certInfo.validTo = FileTimeToTimePoint(pCertContext->pCertInfo->NotAfter);
+
+					// Check if certificate is currently valid
+					auto now = std::chrono::system_clock::now();
+					certInfo.isValid = (now >= certInfo.validFrom && now <= certInfo.validTo);
+
+					// Check if self-signed
+					certInfo.isSelfSigned = Internal::EqualsIgnoreCase(certInfo.subject, certInfo.issuer);
+
+					// Extract Subject Alternative Names (SAN)
+					PCERT_EXTENSION pExtension = ::CertFindExtension(
+						szOID_SUBJECT_ALT_NAME2,
+						pCertContext->pCertInfo->cExtension,
+						pCertContext->pCertInfo->rgExtension
+					);
+
+					if (pExtension) {
+						DWORD sanSize = 0;
+						if (::CryptDecodeObjectEx(
+							X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+							X509_ALTERNATE_NAME,
+							pExtension->Value.pbData,
+							pExtension->Value.cbData,
+							CRYPT_DECODE_ALLOC_FLAG,
+							nullptr,
+							nullptr,
+							&sanSize)) {
+
+							std::vector<uint8_t> sanBuf(sanSize);
+							if (::CryptDecodeObjectEx(
+								X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+								X509_ALTERNATE_NAME,
+								pExtension->Value.pbData,
+								pExtension->Value.cbData,
+								CRYPT_DECODE_ALLOC_FLAG,
+								nullptr,
+								sanBuf.data(),
+								&sanSize)) {
+
+								auto* pAltNameInfo = reinterpret_cast<PCERT_ALT_NAME_INFO>(sanBuf.data());
+
+								for (DWORD i = 0; i < pAltNameInfo->cAltEntry; ++i) {
+									const auto& entry = pAltNameInfo->rgAltEntry[i];
+
+									if (entry.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME && entry.pwszDNSName) {
+										certInfo.subjectAltNames.emplace_back(entry.pwszDNSName);
+									}
+									else if (entry.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS) {
+										// Handle IP address SANs if needed
+										if (entry.IPAddress.cbData == 4) {
+											// IPv4
+											IPv4Address ipv4;
+											std::memcpy(ipv4.octets.data(), entry.IPAddress.pbData, 4);
+											certInfo.subjectAltNames.emplace_back(ipv4.ToString());
+										}
+										else if (entry.IPAddress.cbData == 16) {
+											// IPv6
+											std::array<uint8_t, 16> bytes;
+											std::memcpy(bytes.data(), entry.IPAddress.pbData, 16);
+											IPv6Address ipv6(bytes);
+											certInfo.subjectAltNames.emplace_back(ipv6.ToStringCompressed());
+										}
+									}
+								}
+							}
+						}
+					}
+
+					// Verify certificate chain (optional but recommended for enterprise AV)
+					CERT_CHAIN_PARA chainPara = {};
+					chainPara.cbSize = sizeof(chainPara);
+
+					PCCERT_CHAIN_CONTEXT pChainContext = nullptr;
+
+					if (::CertGetCertificateChain(
+						nullptr,                    // Use default chain engine
+						pCertContext,
+						nullptr,                    // Use current time
+						pCertContext->hCertStore,
+						&chainPara,
+						CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+						nullptr,
+						&pChainContext)) {
+
+						struct ChainDeleter {
+							void operator()(PCCERT_CHAIN_CONTEXT p) const {
+								if (p) ::CertFreeCertificateChain(p);
+							}
+						};
+						std::unique_ptr<const CERT_CHAIN_CONTEXT, ChainDeleter> chainGuard(pChainContext);
+
+						// Check chain status
+						if (pChainContext->TrustStatus.dwErrorStatus == CERT_TRUST_NO_ERROR) {
+							// Certificate chain is valid
+							certInfo.isValid = certInfo.isValid && true;
+						}
+						else {
+							// Chain has errors - mark as potentially invalid
+							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_TIME_VALID) {
+								certInfo.isValid = false;
+							}
+							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_REVOKED) {
+								certInfo.isValid = false;
+							}
+							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_NOT_SIGNATURE_VALID) {
+								certInfo.isValid = false;
+							}
+							if (pChainContext->TrustStatus.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) {
+								// Self-signed or untrusted CA
+								certInfo.isSelfSigned = true;
+							}
+						}
+					}
+
+					return true;
+
+				}
+				catch (const std::exception& ex) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Exception in GetSslCertificate: ";
+
+						// Convert exception message to wstring
+						std::string exMsg = ex.what();
+						err->message += std::wstring(exMsg.begin(), exMsg.end());
+					}
+					return false;
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Unknown exception in GetSslCertificate");
+					return false;
+				}
 			}
 
 			bool ValidateSslCertificate(const SslCertificateInfo& certInfo, std::wstring_view expectedHostname) noexcept {
-				if (!certInfo.isValid) return false;
-				if (certInfo.isSelfSigned) return false;
+				try {
+					// 1. Check if certificate structure is valid
+					if (!certInfo.isValid) {
+						return false;
+					}
 
-				auto now = std::chrono::system_clock::now();
-				if (now < certInfo.validFrom || now > certInfo.validTo) {
+					// 2. Reject self-signed certificates (enterprise policy)
+					if (certInfo.isSelfSigned) {
+						return false;
+					}
+
+					// 3. Check temporal validity
+					auto now = std::chrono::system_clock::now();
+
+					if (now < certInfo.validFrom) {
+						// Certificate not yet valid
+						return false;
+					}
+
+					if (now > certInfo.validTo) {
+						// Certificate expired
+						return false;
+					}
+
+					// 4. Validate hostname matching (RFC 6125)
+					bool hostnameMatches = false;
+
+					// 4a. Check Subject Alternative Names (SAN) first (modern standard)
+					if (!certInfo.subjectAltNames.empty()) {
+						for (const auto& san : certInfo.subjectAltNames) {
+							if (MatchesHostname(san, expectedHostname)) {
+								hostnameMatches = true;
+								break;
+							}
+						}
+					}
+
+					// 4b. Fallback to Common Name (deprecated but still used)
+					if (!hostnameMatches && !certInfo.subject.empty()) {
+						std::wstring cn = ExtractCommonName(certInfo.subject.c_str());
+						if (!cn.empty() && MatchesHostname(cn, expectedHostname)) {
+							hostnameMatches = true;
+						}
+					}
+
+					if (!hostnameMatches) {
+						// Hostname doesn't match certificate
+						return false;
+					}
+
+					// 5. Additional security checks
+
+					// 5a. Check validity period length (suspicious if > 825 days as per CA/Browser Forum)
+					auto validityPeriod = std::chrono::duration_cast<std::chrono::hours>(
+						certInfo.validTo - certInfo.validFrom
+					).count();
+
+					constexpr int64_t MAX_VALIDITY_HOURS = 825 * 24; // 825 days
+					if (validityPeriod > MAX_VALIDITY_HOURS) {
+						// Suspiciously long validity period
+						return false;
+					}
+
+					// 5b. Ensure issuer is not empty
+					if (certInfo.issuer.empty()) {
+						return false;
+					}
+
+					// 5c. Ensure serial number exists
+					if (certInfo.serialNumber.empty()) {
+						return false;
+					}
+
+					// All checks passed
+					return true;
+
+				}
+				catch (...) {
+					// Any exception during validation = failed validation
 					return false;
 				}
-
-				// Check if hostname matches
-				if (certInfo.subject.find(expectedHostname) != std::wstring::npos) {
-					return true;
-				}
-
-				for (const auto& altName : certInfo.subjectAltNames) {
-					if (altName == expectedHostname) {
-						return true;
-					}
-				}
-
-				return false;
 			}
 
 			// ============================================================================
-			// Network Protocol Detection
-			// ============================================================================
-
+            // Network Protocol Detection
+            // Implementation based on RFC specifications:
+            // - RFC 959 (FTP), RFC 4253 (SSH), RFC 5321 (SMTP), RFC 3501 (IMAP)
+            // - RFC 1939 (POP3), RFC 854 (Telnet), ITU-T T.123 (RDP)
+            // Protocol magic numbers and signatures are standardized, not copyrightable.
+            // ============================================================================
 			bool DetectProtocol(const std::vector<uint8_t>& data, std::wstring& protocol) noexcept {
+				if (data.empty()) {
+					protocol = L"Unknown";
+					return false;
+				}
+
+				// Check protocols in order of likelihood
 				if (IsHttpTraffic(data)) {
 					protocol = L"HTTP";
 					return true;
@@ -2168,8 +3871,40 @@ namespace ShadowStrike {
 					protocol = L"HTTPS/TLS";
 					return true;
 				}
+				if (IsSshTraffic(data)) {
+					protocol = L"SSH";
+					return true;
+				}
+				if (IsFtpTraffic(data)) {
+					protocol = L"FTP";
+					return true;
+				}
+				if (IsSmtpTraffic(data)) {
+					protocol = L"SMTP";
+					return true;
+				}
+				if (IsImapTraffic(data)) {
+					protocol = L"IMAP";
+					return true;
+				}
+				if (IsPop3Traffic(data)) {
+					protocol = L"POP3";
+					return true;
+				}
 				if (IsDnsTraffic(data)) {
 					protocol = L"DNS";
+					return true;
+				}
+				if (IsTelnetTraffic(data)) {
+					protocol = L"TELNET";
+					return true;
+				}
+				if (IsRdpTraffic(data)) {
+					protocol = L"RDP";
+					return true;
+				}
+				if (IsSmbTraffic(data)) {
+					protocol = L"SMB";
 					return true;
 				}
 
@@ -2177,26 +3912,409 @@ namespace ShadowStrike {
 				return false;
 			}
 
-			bool IsHttpTraffic(const std::vector<uint8_t>& data) noexcept {
-				if (data.size() < 4) return false;
-				
-				std::string prefix(data.begin(), data.begin() + std::min(size_t(16), data.size()));
-				return prefix.find("GET ") == 0 || prefix.find("POST ") == 0 || 
-					   prefix.find("PUT ") == 0 || prefix.find("HTTP/") == 0;
-			}
-
-			bool IsHttpsTraffic(const std::vector<uint8_t>& data) noexcept {
+			bool IsFtpTraffic(const std::vector<uint8_t>& data) noexcept {
 				if (data.size() < 3) return false;
-				
-				// TLS handshake starts with 0x16, 0x03, 0x0X
-				return data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x00 && data[2] <= 0x03);
+
+				// FTP server responses start with 3-digit status codes
+				// 220 = Service ready, 331 = User name okay, need password, etc.
+				if (data.size() >= 4) {
+					// Check for 3-digit code followed by space or dash
+					if (std::isdigit(data[0]) && std::isdigit(data[1]) && std::isdigit(data[2])) {
+						if (data[3] == ' ' || data[3] == '-') {
+							// Common FTP response codes
+							char code[4] = { static_cast<char>(data[0]), static_cast<char>(data[1]),
+											static_cast<char>(data[2]), '\0' };
+							int codeNum = std::atoi(code);
+							// FTP codes are typically 1xx-5xx
+							if (codeNum >= 100 && codeNum <= 599) {
+								return true;
+							}
+						}
+					}
+				}
+
+				// FTP client commands (always uppercase)
+				static const char* ftpCommands[] = {
+					"USER ", "PASS ", "ACCT ", "CWD ", "CDUP", "SMNT ", "QUIT",
+					"REIN", "PORT ", "PASV", "TYPE ", "STRU ", "MODE ", "RETR ",
+					"STOR ", "STOU ", "APPE ", "ALLO ", "REST ", "RNFR ", "RNTO ",
+					"ABOR", "DELE ", "RMD ", "MKD ", "PWD", "LIST", "NLST",
+					"SITE ", "SYST", "STAT", "HELP", "NOOP", "FEAT", "OPTS "
+				};
+
+				std::string dataStr;
+				if (data.size() >= 4) {
+					dataStr.assign(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(8), data.size()));
+					std::transform(dataStr.begin(), dataStr.end(), dataStr.begin(), ::toupper);
+
+					for (const auto* cmd : ftpCommands) {
+						if (dataStr.find(cmd) == 0) {
+							return true;
+						}
+					}
+				}
+
+				// Check for FTP greeting (220 response with "FTP" in text)
+				if (data.size() >= 20) {
+					std::string greeting(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(50), data.size()));
+					if (greeting.find("220") == 0 && greeting.find("FTP") != std::string::npos) {
+						return true;
+					}
+				}
+
+				return false;
 			}
 
-			bool IsDnsTraffic(const std::vector<uint8_t>& data) noexcept {
-				if (data.size() < 12) return false;
-				
-				// DNS header is 12 bytes, check flags
-				return true; // Simplified check
+			bool IsSshTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 4) return false;
+
+				// SSH protocol identification string: "SSH-"
+				// Format: SSH-protoversion-softwareversion
+				// Examples: "SSH-2.0-OpenSSH_7.4", "SSH-1.99-Cisco-1.25"
+				if (data.size() >= 8) {
+					if (std::memcmp(data.data(), "SSH-", 4) == 0) {
+						// Check version format: SSH-X.Y
+						if (data.size() >= 7) {
+							if (std::isdigit(data[4]) && data[5] == '.' && std::isdigit(data[6])) {
+								return true;
+							}
+						}
+					}
+				}
+
+				// SSH binary packet structure (after key exchange)
+				// First 4 bytes: packet length (big-endian, excluding MAC and length itself)
+				// Next byte: padding length
+				// Packet length should be reasonable (not too large)
+				if (data.size() >= 6) {
+					uint32_t packetLen = (static_cast<uint32_t>(data[0]) << 24) |
+						(static_cast<uint32_t>(data[1]) << 16) |
+						(static_cast<uint32_t>(data[2]) << 8) |
+						static_cast<uint32_t>(data[3]);
+
+					// SSH packets are typically < 256KB
+					if (packetLen > 0 && packetLen < 262144) {
+						uint8_t paddingLen = data[4];
+						// Padding length should be 4-255 bytes per SSH spec
+						if (paddingLen >= 4 && paddingLen < 256) {
+							// Message code (byte 5) should be valid SSH message type
+							uint8_t msgCode = data[5];
+							// SSH message types: 1-99 = Transport layer, 20-49 = Key exchange, etc.
+							if (msgCode >= 1 && msgCode <= 99) {
+								return true;
+							}
+						}
+					}
+				}
+
+				return false;
+			}
+
+			bool IsSmtpTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 4) return false;
+
+				// SMTP server responses: 3-digit code followed by space or dash
+				if (data.size() >= 4) {
+					if (std::isdigit(data[0]) && std::isdigit(data[1]) && std::isdigit(data[2])) {
+						if (data[3] == ' ' || data[3] == '-') {
+							char code[4] = { static_cast<char>(data[0]), static_cast<char>(data[1]),
+											static_cast<char>(data[2]), '\0' };
+							int codeNum = std::atoi(code);
+
+							// Common SMTP response codes
+							static const int smtpCodes[] = {
+								220, 221, 250, 251, 252, 354, 421, 450, 451, 452,
+								500, 501, 502, 503, 504, 550, 551, 552, 553, 554
+							};
+
+							for (int validCode : smtpCodes) {
+								if (codeNum == validCode) {
+									return true;
+								}
+							}
+						}
+					}
+				}
+
+				// SMTP client commands
+				static const char* smtpCommands[] = {
+					"HELO ", "EHLO ", "MAIL FROM:", "RCPT TO:", "DATA", "RSET",
+					"VRFY ", "EXPN ", "HELP", "NOOP", "QUIT", "AUTH ", "STARTTLS"
+				};
+
+				std::string dataStr;
+				if (data.size() >= 4) {
+					dataStr.assign(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(12), data.size()));
+					std::transform(dataStr.begin(), dataStr.end(), dataStr.begin(), ::toupper);
+
+					for (const auto* cmd : smtpCommands) {
+						if (dataStr.find(cmd) == 0) {
+							return true;
+						}
+					}
+				}
+
+				// Check for SMTP greeting (220 with SMTP/ESMTP in message)
+				if (data.size() >= 20) {
+					std::string greeting(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(40), data.size()));
+					if (greeting.find("220") == 0) {
+						if (greeting.find("SMTP") != std::string::npos ||
+							greeting.find("ESMTP") != std::string::npos) {
+							return true;
+						}
+					}
+				}
+
+				return false;
+			}
+
+			bool IsImapTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 4) return false;
+
+				// IMAP commands start with a tag (alphanumeric string)
+				// followed by space and command
+				// Examples: "A001 LOGIN", "* OK IMAP4", "a1 SELECT INBOX"
+
+				// Check for IMAP server greeting: "* OK" or "* BYE"
+				if (data.size() >= 4) {
+					if (data[0] == '*' && data[1] == ' ') {
+						if (data.size() >= 6) {
+							std::string prefix(reinterpret_cast<const char*>(data.data() + 2),
+								std::min(size_t(4), data.size() - 2));
+							std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::toupper);
+
+							if (prefix.find("OK") == 0 || prefix.find("BYE") == 0 ||
+								prefix.find("NO") == 0 || prefix.find("BAD") == 0) {
+								// Look for "IMAP" in greeting to confirm
+								if (data.size() >= 15) {
+									std::string greeting(reinterpret_cast<const char*>(data.data()),
+										std::min(size_t(40), data.size()));
+									std::transform(greeting.begin(), greeting.end(), greeting.begin(), ::toupper);
+									if (greeting.find("IMAP") != std::string::npos) {
+										return true;
+									}
+								}
+								return true; // OK/BYE/NO/BAD with * prefix is strong indicator
+							}
+						}
+					}
+				}
+
+				// IMAP client commands (come after tag, so search in string)
+				static const char* imapCommands[] = {
+					"LOGIN", "SELECT", "EXAMINE", "CREATE", "DELETE", "RENAME",
+					"SUBSCRIBE", "UNSUBSCRIBE", "LIST", "LSUB", "STATUS", "APPEND",
+					"CHECK", "CLOSE", "EXPUNGE", "SEARCH", "FETCH", "STORE",
+					"COPY", "UID", "LOGOUT", "NOOP", "CAPABILITY", "STARTTLS", "AUTHENTICATE"
+				};
+
+				std::string dataStr;
+				if (data.size() >= 5) {
+					dataStr.assign(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(50), data.size()));
+					std::transform(dataStr.begin(), dataStr.end(), dataStr.begin(), ::toupper);
+
+					for (const auto* cmd : imapCommands) {
+						if (dataStr.find(cmd) != std::string::npos) {
+							return true;
+						}
+					}
+				}
+
+				return false;
+			}
+
+			bool IsPop3Traffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 3) return false;
+
+				// POP3 server responses start with "+OK" or "-ERR"
+				if (data.size() >= 3) {
+					if (data[0] == '+') {
+						if (data.size() >= 4 && data[1] == 'O' && data[2] == 'K') {
+							return true;
+						}
+					}
+					if (data[0] == '-') {
+						if (data.size() >= 4 && data[1] == 'E' && data[2] == 'R' && data[3] == 'R') {
+							return true;
+						}
+					}
+				}
+
+				// POP3 client commands
+				static const char* pop3Commands[] = {
+					"USER ", "PASS ", "STAT", "LIST", "RETR ", "DELE ", "NOOP",
+					"RSET", "QUIT", "TOP ", "UIDL", "APOP ", "AUTH "
+				};
+
+				std::string dataStr;
+				if (data.size() >= 4) {
+					dataStr.assign(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(8), data.size()));
+					std::transform(dataStr.begin(), dataStr.end(), dataStr.begin(), ::toupper);
+
+					for (const auto* cmd : pop3Commands) {
+						if (dataStr.find(cmd) == 0) {
+							return true;
+						}
+					}
+				}
+
+				// Check for POP3 greeting
+				if (data.size() >= 20) {
+					std::string greeting(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(40), data.size()));
+					std::transform(greeting.begin(), greeting.end(), greeting.begin(), ::toupper);
+					if (greeting.find("+OK POP3") != std::string::npos) {
+						return true;
+					}
+				}
+
+				return false;
+			}
+
+			bool IsTelnetTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 3) return false;
+
+				// Telnet uses IAC (Interpret As Command) = 0xFF
+				// Followed by command byte and option byte
+				// Common sequences: IAC WILL, IAC WONT, IAC DO, IAC DONT
+
+				for (size_t i = 0; i < data.size() - 2; ++i) {
+					if (data[i] == 0xFF) { // IAC
+						uint8_t cmd = data[i + 1];
+						// Telnet commands: 240-255
+						// 251=WILL, 252=WONT, 253=DO, 254=DONT, 250=SB, 240=SE
+						if (cmd >= 240 && cmd <= 255) {
+							return true;
+						}
+					}
+				}
+
+				// Check for telnet option negotiation patterns
+				if (data.size() >= 3) {
+					// Count IAC sequences
+					int iacCount = 0;
+					for (size_t i = 0; i < data.size(); ++i) {
+						if (data[i] == 0xFF) iacCount++;
+					}
+					// If more than 2 IAC bytes in small packet, likely telnet
+					if (iacCount >= 2 && data.size() < 100) {
+						return true;
+					}
+				}
+
+				return false;
+			}
+
+			bool IsRdpTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 11) return false;
+
+				// RDP uses TPKT header (RFC 1006)
+				// TPKT version: 0x03
+				// Reserved: 0x00
+				// Length: 2 bytes (big-endian)
+				if (data[0] == 0x03 && data[1] == 0x00) {
+					uint16_t tpktLen = (static_cast<uint16_t>(data[2]) << 8) | data[3];
+
+					// TPKT length should match or be close to actual data length
+					if (tpktLen >= 11 && tpktLen <= data.size() + 100) {
+						// Check for X.224 connection request/confirm (RDP's transport layer)
+						// X.224 header starts at byte 4
+						if (data.size() > 5) {
+							uint8_t x224Len = data[4];
+							uint8_t x224Type = data[5];
+
+							// X.224 Connection Request = 0xE0, Connection Confirm = 0xD0
+							// Data = 0xF0
+							if (x224Type == 0xE0 || x224Type == 0xD0 || x224Type == 0xF0) {
+								return true;
+							}
+						}
+					}
+				}
+
+				// Check for RDP negotiation request (Cookie: mstshash=)
+				if (data.size() >= 15) {
+					std::string dataStr(reinterpret_cast<const char*>(data.data()),
+						std::min(size_t(80), data.size()));
+					if (dataStr.find("Cookie: mstshash=") != std::string::npos ||
+						dataStr.find("rdpdr") != std::string::npos ||
+						dataStr.find("cliprdr") != std::string::npos) {
+						return true;
+					}
+				}
+
+				// Check for CredSSP (RDP with NLA - Network Level Authentication)
+				// CredSSP uses SPNEGO which starts with specific ASN.1 structures
+				if (data.size() >= 10) {
+					// SPNEGO typically starts with 0x60 (SEQUENCE tag)
+					if (data[0] == 0x60 && data.size() >= 20) {
+						// Look for NTLM or Kerberos OIDs
+						std::string dataStr(reinterpret_cast<const char*>(data.data()),
+							std::min(size_t(100), data.size()));
+						// NTLMSSP signature
+						if (dataStr.find("NTLMSSP") != std::string::npos) {
+							return true;
+						}
+					}
+				}
+
+				return false;
+			}
+
+			bool IsSmbTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 4) return false;
+
+				// SMB1 (CIFS) signature: 0xFF 'S' 'M' 'B'
+				if (data.size() >= 4) {
+					if (data[0] == 0xFF && data[1] == 'S' && data[2] == 'M' && data[3] == 'B') {
+						return true;
+					}
+				}
+
+				// SMB2/SMB3 signature: 0xFE 'S' 'M' 'B'
+				if (data.size() >= 4) {
+					if (data[0] == 0xFE && data[1] == 'S' && data[2] == 'M' && data[3] == 'B') {
+						return true;
+					}
+				}
+
+				// NetBIOS Session Service header (used for SMB over NetBIOS)
+				// Type: 0x00 (Session Message), Length: 3 bytes
+				if (data.size() >= 8) {
+					if (data[0] == 0x00) {
+						// Next 3 bytes are length (big-endian, but only lower 17 bits used)
+						uint32_t nbLen = ((static_cast<uint32_t>(data[1]) & 0x01) << 16) |
+							(static_cast<uint32_t>(data[2]) << 8) |
+							static_cast<uint32_t>(data[3]);
+
+						// Check if SMB signature follows NetBIOS header
+						if (nbLen > 0 && nbLen < 0x20000 && data.size() >= 8) {
+							if ((data[4] == 0xFF || data[4] == 0xFE) &&
+								data[5] == 'S' && data[6] == 'M' && data[7] == 'B') {
+								return true;
+							}
+						}
+					}
+				}
+
+				// SMB Direct (SMB over RDMA)
+				// Uses different framing but still contains SMB signature
+				if (data.size() >= 64) {
+					for (size_t i = 0; i < data.size() - 4; ++i) {
+						if ((data[i] == 0xFF || data[i] == 0xFE) &&
+							data[i + 1] == 'S' && data[i + 2] == 'M' && data[i + 3] == 'B') {
+							return true;
+						}
+					}
+				}
+
+				return false;
 			}
 
 			// ============================================================================
@@ -2208,41 +4326,317 @@ namespace ShadowStrike {
 					proxy = ProxyInfo{};
 
 					WINHTTP_CURRENT_USER_IE_PROXY_CONFIG proxyConfig{};
-					if (::WinHttpGetIEProxyConfigForCurrentUser(&proxyConfig)) {
-						proxy.enabled = (proxyConfig.lpszProxy != nullptr);
-						if (proxyConfig.lpszProxy) {
-							proxy.server = proxyConfig.lpszProxy;
-							::GlobalFree(proxyConfig.lpszProxy);
-						}
-						if (proxyConfig.lpszProxyBypass) {
-							proxy.bypass = proxyConfig.lpszProxyBypass;
-							::GlobalFree(proxyConfig.lpszProxyBypass);
-						}
-						if (proxyConfig.lpszAutoConfigUrl) {
-							proxy.autoConfigUrl = proxyConfig.lpszAutoConfigUrl;
-							::GlobalFree(proxyConfig.lpszAutoConfigUrl);
-						}
-						proxy.autoDetect = proxyConfig.fAutoDetect;
 
-						return true;
+					if (!::WinHttpGetIEProxyConfigForCurrentUser(&proxyConfig)) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpGetIEProxyConfigForCurrentUser failed");
+						return false;
 					}
 
-					Internal::SetError(err, ::GetLastError(), L"WinHttpGetIEProxyConfigForCurrentUser failed");
-					return false;
+					// RAII cleanup for allocated strings
+					struct ProxyConfigCleanup {
+						WINHTTP_CURRENT_USER_IE_PROXY_CONFIG* config;
+						~ProxyConfigCleanup() {
+							if (config->lpszProxy) ::GlobalFree(config->lpszProxy);
+							if (config->lpszProxyBypass) ::GlobalFree(config->lpszProxyBypass);
+							if (config->lpszAutoConfigUrl) ::GlobalFree(config->lpszAutoConfigUrl);
+						}
+					};
+					ProxyConfigCleanup cleanup{ &proxyConfig };
 
-				} catch (...) {
+					proxy.enabled = (proxyConfig.lpszProxy != nullptr);
+					proxy.autoDetect = proxyConfig.fAutoDetect;
+
+					if (proxyConfig.lpszProxy) {
+						proxy.server = proxyConfig.lpszProxy;
+					}
+
+					if (proxyConfig.lpszProxyBypass) {
+						proxy.bypass = proxyConfig.lpszProxyBypass;
+					}
+
+					if (proxyConfig.lpszAutoConfigUrl) {
+						proxy.autoConfigUrl = proxyConfig.lpszAutoConfigUrl;
+					}
+
+					return true;
+
+				}
+				catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in GetSystemProxySettings");
 					return false;
 				}
 			}
 
 			bool SetSystemProxySettings(const ProxyInfo& proxy, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges and registry modification");
-				return false; // Requires modifying IE/Windows proxy settings in registry
+				try {
+					// Internet Settings registry path
+					constexpr wchar_t REG_PATH[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+
+					HKEY hKey = nullptr;
+					LONG result = ::RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH, 0, KEY_WRITE, &hKey);
+
+					if (result != ERROR_SUCCESS) {
+						Internal::SetError(err, result, L"Failed to open Internet Settings registry key");
+						return false;
+					}
+
+					// RAII wrapper for registry key
+					struct RegKeyDeleter {
+						void operator()(HKEY h) const {
+							if (h) ::RegCloseKey(h);
+						}
+					};
+					std::unique_ptr<std::remove_pointer_t<HKEY>, RegKeyDeleter> keyGuard(hKey);
+
+					// Set ProxyEnable
+					DWORD proxyEnable = proxy.enabled ? 1 : 0;
+					result = ::RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD,
+						reinterpret_cast<const BYTE*>(&proxyEnable), sizeof(DWORD));
+
+					if (result != ERROR_SUCCESS) {
+						Internal::SetError(err, result, L"Failed to set ProxyEnable");
+						return false;
+					}
+
+					// Set ProxyServer
+					if (proxy.enabled && !proxy.server.empty()) {
+						result = ::RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ,
+							reinterpret_cast<const BYTE*>(proxy.server.c_str()),
+							static_cast<DWORD>((proxy.server.length() + 1) * sizeof(wchar_t)));
+
+						if (result != ERROR_SUCCESS) {
+							Internal::SetError(err, result, L"Failed to set ProxyServer");
+							return false;
+						}
+					}
+					else {
+						// Delete ProxyServer if proxy is disabled
+						::RegDeleteValueW(hKey, L"ProxyServer");
+					}
+
+					// Set ProxyOverride (bypass list)
+					if (!proxy.bypass.empty()) {
+						result = ::RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ,
+							reinterpret_cast<const BYTE*>(proxy.bypass.c_str()),
+							static_cast<DWORD>((proxy.bypass.length() + 1) * sizeof(wchar_t)));
+
+						if (result != ERROR_SUCCESS) {
+							Internal::SetError(err, result, L"Failed to set ProxyOverride");
+							return false;
+						}
+					}
+					else {
+						::RegDeleteValueW(hKey, L"ProxyOverride");
+					}
+
+					// Set AutoConfigURL
+					if (!proxy.autoConfigUrl.empty()) {
+						result = ::RegSetValueExW(hKey, L"AutoConfigURL", 0, REG_SZ,
+							reinterpret_cast<const BYTE*>(proxy.autoConfigUrl.c_str()),
+							static_cast<DWORD>((proxy.autoConfigUrl.length() + 1) * sizeof(wchar_t)));
+
+						if (result != ERROR_SUCCESS) {
+							Internal::SetError(err, result, L"Failed to set AutoConfigURL");
+							return false;
+						}
+					}
+					else {
+						::RegDeleteValueW(hKey, L"AutoConfigURL");
+					}
+
+					// Notify system about proxy changes
+					::InternetSetOptionW(nullptr, INTERNET_OPTION_SETTINGS_CHANGED, nullptr, 0);
+					::InternetSetOptionW(nullptr, INTERNET_OPTION_REFRESH, nullptr, 0);
+
+					return true;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in SetSystemProxySettings");
+					return false;
+				}
 			}
 
 			bool DetectProxyForUrl(std::wstring_view url, ProxyInfo& proxy, Error* err) noexcept {
-				return GetSystemProxySettings(proxy, err);
+				try {
+					proxy = ProxyInfo{};
+
+					// Open WinHTTP session
+					HINTERNET hSession = ::WinHttpOpen(L"AntivirusProxyDetection/1.0",
+						WINHTTP_ACCESS_TYPE_NO_PROXY,
+						WINHTTP_NO_PROXY_NAME,
+						WINHTTP_NO_PROXY_BYPASS,
+						0);
+
+					if (!hSession) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed");
+						return false;
+					}
+
+					struct SessionDeleter {
+						void operator()(HINTERNET h) const {
+							if (h) ::WinHttpCloseHandle(h);
+						}
+					};
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> sessionGuard(hSession);
+
+					// Get autoproxy options
+					WINHTTP_AUTOPROXY_OPTIONS autoProxyOptions = {};
+					autoProxyOptions.dwFlags = WINHTTP_AUTOPROXY_AUTO_DETECT;
+					autoProxyOptions.dwAutoDetectFlags = WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
+					autoProxyOptions.fAutoLogonIfChallenged = TRUE;
+
+					// Check for PAC file
+					WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieProxyConfig{};
+					if (::WinHttpGetIEProxyConfigForCurrentUser(&ieProxyConfig)) {
+						if (ieProxyConfig.lpszAutoConfigUrl) {
+							autoProxyOptions.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
+							autoProxyOptions.lpszAutoConfigUrl = ieProxyConfig.lpszAutoConfigUrl;
+						}
+					}
+
+					WINHTTP_PROXY_INFO proxyInfo = {};
+
+					std::wstring urlStr(url);
+					BOOL result = ::WinHttpGetProxyForUrl(hSession, urlStr.c_str(), &autoProxyOptions, &proxyInfo);
+
+					// Cleanup IE proxy config
+					if (ieProxyConfig.lpszProxy) ::GlobalFree(ieProxyConfig.lpszProxy);
+					if (ieProxyConfig.lpszProxyBypass) ::GlobalFree(ieProxyConfig.lpszProxyBypass);
+					if (ieProxyConfig.lpszAutoConfigUrl) ::GlobalFree(ieProxyConfig.lpszAutoConfigUrl);
+
+					if (!result) {
+						// Fall back to system proxy settings
+						return GetSystemProxySettings(proxy, err);
+					}
+
+					// Process proxy info
+					if (proxyInfo.lpszProxy) {
+						proxy.enabled = true;
+						proxy.server = proxyInfo.lpszProxy;
+						::GlobalFree(proxyInfo.lpszProxy);
+					}
+
+					if (proxyInfo.lpszProxyBypass) {
+						proxy.bypass = proxyInfo.lpszProxyBypass;
+						::GlobalFree(proxyInfo.lpszProxyBypass);
+					}
+
+					return true;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in DetectProxyForUrl");
+					return false;
+				}
+			}
+
+			//Proxy Bypass check
+			bool ShouldBypassProxy(std::wstring_view url, const ProxyInfo& proxy, Error* err) noexcept {
+				try {
+					if (proxy.bypass.empty()) {
+						return false;
+					}
+
+					// Parse bypass list (semicolon or space separated)
+					std::wstring bypassList = proxy.bypass;
+					std::wstring urlLower(url);
+					std::transform(urlLower.begin(), urlLower.end(), urlLower.begin(), ::towlower);
+
+					size_t pos = 0;
+					while (pos < bypassList.length()) {
+						size_t nextPos = bypassList.find_first_of(L"; ", pos);
+						if (nextPos == std::wstring::npos) {
+							nextPos = bypassList.length();
+						}
+
+						std::wstring pattern = bypassList.substr(pos, nextPos - pos);
+						std::transform(pattern.begin(), pattern.end(), pattern.begin(), ::towlower);
+
+						// Remove whitespace
+						pattern.erase(std::remove_if(pattern.begin(), pattern.end(), ::iswspace), pattern.end());
+
+						if (pattern.empty()) {
+							pos = nextPos + 1;
+							continue;
+						}
+
+						// Special case: <local>
+						if (pattern == L"<local>") {
+							if (urlLower.find(L'.') == std::wstring::npos) {
+								return true;
+							}
+						}
+						// Wildcard matching
+						else if (pattern.find(L'*') != std::wstring::npos) {
+							// Simple wildcard implementation
+							size_t starPos = pattern.find(L'*');
+							std::wstring prefix = pattern.substr(0, starPos);
+							std::wstring suffix = pattern.substr(starPos + 1);
+
+							if (urlLower.find(prefix) != std::wstring::npos &&
+								(suffix.empty() || urlLower.find(suffix) != std::wstring::npos)) {
+								return true;
+							}
+						}
+						// Direct match
+						else if (urlLower.find(pattern) != std::wstring::npos) {
+							return true;
+						}
+
+						pos = nextPos + 1;
+					}
+
+					return false;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in ShouldBypassProxy");
+					return false;
+				}
+			}
+
+			//Proxy authentication test
+			bool TestProxyConnection(const ProxyInfo& proxy, Error* err) noexcept {
+				try {
+					if (!proxy.enabled || proxy.server.empty()) {
+						return true; // No proxy, connection is direct
+					}
+
+					HINTERNET hSession = ::WinHttpOpen(L"AntivirusProxyTest/1.0",
+						WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+						proxy.server.c_str(),
+						proxy.bypass.empty() ? WINHTTP_NO_PROXY_BYPASS : proxy.bypass.c_str(),
+						0);
+
+					if (!hSession) {
+						Internal::SetError(err, ::GetLastError(), L"WinHttpOpen failed");
+						return false;
+					}
+
+					struct SessionDeleter {
+						void operator()(HINTERNET h) const {
+							if (h) ::WinHttpCloseHandle(h);
+						}
+					};
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> sessionGuard(hSession);
+
+					// Try to connect to a known endpoint
+					HINTERNET hConnect = ::WinHttpConnect(hSession, L"www.microsoft.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+
+					if (!hConnect) {
+						Internal::SetError(err, ::GetLastError(), L"Proxy connection test failed");
+						return false;
+					}
+
+					::WinHttpCloseHandle(hConnect);
+					return true;
+
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in TestProxyConnection");
+					return false;
+				}
 			}
 
 			// ============================================================================
