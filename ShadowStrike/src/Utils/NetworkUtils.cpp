@@ -3912,60 +3912,138 @@ namespace ShadowStrike {
 				return false;
 			}
 
-			bool IsFtpTraffic(const std::vector<uint8_t>& data) noexcept {
-				if (data.size() < 3) return false;
+			bool IsHttpTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 4) return false;
 
-				// FTP server responses start with 3-digit status codes
-				// 220 = Service ready, 331 = User name okay, need password, etc.
-				if (data.size() >= 4) {
-					// Check for 3-digit code followed by space or dash
-					if (std::isdigit(data[0]) && std::isdigit(data[1]) && std::isdigit(data[2])) {
-						if (data[3] == ' ' || data[3] == '-') {
-							// Common FTP response codes
-							char code[4] = { static_cast<char>(data[0]), static_cast<char>(data[1]),
-											static_cast<char>(data[2]), '\0' };
-							int codeNum = std::atoi(code);
-							// FTP codes are typically 1xx-5xx
-							if (codeNum >= 100 && codeNum <= 599) {
-								return true;
-							}
-						}
-					}
-				}
-
-				// FTP client commands (always uppercase)
-				static const char* ftpCommands[] = {
-					"USER ", "PASS ", "ACCT ", "CWD ", "CDUP", "SMNT ", "QUIT",
-					"REIN", "PORT ", "PASV", "TYPE ", "STRU ", "MODE ", "RETR ",
-					"STOR ", "STOU ", "APPE ", "ALLO ", "REST ", "RNFR ", "RNTO ",
-					"ABOR", "DELE ", "RMD ", "MKD ", "PWD", "LIST", "NLST",
-					"SITE ", "SYST", "STAT", "HELP", "NOOP", "FEAT", "OPTS "
+				// HTTP method patterns (GET, POST, PUT, DELETE, HEAD, PATCH, OPTIONS, TRACE)
+				const char* httpMethods[] = {
+					"GET ", "POST", "PUT ", "DELE", "HEAD", "PATC", "OPTI", "TRAC",
+					"HTTP"  // HTTP response
 				};
 
-				std::string dataStr;
-				if (data.size() >= 4) {
-					dataStr.assign(reinterpret_cast<const char*>(data.data()),
-						std::min(size_t(8), data.size()));
-					std::transform(dataStr.begin(), dataStr.end(), dataStr.begin(), ::toupper);
-
-					for (const auto* cmd : ftpCommands) {
-						if (dataStr.find(cmd) == 0) {
-							return true;
+				// Check first 4 bytes for HTTP methods
+				for (const char* method : httpMethods) {
+					if (data.size() >= strlen(method)) {
+						bool match = true;
+						for (size_t i = 0; i < strlen(method); ++i) {
+							if (data[i] != static_cast<uint8_t>(method[i])) {
+								match = false;
+								break;
+							}
 						}
-					}
-				}
-
-				// Check for FTP greeting (220 response with "FTP" in text)
-				if (data.size() >= 20) {
-					std::string greeting(reinterpret_cast<const char*>(data.data()),
-						std::min(size_t(50), data.size()));
-					if (greeting.find("220") == 0 && greeting.find("FTP") != std::string::npos) {
-						return true;
+						if (match) return true;
 					}
 				}
 
 				return false;
 			}
+
+			bool IsHttpsTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 5) return false;
+
+				// TLS/SSL Handshake patterns
+				// TLS Record: [Content Type (1 byte)][Version (2 bytes)][Length (2 bytes)]
+				// Content Type: 0x16 = Handshake, 0x17 = Application Data
+				// Version: 0x0301 = TLS 1.0, 0x0302 = TLS 1.1, 0x0303 = TLS 1.2, 0x0304 = TLS 1.3
+
+				uint8_t contentType = data[0];
+				uint16_t version = (static_cast<uint16_t>(data[1]) << 8) | data[2];
+
+				// Check for TLS/SSL content types
+				if (contentType == 0x16 || contentType == 0x17 || contentType == 0x14 ||
+					contentType == 0x15 || contentType == 0x18) {
+
+					// Check for valid TLS/SSL versions
+					if (version == 0x0301 || // TLS 1.0
+						version == 0x0302 || // TLS 1.1
+						version == 0x0303 || // TLS 1.2
+						version == 0x0304 || // TLS 1.3
+						version == 0x0300) { // SSL 3.0
+						return true;
+					}
+				}
+
+				// Additional check for Client Hello (Handshake Type 0x01)
+				if (data.size() >= 6 &&
+					data[0] == 0x16 && // Handshake
+					data[5] == 0x01) { // Client Hello
+					return true;
+				}
+
+				return false;
+			}
+
+			bool IsDnsTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 12) return false; // DNS header minimum 12 bytes
+
+				// DNS Header structure:
+				// [Transaction ID (2)][Flags (2)][Questions (2)][Answers (2)][Authority (2)][Additional (2)]
+
+				// Get flags (bytes 2-3)
+				uint16_t flags = (static_cast<uint16_t>(data[2]) << 8) | data[3];
+
+				// Check QR bit (bit 15): 0 = Query, 1 = Response
+				// Check Opcode (bits 11-14): 0 = Standard Query, 1 = Inverse Query, 2 = Status Request
+				uint8_t qr = (flags >> 15) & 0x01;
+				uint8_t opcode = (flags >> 11) & 0x0F;
+
+				// Valid DNS opcodes: 0 (Standard), 1 (Inverse - deprecated), 2 (Status), 4 (Notify), 5 (Update)
+				if (opcode > 5 && opcode != 0) return false;
+
+				// Get question count (bytes 4-5)
+				uint16_t questions = (static_cast<uint16_t>(data[4]) << 8) | data[5];
+
+				// DNS query should have at least 1 question, DNS response can have 0 questions
+				if (qr == 0 && questions == 0) return false; // Query with no questions is invalid
+
+				// Sanity check: questions count should be reasonable (< 100 for most cases)
+				if (questions > 100) return false;
+
+				// Additional validation: check if data length is reasonable for DNS packet
+				// DNS over UDP: max 512 bytes (traditionally), DNS over TCP can be larger
+				if (data.size() > 4096) return false; // Too large for typical DNS
+
+				return true;
+			}
+
+			bool IsFtpTraffic(const std::vector<uint8_t>& data) noexcept {
+				if (data.size() < 3) return false;
+
+				// FTP server responses start with 3-digit status codes (e.g., "220 ", "331 ")
+				// FTP client commands: USER, PASS, LIST, RETR, STOR, etc.
+
+				// Check for 3-digit response code (e.g., "220", "331", "230")
+				if (data.size() >= 4 &&
+					std::isdigit(data[0]) && std::isdigit(data[1]) && std::isdigit(data[2]) &&
+					(data[3] == ' ' || data[3] == '-')) {
+					return true;
+				}
+
+				// Check for common FTP commands
+				const char* ftpCommands[] = {
+					"USER", "PASS", "ACCT", "CWD ", "CDUP", "SMNT", "QUIT",
+					"REIN", "PORT", "PASV", "TYPE", "STRU", "MODE", "RETR",
+					"STOR", "STOU", "APPE", "ALLO", "REST", "RNFR", "RNTO",
+					"ABOR", "DELE", "RMD ", "MKD ", "PWD ", "LIST", "NLST",
+					"SITE", "SYST", "STAT", "HELP", "NOOP"
+				};
+
+				for (const char* cmd : ftpCommands) {
+					if (data.size() >= strlen(cmd)) {
+						bool match = true;
+						for (size_t i = 0; i < strlen(cmd); ++i) {
+							if (data[i] != static_cast<uint8_t>(cmd[i])) {
+								match = false;
+								break;
+							}
+						}
+						if (match) return true;
+					}
+				}
+
+				return false;
+			}
+
 
 			bool IsSshTraffic(const std::vector<uint8_t>& data) noexcept {
 				if (data.size() < 4) return false;
