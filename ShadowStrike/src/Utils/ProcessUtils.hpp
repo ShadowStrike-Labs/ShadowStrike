@@ -20,6 +20,7 @@
 #  include <TlHelp32.h>
 #  include <Psapi.h>
 #  include <winternl.h>
+#  pragma comment(lib, "ntdll.lib")
 #  pragma comment(lib, "psapi.lib")
 #  pragma comment(lib, "advapi32.lib")
 #endif
@@ -370,7 +371,7 @@ namespace ShadowStrike {
 
             // Process Information Retrieval
             bool GetProcessBasicInfo(ProcessId pid, ProcessBasicInfo& info, Error* err = nullptr) noexcept;
-            bool QueryProcessMemoryInfo(ProcessId pid, ProcessMemoryInfo& info, Error* err = nullptr) noexcept;
+            bool GetProcessMemoryInfo(ProcessId pid, ProcessMemoryInfo& info, Error* err = nullptr) noexcept;
             bool GetProcessCpuInfo(ProcessId pid, ProcessCpuInfo& info, Error* err = nullptr) noexcept;
             bool GetProcessIOCounters(ProcessId pid, ProcessIOCounters& info, Error* err = nullptr) noexcept;
             bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& info, Error* err = nullptr) noexcept;
@@ -510,6 +511,8 @@ namespace ShadowStrike {
 
             bool ImpersonateProcess(ProcessId pid, Error* err = nullptr) noexcept;
             bool RevertToSelf(Error* err = nullptr) noexcept;
+
+            
 
             // ============================================================================
             // Process Monitoring (Real-time)

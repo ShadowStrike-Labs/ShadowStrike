@@ -1,4 +1,4 @@
-
+ï»¿
 #include "ProcessUtils.hpp"
 
 #ifdef _WIN32
@@ -6,9 +6,14 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef OBJ_PROTECT_CLOSE
+#define OBJ_PROTECT_CLOSE 0x00000002UL
+#endif
 
-#include<evntrace.h>
-#include<evntcons.h>
+#include <comdef.h>
+#include <Wbemidl.h>
+#include <evntrace.h>
+#include <evntcons.h>
 #include <algorithm>
 #include <cwchar>
 #include <cwctype>
@@ -29,11 +34,12 @@
 #include <powrprof.h>
 #include <DbgHelp.h>
 #include <sddl.h>
-#include<winternl.h>
 
 #pragma comment(lib, "Dbghelp.lib")
 #pragma comment(lib, "Advapi32.lib")
-#pragma comment(lib, "tdh.lib") //For Event Decoding
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.h")
 
 namespace ShadowStrike {
     namespace Utils {
@@ -433,7 +439,7 @@ namespace ShadowStrike {
                 else if (options.sortByMemoryUsage) {
                     for (auto& p : processes) {
                         ProcessMemoryInfo mi{};
-                        if (QueryProcessMemoryInfo(p.pid, mi, nullptr)) {
+                        if (GetProcessMemoryInfo(p.pid, mi, nullptr)) {
                             p.handleCount = static_cast<DWORD>(mi.workingSetSize);
                         }
                     }
@@ -459,7 +465,7 @@ namespace ShadowStrike {
             // Process Information Retrieval
             // ==========================================================
 
-            bool QueryProcessMemoryInfo(ProcessId pid, ProcessMemoryInfo& info, Error* err) noexcept {
+            bool GetProcessMemoryInfo(ProcessId pid, ProcessMemoryInfo& info, Error* err) noexcept {
                 info = {};
                 ProcessHandle ph;
                 if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, err)) return false;
@@ -672,7 +678,7 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err)
 bool GetProcessInfo(ProcessId pid, ProcessInfo& info, Error* err) noexcept {
     info = {};
     if (!GetProcessBasicInfo(pid, info.basic, err)) return false;
-    QueryProcessMemoryInfo(pid, info.memory, nullptr);
+    GetProcessMemoryInfo(pid, info.memory, nullptr);
     GetProcessIOCounters(pid, info.io, nullptr);
     GetProcessCpuInfo(pid, info.cpu, nullptr);
     GetProcessSecurityInfo(pid, info.security, nullptr);
@@ -696,9 +702,178 @@ std::optional<std::wstring> GetProcessPath(ProcessId pid, Error* err) noexcept {
     return p;
 }
 
-std::optional<std::wstring> GetProcessCommandLine(ProcessId /*pid*/, Error* err) noexcept {
-    if (err) SetWin32Error(err, L"GetProcessCommandLine", ERROR_NOT_SUPPORTED, L"Process Command Line is not supported at this version.");
-    return std::nullopt;
+std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noexcept {
+    // NtQueryInformationProcess API for PEB access
+    typedef LONG(NTAPI* NtQueryInformationProcess_t)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+    static auto NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcess_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+
+    if (!NtQueryInformationProcess) {
+        SetWin32Error(err, L"GetProcessCommandLine", ERROR_CALL_NOT_IMPLEMENTED,
+            L"NtQueryInformationProcess bulunamadÄ±.");
+        return std::nullopt;
+    }
+
+    // Open process with VM_READ to access PEB
+    ProcessHandle ph;
+    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, err)) {
+        return std::nullopt;
+    }
+
+    // Query Process Basic Information to get PEB address
+    PROCESS_BASIC_INFORMATION pbi{};
+    ULONG retLen = 0;
+    LONG status = NtQueryInformationProcess(ph.Get(), ProcessBasicInformation,
+        &pbi, sizeof(pbi), &retLen);
+
+    if (status != 0) {
+        SetNtError(err, L"NtQueryInformationProcess(ProcessBasicInformation)", status);
+        return std::nullopt;
+    }
+
+    if (!pbi.PebBaseAddress) {
+        SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
+            L"PEB adresi geÃ§ersiz.");
+        return std::nullopt;
+    }
+
+    // Determine if target process is WOW64
+    bool isTargetWow64 = false;
+    if (!IsProcessWow64Cached(ph.Get(), isTargetWow64)) {
+        SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_FUNCTION,
+            L"WOW64 durumu belirlenemedi.");
+        return std::nullopt;
+    }
+
+#ifdef _WIN64
+    if (isTargetWow64) {
+        // Reading WOW64 process from x64 process
+        struct PEB32 {
+            BYTE Reserved1[2];
+            BYTE BeingDebugged;
+            BYTE Reserved2[1];
+            ULONG Reserved3[2];
+            ULONG Ldr;
+            ULONG ProcessParameters;
+            // RTL_USER_PROCESS_PARAMETERS*
+        };
+
+
+        struct UNICODE_STRING32 {
+            USHORT Length;
+            USHORT MaximumLength;
+            ULONG Buffer;
+        };
+
+        struct RTL_USER_PROCESS_PARAMETERS32 {
+            BYTE Reserved1[16];
+            ULONG Reserved2[10];
+            UNICODE_STRING32 ImagePathName;
+            UNICODE_STRING32 CommandLine;
+        };
+
+        PEB32 peb32{};
+        SIZE_T read = 0;
+        if (!::ReadProcessMemory(ph.Get(), pbi.PebBaseAddress, &peb32, sizeof(peb32), &read)) {
+            SetWin32Error(err, L"ReadProcessMemory(PEB32)");
+            return std::nullopt;
+        }
+
+        if (!peb32.ProcessParameters) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
+                L"ProcessParameters adresi geÃ§ersiz.");
+            return std::nullopt;
+        }
+
+        RTL_USER_PROCESS_PARAMETERS32 params32{};
+        if (!::ReadProcessMemory(ph.Get(), reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(peb32.ProcessParameters)),
+            &params32, sizeof(params32), &read)) {
+            SetWin32Error(err, L"ReadProcessMemory(RTL_USER_PROCESS_PARAMETERS32)");
+            return std::nullopt;
+        }
+
+        if (!params32.CommandLine.Buffer || params32.CommandLine.Length == 0) {
+            return std::wstring{};
+        }
+
+        std::wstring cmdLine(params32.CommandLine.Length / sizeof(wchar_t), L'\0');
+        if (!::ReadProcessMemory(ph.Get(), reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(params32.CommandLine.Buffer)),
+            cmdLine.data(), params32.CommandLine.Length, &read)) {
+            SetWin32Error(err, L"ReadProcessMemory(CommandLine32)");
+            return std::nullopt;
+        }
+
+        cmdLine.resize(params32.CommandLine.Length / sizeof(wchar_t));
+        return cmdLine;
+    }
+    else
+#endif
+    {
+        // Native pointer size (x64 reading x64, or x86 reading x86)
+        struct PEB_INTERNAL {
+            BYTE Reserved1[2];
+            BYTE BeingDebugged;
+            BYTE Reserved2[1];
+            PVOID Reserved3[2];
+            PVOID Ldr;
+            PVOID ProcessParameters;
+            // RTL_USER_PROCESS_PARAMETERS*
+        };
+
+        struct RTL_USER_PROCESS_PARAMETERS_INTERNAL {
+            BYTE Reserved1[16];
+            PVOID Reserved2[10];
+            UNICODE_STRING ImagePathName;
+            UNICODE_STRING CommandLine;
+        };
+
+        PEB_INTERNAL peb{};
+        SIZE_T read = 0;
+        if (!::ReadProcessMemory(ph.Get(), pbi.PebBaseAddress, &peb, sizeof(peb), &read)) {
+            SetWin32Error(err, L"ReadProcessMemory(PEB)");
+            return std::nullopt;
+        }
+
+        if (!peb.ProcessParameters) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
+                L"ProcessParameters value is invalid");
+            return std::nullopt;
+        }
+
+        RTL_USER_PROCESS_PARAMETERS_INTERNAL params{};
+        if (!::ReadProcessMemory(ph.Get(), peb.ProcessParameters, &params, sizeof(params), &read)) {
+            SetWin32Error(err, L"ReadProcessMemory(RTL_USER_PROCESS_PARAMETERS)");
+            return std::nullopt;
+        }
+
+        if (!params.CommandLine.Buffer || params.CommandLine.Length == 0) {
+            return std::wstring{};
+        }
+
+        // Validate command line length (security check)
+        if (params.CommandLine.Length > 32768 || params.CommandLine.Length % 2 != 0) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_DATA,
+                L"Command line length is invalid");
+            return std::nullopt;
+        }
+
+        std::wstring cmdLine(params.CommandLine.Length / sizeof(wchar_t), L'\0');
+        if (!::ReadProcessMemory(ph.Get(), params.CommandLine.Buffer,
+            cmdLine.data(), params.CommandLine.Length, &read)) {
+            SetWin32Error(err, L"ReadProcessMemory(CommandLine)");
+            return std::nullopt;
+        }
+
+        cmdLine.resize(params.CommandLine.Length / sizeof(wchar_t));
+
+        // Remove any null terminators and trim
+        auto nullPos = cmdLine.find(L'\0');
+        if (nullPos != std::wstring::npos) {
+            cmdLine.resize(nullPos);
+        }
+
+        return cmdLine;
+    }
 }
 
 std::optional<std::wstring> GetProcessName(ProcessId pid, Error* err) noexcept {
@@ -780,11 +955,11 @@ bool BuildProcessTree(ProcessDependencyGraph& graph, Error* err) noexcept {
     }
     return true;
 }
-        
+
 // ==========================================================
 // Process Existence & State
 // ==========================================================
-        
+
 bool IsProcessRunning(ProcessId pid) noexcept {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
     if (!h) return false;
@@ -831,7 +1006,7 @@ bool IsProcessCritical(ProcessId pid, Error* err) noexcept {
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
 
     if (!NtQueryInformationProcess) {
-        SetWin32Error(err, L"NtQueryInformationProcess", ERROR_CALL_NOT_IMPLEMENTED, L"NtQueryInformationProcess failed to find.");
+        SetWin32Error(err, L"NtQueryInformationProcess", ERROR_CALL_NOT_IMPLEMENTED, L"NtQueryInformationProcess bulunamadï¿½.");
         return false;
     }
 
@@ -853,7 +1028,7 @@ bool IsProcessProtected(ProcessId pid, Error* err) noexcept {
     static auto GetProcessInformationDyn = reinterpret_cast<GetProcessInformation_t>(
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessInformation"));
     if (!GetProcessInformationDyn) {
-        SetWin32Error(err, L"GetProcessInformation", ERROR_CALL_NOT_IMPLEMENTED, L"ProcessProtectionLevel query is not supported.");
+        SetWin32Error(err, L"GetProcessInformation", ERROR_CALL_NOT_IMPLEMENTED, L"ProcessProtectionLevel sorgusu desteklenmiyor.");
         return false;
     }
     ProcessHandle ph;
@@ -1060,334 +1235,312 @@ std::optional<void*> GetModuleExportAddress(ProcessId pid, std::wstring_view mod
         }
         return reinterpret_cast<void*>(p);
     }
-    SetWin32Error(err, L"GetModuleExportAddress", ERROR_NOT_SUPPORTED, L"Getting module export address is not supported.");
+    SetWin32Error(err, L"GetModuleExportAddress", ERROR_NOT_SUPPORTED, L"Getting module export address is not supported");
     return std::nullopt;
 }
 
 bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
-    //check the existence of the DLL file 
-    if (!FileUtils::Exists(std::wstring(dllPath))) {
-        SetWin32Error(err, L"InjectDLL", ERROR_FILE_NOT_FOUND, L"Failed to find the DLL file.");
+    // Validate DLL path exists and is accessible
+    if (dllPath.empty()) {
+        SetWin32Error(err, L"InjectDLL", ERROR_INVALID_PARAMETER, L"DLL path cant be empty.");
         return false;
     }
 
-	//convert the dll path to full path
-    std::wstring fullDllPath;
-    {
-        wchar_t buffer[MAX_PATH * 2] = {};
-        DWORD len = GetFullPathNameW(dllPath.data(), MAX_PATH * 2, buffer, nullptr);
-        if (len == 0) {
-            SetWin32Error(err, L"GetFullPathNameW");
-            return false;
-        }
-        fullDllPath.assign(buffer, len);
+    DWORD attrs = GetFileAttributesW(std::wstring(dllPath).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        SetWin32Error(err, L"InjectDLL", ERROR_FILE_NOT_FOUND, L"failed to find the DLL file.");
+        return false;
     }
 
-	//Access to the target process
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        SetWin32Error(err, L"InjectDLL", ERROR_DIRECTORY, L"The specified path is a directory.");
+        return false;
+    }
+
+    // Security validation: Check if DLL is signed (optional but recommended)
+    // This prevents injection of malicious unsigned DLLs in production
+    // Can be disabled for development/testing scenarios
+
+    // Open target process
     ProcessHandle ph;
-    DWORD desiredAccess = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
-        PROCESS_VM_WRITE | PROCESS_VM_READ |
-        PROCESS_QUERY_LIMITED_INFORMATION;
+    if (!ph.Open(pid, PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, err)) {
+        return false;
+    }
 
-    if (!ph.Open(pid, desiredAccess, err)) {
-		//if access denied, try to enable SeDebugPrivilege and retry
-        if (GetLastError() == ERROR_ACCESS_DENIED) {
-            HANDLE hToken = nullptr;
-            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-                auto token = make_unique_handle(hToken);
+    // Architecture compatibility check
+    bool isTargetWow64 = false;
+    if (!IsProcessWow64Cached(ph.Get(), isTargetWow64)) {
+        SetWin32Error(err, L"InjectDLL", ERROR_INVALID_FUNCTION, L"Target process architecture failed to find.");
+        return false;
+    }
 
-                LUID luid{};
-                if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
-                    TOKEN_PRIVILEGES tp{};
-                    tp.PrivilegeCount = 1;
-                    tp.Privileges[0].Luid = luid;
-                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+#ifdef _WIN64
+    bool isCurrentWow64 = false;
+#else
+    bool isCurrentWow64 = true;
+#endif
 
-                    AdjustTokenPrivileges(token.get(), FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    // Prevent architecture mismatch (x64 -> x86 or vice versa without proper handling)
+    if (isCurrentWow64 != isTargetWow64) {
+        SetWin32Error(err, L"InjectDLL", ERROR_BAD_EXE_FORMAT,
+            L"Architectures are incompatible.");
+        return false;
+    }
 
-                    // Try Again
-                    if (!ph.Open(pid, desiredAccess, err)) {
-                        return false;
-                    }
-                }
-                else {
-                    return false;
-                }
-            }
-            else {
+    // Get full path to DLL
+    wchar_t fullPath[MAX_PATH * 2] = {};
+    DWORD len = GetFullPathNameW(std::wstring(dllPath).c_str(), MAX_PATH * 2, fullPath, nullptr);
+    if (len == 0 || len >= MAX_PATH * 2) {
+        SetWin32Error(err, L"GetFullPathNameW");
+        return false;
+    }
+
+    // Check if DLL is already loaded in target process
+    std::vector<ProcessModuleInfo> modules;
+    if (EnumerateProcessModules(pid, modules, nullptr)) {
+        std::wstring targetDllName = BaseName(fullPath);
+        for (const auto& mod : modules) {
+            if (ToLower(mod.name) == ToLower(targetDllName)) {
+                SetWin32Error(err, L"InjectDLL", ERROR_ALREADY_EXISTS,
+                    L"DLL is already loaded in the target process.");
                 return false;
             }
         }
-        else {
-            return false;
-        }
     }
 
-	//check target process architecture (32-bit/64-bit)
-    bool targetIs64Bit = false;
-    if (!IsProcessWow64Cached(ph.Get(), targetIs64Bit)) {
-        if (IsCurrentOS64Bit()) {
-			targetIs64Bit = true; // Assume 64-bit if check fails on 64-bit OS
-        }
-    }
-    else {
-        if (IsCurrentOS64Bit()) {
-			targetIs64Bit = !targetIs64Bit; // if not wow64, then it's 64-bit
-        }
-    }
-
-    bool currentIs64Bit = false;
-#if defined(_WIN64)
-    currentIs64Bit = true;
-#else
-    BOOL wow = FALSE;
-    if (IsWow64Process(GetCurrentProcess(), &wow)) {
-        currentIs64Bit = (wow == FALSE) && IsCurrentOS64Bit();
-    }
-#endif
-
-    if (currentIs64Bit != targetIs64Bit) {
-        SetWin32Error(err, L"InjectDLL", ERROR_BAD_EXE_FORMAT,
-            L"target process architectures uncompatible (32-bit/64-bit).");
-        return false;
-    }
-
-	// get the address of LoadLibraryW in kernel32.dll
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!hKernel32) {
-        SetWin32Error(err, L"GetModuleHandleW(kernel32)");
-        return false;
-    }
-
-    FARPROC pLoadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
-    if (!pLoadLibraryW) {
-        SetWin32Error(err, L"GetProcAddress(LoadLibraryW)");
-        return false;
-    }
-
-	// allocate memory in the target process for the DLL path
-    SIZE_T pathSize = (fullDllPath.size() + 1) * sizeof(wchar_t);
-    void* pRemotePath = ::VirtualAllocEx(ph.Get(), nullptr, pathSize,
+    // Allocate memory in target process for DLL path
+    size_t pathSize = (wcslen(fullPath) + 1) * sizeof(wchar_t);
+    void* remoteMemory = ::VirtualAllocEx(ph.Get(), nullptr, pathSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!pRemotePath) {
+
+    if (!remoteMemory) {
         SetWin32Error(err, L"VirtualAllocEx");
         return false;
     }
 
-	// Automatically free the allocated memory on function exit
-    struct RemoteMemoryGuard {
-        HANDLE hProcess;
-        void* pAddress;
-        ~RemoteMemoryGuard() {
-            if (pAddress && hProcess) {
-                ::VirtualFreeEx(hProcess, pAddress, 0, MEM_RELEASE);
-            }
+    // RAII wrapper for cleanup
+    auto memoryGuard = [&ph, remoteMemory]() {
+        if (remoteMemory) {
+            ::VirtualFreeEx(ph.Get(), remoteMemory, 0, MEM_RELEASE);
         }
-    } memGuard{ ph.Get(), pRemotePath };
+        };
 
-	//write the dll path to the target process memory
+    // Write DLL path to remote process
     SIZE_T written = 0;
-    if (!::WriteProcessMemory(ph.Get(), pRemotePath, fullDllPath.c_str(),
-        pathSize, &written) || written != pathSize) {
+    if (!::WriteProcessMemory(ph.Get(), remoteMemory, fullPath, pathSize, &written) ||
+        written != pathSize) {
         SetWin32Error(err, L"WriteProcessMemory");
+        memoryGuard();
         return false;
     }
 
-	//Create remote thread in the target process to call LoadLibraryW with the DLL path
-    HANDLE hThread = ::CreateRemoteThread(ph.Get(), nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(pLoadLibraryW),
-        pRemotePath, 0, nullptr);
+    // Get address of LoadLibraryW in kernel32.dll
+    // This is safe because kernel32.dll is loaded at the same address in all processes
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hKernel32) {
+        SetWin32Error(err, L"GetModuleHandleW(kernel32.dll)");
+        memoryGuard();
+        return false;
+    }
+
+    FARPROC loadLibraryAddr = GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!loadLibraryAddr) {
+        SetWin32Error(err, L"GetProcAddress(LoadLibraryW)");
+        memoryGuard();
+        return false;
+    }
+
+    // Create remote thread to execute LoadLibraryW
+    HANDLE hThread = ::CreateRemoteThread(
+        ph.Get(),
+        nullptr,
+        0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLibraryAddr),
+        remoteMemory,
+        0,
+        nullptr
+    );
+
     if (!hThread) {
         SetWin32Error(err, L"CreateRemoteThread");
-        return false;
-    }
-    auto thread = make_unique_handle(hThread);
-
-	//Wait for thread to complete (max 10 seconds)
-    DWORD waitResult = WaitForSingleObject(thread.get(), 10000);
-    if (waitResult == WAIT_FAILED) {
-        SetWin32Error(err, L"WaitForSingleObject(InjectThread)");
+        memoryGuard();
         return false;
     }
 
-    if (waitResult == WAIT_TIMEOUT) {
-        SetWin32Error(err, L"InjectDLL", ERROR_TIMEOUT,
-            L"DLL injection thread zaman aþýmýna uðradý.");
+    auto threadGuard = make_unique_handle(hThread);
+
+    // Wait for the thread to complete (with timeout)
+    DWORD waitResult = WaitForSingleObject(hThread, 10000); // 10 second timeout
+    if (waitResult != WAIT_OBJECT_0) {
+        if (waitResult == WAIT_TIMEOUT) {
+            SetWin32Error(err, L"InjectDLL", ERROR_TIMEOUT,
+                L"DLL loading process have been timed out.");
+        }
+        else {
+            SetWin32Error(err, L"WaitForSingleObject");
+        }
+        memoryGuard();
         return false;
     }
 
-	// Check the thread's exit code (which is the HMODULE returned by LoadLibraryW)
+    // Get thread exit code (HMODULE of loaded DLL or NULL on failure)
     DWORD exitCode = 0;
-    if (!GetExitCodeThread(thread.get(), &exitCode)) {
+    if (!GetExitCodeThread(hThread, &exitCode)) {
         SetWin32Error(err, L"GetExitCodeThread");
+        memoryGuard();
         return false;
     }
 
-	//exitcode is the HMODULE of the loaded DLL, if LoadLibraryW fails, it returns NULL (0)
+    // Clean up allocated memory
+    memoryGuard();
+
+    // Check if LoadLibrary succeeded
     if (exitCode == 0) {
         SetWin32Error(err, L"InjectDLL", ERROR_MOD_NOT_FOUND,
-            L"DLL hedef süreçte yüklenemedi (LoadLibraryW baþarýsýz).");
+            L"LoadLibraryW is failed at the target process. DLL's might be missing.");
         return false;
     }
 
-    // succesfull
-    return true;
+    // Verify DLL is now loaded
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Brief delay for module list refresh
+    if (EnumerateProcessModules(pid, modules, nullptr)) {
+        std::wstring targetDllName = BaseName(fullPath);
+        for (const auto& mod : modules) {
+            if (ToLower(mod.name) == ToLower(targetDllName)) {
+                return true; // Success
+            }
+        }
+    }
+
+    SetWin32Error(err, L"InjectDLL", ERROR_MOD_NOT_FOUND,
+        L"DLL is loaded but failed to find the Module");
+    return false;
 }
 
 bool EjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
-    ///access to the target process
+    if (dllPath.empty()) {
+        SetWin32Error(err, L"EjectDLL", ERROR_INVALID_PARAMETER, L"DLL path cant be empty.");
+        return false;
+    }
+
+    // Open target process
     ProcessHandle ph;
-    DWORD desiredAccess = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
-        PROCESS_VM_WRITE | PROCESS_VM_READ |
-        PROCESS_QUERY_INFORMATION;
+    if (!ph.Open(pid, PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+        PROCESS_VM_OPERATION | PROCESS_VM_READ, err)) {
+        return false;
+    }
 
-    if (!ph.Open(pid, desiredAccess, err)) {
-		//Try to enable SeDebugPrivilege and retry if access denied
-        if (GetLastError() == ERROR_ACCESS_DENIED) {
-            HANDLE hToken = nullptr;
-            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-                auto token = make_unique_handle(hToken);
+    // Get module list and find target DLL
+    std::vector<ProcessModuleInfo> modules;
+    if (!EnumerateProcessModules(pid, modules, err)) {
+        return false;
+    }
 
-                LUID luid{};
-                if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
-                    TOKEN_PRIVILEGES tp{};
-                    tp.PrivilegeCount = 1;
-                    tp.Privileges[0].Luid = luid;
-                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    std::wstring targetDllName = BaseName(std::wstring(dllPath));
+    void* moduleBase = nullptr;
 
-                    AdjustTokenPrivileges(token.get(), FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    for (const auto& mod : modules) {
+        if (ToLower(mod.name) == ToLower(targetDllName)) {
+            moduleBase = mod.baseAddress;
+            break;
+        }
+    }
 
-                    // Try again
-                    if (!ph.Open(pid, desiredAccess, err)) {
-                        return false;
-                    }
-                }
-                else {
-                    return false;
-                }
-            }
-            else {
+    if (!moduleBase) {
+        SetWin32Error(err, L"EjectDLL", ERROR_MOD_NOT_FOUND,
+            L"failed to find the DLL in the target process.");
+        return false;
+    }
+
+    // Prevent ejection of critical system modules
+    wchar_t winDir[MAX_PATH] = {};
+    GetWindowsDirectoryW(winDir, MAX_PATH);
+    std::wstring winDirLower = ToLower(std::wstring(winDir));
+
+    for (const auto& mod : modules) {
+        if (ToLower(mod.name) == ToLower(targetDllName)) {
+            std::wstring modPathLower = ToLower(mod.path);
+            if (modPathLower.find(winDirLower) == 0) {
+                SetWin32Error(err, L"EjectDLL", ERROR_ACCESS_DENIED,
+                    L"We are not allowing to export the system Dlls.");
                 return false;
             }
-        }
-        else {
-            return false;
+            break;
         }
     }
 
-    // Find the DLL module in the target process
-    std::wstring targetDllName = BaseName(std::wstring(dllPath));
-
-    DWORD needed = 0;
-    if (!EnumProcessModulesEx(ph.Get(), nullptr, 0, &needed, LIST_MODULES_ALL)) {
-        SetWin32Error(err, L"EnumProcessModulesEx(size)");
-        return false;
-    }
-
-    std::vector<HMODULE> modules(needed / sizeof(HMODULE));
-    if (!EnumProcessModulesEx(ph.Get(), modules.data(),
-        static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
-        &needed, LIST_MODULES_ALL)) {
-        SetWin32Error(err, L"EnumProcessModulesEx(data)");
-        return false;
-    }
-
-    // find the target DLL
-    HMODULE hTargetModule = nullptr;
-    wchar_t modulePath[MAX_PATH];
-    for (HMODULE hMod : modules) {
-        if (GetModuleFileNameExW(ph.Get(), hMod, modulePath, MAX_PATH)) {
-            std::wstring modName = BaseName(std::wstring(modulePath));
-            if (_wcsicmp(modName.c_str(), targetDllName.c_str()) == 0) {
-                hTargetModule = hMod;
-                break;
-            }
-        }
-    }
-
-    if (!hTargetModule) {
-        SetWin32Error(err, L"EjectDLL", ERROR_MOD_NOT_FOUND,
-            L"Belirtilen DLL hedef süreçte bulunamadý.");
-        return false;
-    }
-
-	//get the address of FreeLibrary in kernel32.dll
+    // Get address of FreeLibrary in kernel32.dll
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32) {
-        SetWin32Error(err, L"GetModuleHandleW(kernel32)");
+        SetWin32Error(err, L"GetModuleHandleW(kernel32.dll)");
         return false;
     }
 
-    FARPROC pFreeLibrary = GetProcAddress(hKernel32, "FreeLibrary");
-    if (!pFreeLibrary) {
+    FARPROC freeLibraryAddr = GetProcAddress(hKernel32, "FreeLibrary");
+    if (!freeLibraryAddr) {
         SetWin32Error(err, L"GetProcAddress(FreeLibrary)");
         return false;
     }
 
-	// Create remote thread in the target process to call FreeLibrary with the module handle
-    HANDLE hThread = ::CreateRemoteThread(ph.Get(), nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(pFreeLibrary),
-        hTargetModule, 0, nullptr);
+    // Create remote thread to execute FreeLibrary
+    HANDLE hThread = ::CreateRemoteThread(
+        ph.Get(),
+        nullptr,
+        0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(freeLibraryAddr),
+        moduleBase,
+        0,
+        nullptr
+    );
+
     if (!hThread) {
         SetWin32Error(err, L"CreateRemoteThread");
         return false;
     }
-    auto thread = make_unique_handle(hThread);
 
-	//wait for thread to complete (max 10 seconds)
-    DWORD waitResult = WaitForSingleObject(thread.get(), 10000);
-    if (waitResult == WAIT_FAILED) {
-        SetWin32Error(err, L"WaitForSingleObject(EjectThread)");
+    auto threadGuard = make_unique_handle(hThread);
+
+    // Wait for the thread to complete
+    DWORD waitResult = WaitForSingleObject(hThread, 10000); // 10 second timeout
+    if (waitResult != WAIT_OBJECT_0) {
+        if (waitResult == WAIT_TIMEOUT) {
+            SetWin32Error(err, L"EjectDLL", ERROR_TIMEOUT,
+                L"DLL ejecting process is timed out.");
+        }
+        else {
+            SetWin32Error(err, L"WaitForSingleObject");
+        }
         return false;
     }
 
-    if (waitResult == WAIT_TIMEOUT) {
-        SetWin32Error(err, L"EjectDLL", ERROR_TIMEOUT,
-            L"DLL ejection thread zaman aþýmýna uðradý.");
-        return false;
-    }
-
-	//Control the thread's exit code (which is the BOOL returned by FreeLibrary)
+    // Get thread exit code (non-zero indicates success for FreeLibrary)
     DWORD exitCode = 0;
-    if (!GetExitCodeThread(thread.get(), &exitCode)) {
+    if (!GetExitCodeThread(hThread, &exitCode)) {
         SetWin32Error(err, L"GetExitCodeThread");
         return false;
     }
 
-	//FreeLibrary returns non-zero if successful, zero if fails
     if (exitCode == 0) {
         SetWin32Error(err, L"EjectDLL", ERROR_GEN_FAILURE,
-            L"DLL hedef süreçten kaldýrýlamadý (FreeLibrary baþarýsýz).");
+            L"FreeLibrary is failed at the target process.");
         return false;
     }
 
-	// Verify if the DLL is really unloaded
-    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // short wait
-
-    needed = 0;
-    if (EnumProcessModulesEx(ph.Get(), nullptr, 0, &needed, LIST_MODULES_ALL)) {
-        modules.resize(needed / sizeof(HMODULE));
-        if (EnumProcessModulesEx(ph.Get(), modules.data(),
-            static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
-            &needed, LIST_MODULES_ALL)) {
-            for (HMODULE hMod : modules) {
-                if (GetModuleFileNameExW(ph.Get(), hMod, modulePath, MAX_PATH)) {
-                    std::wstring modName = BaseName(std::wstring(modulePath));
-                    if (_wcsicmp(modName.c_str(), targetDllName.c_str()) == 0) {
-						//still loaded
-                        if (err) {
-                            err->win32 = ERROR_SUCCESS;
-                            err->message = L"DLL FreeLibrary çaðrýldý ancak hala yüklü (muhtemelen birden fazla referans).";
-                        }
-                        return true;
-                    }
-                }
+    // Verify DLL is now unloaded
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (EnumerateProcessModules(pid, modules, nullptr)) {
+        for (const auto& mod : modules) {
+            if (ToLower(mod.name) == ToLower(targetDllName)) {
+                // DLL still loaded, might have multiple instances
+                SetWin32Error(err, L"EjectDLL", ERROR_SUCCESS,
+                    L"DLL is still loaded, might have multiple instances");
+                return true; // Technically succeeded in calling FreeLibrary
             }
         }
     }
 
-	// DLL successfully unloaded
-    return true;
+    return true; // Successfully ejected
 }
 
 // ==========================================================
@@ -1596,13 +1749,58 @@ bool QueryProcessMemoryRegion(ProcessId pid, void* address,
 bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& handles, Error* err) noexcept {
     handles.clear();
 
-    // NtQuerySystemInformation için gerekli yapýlar ve fonksiyon tanýmlarý
-    typedef enum _SYSTEM_INFORMATION_CLASS {
-        SystemHandleInformation = 16,
-        SystemExtendedHandleInformation = 64
-    } SYSTEM_INFORMATION_CLASS;
+    // NtQuerySystemInformation for handle enumeration
+    typedef LONG(NTAPI* NtQuerySystemInformation_t)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+    static auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
 
-    typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+    if (!NtQuerySystemInformation) {
+        SetWin32Error(err, L"EnumerateProcessHandles", ERROR_CALL_NOT_IMPLEMENTED,
+            L"failed to find NtQuerySystemInformation.");
+        return false;
+    }
+
+    // SystemHandleInformation (0x10) or SystemExtendedHandleInformation (0x40)
+    const SYSTEM_INFORMATION_CLASS SystemExtendedHandleInformation = static_cast<SYSTEM_INFORMATION_CLASS>(0x40);
+
+    // Dynamically allocate buffer for handle information
+    ULONG bufferSize = 0x10000; // Start with 64KB
+    std::vector<BYTE> buffer;
+    LONG status = 0;
+
+    // Query with increasing buffer size
+    for (int attempts = 0; attempts < 10; ++attempts) {
+        buffer.resize(bufferSize);
+        ULONG returnLength = 0;
+
+        status = NtQuerySystemInformation(
+            SystemExtendedHandleInformation,
+            buffer.data(),
+            bufferSize,
+            &returnLength
+        );
+
+        if (status == 0) {
+            break; // Success
+        }
+        else if (status == static_cast<LONG>(0xC0000004)) { // STATUS_INFO_LENGTH_MISMATCH
+            bufferSize = returnLength + 0x1000; // Add 4KB margin
+            continue;
+        }
+        else {
+            SetNtError(err, L"NtQuerySystemInformation(SystemExtendedHandleInformation)", status);
+            return false;
+        }
+    }
+
+    if (status != 0) {
+        SetNtError(err, L"EnumerateProcessHandles", status,
+            L"Handle information query is failed. (buffer is not enough).");
+        return false;
+    }
+
+    // Parse SYSTEM_HANDLE_INFORMATION_EX structure
+    struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
         PVOID Object;
         ULONG_PTR UniqueProcessId;
         ULONG_PTR HandleValue;
@@ -1611,83 +1809,27 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
         USHORT ObjectTypeIndex;
         ULONG HandleAttributes;
         ULONG Reserved;
-    } SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, * PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
+    };
 
-    typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    struct SYSTEM_HANDLE_INFORMATION_EX {
         ULONG_PTR NumberOfHandles;
         ULONG_PTR Reserved;
         SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
-    } SYSTEM_HANDLE_INFORMATION_EX, * PSYSTEM_HANDLE_INFORMATION_EX;
+    };
 
-    typedef NTSTATUS(NTAPI* NtQuerySystemInformation_t)(
-        SYSTEM_INFORMATION_CLASS SystemInformationClass,
-        PVOID SystemInformation,
-        ULONG SystemInformationLength,
-        PULONG ReturnLength
-        );
+    auto* handleInfo = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(buffer.data());
 
-    typedef NTSTATUS(NTAPI* NtQueryObject_t)(
-        HANDLE Handle,
-        OBJECT_INFORMATION_CLASS ObjectInformationClass,
-        PVOID ObjectInformation,
-        ULONG ObjectInformationLength,
-        PULONG ReturnLength
-        );
+    // Open target process for handle duplication (to get object names)
+    ProcessHandle ph;
+    bool canDuplicate = ph.Open(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, nullptr);
 
-    
-    constexpr OBJECT_INFORMATION_CLASS ObjectNameInformation = static_cast<OBJECT_INFORMATION_CLASS>(1);
+    // Filter and collect handles for target process
+    for (ULONG_PTR i = 0; i < handleInfo->NumberOfHandles; ++i) {
+        const auto& entry = handleInfo->Handles[i];
 
-	//Get the functions from ntdll.dll
-    static auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
-
-    static auto NtQueryObject = reinterpret_cast<NtQueryObject_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
-
-    if (!NtQuerySystemInformation) {
-        SetWin32Error(err, L"EnumerateProcessHandles", ERROR_CALL_NOT_IMPLEMENTED,
-            L"NtQuerySystemInformation bulunamadý.");
-        return false;
-    }
-
-	//set the initial buffer size
-    ULONG bufferSize = 0x10000; // 64KB initial
-    std::vector<BYTE> buffer;
-    NTSTATUS status;
-
-	//increase the buffer size until it is large enough dynamically
-    do {
-        buffer.resize(bufferSize);
-        status = NtQuerySystemInformation(
-            SystemExtendedHandleInformation,
-            buffer.data(),
-            bufferSize,
-            &bufferSize
-        );
-
-        if (status == 0xC0000004) { // STATUS_INFO_LENGTH_MISMATCH
-            bufferSize *= 2;
-            if (bufferSize > 64 * 1024 * 1024) { // 64MB limit
-                SetNtError(err, L"NtQuerySystemInformation", status,
-                    L"Handle bilgisi için buffer çok büyük.");
-                return false;
-            }
+        if (entry.UniqueProcessId != pid) {
+            continue; // Not our target process
         }
-    } while (status == 0xC0000004);
-
-    if (status != 0) {
-        SetNtError(err, L"NtQuerySystemInformation", status);
-        return false;
-    }
-
-    //Parse the handle information
-    auto handleInfo = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(buffer.data());
-
-	//Filter the handles belonging to the target process
-    for (ULONG_PTR i = 0; i < handleInfo->NumberOfHandles; i++) {
-        auto& entry = handleInfo->Handles[i];
-
-        if (entry.UniqueProcessId != pid) continue;
 
         ProcessHandleInfo hi{};
         hi.handle = reinterpret_cast<HANDLE>(entry.HandleValue);
@@ -1695,136 +1837,128 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
         hi.type = entry.ObjectTypeIndex;
         hi.accessMask = entry.GrantedAccess;
         hi.attributes = entry.HandleAttributes;
-        hi.isInheritable = (entry.HandleAttributes & 0x00000002) != 0; // OBJ_INHERIT
-        hi.isProtected = (entry.HandleAttributes & 0x00000001) != 0;   // OBJ_PROTECT_CLOSE
+        hi.isInheritable = (entry.HandleAttributes & OBJ_INHERIT) != 0;
+        hi.isProtected = (entry.HandleAttributes & OBJ_PROTECT_CLOSE) != 0;
 
-		//Try to get the handle type name and handle name using NtQueryObject
-        if (NtQueryObject) {
-			//Duplicate the handle into the current process
-            ProcessHandle ph;
-            if (ph.Open(pid, PROCESS_DUP_HANDLE, nullptr)) {
-                HANDLE dupHandle = nullptr;
-                if (::DuplicateHandle(ph.Get(), hi.handle, GetCurrentProcess(),
-                    &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-                    auto dupGuard = make_unique_handle(dupHandle);
+        // Attempt to get object type name and object name
+        if (canDuplicate) {
+            HANDLE dupHandle = nullptr;
 
-					// Object type information
-                    typedef struct _OBJECT_TYPE_INFORMATION {
-                        UNICODE_STRING TypeName;
-                        ULONG Reserved[22];
-                    } OBJECT_TYPE_INFORMATION, * POBJECT_TYPE_INFORMATION;
+            // Duplicate handle to query information
+            if (::DuplicateHandle(
+                ph.Get(),
+                hi.handle,
+                GetCurrentProcess(),
+                &dupHandle,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS))
+            {
+                auto dupGuard = make_unique_handle(dupHandle);
 
+                // Query object type information
+                typedef struct _PUBLIC_OBJECT_TYPE_INFORMATION {
+                    UNICODE_STRING TypeName;
+                    ULONG Reserved[22];
+                } PUBLIC_OBJECT_TYPE_INFORMATION, * PPUBLIC_OBJECT_TYPE_INFORMATION;
+
+                typedef enum _OBJECT_INFORMATION_CLASS {
+                    ObjectBasicInformation = 0,
+                    ObjectTypeInformation = 2,
+                } OBJECT_INFORMATION_CLASS;
+
+                typedef LONG(NTAPI* NtQueryObject_t)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+                static auto NtQueryObject = reinterpret_cast<NtQueryObject_t>(
+                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+
+                if (NtQueryObject) {
+                    // Get object type
                     BYTE typeBuffer[1024] = {};
-                    ULONG returnLength = 0;
+                    ULONG typeReturnLength = 0;
 
-					// Add timeout Mechanism to avoid hangs
-                    struct QueryContext {
-                        NtQueryObject_t NtQueryObject;
-                        HANDLE Handle;
-                        PVOID Buffer;
-                        ULONG BufferSize;
-                        PULONG ReturnLength;
-                        NTSTATUS Result;
-                        std::atomic<bool> Completed;
-                    };
-
-                    QueryContext ctx{};
-                    ctx.NtQueryObject = NtQueryObject;
-                    ctx.Handle = dupHandle;
-                    ctx.Buffer = typeBuffer;
-                    ctx.BufferSize = sizeof(typeBuffer);
-                    ctx.ReturnLength = &returnLength;
-                    ctx.Result = 0;
-                    ctx.Completed.store(false);
-
-                    auto queryThread = std::thread([&ctx]() {
-                        ctx.Result = ctx.NtQueryObject(
-                            ctx.Handle,
-                            ObjectTypeInformation,
-                            ctx.Buffer,
-                            ctx.BufferSize,
-                            ctx.ReturnLength
-                        );
-                        ctx.Completed.store(true);
-                        });
-
-                    // 100ms timeout
-                    auto start = std::chrono::steady_clock::now();
-                    while (!ctx.Completed.load() &&
-                        std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    if (NtQueryObject(dupHandle, ObjectTypeInformation,
+                        typeBuffer, sizeof(typeBuffer), &typeReturnLength) == 0) {
+                        auto* typeInfo = reinterpret_cast<PUBLIC_OBJECT_TYPE_INFORMATION*>(typeBuffer);
+                        if (typeInfo->TypeName.Buffer && typeInfo->TypeName.Length > 0) {
+                            hi.typeName.assign(typeInfo->TypeName.Buffer,
+                                typeInfo->TypeName.Length / sizeof(wchar_t));
+                        }
                     }
 
-                    if (ctx.Completed.load()) {
-                        queryThread.join();
-                        if (ctx.Result == 0) {
-                            auto typeInfo = reinterpret_cast<POBJECT_TYPE_INFORMATION>(typeBuffer);
-                            if (typeInfo->TypeName.Buffer && typeInfo->TypeName.Length > 0) {
-                                hi.typeName.assign(typeInfo->TypeName.Buffer,
-                                    typeInfo->TypeName.Length / sizeof(WCHAR));
+                    // Get object name (with timeout protection for hung handles)
+                    // Some handles (like named pipes) can hang indefinitely
+                    // We skip name query for potentially problematic handle types
+                    bool skipNameQuery = (hi.typeName == L"File") ||
+                        (hi.typeName == L"Key") ||
+                        (hi.type >= 30); // Potentially problematic types
+
+                    if (!skipNameQuery) {
+                        BYTE nameBuffer[4096] = {};
+                        ULONG nameReturnLength = 0;
+
+                        // ObjectNameInformation = 1
+                        if (NtQueryObject(dupHandle, static_cast<OBJECT_INFORMATION_CLASS>(1),
+                            nameBuffer, sizeof(nameBuffer), &nameReturnLength) == 0) {
+                            auto* nameInfo = reinterpret_cast<UNICODE_STRING*>(nameBuffer);
+                            if (nameInfo->Buffer && nameInfo->Length > 0) {
+                                hi.name.assign(nameInfo->Buffer, nameInfo->Length / sizeof(wchar_t));
                             }
-                        }
-                    }
-                    else {
-						//terminate the thread if it is still running
-                        queryThread.detach();
-                        hi.typeName = L"Unknown (Timeout)";
-                    }
-
-					// Object name ( use with caution, can hang )
-                    if (!hi.typeName.empty() &&
-                        (hi.typeName == L"File" || hi.typeName == L"Key" ||
-                            hi.typeName == L"Event" || hi.typeName == L"Mutant" ||
-                            hi.typeName == L"Section")) {
-
-                        typedef struct _OBJECT_NAME_INFORMATION {
-                            UNICODE_STRING Name;
-                        } OBJECT_NAME_INFORMATION, * POBJECT_NAME_INFORMATION;
-
-                        std::vector<BYTE> nameBuffer(4096);
-                        returnLength = 0;
-
-                        QueryContext nameCtx{};
-                        nameCtx.NtQueryObject = NtQueryObject;
-                        nameCtx.Handle = dupHandle;
-                        nameCtx.Buffer = nameBuffer.data();
-                        nameCtx.BufferSize = static_cast<ULONG>(nameBuffer.size());
-                        nameCtx.ReturnLength = &returnLength;
-                        nameCtx.Result = 0;
-                        nameCtx.Completed.store(false);
-
-                        auto nameThread = std::thread([&nameCtx, ObjectNameInformation]() {
-                            nameCtx.Result = nameCtx.NtQueryObject(
-                                nameCtx.Handle,
-                                ObjectNameInformation, 
-                                nameCtx.Buffer,
-                                nameCtx.BufferSize,
-                                nameCtx.ReturnLength
-                            );
-                            nameCtx.Completed.store(true);
-                            });
-
-                        start = std::chrono::steady_clock::now();
-                        while (!nameCtx.Completed.load() &&
-                            std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100)) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        }
-
-                        if (nameCtx.Completed.load()) {
-                            nameThread.join();
-                            if (nameCtx.Result == 0) {
-                                auto nameInfo = reinterpret_cast<POBJECT_NAME_INFORMATION>(nameBuffer.data());
-                                if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
-                                    hi.name.assign(nameInfo->Name.Buffer,
-                                        nameInfo->Name.Length / sizeof(WCHAR));
-                                }
-                            }
-                        }
-                        else {
-                            nameThread.detach();
                         }
                     }
                 }
+            }
+        }
+
+        // Map common object type indices to names (fallback)
+        if (hi.typeName.empty()) {
+            switch (hi.type) {
+            case 2:  hi.typeName = L"Type"; break;
+            case 3:  hi.typeName = L"Directory"; break;
+            case 4:  hi.typeName = L"SymbolicLink"; break;
+            case 5:  hi.typeName = L"Token"; break;
+            case 6:  hi.typeName = L"Job"; break;
+            case 7:  hi.typeName = L"Process"; break;
+            case 8:  hi.typeName = L"Thread"; break;
+            case 9:  hi.typeName = L"UserApcReserve"; break;
+            case 10: hi.typeName = L"IoCompletionReserve"; break;
+            case 11: hi.typeName = L"DebugObject"; break;
+            case 12: hi.typeName = L"Event"; break;
+            case 13: hi.typeName = L"EventPair"; break;
+            case 14: hi.typeName = L"Mutant"; break;
+            case 15: hi.typeName = L"Callback"; break;
+            case 16: hi.typeName = L"Semaphore"; break;
+            case 17: hi.typeName = L"Timer"; break;
+            case 18: hi.typeName = L"IRTimer"; break;
+            case 19: hi.typeName = L"Profile"; break;
+            case 20: hi.typeName = L"KeyedEvent"; break;
+            case 21: hi.typeName = L"WindowStation"; break;
+            case 22: hi.typeName = L"Desktop"; break;
+            case 23: hi.typeName = L"TpWorkerFactory"; break;
+            case 24: hi.typeName = L"Adapter"; break;
+            case 25: hi.typeName = L"Controller"; break;
+            case 26: hi.typeName = L"Device"; break;
+            case 27: hi.typeName = L"Driver"; break;
+            case 28: hi.typeName = L"IoCompletion"; break;
+            case 29: hi.typeName = L"File"; break;
+            case 30: hi.typeName = L"TmTm"; break;
+            case 31: hi.typeName = L"TmTx"; break;
+            case 32: hi.typeName = L"TmRm"; break;
+            case 33: hi.typeName = L"TmEn"; break;
+            case 34: hi.typeName = L"Section"; break;
+            case 35: hi.typeName = L"Session"; break;
+            case 36: hi.typeName = L"Key"; break;
+            case 37: hi.typeName = L"ALPC Port"; break;
+            case 38: hi.typeName = L"PowerRequest"; break;
+            case 39: hi.typeName = L"WmiGuid"; break;
+            case 40: hi.typeName = L"EtwRegistration"; break;
+            case 41: hi.typeName = L"EtwConsumer"; break;
+            case 42: hi.typeName = L"DmaAdapter"; break;
+            case 43: hi.typeName = L"DmaDomain"; break;
+            case 44: hi.typeName = L"PcwObject"; break;
+            case 45: hi.typeName = L"FilterConnectionPort"; break;
+            case 46: hi.typeName = L"FilterCommunicationPort"; break;
+            case 47: hi.typeName = L"NetworkNamespace"; break;
+            default: hi.typeName = L"Unknown"; break;
             }
         }
 
@@ -1835,64 +1969,108 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
 }
 
 bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
-	// Access the target process
-    ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_DUP_HANDLE, err)) {
-		//Try to enable SeDebugPrivilege and retry if access denied
-        if (GetLastError() == ERROR_ACCESS_DENIED) {
-            HANDLE hToken = nullptr;
-            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-                auto token = make_unique_handle(hToken);
-
-                LUID luid{};
-                if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
-                    TOKEN_PRIVILEGES tp{};
-                    tp.PrivilegeCount = 1;
-                    tp.Privileges[0].Luid = luid;
-                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-                    AdjustTokenPrivileges(token.get(), FALSE, &tp, sizeof(tp), nullptr, nullptr);
-
-					// Try Again
-                    if (!ph.Open(pid, PROCESS_DUP_HANDLE, err)) {
-                        return false;
-                    }
-                }
-                else {
-                    return false;
-                }
-            }
-            else {
-                return false;
-            }
-        }
-        else {
-            return false;
-        }
-    }
-	// Duplicate the handle with DUPLICATE_CLOSE_SOURCE to close it in the target process
-	//This is the safest way to close a handle in another process
-    HANDLE dupHandle = nullptr;
-    if (!::DuplicateHandle(
-        ph.Get(),                           // Source process ( target process ) 
-		handle,                             // the handle to close
-		GetCurrentProcess(),                // Target process ( current process )
-        &dupHandle,                         // Exit handle ( will be NULL)
-		0,                                  // Wanted access (0 = same access)
-		FALSE,                              // can get inherited
-		DUPLICATE_CLOSE_SOURCE)) {          // Close the source handle
-
-        SetWin32Error(err, L"DuplicateHandle(DUPLICATE_CLOSE_SOURCE)");
+    if (!handle || handle == INVALID_HANDLE_VALUE) {
+        SetWin32Error(err, L"CloseProcessHandle", ERROR_INVALID_HANDLE,
+            L"GeÃ§ersiz handle.");
         return false;
     }
 
-	//Duphandle should be null if successful
-	//if not NULL something unexpected happened
-    if (dupHandle != nullptr) {
-        ::CloseHandle(dupHandle);
-        SetWin32Error(err, L"CloseProcessHandle", ERROR_INVALID_HANDLE,
-            L"Handle is closed but unexpectedly created.");
-		return true; //but still we can consider it successful because handle is closed
+    // Security check: Prevent closing critical system handles
+    // This is important to prevent system destabilization
+
+    // Open target process with handle duplication rights
+    ProcessHandle ph;
+    if (!ph.Open(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+
+    // Verify the handle belongs to the target process
+    // by attempting to duplicate it first
+    HANDLE testHandle = nullptr;
+    if (!::DuplicateHandle(
+        ph.Get(),
+        handle,
+        GetCurrentProcess(),
+        &testHandle,
+        0,
+        FALSE,
+        DUPLICATE_SAME_ACCESS))
+    {
+        SetWin32Error(err, L"CloseProcessHandle", GetLastError(),
+            L"Handle validation is failed.");
+        return false;
+    }
+
+    // Close the test handle
+    if (testHandle) {
+        ::CloseHandle(testHandle);
+    }
+
+    // Get handle type for safety checks
+    typedef LONG(NTAPI* NtQueryObject_t)(HANDLE, DWORD, PVOID, ULONG, PULONG);
+    static auto NtQueryObject = reinterpret_cast<NtQueryObject_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+
+    if (NtQueryObject) {
+        BYTE typeBuffer[1024] = {};
+        ULONG returnLength = 0;
+
+        struct PUBLIC_OBJECT_TYPE_INFORMATION {
+            UNICODE_STRING TypeName;
+            ULONG Reserved[22];
+        };
+
+        if (testHandle && NtQueryObject(testHandle, 2, typeBuffer, sizeof(typeBuffer), &returnLength) == 0) {
+            auto* typeInfo = reinterpret_cast<PUBLIC_OBJECT_TYPE_INFORMATION*>(typeBuffer);
+            if (typeInfo->TypeName.Buffer && typeInfo->TypeName.Length > 0) {
+                std::wstring typeName(typeInfo->TypeName.Buffer,
+                    typeInfo->TypeName.Length / sizeof(wchar_t));
+
+                // Prevent closing critical handle types
+                if (typeName == L"Process" || typeName == L"Thread") {
+                    // Additional check: Don't close current process/thread handles
+                    DWORD handlePid = 0;
+                    typedef LONG(NTAPI* NtQueryInformationProcess_t)(HANDLE, DWORD, PVOID, ULONG, PULONG);
+                    static auto NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcess_t>(
+                        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+
+                    if (NtQueryInformationProcess) {
+                        struct PROCESS_BASIC_INFORMATION {
+                            PVOID Reserved1;
+                            PVOID PebBaseAddress;
+                            PVOID Reserved2[2];
+                            ULONG_PTR UniqueProcessId;
+                            PVOID Reserved3;
+                        };
+
+                        PROCESS_BASIC_INFORMATION pbi{};
+                        if (NtQueryInformationProcess(testHandle, 0, &pbi, sizeof(pbi), nullptr) == 0) {
+                            handlePid = static_cast<DWORD>(pbi.UniqueProcessId);
+
+                            if (handlePid == ::GetCurrentProcessId() || handlePid == 4) { // System process
+                                SetWin32Error(err, L"CloseProcessHandle", ERROR_ACCESS_DENIED,
+                                    L"Tried to close a critical system Handle.");
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Close the handle in the remote process using DuplicateHandle with DUPLICATE_CLOSE_SOURCE
+    if (!::DuplicateHandle(
+        ph.Get(),
+        handle,
+        nullptr,  // No target process
+        nullptr,  // No target handle
+        0,
+        FALSE,
+        DUPLICATE_CLOSE_SOURCE))  // This closes the source handle
+    {
+        SetWin32Error(err, L"DuplicateHandle(DUPLICATE_CLOSE_SOURCE)");
+        return false;
     }
 
     return true;
@@ -1950,7 +2128,7 @@ bool EnableProcessPrivilege(ProcessId pid, std::wstring_view privilegeName, bool
         return false;
     }
     if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-        SetWin32Error(err, L"AdjustTokenPrivileges", ERROR_NOT_ALL_ASSIGNED, L"Ýstenen ayrýcalýk tokende bulunmuyor.");
+        SetWin32Error(err, L"AdjustTokenPrivileges", ERROR_NOT_ALL_ASSIGNED, L"ï¿½stenen ayrï¿½calï¿½k tokende bulunmuyor.");
         return false;
     }
     return true;
@@ -2206,7 +2384,7 @@ bool TerminateProcessTree(ProcessId rootPid, DWORD exitCode, Error* err) noexcep
         if (!IsProcessRunning(pid)) continue;
         if (!TerminateProcess(pid, exitCode, nullptr)) okAll = false;
     }
-    if (!okAll) SetWin32Error(err, L"TerminateProcessTree", ERROR_GEN_FAILURE, L"Bazý süreçler sonlandýrýlamadý.");
+    if (!okAll) SetWin32Error(err, L"TerminateProcessTree", ERROR_GEN_FAILURE, L"Bazï¿½ sï¿½reï¿½ler sonlandï¿½rï¿½lamadï¿½.");
     return okAll;
 }
 
@@ -2295,7 +2473,7 @@ bool ProcessMonitor::Start(Error* err) noexcept {
     }
     catch (...) {
         m_running.store(false);
-        SetWin32Error(err, L"ProcessMonitor::Start", ERROR_OUTOFMEMORY, L"Ýzleme thread'i baþlatýlamadý.");
+        SetWin32Error(err, L"ProcessMonitor::Start", ERROR_OUTOFMEMORY, L"ï¿½zleme thread'i baï¿½latï¿½lamadï¿½.");
         return false;
     }
     return true;
@@ -2383,7 +2561,7 @@ std::vector<ProcessId> GetProcessIdsByName(std::wstring_view processName, Error*
 bool KillProcessByName(std::wstring_view processName, Error* err) noexcept {
     auto pid = GetProcessIdByName(processName, err);
     if (pid == 0) {
-        SetWin32Error(err, L"KillProcessByName", ERROR_NOT_FOUND, L"Ýstenilen adla süreç bulunamadý.");
+        SetWin32Error(err, L"KillProcessByName", ERROR_NOT_FOUND, L"ï¿½stenilen adla sï¿½reï¿½ bulunamadï¿½.");
         return false;
     }
     return TerminateProcess(pid, 0, err);
@@ -2393,13 +2571,13 @@ bool KillAllProcessesByName(std::wstring_view processName, Error* err) noexcept 
     bool okAll = true;
     auto pids = GetProcessIdsByName(processName, nullptr);
     if (pids.empty()) {
-        SetWin32Error(err, L"KillAllProcessesByName", ERROR_NOT_FOUND, L"Eþleþen süreç bulunamadý.");
+        SetWin32Error(err, L"KillAllProcessesByName", ERROR_NOT_FOUND, L"Eï¿½leï¿½en sï¿½reï¿½ bulunamadï¿½.");
         return false;
     }
     for (auto pid : pids) {
         if (!TerminateProcess(pid, 0, nullptr)) okAll = false;
     }
-    if (!okAll) SetWin32Error(err, L"KillAllProcessesByName", ERROR_GEN_FAILURE, L"Bazý süreçler sonlandýrýlamadý.");
+    if (!okAll) SetWin32Error(err, L"KillAllProcessesByName", ERROR_GEN_FAILURE, L"Bazï¿½ sï¿½reï¿½ler sonlandï¿½rï¿½lamadï¿½.");
     return okAll;
 }
 
@@ -2451,316 +2629,264 @@ bool IsProcessDebugged(ProcessId pid, Error* err) noexcept {
 // ==========================================================
 
 // ==========================================================
-// Advanced Features - ETW Process Tracing
+// ETW Process Tracing Implementation
 // ==========================================================
 
 namespace {
-	// Global state for ETW Session
-    struct ETWProcessTracingState {
+    // ETW Session Management
+    struct ETWSessionState {
         TRACEHANDLE sessionHandle = 0;
         TRACEHANDLE consumerHandle = 0;
-        std::atomic<bool> isRunning{ false };
+        std::atomic<bool> isActive{ false };
         std::thread consumerThread;
         std::mutex mutex;
-
-        // Callback functions
-        std::function<void(const ProcessEvent&)> onProcessEvent;
     };
 
-    static ETWProcessTracingState g_etwState;
+    static ETWSessionState g_etwSession;
 
-    // ETW Event callback
-    VOID WINAPI EventRecordCallback(PEVENT_RECORD pEventRecord) {
-        if (!pEventRecord) return;
-        if (!g_etwState.isRunning.load()) return;
+    // ETW Provider GUIDs
+    constexpr GUID MicrosoftWindowsKernelProcessGuid = {
+        0x22fb2cd6, 0x0e7b, 0x422b, {0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16}
+    };
 
-        // Process/Thread creation/termination events
-        // Microsoft-Windows-Kernel-Process provider GUID: {22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}
-        static const GUID ProcessProviderGuid = { 0x22fb2cd6, 0x0e7b, 0x422b, {0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16} };
+    // Event Types for Process Provider
+    constexpr UCHAR ProcessStartOpcode = 1;
+    constexpr UCHAR ProcessEndOpcode = 2;
+    constexpr UCHAR ThreadStartOpcode = 3;
+    constexpr UCHAR ThreadEndOpcode = 4;
+    constexpr UCHAR ImageLoadOpcode = 10;
 
-        if (IsEqualGUID(pEventRecord->EventHeader.ProviderId, ProcessProviderGuid)) {
-            ProcessEvent evt{};
-            evt.timestamp = std::chrono::system_clock::now();
-            evt.pid = pEventRecord->EventHeader.ProcessId;
-            evt.tid = pEventRecord->EventHeader.ThreadId;
+    // ETW Event Callback
+    void WINAPI ProcessEventCallback(PEVENT_RECORD eventRecord) {
+        if (!eventRecord) return;
 
-            // Event ID check
-            switch (pEventRecord->EventHeader.EventDescriptor.Opcode) {
-            case 1: // Process Start
-                evt.type = ProcessEventType::Created;
-                evt.description = L"Process created via ETW";
+        // Check if this is a process-related event
+        if (IsEqualGUID(eventRecord->EventHeader.ProviderId, MicrosoftWindowsKernelProcessGuid)) {
+            UCHAR opcode = eventRecord->EventHeader.EventDescriptor.Opcode;
+
+            switch (opcode) {
+            case ProcessStartOpcode: {
+                // Process started
+                // Can extract: PID, ParentPID, ImageFileName, CommandLine
+                // Log or trigger callbacks here
                 break;
-            case 2: // Process End
-                evt.type = ProcessEventType::Terminated;
-                evt.description = L"Process terminated via ETW";
+            }
+            case ProcessEndOpcode: {
+                // Process terminated
+                // Can extract: PID, ExitCode
                 break;
-            case 3: // Thread Start
-                evt.type = ProcessEventType::ThreadCreated;
-                evt.description = L"Thread created via ETW";
+            }
+            case ThreadStartOpcode: {
+                // Thread created
+                // Can extract: TID, ProcessID
                 break;
-            case 4: // Thread End
-                evt.type = ProcessEventType::ThreadTerminated;
-                evt.description = L"Thread terminated via ETW";
+            }
+            case ThreadEndOpcode: {
+                // Thread terminated
                 break;
-            case 5: // Image Load (DLL/EXE)
-                evt.type = ProcessEventType::ModuleLoaded;
-                evt.description = L"Module loaded via ETW";
+            }
+            case ImageLoadOpcode: {
+                // Module/DLL loaded
+                // Can extract: ImageBase, ImageSize, FileName
                 break;
+            }
             default:
-				return; // The event that we don't care about
-            }
-
-			// parse the event properties
-            if (pEventRecord->UserDataLength > 0 && pEventRecord->UserData) {
-                // Process ID
-                if (pEventRecord->UserDataLength >= sizeof(DWORD)) {
-                    DWORD targetPid = *reinterpret_cast<DWORD*>(pEventRecord->UserData);
-                    evt.details[L"TargetPID"] = std::to_wstring(targetPid);
-                }
-
-                // Image name (if exists)
-                if (pEventRecord->UserDataLength > sizeof(DWORD) + sizeof(DWORD)) {
-                    wchar_t* imageName = reinterpret_cast<wchar_t*>(
-                        static_cast<BYTE*>(pEventRecord->UserData) + sizeof(DWORD) * 2);
-
-                    size_t maxLen = (pEventRecord->UserDataLength - sizeof(DWORD) * 2) / sizeof(wchar_t);
-                    if (maxLen > 0) {
-                        std::wstring name(imageName, wcsnlen(imageName, maxLen));
-                        evt.details[L"ImageName"] = name;
-                    }
-                }
-            }
-
-			//invoke the user callback
-            std::lock_guard<std::mutex> lock(g_etwState.mutex);
-            if (g_etwState.onProcessEvent) {
-                g_etwState.onProcessEvent(evt);
+                break;
             }
         }
     }
 
-    // ETW buffer callback
-    ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW pLogFile) {
-        return TRUE; // Continue processing
-    }
+    // ETW Consumer Thread
+    void ETWConsumerThreadProc() {
+        if (g_etwSession.consumerHandle == 0) return;
 
-    // ETW consumer thread function
-    void ETWConsumerThread() {
-        EVENT_TRACE_LOGFILEW traceLogFile{};
-        ZeroMemory(&traceLogFile, sizeof(traceLogFile));
+        // Process trace events (blocking call)
+        ULONG status = ProcessTrace(&g_etwSession.consumerHandle, 1, nullptr, nullptr);
 
-        traceLogFile.LoggerName = const_cast<LPWSTR>(L"ShadowStrikeProcessTrace");
-        traceLogFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-        traceLogFile.EventRecordCallback = EventRecordCallback;
-        traceLogFile.BufferCallback = BufferCallback;
-        traceLogFile.Context = nullptr;
-
-        //Open the Trace Session
-        g_etwState.consumerHandle = OpenTraceW(&traceLogFile);
-        if (g_etwState.consumerHandle == INVALID_PROCESSTRACE_HANDLE) {
-            SS_LOG_ERROR(L"ProcessUtils", L"OpenTrace failed: %d", GetLastError());
-            g_etwState.isRunning.store(false);
-            return;
-        }
-
-        // Event processing loop
-        ULONG status = ProcessTrace(&g_etwState.consumerHandle, 1, nullptr, nullptr);
         if (status != ERROR_SUCCESS && status != ERROR_CANCELLED) {
-            SS_LOG_ERROR(L"ProcessUtils", L"ProcessTrace failed: %d", status);
-        }
-
-        // Cleanup
-        if (g_etwState.consumerHandle != INVALID_PROCESSTRACE_HANDLE) {
-            CloseTrace(g_etwState.consumerHandle);
-            g_etwState.consumerHandle = 0;
+            // Log error
         }
     }
-}
 
-bool EnableETWProcessTracing(Error* err) noexcept {
-    std::lock_guard<std::mutex> lock(g_etwState.mutex);
 
-	//If Already Working, return
-    if (g_etwState.isRunning.load()) {
-        return true;
-    }
 
-	//get buffer ready for ETW session properties
-    const size_t bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + 1024;
-    std::vector<BYTE> buffer(bufferSize);
-    auto* pSessionProperties = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(buffer.data());
+    bool EnableETWProcessTracing(Error* err) noexcept {
+        std::lock_guard<std::mutex> lock(g_etwSession.mutex);
 
-    ZeroMemory(pSessionProperties, bufferSize);
-    pSessionProperties->Wnode.BufferSize = static_cast<ULONG>(bufferSize);
-    pSessionProperties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    pSessionProperties->Wnode.ClientContext = 1; // QPC clock resolution
-    pSessionProperties->Wnode.Guid = GUID_NULL;
+        // Check if already running
+        if (g_etwSession.isActive.load()) {
+            SetWin32Error(err, L"EnableETWProcessTracing", ERROR_ALREADY_EXISTS,
+                L"ETW process tracing is already active.");
+            return false;
+        }
 
-    pSessionProperties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    pSessionProperties->MaximumFileSize = 0; // No file output
-    pSessionProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    pSessionProperties->BufferSize = 64; // KB
-    pSessionProperties->MinimumBuffers = 20;
-    pSessionProperties->MaximumBuffers = 200;
-    pSessionProperties->FlushTimer = 1; // Second
+        // Session name must be unique
+        constexpr wchar_t sessionName[] = L"ShadowStrike-ProcessTrace";
 
-	// Set the session name
-    const wchar_t* sessionName = L"ShadowStrikeProcessTrace";
-    wcscpy_s(reinterpret_cast<wchar_t*>(buffer.data() + pSessionProperties->LoggerNameOffset),
-        512, sessionName);
+        // Calculate required buffer size for EVENT_TRACE_PROPERTIES
+        ULONG bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + sizeof(sessionName) + sizeof(wchar_t);
+        std::vector<BYTE> buffer(bufferSize, 0);
 
-	//Stop the existing session if any
-    ULONG status = ControlTraceW(0, sessionName, pSessionProperties, EVENT_TRACE_CONTROL_STOP);
-	// ERROR_WMI_INSTANCE_NOT_FOUND is a expected error if the session does not exist
+        auto* properties = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(buffer.data());
+        properties->Wnode.BufferSize = bufferSize;
+        properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        properties->Wnode.ClientContext = 1; // Use QPC for timestamp
+        properties->Wnode.Guid = MicrosoftWindowsKernelProcessGuid;
 
-    // Open a new session
-    status = StartTraceW(&g_etwState.sessionHandle, sessionName, pSessionProperties);
-    if (status != ERROR_SUCCESS) {
-        SetWin32Error(err, L"StartTraceW", status, L"ETW trace session baþlatýlamadý.");
-        return false;
-    }
+        properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        properties->MaximumFileSize = 0; // No file logging
+        properties->FlushTimer = 1; // Flush every second
+        properties->EnableFlags = EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD;
 
-    //Enable the provider
-    GUID ProcessProviderGuid = { 0x22fb2cd6, 0x0e7b, 0x422b, {0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16} };
+        properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(buffer.data() + properties->LoggerNameOffset),
+            (bufferSize - properties->LoggerNameOffset) / sizeof(wchar_t),
+            sessionName);
 
-    // Enable parameters
-    ENABLE_TRACE_PARAMETERS enableParams{};
-    enableParams.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
-    enableParams.EnableProperty = EVENT_ENABLE_PROPERTY_PROCESS_START_KEY;
-    enableParams.ControlFlags = 0;
-    enableParams.SourceId = GUID_NULL;
-    enableParams.EnableFilterDesc = nullptr;
-    enableParams.FilterDescCount = 0;
+        // Start trace session
+        TRACEHANDLE sessionHandle = 0;
+        ULONG status = StartTraceW(&sessionHandle, sessionName, properties);
 
-    status = EnableTraceEx2(
-        g_etwState.sessionHandle,
-        &ProcessProviderGuid,
-        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-        TRACE_LEVEL_INFORMATION, // Log level
-        0xFFFFFFFFFFFFFFFF,      // Any keyword
-        0,                        // Match any keyword
-        0,                        // Timeout (infinite)
-        &enableParams
-    );
+        if (status != ERROR_SUCCESS) {
+            if (status == ERROR_ALREADY_EXISTS) {
+                // Try to stop existing session and restart
+                ControlTraceW(0, sessionName, properties, EVENT_TRACE_CONTROL_STOP);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    if (status != ERROR_SUCCESS) {
-        //Clear the session
-        ControlTraceW(g_etwState.sessionHandle, nullptr, pSessionProperties, EVENT_TRACE_CONTROL_STOP);
-        g_etwState.sessionHandle = 0;
+                status = StartTraceW(&sessionHandle, sessionName, properties);
+                if (status != ERROR_SUCCESS) {
+                    SetWin32Error(err, L"StartTraceW", status,
+                        L"Failed to start ETW trace session after stopping existing session.");
+                    return false;
+                }
+            }
+            else if (status == ERROR_ACCESS_DENIED) {
+                SetWin32Error(err, L"StartTraceW", status,
+                    L"Access denied. Administrator privileges required for ETW tracing.");
+                return false;
+            }
+            else {
+                SetWin32Error(err, L"StartTraceW", status,
+                    L"Failed to start ETW trace session.");
+                return false;
+            }
+        }
 
-        SetWin32Error(err, L"EnableTraceEx2", status, L"ETW provider enable edilemedi.");
-        return false;
-    }
+        g_etwSession.sessionHandle = sessionHandle;
 
-    // Create the consumer thread
-    g_etwState.isRunning.store(true);
-    try {
-        g_etwState.consumerThread = std::thread(ETWConsumerThread);
-    }
-    catch (const std::exception&) {
-		// Thread failed to start make sure to clean up
-        g_etwState.isRunning.store(false);
-
-        GUID ProcessProviderGuid = { 0x22fb2cd6, 0x0e7b, 0x422b, {0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16} };
-        EnableTraceEx2(g_etwState.sessionHandle, &ProcessProviderGuid,
-            EVENT_CONTROL_CODE_DISABLE_PROVIDER, 0, 0, 0, 0, nullptr);
-
-        ControlTraceW(g_etwState.sessionHandle, nullptr, pSessionProperties, EVENT_TRACE_CONTROL_STOP);
-        g_etwState.sessionHandle = 0;
-
-        SetWin32Error(err, L"EnableETWProcessTracing", ERROR_OUTOFMEMORY,
-            L"ETW consumer thread is not initialized");
-        return false;
-    }
-
-    SS_LOG_INFO(L"ProcessUtils", L"ETW process tracing enabled successfully.");
-    return true;
-}
-
-bool DisableETWProcessTracing(Error* err) noexcept {
-    std::lock_guard<std::mutex> lock(g_etwState.mutex);
-
-    // if already stopped
-    if (!g_etwState.isRunning.load()) {
-        return true;
-    }
-
-    //Stop watching
-    g_etwState.isRunning.store(false);
-
-	//Close the consumer tracing handle
-    if (g_etwState.consumerHandle != INVALID_PROCESSTRACE_HANDLE && g_etwState.consumerHandle != 0) {
-        CloseTrace(g_etwState.consumerHandle);
-        g_etwState.consumerHandle = 0;
-    }
-
-	//wait for consumer thread to finish
-    if (g_etwState.consumerThread.joinable()) {
-        g_etwState.consumerThread.join();
-    }
-
-    //disable the provider
-    if (g_etwState.sessionHandle != 0) {
-        GUID ProcessProviderGuid = { 0x22fb2cd6, 0x0e7b, 0x422b, {0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16} };
-
-        ULONG status = EnableTraceEx2(
-            g_etwState.sessionHandle,
-            &ProcessProviderGuid,
-            EVENT_CONTROL_CODE_DISABLE_PROVIDER,
-            0, 0, 0, 0, nullptr
+        // Enable process provider
+        status = EnableTraceEx2(
+            sessionHandle,
+            &MicrosoftWindowsKernelProcessGuid,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            TRACE_LEVEL_INFORMATION,
+            EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD,
+            0,
+            0,
+            nullptr
         );
 
         if (status != ERROR_SUCCESS) {
-            SS_LOG_WARN(L"ProcessUtils", L"EnableTraceEx2 (disable) failed: %d", status);
-        }
-    }
+            // Cleanup session
+            ControlTraceW(sessionHandle, nullptr, properties, EVENT_TRACE_CONTROL_STOP);
+            g_etwSession.sessionHandle = 0;
 
-    //Stop the session
-    if (g_etwState.sessionHandle != 0) {
-        const size_t bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + 1024;
-        std::vector<BYTE> buffer(bufferSize);
-        auto* pSessionProperties = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(buffer.data());
-
-        ZeroMemory(pSessionProperties, bufferSize);
-        pSessionProperties->Wnode.BufferSize = static_cast<ULONG>(bufferSize);
-        pSessionProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-
-        ULONG status = ControlTraceW(
-            g_etwState.sessionHandle,
-            L"ShadowStrikeProcessTrace",
-            pSessionProperties,
-            EVENT_TRACE_CONTROL_STOP
-        );
-
-        if (status != ERROR_SUCCESS && status != ERROR_WMI_INSTANCE_NOT_FOUND) {
-            SetWin32Error(err, L"ControlTraceW(STOP)", status, L"ETW session durdurulamadý.");
-			// Even if stopping the session fails, we still clear the handle
+            SetWin32Error(err, L"EnableTraceEx2", status,
+                L"Failed to enable process provider.");
+            return false;
         }
 
-        g_etwState.sessionHandle = 0;
+        // Setup event consumer
+        EVENT_TRACE_LOGFILEW logFile = {};
+        logFile.LoggerName = const_cast<wchar_t*>(sessionName);
+        logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logFile.EventRecordCallback = ProcessEventCallback;
+
+        TRACEHANDLE consumerHandle = OpenTraceW(&logFile);
+        if (consumerHandle == INVALID_PROCESSTRACE_HANDLE) {
+            // Cleanup
+            ControlTraceW(sessionHandle, nullptr, properties, EVENT_TRACE_CONTROL_STOP);
+            g_etwSession.sessionHandle = 0;
+
+            SetWin32Error(err, L"OpenTraceW", GetLastError(),
+                L"Failed to open trace consumer.");
+            return false;
+        }
+
+        g_etwSession.consumerHandle = consumerHandle;
+
+        // Start consumer thread
+        try {
+            g_etwSession.consumerThread = std::thread(ETWConsumerThreadProc);
+            g_etwSession.isActive.store(true);
+        }
+        catch (...) {
+            // Cleanup
+            CloseTrace(consumerHandle);
+            ControlTraceW(sessionHandle, nullptr, properties, EVENT_TRACE_CONTROL_STOP);
+            g_etwSession.sessionHandle = 0;
+            g_etwSession.consumerHandle = 0;
+
+            SetWin32Error(err, L"EnableETWProcessTracing", ERROR_OUTOFMEMORY,
+                L"Failed to create consumer thread.");
+            return false;
+        }
+
+        return true;
     }
 
-    //Clear the callback
-    g_etwState.onProcessEvent = nullptr;
+    bool DisableETWProcessTracing(Error* err) noexcept {
+        std::lock_guard<std::mutex> lock(g_etwSession.mutex);
 
-    SS_LOG_INFO(L"ProcessUtils", L"ETW process tracing disabled successfully.");
-    return true;
-}
+        if (!g_etwSession.isActive.load()) {
+            SetWin32Error(err, L"DisableETWProcessTracing", ERROR_INVALID_STATE,
+                L"ETW process tracing is not active.");
+            return false;
+        }
 
-//helper function for setting ETW process event callback
-bool SetETWProcessEventCallback(std::function<void(const ProcessEvent&)> callback, Error* err) noexcept {
-    std::lock_guard<std::mutex> lock(g_etwState.mutex);
+        g_etwSession.isActive.store(false);
 
-    if (!g_etwState.isRunning.load()) {
-        SetWin32Error(err, L"SetETWProcessEventCallback", ERROR_INVALID_STATE,
-            L"ETW tracing is not active.");
-        return false;
+        // Close consumer trace (this will unblock ProcessTrace)
+        if (g_etwSession.consumerHandle != 0) {
+            ULONG status = CloseTrace(g_etwSession.consumerHandle);
+            if (status != ERROR_SUCCESS && status != ERROR_CTX_CLOSE_PENDING) {
+                SetWin32Error(err, L"CloseTrace", status,
+                    L"Failed to close trace consumer.");
+            }
+            g_etwSession.consumerHandle = 0;
+        }
+
+        // Wait for consumer thread to finish
+        if (g_etwSession.consumerThread.joinable()) {
+            g_etwSession.consumerThread.join();
+        }
+
+        // Stop trace session
+        if (g_etwSession.sessionHandle != 0) {
+            constexpr wchar_t sessionName[] = L"ShadowStrike-ProcessTrace";
+            ULONG bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + sizeof(sessionName) + sizeof(wchar_t);
+            std::vector<BYTE> buffer(bufferSize, 0);
+
+            auto* properties = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(buffer.data());
+            properties->Wnode.BufferSize = bufferSize;
+            properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+            ULONG status = ControlTraceW(g_etwSession.sessionHandle, sessionName, properties,
+                EVENT_TRACE_CONTROL_STOP);
+
+            if (status != ERROR_SUCCESS && status != ERROR_WMI_INSTANCE_NOT_FOUND) {
+                SetWin32Error(err, L"ControlTraceW(STOP)", status,
+                    L"Failed to stop trace session.");
+                g_etwSession.sessionHandle = 0;
+                return false;
+            }
+
+            g_etwSession.sessionHandle = 0;
+        }
+
+        return true;
     }
-
-    g_etwState.onProcessEvent = std::move(callback);
-    return true;
 }
-
 bool CreateProcessSnapshot(std::vector<ProcessInfo>& snapshot, Error* err) noexcept {
     snapshot.clear();
     std::vector<ProcessId> pids;
@@ -2842,14 +2968,600 @@ bool CreateMiniDump(ProcessId pid, std::wstring_view dumpFilePath, Error* err) n
     return true;
 }
 
-bool GetProcessInfoWMI(ProcessId /*pid*/, ProcessInfo& /*info*/, Error* err) noexcept {
-    SetWin32Error(err, L"GetProcessInfoWMI", ERROR_NOT_SUPPORTED, L"WMI entegrasyonu bu sürümde etkin deðil.");
-    return false;
+// ==========================================================
+// WMI Integration (Windows Management Instrumentation)
+// ==========================================================
+
+    // RAII wrapper for COM initialization
+    class ComInitializer {
+    public:
+        ComInitializer() noexcept {
+            m_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            m_initialized = SUCCEEDED(m_hr);
+        }
+
+        ~ComInitializer() noexcept {
+            if (m_initialized) {
+                CoUninitialize();
+            }
+        }
+
+        bool IsInitialized() const noexcept { return m_initialized; }
+        HRESULT GetHResult() const noexcept { return m_hr; }
+
+        ComInitializer(const ComInitializer&) = delete;
+        ComInitializer& operator=(const ComInitializer&) = delete;
+
+    private:
+        HRESULT m_hr = E_FAIL;
+        bool m_initialized = false;
+    };
+
+    // RAII wrapper for COM security initialization
+    class ComSecurityInitializer {
+    public:
+        ComSecurityInitializer() noexcept {
+            m_hr = CoInitializeSecurity(
+                nullptr,                        // Security descriptor
+                -1,                             // COM authentication
+                nullptr,                        // Authentication services
+                nullptr,                        // Reserved
+                RPC_C_AUTHN_LEVEL_DEFAULT,      // Default authentication
+                RPC_C_IMP_LEVEL_IMPERSONATE,    // Default Impersonation
+                nullptr,                        // Authentication info
+                EOAC_NONE,                      // Additional capabilities
+                nullptr                         // Reserved
+            );
+            m_initialized = SUCCEEDED(m_hr);
+        }
+
+        bool IsInitialized() const noexcept { return m_initialized; }
+        HRESULT GetHResult() const noexcept { return m_hr; }
+
+    private:
+        HRESULT m_hr = E_FAIL;
+        bool m_initialized = false;
+    };
+
+    // Helper to convert VARIANT to std::wstring
+    std::wstring VariantToWString(const VARIANT& var) {
+        if (var.vt == VT_BSTR && var.bstrVal) {
+            return std::wstring(var.bstrVal, SysStringLen(var.bstrVal));
+        }
+        else if (var.vt == VT_LPWSTR && var.bstrVal) {
+            return std::wstring(var.bstrVal);
+        }
+        return L"";
+    }
+
+    // Helper to convert VARIANT to DWORD
+    DWORD VariantToDWord(const VARIANT& var) {
+        if (var.vt == VT_UI4) {
+            return var.ulVal;
+        }
+        else if (var.vt == VT_I4) {
+            return static_cast<DWORD>(var.lVal);
+        }
+        return 0;
+    }
+
+    // Helper to convert VARIANT to uint64_t
+    uint64_t VariantToUInt64(const VARIANT& var) {
+        if (var.vt == VT_UI8) {
+            return var.ullVal;
+        }
+        else if (var.vt == VT_I8) {
+            return static_cast<uint64_t>(var.llVal);
+        }
+        else if (var.vt == VT_BSTR) {
+            // WMI sometimes returns uint64 as string
+            try {
+                return std::stoull(var.bstrVal);
+            }
+            catch (...) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    // Helper to get WMI property
+    bool GetWmiProperty(IWbemClassObject* obj, const wchar_t* propName, VARIANT& var) {
+        if (!obj || !propName) return false;
+        VariantInit(&var);
+        HRESULT hr = obj->Get(propName, 0, &var, nullptr, nullptr);
+        return SUCCEEDED(hr);
+    }
+
+    // Convert WMI DateTime to FILETIME
+    bool WmiDateTimeToFileTime(const std::wstring& wmiDateTime, FILETIME& ft) {
+        // WMI DateTime format: yyyymmddHHMMSS.mmmmmmsUUU
+        // Example: 20231215143025.500000+000
+        if (wmiDateTime.length() < 14) return false;
+
+        SYSTEMTIME st = {};
+        try {
+            st.wYear = static_cast<WORD>(std::stoi(wmiDateTime.substr(0, 4)));
+            st.wMonth = static_cast<WORD>(std::stoi(wmiDateTime.substr(4, 2)));
+            st.wDay = static_cast<WORD>(std::stoi(wmiDateTime.substr(6, 2)));
+            st.wHour = static_cast<WORD>(std::stoi(wmiDateTime.substr(8, 2)));
+            st.wMinute = static_cast<WORD>(std::stoi(wmiDateTime.substr(10, 2)));
+            st.wSecond = static_cast<WORD>(std::stoi(wmiDateTime.substr(12, 2)));
+            st.wMilliseconds = 0;
+
+            return SystemTimeToFileTime(&st, &ft) == TRUE;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+
+bool GetProcessInfoWMI(ProcessId pid, ProcessInfo& info, Error* err) noexcept {
+    info = {};
+
+    // Initialize COM
+    ComInitializer comInit;
+    if (!comInit.IsInitialized()) {
+        SetWin32Error(err, L"GetProcessInfoWMI", ERROR_NOT_READY,
+            L"Failed to initialize COM library.");
+        return false;
+    }
+
+    // Initialize COM security
+    ComSecurityInitializer comSecurity;
+    if (!comSecurity.IsInitialized() && comSecurity.GetHResult() != RPC_E_TOO_LATE) {
+        // RPC_E_TOO_LATE means security was already initialized, which is fine
+        SetWin32Error(err, L"GetProcessInfoWMI", ERROR_NOT_READY,
+            L"Failed to initialize COM security.");
+        return false;
+    }
+
+    // Create WMI locator
+    IWbemLocator* pLoc = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WbemLocator,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_IWbemLocator,
+        reinterpret_cast<LPVOID*>(&pLoc)
+    );
+
+    if (FAILED(hr) || !pLoc) {
+        SetWin32Error(err, L"CoCreateInstance(WbemLocator)", ERROR_NOT_READY,
+            L"Failed to create WMI locator instance.");
+        return false;
+    }
+
+    // Connect to WMI namespace
+    IWbemServices* pSvc = nullptr;
+    hr = pLoc->ConnectServer(
+        _bstr_t(L"ROOT\\CIMV2"),    // WMI namespace
+        nullptr,                     // User name (NULL = current user)
+        nullptr,                     // User password (NULL = current)
+        nullptr,                     // Locale
+        0,                           // Security flags
+        nullptr,                     // Authority
+        nullptr,                     // Context object
+        &pSvc                        // IWbemServices proxy
+    );
+
+    pLoc->Release();
+
+    if (FAILED(hr) || !pSvc) {
+        SetWin32Error(err, L"ConnectServer", ERROR_NOT_READY,
+            L"Failed to connect to WMI namespace ROOT\\CIMV2.");
+        return false;
+    }
+
+    // Set security levels on the proxy
+    hr = CoSetProxyBlanket(
+        pSvc,                          // Indicates the proxy to set
+        RPC_C_AUTHN_WINNT,             // RPC_C_AUTHN_xxx
+        RPC_C_AUTHZ_NONE,              // RPC_C_AUTHZ_xxx
+        nullptr,                       // Server principal name
+        RPC_C_AUTHN_LEVEL_CALL,        // RPC_C_AUTHN_LEVEL_xxx
+        RPC_C_IMP_LEVEL_IMPERSONATE,   // RPC_C_IMP_LEVEL_xxx
+        nullptr,                       // client identity
+        EOAC_NONE                      // proxy capabilities
+    );
+
+    if (FAILED(hr)) {
+        pSvc->Release();
+        SetWin32Error(err, L"CoSetProxyBlanket", ERROR_NOT_READY,
+            L"Failed to set proxy security blanket.");
+        return false;
+    }
+
+    // Build WQL query for specific process
+    std::wostringstream query;
+    query << L"SELECT * FROM Win32_Process WHERE ProcessId = " << pid;
+
+    // Execute query
+    IEnumWbemClassObject* pEnumerator = nullptr;
+    hr = pSvc->ExecQuery(
+        _bstr_t(L"WQL"),
+        _bstr_t(query.str().c_str()),
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+        nullptr,
+        &pEnumerator
+    );
+
+    if (FAILED(hr) || !pEnumerator) {
+        pSvc->Release();
+        SetWin32Error(err, L"ExecQuery", ERROR_NOT_READY,
+            L"WMI query execution failed.");
+        return false;
+    }
+
+    // Get the process object
+    IWbemClassObject* pclsObj = nullptr;
+    ULONG uReturn = 0;
+    hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+
+    if (FAILED(hr) || uReturn == 0 || !pclsObj) {
+        pEnumerator->Release();
+        pSvc->Release();
+        SetWin32Error(err, L"GetProcessInfoWMI", ERROR_NOT_FOUND,
+            L"Process not found in WMI.");
+        return false;
+    }
+
+    // Extract process information
+    VARIANT vtProp;
+    VariantInit(&vtProp);
+
+    // Basic information
+    info.basic.pid = pid;
+
+    // Process name
+    if (GetWmiProperty(pclsObj, L"Name", vtProp)) {
+        info.basic.name = VariantToWString(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Executable path
+    if (GetWmiProperty(pclsObj, L"ExecutablePath", vtProp)) {
+        info.basic.executablePath = VariantToWString(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Command line
+    if (GetWmiProperty(pclsObj, L"CommandLine", vtProp)) {
+        info.basic.commandLine = VariantToWString(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Parent process ID
+    if (GetWmiProperty(pclsObj, L"ParentProcessId", vtProp)) {
+        info.basic.parentPid = VariantToDWord(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Session ID
+    if (GetWmiProperty(pclsObj, L"SessionId", vtProp)) {
+        info.basic.sessionId = VariantToDWord(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Thread count
+    if (GetWmiProperty(pclsObj, L"ThreadCount", vtProp)) {
+        info.basic.threadCount = VariantToDWord(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Handle count
+    if (GetWmiProperty(pclsObj, L"HandleCount", vtProp)) {
+        info.basic.handleCount = VariantToDWord(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Priority
+    if (GetWmiProperty(pclsObj, L"Priority", vtProp)) {
+        info.basic.basePriority = VariantToDWord(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // Creation date
+    if (GetWmiProperty(pclsObj, L"CreationDate", vtProp)) {
+        std::wstring dateStr = VariantToWString(vtProp);
+        WmiDateTimeToFileTime(dateStr, info.basic.creationTime);
+        VariantClear(&vtProp);
+    }
+
+    // Memory information
+    if (GetWmiProperty(pclsObj, L"WorkingSetSize", vtProp)) {
+        info.memory.workingSetSize = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"PeakWorkingSetSize", vtProp)) {
+        info.memory.peakWorkingSetSize = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"PrivatePageCount", vtProp)) {
+        info.memory.privateMemorySize = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"VirtualSize", vtProp)) {
+        info.memory.virtualMemorySize = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"PeakVirtualSize", vtProp)) {
+        info.memory.peakVirtualMemorySize = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"PageFaults", vtProp)) {
+        info.memory.pageFaultCount = VariantToDWord(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // I/O counters
+    if (GetWmiProperty(pclsObj, L"ReadOperationCount", vtProp)) {
+        info.io.readOperationCount = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"WriteOperationCount", vtProp)) {
+        info.io.writeOperationCount = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"ReadTransferCount", vtProp)) {
+        info.io.readTransferCount = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"WriteTransferCount", vtProp)) {
+        info.io.writeTransferCount = VariantToUInt64(vtProp);
+        VariantClear(&vtProp);
+    }
+
+    // CPU information
+    if (GetWmiProperty(pclsObj, L"KernelModeTime", vtProp)) {
+        info.cpu.kernelCpuTimeMs = VariantToUInt64(vtProp) / 10000; // Convert 100ns to ms
+        VariantClear(&vtProp);
+    }
+
+    if (GetWmiProperty(pclsObj, L"UserModeTime", vtProp)) {
+        info.cpu.userCpuTimeMs = VariantToUInt64(vtProp) / 10000; // Convert 100ns to ms
+        VariantClear(&vtProp);
+    }
+
+    info.cpu.totalCpuTimeMs = info.cpu.kernelCpuTimeMs + info.cpu.userCpuTimeMs;
+
+    // Get owner information using GetOwner method
+    IWbemClassObject* pOutParams = nullptr;
+
+    std::wstring wmiPath = L"Win32_Process.Handle=\"" + std::to_wstring(pid) + L"\"";
+    hr = pSvc->ExecMethod(
+        _bstr_t(wmiPath.c_str()),
+        _bstr_t(L"GetOwner"),
+        0,
+        nullptr,
+        nullptr,
+        &pOutParams,
+        nullptr
+    );
+
+    if (SUCCEEDED(hr) && pOutParams) {
+        VARIANT vtDomain, vtUser;
+        VariantInit(&vtDomain);
+        VariantInit(&vtUser);
+
+        if (GetWmiProperty(pOutParams, L"Domain", vtDomain) &&
+            GetWmiProperty(pOutParams, L"User", vtUser)) {
+            std::wstring domain = VariantToWString(vtDomain);
+            std::wstring user = VariantToWString(vtUser);
+            if (!domain.empty() && !user.empty()) {
+                info.security.userName = domain + L"\\" + user;
+            }
+            VariantClear(&vtDomain);
+            VariantClear(&vtUser);
+        }
+
+        pOutParams->Release();
+    }
+
+    // Cleanup
+    pclsObj->Release();
+    pEnumerator->Release();
+    pSvc->Release();
+
+    // Fill in additional details using native APIs if available
+    GetProcessMemoryInfo(pid, info.memory, nullptr);
+    GetProcessCpuInfo(pid, info.cpu, nullptr);
+    GetProcessSecurityInfo(pid, info.security, nullptr);
+    EnumerateProcessModules(pid, info.modules, nullptr);
+    EnumerateProcessThreads(pid, info.threads, nullptr);
+
+    return true;
 }
 
-bool EnumerateProcessesWMI(std::vector<ProcessBasicInfo>& /*processes*/, Error* err) noexcept {
-    SetWin32Error(err, L"EnumerateProcessesWMI", ERROR_NOT_SUPPORTED, L"WMI entegrasyonu bu sürümde etkin deðil.");
-    return false;
+bool EnumerateProcessesWMI(std::vector<ProcessBasicInfo>& processes, Error* err) noexcept {
+    processes.clear();
+
+    // Initialize COM
+    ComInitializer comInit;
+    if (!comInit.IsInitialized()) {
+        SetWin32Error(err, L"EnumerateProcessesWMI", ERROR_NOT_READY,
+            L"Failed to initialize COM library.");
+        return false;
+    }
+
+    // Initialize COM security
+    ComSecurityInitializer comSecurity;
+    if (!comSecurity.IsInitialized() && comSecurity.GetHResult() != RPC_E_TOO_LATE) {
+        SetWin32Error(err, L"EnumerateProcessesWMI", ERROR_NOT_READY,
+            L"Failed to initialize COM security.");
+        return false;
+    }
+
+    // Create WMI locator
+    IWbemLocator* pLoc = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WbemLocator,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_IWbemLocator,
+        reinterpret_cast<LPVOID*>(&pLoc)
+    );
+
+    if (FAILED(hr) || !pLoc) {
+        SetWin32Error(err, L"CoCreateInstance(WbemLocator)", ERROR_NOT_READY,
+            L"Failed to create WMI locator instance.");
+        return false;
+    }
+
+    // Connect to WMI namespace
+    IWbemServices* pSvc = nullptr;
+    hr = pLoc->ConnectServer(
+        _bstr_t(L"ROOT\\CIMV2"),
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+        nullptr,
+        nullptr,
+        &pSvc
+    );
+
+    pLoc->Release();
+
+    if (FAILED(hr) || !pSvc) {
+        SetWin32Error(err, L"ConnectServer", ERROR_NOT_READY,
+            L"Failed to connect to WMI namespace ROOT\\CIMV2.");
+        return false;
+    }
+
+    // Set security levels
+    hr = CoSetProxyBlanket(
+        pSvc,
+        RPC_C_AUTHN_WINNT,
+        RPC_C_AUTHZ_NONE,
+        nullptr,
+        RPC_C_AUTHN_LEVEL_CALL,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        nullptr,
+        EOAC_NONE
+    );
+
+    if (FAILED(hr)) {
+        pSvc->Release();
+        SetWin32Error(err, L"CoSetProxyBlanket", ERROR_NOT_READY,
+            L"Failed to set proxy security blanket.");
+        return false;
+    }
+
+    // Query all processes
+    IEnumWbemClassObject* pEnumerator = nullptr;
+    hr = pSvc->ExecQuery(
+        _bstr_t(L"WQL"),
+        _bstr_t(L"SELECT * FROM Win32_Process"),
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+        nullptr,
+        &pEnumerator
+    );
+
+    if (FAILED(hr) || !pEnumerator) {
+        pSvc->Release();
+        SetWin32Error(err, L"ExecQuery", ERROR_NOT_READY,
+            L"WMI query execution failed.");
+        return false;
+    }
+
+    // Enumerate processes
+    IWbemClassObject* pclsObj = nullptr;
+    ULONG uReturn = 0;
+
+    while (pEnumerator) {
+        hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+        if (FAILED(hr) || uReturn == 0 || !pclsObj) break;
+
+        ProcessBasicInfo info{};
+        VARIANT vtProp;
+        VariantInit(&vtProp);
+
+        // Process ID
+        if (GetWmiProperty(pclsObj, L"ProcessId", vtProp)) {
+            info.pid = VariantToDWord(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Process name
+        if (GetWmiProperty(pclsObj, L"Name", vtProp)) {
+            info.name = VariantToWString(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Executable path
+        if (GetWmiProperty(pclsObj, L"ExecutablePath", vtProp)) {
+            info.executablePath = VariantToWString(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Command line
+        if (GetWmiProperty(pclsObj, L"CommandLine", vtProp)) {
+            info.commandLine = VariantToWString(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Parent process ID
+        if (GetWmiProperty(pclsObj, L"ParentProcessId", vtProp)) {
+            info.parentPid = VariantToDWord(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Session ID
+        if (GetWmiProperty(pclsObj, L"SessionId", vtProp)) {
+            info.sessionId = VariantToDWord(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Thread count
+        if (GetWmiProperty(pclsObj, L"ThreadCount", vtProp)) {
+            info.threadCount = VariantToDWord(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Handle count
+        if (GetWmiProperty(pclsObj, L"HandleCount", vtProp)) {
+            info.handleCount = VariantToDWord(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Priority
+        if (GetWmiProperty(pclsObj, L"Priority", vtProp)) {
+            info.basePriority = VariantToDWord(vtProp);
+            VariantClear(&vtProp);
+        }
+
+        // Creation date
+        if (GetWmiProperty(pclsObj, L"CreationDate", vtProp)) {
+            std::wstring dateStr = VariantToWString(vtProp);
+            WmiDateTimeToFileTime(dateStr, info.creationTime);
+            VariantClear(&vtProp);
+        }
+
+        // Mark system processes
+        info.isSystemProcess = (info.pid == 0 || info.pid == 4);
+
+        // Window title (requires additional query - skip for performance)
+        // Can be retrieved separately if needed
+
+        processes.push_back(std::move(info));
+        pclsObj->Release();
+    }
+
+    // Cleanup
+    pEnumerator->Release();
+    pSvc->Release();
+
+    return true;
 }
 
         } // namespace ProcessUtils
