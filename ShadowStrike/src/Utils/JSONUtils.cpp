@@ -187,12 +187,12 @@ namespace ShadowStrike {
             bool LoadFromFile(const std::filesystem::path& path, Json& out, Error* err, const ParseOptions& opt, size_t maxBytes) noexcept {
                 try {
                     std::error_code ec;
-                    auto sz = std::filesystem::file_size(path, ec);
+                    uintmax_t fsz = std::filesystem::file_size(path, ec); // filesystem size (uintmax_t)
                     if (ec) {
                         setIoErr(err, "Failed to get file size", path, ec.message());
                         return false;
                     }
-                    if (sz > static_cast<uintmax_t>(maxBytes)) {
+                    if (fsz > static_cast<uintmax_t>(maxBytes)) { // first check using filesystem size
                         setIoErr(err, "File too large", path);
                         return false;
                     }
@@ -202,16 +202,67 @@ namespace ShadowStrike {
                         setIoErr(err, "Failed to open file", path);
                         return false;
                     }
+
+                    ifs.seekg(0, std::ios::end);
+                    if (!ifs) {
+                        setIoErr(err, "Failed to seek file", path);
+                        return false;
+                    }
+
+                    auto tell = ifs.tellg();
+                    if (tell < 0) {
+                        setIoErr(err, "Failed to tell file size", path);
+                        return false;
+                    }
+                    size_t fileSz = static_cast<size_t>(tell); // stream-derived size (size_t), used below
+
+                    // size validation
+                    constexpr size_t MAX_SAFE_JSON_SIZE = 100ULL * 1024 * 1024; // 100MB
+                    size_t effectiveMax = (maxBytes > 0) ? std::min(maxBytes, MAX_SAFE_JSON_SIZE) : MAX_SAFE_JSON_SIZE;
+
+                    if (fileSz > effectiveMax) {
+                        setIoErr(err, "File too large", path,
+                            "Size: " + std::to_string(fileSz) + " bytes, max: " + std::to_string(effectiveMax));
+                        return false;
+                    }
+
+                    ifs.seekg(0, std::ios::beg);
+                    if (!ifs) {
+                        setIoErr(err, "Failed to seek to beginning of file", path);
+                        return false;
+                    }
+
                     std::string buf;
-                    buf.resize(static_cast<size_t>(sz));
-                    if (sz > 0) {
-                        ifs.read(buf.data(), static_cast<std::streamsize>(sz));
-                        if (!ifs) {
+                    try {
+                        buf.resize(fileSz);
+                    }
+                    catch (const std::bad_alloc&) {
+                        setIoErr(err, "Memory allocation failed for file size", path);
+                        return false;
+                    }
+
+                    if (fileSz > 0) {
+                        ifs.read(buf.data(), static_cast<std::streamsize>(fileSz));
+
+                        // VERIFY ACTUAL BYTES READ
+                        auto bytesRead = ifs.gcount();
+                        if (!ifs && !ifs.eof()) {
                             setIoErr(err, "Failed to read file", path);
                             return false;
                         }
+
+                        if (static_cast<size_t>(bytesRead) != fileSz) {
+                            // File size changed during read
+                            setIoErr(err, "File size changed during read", path,
+                                "Expected: " + std::to_string(fileSz) + ", got: " + std::to_string(bytesRead));
+                            return false;
+                        }
+
+                        buf.resize(static_cast<size_t>(bytesRead));
                     }
+
                     stripUtf8BOM(buf);
+
                     // Parse
                     try {
                         out = Json::parse(buf, /*cb*/nullptr, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);

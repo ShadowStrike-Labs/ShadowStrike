@@ -28,7 +28,7 @@
 #include <memory>
 #include <system_error>
 #include <iomanip>
-
+#include <OleAuto.h>
 #include <processthreadsapi.h>
 #include <tchar.h>
 #include <powrprof.h>
@@ -39,7 +39,7 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "oleaut32.h")
+#pragma comment(lib, "oleaut32.lib")
 
 namespace ShadowStrike {
     namespace Utils {
@@ -745,6 +745,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         return std::nullopt;
     }
 
+    SIZE_T read = 0;
 #ifdef _WIN64
     if (isTargetWow64) {
         // Reading WOW64 process from x64 process
@@ -828,7 +829,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         };
 
         PEB_INTERNAL peb{};
-        SIZE_T read = 0;
+        
         if (!::ReadProcessMemory(ph.Get(), pbi.PebBaseAddress, &peb, sizeof(peb), &read)) {
             SetWin32Error(err, L"ReadProcessMemory(PEB)");
             return std::nullopt;
@@ -851,25 +852,72 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         }
 
         // Validate command line length (security check)
-        if (params.CommandLine.Length > 32768 || params.CommandLine.Length % 2 != 0) {
+        if (params.CommandLine.Length > 32768 || params.CommandLine.Length % sizeof(wchar_t) != 0) {
             SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_DATA,
                 L"Command line length is invalid");
             return std::nullopt;
         }
+        if (!params.CommandLine.Buffer) {
+            return std::wstring{};
+        }
 
-        std::wstring cmdLine(params.CommandLine.Length / sizeof(wchar_t), L'\0');
+        //Probe read access before allocating memory
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!::VirtualQueryEx(ph.Get(), params.CommandLine.Buffer, &mbi, sizeof(mbi))) {
+            SetWin32Error(err, L"VirtualQueryEx(CommandLine)");
+            return std::nullopt;
+        }
+
+        //Check if memory region is readable
+        if (!(mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
+                L"Command line buffer is not readable");
+            return std::nullopt;
+        }
+
+        // Check if the entire buffer is within the valid region
+        if (params.CommandLine.Length > mbi.RegionSize -
+            (reinterpret_cast<uintptr_t>(params.CommandLine.Buffer) -
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress))) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_DATA,
+                L"Command line buffer exceeds memory region");
+            return std::nullopt;
+        }
+
+
+        std::wstring cmdLine;
+        try {
+            cmdLine.resize(params.CommandLine.Length / sizeof(wchar_t), L'\0');
+        }
+        catch (const std::bad_alloc&) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_NOT_ENOUGH_MEMORY,
+                L"Memory allocation failed");
+            return std::nullopt;
+        }
+
+        //SIZE_T read = 0;
         if (!::ReadProcessMemory(ph.Get(), params.CommandLine.Buffer,
             cmdLine.data(), params.CommandLine.Length, &read)) {
             SetWin32Error(err, L"ReadProcessMemory(CommandLine)");
             return std::nullopt;
         }
 
+        // Validate actual bytes read
+        if (read != params.CommandLine.Length) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_PARTIAL_COPY,
+                L"Incomplete read of command line");
+            return std::nullopt;
+        }
+
         cmdLine.resize(params.CommandLine.Length / sizeof(wchar_t));
 
-        // Remove any null terminators and trim
-        auto nullPos = cmdLine.find(L'\0');
-        if (nullPos != std::wstring::npos) {
-            cmdLine.resize(nullPos);
+        // Sanitize: Remove any embedded nulls and validate UTF-16
+        for (size_t i = 0; i < cmdLine.size(); ++i) {
+            if (cmdLine[i] == L'\0') {
+                cmdLine.resize(i);
+                break;
+            }
         }
 
         return cmdLine;
@@ -1257,21 +1305,19 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
         return false;
     }
 
-    // Security validation: Check if DLL is signed (optional but recommended)
-    // This prevents injection of malicious unsigned DLLs in production
-    // Can be disabled for development/testing scenarios
-
-    // Open target process
+    // Open target process WITH SYNCHRONIZE for locking
     ProcessHandle ph;
     if (!ph.Open(pid, PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
-        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, err)) {
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+        SYNCHRONIZE, err)) { // ✅ SYNCHRONIZE eklendi
         return false;
     }
 
     // Architecture compatibility check
     bool isTargetWow64 = false;
     if (!IsProcessWow64Cached(ph.Get(), isTargetWow64)) {
-        SetWin32Error(err, L"InjectDLL", ERROR_INVALID_FUNCTION, L"Target process architecture failed to find.");
+        SetWin32Error(err, L"InjectDLL", ERROR_INVALID_FUNCTION,
+            L"Target process architecture failed to find.");
         return false;
     }
 
@@ -1281,7 +1327,6 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     bool isCurrentWow64 = true;
 #endif
 
-    // Prevent architecture mismatch (x64 -> x86 or vice versa without proper handling)
     if (isCurrentWow64 != isTargetWow64) {
         SetWin32Error(err, L"InjectDLL", ERROR_BAD_EXE_FORMAT,
             L"Architectures are incompatible.");
@@ -1296,10 +1341,36 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
         return false;
     }
 
-    // Check if DLL is already loaded in target process
+    // CREATE A NAMED MUTEX FOR INJECTION SYNCHRONIZATION
+    // This prevents multiple injectors from racing
+    std::wstring mutexName = L"Global\\ShadowStrike_Inject_" + std::to_wstring(pid);
+    HANDLE hMutex = ::CreateMutexW(nullptr, FALSE, mutexName.c_str());
+    if (!hMutex) {
+        SetWin32Error(err, L"CreateMutexW");
+        return false;
+    }
+
+    auto mutexGuard = make_unique_handle(hMutex);
+
+    // Wait for mutex with timeout (prevent deadlock)
+    DWORD mutexWait = ::WaitForSingleObject(hMutex, 5000); // 5 second timeout
+    if (mutexWait != WAIT_OBJECT_0) {
+        SetWin32Error(err, L"InjectDLL", ERROR_TIMEOUT,
+            L"Failed to acquire injection mutex (another injection in progress?)");
+        return false;
+    }
+
+    //  RAII mutex releaser
+    struct MutexReleaser {
+        HANDLE mutex;
+        ~MutexReleaser() { if (mutex) ::ReleaseMutex(mutex); }
+    } mutexReleaser{ hMutex };
+
+    //  NOW WE HAVE EXCLUSIVE ACCESS - CHECK AGAIN
     std::vector<ProcessModuleInfo> modules;
+    std::wstring targetDllName = BaseName(fullPath);
+
     if (EnumerateProcessModules(pid, modules, nullptr)) {
-        std::wstring targetDllName = BaseName(fullPath);
         for (const auto& mod : modules) {
             if (ToLower(mod.name) == ToLower(targetDllName)) {
                 SetWin32Error(err, L"InjectDLL", ERROR_ALREADY_EXISTS,
@@ -1309,7 +1380,7 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
         }
     }
 
-    // Allocate memory in target process for DLL path
+    //  ALLOCATE MEMORY (now under mutex protection)
     size_t pathSize = (wcslen(fullPath) + 1) * sizeof(wchar_t);
     void* remoteMemory = ::VirtualAllocEx(ph.Get(), nullptr, pathSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1319,39 +1390,39 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
         return false;
     }
 
-    // RAII wrapper for cleanup
-    auto memoryGuard = [&ph, remoteMemory]() {
-        if (remoteMemory) {
-            ::VirtualFreeEx(ph.Get(), remoteMemory, 0, MEM_RELEASE);
+    //  IMPROVED RAII wrapper with proper cleanup
+    struct MemoryGuard {
+        HANDLE process;
+        void* memory;
+        ~MemoryGuard() {
+            if (memory && process) {
+                ::VirtualFreeEx(process, memory, 0, MEM_RELEASE);
+            }
         }
-        };
+    } memGuard{ ph.Get(), remoteMemory };
 
     // Write DLL path to remote process
     SIZE_T written = 0;
     if (!::WriteProcessMemory(ph.Get(), remoteMemory, fullPath, pathSize, &written) ||
         written != pathSize) {
         SetWin32Error(err, L"WriteProcessMemory");
-        memoryGuard();
         return false;
     }
 
-    // Get address of LoadLibraryW in kernel32.dll
-    // This is safe because kernel32.dll is loaded at the same address in all processes
+    // Get address of LoadLibraryW
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32) {
         SetWin32Error(err, L"GetModuleHandleW(kernel32.dll)");
-        memoryGuard();
         return false;
     }
 
     FARPROC loadLibraryAddr = GetProcAddress(hKernel32, "LoadLibraryW");
     if (!loadLibraryAddr) {
         SetWin32Error(err, L"GetProcAddress(LoadLibraryW)");
-        memoryGuard();
         return false;
     }
 
-    // Create remote thread to execute LoadLibraryW
+    // Create remote thread
     HANDLE hThread = ::CreateRemoteThread(
         ph.Get(),
         nullptr,
@@ -1364,58 +1435,65 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
 
     if (!hThread) {
         SetWin32Error(err, L"CreateRemoteThread");
-        memoryGuard();
         return false;
     }
 
     auto threadGuard = make_unique_handle(hThread);
 
-    // Wait for the thread to complete (with timeout)
-    DWORD waitResult = WaitForSingleObject(hThread, 10000); // 10 second timeout
+    // Wait for thread completion
+    DWORD waitResult = WaitForSingleObject(hThread, 10000);
     if (waitResult != WAIT_OBJECT_0) {
         if (waitResult == WAIT_TIMEOUT) {
+            //  TRY TO TERMINATE HUNG THREAD
+            ::TerminateThread(hThread, ERROR_TIMEOUT);
             SetWin32Error(err, L"InjectDLL", ERROR_TIMEOUT,
-                L"DLL loading process have been timed out.");
+                L"DLL loading process timed out.");
         }
         else {
             SetWin32Error(err, L"WaitForSingleObject");
         }
-        memoryGuard();
         return false;
     }
 
-    // Get thread exit code (HMODULE of loaded DLL or NULL on failure)
+    // Get thread exit code
     DWORD exitCode = 0;
     if (!GetExitCodeThread(hThread, &exitCode)) {
         SetWin32Error(err, L"GetExitCodeThread");
-        memoryGuard();
         return false;
     }
-
-    // Clean up allocated memory
-    memoryGuard();
 
     // Check if LoadLibrary succeeded
     if (exitCode == 0) {
         SetWin32Error(err, L"InjectDLL", ERROR_MOD_NOT_FOUND,
-            L"LoadLibraryW is failed at the target process. DLL's might be missing.");
+            L"LoadLibraryW failed in target process. DLL dependencies might be missing.");
         return false;
     }
 
-    // Verify DLL is now loaded
-    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Brief delay for module list refresh
+    //  FINAL VERIFICATION (still under mutex)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    bool verified = false;
     if (EnumerateProcessModules(pid, modules, nullptr)) {
-        std::wstring targetDllName = BaseName(fullPath);
         for (const auto& mod : modules) {
             if (ToLower(mod.name) == ToLower(targetDllName)) {
-                return true; // Success
+                // ADDITIONAL CHECK: Verify base address matches HMODULE returned
+                if (reinterpret_cast<uintptr_t>(mod.baseAddress) ==
+                    static_cast<uintptr_t>(exitCode)) {
+                    verified = true;
+                    break;
+                }
             }
         }
     }
 
-    SetWin32Error(err, L"InjectDLL", ERROR_MOD_NOT_FOUND,
-        L"DLL is loaded but failed to find the Module");
-    return false;
+    if (!verified) {
+        SetWin32Error(err, L"InjectDLL", ERROR_MOD_NOT_FOUND,
+            L"DLL loaded but verification failed (possible race condition detected)");
+        return false;
+    }
+
+    //  SUCCESS - Mutex will be released by RAII
+    return true;
 }
 
 bool EjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {

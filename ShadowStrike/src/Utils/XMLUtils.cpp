@@ -100,8 +100,25 @@ namespace ShadowStrike {
                             std::string idxStr = s.name.substr(lb + 1, rb - (lb + 1));
                             bool allDigits = !idxStr.empty() && std::all_of(idxStr.begin(), idxStr.end(), isDigit);
                             if (allDigits) {
-                                s.hasIndex = true;
-								s.index = static_cast<size_t>(std::stoull(idxStr)); // 0-based
+                                try {
+                                    unsigned long long idx = std::stoull(idxStr);
+									// Max index limit to prevent DoS attack
+                                    constexpr size_t MAX_INDEX = 100000;
+                                    if (idx > MAX_INDEX) {
+                                        // invalid index, skip it
+                                        continue;
+                                    }
+                                    s.hasIndex = true;
+                                    s.index = static_cast<size_t>(idx);
+                                }
+                                catch (const std::out_of_range&) {
+                                    // Index is too large, skip it
+                                    continue;
+                                }
+                                catch (const std::invalid_argument&) {
+                                    // invalid format , skip it
+                                    continue;
+                                }
                             }
                             s.name = s.name.substr(0, lb);
                         }
@@ -231,7 +248,8 @@ namespace ShadowStrike {
                         setIoErr(err, "Failed to get file size", path, ec.message());
                         return false;
                     }
-                    if (sz > static_cast<uintmax_t>(maxBytes)) {
+					constexpr uintmax_t MAX_SAFE_XML_SIZE = 512ULL * 1024 * 1024; // 512MB
+                    if (sz > MAX_SAFE_XML_SIZE) {
                         setIoErr(err, "File too large", path);
                         return false;
                     }
@@ -241,7 +259,12 @@ namespace ShadowStrike {
                         return false;
                     }
                     std::string buf;
-                    buf.resize(static_cast<size_t>(sz));
+                    try {
+                        buf.resize(static_cast<size_t>(sz));
+                    }catch(const std::bad_alloc&) {
+                        setIoErr(err, "Memory allocation failed for file size", path);
+                        return false;
+					}
                     if (sz > 0) {
                         ifs.read(buf.data(), static_cast<std::streamsize>(sz));
                         if (!ifs) {
@@ -472,6 +495,12 @@ namespace ShadowStrike {
                                     // count existing and add until reaching s.index
                                     size_t cnt = 0;
                                     for (Node child = parent.child(s.name.c_str()); child; child = child.next_sibling(s.name.c_str())) ++cnt;
+									if (cnt > 100000) return false; // prevent infinite loop from malformed XML
+
+                                    constexpr size_t MAX_XML_ARRAY_SIZE = 10000;
+									if (s.index > MAX_XML_ARRAY_SIZE) return false; //Maximum array size protection
+
+                                    if (s.index - cnt > 1000) return false; //Too many nodes to create at once.
                                     for (; cnt <= s.index; ++cnt) parent.append_child(s.name.c_str());
                                     // find again
                                     size_t idx = 0;

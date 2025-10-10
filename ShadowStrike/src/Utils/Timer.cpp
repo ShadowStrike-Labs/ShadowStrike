@@ -93,51 +93,191 @@ namespace ShadowStrike {
 
 
         void TimerManager::managerThread() {
-            while (!m_shutdown.load()) {
-                std::unique_lock<std::mutex> lock(m_mutex);
+            SS_LOG_INFO(L"TimerManager", L"Manager thread started");
 
-                if (m_taskQueue.empty()) {
-					//if the queue is empty, wait until a new task is added or shutdown is signaled
-                    m_cv.wait(lock, [this] { return m_shutdown.load() || !m_taskQueue.empty(); });
-                }
-                else {
-                    auto nextExecutionTime = m_taskQueue.top().nextExecutionTime;
-                    auto now = std::chrono::steady_clock::now();
+            // ENTIRE THREAD WRAPPED IN TRY-CATCH
+            try {
+                while (!m_shutdown.load(std::memory_order_acquire)) {
+                    std::unique_lock<std::mutex> lock(m_mutex);
 
-                    if (now >= nextExecutionTime) {
-						// Get the task to execute
-                        TimerTask task = m_taskQueue.top();
-                        m_taskQueue.pop();
-						lock.unlock(); //send the task to threadpool by unlocking the mutex
-
-						//Send the task to threadpool
-                        m_threadPool->submit([callback = task.callback]() {
-                            try {
-                                callback();
-                            }
-                            catch (const std::exception& e) {
-                                SS_LOG_ERROR(L"TimerManager", L"Exception in timer callback: %hs", e.what());
-                            }
-                            catch (...) {
-                                SS_LOG_ERROR(L"TimerManager", L"Unknown exception in timer callback.");
-                            }
+                    // WAIT WITH PROPER SPURIOUS WAKEUP HANDLING
+                    if (m_taskQueue.empty()) {
+                        m_cv.wait(lock, [this]() {
+                            return m_shutdown.load(std::memory_order_acquire) ||
+                                !m_taskQueue.empty();
                             });
 
-                        lock.lock(); //Get the mutex again.
-                        if (task.isPeriodic) {
-							// If its periodic, calculate the other execution time and re-add to the queue.
-                            task.nextExecutionTime += task.interval;
-                            m_taskQueue.push(task);
+                        if (m_shutdown.load(std::memory_order_acquire)) {
+                            break; // Exit cleanly on shutdown
+                        }
+
+                        continue;
+                    }
+
+                    auto now = std::chrono::steady_clock::now();
+
+                    // PEEK AT TOP TASK (don't pop yet - might change)
+                    TimerTask nextTask = m_taskQueue.top();
+
+                    // CHECK IF TASK IS DUE
+                    if (nextTask.nextExecutionTime > now) {
+                        auto waitTime = nextTask.nextExecutionTime - now;
+
+                        // LIMIT MAXIMUM WAIT TIME (prevent issues if system clock changes)
+                        constexpr auto MAX_WAIT = std::chrono::minutes(5);
+                        if (waitTime > MAX_WAIT) {
+                            waitTime = MAX_WAIT;
+                            SS_LOG_WARN(L"TimerManager",
+                                L"Task %llu wait time exceeds 5 minutes, capping to max",
+                                static_cast<unsigned long long>(nextTask.id));
+                        }
+
+                        // WAIT UNTIL DUE TIME OR SHUTDOWN/QUEUE CHANGE
+                        auto waitResult = m_cv.wait_until(lock, nextTask.nextExecutionTime, [this, nextTask]() {
+                            return m_shutdown.load(std::memory_order_acquire) ||
+                                m_taskQueue.empty() ||
+                                m_taskQueue.top().nextExecutionTime < nextTask.nextExecutionTime;
+                            });
+
+                        if (m_shutdown.load(std::memory_order_acquire)) {
+                            break; // Shutdown requested
+                        }
+
+                        // RE-CHECK AFTER WAKE (queue might have changed)
+                        now = std::chrono::steady_clock::now();
+                        if (m_taskQueue.empty()) {
+                            continue; // Queue was cleared, restart loop
+                        }
+
+                        // RE-PEEK (different task might be on top now)
+                        TimerTask currentTop = m_taskQueue.top();
+                        if (currentTop.id != nextTask.id) {
+                            // Different task is now on top, restart loop
+                            continue;
+                        }
+
+                        if (currentTop.nextExecutionTime > now) {
+                            // Still not due, wait again
+                            continue;
+                        }
+
+                        // Task is due, proceed to execution
+                        nextTask = currentTop;
+                    }
+
+                    // NOW POP THE TASK (it's definitely due)
+                    m_taskQueue.pop();
+
+                    // RELEASE LOCK BEFORE EXECUTION (prevent blocking other operations)
+                    lock.unlock();
+
+                    // EXECUTE CALLBACK IN THREAD POOL
+                    if (m_threadPool) {
+                        try {
+                            m_threadPool->submit([task = std::move(nextTask), this]() mutable {
+                                try {
+                                    task.callback();
+                                }
+                                catch (const std::bad_alloc& e) {
+                                    SS_LOG_ERROR(L"TimerManager",
+                                        L"Timer callback %llu threw bad_alloc: %hs",
+                                        static_cast<unsigned long long>(task.id), e.what());
+                                }
+                                catch (const std::runtime_error& e) {
+                                    SS_LOG_ERROR(L"TimerManager",
+                                        L"Timer callback %llu threw runtime_error: %hs",
+                                        static_cast<unsigned long long>(task.id), e.what());
+                                }
+                                catch (const std::exception& e) {
+                                    SS_LOG_ERROR(L"TimerManager",
+                                        L"Timer callback %llu threw exception: %hs",
+                                        static_cast<unsigned long long>(task.id), e.what());
+                                }
+                                catch (...) {
+                                    SS_LOG_ERROR(L"TimerManager",
+                                        L"Timer callback %llu threw unknown exception",
+                                        static_cast<unsigned long long>(task.id));
+                                }
+                                });
+                        }
+                        catch (const std::exception& e) {
+                            SS_LOG_ERROR(L"TimerManager",
+                                L"Failed to submit timer task %llu to thread pool: %hs",
+                                static_cast<unsigned long long>(nextTask.id), e.what());
+
+                            // FALLBACK: Execute directly if thread pool submission fails
+                            try {
+                                nextTask.callback();
+                            }
+                            catch (...) {
+                                SS_LOG_ERROR(L"TimerManager",
+                                    L"Timer callback %llu failed in fallback execution",
+                                    static_cast<unsigned long long>(nextTask.id));
+                            }
                         }
                     }
                     else {
-                        //Wait until the next tasks's execution time.
-                        m_cv.wait_until(lock, nextExecutionTime, [this, nextExecutionTime] {
-                            return m_shutdown.load() || m_taskQueue.empty() || m_taskQueue.top().nextExecutionTime < nextExecutionTime;
-                            });
+                        // NO THREAD POOL: Execute directly (blocking, but necessary)
+                        SS_LOG_WARN(L"TimerManager", L"No thread pool available, executing timer %llu directly",
+                            static_cast<unsigned long long>(nextTask.id));
+
+                        try {
+                            nextTask.callback();
+                        }
+                        catch (const std::exception& e) {
+                            SS_LOG_ERROR(L"TimerManager",
+                                L"Timer callback %llu threw exception: %hs",
+                                static_cast<unsigned long long>(nextTask.id), e.what());
+                        }
+                        catch (...) {
+                            SS_LOG_ERROR(L"TimerManager",
+                                L"Timer callback %llu threw unknown exception",
+                                static_cast<unsigned long long>(nextTask.id));
+                        }
                     }
+
+                    // RE-ACQUIRE LOCK FOR PERIODIC TASK RE-SCHEDULING
+                    lock.lock();
+
+                    if (nextTask.isPeriodic && !m_shutdown.load(std::memory_order_acquire)) {
+                        // CALCULATE NEXT EXECUTION TIME
+                        auto newExecutionTime = std::chrono::steady_clock::now() + nextTask.interval;
+
+                        // PROTECT AGAINST CLOCK SKEW
+                        if (newExecutionTime < nextTask.nextExecutionTime) {
+                            SS_LOG_WARN(L"TimerManager",
+                                L"Clock skew detected for timer %llu, adjusting",
+                                static_cast<unsigned long long>(nextTask.id));
+                            newExecutionTime = nextTask.nextExecutionTime + nextTask.interval;
+                        }
+
+                        nextTask.nextExecutionTime = newExecutionTime;
+
+                        // RE-INSERT INTO QUEUE
+                        m_taskQueue.push(nextTask);
+
+                        SS_LOG_DEBUG(L"TimerManager",
+                            L"Periodic timer %llu rescheduled for next execution",
+                            static_cast<unsigned long long>(nextTask.id));
+                    }
+
+                    lock.unlock();
+
+                    // YIELD TO PREVENT CPU SPINNING
+                    std::this_thread::yield();
                 }
+
             }
+            catch (const std::exception& e) {
+                SS_LOG_ERROR(L"TimerManager",
+                    L"CRITICAL: Manager thread crashed: %hs", e.what());
+            }
+            catch (...) {
+                SS_LOG_ERROR(L"TimerManager",
+                    L"CRITICAL: Manager thread crashed with unknown exception");
+            }
+
+            SS_LOG_INFO(L"TimerManager", L"Manager thread stopped");
         }
 
 

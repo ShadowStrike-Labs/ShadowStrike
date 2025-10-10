@@ -174,7 +174,7 @@ namespace ShadowStrike {
 
 			Hasher::Hasher(Algorithm alg) noexcept : m_alg(alg), m_hashLen(DigestSize(alg)) {}
 
-			Hasher::~Hasher() {
+			Hasher::~Hasher(){
 				resetState();
 			}
 
@@ -187,12 +187,13 @@ namespace ShadowStrike {
 				}
 				if (m_objBuf) {
 					SecureZeroMemory(m_objBuf, m_objLen);
-					free(m_objBuf);
+					delete[] static_cast<uint8_t*>(m_objBuf);
 					m_objBuf = nullptr;
 				}
 				m_objLen = 0;
-#endif
 				m_inited = false;
+#endif
+			
 			}
 
 

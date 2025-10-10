@@ -555,6 +555,7 @@ namespace ShadowStrike {
 				return IsAEADAlg(m_algorithm);
 			}
 
+			// BCrypt'in kendi padding sistemini kullan
 			bool SymmetricCipher::Encrypt(const uint8_t* plaintext, size_t plaintextLen,
 				std::vector<uint8_t>& ciphertext, Error* err) noexcept
 			{
@@ -567,35 +568,55 @@ namespace ShadowStrike {
 					return false;
 				}
 
-#ifdef _WIN32
-				std::vector<uint8_t> inputData(plaintext, plaintext + plaintextLen);
+				// Input validation
+				if (!plaintext && plaintextLen != 0) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid input"; }
+					return false;
+				}
 
-				if (m_paddingMode != PaddingMode::None && !IsAEAD()) {
-					if (!applyPadding(inputData, GetBlockSize())) {
-						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Padding failed"; }
-						return false;
+				// For AEAD modes, use separate function
+				if (IsAEAD()) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Use EncryptAEAD for AEAD modes";
 					}
+					return false;
+				}
+#ifdef _WIN32
+				DWORD flags = 0;
+
+				// BCrypt'in padding desteği varsa kullan
+				if (m_paddingMode == PaddingMode::PKCS7) {
+					flags = BCRYPT_BLOCK_PADDING; // BCrypt PKCS7 padding'i kendi yapar
 				}
 
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptEncrypt(m_keyHandle,
-					inputData.data(), static_cast<ULONG>(inputData.size()),
+					const_cast<uint8_t*>(plaintext), static_cast<ULONG>(plaintextLen),
 					nullptr,
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
-					nullptr, 0, &cbResult, 0);
+					nullptr, 0, &cbResult, flags);
+
 				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt size query failed"; }
+					if (err) {
+						err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"BCryptEncrypt size query failed";
+					}
 					return false;
 				}
 
 				ciphertext.resize(cbResult);
 				st = BCryptEncrypt(m_keyHandle,
-					inputData.data(), static_cast<ULONG>(inputData.size()),
+					const_cast<uint8_t*>(plaintext), static_cast<ULONG>(plaintextLen),
 					nullptr,
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
-					ciphertext.data(), static_cast<ULONG>(ciphertext.size()), &cbResult, 0);
+					ciphertext.data(), static_cast<ULONG>(ciphertext.size()), &cbResult, flags);
+
 				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt failed"; }
+					if (err) {
+						err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"BCryptEncrypt failed";
+					}
 					return false;
 				}
 
@@ -1095,32 +1116,53 @@ namespace ShadowStrike {
 			bool SymmetricCipher::applyPadding(std::vector<uint8_t>& data, size_t blockSize) noexcept {
 				if (blockSize == 0 || m_paddingMode == PaddingMode::None) return true;
 
+				//Validate block size
+				if (blockSize > 256) {
+					SS_LOG_ERROR(L"CryptoUtils", L"Invalid block size : %zu", blockSize);
+					return false;
+				}
 				const size_t remainder = data.size() % blockSize;
 				const size_t padLen = blockSize - remainder;
 
-				switch (m_paddingMode) {
-				case PaddingMode::PKCS7: {
-					const uint8_t padByte = static_cast<uint8_t>(padLen);
-					data.insert(data.end(), padLen, padByte);
-					break;
+				if(padLen == 0 || padLen > blockSize) {
+					SS_LOG_ERROR(L"CryptoUtils", L"Invalid padding length : %zu", padLen);
+					return false;
 				}
-				case PaddingMode::Zeros:
-					data.insert(data.end(), padLen, 0x00);
-					break;
-				case PaddingMode::ANSIX923: {
-					data.insert(data.end(), padLen - 1, 0x00);
-					data.push_back(static_cast<uint8_t>(padLen));
-					break;
+
+				//check for size overflow before resize
+				if (data.size() > SIZE_MAX - padLen) {
+					SS_LOG_ERROR(L"CryptoUtils", L"Data size overflow in padding");
+					return false;
 				}
-				case PaddingMode::ISO10126: {
-					SecureRandom rng;
-					std::vector<uint8_t> randBytes;
-					if (!rng.Generate(randBytes, padLen - 1, nullptr)) return false;
-					data.insert(data.end(), randBytes.begin(), randBytes.end());
-					data.push_back(static_cast<uint8_t>(padLen));
-					break;
+				try {
+					switch (m_paddingMode) {
+					case PaddingMode::PKCS7: {
+						const uint8_t padByte = static_cast<uint8_t>(padLen);
+						data.insert(data.end(), padLen, padByte);
+						break;
+					}
+					case PaddingMode::Zeros:
+						data.insert(data.end(), padLen, 0x00);
+						break;
+					case PaddingMode::ANSIX923: {
+						data.insert(data.end(), padLen - 1, 0x00);
+						data.push_back(static_cast<uint8_t>(padLen));
+						break;
+					}
+					case PaddingMode::ISO10126: {
+						SecureRandom rng;
+						std::vector<uint8_t> randBytes;
+						if (!rng.Generate(randBytes, padLen - 1, nullptr)) return false;
+						data.insert(data.end(), randBytes.begin(), randBytes.end());
+						data.push_back(static_cast<uint8_t>(padLen));
+						break;
+					}
+					default:
+						return false;
+					}
 				}
-				default:
+				catch (const std::bad_alloc&) {
+					SS_LOG_ERROR(L"CryptoUtils", L"Memory allocation failed during padding");
 					return false;
 				}
 

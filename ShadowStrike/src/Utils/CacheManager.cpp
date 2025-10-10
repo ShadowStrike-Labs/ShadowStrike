@@ -13,6 +13,41 @@
 namespace ShadowStrike {
 	namespace Utils {
 
+        namespace {
+
+            // Convert system_clock::time_point to FILETIME (100ns ticks)
+            uint64_t TimePointToFileTime(const std::chrono::system_clock::time_point& tp) {
+                auto duration = tp.time_since_epoch();
+                auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+
+                // Convert to 100ns intervals (Windows epoch is 1601, Unix is 1970)
+                // Add 116444736000000000 to convert from Unix epoch to Windows epoch
+                constexpr uint64_t EPOCH_DIFF = 116444736000000000ULL;
+                uint64_t filetime = static_cast<uint64_t>(microseconds) * 10ULL + EPOCH_DIFF;
+
+                return filetime;
+            }
+
+            // Convert FILETIME (100ns ticks) back to system_clock::time_point
+            std::chrono::system_clock::time_point FileTimeToTimePoint(uint64_t filetime) {
+                if (filetime == 0) {
+                    return std::chrono::system_clock::time_point{};
+                }
+
+                constexpr uint64_t EPOCH_DIFF = 116444736000000000ULL;
+
+                if (filetime < EPOCH_DIFF) {
+                    return std::chrono::system_clock::time_point{};
+                }
+
+                uint64_t unix_time_100ns = filetime - EPOCH_DIFF;
+                auto microseconds = std::chrono::microseconds(unix_time_100ns / 10ULL);
+
+                return std::chrono::system_clock::time_point(microseconds);
+            }
+
+        }
+
         // ---- Bcrypt dynamic resolve (SHA-256) ----
         struct BcryptApi {
             HMODULE h = nullptr;
@@ -79,6 +114,9 @@ namespace ShadowStrike {
 
         CacheManager::CacheManager() {
             InitializeSRWLock(&m_lock);
+            //initialize atomic timestamp
+            auto now = std::chrono::system_clock::now();
+            m_lastMaint.store(TimePointToFileTime(now), std::memory_order_release);
         }
 
         CacheManager::~CacheManager() {
@@ -159,33 +197,79 @@ namespace ShadowStrike {
             if (key.empty()) return false;
             if (!data && size != 0) return false;
 
+            // MAXIMUM KEY SIZE CHECK
+            constexpr size_t MAX_KEY_SIZE = 4096; // 4KB max key size
+            if (key.size() * sizeof(wchar_t) > MAX_KEY_SIZE) {
+                SS_LOG_ERROR(L"CacheManager", L"Key too large: %zu bytes", key.size() * sizeof(wchar_t));
+                return false;
+            }
+
+            // MAXIMUM VALUE SIZE CHECK
+            constexpr size_t MAX_VALUE_SIZE = 100ULL * 1024 * 1024; // 100MB
+            if (size > MAX_VALUE_SIZE) {
+                SS_LOG_ERROR(L"CacheManager", L"Value too large: %zu bytes", size);
+                return false;
+            }
+
             FILETIME now = nowFileTime();
 
-            // expire = now + ttl
+            // Calculate expiration time with overflow protection
             ULARGE_INTEGER ua{}, ub{};
             ua.LowPart = now.dwLowDateTime;
             ua.HighPart = now.dwHighDateTime;
-            const uint64_t delta100ns = static_cast<uint64_t>(ttl.count()) * 10000ULL; // ms -> 100ns
+
+            const uint64_t delta100ns = static_cast<uint64_t>(ttl.count()) * 10000ULL;
+
+            // CHECK FOR OVERFLOW BEFORE ADDITION
+            if (ua.QuadPart > ULLONG_MAX - delta100ns) {
+                SS_LOG_ERROR(L"CacheManager", L"TTL causes timestamp overflow");
+                return false;
+            }
+
             ub.QuadPart = ua.QuadPart + delta100ns;
+
             FILETIME expire{};
             expire.dwLowDateTime = ub.LowPart;
             expire.dwHighDateTime = ub.HighPart;
 
             std::shared_ptr<Entry> e = std::make_shared<Entry>();
             e->key = key;
-            e->value.assign(data, data + size);
+
+            try {
+                e->value.assign(data, data + size);
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"CacheManager", L"Memory allocation failed for cache entry");
+                return false;
+            }
+
             e->expire = expire;
             e->ttl = ttl;
             e->sliding = sliding;
             e->persistent = persistent;
-            e->sizeBytes = e->value.size();
 
+            // PROPER SIZE CALCULATION (key + value + overhead)
+            e->sizeBytes = (key.size() * sizeof(wchar_t)) + e->value.size() + sizeof(Entry);
+
+            // CHECK TOTAL CACHE SIZE BEFORE INSERT
             {
                 SRWExclusive g(m_lock);
 
+                // Check if adding this entry would exceed max bytes
+                if (m_maxBytes > 0 && (m_totalBytes + e->sizeBytes) > m_maxBytes) {
+                    // Try to evict enough entries
+                    evictIfNeeded_NoLock();
+
+                    // Still too large?
+                    if ((m_totalBytes + e->sizeBytes) > m_maxBytes) {
+                        SS_LOG_WARN(L"CacheManager", L"Cache full, cannot add entry: %ls", key.c_str());
+                        return false;
+                    }
+                }
+
                 auto it = m_map.find(key);
                 if (it != m_map.end()) {
-                    // replace existing
+                    // Replace existing
                     m_totalBytes -= it->second->sizeBytes;
                     m_lru.erase(it->second->lruIt);
                     m_map.erase(it);
@@ -213,15 +297,19 @@ namespace ShadowStrike {
             if (key.empty()) return false;
 
             FILETIME now = nowFileTime();
+            bool needsPersist = false;
+            std::shared_ptr<Entry> entryToUpdate;
 
             {
-                SRWExclusive g(m_lock); // exclusive for LRU touch
+                SRWExclusive g(m_lock);
 
                 auto it = m_map.find(key);
                 if (it != m_map.end()) {
                     std::shared_ptr<Entry> e = it->second;
+
+                    // Check if expired
                     if (isExpired_NoLock(*e, now)) {
-                        // remove expired
+                        // Remove expired entry
                         m_totalBytes -= e->sizeBytes;
                         m_lru.erase(e->lruIt);
                         m_map.erase(it);
@@ -231,37 +319,64 @@ namespace ShadowStrike {
                         return false;
                     }
 
-					//Longer the expire for sliding entries
+                    // UPDATE SLIDING EXPIRATION
                     if (e->sliding && e->ttl.count() > 0) {
                         ULARGE_INTEGER ua{}, ub{};
-                        ua.LowPart = now.dwLowDateTime; ua.HighPart = now.dwHighDateTime;
-                        ub.QuadPart = ua.QuadPart + static_cast<uint64_t>(e->ttl.count()) * 10000ULL;
-                        e->expire.dwLowDateTime = ub.LowPart;
-                        e->expire.dwHighDateTime = ub.HighPart;
+                        ua.LowPart = now.dwLowDateTime;
+                        ua.HighPart = now.dwHighDateTime;
+
+                        const uint64_t delta100ns = static_cast<uint64_t>(e->ttl.count()) * 10000ULL;
+
+                        // Check overflow
+                        if (ua.QuadPart <= ULLONG_MAX - delta100ns) {
+                            ub.QuadPart = ua.QuadPart + delta100ns;
+                            e->expire.dwLowDateTime = ub.LowPart;
+                            e->expire.dwHighDateTime = ub.HighPart;
+
+                            // MARK FOR PERSISTENCE UPDATE
+                            if (e->persistent) {
+                                needsPersist = true;
+                                entryToUpdate = e; // Keep shared_ptr alive
+                            }
+                        }
                     }
 
+                    // Copy data BEFORE releasing lock
                     outData = e->value;
                     touchLRU_NoLock(key, e);
-                    return true;
+
+                    // DON'T RETURN YET - need to persist outside lock
+                }
+            } // RELEASE LOCK HERE
+
+            // PERSIST OUTSIDE OF LOCK (prevents deadlock)
+            if (needsPersist && entryToUpdate) {
+                if (!persistWrite(key, *entryToUpdate)) {
+                    SS_LOG_WARN(L"CacheManager", L"Failed to update sliding expiration on disk: %ls", key.c_str());
                 }
             }
 
-			// not found in memory, try disk if persistent
+            // IF WE GOT DATA FROM MEMORY, RETURN SUCCESS
+            if (!outData.empty()) {
+                return true;
+            }
+
+            // NOT IN MEMORY - TRY DISK
             Entry diskEntry;
             if (persistRead(key, diskEntry)) {
-                //is it expired?
                 FILETIME now2 = nowFileTime();
                 if (isExpired_NoLock(diskEntry, now2)) {
                     persistRemoveByKey(key);
                     return false;
                 }
 
-                //Put to the memory
+                // Put back to memory
                 std::shared_ptr<Entry> e = std::make_shared<Entry>(std::move(diskEntry));
                 {
                     SRWExclusive g(m_lock);
                     auto it2 = m_map.find(key);
                     if (it2 != m_map.end()) {
+                        // Already loaded by another thread
                         m_totalBytes -= it2->second->sizeBytes;
                         m_lru.erase(it2->second->lruIt);
                         m_map.erase(it2);
@@ -374,7 +489,9 @@ namespace ShadowStrike {
             s.totalBytes = m_totalBytes;
             s.maxEntries = m_maxEntries;
             s.maxBytes = m_maxBytes;
-            s.lastMaintenance = m_lastMaint;
+            uint64_t timestamp = m_lastMaint.load(std::memory_order_acquire);
+            s.lastMaintenance = FileTimeToTimePoint(timestamp);
+
             return s;
         }
 
@@ -401,11 +518,15 @@ namespace ShadowStrike {
                 SRWExclusive g(m_lock);
                 removeExpired_NoLock(removed);
                 evictIfNeeded_NoLock();
-                m_lastMaint = std::chrono::system_clock::now();
+
+                // STORE CURRENT TIME AS ATOMIC
+                auto nowTimePoint = std::chrono::system_clock::now();
+                uint64_t timestamp = TimePointToFileTime(nowTimePoint);
+                m_lastMaint.store(timestamp, std::memory_order_release);
             }
 
+            // Delete from disk if persistent
             if (!removed.empty()) {
-				//Delete from disk if its even persistent
                 for (const auto& k : removed) {
                     persistRemoveByKey(k);
                 }
@@ -622,89 +743,140 @@ namespace ShadowStrike {
                 FILE_SHARE_READ | FILE_SHARE_DELETE,
                 nullptr,
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, // Sequential hint
                 nullptr);
+
             if (h == INVALID_HANDLE_VALUE) {
-                //File could not exist
                 return false;
             }
+
+            // RAII handle wrapper
+            auto handleGuard = [h]() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); };
+            struct HandleRAII {
+                HANDLE h;
+                ~HandleRAII() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+            } hGuard{ h };
 
             CacheFileHeader hdr{};
             DWORD read = 0;
-            BOOL ok = ReadFile(h, &hdr, sizeof(hdr), &read, nullptr);
-            if (!ok || read != sizeof(hdr)) {
+
+            if (!ReadFile(h, &hdr, sizeof(hdr), &read, nullptr) || read != sizeof(hdr)) {
                 SS_LOG_LAST_ERROR(L"CacheManager", L"ReadFile header failed");
-                CloseHandle(h);
                 return false;
             }
 
-            if (hdr.magic != kCacheMagic || hdr.version != kCacheVersion) {
-                SS_LOG_WARN(L"CacheManager", L"Invalid cache header for %ls", finalPath.c_str());
-                CloseHandle(h);
+            //VALIDATE MAGIC AND VERSION
+            if (hdr.magic != kCacheMagic) {
+                SS_LOG_WARN(L"CacheManager", L"Invalid magic in cache file: %ls (got 0x%08X, expected 0x%08X)",
+                    finalPath.c_str(), hdr.magic, kCacheMagic);
                 return false;
             }
 
-            if (hdr.keyBytes > (16u * 1024u)) { //Security limit
-                SS_LOG_WARN(L"CacheManager", L"Key too large in cache file: %ls", finalPath.c_str());
-                CloseHandle(h);
+            if (hdr.version != kCacheVersion) {
+                SS_LOG_WARN(L"CacheManager", L"Unsupported version in cache file: %ls (got %u, expected %u)",
+                    finalPath.c_str(), hdr.version, kCacheVersion);
                 return false;
             }
 
+            // STRICTER KEY SIZE VALIDATION
+            constexpr uint32_t MAX_KEY_BYTES = 8192; // 8KB max (4K wchar_t)
+            if (hdr.keyBytes == 0 || hdr.keyBytes > MAX_KEY_BYTES) {
+                SS_LOG_WARN(L"CacheManager", L"Invalid key size in cache file: %ls (%u bytes)",
+                    finalPath.c_str(), hdr.keyBytes);
+                return false;
+            }
+
+            // CHECK IF keyBytes IS MULTIPLE OF sizeof(wchar_t)
+            if (hdr.keyBytes % sizeof(wchar_t) != 0) {
+                SS_LOG_WARN(L"CacheManager", L"Key size not aligned to wchar_t: %ls (%u bytes)",
+                    finalPath.c_str(), hdr.keyBytes);
+                return false;
+            }
+
+            // VALUE SIZE VALIDATION
+            constexpr uint64_t MAX_VALUE_BYTES = 100ULL * 1024 * 1024; // 100MB
+            if (hdr.valueBytes > MAX_VALUE_BYTES) {
+                SS_LOG_WARN(L"CacheManager", L"Value too large in cache file: %ls (%llu bytes)",
+                    finalPath.c_str(), hdr.valueBytes);
+                return false;
+            }
+
+            //TOTAL FILE SIZE VALIDATION
+            LARGE_INTEGER fileSize{};
+            if (!GetFileSizeEx(h, &fileSize)) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"GetFileSizeEx failed");
+                return false;
+            }
+
+            const uint64_t expectedSize = sizeof(CacheFileHeader) +
+                static_cast<uint64_t>(hdr.keyBytes) +
+                hdr.valueBytes;
+
+            if (static_cast<uint64_t>(fileSize.QuadPart) < expectedSize) {
+                SS_LOG_WARN(L"CacheManager", L"File too small (possible truncation): %ls", finalPath.c_str());
+                return false;
+            }
+
+            // Read key
             std::vector<wchar_t> keyBuf;
-            keyBuf.resize(hdr.keyBytes / sizeof(wchar_t));
+            try {
+                keyBuf.resize(hdr.keyBytes / sizeof(wchar_t));
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"CacheManager", L"Memory allocation failed for key buffer");
+                return false;
+            }
+
             read = 0;
             if (hdr.keyBytes > 0) {
-                ok = ReadFile(h, keyBuf.data(), hdr.keyBytes, &read, nullptr);
-                if (!ok || read != hdr.keyBytes) {
+                if (!ReadFile(h, keyBuf.data(), hdr.keyBytes, &read, nullptr) || read != hdr.keyBytes) {
                     SS_LOG_LAST_ERROR(L"CacheManager", L"ReadFile key failed");
-                    CloseHandle(h);
                     return false;
                 }
             }
 
-            // Verify key 
+            // VERIFY KEY MATCHES
             if (key.size() != keyBuf.size() ||
                 (hdr.keyBytes > 0 && wmemcmp(key.data(), keyBuf.data(), keyBuf.size()) != 0)) {
-                
                 SS_LOG_WARN(L"CacheManager", L"Key mismatch for cache file: %ls", finalPath.c_str());
-                CloseHandle(h);
                 return false;
             }
 
-            if (hdr.valueBytes > (1ull << 31)) {
-                SS_LOG_WARN(L"CacheManager", L"Value too large in cache file: %ls", finalPath.c_str());
-                CloseHandle(h);
-                return false;
-            }
-
+            // Read value
             std::vector<uint8_t> value;
-            value.resize(static_cast<size_t>(hdr.valueBytes));
+            try {
+                value.resize(static_cast<size_t>(hdr.valueBytes));
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"CacheManager", L"Memory allocation failed for value buffer");
+                return false;
+            }
+
             read = 0;
             if (hdr.valueBytes > 0) {
-                ok = ReadFile(h, value.data(), static_cast<DWORD>(hdr.valueBytes), &read, nullptr);
-                if (!ok || read != hdr.valueBytes) {
+                if (!ReadFile(h, value.data(), static_cast<DWORD>(hdr.valueBytes), &read, nullptr) ||
+                    read != static_cast<DWORD>(hdr.valueBytes)) {
                     SS_LOG_LAST_ERROR(L"CacheManager", L"ReadFile value failed");
-                    CloseHandle(h);
                     return false;
                 }
             }
 
-            CloseHandle(h);
-
-            //Fill
+            // Fill output
             out.key = key;
             out.value = std::move(value);
-            out.sizeBytes = out.value.size();
+            out.sizeBytes = (key.size() * sizeof(wchar_t)) + out.value.size() + sizeof(Entry);
+
             ULARGE_INTEGER u{};
             u.QuadPart = hdr.expire100ns;
             out.expire.dwLowDateTime = u.LowPart;
             out.expire.dwHighDateTime = u.HighPart;
+
             out.sliding = (hdr.flags & 0x1) != 0;
             out.persistent = (hdr.flags & 0x2) != 0;
             out.ttl = std::chrono::milliseconds(hdr.ttlMs);
+
             return true;
         }
-
         bool CacheManager::persistRemoveByKey(const std::wstring& key) {
             if (m_baseDir.empty()) return false;
             const std::wstring hex = hashKeyToHex(key);
@@ -728,9 +900,16 @@ namespace ShadowStrike {
             const uint8_t* bytes = reinterpret_cast<const uint8_t*>(key.data());
             const ULONG cb = static_cast<ULONG>(key.size() * sizeof(wchar_t));
 
+            // VALIDATE INPUT SIZE
+            if (cb == 0) {
+                SS_LOG_WARN(L"CacheManager", L"Empty key for hashing");
+                return L"00000000000000000000000000000000"; // 32 hex digits (SHA-256)
+            }
+
             if (api.available()) {
                 BCRYPT_ALG_HANDLE hAlg = nullptr;
                 BCRYPT_HASH_HANDLE hHash = nullptr;
+
                 NTSTATUS st = api.BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
                 if (st == 0 && hAlg) {
                     st = api.BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
@@ -738,7 +917,8 @@ namespace ShadowStrike {
                         if (cb > 0) {
                             st = api.BCryptHashData(hHash, const_cast<PUCHAR>(bytes), cb, 0);
                         }
-                        uint8_t digest[32] = {};
+
+                        uint8_t digest[32] = {}; // SHA-256 = 32 bytes
                         if (st == 0) {
                             st = api.BCryptFinishHash(hHash, digest, sizeof(digest), 0);
                             if (st == 0) {
@@ -753,10 +933,29 @@ namespace ShadowStrike {
                 }
             }
 
-            // Fallback FNV-1a 64
-            uint64_t h = Fnv1a64(bytes, cb);
-            uint8_t buf[8];
-            for (int i = 0; i < 8; ++i) buf[i] = static_cast<uint8_t>((h >> (8 * i)) & 0xFF);
+            // IMPROVED FALLBACK: USE DOUBLE HASH (FNV-1a + SipHash-like)
+            // This is much better than single FNV-1a for cache key safety
+
+            // First pass: FNV-1a 64
+            uint64_t h1 = Fnv1a64(bytes, cb);
+
+            // Second pass: Use h1 as seed for another hash
+            // Mix in key bytes again with different constants
+            uint64_t h2 = 0xcbf29ce484222325ULL; // FNV offset basis (different)
+            for (size_t i = 0; i < cb; ++i) {
+                h2 ^= bytes[i];
+                h2 *= 0x100000001b3ULL; // FNV prime
+                h2 ^= (h1 >> (i % 64)); // Mix in h1
+            }
+
+            // Combine both hashes
+            uint8_t buf[16]; // 128-bit combined hash
+            for (int i = 0; i < 8; ++i) {
+                buf[i] = static_cast<uint8_t>((h1 >> (8 * i)) & 0xFF);
+                buf[i + 8] = static_cast<uint8_t>((h2 >> (8 * i)) & 0xFF);
+            }
+
+            SS_LOG_WARN(L"CacheManager", L"Using fallback hash (BCrypt unavailable)");
             return ToHex(buf, sizeof(buf));
         }
 

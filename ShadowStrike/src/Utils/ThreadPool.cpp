@@ -241,139 +241,218 @@ namespace ShadowStrike {
         }
 
         void ThreadPool::workerThread(size_t threadIndex) {
+            // ENTIRE WORKER WRAPPED IN TRY-CATCH
+            try {
+                std::wstringstream threadName;
+                threadName << m_config.poolName << L"-" << threadIndex;
 
-            std::wstringstream threadName;
-            threadName << m_config.poolName << L"-" << threadIndex;
-
-            if (m_config.enableLogging) {
-                SS_LOG_DEBUG(L"ThreadPool", L"Thread %zu (%s) started", threadIndex, threadName.str().c_str());
-            }
-
-            while (!m_shutdown.load(std::memory_order_relaxed)) {
-
-                //get the next task
-                Task task;
-                bool hasTask = false;
-
-                {
-                    std::unique_lock<std::mutex> lock(m_queueMutex);
-
-                    m_taskCv.wait(lock, [this]() {
-                        // Ensure parentheses so boolean logic is clear
-                        return m_shutdown.load(std::memory_order_relaxed) ||
-                            (!m_paused.load(std::memory_order_relaxed) &&
-                                (!m_highPriorityQueue.empty() ||
-                                    !m_normalPriorityQueue.empty() ||
-                                    !m_lowPriorityQueue.empty()));
-                        });
-
-                    if (m_shutdown.load(std::memory_order_relaxed)) {
-                        break;
-                    }
-
-                    if (!m_paused.load(std::memory_order_relaxed)) {
-                        task = getNextTask();
-                        hasTask = true;
-                    }
+                if (m_config.enableLogging) {
+                    SS_LOG_DEBUG(L"ThreadPool", L"Thread %zu (%s) started", threadIndex, threadName.str().c_str());
                 }
 
-                //process the task
-                if (hasTask) {
-                    auto startTime = std::chrono::steady_clock::now();
+                while (!m_shutdown.load(std::memory_order_acquire)) {
+                    Task task;
+                    bool hasTask = false;
 
-                    // ETW event for task started
-                    if (m_etwProvider != 0) {
-                        // Prepare fixed-size locals
-                        ULONGLONG taskId = static_cast<ULONGLONG>(task.id);
-                        ULONG threadIdx = static_cast<ULONG>(threadIndex);
-                        ULONG priorityUL = static_cast<ULONG>(static_cast<uint8_t>(task.priority));
-                        const wchar_t* poolNamePtr = m_config.poolName.c_str();
-                        ULONG poolNameBytes = static_cast<ULONG>((m_config.poolName.length() + 1) * sizeof(wchar_t));
-                        ULONG threadCountUL = static_cast<ULONG>(m_config.threadCount);
-
-                        // Build a single eventData array for TaskStarted (we include both numeric fields and poolName)
-                        EVENT_DATA_DESCRIPTOR eventData[5];
-                        EventDataDescCreate(&eventData[0], &taskId, sizeof(taskId));         // ULONGLONG
-                        EventDataDescCreate(&eventData[1], &threadIdx, sizeof(threadIdx));   // ULONG
-                        EventDataDescCreate(&eventData[2], &priorityUL, sizeof(priorityUL)); // ULONG
-                        EventDataDescCreate(&eventData[3], poolNamePtr, poolNameBytes);      // pool name bytes
-                        EventDataDescCreate(&eventData[4], &threadCountUL, sizeof(threadCountUL)); // ULONG
-
-                        EventWrite(m_etwProvider, &g_evt_TaskStarted, _countof(eventData), eventData);
-                    }
-
-                    m_activeThreads.fetch_add(1, std::memory_order_relaxed);
-
-                    // Execute the task
+                    // SAFE TASK RETRIEVAL WITH EXCEPTION HANDLING
                     try {
-                        task.function();
+                        std::unique_lock<std::mutex> lock(m_queueMutex);
+
+                        m_taskCv.wait(lock, [this]() {
+                            return m_shutdown.load(std::memory_order_acquire) ||
+                                (!m_paused.load(std::memory_order_acquire) &&
+                                    (!m_highPriorityQueue.empty() ||
+                                        !m_normalPriorityQueue.empty() ||
+                                        !m_lowPriorityQueue.empty()));
+                            });
+
+                        if (m_shutdown.load(std::memory_order_acquire)) {
+                            break;
+                        }
+
+                        if (!m_paused.load(std::memory_order_acquire)) {
+                            task = getNextTask();
+                            hasTask = (task.function != nullptr);
+                        }
                     }
                     catch (const std::exception& e) {
                         if (m_config.enableLogging) {
-                            SS_LOG_ERROR(L"ThreadPool", L"Exception in task %llu: %hs",
-                                static_cast<unsigned long long>(task.id), e.what());
+                            SS_LOG_ERROR(L"ThreadPool", L"Worker %zu: Exception in task retrieval: %hs",
+                                threadIndex, e.what());
                         }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        continue;
                     }
                     catch (...) {
                         if (m_config.enableLogging) {
-                            SS_LOG_ERROR(L"ThreadPool", L"Unknown exception in task %llu",
-                                static_cast<unsigned long long>(task.id));
+                            SS_LOG_ERROR(L"ThreadPool", L"Worker %zu: Unknown exception in task retrieval",
+                                threadIndex);
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        continue;
+                    }
+
+                    // Process the task
+                    if (hasTask && task.function) {
+                        auto startTime = std::chrono::steady_clock::now();
+
+                        // ETW event for task started
+                        if (m_etwProvider != 0) {
+                            ULONGLONG taskId = static_cast<ULONGLONG>(task.id);
+                            ULONG threadIdx = static_cast<ULONG>(threadIndex);
+                            ULONG priorityUL = static_cast<ULONG>(static_cast<uint8_t>(task.priority));
+                            const wchar_t* poolNamePtr = m_config.poolName.c_str();
+                            ULONG poolNameBytes = static_cast<ULONG>((m_config.poolName.length() + 1) * sizeof(wchar_t));
+                            ULONG threadCountUL = static_cast<ULONG>(m_config.threadCount);
+
+                            EVENT_DATA_DESCRIPTOR eventData[5];
+                            EventDataDescCreate(&eventData[0], &taskId, sizeof(taskId));
+                            EventDataDescCreate(&eventData[1], &threadIdx, sizeof(threadIdx));
+                            EventDataDescCreate(&eventData[2], &priorityUL, sizeof(priorityUL));
+                            EventDataDescCreate(&eventData[3], poolNamePtr, poolNameBytes);
+                            EventDataDescCreate(&eventData[4], &threadCountUL, sizeof(threadCountUL));
+
+                            EventWrite(m_etwProvider, &g_evt_TaskStarted, _countof(eventData), eventData);
+                        }
+
+                        // INCREMENT ACTIVE COUNTER
+                        m_activeThreads.fetch_add(1, std::memory_order_release);
+
+                        bool taskSucceeded = false;
+
+                        // EXECUTE TASK WITH COMPREHENSIVE EXCEPTION HANDLING
+                        try {
+                            task.function();
+                            taskSucceeded = true;
+                        }
+                        catch (const std::bad_alloc& e) {
+                            if (m_config.enableLogging) {
+                                SS_LOG_ERROR(L"ThreadPool",
+                                    L"Worker %zu: Task %llu threw bad_alloc (out of memory): %hs",
+                                    threadIndex,
+                                    static_cast<unsigned long long>(task.id),
+                                    e.what());
+                            }
+                        }
+                        catch (const std::runtime_error& e) {
+                            if (m_config.enableLogging) {
+                                SS_LOG_ERROR(L"ThreadPool",
+                                    L"Worker %zu: Task %llu threw runtime_error: %hs",
+                                    threadIndex,
+                                    static_cast<unsigned long long>(task.id),
+                                    e.what());
+                            }
+                        }
+                        catch (const std::exception& e) {
+                            if (m_config.enableLogging) {
+                                SS_LOG_ERROR(L"ThreadPool",
+                                    L"Worker %zu: Task %llu threw exception: %hs",
+                                    threadIndex,
+                                    static_cast<unsigned long long>(task.id),
+                                    e.what());
+                            }
+                        }
+                        catch (...) {
+                            if (m_config.enableLogging) {
+                                SS_LOG_ERROR(L"ThreadPool",
+                                    L"Worker %zu: Task %llu threw unknown exception",
+                                    threadIndex,
+                                    static_cast<unsigned long long>(task.id));
+                            }
+                        }
+
+                        auto endTime = std::chrono::steady_clock::now();
+                        auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+
+                        // UPDATE STATISTICS
+                        m_totalExecutionTimeMs.fetch_add(static_cast<uint64_t>(durationMs), std::memory_order_relaxed);
+                        m_totalTasksProcessed.fetch_add(1, std::memory_order_relaxed);
+                        m_activeThreads.fetch_sub(1, std::memory_order_release);
+
+                        // NOTIFY WAITERS IF ALL WORK DONE
+                        if (m_activeThreads.load(std::memory_order_acquire) == 0) {
+                            std::lock_guard<std::mutex> lock(m_queueMutex);
+                            if (m_highPriorityQueue.empty() &&
+                                m_normalPriorityQueue.empty() &&
+                                m_lowPriorityQueue.empty()) {
+                                m_waitAllCv.notify_all();
+                            }
+                        }
+
+                        // ETW event - task completed
+                        if (m_etwProvider != 0) {
+                            ULONGLONG taskId = static_cast<ULONGLONG>(task.id);
+                            ULONG threadIdx = static_cast<ULONG>(threadIndex);
+                            ULONGLONG durationUL = static_cast<ULONGLONG>(durationMs);
+
+                            EVENT_DATA_DESCRIPTOR eventData[3];
+                            EventDataDescCreate(&eventData[0], &taskId, sizeof(taskId));
+                            EventDataDescCreate(&eventData[1], &threadIdx, sizeof(threadIdx));
+                            EventDataDescCreate(&eventData[2], &durationUL, sizeof(durationUL));
+
+                            EventWrite(m_etwProvider, &g_evt_TaskCompleted, _countof(eventData), eventData);
+                        }
+
+                        // Logging for slow or critical tasks
+                        if (m_config.enableLogging &&
+                            (durationMs > 1000 || task.priority == TaskPriority::Critical)) {
+                            SS_LOG_DEBUG(L"ThreadPool",
+                                L"Task %llu completed in %lld ms (priority: %d, success: %d)",
+                                static_cast<unsigned long long>(task.id),
+                                static_cast<long long>(durationMs),
+                                static_cast<int>(task.priority),
+                                taskSucceeded ? 1 : 0);
+                        }
+
+                        // Update stats
+                        try {
+                            updateStatistics();
+                        }
+                        catch (...) {
+                            // Ignore stats update failures
                         }
                     }
-
-                    auto endTime = std::chrono::steady_clock::now();
-                    auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-
-                    m_totalExecutionTimeMs.fetch_add(static_cast<uint64_t>(durationMs), std::memory_order_relaxed);
-                    m_totalTasksProcessed.fetch_add(1, std::memory_order_relaxed);
-                    m_activeThreads.fetch_sub(1, std::memory_order_relaxed);
-
-                    // If queues empty & no active threads, notify waiters
-                    if (m_activeThreads.load(std::memory_order_relaxed) == 0) {
-                        std::lock_guard<std::mutex> lock(m_queueMutex);
-                        if (m_highPriorityQueue.empty() && m_normalPriorityQueue.empty() && m_lowPriorityQueue.empty()) {
-                            m_waitAllCv.notify_all();
-                        }
-                    }
-
-                    // ETW event - task completed
-                    if (m_etwProvider != 0) {
-                        ULONGLONG taskId = static_cast<ULONGLONG>(task.id);
-                        ULONG threadIdx = static_cast<ULONG>(threadIndex);
-                        ULONGLONG durationUL = static_cast<ULONGLONG>(durationMs);
-
-                        EVENT_DATA_DESCRIPTOR eventData[3];
-                        EventDataDescCreate(&eventData[0], &taskId, sizeof(taskId));
-                        EventDataDescCreate(&eventData[1], &threadIdx, sizeof(threadIdx));
-                        EventDataDescCreate(&eventData[2], &durationUL, sizeof(durationUL));
-
-                        EventWrite(m_etwProvider, &g_evt_TaskCompleted, _countof(eventData), eventData);
-                    }
-
-                    // Logging for slow or critical tasks
-                    if (m_config.enableLogging &&
-                        (durationMs > 1000 || task.priority == TaskPriority::Critical)) {
-                        SS_LOG_DEBUG(L"ThreadPool", L"Task %llu completed in %lld ms (priority: %d)",
-                            static_cast<unsigned long long>(task.id),
-                            static_cast<long long>(durationMs),
-                            static_cast<int>(task.priority));
-                    }
-
-                    // Update stats
-                    updateStatistics();
                 }
-            }
 
-            if (m_config.enableLogging) {
-                SS_LOG_DEBUG(L"ThreadPool", L"Thread %zu exiting", threadIndex);
-            }
+                if (m_config.enableLogging) {
+                    SS_LOG_DEBUG(L"ThreadPool", L"Thread %zu exiting normally", threadIndex);
+                }
 
-            // ETW event - thread closed
-            if (m_etwProvider != 0) {
-                ULONG threadIdx = static_cast<ULONG>(threadIndex);
-                EVENT_DATA_DESCRIPTOR eventData[1];
-                EventDataDescCreate(&eventData[0], &threadIdx, sizeof(threadIdx));
-                EventWrite(m_etwProvider, &g_evt_ThreadDestroyed, _countof(eventData), eventData);
+                // ETW event - thread closed
+                if (m_etwProvider != 0) {
+                    ULONG threadIdx = static_cast<ULONG>(threadIndex);
+                    EVENT_DATA_DESCRIPTOR eventData[1];
+                    EventDataDescCreate(&eventData[0], &threadIdx, sizeof(threadIdx));
+                    EventWrite(m_etwProvider, &g_evt_ThreadDestroyed, _countof(eventData), eventData);
+                }
+
+            }
+            catch (const std::exception& e) {
+                // CATASTROPHIC FAILURE - LOG AND EXIT GRACEFULLY
+                if (m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool",
+                        L"CRITICAL: Worker thread %zu crashed: %hs",
+                        threadIndex, e.what());
+                }
+
+                // Try to decrement active counter if it was incremented
+                size_t activeCount = m_activeThreads.load(std::memory_order_acquire);
+                if (activeCount > 0) {
+                    m_activeThreads.fetch_sub(1, std::memory_order_release);
+                }
+
+            }
+            catch (...) {
+                if (m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool",
+                        L"CRITICAL: Worker thread %zu crashed with unknown exception",
+                        threadIndex);
+                }
+
+                size_t activeCount = m_activeThreads.load(std::memory_order_acquire);
+                if (activeCount > 0) {
+                    m_activeThreads.fetch_sub(1, std::memory_order_release);
+                }
             }
         }
 
@@ -523,8 +602,15 @@ namespace ShadowStrike {
 
         void ThreadPool::shutdown(bool wait)
         {
-            if (m_shutdown.exchange(true, std::memory_order_acq_rel)) {
-                return; // already shutting down
+            //IDEMPOTENT SHUTDOWN WITH CAS
+            bool expected = false;
+            if (!m_shutdown.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+                // Already shutting down
+                if (m_config.enableLogging) {
+                    SS_LOG_WARN(L"ThreadPool", L"Shutdown already in progress");
+                }
+                return;
             }
 
             if (m_config.enableLogging) {
@@ -532,45 +618,161 @@ namespace ShadowStrike {
                     wait ? L"true" : L"false");
             }
 
-            //Firstly wake up all threads
+            // WAKE ALL WAITING THREADS
             m_taskCv.notify_all();
+            m_waitAllCv.notify_all();
 
             if (wait) {
+                // WAIT FOR PENDING TASKS TO COMPLETE (with timeout)
                 {
                     std::unique_lock<std::mutex> lock(m_queueMutex);
-                    if (!m_highPriorityQueue.empty() || !m_normalPriorityQueue.empty() ||
-                        !m_lowPriorityQueue.empty() || m_activeThreads.load(std::memory_order_relaxed) > 0) {
 
-                        if (m_paused.load(std::memory_order_relaxed)) {
-                            m_paused.store(false, std::memory_order_relaxed);
-                            m_taskCv.notify_all(); // Duraklatýlmýþsa tekrar uyandýr
+                    // If paused, resume to allow tasks to complete
+                    if (m_paused.load(std::memory_order_acquire)) {
+                        m_paused.store(false, std::memory_order_release);
+                        m_taskCv.notify_all();
+                    }
+
+                    // Wait for all tasks to complete with timeout
+                    bool completed = m_waitAllCv.wait_for(lock, std::chrono::seconds(30), [this]() {
+                        return m_highPriorityQueue.empty() &&
+                            m_normalPriorityQueue.empty() &&
+                            m_lowPriorityQueue.empty() &&
+                            m_activeThreads.load(std::memory_order_acquire) == 0;
+                        });
+
+                    if (!completed && m_config.enableLogging) {
+                        SS_LOG_WARN(L"ThreadPool",
+                            L"Shutdown timeout waiting for tasks. Remaining: High=%zu, Normal=%zu, Low=%zu, Active=%zu",
+                            m_highPriorityQueue.size(),
+                            m_normalPriorityQueue.size(),
+                            m_lowPriorityQueue.size(),
+                            m_activeThreads.load(std::memory_order_acquire));
+                    }
+                }
+
+                // TIMEOUT-BASED JOIN WITH FORCE TERMINATION
+                constexpr auto JOIN_TIMEOUT = std::chrono::seconds(30);
+                auto deadline = std::chrono::steady_clock::now() + JOIN_TIMEOUT;
+
+                std::vector<size_t> hungThreadIndices;
+
+                for (size_t i = 0; i < m_threads.size(); ++i) {
+                    auto& thread = m_threads[i];
+
+                    if (!thread.joinable()) {
+                        continue;
+                    }
+
+                    auto timeRemaining = deadline - std::chrono::steady_clock::now();
+
+                    if (timeRemaining <= std::chrono::seconds(0)) {
+                        // Timeout exceeded
+                        if (m_config.enableLogging) {
+                            SS_LOG_WARN(L"ThreadPool",
+                                L"WARNING: Thread %zu join timeout, attempting force termination", i);
                         }
 
-                        m_waitAllCv.wait(lock, [this]() {
-                            return m_highPriorityQueue.empty() && m_normalPriorityQueue.empty() &&
-                                m_lowPriorityQueue.empty() &&
-                                m_activeThreads.load(std::memory_order_relaxed) == 0;
-                            });
+                        hungThreadIndices.push_back(i);
+
+                        // FORCE TERMINATE HUNG THREAD (Windows-specific)
+                        if (i < m_threadHandles.size() && m_threadHandles[i]) {
+                            DWORD exitCode = 0;
+                            if (::GetExitCodeThread(m_threadHandles[i], &exitCode) &&
+                                exitCode == STILL_ACTIVE) {
+                                ::TerminateThread(m_threadHandles[i], ERROR_TIMEOUT);
+                            }
+                            ::CloseHandle(m_threadHandles[i]);
+                            m_threadHandles[i] = nullptr;
+                        }
+
+                        thread.detach(); // Prevent join() crash
+                        continue;
+                    }
+
+                    // TRY JOIN WITH POLLING (std::thread doesn't have timed_join)
+                    bool joined = false;
+                    auto joinStart = std::chrono::steady_clock::now();
+
+                    while (std::chrono::steady_clock::now() - joinStart < timeRemaining) {
+                        // Check if thread is still running (Windows-specific)
+                        if (i < m_threadHandles.size() && m_threadHandles[i]) {
+                            DWORD exitCode = 0;
+                            if (::GetExitCodeThread(m_threadHandles[i], &exitCode)) {
+                                if (exitCode != STILL_ACTIVE) {
+                                    // Thread finished
+                                    thread.join();
+                                    joined = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+
+                    if (!joined) {
+                        // Final attempt to join
+                        if (thread.joinable()) {
+                            try {
+                                thread.join();
+                                joined = true;
+                            }
+                            catch (const std::system_error& e) {
+                                if (m_config.enableLogging) {
+                                    SS_LOG_ERROR(L"ThreadPool",
+                                        L"Thread %zu join failed: error %d", i, e.code().value());
+                                }
+                                thread.detach();
+                            }
+                        }
+                    }
+
+                    if (joined && m_config.enableLogging) {
+                        SS_LOG_DEBUG(L"ThreadPool", L"Thread %zu joined successfully", i);
+                    }
+                }
+
+                // REPORT HUNG THREADS
+                if (!hungThreadIndices.empty() && m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool",
+                        L"WARNING: %zu thread(s) were forcibly terminated",
+                        hungThreadIndices.size());
+                }
+
+            }
+            else {
+                // NON-WAIT MODE: DETACH ALL THREADS
+                if (m_config.enableLogging) {
+                    SS_LOG_INFO(L"ThreadPool", L"Detaching %zu threads (no wait)", m_threads.size());
+                }
+
+                for (auto& thread : m_threads) {
+                    if (thread.joinable()) {
+                        thread.detach();
                     }
                 }
             }
-            else {
+
+            // CLEANUP RESOURCES
+            m_threads.clear();
+
+            for (auto handle : m_threadHandles) {
+                if (handle && handle != INVALID_HANDLE_VALUE) {
+                    ::CloseHandle(handle);
+                }
+            }
+            m_threadHandles.clear();
+
+            // CLEAR ALL QUEUES
+            {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
                 m_highPriorityQueue.clear();
                 m_normalPriorityQueue.clear();
                 m_lowPriorityQueue.clear();
             }
 
-            // join threads
-            for (auto& t : m_threads) {
-                if (t.joinable()) {
-                    t.join();
-                }
-            }
-
-            m_threads.clear();
-            m_threadHandles.clear();
-
+            // ETW EVENT - THREAD POOL DESTROYED
             if (m_etwProvider != 0) {
                 ULONG totalTasks = static_cast<ULONG>(m_totalTasksProcessed.load(std::memory_order_relaxed));
                 EVENT_DATA_DESCRIPTOR eventData[1];
@@ -579,8 +781,8 @@ namespace ShadowStrike {
             }
 
             if (m_config.enableLogging) {
-                SS_LOG_INFO(L"ThreadPool", L"ThreadPool shut down, processed %llu tasks",
-                    m_totalTasksProcessed.load(std::memory_order_relaxed));
+                SS_LOG_INFO(L"ThreadPool", L"ThreadPool shut down successfully, processed %llu tasks",
+                    static_cast<unsigned long long>(m_totalTasksProcessed.load(std::memory_order_relaxed)));
             }
         }
 

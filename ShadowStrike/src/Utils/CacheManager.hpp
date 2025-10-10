@@ -175,7 +175,7 @@ namespace ShadowStrike {
 				std::atomic<bool> m_shutdown{ false };
 				std::thread m_maintThread;
 				std::chrono::milliseconds m_maintInterval{ std::chrono::minutes(1) };
-				std::chrono::system_clock::time_point m_lastMaint{};
+			    std::atomic<uint64_t> m_lastMaint{ 0 };
 		};
 
 

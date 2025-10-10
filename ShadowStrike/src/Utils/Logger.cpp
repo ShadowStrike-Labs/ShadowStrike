@@ -637,44 +637,143 @@ namespace ShadowStrike {
 			void Logger::PerformRotation()
 			{
 #ifdef _WIN32
-				// Close the current file
-				if (m_file && m_file != INVALID_HANDLE_VALUE)
-				{
-					CloseHandle(m_file);
-					m_file = INVALID_HANDLE_VALUE;
-				}
+				SS_LOG_INFO(L"Logger", L"Starting log file rotation");
 
-				const std::wstring base = BaseLogPath(); // logs\ShadowStrike.log
+				// EXCLUSIVE LOCK DURING ROTATION
+				std::lock_guard<std::mutex> lock(m_cfgmutex);
 
-				// Delete the oldest one
-				if (m_cfg.maxFileCount > 1)
-				{
-					std::wstring oldest = base + L"." + std::to_wstring(m_cfg.maxFileCount - 1);
-					DeleteFileW(oldest.c_str());
-
-					// N-1 ... 1 -> 2 ... N scroll it like this
-					for (size_t idx = m_cfg.maxFileCount - 1; idx >= 1; --idx)
-					{
-						std::wstring src = base + L"." + std::to_wstring(idx);
-						std::wstring dst = base + L"." + std::to_wstring(idx + 1);
-						MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING);
-						if (idx == 1) break; //to prevent size_t wrap
+				try {
+					// CLOSE CURRENT FILE BEFORE ROTATION
+					if (m_file && m_file != INVALID_HANDLE_VALUE) {
+						::FlushFileBuffers(m_file);
+						::CloseHandle(m_file);
+						m_file = INVALID_HANDLE_VALUE;
 					}
 
-					// base -> .1
-					std::wstring first = base + L".1";
-					MoveFileExW(base.c_str(), first.c_str(), MOVEFILE_REPLACE_EXISTING);
+					const std::wstring base = BaseLogPath(); // logs\ShadowStrike.log
+
+					// DELETE OLDEST FILE FIRST (if exists)
+					if (m_cfg.maxFileCount > 1) {
+						std::wstring oldestFile = base + L"." + std::to_wstring(m_cfg.maxFileCount);
+
+						// Check if file exists before trying to delete
+						DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
+						if (attrs != INVALID_FILE_ATTRIBUTES) {
+							// File exists, try to delete
+							::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL); // Remove read-only
+
+							if (!::DeleteFileW(oldestFile.c_str())) {
+								DWORD error = ::GetLastError();
+								if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+									SS_LOG_WARN(L"Logger",
+										L"Failed to delete oldest log file: %ls (error %lu)",
+										oldestFile.c_str(), error);
+
+									// TRY FORCE DELETE WITH RETRY
+									for (int retry = 0; retry < 3; ++retry) {
+										::Sleep(100); // Wait 100ms
+										if (::DeleteFileW(oldestFile.c_str())) {
+											break;
+										}
+									}
+								}
+							}
+						}
+
+						// ROTATE FILES IN REVERSE ORDER (N-1 ... 1 -> N ... 2)
+						for (size_t idx = m_cfg.maxFileCount - 1; idx >= 1; --idx) {
+							std::wstring srcFile = base + L"." + std::to_wstring(idx);
+							std::wstring dstFile = base + L"." + std::to_wstring(idx + 1);
+
+							// Check if source file exists
+							attrs = ::GetFileAttributesW(srcFile.c_str());
+							if (attrs == INVALID_FILE_ATTRIBUTES) {
+								// Source doesn't exist, skip
+								if (idx == 1) break; // Prevent size_t underflow
+								continue;
+							}
+
+							// DELETE TARGET FILE IF EXISTS
+							attrs = ::GetFileAttributesW(dstFile.c_str());
+							if (attrs != INVALID_FILE_ATTRIBUTES) {
+								::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
+								::DeleteFileW(dstFile.c_str());
+							}
+
+							// MOVE FILE WITH ERROR HANDLING
+							if (!::MoveFileExW(srcFile.c_str(), dstFile.c_str(),
+								MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+								DWORD error = ::GetLastError();
+								SS_LOG_WARN(L"Logger",
+									L"Failed to rotate log file %ls to %ls (error %lu)",
+									srcFile.c_str(), dstFile.c_str(), error);
+
+								// FALLBACK: COPY + DELETE
+								if (::CopyFileW(srcFile.c_str(), dstFile.c_str(), FALSE)) {
+									::DeleteFileW(srcFile.c_str());
+								}
+							}
+
+							if (idx == 1) break; // Prevent size_t underflow
+						}
+
+						// RENAME CURRENT LOG TO .1 (base -> .1)
+						std::wstring firstRotated = base + L".1";
+
+						// Check if current log exists
+						attrs = ::GetFileAttributesW(base.c_str());
+						if (attrs != INVALID_FILE_ATTRIBUTES) {
+							// Delete target if exists
+							attrs = ::GetFileAttributesW(firstRotated.c_str());
+							if (attrs != INVALID_FILE_ATTRIBUTES) {
+								::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
+								::DeleteFileW(firstRotated.c_str());
+							}
+
+							if (!::MoveFileExW(base.c_str(), firstRotated.c_str(),
+								MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+								DWORD error = ::GetLastError();
+								SS_LOG_WARN(L"Logger",
+									L"Failed to rotate current log to %ls (error %lu)",
+									firstRotated.c_str(), error);
+
+								// FALLBACK: COPY + DELETE
+								if (::CopyFileW(base.c_str(), firstRotated.c_str(), FALSE)) {
+									::DeleteFileW(base.c_str());
+								}
+							}
+						}
+					}
+					else {
+						// IF ONLY ONE FILE, JUST DELETE IT
+						DWORD attrs = ::GetFileAttributesW(base.c_str());
+						if (attrs != INVALID_FILE_ATTRIBUTES) {
+							::SetFileAttributesW(base.c_str(), FILE_ATTRIBUTE_NORMAL);
+							if (!::DeleteFileW(base.c_str())) {
+								DWORD error = ::GetLastError();
+								SS_LOG_WARN(L"Logger",
+									L"Failed to delete current log file: %ls (error %lu)",
+									base.c_str(), error);
+							}
+						}
+					}
+
+					// RESET SIZE AND PATH
+					m_currentSize = 0;
+					m_actualLogPath.clear();
+
+					// CREATE NEW LOG FILE (will be done by OpenLogFileIfNeeded)
+
 				}
-				else
-				{
-					// If only one file, just delete it
-					DeleteFileW(base.c_str());
+				catch (const std::exception& e) {
+					SS_LOG_ERROR(L"Logger", L"Log rotation exception: %hs", e.what());
+				}
+				catch (...) {
+					SS_LOG_ERROR(L"Logger", L"Log rotation unknown exception");
 				}
 
-				m_currentSize = 0;
-				m_actualLogPath.clear();
+				SS_LOG_INFO(L"Logger", L"Log file rotation completed");
 #endif
-
 			}
 		
 

@@ -157,8 +157,17 @@ namespace ShadowStrike {
 
             static bool ReadAllBytesImpl(HANDLE h, std::vector<std::byte>& out, uint64_t fileSize, Error* err) {
                 out.clear();
-                if (fileSize > SIZE_MAX) { if (err) err->win32 = ERROR_FILE_TOO_LARGE; return false; }
-                out.resize(static_cast<size_t>(fileSize));
+
+                constexpr uint64_t MAX_FILE_SIZE = 2ULL * 1024 * 1024 * 1024; //2 GB
+                if (fileSize > SIZE_MAX || fileSize > MAX_FILE_SIZE ) { if (err) err->win32 = ERROR_FILE_TOO_LARGE; return false; }
+                try {
+                    out.resize(static_cast<size_t>(fileSize));
+                }
+                catch (const std::bad_alloc&) {
+                    if (err) err->win32 = ERROR_NOT_ENOUGH_MEMORY;
+                    SS_LOG_ERROR(L"FileUtils", L"Memory allocation failed for size: %llu", fileSize);
+                    return false;
+                }
                 uint8_t* ptr = reinterpret_cast<uint8_t*>(out.data());
                 size_t toRead = out.size();
                 DWORD chunk = 0;
@@ -209,21 +218,30 @@ namespace ShadowStrike {
             }
 
             static std::wstring MakeTempSibling(std::wstring_view dstPath) {
-                // dstPath: C:\dir\file.ext -> C:\dir\.~file.ext.tmp
                 std::wstring p(dstPath);
                 auto pos = p.find_last_of(L"\\/");
                 std::wstring dir = (pos == std::wstring::npos) ? L"" : p.substr(0, pos);
                 std::wstring file = (pos == std::wstring::npos) ? p : p.substr(pos + 1);
 
+				//Create unique file name using GUID
+                GUID guid;
+                CoCreateGuid(&guid);
+                wchar_t guidStr[40];
+                swprintf_s(guidStr, L"%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                    guid.Data1, guid.Data2, guid.Data3,
+                    guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+                    guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+
                 std::wstring tmp;
-                tmp.reserve(p.size() + 16);
+                tmp.reserve(p.size() + 64);
                 if (!dir.empty()) { tmp.append(dir); tmp.push_back(L'\\'); }
                 tmp.append(L".~");
                 tmp.append(file);
+                tmp.append(L"_");
+                tmp.append(guidStr);
                 tmp.append(L".tmp");
                 return tmp;
             }
-
 
 
             bool WriteAllBytesAtomic(std::wstring_view path, const std::byte* data, size_t len, Error* err) {
@@ -300,8 +318,19 @@ namespace ShadowStrike {
 
                 std::wstring d = ToW(dir); // wstring_view → wstring conversion
 
+                if (d.find(L"..") != std::wstring::npos) {
+					if (err) err->win32 = ERROR_INVALID_PARAMETER;
+					SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Path contains .. : %s", d.c_str());
+                    return false;
+                }
+
+                const wchar_t invalidChars[] = L"<>:\"|?*";
+                if (d.find_first_of(invalidChars) != std::wstring::npos) {
+                    if (err) err->win32 = ERROR_INVALID_NAME;
+                    return false;
+                }
+
               //if the path starts with C:\ it will continue
-             
 
                 std::wstring cur;
                 cur.reserve(d.size() + 8); 
@@ -367,6 +396,7 @@ namespace ShadowStrike {
 
 
             bool WalkDirectory(std::wstring_view root, const WalkOptions& opts, const WalkCallback& cb, Error* err) {
+                constexpr size_t MAX_SYMLINK_DEPTH = 40; 
                 if (root.empty()) { if (err) err->win32 = ERROR_INVALID_PARAMETER; return false; }
 
                 std::wstring base = ToW(root);
@@ -394,8 +424,31 @@ namespace ShadowStrike {
                             if (GetFileIdFromHandle(dh, fid)) {
                                 if (!visited.insert(fid).second) {
                                     CloseHandle(dh);
-                                    continue; // loop
+                                    std::vector<std::pair<std::wstring, size_t>> stack; //path, depth
+                                    stack.emplace_back(base, 0);
+
+                                    //in the loop
+                                    auto [cur, depth] = stack.back();
+                                    stack.pop_back();
+
+                                    //Depth check
+                                    if (depth > MAX_SYMLINK_DEPTH) {
+                                        if (err) err->win32 = ERROR_CANT_RESOLVE_FILENAME;
+                                        SS_LOG_ERROR(L"FileUtils", L"WalkDirectory: Maximum symlink depth exceeded: %s", cur.c_str());
+                                        return false;
+                                    }
+
+                                    if(GetFileIdFromHandle(dh,fid)) {
+
+                                        if (!visited.insert(fid).second) {
+                                            CloseHandle(dh);
+                                            SS_LOG_WARN(L"FileUtils", L"Symlink loop detected at: %ls", cur.c_str());
+                                            continue;
+                                        }
+                                    }
+
                                 }
+                                    
                             }
                             CloseHandle(dh);
                         }
@@ -580,13 +633,26 @@ namespace ShadowStrike {
 
                 std::wstring longp = AddLongPathPrefix(path);
                 HANDLE h = CreateFileW(longp.c_str(), GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+					0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr); //Extra security
                 if (h == INVALID_HANDLE_VALUE) {
                     if (err) err->win32 = GetLastError();
                     SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: CreateFileW failed: %s", longp.c_str());
                     return false;
                 }
 
+				//Make the directory check using the handle
+                BY_HANDLE_FILE_INFORMATION fileInfo;
+                if (!GetFileInformationByHandle(h, &fileInfo)) {
+                    DWORD ec = GetLastError();
+                    CloseHandle(h);
+                    if (err) err->win32 = ec;
+                    return false;
+                }
+                if (fileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+					CloseHandle(h); 
+					if (err) err->win32 = ERROR_ACCESS_DENIED;
+                    return false;
+                }
                 LARGE_INTEGER sz{};
                 if (!GetFileSizeEx(h, &sz)) {
                     if (err) err->win32 = GetLastError();

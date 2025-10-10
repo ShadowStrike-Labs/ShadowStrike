@@ -533,12 +533,13 @@ namespace ShadowStrike {
                 bool Start(Error* err = nullptr) noexcept;
                 bool Stop(Error* err = nullptr) noexcept;
                 bool IsRunning() const noexcept { return m_running; }
-
+              
                 // Event callbacks
-                void OnProcessCreated(ProcessEventCallback callback) noexcept { m_onProcessCreated = std::move(callback); }
-                void OnProcessTerminated(ProcessEventCallback callback) noexcept { m_onProcessTerminated = std::move(callback); }
-                void OnModuleLoaded(ProcessEventCallback callback) noexcept { m_onModuleLoaded = std::move(callback); }
-                void OnThreadCreated(ProcessEventCallback callback) noexcept { m_onThreadCreated = std::move(callback); }
+               
+                void OnProcessCreated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onProcessCreated = std::move(callback); }
+                void OnProcessTerminated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onProcessTerminated = std::move(callback); }
+                void OnModuleLoaded(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onModuleLoaded = std::move(callback); }
+                void OnThreadCreated(ShadowStrike::Utils::ProcessUtils::ProcessEventCallback callback) noexcept { m_onThreadCreated = std::move(callback); }
 
                 // Filtering
                 void AddProcessFilter(ProcessId pid) noexcept { m_processFilter.insert(pid); }
@@ -556,10 +557,10 @@ namespace ShadowStrike {
                 std::atomic<bool> m_running{ false };
                 std::thread m_monitorThread;
 
-                ProcessEventCallback m_onProcessCreated;
-                ProcessEventCallback m_onProcessTerminated;
-                ProcessEventCallback m_onModuleLoaded;
-                ProcessEventCallback m_onThreadCreated;
+                ShadowStrike::Utils::ProcessUtils::ProcessEventCallback m_onProcessCreated;
+                ShadowStrike::Utils::ProcessUtils::ProcessEventCallback m_onProcessTerminated;
+                ShadowStrike::Utils::ProcessUtils::ProcessEventCallback m_onModuleLoaded;
+                ShadowStrike::Utils::ProcessUtils::ProcessEventCallback m_onThreadCreated;
 
                 std::unordered_set<ProcessId> m_processFilter;
                 std::unordered_set<std::wstring> m_nameFilter;

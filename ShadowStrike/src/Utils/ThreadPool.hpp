@@ -224,7 +224,11 @@ namespace ShadowStrike {
             using ReturnType = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>;
             using PackagedTask = std::packaged_task<ReturnType()>;
 
-            // bind the callable + args into a zero-arg callable (portable)
+            // EARLY SHUTDOWN CHECK (no lock needed)
+            if (m_shutdown.load(std::memory_order_acquire)) {
+                throw std::runtime_error("ThreadPool is shutting down, cannot accept new tasks");
+            }
+
             auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
             auto task = std::make_shared<PackagedTask>(
@@ -239,25 +243,47 @@ namespace ShadowStrike {
             );
 
             std::future<ReturnType> result = task->get_future();
-
-            if (m_shutdown.load(std::memory_order_relaxed)) {
-                throw std::runtime_error("ThreadPool is shutting down, cannot accept new tasks");
-            }
-
             TaskId taskId = m_nextTaskId.fetch_add(1, std::memory_order_relaxed);
 
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
 
+                // IMPROVED WAIT WITH PROPER SHUTDOWN HANDLING
                 if (m_config.maxQueueSize > 0) {
-                    // recompute queue size every wake (fixes previous bug)
-                    m_taskCv.wait(lock, [this]() {
-                        size_t total = m_highPriorityQueue.size() + m_normalPriorityQueue.size() + m_lowPriorityQueue.size();
-                        return m_shutdown.load(std::memory_order_relaxed) || total < m_config.maxQueueSize;
+                    bool waitResult = m_taskCv.wait_for(lock, std::chrono::seconds(30), [this]() {
+                        size_t total = m_highPriorityQueue.size() +
+                            m_normalPriorityQueue.size() +
+                            m_lowPriorityQueue.size();
+                        return m_shutdown.load(std::memory_order_acquire) ||
+                            total < m_config.maxQueueSize;
                         });
 
-                    if (m_shutdown.load(std::memory_order_relaxed)) {
+                    // TIMEOUT CHECK
+                    if (!waitResult) {
+                        throw std::runtime_error("ThreadPool queue wait timeout (30s) - possible deadlock");
+                    }
+
+                    // DOUBLE-CHECK SHUTDOWN AFTER WAKE
+                    if (m_shutdown.load(std::memory_order_acquire)) {
                         throw std::runtime_error("ThreadPool is shutting down, cannot accept new tasks");
+                    }
+
+                    // VERIFY SPACE STILL AVAILABLE (another thread might have filled queue)
+                    size_t total = m_highPriorityQueue.size() +
+                        m_normalPriorityQueue.size() +
+                        m_lowPriorityQueue.size();
+
+                    if (total >= m_config.maxQueueSize) {
+                        // Try one more time with short timeout
+                        if (!m_taskCv.wait_for(lock, std::chrono::milliseconds(100), [this]() {
+                            size_t t = m_highPriorityQueue.size() +
+                                m_normalPriorityQueue.size() +
+                                m_lowPriorityQueue.size();
+                            return m_shutdown.load(std::memory_order_acquire) ||
+                                t < m_config.maxQueueSize;
+                            })) {
+                            throw std::runtime_error("ThreadPool queue is full");
+                        }
                     }
                 }
 
@@ -278,16 +304,21 @@ namespace ShadowStrike {
                     break;
                 }
 
-                // update peak with CAS loop
-                size_t totalSize = m_highPriorityQueue.size() + m_normalPriorityQueue.size() + m_lowPriorityQueue.size();
+                // ATOMIC PEAK UPDATE
+                size_t totalSize = m_highPriorityQueue.size() +
+                    m_normalPriorityQueue.size() +
+                    m_lowPriorityQueue.size();
                 size_t oldPeak = m_peakQueueSize.load(std::memory_order_relaxed);
-                while (oldPeak < totalSize && !m_peakQueueSize.compare_exchange_weak(oldPeak, totalSize)) {}
+                while (oldPeak < totalSize &&
+                    !m_peakQueueSize.compare_exchange_weak(oldPeak, totalSize,
+                        std::memory_order_release, std::memory_order_relaxed)) {
+                    // CAS loop
+                }
             }
 
             m_taskCv.notify_one();
 
             if (m_config.enableLogging) {
-                // cast taskId to avoid format mismatch
                 logThreadPoolEvent(L"ThreadPool", L"Task submitted with priority %d, ID: %llu",
                     static_cast<int>(priority), static_cast<unsigned long long>(taskId));
             }
