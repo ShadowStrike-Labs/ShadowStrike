@@ -312,8 +312,8 @@ namespace ShadowStrike {
                 }
                 return true;
             }
-
-            static bool CreateDirectories(std::wstring_view dir, Error* err) {
+            //Static
+             bool CreateDirectories(std::wstring_view dir, Error* err) {
                 if (dir.empty()) return true; 
 
                 std::wstring d = ToW(dir); // wstring_view → wstring conversion
