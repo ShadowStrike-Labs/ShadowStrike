@@ -99,6 +99,30 @@
     <ClCompile Include="src\Database\ConfigurationDB.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\sqlite3\sqlite3.c">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Backup.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Column.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Database.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Exception.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Statement.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Utils\Logger.hpp">
@@ -182,5 +206,54 @@
     <ClInclude Include="src\Database\StatisticsDB.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Assertion.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Backup.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Column.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Database.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Exception.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\ExecuteMany.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Savepoint.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\SQLiteCpp.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\SQLiteCppExport.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Statement.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Transaction.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Utils.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\VariadicBind.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="external\SQLiteCpp\sqlite3\sqlite3.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="docs\CacheDB_Examples.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="docs\DatabaseManager_Documentation.md" />
+    <None Include="docs\CacheDB_Documentation.md" />
   </ItemGroup>
 </Project>

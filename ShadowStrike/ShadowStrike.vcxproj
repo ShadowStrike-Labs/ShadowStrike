@@ -76,6 +76,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include\SQLiteCpp</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -90,6 +91,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include\SQLiteCpp</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -104,6 +106,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -120,6 +123,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include\SQLiteCpp</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -128,6 +132,14 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="external\pugixml\pugixml.cpp" />
+    <ClCompile Include="external\SQLiteCpp\sqlite3\sqlite3.c" />
+    <ClCompile Include="external\SQLiteCpp\src\Backup.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Column.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Database.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Exception.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Statement.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp" />
     <ClCompile Include="src\Database\CacheDB.cpp" />
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Database\DatabaseManager.cpp" />
@@ -157,7 +169,22 @@
     <ClCompile Include="src\Utils\XMLUtils.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="docs\CacheDB_Examples.hpp" />
     <ClInclude Include="external\pugixml\pugixml.hpp" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Assertion.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Backup.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Column.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Database.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Exception.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\ExecuteMany.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Savepoint.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\SQLiteCpp.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\SQLiteCppExport.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Statement.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Transaction.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Utils.h" />
+    <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\VariadicBind.h" />
+    <ClInclude Include="external\SQLiteCpp\sqlite3\sqlite3.h" />
     <ClInclude Include="src\Database\CacheDB.hpp" />
     <ClInclude Include="src\Database\ConfigurationDB.hpp" />
     <ClInclude Include="src\Database\DatabaseManager.hpp" />
@@ -184,6 +211,10 @@
     <ClInclude Include="src\Utils\ThreadPool.hpp" />
     <ClInclude Include="src\Utils\Timer.hpp" />
     <ClInclude Include="src\Utils\XMLUtils.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="docs\CacheDB_Documentation.md" />
+    <None Include="docs\DatabaseManager_Documentation.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
