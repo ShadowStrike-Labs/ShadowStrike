@@ -1,5 +1,3 @@
-
-
 #pragma once
 
 #include <SQLiteCpp/SQLiteCpp.h>
@@ -530,7 +528,10 @@ namespace ShadowStrike {
         void DatabaseManager::bindParameter(SQLite::Statement& stmt, int index, T&& value) {
             using DecayT = std::decay_t<T>;
             
-            if constexpr (std::is_same_v<DecayT, int>) {
+            if constexpr (std::is_same_v<DecayT, bool>) {
+                stmt.bind(index, static_cast<int>(value));
+            }
+            else if constexpr (std::is_same_v<DecayT, int>) {
                 stmt.bind(index, value);
             }
             else if constexpr (std::is_same_v<DecayT, int64_t> || std::is_same_v<DecayT, long long>) {
@@ -546,7 +547,11 @@ namespace ShadowStrike {
                 stmt.bind(index, std::string(value));
             }
             else if constexpr (std::is_same_v<DecayT, std::vector<uint8_t>>) {
-                stmt.bind(index, value.data(), value.size());
+                if (value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                    
+					SS_LOG_ERROR(L"Database", L"Blob size exceeds maximum allowed size for binding");
+                }
+                stmt.bind(index, value.data(), static_cast<int>(value.size()));
             }
             else if constexpr (std::is_same_v<DecayT, std::nullptr_t>) {
                 stmt.bind(index);  // NULL

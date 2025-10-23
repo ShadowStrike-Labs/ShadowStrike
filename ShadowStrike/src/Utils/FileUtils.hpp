@@ -30,6 +30,7 @@ namespace ShadowStrike {
 			//basic error structure
 			struct Error {
 				DWORD win32 = 0;
+				std::string message;
 			};
 
 			//File statistics

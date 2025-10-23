@@ -2852,21 +2852,6 @@ namespace ShadowStrike {
 
             case ValueType::Boolean: {
                 std::wstring lower(str);
-                std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-                if (lower == L"true" || lower == L"1" || lower == L"yes") {
-                    return true;
-                }
-                return false;
-            }
-
-            case ValueType::Json: {
-                // Convert wstring to UTF-8 string for JSON parsing
-                std::string utf8Str = wstringToUtf8(str);
-                Utils::JSON::Json json;
-                if (Utils::JSON::Parse(utf8Str, json)) {
-                    return json;
-                }
-                return Utils::JSON::Json{};
             }
 
             case ValueType::Binary:

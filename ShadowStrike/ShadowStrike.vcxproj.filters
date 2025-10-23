@@ -87,9 +87,6 @@
     <ClCompile Include="src\Database\WhitelistDB.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="src\Database\QuarantineDB.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="src\Database\CacheDB.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
@@ -121,6 +118,9 @@
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Database\QuarantineDB.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
   </ItemGroup>

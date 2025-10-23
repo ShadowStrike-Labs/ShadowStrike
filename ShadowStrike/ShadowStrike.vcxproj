@@ -106,7 +106,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\projects\vcpkg\vcpkg\packages\yara_x64-windows\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

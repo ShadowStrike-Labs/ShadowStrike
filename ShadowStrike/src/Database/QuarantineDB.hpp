@@ -438,6 +438,11 @@ namespace ShadowStrike {
             bool BackupQuarantine(std::wstring_view backupPath, DatabaseError* err = nullptr);
             bool RestoreQuarantine(std::wstring_view backupPath, DatabaseError* err = nullptr);
 
+            // Audit logging
+            void logAuditEvent(QuarantineAction action,
+                int64_t entryId,
+                std::wstring_view details);
+
         private:
             QuarantineDB();
             ~QuarantineDB();
@@ -504,10 +509,7 @@ namespace ShadowStrike {
             void updateStatistics(const QuarantineEntry& entry, QuarantineAction action);
             void recalculateStatistics(DatabaseError* err);
 
-            // Audit logging
-            void logAuditEvent(QuarantineAction action,
-                             int64_t entryId,
-                             std::wstring_view details);
+         
 
             // Utility helpers
             QuarantineEntry rowToQuarantineEntry(QueryResult& result);
