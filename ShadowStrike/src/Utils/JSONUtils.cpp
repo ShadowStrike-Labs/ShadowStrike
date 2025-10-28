@@ -4,6 +4,8 @@
 #include <sstream>
 #include <limits>
 #include <algorithm>
+#include <chrono>
+#include <random>
 
 #ifdef _WIN32
 #  define NOMINMAX
@@ -131,8 +133,16 @@ namespace ShadowStrike {
 
             bool Parse(std::string_view jsonText, Json& out, Error* err, const ParseOptions& opt) noexcept {
                 try {
-					//if allowExceptions is false, parse errors will not throw but return discarded json
-                    out = Json::parse(jsonText, /*cb*/nullptr, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);
+                    // ? FIX: Depth limit callback
+                    auto depthCallback = [maxDepth = opt.maxDepth](int depth, nlohmann::json::parse_event_t event, Json& parsed) -> bool {
+                        if (static_cast<size_t>(depth) > maxDepth) {
+                            return false; // Reject parsing
+                        }
+                        return true; // Continue parsing
+                    };
+
+                    //if allowExceptions is false, parse errors will not throw but return discarded json
+                    out = Json::parse(jsonText, depthCallback, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);
                     if (!opt.allowExceptions && out.is_discarded()) {
                         setErr(err, "JSON parse failed", {}, jsonText, 0);
                         return false;
@@ -214,7 +224,17 @@ namespace ShadowStrike {
                         setIoErr(err, "Failed to tell file size", path);
                         return false;
                     }
-                    size_t fileSz = static_cast<size_t>(tell); // stream-derived size (size_t), used below
+
+                    // ? FIX: Proper 32-bit safety check using streampos
+                    // streampos is not an integer type, so we can't use make_unsigned
+                    // Instead, compare directly as streampos can be converted to streamoff (signed integer)
+                    std::streamoff tellOff = static_cast<std::streamoff>(tell);
+                    if (tellOff < 0 || static_cast<uint64_t>(tellOff) > SIZE_MAX) {
+                        setIoErr(err, "File size exceeds addressable memory", path);
+                        return false;
+                    }
+
+                    size_t fileSz = static_cast<size_t>(tellOff); // stream-derived size (size_t), used below
 
                     // size validation
                     constexpr size_t MAX_SAFE_JSON_SIZE = 100ULL * 1024 * 1024; // 100MB
@@ -263,9 +283,16 @@ namespace ShadowStrike {
 
                     stripUtf8BOM(buf);
 
-                    // Parse
+                    // ? FIX: Use depth callback for parsing
                     try {
-                        out = Json::parse(buf, /*cb*/nullptr, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);
+                        auto depthCallback = [maxDepth = opt.maxDepth](int depth, nlohmann::json::parse_event_t event, Json& parsed) -> bool {
+                            if (static_cast<size_t>(depth) > maxDepth) {
+                                return false;
+                            }
+                            return true;
+                        };
+
+                        out = Json::parse(buf, depthCallback, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);
                         if (!opt.allowExceptions && out.is_discarded()) {
                             setErr(err, "JSON parse failed", path, buf, 0);
                             return false;
@@ -302,9 +329,17 @@ namespace ShadowStrike {
 
                     const auto dir = path.parent_path().empty() ? std::filesystem::current_path() : path.parent_path();
                     std::error_code ec;
-					std::filesystem::create_directories(dir, ec); //create if not exists
-                    // temp file name
-                    const auto tmp = dir / (path.filename().wstring() + L".tmp.json");
+                    std::filesystem::create_directories(dir, ec); //create if not exists
+
+                    // ? FIX: Secure temp file name using high-resolution clock + random
+                    auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+                    std::mt19937_64 rng(static_cast<uint64_t>(now) ^ reinterpret_cast<uintptr_t>(&rng));
+                    std::uniform_int_distribution<uint64_t> dist;
+                    uint64_t randomId = dist(rng);
+
+                    std::wostringstream tempNameStream;
+                    tempNameStream << L".tmp." << std::hex << now << L"_" << randomId << L".json";
+                    const auto tmp = dir / tempNameStream.str();
 
                     // write to temp file 
                     {
@@ -332,8 +367,10 @@ namespace ShadowStrike {
                         if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                             DWORD le = GetLastError();
                             setIoErr(err, "MoveFileExW failed", path, std::to_string(static_cast<unsigned long>(le)));
-                            // Temizlik dene
-                            std::filesystem::remove(tmp, ec);
+                            // ? FIX: Check if cleanup succeeded
+                            if (!std::filesystem::remove(tmp, ec) && ec) {
+                                // Log cleanup failure but don't change return value
+                            }
                             return false;
                         }
 #else

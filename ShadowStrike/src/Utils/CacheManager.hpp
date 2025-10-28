@@ -1,5 +1,3 @@
-
-
 #pragma once
 
 #include <cstdint>
@@ -168,6 +166,7 @@ namespace ShadowStrike {
 				size_t m_maxBytes = 0;
 
 				mutable SRWLOCK m_lock{};
+				mutable SRWLOCK m_diskLock{}; // ? NEW: Protect disk operations
 				std::unordered_map<std::wstring, std::shared_ptr<Entry>> m_map;
 				std::list<std::wstring> m_lru;
 				size_t m_totalBytes = 0;
@@ -175,7 +174,9 @@ namespace ShadowStrike {
 				std::atomic<bool> m_shutdown{ false };
 				std::thread m_maintThread;
 				std::chrono::milliseconds m_maintInterval{ std::chrono::minutes(1) };
-			    std::atomic<uint64_t> m_lastMaint{ 0 };
+				std::atomic<uint64_t> m_lastMaint{ 0 };
+				std::atomic<size_t> m_pendingDiskOps{ 0 }; // ? NEW: Track pending disk I/O
+				std::vector<uint8_t> m_hmacKey; // ? NEW: Secret key for HMAC-SHA256
 		};
 
 

@@ -316,54 +316,65 @@ namespace ShadowStrike {
              bool CreateDirectories(std::wstring_view dir, Error* err) {
                 if (dir.empty()) return true; 
 
-                std::wstring d = ToW(dir); // wstring_view → wstring conversion
+                std::wstring d = ToW(dir);
 
+                // ✅ FIXED: Path traversal attack prevention
                 if (d.find(L"..") != std::wstring::npos) {
 					if (err) err->win32 = ERROR_INVALID_PARAMETER;
 					SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Path contains .. : %s", d.c_str());
                     return false;
                 }
 
-                const wchar_t invalidChars[] = L"<>:\"|?*";
+                // ✅ FIXED: More comprehensive invalid char check
+                const wchar_t invalidChars[] = L"<>\"|?*";
+                size_t colonPos = d.find(L':');
+                // Allow colon only at position 1 for drive letter (C:)
+                if (colonPos != std::wstring::npos && colonPos != 1) {
+                    if (err) err->win32 = ERROR_INVALID_NAME;
+                    SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Invalid colon position in path");
+                    return false;
+                }
+                
                 if (d.find_first_of(invalidChars) != std::wstring::npos) {
                     if (err) err->win32 = ERROR_INVALID_NAME;
                     return false;
                 }
 
-              //if the path starts with C:\ it will continue
-
                 std::wstring cur;
-                cur.reserve(d.size() + 8); 
+                // ✅ FIXED: Reserve enough space for long path prefix
+                cur.reserve(d.size() + LONG_PATH_PREFIX.size() + 8);
 
                 for (size_t i = 0; i < d.size(); ++i) {
                     wchar_t c = d[i];
                     if (c == L'/') c = L'\\'; 
                     cur.push_back(c);
 
-					//Skipping first 3 characters (C:\)
+					// Skip first 3 characters (C:\)
                     if (c == L'\\' && cur.size() > 3) {
                         std::wstring longp = AddLongPathPrefix(cur);
                         if (!CreateDirectoryW(longp.c_str(), nullptr)) {
                             DWORD ec = GetLastError();
                             if (ec != ERROR_ALREADY_EXISTS) {
                                 if (err) err->win32 = ec;
+                                SS_LOG_LAST_ERROR(L"FileUtils", L"CreateDirectories failed for: %s", cur.c_str());
                                 return false; 
                             }
                         }
                     }
                 }
 
-               
+                // Create final directory
                 std::wstring longp = AddLongPathPrefix(d);
                 if (!CreateDirectoryW(longp.c_str(), nullptr)) {
                     DWORD ec = GetLastError();
                     if (ec != ERROR_ALREADY_EXISTS) {
                         if (err) err->win32 = ec;
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"CreateDirectories final failed: %s", d.c_str());
                         return false;
                     }
                 }
 
-				return true; //All directories created succesfully
+				return true;
             }
 
             bool RemoveFile(std::wstring_view path, Error* err) {
@@ -412,7 +423,14 @@ namespace ShadowStrike {
                     auto [cur, depth] = stack.back();
                     stack.pop_back();
 
-                    //Save the file ID with handle
+                    // ✅ FIXED: Check depth BEFORE processing
+                    if (depth > MAX_SYMLINK_DEPTH) {
+                        if (err) err->win32 = ERROR_CANT_RESOLVE_FILENAME;
+                        SS_LOG_ERROR(L"FileUtils", L"WalkDirectory: Maximum symlink depth exceeded: %s", cur.c_str());
+                        return false;
+                    }
+
+                    // ✅ FIXED: Check for symlink loops
                     {
                         std::wstring longp = AddLongPathPrefix(cur);
                         HANDLE dh = CreateFileW(longp.c_str(), FILE_READ_ATTRIBUTES,
@@ -423,32 +441,11 @@ namespace ShadowStrike {
                             FileId fid{};
                             if (GetFileIdFromHandle(dh, fid)) {
                                 if (!visited.insert(fid).second) {
+                                    // Loop detected - skip this directory
                                     CloseHandle(dh);
-                                    std::vector<std::pair<std::wstring, size_t>> stack; //path, depth
-                                    stack.emplace_back(base, 0);
-
-                                    //in the loop
-                                    auto [cur, depth] = stack.back();
-                                    stack.pop_back();
-
-                                    //Depth check
-                                    if (depth > MAX_SYMLINK_DEPTH) {
-                                        if (err) err->win32 = ERROR_CANT_RESOLVE_FILENAME;
-                                        SS_LOG_ERROR(L"FileUtils", L"WalkDirectory: Maximum symlink depth exceeded: %s", cur.c_str());
-                                        return false;
-                                    }
-
-                                    if(GetFileIdFromHandle(dh,fid)) {
-
-                                        if (!visited.insert(fid).second) {
-                                            CloseHandle(dh);
-                                            SS_LOG_WARN(L"FileUtils", L"Symlink loop detected at: %ls", cur.c_str());
-                                            continue;
-                                        }
-                                    }
-
+                                    SS_LOG_WARN(L"FileUtils", L"Symlink loop detected at: %ls", cur.c_str());
+                                    continue;
                                 }
-                                    
                             }
                             CloseHandle(dh);
                         }
@@ -526,17 +523,16 @@ namespace ShadowStrike {
 
                 BYTE buffer[64 * 1024];
                 DWORD bytesRead = 0;
-                LARGE_INTEGER zero{}; zero.QuadPart = 0;
                 PVOID ctx = nullptr;
+                bool success = true; // ✅ Track success state
 
                 while (true) {
                     BOOL ok = BackupRead(h, buffer, sizeof(buffer), &bytesRead, FALSE, FALSE, &ctx);
                     if (!ok) {
                         if (err) err->win32 = GetLastError();
                         SS_LOG_LAST_ERROR(L"FileUtils", L"ListAlternateStreams: BackupRead failed: %s", longp.c_str());
-                        BackupRead(h, nullptr, 0, &bytesRead, TRUE, FALSE, &ctx);
-                        CloseHandle(h);
-                        return false;
+                        success = false;
+                        break; // ✅ FIXED: Break instead of early return
                     }
                     if (bytesRead == 0) break; // EOF
 
@@ -546,17 +542,16 @@ namespace ShadowStrike {
                         size_t headerSize = sizeof(WIN32_STREAM_ID);
                         size_t nameBytes = sid->dwStreamNameSize;
                         size_t blockSize = headerSize + nameBytes + static_cast<size_t>(sid->Size.QuadPart);
-                        if (blockSize > bytesRead) {
-                            
-                            DWORD br = 0;
-                            BackupSeek(h, static_cast<DWORD>(sid->Size.LowPart), static_cast<DWORD>(sid->Size.HighPart), nullptr, nullptr, &ctx);
+                        
+                        // ✅ FIXED: Check blockSize doesn't exceed bytesRead to prevent overflow
+                        if (blockSize > bytesRead || nameBytes > bytesRead || headerSize > bytesRead) {
+                            BackupSeek(h, sid->Size.LowPart, sid->Size.HighPart, nullptr, nullptr, &ctx);
                             break;
                         }
 
                         if (sid->dwStreamId == BACKUP_ALTERNATE_DATA) {
-                            
                             std::wstring sname;
-                            if (nameBytes > 0) {
+                            if (nameBytes > 0 && nameBytes < 32768) { // ✅ FIXED: Sanity check
                                 sname.assign(reinterpret_cast<wchar_t*>(p + headerSize), nameBytes / sizeof(wchar_t));
                             }
                             AlternateStreamInfo si{};
@@ -565,8 +560,7 @@ namespace ShadowStrike {
                             out.emplace_back(std::move(si));
                         }
 
-						//Pass the stream data
-                        DWORD br2 = 0;
+                        // Pass the stream data
                         if (sid->Size.QuadPart > 0) {
                             BackupSeek(h, sid->Size.LowPart, sid->Size.HighPart, nullptr, nullptr, &ctx);
                         }
@@ -579,9 +573,11 @@ namespace ShadowStrike {
                     }
                 }
 
+                // ✅ FIXED: ALWAYS cleanup BackupRead context before closing handle
                 BackupRead(h, nullptr, 0, &bytesRead, TRUE, FALSE, &ctx);
                 CloseHandle(h);
-                return true;
+                
+                return success;
             }
 
 
@@ -628,19 +624,24 @@ namespace ShadowStrike {
 
 
             bool SecureEraseFile(std::wstring_view path, SecureEraseMode mode, Error* err) {
-                //Only files, not directories
+                // Only files, not directories
                 if (IsDirectory(path)) { if (err) err->win32 = ERROR_ACCESS_DENIED; return false; }
 
                 std::wstring longp = AddLongPathPrefix(path);
-                HANDLE h = CreateFileW(longp.c_str(), GENERIC_READ | GENERIC_WRITE,
-					0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr); //Extra security
+                
+                // ✅ FIXED: Single handle for both erase and delete - prevents race condition
+                HANDLE h = CreateFileW(longp.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+					0, // Exclusive access
+					nullptr, OPEN_EXISTING, 
+					FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, // Delete on close
+					nullptr);
                 if (h == INVALID_HANDLE_VALUE) {
                     if (err) err->win32 = GetLastError();
                     SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: CreateFileW failed: %s", longp.c_str());
                     return false;
                 }
 
-				//Make the directory check using the handle
+				// Verify it's not a directory using the handle
                 BY_HANDLE_FILE_INFORMATION fileInfo;
                 if (!GetFileInformationByHandle(h, &fileInfo)) {
                     DWORD ec = GetLastError();
@@ -653,6 +654,7 @@ namespace ShadowStrike {
 					if (err) err->win32 = ERROR_ACCESS_DENIED;
                     return false;
                 }
+                
                 LARGE_INTEGER sz{};
                 if (!GetFileSizeEx(h, &sz)) {
                     if (err) err->win32 = GetLastError();
@@ -661,9 +663,10 @@ namespace ShadowStrike {
                 }
 
                 const int passCount = (mode == SecureEraseMode::TriplePass) ? 3 : 1;
-                std::vector<uint8_t> buf(1 << 20);
+                std::vector<uint8_t> buf(1 << 20); // 1MB buffer
+                
                 for (int pass = 0; pass < passCount; ++pass) {
-                    // Create data
+                    // Create data pattern
                     if (pass == 0) {
                         std::fill(buf.begin(), buf.end(), 0x00);
                     }
@@ -671,11 +674,21 @@ namespace ShadowStrike {
                         std::fill(buf.begin(), buf.end(), 0xFF);
                     }
                     else {
-                        for (auto& b : buf) b = static_cast<uint8_t>(rand() & 0xFF);
+                        // ✅ FIXED: Use cryptographically secure random for third pass
+                        NTSTATUS st = BCryptGenRandom(nullptr, buf.data(), static_cast<ULONG>(buf.size()), 
+                                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                        if (st < 0) {
+                            // Fallback to rand() if BCrypt fails
+                            for (auto& b : buf) b = static_cast<uint8_t>(rand() & 0xFF);
+                        }
                     }
 
                     LARGE_INTEGER pos{}; pos.QuadPart = 0;
-                    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) { if (err) err->win32 = GetLastError(); CloseHandle(h); return false; }
+                    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) { 
+                        if (err) err->win32 = GetLastError(); 
+                        CloseHandle(h); 
+                        return false; 
+                    }
 
                     uint64_t left = static_cast<uint64_t>(sz.QuadPart);
                     while (left > 0) {
@@ -691,31 +704,27 @@ namespace ShadowStrike {
                     }
                     FlushFileBuffers(h);
                 }
-                CloseHandle(h);
 
-                // Delete flags
-                std::wstring longp2 = AddLongPathPrefix(path);
-                HANDLE hd = CreateFileW(longp2.c_str(), DELETE, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (hd == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: open for delete failed: %s", longp2.c_str());
-                    return false;
-                }
-
-                //force delete on windows 10+ with FILE_DISPOSITION_INFO_EX 
+                // ✅ FIXED: Set delete disposition before closing (more reliable than FILE_FLAG_DELETE_ON_CLOSE alone)
                 FILE_DISPOSITION_INFO_EX dx{};
                 dx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
-                BOOL ok = SetFileInformationByHandle(hd, FileDispositionInfoEx, &dx, sizeof(dx));
+                BOOL ok = SetFileInformationByHandle(h, FileDispositionInfoEx, &dx, sizeof(dx));
                 if (!ok) {
-                    // Geriye uyumlu: FILE_DISPOSITION_INFO
+                    // Fallback for older Windows versions
                     FILE_DISPOSITION_INFO d{};
                     d.DeleteFile = TRUE;
-                    ok = SetFileInformationByHandle(hd, FileDispositionInfo, &d, sizeof(d));
+                    ok = SetFileInformationByHandle(h, FileDispositionInfo, &d, sizeof(d));
                 }
+                
                 DWORD ec = ok ? ERROR_SUCCESS : GetLastError();
-                CloseHandle(hd);
-                if (!ok) { if (err) err->win32 = ec; return false; }
+                CloseHandle(h); // This will delete the file due to FILE_FLAG_DELETE_ON_CLOSE
+                
+                if (!ok) { 
+                    if (err) err->win32 = ec; 
+                    SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: Delete disposition failed");
+                    return false; 
+                }
+                
                 return true;
             }
 
@@ -806,4 +815,4 @@ namespace ShadowStrike {
 		}//namespace FileUtils
 
 	}//namespace Utils
-}//namespace ShadowStrike
+}//namespace ShadowStrike}//namespace ShadowStrike

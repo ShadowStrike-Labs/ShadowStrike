@@ -16,6 +16,10 @@ namespace ShadowStrike {
 
 			using Json = nlohmann::json;
 
+			// ? ADDED: Security constants
+			constexpr size_t MAX_JSON_SIZE = 100ULL * 1024 * 1024; // 100MB
+			constexpr size_t MAX_JSON_DEPTH = 1000; // Max nesting depth
+			constexpr size_t MAX_HEX_INPUT = 10 * 1024 * 1024; // 10MB hex input limit
 
 			struct Error {
 				// Error info
@@ -29,6 +33,7 @@ namespace ShadowStrike {
 			struct ParseOptions {
 				bool allowComments = true;         // // ve /* */ comments
 				bool allowExceptions = true;       // Allow exceptions at parsing?
+				size_t maxDepth = MAX_JSON_DEPTH;  // ? ADDED: Max nesting depth
 			};
 
 			struct StringifyOptions {

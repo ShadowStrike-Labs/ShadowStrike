@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <cstdint>
@@ -18,6 +17,12 @@
 namespace ShadowStrike {
     namespace Utils {
         namespace CompressionUtils {
+            // ? ADDED: Security limits to prevent decompression bombs
+            constexpr size_t MAX_DECOMPRESSED_SIZE = 512 * 1024 * 1024; // 512MB max output
+            constexpr size_t MAX_COMPRESSED_SIZE = 256 * 1024 * 1024;   // 256MB max input
+            constexpr size_t MAX_COMPRESSION_RATIO = 100;                // 100:1 max ratio
+            constexpr size_t MIN_BUFFER_SIZE = 64;                       // Minimum allocation
+
             // Windows Compression API algorithm values (compressapi.h)
             // COMPRESS_ALGORITHM_MSZIP       0x0002
             // COMPRESS_ALGORITHM_XPRESS      0x0003

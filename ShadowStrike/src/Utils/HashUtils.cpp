@@ -1,4 +1,3 @@
-
 #include "HashUtils.hpp"
 
 #include <algorithm>
@@ -133,6 +132,13 @@ namespace ShadowStrike {
 
 			bool FromHex(std::string_view hex, std::vector<uint8_t>& out) {
 				out.clear();
+
+				// ? FIX: Prevent DoS via large hex input
+				constexpr size_t MAX_HEX_INPUT = 20 * 1024 * 1024; // 20MB hex = 10MB binary (reasonable limit)
+				if (hex.size() > MAX_HEX_INPUT) {
+					return false;
+				}
+
 				auto hv = [](char c) -> int {
 					if (c >= '0' && c <= '9') return c - '0';
 					if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -140,7 +146,15 @@ namespace ShadowStrike {
 					return -1;
 					};
 				if ((hex.size() & 1) != 0) return false;
-				out.resize(hex.size() / 2);
+
+				// ? FIX: Protect against bad_alloc
+				try {
+					out.resize(hex.size() / 2);
+				}
+				catch (const std::bad_alloc&) {
+					return false;
+				}
+
 				for (size_t i = 0, j = 0; i < hex.size(); i += 2, ++j) {
 					int hi = hv(hex[i]); int lo = hv(hex[i + 1]);
 					if (hi < 0 || lo < 0) { out.clear(); return false; }
@@ -326,10 +340,26 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				//Temporary copy for key(not on the stack, it could be big so use heap)
-				std::unique_ptr<uint8_t[]> keyCopy;
-				if (keyLen) {
-					keyCopy.reset(new (std::nothrow) uint8_t[keyLen]);
+				// ? FIX: RAII wrapper for secure key cleanup
+				struct SecureKeyBuffer {
+					std::unique_ptr<uint8_t[]> data;
+					size_t size;
+					SecureKeyBuffer(size_t sz) : size(sz) {
+						if (sz > 0) {
+							data.reset(new (std::nothrow) uint8_t[sz]);
+						}
+					}
+					~SecureKeyBuffer() {
+						if (data && size > 0) {
+							SecureZeroMemory(data.get(), size);
+						}
+					}
+					uint8_t* get() { return data.get(); }
+					explicit operator bool() const { return data != nullptr; }
+				};
+
+				SecureKeyBuffer keyCopy(keyLen);
+				if (keyLen > 0) {
 					if (!keyCopy) {
 						if (err) { err->win32 = ERROR_OUTOFMEMORY; err->ntstatus = STATUS_NO_MEMORY; }
 						resetState();
@@ -341,7 +371,7 @@ namespace ShadowStrike {
 				NTSTATUS st = BCryptCreateHash(ap.hAlgHmac, &m_hash, static_cast<PUCHAR>(m_objBuf), m_objLen,
 					keyLen ? keyCopy.get() : nullptr, static_cast<ULONG>(keyLen), 0);
 
-				if (keyCopy) SecureZeroMemory(keyCopy.get(), keyLen);
+				// ? Key automatically zeroed here by SecureKeyBuffer destructor
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); }

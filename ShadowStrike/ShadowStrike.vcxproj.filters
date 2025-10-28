@@ -84,13 +84,7 @@
     <ClCompile Include="src\Database\LogDB.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="src\Database\WhitelistDB.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="src\Database\CacheDB.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
-    <ClCompile Include="src\Database\StatisticsDB.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="src\Database\ConfigurationDB.cpp">
@@ -121,6 +115,9 @@
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="src\Database\QuarantineDB.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Utils\Base64UtilsTests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
   </ItemGroup>
@@ -194,16 +191,10 @@
     <ClInclude Include="src\Database\LogDB.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
-    <ClInclude Include="src\Database\WhitelistDB.hpp">
-      <Filter>Üst Bilgi Dosyaları</Filter>
-    </ClInclude>
     <ClInclude Include="src\Database\QuarantineDB.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
     <ClInclude Include="src\Database\CacheDB.hpp">
-      <Filter>Üst Bilgi Dosyaları</Filter>
-    </ClInclude>
-    <ClInclude Include="src\Database\StatisticsDB.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Assertion.h">
@@ -251,9 +242,5 @@
     <ClInclude Include="docs\CacheDB_Examples.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="docs\DatabaseManager_Documentation.md" />
-    <None Include="docs\CacheDB_Documentation.md" />
   </ItemGroup>
 </Project>

@@ -146,9 +146,7 @@
     <ClCompile Include="src\Database\LogDB.cpp" />
     <ClCompile Include="src\Database\QuarantineDB.cpp" />
     <ClCompile Include="src\Database\SignatureDB.cpp" />
-    <ClCompile Include="src\Database\StatisticsDB.cpp" />
     <ClCompile Include="src\Database\ThreatIntelDB.cpp" />
-    <ClCompile Include="src\Database\WhitelistDB.cpp" />
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\Utils\Base64Utils.cpp" />
     <ClCompile Include="src\Utils\CacheManager.cpp" />
@@ -167,6 +165,7 @@
     <ClCompile Include="src\Utils\ThreadPool.cpp" />
     <ClCompile Include="src\Utils\Timer.cpp" />
     <ClCompile Include="src\Utils\XMLUtils.cpp" />
+    <ClCompile Include="tests\unit\Utils\Base64UtilsTests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="docs\CacheDB_Examples.hpp" />
@@ -191,9 +190,7 @@
     <ClInclude Include="src\Database\LogDB.hpp" />
     <ClInclude Include="src\Database\QuarantineDB.hpp" />
     <ClInclude Include="src\Database\SignatureDB.hpp" />
-    <ClInclude Include="src\Database\StatisticsDB.hpp" />
     <ClInclude Include="src\Database\ThreatIntelDB.hpp" />
-    <ClInclude Include="src\Database\WhitelistDB.hpp" />
     <ClInclude Include="src\Utils\Base64Utils.hpp" />
     <ClInclude Include="src\Utils\CacheManager.hpp" />
     <ClInclude Include="src\Utils\CompressionUtils.hpp" />
@@ -211,10 +208,6 @@
     <ClInclude Include="src\Utils\ThreadPool.hpp" />
     <ClInclude Include="src\Utils\Timer.hpp" />
     <ClInclude Include="src\Utils\XMLUtils.hpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="docs\CacheDB_Documentation.md" />
-    <None Include="docs\DatabaseManager_Documentation.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

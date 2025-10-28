@@ -1,11 +1,10 @@
-
-#include"../Utils/Logger.hpp"
-
+﻿#include"../Utils/Logger.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
 #include <io.h>
+#include <chrono>
 
 #ifdef _WIN32
 #  include <Shlwapi.h>
@@ -90,27 +89,36 @@ namespace ShadowStrike {
 #endif
 
 			m_stop.store(false, std::memory_order_release);
-			m_accepting.store(true, std::memory_order_release); // start accepting logs
-
+			
+			// ✅ FIX: Start worker thread BEFORE enabling log acceptance to prevent race condition
 			if (m_cfg.async) {
 				m_worker = std::thread([this]() {WorkerLoop(); });
+				// Give thread a moment to start (prevents lost logs during initialization)
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
 			}
+			
+			// ✅ FIX: Enable log acceptance AFTER worker thread is running
+			m_accepting.store(true, std::memory_order_release);
 		}
 
 		void Logger::ShutDown() {
 
 			if (!IsInitialized()) return;
 
+			// ✅ FIX: Stop accepting logs FIRST
 			m_accepting.store(false, std::memory_order_release);
 
+			// ✅ FIX: Signal worker thread to stop
 			m_stop.store(true, std::memory_order_release);
 			m_queueCv.notify_all();
 
+			// ✅ FIX: Wait for worker thread to finish processing
 			if (m_worker.joinable()) {
 				m_worker.join();
 			}
-			LogItem item;
 
+			// ✅ FIX: Now safe to drain remaining queue items (worker thread has stopped)
+			LogItem item;
 			while (Dequeue(item)) {
 				if (m_cfg.toConsole) WriteConsole(item);
 				if (m_cfg.toFile) WriteFile(item);
@@ -247,10 +255,10 @@ namespace ShadowStrike {
 
 			LogItem item{};
 			item.level = level;
-			item.category = category ? category : L"";
+			item.category = category ? category : L"";;
 			item.message = message;
-			item.file = file ? file : L"";
-			item.function = function ? function : L"";
+			item.file = file ? file : L"";;
+			item.function = function ? function : L"";;
 			item.line = line;
 #ifdef _WIN32
 			item.pid = GetCurrentProcessId();
@@ -312,19 +320,21 @@ namespace ShadowStrike {
 
 		std::wstring Logger::FormatMessageV(const wchar_t* fmt, va_list args) {
 
-			if (!fmt) return L"";
+			if (!fmt) return L""; 
 
-			//first try 512 wchar
+			// ✅ FIX: Proper handling of _vsnwprintf_s with _TRUNCATE
 			std::wstring out;
 			out.resize(512);
 			va_list args_copy;
 			va_copy(args_copy, args);
-		     int needed = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
+			int needed = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
 			va_end(args_copy);
 
+			// When using _TRUNCATE:
+			// - If buffer sufficient: returns number of characters written (excluding null terminator)
+			// - If buffer too small: returns -1 and truncates
 			if (needed < 0) {
-
-				//if we cannot calculate the length, increase it  section by section
+				// Buffer was too small, need to grow
 				size_t cap = 1024;
 				while (true) {
 					out.resize(cap);
@@ -333,33 +343,22 @@ namespace ShadowStrike {
 					va_end(args_copy);
 
 					if (n >= 0 && static_cast<size_t>(n) < out.size()) {
+						// Success: resize to actual length
 						out.resize(static_cast<size_t>(n));
 						break;
 					}
+					
+					// Still too small, double the capacity
 					cap *= 2;
-					if (cap > (1u << 20)) {//1M
-
+					if (cap > (1u << 20)) { // 1MB limit
 						out = L"[Logger] formatting error or message too large";
 						break;
 					}
 				}
-				return out;
 			}
 			else {
-				if (static_cast<size_t>(needed) < out.size()) {
-
-					out.resize(static_cast<size_t>(needed) + 1);
-					va_copy(args_copy, args);
-					int n = _vsnwprintf_s(&out[0], out.size(),_TRUNCATE, fmt, args_copy);
-					va_end(args_copy);
-					if (n >= 0) {
-						out.resize(static_cast<size_t>(n));
-					}
-					else {
-						out.resize(static_cast<size_t>(needed));
-					}
-					return out;
-				}
+				// ✅ FIXED: Success case - resize to actual length
+				out.resize(static_cast<size_t>(needed));
 			}
 
 			return out;
@@ -419,25 +418,28 @@ namespace ShadowStrike {
 			std::wstring Logger::FormatIso8601UTC(uint64_t filetime100ns) {
 
 #ifdef _WIN32
-				// FILETIME -> SYSTEMTIME (UTC)
-				FILETIME ft{};
-				ft.dwLowDateTime = static_cast<DWORD>(filetime100ns & 0xFFFFFFFFull);
-				ft.dwHighDateTime = static_cast<DWORD>((filetime100ns >> 32) & 0xFFFFFFFFull);
+	// FILETIME -> SYSTEMTIME (UTC)
+	FILETIME ft{};
+	ft.dwLowDateTime = static_cast<DWORD>(filetime100ns & 0xFFFFFFFFull);
+	ft.dwHighDateTime = static_cast<DWORD>((filetime100ns >> 32) & 0xFFFFFFFFull);
 
-				SYSTEMTIME st{};
-				FileTimeToSystemTime(&ft, &st);
+	SYSTEMTIME st{};
+	// ✅ FIX: Check return value to prevent uninitialized data usage
+	if (!FileTimeToSystemTime(&ft, &st)) {
+		return L"[Invalid timestamp]";
+	}
 
-				wchar_t buf[40] = { 0 };
-				// yyyy-MM-ddTHH:mm:ss.mmmZ
-				_snwprintf_s(buf, _TRUNCATE, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
-					st.wYear, st.wMonth, st.wDay,
-					st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-				return std::wstring(buf);
+	wchar_t buf[40] = { 0 };
+	// yyyy-MM-ddTHH:mm:ss.mmmZ
+	_snwprintf_s(buf, _TRUNCATE, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+		st.wYear, st.wMonth, st.wDay,
+		st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+	return std::wstring(buf);
 #else
-				return L"";
+	return L"";
 #endif
 
-			}
+}
 
 			std::wstring Logger::EscapeJson(const std::wstring& s) {
 
@@ -479,7 +481,7 @@ namespace ShadowStrike {
 				s.reserve(128);
 				s += ts;
 				s += L" [";
-				s += LevelToW(item.level);
+			 s += LevelToW(item.level);
 				s += L"]";
 				if (!item.category.empty())
 				{
@@ -492,7 +494,7 @@ namespace ShadowStrike {
 					s += L" (";
 					s += std::to_wstring(item.pid);
 					s += L":";
-					s += std::to_wstring(item.tid);
+				 s += std::to_wstring(item.tid);
 					s += L")";
 				}
 				if (m_cfg.includeSrcLocation && !item.file.empty())
@@ -521,12 +523,12 @@ namespace ShadowStrike {
 				s += L"{\"ts\":\"";
 				s += EscapeJson(FormatIso8601UTC(item.ts_100ns));
 				s += L"\",\"lvl\":\"";
-				s += LevelToW(item.level);
+			 s += LevelToW(item.level);
 				s += L"\"";
 				if (!item.category.empty())
 				{
 					s += L",\"cat\":\"";
-					s += EscapeJson(item.category);
+				 s += EscapeJson(item.category);
 					s += L"\"";
 				}
 
@@ -541,13 +543,13 @@ namespace ShadowStrike {
 				if (m_cfg.includeSrcLocation && !item.file.empty())
 				{
 					s += L",\"file\":\"";
-					s += EscapeJson(item.file);
+				 s += EscapeJson(item.file);
 					s += L"\",\"line\":";
-					s += std::to_wstring(item.line);
+				 s += std::to_wstring(item.line);
 					if (!item.function.empty())
 					{
 						s += L",\"func\":\"";
-						s += EscapeJson(item.function);
+					 s += EscapeJson(item.function);
 						s += L"\"";
 					}
 				}
@@ -555,17 +557,17 @@ namespace ShadowStrike {
 				if (item.winError)
 				{
 					s += L",\"winerr\":";
-					s += std::to_wstring(item.winError);
+				 s += std::to_wstring(item.winError);
 				}
 				s += L",\"msg\":\"";
-				s += EscapeJson(item.message);
+			 s += EscapeJson(item.message);
 				s += L"\"}";
 				return s;
 			}
 
 			//Sinks
 
-			void Logger::WriteConsoleW(const LogItem& item) {
+			void Logger::WriteConsole(const LogItem& item) {
 #ifdef _WIN32
 				if (!m_console || m_console == INVALID_HANDLE_VALUE) return;
 
@@ -637,145 +639,142 @@ namespace ShadowStrike {
 			void Logger::PerformRotation()
 			{
 #ifdef _WIN32
-				SS_LOG_INFO(L"Logger", L"Starting log file rotation");
+	// ✅ FIX: Set rotation guard to prevent recursive logging
+	bool expected = false;
+	if (!m_insideRotation.compare_exchange_strong(expected, true)) {
+		// Already inside rotation, skip to prevent recursion
+		return;
+	}
 
-				// EXCLUSIVE LOCK DURING ROTATION
-				std::lock_guard<std::mutex> lock(m_cfgmutex);
+	// ✅ RAII guard to ensure flag is cleared
+	struct RotationGuard {
+		std::atomic<bool>& flag;
+		~RotationGuard() { flag.store(false, std::memory_order_release); }
+	} guard{ m_insideRotation };
 
-				try {
-					// CLOSE CURRENT FILE BEFORE ROTATION
-					if (m_file && m_file != INVALID_HANDLE_VALUE) {
-						::FlushFileBuffers(m_file);
-						::CloseHandle(m_file);
-						m_file = INVALID_HANDLE_VALUE;
-					}
+	// EXCLUSIVE LOCK DURING ROTATION
+	std::lock_guard<std::mutex> lock(m_cfgmutex);
 
-					const std::wstring base = BaseLogPath(); // logs\ShadowStrike.log
+	try {
+		// CLOSE CURRENT FILE BEFORE ROTATION
+		if (m_file && m_file != INVALID_HANDLE_VALUE) {
+			::FlushFileBuffers(m_file);
+			::CloseHandle(m_file);
+			m_file = INVALID_HANDLE_VALUE;
+		}
 
-					// DELETE OLDEST FILE FIRST (if exists)
-					if (m_cfg.maxFileCount > 1) {
-						std::wstring oldestFile = base + L"." + std::to_wstring(m_cfg.maxFileCount);
+		const std::wstring base = BaseLogPath(); // logs\ShadowStrike.log
 
-						// Check if file exists before trying to delete
-						DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
-						if (attrs != INVALID_FILE_ATTRIBUTES) {
-							// File exists, try to delete
-							::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL); // Remove read-only
+		// DELETE OLDEST FILE FIRST (if exists)
+		if (m_cfg.maxFileCount > 1) {
+			std::wstring oldestFile = base + L"." + std::to_wstring(m_cfg.maxFileCount);
 
-							if (!::DeleteFileW(oldestFile.c_str())) {
-								DWORD error = ::GetLastError();
-								if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
-									SS_LOG_WARN(L"Logger",
-										L"Failed to delete oldest log file: %ls (error %lu)",
-										oldestFile.c_str(), error);
+			// Check if file exists before trying to delete
+			DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
+			if (attrs != INVALID_FILE_ATTRIBUTES) {
+				// File exists, try to delete
+				::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL); // Remove read-only
 
-									// TRY FORCE DELETE WITH RETRY
-									for (int retry = 0; retry < 3; ++retry) {
-										::Sleep(100); // Wait 100ms
-										if (::DeleteFileW(oldestFile.c_str())) {
-											break;
-										}
-									}
-								}
-							}
-						}
-
-						// ROTATE FILES IN REVERSE ORDER (N-1 ... 1 -> N ... 2)
-						for (size_t idx = m_cfg.maxFileCount - 1; idx >= 1; --idx) {
-							std::wstring srcFile = base + L"." + std::to_wstring(idx);
-							std::wstring dstFile = base + L"." + std::to_wstring(idx + 1);
-
-							// Check if source file exists
-							attrs = ::GetFileAttributesW(srcFile.c_str());
-							if (attrs == INVALID_FILE_ATTRIBUTES) {
-								// Source doesn't exist, skip
-								if (idx == 1) break; // Prevent size_t underflow
-								continue;
-							}
-
-							// DELETE TARGET FILE IF EXISTS
-							attrs = ::GetFileAttributesW(dstFile.c_str());
-							if (attrs != INVALID_FILE_ATTRIBUTES) {
-								::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
-								::DeleteFileW(dstFile.c_str());
-							}
-
-							// MOVE FILE WITH ERROR HANDLING
-							if (!::MoveFileExW(srcFile.c_str(), dstFile.c_str(),
-								MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-								DWORD error = ::GetLastError();
-								SS_LOG_WARN(L"Logger",
-									L"Failed to rotate log file %ls to %ls (error %lu)",
-									srcFile.c_str(), dstFile.c_str(), error);
-
-								// FALLBACK: COPY + DELETE
-								if (::CopyFileW(srcFile.c_str(), dstFile.c_str(), FALSE)) {
-									::DeleteFileW(srcFile.c_str());
-								}
-							}
-
-							if (idx == 1) break; // Prevent size_t underflow
-						}
-
-						// RENAME CURRENT LOG TO .1 (base -> .1)
-						std::wstring firstRotated = base + L".1";
-
-						// Check if current log exists
-						attrs = ::GetFileAttributesW(base.c_str());
-						if (attrs != INVALID_FILE_ATTRIBUTES) {
-							// Delete target if exists
-							attrs = ::GetFileAttributesW(firstRotated.c_str());
-							if (attrs != INVALID_FILE_ATTRIBUTES) {
-								::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
-								::DeleteFileW(firstRotated.c_str());
-							}
-
-							if (!::MoveFileExW(base.c_str(), firstRotated.c_str(),
-								MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-								DWORD error = ::GetLastError();
-								SS_LOG_WARN(L"Logger",
-									L"Failed to rotate current log to %ls (error %lu)",
-									firstRotated.c_str(), error);
-
-								// FALLBACK: COPY + DELETE
-								if (::CopyFileW(base.c_str(), firstRotated.c_str(), FALSE)) {
-									::DeleteFileW(base.c_str());
-								}
+				if (!::DeleteFileW(oldestFile.c_str())) {
+					DWORD error = ::GetLastError();
+					if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+						// ❌ REMOVED: SS_LOG_WARN to prevent recursion
+						// TRY FORCE DELETE WITH RETRY
+						for (int retry = 0; retry < 3; ++retry) {
+							::Sleep(100); // Wait 100ms
+							if (::DeleteFileW(oldestFile.c_str())) {
+								break;
 							}
 						}
 					}
-					else {
-						// IF ONLY ONE FILE, JUST DELETE IT
-						DWORD attrs = ::GetFileAttributesW(base.c_str());
-						if (attrs != INVALID_FILE_ATTRIBUTES) {
-							::SetFileAttributesW(base.c_str(), FILE_ATTRIBUTE_NORMAL);
-							if (!::DeleteFileW(base.c_str())) {
-								DWORD error = ::GetLastError();
-								SS_LOG_WARN(L"Logger",
-									L"Failed to delete current log file: %ls (error %lu)",
-									base.c_str(), error);
-							}
-						}
-					}
-
-					// RESET SIZE AND PATH
-					m_currentSize = 0;
-					m_actualLogPath.clear();
-
-					// CREATE NEW LOG FILE (will be done by OpenLogFileIfNeeded)
-
 				}
-				catch (const std::exception& e) {
-					SS_LOG_ERROR(L"Logger", L"Log rotation exception: %hs", e.what());
-				}
-				catch (...) {
-					SS_LOG_ERROR(L"Logger", L"Log rotation unknown exception");
-				}
-
-				SS_LOG_INFO(L"Logger", L"Log file rotation completed");
-#endif
 			}
-		
+
+			// ROTATE FILES IN REVERSE ORDER (N-1 ... 1 -> N ... 2)
+			for (size_t idx = m_cfg.maxFileCount - 1; idx >= 1; --idx) {
+				std::wstring srcFile = base + L"." + std::to_wstring(idx);
+				std::wstring dstFile = base + L"." + std::to_wstring(idx + 1);
+
+				// Check if source file exists
+				attrs = ::GetFileAttributesW(srcFile.c_str());
+				if (attrs == INVALID_FILE_ATTRIBUTES) {
+					// Source doesn't exist, skip
+					if (idx == 1) break; // Prevent size_t underflow
+					continue;
+				}
+
+				// DELETE TARGET FILE IF EXISTS
+				attrs = ::GetFileAttributesW(dstFile.c_str());
+				if (attrs != INVALID_FILE_ATTRIBUTES) {
+					::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
+					::DeleteFileW(dstFile.c_str());
+				}
+
+				// MOVE FILE WITH ERROR HANDLING
+				if (!::MoveFileExW(srcFile.c_str(), dstFile.c_str(),
+					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+					// ❌ REMOVED: SS_LOG_WARN to prevent recursion
+					// FALLBACK: COPY + DELETE
+					if (::CopyFileW(srcFile.c_str(), dstFile.c_str(), FALSE)) {
+						::DeleteFileW(srcFile.c_str());
+					}
+				}
+
+				if (idx == 1) break; // Prevent size_t underflow
+			}
+
+			// RENAME CURRENT LOG TO .1 (base -> .1)
+			std::wstring firstRotated = base + L".1";
+
+			// Check if current log exists
+			attrs = ::GetFileAttributesW(base.c_str());
+			if (attrs != INVALID_FILE_ATTRIBUTES) {
+				// Delete target if exists
+				attrs = ::GetFileAttributesW(firstRotated.c_str());
+				if (attrs != INVALID_FILE_ATTRIBUTES) {
+					::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
+					::DeleteFileW(firstRotated.c_str());
+				}
+
+				if (!::MoveFileExW(base.c_str(), firstRotated.c_str(),
+					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+					// ❌ REMOVED: SS_LOG_WARN to prevent recursion
+					// FALLBACK: COPY + DELETE
+					if (::CopyFileW(base.c_str(), firstRotated.c_str(), FALSE)) {
+						::DeleteFileW(base.c_str());
+					}
+				}
+			}
+		}
+		else {
+			// IF ONLY ONE FILE, JUST DELETE IT
+			DWORD attrs = ::GetFileAttributesW(base.c_str());
+			if (attrs != INVALID_FILE_ATTRIBUTES) {
+				::SetFileAttributesW(base.c_str(), FILE_ATTRIBUTE_NORMAL);
+				::DeleteFileW(base.c_str());
+				// ❌ REMOVED: SS_LOG_WARN to prevent recursion
+			}
+		}
+
+		// RESET SIZE AND PATH
+		m_currentSize = 0;
+		m_actualLogPath.clear();
+
+		// CREATE NEW LOG FILE (will be done by OpenLogFileIfNeeded)
+
+	}
+	catch (const std::exception&) {
+		// ❌ REMOVED: SS_LOG_ERROR to prevent recursion
+		// Silent failure during rotation
+	}
+	catch (...) {
+		// ❌ REMOVED: SS_LOG_ERROR to prevent recursion
+		// Silent failure during rotation
+	}
+
+	// ❌ REMOVED: SS_LOG_INFO to prevent recursion
+#endif
+}
 
 			void Logger::EnsureLogDirectory()
 			{
@@ -911,4 +910,4 @@ namespace ShadowStrike {
 			}	
 
 	}//namespace Utils
-}//namespace ShadowStrike
+}//namespace ShadowStrike>

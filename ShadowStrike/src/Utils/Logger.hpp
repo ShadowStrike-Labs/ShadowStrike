@@ -187,6 +187,7 @@ namespace ShadowStrike {
 			void CloseEventLog();
 
 			std::atomic<bool> m_accepting{ false };
+			std::atomic<bool> m_insideRotation{ false }; // ? ADDED: Rotation guard to prevent recursive logging
 
 		private:
 

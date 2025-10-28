@@ -73,24 +73,69 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                WCHAR className[256] = {};
-                DWORD classLen = static_cast<DWORD>(std::size(className));
+                // ? FIX: First query to get required class name length
+                DWORD classLen = 0;
                 DWORD subKeys = 0, maxSubKeyLen = 0, maxClassLen = 0;
                 DWORD values = 0, maxValueNameLen = 0, maxValueDataLen = 0;
                 DWORD secDescLen = 0;
                 FILETIME lastWrite = {};
 
-                const LSTATUS st = RegQueryInfoKeyW(m_key, className, &classLen, nullptr,
+                // First call with nullptr to get required buffer size
+                LSTATUS st = RegQueryInfoKeyW(m_key, nullptr, &classLen, nullptr,
                     &subKeys, &maxSubKeyLen, &maxClassLen,
                     &values, &maxValueNameLen, &maxValueDataLen,
                     &secDescLen, &lastWrite);
-                if (st != ERROR_SUCCESS) {
-                    SetError(err, st, L"RegQueryInfoKeyW failed");
+                
+                if (st != ERROR_SUCCESS && st != ERROR_MORE_DATA) {
+                    SetError(err, st, L"RegQueryInfoKeyW size query failed");
                     SS_LOG_ERROR(L"RegistryUtils", L"RegQueryInfoKeyW failed (code=%lu)", st);
                     return false;
                 }
 
-                info.className = className;
+                // ? FIX: Allocate dynamic buffer based on actual class name length
+                std::wstring className;
+                if (classLen > 0) {
+                    // ? Sanity check on class name length
+                    constexpr DWORD MAX_CLASS_NAME_LENGTH = 32768; // 32K chars reasonable limit
+                    if (classLen > MAX_CLASS_NAME_LENGTH) {
+                        SetError(err, ERROR_INVALID_DATA, L"Class name too long");
+                        SS_LOG_ERROR(L"RegistryUtils", L"QueryInfo: Class name length %lu exceeds maximum", classLen);
+                        return false;
+                    }
+
+                    try {
+                        className.resize(classLen + 1, L'\0'); // +1 for safety
+                    }
+                    catch (const std::bad_alloc&) {
+                        SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed");
+                        SS_LOG_ERROR(L"RegistryUtils", L"QueryInfo: Failed to allocate %lu chars", classLen);
+                        return false;
+                    }
+
+                    // Second call with allocated buffer
+                    DWORD actualLen = classLen + 1;
+                    st = RegQueryInfoKeyW(m_key, className.data(), &actualLen, nullptr,
+                        &subKeys, &maxSubKeyLen, &maxClassLen,
+                        &values, &maxValueNameLen, &maxValueDataLen,
+                        &secDescLen, &lastWrite);
+                    
+                    if (st != ERROR_SUCCESS) {
+                        SetError(err, st, L"RegQueryInfoKeyW failed");
+                        SS_LOG_ERROR(L"RegistryUtils", L"RegQueryInfoKeyW failed (code=%lu)", st);
+                        return false;
+                    }
+
+                    // ? Trim to actual length
+                    if (actualLen < className.size()) {
+                        className.resize(actualLen);
+                    }
+                }
+                else {
+                    // No class name, use data from first call
+                    st = ERROR_SUCCESS;
+                }
+
+                info.className = std::move(className);
                 info.subKeyCount = subKeys;
                 info.valueCount = values;
                 info.maxSubKeyLen = maxSubKeyLen;
@@ -131,7 +176,25 @@ namespace ShadowStrike {
                     return true;
                 }
 
-                out.resize(size);
+                // ? FIX: Validate size to prevent DoS attacks
+                constexpr DWORD MAX_REGISTRY_VALUE_SIZE = 16 * 1024 * 1024; // 16MB reasonable limit
+                if (size > MAX_REGISTRY_VALUE_SIZE) {
+                    SetError(err, ERROR_INVALID_DATA, L"Registry value too large", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"ReadValue: Size %lu exceeds maximum %lu for value %ls", 
+                                 size, MAX_REGISTRY_VALUE_SIZE, vn.c_str());
+                    return false;
+                }
+
+                // ? FIX: Protect against bad_alloc in noexcept function
+                try {
+                    out.resize(size);
+                }
+                catch (const std::bad_alloc&) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"ReadValue: Failed to allocate %lu bytes", size);
+                    return false;
+                }
+
                 st = RegQueryValueExW(m_key, vn.c_str(), nullptr, &type, out.data(), &size);
                 if (st != ERROR_SUCCESS) {
                     SetError(err, st, L"RegQueryValueExW data read failed", L"", valueName);
@@ -155,7 +218,6 @@ namespace ShadowStrike {
                     return true;
                 }
 
-				
                 if (buf.size() < sizeof(wchar_t)) {
                     out.clear();
                     return true;
@@ -164,20 +226,42 @@ namespace ShadowStrike {
                 const wchar_t* ptr = reinterpret_cast<const wchar_t*>(buf.data());
                 size_t len = buf.size() / sizeof(wchar_t);
 
-				// Remove trailing null if present
+                // Remove trailing null if present
                 if (len > 0 && ptr[len - 1] == L'\0') --len;
 
                 out.assign(ptr, len);
 
 				// Expand environment strings if needed
                 if (expand && actualType == ValueType::ExpandString && !out.empty()) {
+                    // ? FIX: Properly check ExpandEnvironmentStringsW return value
                     const DWORD expandSize = ExpandEnvironmentStringsW(out.c_str(), nullptr, 0);
-                    if (expandSize > 0) {
+                    
+                    // ? FIX: Validate expandSize (0 = error, 0xFFFFFFFF also possible on error)
+                    constexpr DWORD MAX_EXPANDED_SIZE = 32768; // 32K chars (64KB) reasonable limit
+                    if (expandSize == 0 || expandSize > MAX_EXPANDED_SIZE) {
+                        // Expansion failed or result too large - keep original string
+                        SS_LOG_ERROR(L"RegistryUtils", L"ReadStringInternal: ExpandEnvironmentStringsW returned invalid size %lu", expandSize);
+                        // ? Don't fail, just keep original unexpanded string
+                        return true;
+                    }
+
+                    try {
                         std::wstring expanded(expandSize, L'\0');
-                        if (ExpandEnvironmentStringsW(out.c_str(), expanded.data(), expandSize)) {
+                        const DWORD actualSize = ExpandEnvironmentStringsW(out.c_str(), expanded.data(), expandSize);
+                        
+                        if (actualSize > 0 && actualSize <= expandSize) {
+                            // ? Success: remove trailing null if present
                             if (!expanded.empty() && expanded.back() == L'\0') expanded.pop_back();
                             out = std::move(expanded);
                         }
+                        else {
+                            // ? Second call failed - keep original
+                            SS_LOG_ERROR(L"RegistryUtils", L"ReadStringInternal: ExpandEnvironmentStringsW second call failed");
+                        }
+                    }
+                    catch (const std::bad_alloc&) {
+                        // ? Allocation failed - keep original string
+                        SS_LOG_ERROR(L"RegistryUtils", L"ReadStringInternal: Failed to allocate %lu chars for expansion", expandSize);
                     }
                 }
 
@@ -200,21 +284,53 @@ namespace ShadowStrike {
                 }
 
                 if (buf.size() < sizeof(wchar_t) * 2) {
-					//minimum is two nulls
+                    //minimum is two nulls
                     return true;
                 }
 
                 const wchar_t* ptr = reinterpret_cast<const wchar_t*>(buf.data());
                 size_t len = buf.size() / sizeof(wchar_t);
 
+                // ? FIX: Protect against malformed multi-string data
                 for (size_t i = 0; i < len;) {
                     if (ptr[i] == L'\0') break; // end of the list
 
                     const wchar_t* start = ptr + i;
+                    size_t startIdx = i; // ? Track start position
                     size_t strLen = 0;
-                    while (i < len && ptr[i] != L'\0') { ++i; ++strLen; }
+                    
+                    // ? FIX: Add bounds check in inner loop to prevent buffer overrun
+                    while (i < len && ptr[i] != L'\0') { 
+                        ++i; 
+                        ++strLen;
+                        
+                        // ? FIX: Sanity check - prevent infinite loop on corrupted data
+                        constexpr size_t MAX_STRING_LENGTH = 32768; // 32K chars per string (64KB)
+                        if (strLen > MAX_STRING_LENGTH) {
+                            SetError(err, ERROR_INVALID_DATA, L"Multi-string entry too long", L"", valueName);
+                            SS_LOG_ERROR(L"RegistryUtils", L"ReadMultiString: String exceeds %zu chars at offset %zu", 
+                                         MAX_STRING_LENGTH, startIdx);
+                            return false;
+                        }
+                    }
 
-                    if (strLen > 0) out.emplace_back(start, strLen);
+                    // ? FIX: Validate start pointer is still within bounds
+                    if (startIdx >= len || startIdx + strLen > len) {
+                        SetError(err, ERROR_INVALID_DATA, L"Multi-string data corrupted", L"", valueName);
+                        SS_LOG_ERROR(L"RegistryUtils", L"ReadMultiString: Buffer overflow detected at offset %zu", startIdx);
+                        return false;
+                    }
+
+                    if (strLen > 0) {
+                        try {
+                            out.emplace_back(start, strLen);
+                        }
+                        catch (const std::bad_alloc&) {
+                            SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                            return false;
+                        }
+                    }
+                    
                     if (i < len && ptr[i] == L'\0') ++i; // skip null
                 }
 
@@ -292,13 +408,46 @@ namespace ShadowStrike {
                     return false;
                 }
 
+                // ? FIX: Validate input and check for embedded nulls
+                size_t totalSize = 0;
+                for (const auto& s : value) {
+                    // ? Check for embedded nulls which would corrupt multi-string format
+                    if (s.find(L'\0') != std::wstring::npos) {
+                        SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string entry contains embedded null", L"", valueName);
+                        SS_LOG_ERROR(L"RegistryUtils", L"WriteMultiString: String contains embedded null character");
+                        return false;
+                    }
+                    
+                    totalSize += s.size() + 1; // +1 for null terminator
+                }
+                
+                // Add final null terminator
+                totalSize += 1;
+                
+                // ? FIX: Check for size overflow (prevent DoS)
+                constexpr size_t MAX_MULTI_STRING_SIZE = MAXDWORD / sizeof(wchar_t);
+                if (totalSize > MAX_MULTI_STRING_SIZE) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"Multi-string data too large", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"WriteMultiString: Total size %zu exceeds maximum %zu", 
+                                 totalSize, MAX_MULTI_STRING_SIZE);
+                    return false;
+                }
+
                 // Multi-string format: "str1\0str2\0str3\0\0"
                 std::wstring combined;
-                for (const auto& s : value) {
-                    combined.append(s);
-                    combined.push_back(L'\0');
+                try {
+                    combined.reserve(totalSize); // ? Pre-allocate to avoid reallocations
+                    for (const auto& s : value) {
+                        combined.append(s);
+                        combined.push_back(L'\0');
+                    }
+                    combined.push_back(L'\0'); // last null
                 }
-                combined.push_back(L'\0'); // last null
+                catch (const std::bad_alloc&) {
+                    SetError(err, ERROR_NOT_ENOUGH_MEMORY, L"Memory allocation failed", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"WriteMultiString: Failed to allocate %zu chars", totalSize);
+                    return false;
+                }
 
                 std::wstring vn(valueName);
                 const DWORD size = static_cast<DWORD>(combined.size() * sizeof(wchar_t));
@@ -346,6 +495,14 @@ namespace ShadowStrike {
                     SetError(err, ERROR_INVALID_HANDLE, L"Invalid key handle", L"", valueName);
                     return false;
                 }
+                
+                // ? FIX: Validate size to prevent truncation on 64-bit systems
+                if (size > MAXDWORD) {
+                    SetError(err, ERROR_INVALID_PARAMETER, L"Binary data too large", L"", valueName);
+                    SS_LOG_ERROR(L"RegistryUtils", L"WriteBinary: Size %zu exceeds DWORD maximum %lu", size, MAXDWORD);
+                    return false;
+                }
+                
                 std::wstring vn(valueName);
                 const LSTATUS st = RegSetValueExW(m_key, vn.c_str(), 0, REG_BINARY, static_cast<const BYTE*>(data), static_cast<DWORD>(size));
                 if (st != ERROR_SUCCESS) {
@@ -478,6 +635,11 @@ namespace ShadowStrike {
             }
 
             bool RegistryKey::SubKeyExists(std::wstring_view subKey) const noexcept {
+                // ?? WARNING: This function is subject to TOCTOU (Time-Of-Check-Time-Of-Use) race condition.
+                // The key might be deleted or permissions changed between this check and subsequent operations.
+                // Callers should be prepared for Open() or other operations to fail even if this returns true.
+                // For critical operations, use Open() directly and handle errors rather than checking first.
+                
                 if (!m_key) return false;
                 std::wstring sk(subKey);
                 HKEY hTest = nullptr;
@@ -685,13 +847,20 @@ namespace ShadowStrike {
                     return false;
                 }
 
+                // ? FIX: RAII guard to ensure handle is always closed
+                struct TokenGuard {
+                    HANDLE handle;
+                    ~TokenGuard() { 
+                        if (handle) CloseHandle(handle); 
+                    }
+                } guard{ hToken };
+
                 LUID luid = {};
                 if (!LookupPrivilegeValueW(nullptr, privName, &luid)) {
                     const DWORD le = GetLastError();
                     SetError(err, le, L"LookupPrivilegeValueW failed");
                     SS_LOG_LAST_ERROR(L"RegistryUtils", L"LookupPrivilegeValueW failed for %ls", privName);
-                    CloseHandle(hToken);
-                    return false;
+                    return false; // ? Guard will close handle
                 }
 
                 TOKEN_PRIVILEGES tp = {};
@@ -703,12 +872,10 @@ namespace ShadowStrike {
                     const DWORD le = GetLastError();
                     SetError(err, le, L"AdjustTokenPrivileges failed");
                     SS_LOG_LAST_ERROR(L"RegistryUtils", L"AdjustTokenPrivileges failed for %ls", privName);
-                    CloseHandle(hToken);
-                    return false;
+                    return false; // ? Guard will close handle
                 }
 
-                CloseHandle(hToken);
-                return true;
+                return true; // ? Guard will close handle
             }
 
             bool EnableBackupPrivilege(Error* err) noexcept {

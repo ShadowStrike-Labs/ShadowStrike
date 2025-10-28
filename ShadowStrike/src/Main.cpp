@@ -1,9 +1,6 @@
+#include <iostream>
 
-#include<iostream>
-#include<SQLiteCpp/SQLiteCpp.h>
-
-int main() {
-
-	
-	return 0;
+int main(int argc, char** argv) {
+    std::cout << "ShadowStrike - Production Build\n";
+    return 0;
 }
