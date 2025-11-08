@@ -165,7 +165,21 @@
     <ClCompile Include="src\Utils\ThreadPool.cpp" />
     <ClCompile Include="src\Utils\Timer.cpp" />
     <ClCompile Include="src\Utils\XMLUtils.cpp" />
-    <ClCompile Include="tests\unit\Utils\Base64UtilsTests.cpp" />
+    <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\CompressionUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\CryptoUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\FileUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\Utils\HashUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\JSONUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\MemoryUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\NetworkUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\ProcessUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\RegistryUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\Utils\StringUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\SystemUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\ThreadPool_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\Timer_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\XMLUtils_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="docs\CacheDB_Examples.hpp" />

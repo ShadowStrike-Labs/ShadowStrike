@@ -158,6 +158,7 @@ namespace ShadowStrike {
 
 			// LRU helpers
 			void touchLRU_NoLock(const std::wstring& key, std::shared_ptr<Entry>& e);
+			void loadPersistentEntries();
 
 			private:
 				// State

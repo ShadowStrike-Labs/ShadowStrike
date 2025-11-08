@@ -229,10 +229,28 @@ namespace ShadowStrike {
                 throw std::runtime_error("ThreadPool is shutting down, cannot accept new tasks");
             }
 
+            // ? BUG #24 FIX: MOVE-ONLY TYPES SUPPORT
+            // PROBLEM: std::bind with perfect forwarding doesn't support move-only types
+            //          (e.g., std::unique_ptr, move-only lambdas, std::packaged_task)
+            // SOLUTION: Use move-capture lambda instead of std::bind
+            //
+            // BEFORE (broken):
+            //   auto task = std::make_shared<PackagedTask>(std::bind(f, args...));
+            //
+            // AFTER (fixed):
+            //   auto bound = std::bind(f, args...);
+            //   auto task = std::make_shared<PackagedTask>([bound = std::move(bound)]() mutable { ... });
+            //
+            // This allows submitting:
+            //   - std::unique_ptr<Data> objects
+            //   - Move-only lambdas with captured state
+            //   - std::function with move-only state
+            //   - Other non-copyable types
+            
             auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
             auto task = std::make_shared<PackagedTask>(
-                [bound]() mutable -> ReturnType {
+                [bound = std::move(bound)]() mutable -> ReturnType {
                     if constexpr (std::is_void_v<ReturnType>) {
                         bound();
                     }
@@ -248,8 +266,12 @@ namespace ShadowStrike {
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
 
-                // IMPROVED WAIT WITH PROPER SHUTDOWN HANDLING
+                // ? BUG #22 FIX: RACE CONDITION - Prevent TOCTOU (Time-Of-Check-Time-Of-Use)
+                // PROBLEM: After wait() wakes, multiple threads can wake simultaneously
+                // Solution: Re-check queue size with lock held BEFORE inserting
+                
                 if (m_config.maxQueueSize > 0) {
+                    // WAIT with shutdown check and timeout
                     bool waitResult = m_taskCv.wait_for(lock, std::chrono::seconds(30), [this]() {
                         size_t total = m_highPriorityQueue.size() +
                             m_normalPriorityQueue.size() +
@@ -258,32 +280,28 @@ namespace ShadowStrike {
                             total < m_config.maxQueueSize;
                         });
 
-                    // TIMEOUT CHECK
+                    // CHECK 1: Timeout protection
                     if (!waitResult) {
                         throw std::runtime_error("ThreadPool queue wait timeout (30s) - possible deadlock");
                     }
 
-                    // DOUBLE-CHECK SHUTDOWN AFTER WAKE
+                    // CHECK 2: Shutdown during wait
                     if (m_shutdown.load(std::memory_order_acquire)) {
                         throw std::runtime_error("ThreadPool is shutting down, cannot accept new tasks");
                     }
 
-                    // VERIFY SPACE STILL AVAILABLE (another thread might have filled queue)
+                    // ? CHECK 3: FINAL VERIFICATION (prevents TOCTOU race)
+                    // Multiple threads can wake from wait() simultaneously
+                    // Must re-verify queue has space BEFORE insertion
                     size_t total = m_highPriorityQueue.size() +
                         m_normalPriorityQueue.size() +
                         m_lowPriorityQueue.size();
 
                     if (total >= m_config.maxQueueSize) {
-                        // Try one more time with short timeout
-                        if (!m_taskCv.wait_for(lock, std::chrono::milliseconds(100), [this]() {
-                            size_t t = m_highPriorityQueue.size() +
-                                m_normalPriorityQueue.size() +
-                                m_lowPriorityQueue.size();
-                            return m_shutdown.load(std::memory_order_acquire) ||
-                                t < m_config.maxQueueSize;
-                            })) {
-                            throw std::runtime_error("ThreadPool queue is full");
-                        }
+                        // ? NO RETRY LOOP - Immediate failure
+                        // Prevents thundering herd problem
+                        // Caller should handle retry with backoff if needed
+                        throw std::runtime_error("ThreadPool queue is full after wake (race condition detected)");
                     }
                 }
 
@@ -345,8 +363,9 @@ namespace ShadowStrike {
 
             auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
+            // ? BUG #24 FIX: Move capture for move-only types
             auto task = std::make_shared<PackagedTask>(
-                [bound]() mutable -> ReturnType {
+                [bound = std::move(bound)]() mutable -> ReturnType {
                     if constexpr (std::is_void_v<ReturnType>) {
                         bound();
                     }
@@ -364,9 +383,6 @@ namespace ShadowStrike {
 
             TaskId taskId = m_nextTaskId.fetch_add(1, std::memory_order_relaxed);
 
-            // increment pending BEFORE queuing
-            group->pendingTasks.fetch_add(1, std::memory_order_relaxed);
-
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
 
@@ -382,15 +398,19 @@ namespace ShadowStrike {
                     }
 
                     // decrement pending and increment completed (old value returned)
-                    size_t oldPending = group->pendingTasks.fetch_sub(1, std::memory_order_relaxed);
+                    size_t oldPending = group->pendingTasks.fetch_sub(1, std::memory_order_release);
                     group->completedTasks.fetch_add(1, std::memory_order_relaxed);
                     if (oldPending == 1) { // was 1 -> now zero
                         group->completionCv.notify_all();
                     }
-                    };
+                };
 
                 Task newTask(taskId, groupId, TaskPriority::Normal, std::move(taskWrapper));
                 m_normalPriorityQueue.push_back(std::move(newTask));
+
+                // ? Increment pending AFTER queuing (with lock held)
+                // This ensures task can't execute before counter is incremented
+                group->pendingTasks.fetch_add(1, std::memory_order_release);
 
                 size_t totalSize = m_highPriorityQueue.size() + m_normalPriorityQueue.size() + m_lowPriorityQueue.size();
                 size_t oldPeak = m_peakQueueSize.load(std::memory_order_relaxed);
@@ -420,8 +440,9 @@ namespace ShadowStrike {
 
             auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
+            // ? BUG #24 FIX: Move capture for move-only types
             auto task = std::make_shared<PackagedTask>(
-                [bound]() mutable -> ReturnType {
+                [bound = std::move(bound)]() mutable -> ReturnType {
                     if constexpr (std::is_void_v<ReturnType>) {
                         bound();
                     }

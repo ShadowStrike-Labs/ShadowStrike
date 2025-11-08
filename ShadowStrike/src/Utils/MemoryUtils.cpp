@@ -9,6 +9,12 @@ namespace ShadowStrike {
 		namespace MemoryUtils {
 
 			static inline size_t AlignUp(size_t v, size_t a) noexcept {
+				// ? FIX: Check for overflow before addition
+				if (a == 0) return v; // Avoid division by zero
+				if (v > SIZE_MAX - (a - 1)) {
+					// Overflow would occur - return max aligned value
+					return SIZE_MAX & ~(a - 1);
+				}
 				return (v + (a - 1)) & ~(a - 1);
 			}
       
@@ -68,35 +74,44 @@ namespace ShadowStrike {
 			}
 			bool Free(void* base, DWORD freeType, size_t size) noexcept {
 #ifdef _WIN32
-				if (!base) return true;
+    if (!base) return true;
 
-				// VirtualFree preconditions per WinAPI
-				if (freeType == MEM_RELEASE) {
-					// size must be 0
-					if (!::VirtualFree(base, 0, MEM_RELEASE)) {
-						SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_RELEASE) failed (base=%p)", base);
-						return false;
-					}
-					return true;
-				} else if (freeType == MEM_DECOMMIT) {
-					// size must be non-zero and a multiple of page size
-					const size_t page = PageSize();
-					if (size == 0 || (size % page) != 0) {
-						SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) requires non-zero size aligned to page size (size=%llu, page=%llu)",
-							static_cast<unsigned long long>(size), static_cast<unsigned long long>(page));
-						return false;
-					}
-					if (!::VirtualFree(base, size, MEM_DECOMMIT)) {
-						SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) failed (base=%p, size=%llu)", base, static_cast<unsigned long long>(size));
-						return false;
-					}
-					return true;
-				} else {
-					SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree called with unsupported freeType=0x%08X", freeType);
-					return false;
-				}
+    // VirtualFree preconditions per WinAPI
+    if (freeType == MEM_RELEASE) {
+        // size must be 0
+        if (!::VirtualFree(base, 0, MEM_RELEASE)) {
+            SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_RELEASE) failed (base=%p)", base);
+            return false;
+        }
+        return true;
+    } else if (freeType == MEM_DECOMMIT) {
+        // ? FIX: Validate size doesn't exceed reasonable limits
+        const size_t page = PageSize();
+        if (size == 0 || (size % page) != 0) {
+            SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) requires non-zero size aligned to page size (size=%llu, page=%llu)",
+                static_cast<unsigned long long>(size), static_cast<unsigned long long>(page));
+            return false;
+        }
+        
+        // ? FIX: Sanity check - prevent absurdly large sizes
+        constexpr size_t MAX_DECOMMIT_SIZE = 1ULL << 40; // 1TB limit
+        if (size > MAX_DECOMMIT_SIZE) {
+            SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) size too large (size=%llu)",
+                static_cast<unsigned long long>(size));
+            return false;
+        }
+        
+        if (!::VirtualFree(base, size, MEM_DECOMMIT)) {
+            SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) failed (base=%p, size=%llu)", base, static_cast<unsigned long long>(size));
+            return false;
+        }
+        return true;
+    } else {
+        SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree called with unsupported freeType=0x%08X", freeType);
+        return false;
+    }
 #else
-				(void)base; (void)freeType; (void)size; return false;
+    (void)base; (void)freeType; (void)size; return false;
 #endif
 			}
 
@@ -178,46 +193,62 @@ namespace ShadowStrike {
 
 			bool AllocateWithGuards(size_t dataSize, GuardedAlloc& out, bool executable) noexcept {
 #ifdef _WIN32
-				out.Release();
+    out.Release();
 
-				if (dataSize == 0) {
-					out.base = nullptr;
-					out.data = nullptr;
-					out.dataSize = 0;
-					out.totalSize = 0;
-					out.executable = executable;
-					return true;
-				}
+    if (dataSize == 0) {
+        out.base = nullptr;
+        out.data = nullptr;
+        out.dataSize = 0;
+        out.totalSize = 0;
+        out.executable = executable;
+        return true;
+    }
 
-				const size_t page = PageSize();
-				const size_t dataSizeAligned = AlignUp(dataSize, page);
-				const size_t total = dataSizeAligned + page * 2;
+    const size_t page = PageSize();
+    const size_t dataSizeAligned = AlignUp(dataSize, page);
+    const size_t total = dataSizeAligned + page * 2;
 
-				void* base = ::VirtualAlloc(nullptr, total, MEM_RESERVE, PAGE_NOACCESS);
-				if (!base) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: VirtualAlloc(MEM_RESERVE) failed (total=%llu)",
-						static_cast<unsigned long long>(total));
-					return false;
-				}
+    void* base = ::VirtualAlloc(nullptr, total, MEM_RESERVE, PAGE_NOACCESS);
+    if (!base) {
+        SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: VirtualAlloc(MEM_RESERVE) failed (total=%llu)",
+            static_cast<unsigned long long>(total));
+        return false;
+    }
 
-				BYTE* dataPtr = reinterpret_cast<BYTE*>(base) + page;
-				DWORD prot = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    // ? FIX: Commit guard pages with PAGE_NOACCESS to trigger exceptions
+    BYTE* guardFront = reinterpret_cast<BYTE*>(base);
+    if (!::VirtualAlloc(guardFront, page, MEM_COMMIT, PAGE_NOACCESS)) {
+        SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: Failed to commit front guard page");
+        ::VirtualFree(base, 0, MEM_RELEASE);
+        return false;
+    }
 
-				if (!::VirtualAlloc(dataPtr, dataSizeAligned, MEM_COMMIT, prot)) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: VirtualAlloc(MEM_COMMIT) failed (dataSize=%llu)",
-						static_cast<unsigned long long>(dataSizeAligned));
-					::VirtualFree(base, 0, MEM_RELEASE);
-					return false;
-				}
+    BYTE* dataPtr = reinterpret_cast<BYTE*>(base) + page;
+    DWORD prot = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
 
-				out.base = base;
-				out.data = dataPtr;
-				out.dataSize = dataSize;
-				out.totalSize = total;
-				out.executable = executable;
-				return true;
+    if (!::VirtualAlloc(dataPtr, dataSizeAligned, MEM_COMMIT, prot)) {
+        SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: VirtualAlloc(MEM_COMMIT) failed (dataSize=%llu)",
+            static_cast<unsigned long long>(dataSizeAligned));
+        ::VirtualFree(base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // ? FIX: Commit back guard page
+    BYTE* guardBack = dataPtr + dataSizeAligned;
+    if (!::VirtualAlloc(guardBack, page, MEM_COMMIT, PAGE_NOACCESS)) {
+        SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: Failed to commit back guard page");
+        ::VirtualFree(base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    out.base = base;
+    out.data = dataPtr;
+    out.dataSize = dataSize;
+    out.totalSize = total;
+    out.executable = executable;
+    return true;
 #else
-				(void)dataSize; (void)out; (void)executable; return false;
+    (void)dataSize; (void)out; (void)executable; return false;
 #endif
 			}
 
@@ -290,13 +321,18 @@ namespace ShadowStrike {
 					return true;
 				}
 				addresses.resize(count, nullptr);
-				res = ::GetWriteWatch(0, base, regionSize, reinterpret_cast<void**>(addresses.data()), &count, &granularity);
+				
+				// ? FIX: Update count variable for second call (it's in/out parameter)
+				ULONG_PTR actualCount = count;
+				res = ::GetWriteWatch(0, base, regionSize, reinterpret_cast<void**>(addresses.data()), &actualCount, &granularity);
 				if (res != 0) {
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"GetWriteWatch addresses failed (res=%lu)", res);
 					addresses.clear();
 					return false;
 				}
-				if (addresses.size() != count) addresses.resize(count);
+				
+				// ? FIX: Always resize to actual count returned
+				addresses.resize(actualCount);
 				return true;
 #else
 				(void)base; (void)regionSize; (void)addresses; (void)granularity; return false;
@@ -456,28 +492,35 @@ namespace ShadowStrike {
 
 			bool MappedView::mapReadWrite(const std::wstring& path) {
 #ifdef _WIN32
-				close();
-				size_t sz = 0;
-				if (!OpenFileForMap(path, true, m_file, sz)) return false;
+    close();
+    size_t sz = 0;
+    if (!OpenFileForMap(path, true, m_file, sz)) return false;
 
-				m_rw = true;
-				m_size = sz;
+    m_rw = true;
+    m_size = sz;
 
-				m_mapping = ::CreateFileMappingW(m_file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
-				if (!m_mapping) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileMappingW(PAGE_READWRITE) failed");
-					close();
-					return false;
-				}
-				m_view = ::MapViewOfFile(m_mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
-				if (!m_view) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"MapViewOfFile(RW) failed");
-					close();
-					return false;
-				}
-				return true;
+    // ? FIX: Handle empty files - cannot create mapping for 0-byte files
+    if (m_size == 0) {
+        // File is empty - valid state but no mapping needed
+        SS_LOG_WARN(L"MemoryUtils", L"mapReadWrite: Cannot map empty file: %ls", path.c_str());
+        return true;
+    }
+
+    m_mapping = ::CreateFileMappingW(m_file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+    if (!m_mapping) {
+        SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileMappingW(PAGE_READWRITE) failed");
+        close();
+        return false;
+    }
+    m_view = ::MapViewOfFile(m_mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+    if (!m_view) {
+        SS_LOG_LAST_ERROR(L"MemoryUtils", L"MapViewOfFile(RW) failed");
+        close();
+        return false;
+    }
+    return true;
 #else
-				(void)path; return false;
+    (void)path; return false;
 #endif
 			}
 
@@ -514,11 +557,24 @@ namespace ShadowStrike {
 
 			void* AlignedAlloc(size_t size, size_t alignment) noexcept {
 				if (size == 0 || alignment == 0) return nullptr;
+				
+				// ? FIX: Add sanity checks before allocation
+				constexpr size_t MAX_ALIGNMENT = 1ULL << 20; // 1MB max alignment
+				constexpr size_t MAX_ALLOC_SIZE = 1ULL << 32; // 4GB max allocation
+				
+				if (alignment > MAX_ALIGNMENT || size > MAX_ALLOC_SIZE) {
+					SS_LOG_ERROR(L"MemoryUtils", L"AlignedAlloc: Invalid parameters (size=%llu, alignment=%llu)",
+						static_cast<unsigned long long>(size),
+						static_cast<unsigned long long>(alignment));
+					return nullptr;
+				}
+				
 				void* p = _aligned_malloc(size, alignment);
 				if (!p) {
 					SS_LOG_ERROR(L"MemoryUtils", L"_aligned_malloc failed (size=%llu, alignment=%llu)",
 						static_cast<unsigned long long>(size),
 						static_cast<unsigned long long>(alignment));
+					// ? NOTE: Caller must check for nullptr - this is documented behavior
 				}
 				return p;
 			}

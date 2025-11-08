@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <cstdint>
@@ -97,7 +96,10 @@ namespace ShadowStrike {
 
                 [[nodiscard]] void* data() const noexcept { return m_view; }
                 [[nodiscard]] size_t size() const noexcept { return m_size; }
-                [[nodiscard]] bool  valid() const noexcept { return m_view != nullptr || m_size == 0 && m_file != INVALID_HANDLE_VALUE; }
+                [[nodiscard]] bool  valid() const noexcept { 
+                    // ? FIX: Correct operator precedence with explicit parentheses
+                    return (m_view != nullptr) || (m_size == 0 && m_file != INVALID_HANDLE_VALUE); 
+                }
 
             private:
                 void moveFrom(MappedView&& other) noexcept;

@@ -84,7 +84,6 @@ namespace ShadowStrike {
 			std::thread m_managerThread;
 			std::shared_ptr<ThreadPool> m_threadPool;
 
-			std::vector<TimerTask> m_tasks;
 			std::priority_queue<TimerTask, std::vector<TimerTask>, std::greater<TimerTask>> m_taskQueue;
 			mutable std::mutex m_mutex;
 			std::condition_variable m_cv;
@@ -110,4 +109,4 @@ namespace ShadowStrike {
 
 	}// namespace Utils
 	
-}// namespace ShadowStrike
+}// namespace ShadowStrike}// namespace ShadowStrike

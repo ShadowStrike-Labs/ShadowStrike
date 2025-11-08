@@ -207,15 +207,16 @@ namespace ShadowStrike {
                             switch (info->Relationship) {
                             case RelationProcessorCore:
                                 out.coreCount++;
-                                out.logicalProcessorCount += info->Processor.Flags ? 1 : 0; // SMT have or not
-                                
+                                // ? FIX #1-2: Remove double counting - only use popcnt
                                 for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
                                     KAFFINITY mask = info->Processor.GroupMask[g].Mask;
 #if defined(_WIN64)
                                     out.logicalProcessorCount += static_cast<DWORD>(__popcnt64(mask));
 #else
-									// slice it to 32-bit chunks
-                                    out.logicalProcessorCount += static_cast<DWORD>(__popcnt(static_cast<unsigned int>(mask)));
+                                    // ? FIX #3: Handle full 64-bit mask on x86
+                                    DWORD low = static_cast<DWORD>(mask & 0xFFFFFFFFULL);
+                                    DWORD high = static_cast<DWORD>((mask >> 32) & 0xFFFFFFFFULL);
+                                    out.logicalProcessorCount += __popcnt(low) + __popcnt(high);
 #endif
                                 }
                                 break;
@@ -384,8 +385,10 @@ namespace ShadowStrike {
                     CloseHandle(hToken);
                     return false;
                 }
+                // ? FIX #6: Check GetLastError BEFORE CloseHandle
+                DWORD lastError = GetLastError();
                 CloseHandle(hToken);
-                return GetLastError() == ERROR_SUCCESS;
+                return lastError == ERROR_SUCCESS;
 #else
                 (void)privName; (void)enable; return false;
 #endif
@@ -513,7 +516,8 @@ namespace ShadowStrike {
 #ifdef _WIN32
                 std::wstring in = ToW(s);
                 DWORD need = ExpandEnvironmentStringsW(in.c_str(), nullptr, 0);
-                if (need == 0) {
+                // ? FIX #4: Handle need <= 1 case (empty string)
+                if (need <= 1) {
                     SS_LOG_LAST_ERROR(L"SystemUtils", L"ExpandEnvironmentStringsW size query failed");
                     return ToW(s);
                 }
@@ -534,7 +538,8 @@ namespace ShadowStrike {
 #ifdef _WIN32
                 DWORD sz = 0;
                 GetComputerNameExW(ComputerNameDnsFullyQualified, nullptr, &sz);
-                if (sz == 0) {
+                // ? FIX #5: Handle sz <= 1 case to prevent crash
+                if (sz <= 1) {
                     SS_LOG_LAST_ERROR(L"SystemUtils", L"GetComputerNameExW size query failed");
                     return L"";
                 }
@@ -554,7 +559,8 @@ namespace ShadowStrike {
 #ifdef _WIN32
                 DWORD sz = 0;
                 GetComputerNameExW(ComputerNameDnsHostname, nullptr, &sz);
-                if (sz == 0) {
+                // ? FIX #5: Handle sz <= 1 case to prevent crash
+                if (sz <= 1) {
                     SS_LOG_LAST_ERROR(L"SystemUtils", L"GetComputerNameExW(Host) size query failed");
                     return L"";
                 }

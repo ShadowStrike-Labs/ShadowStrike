@@ -787,7 +787,8 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         }
 
         RTL_USER_PROCESS_PARAMETERS32 params32{};
-        if (!::ReadProcessMemory(ph.Get(), reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(peb32.ProcessParameters)),
+        if (!::ReadProcessMemory(ph.Get(),
+            reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(peb32.ProcessParameters)),
             &params32, sizeof(params32), &read)) {
             SetWin32Error(err, L"ReadProcessMemory(RTL_USER_PROCESS_PARAMETERS32)");
             return std::nullopt;
@@ -797,18 +798,30 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
             return std::wstring{};
         }
 
+        if(params32.CommandLine.Length > 32768 || params32.CommandLine.Length % sizeof(wchar_t) != 0) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_DATA,
+                L"Invalid Command Line Length.");
+            return std::nullopt;
+		}
+
         std::wstring cmdLine(params32.CommandLine.Length / sizeof(wchar_t), L'\0');
-        if (!::ReadProcessMemory(ph.Get(), reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(params32.CommandLine.Buffer)),
+        if (!::ReadProcessMemory(ph.Get(),
+            reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(params32.CommandLine.Buffer)),
             cmdLine.data(), params32.CommandLine.Length, &read)) {
             SetWin32Error(err, L"ReadProcessMemory(CommandLine32)");
             return std::nullopt;
         }
 
+        if (read != params32.CommandLine.Length) {
+            SetWin32Error(err, L"GetProcessCommandLine", ERROR_PARTIAL_COPY,
+                L"Incomplete read of command line.");
+            return std::nullopt;
+        }
         cmdLine.resize(params32.CommandLine.Length / sizeof(wchar_t));
         return cmdLine;
     }
     else
-#endif
+
     {
         // Native pointer size (x64 reading x64, or x86 reading x86)
         struct PEB_INTERNAL {
@@ -921,6 +934,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
         }
 
         return cmdLine;
+#endif
     }
 }
 
