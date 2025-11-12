@@ -194,17 +194,23 @@ namespace ShadowStrike {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
                 if (h == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"ReadAllBytes: CreateFileW failed: %s", longp.c_str());
+                    DWORD lastError = GetLastError();
+                    if (err) err->win32 = lastError;
+                    // Don't log for non-existent files in tests
+                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"ReadAllBytes: CreateFileW failed: %s", longp.c_str());
+                    }
                     return false;
                 }
 
                 LARGE_INTEGER sz{};
                 if (!GetFileSizeEx(h, &sz)) {
-                    if (err) err->win32 = GetLastError();
+                    DWORD lastError = GetLastError();
+                    if (err) err->win32 = lastError;
                     CloseHandle(h);
                     return false;
                 }
+                
                 bool ok = ReadAllBytesImpl(h, out, static_cast<uint64_t>(sz.QuadPart), err);
                 CloseHandle(h);
                 return ok;
@@ -516,23 +522,26 @@ namespace ShadowStrike {
                     nullptr, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS, nullptr);
                 if (h == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"ListAlternateStreams: CreateFileW failed: %s", longp.c_str());
+                    DWORD lastError = GetLastError();
+                    if (err) err->win32 = lastError;
+                    // Don't log for non-existent files
+                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"ListAlternateStreams: CreateFileW failed: %s", longp.c_str());
+                    }
                     return false;
                 }
 
                 BYTE buffer[64 * 1024];
                 DWORD bytesRead = 0;
                 PVOID ctx = nullptr;
-                bool success = true; // ✅ Track success state
+                bool success = true;
 
                 while (true) {
                     BOOL ok = BackupRead(h, buffer, sizeof(buffer), &bytesRead, FALSE, FALSE, &ctx);
                     if (!ok) {
                         if (err) err->win32 = GetLastError();
-                        SS_LOG_LAST_ERROR(L"FileUtils", L"ListAlternateStreams: BackupRead failed: %s", longp.c_str());
                         success = false;
-                        break; // ✅ FIXED: Break instead of early return
+                        break;
                     }
                     if (bytesRead == 0) break; // EOF
 
@@ -543,7 +552,6 @@ namespace ShadowStrike {
                         size_t nameBytes = sid->dwStreamNameSize;
                         size_t blockSize = headerSize + nameBytes + static_cast<size_t>(sid->Size.QuadPart);
                         
-                        // ✅ FIXED: Check blockSize doesn't exceed bytesRead to prevent overflow
                         if (blockSize > bytesRead || nameBytes > bytesRead || headerSize > bytesRead) {
                             BackupSeek(h, sid->Size.LowPart, sid->Size.HighPart, nullptr, nullptr, &ctx);
                             break;
@@ -551,7 +559,7 @@ namespace ShadowStrike {
 
                         if (sid->dwStreamId == BACKUP_ALTERNATE_DATA) {
                             std::wstring sname;
-                            if (nameBytes > 0 && nameBytes < 32768) { // ✅ FIXED: Sanity check
+                            if (nameBytes > 0 && nameBytes < 32768) {
                                 sname.assign(reinterpret_cast<wchar_t*>(p + headerSize), nameBytes / sizeof(wchar_t));
                             }
                             AlternateStreamInfo si{};
@@ -560,12 +568,10 @@ namespace ShadowStrike {
                             out.emplace_back(std::move(si));
                         }
 
-                        // Pass the stream data
                         if (sid->Size.QuadPart > 0) {
                             BackupSeek(h, sid->Size.LowPart, sid->Size.HighPart, nullptr, nullptr, &ctx);
                         }
 
-                        // Get to the next header
                         size_t advance = headerSize + nameBytes;
                         if (advance > bytesRead) break;
                         p += advance;
@@ -573,7 +579,7 @@ namespace ShadowStrike {
                     }
                 }
 
-                // ✅ FIXED: ALWAYS cleanup BackupRead context before closing handle
+                // ALWAYS cleanup BackupRead context before closing handle
                 BackupRead(h, nullptr, 0, &bytesRead, TRUE, FALSE, &ctx);
                 CloseHandle(h);
                 
@@ -589,55 +595,89 @@ namespace ShadowStrike {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
                 if (h == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"ComputeFileSHA256: CreateFileW failed: %s", longp.c_str());
+                    DWORD lastError = GetLastError();
+                    if (err) err->win32 = lastError;
+                    // Don't log for non-existent files
+                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"ComputeFileSHA256: CreateFileW failed: %s", longp.c_str());
+                    }
                     return false;
                 }
 
                 BCRYPT_ALG_HANDLE alg = nullptr;
                 BCRYPT_HASH_HANDLE hash = nullptr;
                 NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-                if (st < 0) { CloseHandle(h); if (err) err->win32 = RtlNtStatusToDosError(st); return false; }
+                if (st < 0) { 
+                    CloseHandle(h); 
+                    if (err) err->win32 = RtlNtStatusToDosError(st); 
+                    return false; 
+                }
 
                 DWORD objLen = 0, cbRes = 0;
                 st = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objLen), sizeof(objLen), &cbRes, 0);
-                if (st < 0) { BCryptCloseAlgorithmProvider(alg, 0); CloseHandle(h); if (err) err->win32 = RtlNtStatusToDosError(st); return false; }
+                if (st < 0) { 
+                    BCryptCloseAlgorithmProvider(alg, 0); 
+                    CloseHandle(h); 
+                    if (err) err->win32 = RtlNtStatusToDosError(st); 
+                    return false; 
+                }
 
                 std::vector<uint8_t> obj(objLen);
                 st = BCryptCreateHash(alg, &hash, obj.data(), objLen, nullptr, 0, 0);
-                if (st < 0) { BCryptCloseAlgorithmProvider(alg, 0); CloseHandle(h); if (err) err->win32 = RtlNtStatusToDosError(st); return false; }
+                if (st < 0) { 
+                    BCryptCloseAlgorithmProvider(alg, 0); 
+                    CloseHandle(h); 
+                    if (err) err->win32 = RtlNtStatusToDosError(st); 
+                    return false; 
+                }
 
                 std::vector<uint8_t> buf(1 << 20); // 1MB
                 DWORD rd = 0;
                 while (ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &rd, nullptr) && rd > 0) {
                     st = BCryptHashData(hash, buf.data(), rd, 0);
-                    if (st < 0) { BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(alg, 0); CloseHandle(h); if (err) err->win32 = RtlNtStatusToDosError(st); return false; }
+                    if (st < 0) { 
+                        BCryptDestroyHash(hash); 
+                        BCryptCloseAlgorithmProvider(alg, 0); 
+                        CloseHandle(h); 
+                        if (err) err->win32 = RtlNtStatusToDosError(st); 
+                        return false; 
+                    }
                 }
                 CloseHandle(h);
 
                 st = BCryptFinishHash(hash, outHash.data(), static_cast<ULONG>(outHash.size()), 0);
                 BCryptDestroyHash(hash);
                 BCryptCloseAlgorithmProvider(alg, 0);
-                if (st < 0) { if (err) err->win32 = RtlNtStatusToDosError(st); return false; }
+                if (st < 0) { 
+                    if (err) err->win32 = RtlNtStatusToDosError(st); 
+                    return false; 
+                }
                 return true;
             }
 
 
             bool SecureEraseFile(std::wstring_view path, SecureEraseMode mode, Error* err) {
                 // Only files, not directories
-                if (IsDirectory(path)) { if (err) err->win32 = ERROR_ACCESS_DENIED; return false; }
+                if (IsDirectory(path)) { 
+                    if (err) err->win32 = ERROR_ACCESS_DENIED; 
+                    return false; 
+                }
 
                 std::wstring longp = AddLongPathPrefix(path);
                 
-                // ✅ FIXED: Single handle for both erase and delete - prevents race condition
+                // Single handle for both erase and delete - prevents race condition
                 HANDLE h = CreateFileW(longp.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
 					0, // Exclusive access
 					nullptr, OPEN_EXISTING, 
 					FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, // Delete on close
 					nullptr);
                 if (h == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: CreateFileW failed: %s", longp.c_str());
+                    DWORD lastError = GetLastError();
+                    if (err) err->win32 = lastError;
+                    // Don't log for non-existent files
+                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: CreateFileW failed: %s", longp.c_str());
+                    }
                     return false;
                 }
 
@@ -674,7 +714,7 @@ namespace ShadowStrike {
                         std::fill(buf.begin(), buf.end(), 0xFF);
                     }
                     else {
-                        // ✅ FIXED: Use cryptographically secure random for third pass
+                        // Use cryptographically secure random for third pass
                         NTSTATUS st = BCryptGenRandom(nullptr, buf.data(), static_cast<ULONG>(buf.size()), 
                                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
                         if (st < 0) {
@@ -705,7 +745,7 @@ namespace ShadowStrike {
                     FlushFileBuffers(h);
                 }
 
-                // ✅ FIXED: Set delete disposition before closing (more reliable than FILE_FLAG_DELETE_ON_CLOSE alone)
+                // Set delete disposition before closing (more reliable than FILE_FLAG_DELETE_ON_CLOSE alone)
                 FILE_DISPOSITION_INFO_EX dx{};
                 dx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
                 BOOL ok = SetFileInformationByHandle(h, FileDispositionInfoEx, &dx, sizeof(dx));
@@ -721,7 +761,6 @@ namespace ShadowStrike {
                 
                 if (!ok) { 
                     if (err) err->win32 = ec; 
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"SecureEraseFile: Delete disposition failed");
                     return false; 
                 }
                 
@@ -735,8 +774,12 @@ namespace ShadowStrike {
                     nullptr, OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (h == INVALID_HANDLE_VALUE) {
-                    if (err) err->win32 = GetLastError();
-                    SS_LOG_LAST_ERROR(L"FileUtils", L"OpenFileExclusive: CreateFileW failed: %s", longp.c_str());
+                    DWORD lastError = GetLastError();
+                    if (err) err->win32 = lastError;
+                    // Don't log for non-existent files
+                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"OpenFileExclusive: CreateFileW failed: %s", longp.c_str());
+                    }
                 }
                 return h;
             }
@@ -815,4 +858,4 @@ namespace ShadowStrike {
 		}//namespace FileUtils
 
 	}//namespace Utils
-}//namespace ShadowStrike}//namespace ShadowStrike
+}//namespace ShadowStrike

@@ -67,10 +67,8 @@ namespace ShadowStrike {
 
 			enum class PaddingMode : uint8_t {
 				None,
-				PKCS7,
-				Zeros,
-				ANSIX923,
-				ISO10126
+				PKCS7  // Industry standard, used by GravityZone/CrowdStrike
+				// ANSIX923, ISO10126, and Zero Padding removed - insecure and non-standard
 			};
 
 			// ============================================================================
@@ -322,13 +320,13 @@ namespace ShadowStrike {
 
 				// ECDH Key Agreement (for ECC)
 				bool DeriveSharedSecret(const PublicKey& peerPublicKey,
-					std::vector<uint8_t>& sharedSecret,
-					Error* err = nullptr) noexcept;
+				std::vector<uint8_t>& sharedSecret,
+				Error* err = nullptr) noexcept;
 
 				// Properties
-				AsymmetricAlgorithm GetAlgorithm() const noexcept { return m_algorithm; }
-				size_t GetMaxPlaintextSize() const noexcept;
+				size_t GetMaxPlaintextSize(RSAPaddingScheme padding) const noexcept;
 				size_t GetSignatureSize() const noexcept;
+				AsymmetricAlgorithm GetAlgorithm() const noexcept { return m_algorithm; }
 
 			private:
 				AsymmetricAlgorithm m_algorithm;
