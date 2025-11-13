@@ -46,14 +46,11 @@ namespace ShadowStrike {
 				case SymmetricAlgorithm::AES_128_GCM:
 				case SymmetricAlgorithm::AES_192_GCM:
 				case SymmetricAlgorithm::AES_256_GCM: return BCRYPT_AES_ALGORITHM;
-				case SymmetricAlgorithm::AES_128_ECB:
-				case SymmetricAlgorithm::AES_192_ECB:
-				case SymmetricAlgorithm::AES_256_ECB: return BCRYPT_AES_ALGORITHM;
 				case SymmetricAlgorithm::AES_128_CFB:
 				case SymmetricAlgorithm::AES_192_CFB:
 				case SymmetricAlgorithm::AES_256_CFB: return BCRYPT_AES_ALGORITHM;
 				case SymmetricAlgorithm::ChaCha20_Poly1305: return L"ChaCha20-Poly1305";
-				default: return BCRYPT_AES_ALGORITHM;
+				default: return nullptr;
 				}
 			}
 
@@ -65,13 +62,10 @@ namespace ShadowStrike {
 				case SymmetricAlgorithm::AES_128_GCM:
 				case SymmetricAlgorithm::AES_192_GCM:
 				case SymmetricAlgorithm::AES_256_GCM: return BCRYPT_CHAIN_MODE_GCM;
-				case SymmetricAlgorithm::AES_128_ECB:
-				case SymmetricAlgorithm::AES_192_ECB:
-				case SymmetricAlgorithm::AES_256_ECB: return BCRYPT_CHAIN_MODE_ECB;
 				case SymmetricAlgorithm::AES_128_CFB:
 				case SymmetricAlgorithm::AES_192_CFB:
 				case SymmetricAlgorithm::AES_256_CFB: return BCRYPT_CHAIN_MODE_CFB;
-				default: return BCRYPT_CHAIN_MODE_CBC;
+				default: return nullptr;
 				}
 			}
 
@@ -79,18 +73,15 @@ namespace ShadowStrike {
 				switch (alg) {
 				case SymmetricAlgorithm::AES_128_CBC:
 				case SymmetricAlgorithm::AES_128_GCM:
-				case SymmetricAlgorithm::AES_128_ECB:
 				case SymmetricAlgorithm::AES_128_CFB: return 16;
 				case SymmetricAlgorithm::AES_192_CBC:
 				case SymmetricAlgorithm::AES_192_GCM:
-				case SymmetricAlgorithm::AES_192_ECB:
 				case SymmetricAlgorithm::AES_192_CFB: return 24;
 				case SymmetricAlgorithm::AES_256_CBC:
 				case SymmetricAlgorithm::AES_256_GCM:
-				case SymmetricAlgorithm::AES_256_ECB:
 				case SymmetricAlgorithm::AES_256_CFB:
 				case SymmetricAlgorithm::ChaCha20_Poly1305: return 32;
-				default: return 32;
+				default: return 0;
 				}
 			}
 
@@ -100,10 +91,7 @@ namespace ShadowStrike {
 				case SymmetricAlgorithm::AES_192_GCM:
 				case SymmetricAlgorithm::AES_256_GCM: return 12;
 				case SymmetricAlgorithm::ChaCha20_Poly1305: return 12;
-				case SymmetricAlgorithm::AES_128_ECB:
-				case SymmetricAlgorithm::AES_192_ECB:
-				case SymmetricAlgorithm::AES_256_ECB: return 0;
-				default: return 16;
+				default: return 0;
 				}
 			}
 
@@ -116,7 +104,6 @@ namespace ShadowStrike {
 
 			static const wchar_t* RSAAlgName(AsymmetricAlgorithm alg) noexcept {
 				switch (alg) {
-				case AsymmetricAlgorithm::RSA_1024:
 				case AsymmetricAlgorithm::RSA_2048:
 				case AsymmetricAlgorithm::RSA_3072:
 				case AsymmetricAlgorithm::RSA_4096: return BCRYPT_RSA_ALGORITHM;
@@ -129,20 +116,19 @@ namespace ShadowStrike {
 					return BCRYPT_ECDH_P521_ALGORITHM;
 
 				default:
-					return BCRYPT_RSA_ALGORITHM;
+					return nullptr;
 				}
 			}
 
 			static ULONG RSAKeySizeForAlg(AsymmetricAlgorithm alg) noexcept {
 				switch (alg) {
-				case AsymmetricAlgorithm::RSA_1024: return 1024;
 				case AsymmetricAlgorithm::RSA_2048: return 2048;
 				case AsymmetricAlgorithm::RSA_3072: return 3072;
 				case AsymmetricAlgorithm::RSA_4096: return 4096;
 				case AsymmetricAlgorithm::ECC_P256: return 256;
 				case AsymmetricAlgorithm::ECC_P384: return 384;
 				case AsymmetricAlgorithm::ECC_P521: return 521;
-				default: return 2048;
+				default: return 0;
 				}
 			}
 
@@ -418,23 +404,28 @@ namespace ShadowStrike {
 
 			bool SymmetricCipher::ensureProvider(Error* err) noexcept {
 #ifdef _WIN32
-				// ✅ Eğer zaten açılmış bir sağlayıcı varsa, tekrar açmadan kullan
+				//use if there is already a handle
 				if (m_algHandle) {
 					return true;
 				}
 
-				// ✅ Algoritma adı al
+				//Get Algorithm name
 				const wchar_t* algName = AlgName(m_algorithm);
 				if (!algName || !*algName) {
 					if (err) {
 						err->win32 = ERROR_INVALID_PARAMETER;
 						err->ntstatus = 0;
-						err->message = L"Invalid asymmetric algorithm";
+						err->message = L"Invalid symmetric algorithm";
 						err->context.clear();
 					}
 					
-					// ✅ CRITICAL FIX: Use safe OutputDebugStringW instead of SS_LOG_ERROR
+					
 					// Logger may not be initialized yet (prevents abort)
+					if (Logger::Instance().IsInitialized()) {
+						SS_LOG_ERROR(L"CryptoUtils", L"ensureProvider: invalid algorithm enum: %d", 
+							static_cast<int>(m_algorithm));
+					}
+					else
 					{
 						wchar_t debugMsg[256];
 						swprintf_s(debugMsg, L"[CryptoUtils] ensureProvider: invalid algorithm enum: %d\n", 
@@ -444,7 +435,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ Açmayı dene
+				//Try to open algorithm provider
 				BCRYPT_ALG_HANDLE h = nullptr;
 				NTSTATUS st = BCryptOpenAlgorithmProvider(&h, algName, nullptr, 0);
 				if (st < 0 || h == nullptr) {
@@ -454,11 +445,16 @@ namespace ShadowStrike {
 						err->message = L"BCryptOpenAlgorithmProvider failed for asymmetric";
 						wchar_t tmp[256];
 						swprintf_s(tmp, L"Algorithm=%s NTSTATUS=0x%08X Win32=%u", algName, static_cast<unsigned>(st), err->win32);
-						err->context = tmp; // std::wstring kopyalar, dangling yok
+						err->context = tmp; // copies std::wstring, no dangling
 					}
 					
-					// ✅ CRITICAL FIX: Use safe OutputDebugStringW instead of SS_LOG_ERROR
+				
 					// Prevents abort() if Logger is not initialized
+					if (Logger::Instance().IsInitialized()) {
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X, Win32=%u",
+							algName, static_cast<unsigned>(st), RtlNtStatusToDosError(st));
+					}
+					else
 					{
 						wchar_t debugMsg[512];
 						swprintf_s(debugMsg, 
@@ -467,20 +463,18 @@ namespace ShadowStrike {
 						OutputDebugStringW(debugMsg);
 					}
 					
-					// ✅ Garanti: m_algHandle bırakılmaz (null)
+					//Guarantee no dangling
 					m_algHandle = nullptr;
 					return false;
 				}
 
-				// ✅ Başarılıysa sakla ve dön
 				m_algHandle = h;
 
-				// ✅ CRITICAL FIX: Safe logging that doesn't abort
-				// Check if Logger is initialized before using SS_LOG_INFO
+				// Prevents abort() if Logger is not initialized
 				if (Logger::Instance().IsInitialized()) {
 					SS_LOG_INFO(L"CryptoUtils", L"Algorithm provider opened: %s (handle: %p)", algName, m_algHandle);
 				} else {
-					// ✅ Fallback to OutputDebugStringW if Logger not ready
+					//Fallback to OutputDebugStringW if Logger not ready
 					wchar_t debugMsg[256];
 					swprintf_s(debugMsg, L"[CryptoUtils] Algorithm provider opened: %s (handle: %p)\n", 
 						algName, static_cast<void*>(m_algHandle));
@@ -597,7 +591,7 @@ namespace ShadowStrike {
 			}
 
 			size_t SymmetricCipher::GetBlockSize() const noexcept {
-				return 16;
+				return 16; // AES block size is always 16 bytes
 			}
 
 			size_t SymmetricCipher::GetTagSize() const noexcept {
@@ -612,7 +606,7 @@ namespace ShadowStrike {
 				std::vector<uint8_t>& ciphertext, Error* err) noexcept
 			{
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ TIER-1 INPUT VALIDATION (CrowdStrike/Sophos standard)
+				//  TIER-1 INPUT VALIDATION 
 				// ═══════════════════════════════════════════════════════════════════
 				if (!m_keySet) {
 					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
@@ -633,26 +627,32 @@ namespace ShadowStrike {
 
 #ifdef _WIN32
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ ALGORITHM CLASSIFICATION
+				//  ALGORITHM CLASSIFICATION
 				// ═══════════════════════════════════════════════════════════════════
 				const bool isCBC = (m_algorithm == SymmetricAlgorithm::AES_128_CBC ||
 					m_algorithm == SymmetricAlgorithm::AES_192_CBC ||
 					m_algorithm == SymmetricAlgorithm::AES_256_CBC);
-				const bool isECB = (m_algorithm == SymmetricAlgorithm::AES_128_ECB ||
-					m_algorithm == SymmetricAlgorithm::AES_192_ECB ||
-					m_algorithm == SymmetricAlgorithm::AES_256_ECB);
-				const bool needsPadding = (isCBC || isECB);
+			
+				const bool needsPadding = isCBC;
 				const size_t blockSize = GetBlockSize();
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ PADDING STRATEGY (Manual PKCS7 - Industry Standard)
+				//  PADDING STRATEGY (Manual PKCS7 - Industry Standard)
 				// ═══════════════════════════════════════════════════════════════════
+
+				if (plaintextLen > std::numeric_limits<ULONG>::max()) {
+					if (err) {
+						err->win32 = ERROR_BUFFER_OVERFLOW;
+						err->message = L"Ciphertext too large for Windows CNG API";
+					}
+					return false;
+				}
 				std::vector<uint8_t> plaintextWithPadding;
 				const uint8_t* effectivePlaintext = plaintext;
 				size_t effectiveLen = plaintextLen;
 
 				if (needsPadding && m_paddingMode == PaddingMode::PKCS7) {
-					// ✅ CRITICAL: Apply PKCS7 padding MANUALLY
+					//  CRITICAL: Apply PKCS7 padding MANUALLY
 					plaintextWithPadding.assign(plaintext, plaintext + plaintextLen);
 
 					if (!applyPadding(plaintextWithPadding, blockSize)) {
@@ -664,7 +664,7 @@ namespace ShadowStrike {
 					effectiveLen = plaintextWithPadding.size();
 				}
 				else if (needsPadding && m_paddingMode == PaddingMode::None) {
-					// ✅ No padding - MUST be block-aligned
+					//  No padding - MUST be block-aligned
 					if (plaintextLen % blockSize != 0) {
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Plaintext must be block-aligned"; }
 						return false;
@@ -672,14 +672,14 @@ namespace ShadowStrike {
 				}
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ IV MUTATION PROTECTION (Prevent IV reuse attacks)
+				//  IV MUTATION PROTECTION (Prevent IV reuse attacks)
 				// ═══════════════════════════════════════════════════════════════════
 				std::vector<uint8_t> ivLocal = m_iv;
 				PUCHAR ivPtr = ivLocal.empty() ? nullptr : ivLocal.data();
 				ULONG ivLen = static_cast<ULONG>(ivLocal.size());
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ BCRYPT ENCRYPTION (NO PADDING FLAG)
+				//  BCRYPT ENCRYPTION (NO PADDING FLAG)
 				// ═══════════════════════════════════════════════════════════════════
 				DWORD flags = 0; // ✅ CRITICAL: We handle padding ourselves
 
@@ -711,7 +711,7 @@ namespace ShadowStrike {
 					ivPtr, ivLen,
 					ciphertext.data(), static_cast<ULONG>(ciphertext.size()), &cbResult, flags);
 
-				// ✅ SECURE CLEANUP
+				//  SECURE CLEANUP
 				SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 
 				if (st < 0) {
@@ -727,7 +727,7 @@ namespace ShadowStrike {
 				ciphertext.resize(cbResult);
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ IV CHAINING (CBC mode - prevent IV reuse)
+				//  IV CHAINING (CBC mode - prevent IV reuse)
 				// ═══════════════════════════════════════════════════════════════════
 				if (isCBC && ivPtr && ivLen > 0) {
 					if (ciphertext.size() >= ivLen) {
@@ -747,7 +747,7 @@ namespace ShadowStrike {
 				std::vector<uint8_t>& plaintext, Error* err) noexcept
 			{
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ TIER-1 INPUT VALIDATION
+				//  TIER-1 INPUT VALIDATION
 				// ═══════════════════════════════════════════════════════════════════
 				if (!m_keySet) {
 					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
@@ -768,35 +768,40 @@ namespace ShadowStrike {
 
 #ifdef _WIN32
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ ALGORITHM CLASSIFICATION
+				//  ALGORITHM CLASSIFICATION
 				// ═══════════════════════════════════════════════════════════════════
 				const bool isCBC = (m_algorithm == SymmetricAlgorithm::AES_128_CBC ||
 					m_algorithm == SymmetricAlgorithm::AES_192_CBC ||
 					m_algorithm == SymmetricAlgorithm::AES_256_CBC);
-				const bool isECB = (m_algorithm == SymmetricAlgorithm::AES_128_ECB ||
-					m_algorithm == SymmetricAlgorithm::AES_192_ECB ||
-					m_algorithm == SymmetricAlgorithm::AES_256_ECB);
-				const bool needsPadding = (isCBC || isECB);
+			
+				const bool needsPadding = isCBC;
 				const size_t blockSize = GetBlockSize();
 
-				// ✅ Block alignment validation
+				//  Block alignment validation
 				if (needsPadding && (ciphertextLen % blockSize != 0)) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Ciphertext not block-aligned"; }
 					return false;
 				}
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ IV MUTATION PROTECTION
+				//  IV MUTATION PROTECTION
 				// ═══════════════════════════════════════════════════════════════════
 				std::vector<uint8_t> ivLocal = m_iv;
 				PUCHAR ivPtr = ivLocal.empty() ? nullptr : ivLocal.data();
 				ULONG ivLen = static_cast<ULONG>(ivLocal.size());
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ BCRYPT DECRYPTION (NO PADDING FLAG)
+				//  BCRYPT DECRYPTION (NO PADDING FLAG)
 				// ═══════════════════════════════════════════════════════════════════
-				DWORD flags = 0; // ✅ CRITICAL: We handle padding removal ourselves
+				DWORD flags = 0; //  CRITICAL: We handle padding removal ourselves
 
+				if (ciphertextLen > std::numeric_limits<ULONG>::max()) {
+					if (err) {
+						err->win32 = ERROR_BUFFER_OVERFLOW;
+						err->message = L"Ciphertext too large for Windows CNG API";
+					}
+					return false;
+				}
 				// Query decrypted size
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptDecrypt(m_keyHandle,
@@ -837,19 +842,19 @@ namespace ShadowStrike {
 				plaintext.resize(cbResult);
 
 				// ═══════════════════════════════════════════════════════════════════
-				// ✅ MANUAL PADDING REMOVAL (Constant-time validation)
+				//  MANUAL PADDING REMOVAL (Constant-time validation)
 				// ═══════════════════════════════════════════════════════════════════
 				if (needsPadding && m_paddingMode == PaddingMode::PKCS7) {
 					const size_t originalSize = plaintext.size();
 
 					if (!removePadding(plaintext, blockSize)) {
-						// ✅ SECURITY: Zero memory before reporting error
+						//  SECURITY: Zero memory before reporting error
 						SecureZeroMemory(plaintext.data(), originalSize);
 						plaintext.clear();
 
 						if (err) {
 							err->win32 = ERROR_INVALID_DATA;
-							err->message = L"Invalid PKCS7 padding";
+							err->message = L"Decrypt Failed";
 						}
 						return false;
 					}
@@ -868,6 +873,10 @@ namespace ShadowStrike {
 				std::vector<uint8_t>& ciphertext,
 				std::vector<uint8_t>& tag, Error* err) noexcept
 			{
+				if (aadLen > 0 && !aad) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"AAD pointer invalid"; }
+					return false;
+				}
 				if (!IsAEAD()) {
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Not an AEAD algorithm"; }
 					return false;
@@ -875,6 +884,22 @@ namespace ShadowStrike {
 
 				if (!m_keySet || !m_ivSet) {
 					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key or IV not set"; }
+					return false;
+				}
+
+				if (plaintextLen > std::numeric_limits<ULONG>::max()) {
+					if (err) {
+						err->win32 = ERROR_BUFFER_OVERFLOW;
+						err->message = L"Plaintext too large for Windows CNG API";
+					}
+					return false;
+				}
+
+				if(aadLen > std::numeric_limits<ULONG>::max()) {
+					if (err) {
+						err->win32 = ERROR_BUFFER_OVERFLOW;
+						err->message = L"AAD too large for Windows CNG API";
+					}
 					return false;
 				}
 
@@ -892,10 +917,11 @@ namespace ShadowStrike {
 				authInfo.pbMacContext = nullptr;
 				authInfo.cbMacContext = 0;
 				authInfo.cbAAD = static_cast<ULONG>(aadLen);
-				authInfo.cbData = 0;
+				authInfo.cbData = static_cast<ULONG>(plaintextLen);
 				authInfo.dwFlags = 0;
 
 				ULONG cbResult = 0;
+				
 				NTSTATUS st = BCryptEncrypt(m_keyHandle,
 					const_cast<uint8_t*>(plaintext), static_cast<ULONG>(plaintextLen),
 					&authInfo,
@@ -930,6 +956,10 @@ namespace ShadowStrike {
 				const uint8_t* tag, size_t tagLen,
 				std::vector<uint8_t>& plaintext, Error* err) noexcept
 			{
+				if (aadLen > 0 && !aad) {
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"AAD pointer invalid"; }
+					return false;
+				}
 				if (!IsAEAD()) {
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Not an AEAD algorithm"; }
 					return false;
@@ -945,6 +975,22 @@ namespace ShadowStrike {
 					return false;
 				}
 
+				if (ciphertextLen > std::numeric_limits<ULONG>::max()) {
+					if (err) {
+						err->win32 = ERROR_BUFFER_OVERFLOW;
+						err->message = L"Ciphertext is too large for Windows CNG API";
+					}
+					return false;
+				}
+
+				if (aadLen > std::numeric_limits<ULONG>::max()) {
+					if (err) {
+						err->win32 = ERROR_BUFFER_OVERFLOW;
+						err->message = L"AAD too large for Windows CNG API";
+					}
+					return false;
+				}
+
 #ifdef _WIN32
 				BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
 				BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
@@ -957,7 +1003,7 @@ namespace ShadowStrike {
 				authInfo.pbMacContext = nullptr;
 				authInfo.cbMacContext = 0;
 				authInfo.cbAAD = static_cast<ULONG>(aadLen);
-				authInfo.cbData = 0;
+				authInfo.cbData = static_cast<ULONG>(ciphertextLen);
 				authInfo.dwFlags = 0;
 
 				ULONG cbResult = 0;
@@ -978,6 +1024,7 @@ namespace ShadowStrike {
 					nullptr, 0,
 					plaintext.data(), static_cast<ULONG>(plaintext.size()), &cbResult, 0);
 				if (st < 0) {
+					SecureZeroMemory(plaintext.data(), plaintext.size());
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt AEAD failed or authentication failed"; }
 					return false;
 				}
@@ -1009,7 +1056,7 @@ namespace ShadowStrike {
 
 			bool SymmetricCipher::EncryptUpdate(const uint8_t* data, size_t len, std::vector<uint8_t>& out, Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"EncryptInit not called"; }
+					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
 					return false;
 				}
 				if (m_streamFinalized) {
@@ -1026,7 +1073,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Gelen veriyi internal buffer'a ekle
+				//Add the new data to the internal buffer
 				m_streamBuffer.insert(m_streamBuffer.end(), data, data + len);
 
 				//encrypt the block-aligned data in the buffer
@@ -1059,6 +1106,7 @@ namespace ShadowStrike {
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 				if (st < 0) {
+					out.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt failed"; }
 					return false;
 				}
@@ -1071,17 +1119,18 @@ namespace ShadowStrike {
 				}
 
 				//Remove the processed data from the buffer
+				SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
 				m_streamBuffer.erase(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
-
 				return true;
 #else
 				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
 				return false;
 #endif
 			}
+
 			bool SymmetricCipher::EncryptFinal(std::vector<uint8_t>& out, Error* err) noexcept {
 				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"EncryptInit not called"; }
+					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
 					return false;
 				}
 				if (m_streamFinalized) {
@@ -1097,13 +1146,13 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
-				// ✅ FIX: Empty buffer handling (no logger spam)
+				// Empty buffer handling (no logger spam)
 				if (m_streamBuffer.empty()) {
 					m_streamFinalized = true;
 					return true;
 				}
 
-				// ✅ CRITICAL FIX: Apply manual padding ONLY if needed
+				// Apply manual padding ONLY if needed
 				if (m_paddingMode == PaddingMode::PKCS7) {
 					if (!applyPadding(m_streamBuffer, GetBlockSize())) {
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Padding failed"; }
@@ -1111,14 +1160,14 @@ namespace ShadowStrike {
 					}
 				}
 
-				// ✅ Encrypt final block (flags=0, BCrypt won't add padding)
+				//Encrypt final block (flags=0, BCrypt won't add padding)
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptEncrypt(
 					m_keyHandle,
 					m_streamBuffer.data(), static_cast<ULONG>(m_streamBuffer.size()),
 					nullptr,
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
-					nullptr, 0, &cbResult, 0); // ✅ flags=0 (no BCrypt padding)
+					nullptr, 0, &cbResult, 0); //flags=0 (no BCrypt padding)
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"EncryptFinal failed"; }
@@ -1182,9 +1231,26 @@ namespace ShadowStrike {
 					return false;
 				}
 
+				//overflow guard
+				if (len > SIZE_MAX - m_streamBuffer.size()) {
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Buffer overflow risk"; }
+					return false;
+				}
+
 				m_streamBuffer.insert(m_streamBuffer.end(), data, data + len);
 
 				const size_t blockSize = GetBlockSize();
+
+				//blocksize validation
+				if (blockSize == 0) {
+					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid block size"; }
+					return false;
+				}
+				//overflow guard for blocksize
+				if (m_streamBuffer.size() / blockSize > SIZE_MAX / blockSize) {
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Block size overflow"; }
+					return false;
+				}
 				const size_t alignedSize = (m_streamBuffer.size() / blockSize) * blockSize;
 
 				// hold the last block for padding
@@ -1196,8 +1262,23 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
+				if (processSize > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"processSize too large for ULONG"; }
+					return false;
+				}
+
 				std::vector<uint8_t> toDecrypt(m_streamBuffer.begin(), m_streamBuffer.begin() + processSize);
 
+				//overflow guard
+				if (toDecrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"toDecrypt size too large for ULONG"; }
+					return false;
+				}
+
+				if (m_iv.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"IV size too large for ULONG"; }
+					return false;
+				}
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptDecrypt(m_keyHandle,
 					toDecrypt.data(), static_cast<ULONG>(toDecrypt.size()),
@@ -1216,6 +1297,7 @@ namespace ShadowStrike {
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 				if (st < 0) {
+					SecureZeroMemory(out.data(), out.size());
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt failed"; }
 					return false;
 				}
@@ -1254,20 +1336,20 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
-				// ✅ FIX: Empty buffer handling
+				// Empty buffer handling
 				if (m_streamBuffer.empty()) {
 					m_streamFinalized = true;
 					return true;
 				}
 
-				// ✅ Decrypt final block (flags=0, no BCrypt padding removal)
+				// Decrypt final block (flags=0, no BCrypt padding removal)
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptDecrypt(
 					m_keyHandle,
 					m_streamBuffer.data(), static_cast<ULONG>(m_streamBuffer.size()),
 					nullptr,
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
-					nullptr, 0, &cbResult, 0); // ✅ flags=0
+					nullptr, 0, &cbResult, 0); // flags=0
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"DecryptFinal failed"; }
@@ -1289,7 +1371,7 @@ namespace ShadowStrike {
 
 				out.resize(cbResult);
 
-				// ✅ CRITICAL FIX: Manual padding removal (constant-time)
+				// Manual padding removal (constant-time)
 				if (m_paddingMode == PaddingMode::PKCS7) {
 					const size_t originalSize = out.size();
 					if (!removePadding(out, GetBlockSize())) {
@@ -1299,7 +1381,7 @@ namespace ShadowStrike {
 						return false;
 					}
 				}
-
+				SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 				m_streamBuffer.clear();
 				m_streamFinalized = true;
 				return true;
@@ -1308,11 +1390,12 @@ namespace ShadowStrike {
 				return false;
 #endif
 			}
+
 			bool SymmetricCipher::applyPadding(std::vector<uint8_t>& data, size_t blockSize) noexcept {
 				if (blockSize == 0 || blockSize > 255) return false;
 				if (m_paddingMode != PaddingMode::PKCS7) return false;
 
-				// ✅ PKCS7: Always add padding (even if block-aligned)
+				// PKCS7: Always add padding (even if block-aligned)
 				const size_t remainder = data.size() % blockSize;
 				const size_t padLen = (remainder == 0) ? blockSize : (blockSize - remainder);
 
@@ -1332,12 +1415,12 @@ namespace ShadowStrike {
 
 				const uint8_t padLen = data.back();
 
-				// ✅ SECURITY: Validate padding length
+				// SECURITY: Validate padding length
 				if (padLen == 0 || padLen > blockSize || padLen > data.size()) {
 					return false;
 				}
 
-				// ✅ CONSTANT-TIME VALIDATION (Prevent padding oracle attacks)
+				// CONSTANT-TIME VALIDATION (Prevent padding oracle attacks)
 				uint8_t diff = 0;
 				for (size_t i = data.size() - padLen; i < data.size(); ++i) {
 					diff |= (data[i] ^ padLen);
@@ -1347,7 +1430,7 @@ namespace ShadowStrike {
 					return false; // Invalid padding
 				}
 
-				// ✅ Remove padding
+				// Remove padding
 				data.resize(data.size() - padLen);
 				return true;
 			}
@@ -1363,7 +1446,7 @@ namespace ShadowStrike {
 
 			void AsymmetricCipher::cleanup() noexcept {
 #ifdef _WIN32
-				// ✅ CRITICAL: Proper cleanup order (keys before provider)
+				// Proper cleanup order (keys before provider)
 				if (m_publicKeyHandle) {
 					BCryptDestroyKey(m_publicKeyHandle);
 					m_publicKeyHandle = nullptr;
@@ -1373,7 +1456,7 @@ namespace ShadowStrike {
 					m_privateKeyHandle = nullptr;
 				}
 
-				// ✅ Close provider handle
+				// Close provider handle
 				if (m_algHandle) {
 					NTSTATUS st = BCryptCloseAlgorithmProvider(m_algHandle, 0);
 					if (st < 0) {
@@ -1388,12 +1471,12 @@ namespace ShadowStrike {
 
 			bool AsymmetricCipher::ensureProvider(Error* err) noexcept {
 #ifdef _WIN32
-				// Eğer zaten açılmış bir sağlayıcı varsa, tekrar açmadan kullan
+				//if already opened
 				if (m_algHandle) {
 					return true;
 				}
 
-				// Algoritma adı al
+				//Get Algorithm Name
 				const wchar_t* algName = RSAAlgName(m_algorithm);
 				if (!algName || !*algName) {
 					if (err) {
@@ -1403,8 +1486,11 @@ namespace ShadowStrike {
 						err->context.clear();
 					}
 					
-					// CRITICAL FIX: Use safe OutputDebugStringW instead of SS_LOG_ERROR
-					// Logger may not be initialized yet (prevents abort)
+					//prevents abort() if logger not initialized
+					if(Logger::Instance().IsInitialized()) {
+						SS_LOG_ERROR(L"CryptoUtils", L"ensureProvider: invalid algorithm enum: %d", static_cast<int>(m_algorithm));
+					}
+					else
 					{
 						wchar_t debugMsg[256];
 						swprintf_s(debugMsg, L"[CryptoUtils] ensureProvider: invalid algorithm enum: %d\n", 
@@ -1414,7 +1500,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Açmayı dene
+				//Try to open
 				BCRYPT_ALG_HANDLE h = nullptr;
 				NTSTATUS st = BCryptOpenAlgorithmProvider(&h, algName, nullptr, 0);
 				if (st < 0 || h == nullptr) {
@@ -1424,11 +1510,13 @@ namespace ShadowStrike {
 						err->message = L"BCryptOpenAlgorithmProvider failed for asymmetric";
 						wchar_t tmp[256];
 						swprintf_s(tmp, L"Algorithm=%s NTSTATUS=0x%08X Win32=%u", algName, static_cast<unsigned>(st), err->win32);
-						err->context = tmp; // std::wstring kopyalar, dangling yok
+						err->context = tmp; //Copies std::wstring, no dangling
 					}
-					
-					// CRITICAL FIX: Use safe OutputDebugStringW instead of SS_LOG_ERROR
-					// Prevents abort() if Logger is not initialized
+					//prevents abort() if logger not initialized
+					if (Logger::Instance().IsInitialized()) {
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X, Win32=%u\n", static_cast<int>(m_algorithm));
+					}
+					else
 					{
 						wchar_t debugMsg[512];
 						swprintf_s(debugMsg, 
@@ -1437,16 +1525,15 @@ namespace ShadowStrike {
 						OutputDebugStringW(debugMsg);
 					}
 					
-					// Garanti: m_algHandle bırakılmaz (null)
+					//Guarantee null handle on failure
 					m_algHandle = nullptr;
 					return false;
 				}
 
-				// Başarılıysa sakla ve dön
+				
 				m_algHandle = h;
 
-				// CRITICAL FIX: Safe logging that doesn't abort
-				// Check if Logger is initialized before using SS_LOG_INFO
+				
 				if (Logger::Instance().IsInitialized()) {
 					SS_LOG_INFO(L"CryptoUtils", L"Algorithm provider opened: %s (handle: %p)", algName, m_algHandle);
 				} else {
@@ -1466,7 +1553,7 @@ namespace ShadowStrike {
 
 			bool AsymmetricCipher::GenerateKeyPair(KeyPair& outKeyPair, Error* err) noexcept {
 #ifdef _WIN32
-				// Sağlayıcıyı hazırla
+				// Ensure provider is opened
 				if (!ensureProvider(err)) {
 					SS_LOG_ERROR(L"CryptoUtils", L"GenerateKeyPair: ensureProvider failed");
 					return false;
@@ -1547,6 +1634,10 @@ namespace ShadowStrike {
 				outKeyPair.privateKey.keyBlob.resize(cbBlob);
 				st = BCryptExportKey(hKey, nullptr, privBlobType, outKeyPair.privateKey.keyBlob.data(), cbBlob, &cbBlob, 0);
 				if (st < 0) {
+					if (!outKeyPair.privateKey.keyBlob.empty()) {
+						SecureZeroMemory(outKeyPair.privateKey.keyBlob.data(), outKeyPair.privateKey.keyBlob.size());
+						outKeyPair.privateKey.keyBlob.clear();
+					}
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptExportKey (private) failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptExportKey (private) failed: 0x%08X", st);
 					BCryptDestroyKey(hKey);
@@ -1574,7 +1665,7 @@ namespace ShadowStrike {
 					m_publicKeyHandle = nullptr;
 				}
 
-				// ✅ FIX: ECC vs RSA blob type selection
+				// ECC vs RSA blob type selection
 				const bool isECC = (key.algorithm == AsymmetricAlgorithm::ECC_P256 ||
 					key.algorithm == AsymmetricAlgorithm::ECC_P384 ||
 					key.algorithm == AsymmetricAlgorithm::ECC_P521);
@@ -1607,7 +1698,7 @@ namespace ShadowStrike {
 					m_privateKeyHandle = nullptr;
 				}
 
-				// ✅ FIX: ECC vs RSA blob type selection
+				// ECC vs RSA blob type selection
 				const bool isECC = (key.algorithm == AsymmetricAlgorithm::ECC_P256 ||
 					key.algorithm == AsymmetricAlgorithm::ECC_P384 ||
 					key.algorithm == AsymmetricAlgorithm::ECC_P521);
@@ -1621,7 +1712,10 @@ namespace ShadowStrike {
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptImportKeyPair private failed: 0x%08X", st);
 					return false;
 				}
-
+				// NOTE: Private key blob is securely erased after import.
+                // Do not rely on key.keyBlob later in the program.
+				SecureZeroMemory(const_cast<uint8_t*>(key.keyBlob.data()), key.keyBlob.size());
+				const_cast<std::vector<uint8_t>&>(key.keyBlob).clear();
 				m_privateKeyLoaded = true;
 				SS_LOG_INFO(L"CryptoUtils", L"Private key loaded successfully");
 				return true;
@@ -1630,6 +1724,7 @@ namespace ShadowStrike {
 				return false;
 #endif
 			}
+
 			bool AsymmetricCipher::Encrypt(const uint8_t* plaintext, size_t plaintextLen,
 				std::vector<uint8_t>& ciphertext,
 				RSAPaddingScheme padding,
@@ -1644,12 +1739,6 @@ namespace ShadowStrike {
 #ifdef _WIN32
 				if (!m_publicKeyHandle) {
 					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Public key handle is null"; }
-					return false;
-				}
-
-				// Block deprecated RSA-1024
-				if (m_algorithm == AsymmetricAlgorithm::RSA_1024) {
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"RSA-1024 is deprecated and insecure"; }
 					return false;
 				}
 
@@ -1763,10 +1852,6 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				if (m_algorithm == AsymmetricAlgorithm::RSA_1024) {
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"RSA-1024 is deprecated and insecure"; }
-					return false;
-				}
 
 				if (!(m_algorithm == AsymmetricAlgorithm::RSA_2048 ||
 					m_algorithm == AsymmetricAlgorithm::RSA_3072 ||
@@ -1871,14 +1956,42 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
+				ULONG Flags = 0;
+				if (padding == RSAPaddingScheme::PKCS1) {
+				Flags = BCRYPT_PAD_PKCS1;
+				}
+				else if(padding == RSAPaddingScheme::PSS_SHA256 || padding == RSAPaddingScheme::PSS_SHA384 || padding == RSAPaddingScheme::PSS_SHA512)
+				{
+					Flags = BCRYPT_PAD_PSS;
+				}
+				else
+				{
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported padding scheme for signing"; }
+					return false;
+				}
+				
+
+				
 				BCRYPT_PKCS1_PADDING_INFO paddingInfo{};
-				paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+				switch (hashAlg) {
+					case HashUtils::Algorithm::SHA1:
+						paddingInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM; break;
+					case HashUtils::Algorithm::SHA256:
+						paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM; break;
+					case HashUtils::Algorithm::SHA384:
+						paddingInfo.pszAlgId = BCRYPT_SHA384_ALGORITHM; break;
+					case HashUtils::Algorithm::SHA512:
+						paddingInfo.pszAlgId = BCRYPT_SHA512_ALGORITHM; break;
+					default:
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported hash algorithm for signing"; }
+						return false;
+				}
 
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptSignHash(m_privateKeyHandle,
 					&paddingInfo,
 					hash.data(), static_cast<ULONG>(hash.size()),
-					nullptr, 0, &cbResult, BCRYPT_PAD_PKCS1);
+					nullptr, 0, &cbResult, Flags);
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptSignHash size query failed"; }
 					return false;
@@ -1888,7 +2001,7 @@ namespace ShadowStrike {
 				st = BCryptSignHash(m_privateKeyHandle,
 					&paddingInfo,
 					hash.data(), static_cast<ULONG>(hash.size()),
-					signature.data(), static_cast<ULONG>(signature.size()), &cbResult, BCRYPT_PAD_PKCS1);
+					signature.data(), static_cast<ULONG>(signature.size()), &cbResult, Flags);
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptSignHash failed"; }
 					return false;
@@ -1921,13 +2034,38 @@ namespace ShadowStrike {
 
 #ifdef _WIN32
 				BCRYPT_PKCS1_PADDING_INFO paddingInfo{};
-				paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+				switch (hashAlg) {
+										case HashUtils::Algorithm::SHA1:
+						paddingInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM; break;
+					case HashUtils::Algorithm::SHA256:
+						paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM; break;
+					case HashUtils::Algorithm::SHA384:
+						paddingInfo.pszAlgId = BCRYPT_SHA384_ALGORITHM; break;
+					case HashUtils::Algorithm::SHA512:
+						paddingInfo.pszAlgId = BCRYPT_SHA512_ALGORITHM; break;
+					default:
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported hash algorithm for verification"; }
+						return false;
+				}
 
+				ULONG Flags = 0;
+				if (padding == RSAPaddingScheme::PKCS1) {
+					Flags = BCRYPT_PAD_PKCS1;
+				}
+				else if(padding == RSAPaddingScheme::PSS_SHA256 || padding == RSAPaddingScheme::PSS_SHA384 || padding == RSAPaddingScheme::PSS_SHA512)
+				{
+					Flags = BCRYPT_PAD_PSS;
+				}
+				else
+				{
+					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported padding scheme for verification"; }
+					return false;
+				}
 				NTSTATUS st = BCryptVerifySignature(m_publicKeyHandle,
 					&paddingInfo,
 					hash.data(), static_cast<ULONG>(hash.size()),
 					const_cast<uint8_t*>(signature), static_cast<ULONG>(signatureLen),
-					BCRYPT_PAD_PKCS1);
+					Flags);
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptVerifySignature failed"; }
 					return false;
@@ -1939,7 +2077,6 @@ namespace ShadowStrike {
 				return false;
 #endif
 			}
-
 			bool AsymmetricCipher::DeriveSharedSecret(const PublicKey& peerPublicKey,
 				std::vector<uint8_t>& sharedSecret,
 				Error* err) noexcept
@@ -1981,65 +2118,86 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Open algorithm provider for ECDH if not already open
-				BCRYPT_ALG_HANDLE hEcdhAlg = nullptr;
-				NTSTATUS st = BCryptOpenAlgorithmProvider(&hEcdhAlg, algName, nullptr, 0);
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptOpenAlgorithmProvider failed for ECDH"; }
-					SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider for ECDH failed: 0x%08X", st);
+				// RAII provider(no throw)
+				struct EcdhProviderHandle {
+					BCRYPT_ALG_HANDLE handle = nullptr;
+					NTSTATUS status = 0;
+
+					explicit EcdhProviderHandle(const wchar_t* name) {
+						status = BCryptOpenAlgorithmProvider(&handle, name, nullptr, 0);
+						if (status < 0) {
+							handle = nullptr;
+						}
+					}
+					~EcdhProviderHandle() {
+						if (handle) {
+							BCryptCloseAlgorithmProvider(handle, 0);
+							handle = nullptr;
+						}
+					}
+					EcdhProviderHandle(const EcdhProviderHandle&) = delete;
+					EcdhProviderHandle& operator=(const EcdhProviderHandle&) = delete;
+					EcdhProviderHandle(EcdhProviderHandle&& other) noexcept {
+						handle = other.handle;
+						status = other.status;
+						other.handle = nullptr;
+					}
+					bool ok() const { return status >= 0 && handle != nullptr; }
+				};
+
+				EcdhProviderHandle provider(algName);
+				if (!provider.ok()) {
+					if (err) {
+						err->ntstatus = provider.status;
+						err->win32 = RtlNtStatusToDosError(provider.status);
+						err->message = L"ECDH provider init failed";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"ECDH provider init failed: 0x%08X", provider.status);
 					return false;
 				}
 
 				// Import peer's public key
 				BCRYPT_KEY_HANDLE hPeerPublicKey = nullptr;
-				st = BCryptImportKeyPair(hEcdhAlg, nullptr, BCRYPT_ECCPUBLIC_BLOB,
-					&hPeerPublicKey, const_cast<uint8_t*>(peerPublicKey.keyBlob.data()),
+				NTSTATUS st = BCryptImportKeyPair(provider.handle, nullptr, BCRYPT_ECCPUBLIC_BLOB,
+					&hPeerPublicKey,
+					const_cast<uint8_t*>(peerPublicKey.keyBlob.data()),
 					static_cast<ULONG>(peerPublicKey.keyBlob.size()), 0);
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptImportKeyPair for peer public key failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptImportKeyPair for peer failed: 0x%08X", st);
-					BCryptCloseAlgorithmProvider(hEcdhAlg, 0);
-					return false;
+					return false; // provider RAII ile kapanacak
 				}
 
 				// Derive shared secret using BCryptSecretAgreement
 				BCRYPT_SECRET_HANDLE hSecret = nullptr;
 				st = BCryptSecretAgreement(m_privateKeyHandle, hPeerPublicKey, &hSecret, 0);
-
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptSecretAgreement failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptSecretAgreement failed: 0x%08X", st);
 					BCryptDestroyKey(hPeerPublicKey);
-					BCryptCloseAlgorithmProvider(hEcdhAlg, 0);
 					return false;
 				}
 
-				// Derive key material from the secret using KDF (Key Derivation Function)
-				// Using BCRYPT_KDF_RAW_SECRET to get the raw shared secret
+				// Derive key material from the secret using RAW secret
 				ULONG cbResult = 0;
 				st = BCryptDeriveKey(hSecret, BCRYPT_KDF_RAW_SECRET, nullptr, nullptr, 0, &cbResult, 0);
-
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDeriveKey size query failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptDeriveKey size query failed: 0x%08X", st);
 					BCryptDestroySecret(hSecret);
 					BCryptDestroyKey(hPeerPublicKey);
-					BCryptCloseAlgorithmProvider(hEcdhAlg, 0);
 					return false;
 				}
 
-				// Allocate buffer for shared secret
 				sharedSecret.resize(cbResult);
 
-				// Derive the actual key material
 				st = BCryptDeriveKey(hSecret, BCRYPT_KDF_RAW_SECRET, nullptr,
 					sharedSecret.data(), static_cast<ULONG>(sharedSecret.size()), &cbResult, 0);
 
-				// Cleanup
+				// Cleanup secret + peer key
 				BCryptDestroySecret(hSecret);
 				BCryptDestroyKey(hPeerPublicKey);
-				BCryptCloseAlgorithmProvider(hEcdhAlg, 0);
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDeriveKey failed"; }
@@ -2051,10 +2209,9 @@ namespace ShadowStrike {
 
 				sharedSecret.resize(cbResult);
 
-				// Log success for debugging
 				SS_LOG_INFO(L"CryptoUtils", L"ECDH shared secret derived successfully (%zu bytes)", sharedSecret.size());
-
 				return true;
+
 #else
 				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
 				return false;
@@ -2063,76 +2220,108 @@ namespace ShadowStrike {
 
 			size_t AsymmetricCipher::GetMaxPlaintextSize(RSAPaddingScheme padding) const noexcept {
 #ifdef _WIN32
-				// Try to determine real key size (in bits) from the loaded key handle if available.
+				
 				ULONG keySizeBits = 0;
 
 				if (m_publicKeyLoaded && m_publicKeyHandle) {
 					ULONG cbBlob = 0;
-					NTSTATUS st = BCryptExportKey(m_publicKeyHandle, nullptr, BCRYPT_RSAPUBLIC_BLOB, nullptr, 0, &cbBlob, 0);
-					if (st >= 0 && cbBlob >= sizeof(ULONG) * 2) {
-						try {
-							std::vector<uint8_t> blob(cbBlob);
-							st = BCryptExportKey(m_publicKeyHandle, nullptr, BCRYPT_RSAPUBLIC_BLOB, blob.data(), cbBlob, &cbBlob, 0);
-							if (st >= 0 && cbBlob >= sizeof(ULONG) * 2) {
-								// BCRYPT_RSAPUBLIC_BLOB layout: ULONG Magic; ULONG BitLength; ...
-								const ULONG* words = reinterpret_cast<const ULONG*>(blob.data());
-								keySizeBits = words[1];
+					NTSTATUS st = BCryptExportKey(m_publicKeyHandle, nullptr, BCRYPT_RSAPUBLIC_BLOB,
+						nullptr, 0, &cbBlob, 0);
+					if (st >= 0 && cbBlob >= sizeof(BCRYPT_RSAKEY_BLOB)) {
+						std::vector<uint8_t> blob(cbBlob);
+						st = BCryptExportKey(m_publicKeyHandle, nullptr, BCRYPT_RSAPUBLIC_BLOB,
+							blob.data(), cbBlob, &cbBlob, 0);
+						if (st >= 0 && cbBlob >= sizeof(BCRYPT_RSAKEY_BLOB)) {
+							//Parse the blob header securely
+							const auto* hdr = reinterpret_cast<const BCRYPT_RSAKEY_BLOB*>(blob.data());
+							//Magic and bit length sanity check
+							if (hdr->Magic == BCRYPT_RSAPUBLIC_MAGIC && (hdr->BitLength % 8) == 0) {
+								const size_t kBytes = static_cast<size_t>(hdr->BitLength / 8);
+								const size_t headerSize = sizeof(BCRYPT_RSAKEY_BLOB);
+								const size_t expectedMin = headerSize + hdr->cbPublicExp + hdr->cbModulus;
+								//Blob size and modulus size consistency check
+								if (cbBlob >= expectedMin && hdr->cbModulus == kBytes) {
+									keySizeBits = hdr->BitLength;
+								}
+								else {
+									SS_LOG_WARN(L"CryptoUtils",
+										L"Inconsistent RSA public blob: cbBlob=%lu, expectedMin=%zu, cbModulus=%lu, kBytes=%zu",
+										cbBlob, expectedMin, hdr->cbModulus, kBytes);
+									keySizeBits = 0;
+								}
 							}
-						}
-						catch (...) {
-							keySizeBits = 0;
+							else {
+								SS_LOG_WARN(L"CryptoUtils",
+									L"Invalid RSA public blob header: Magic=0x%08X, BitLength=%lu",
+									hdr->Magic, hdr->BitLength);
+								keySizeBits = 0;
+							}
 						}
 					}
 				}
 
 				if (keySizeBits == 0) {
-					// Fallback to configured algorithm
+					//Algorithm based fallback
 					keySizeBits = RSAKeySizeForAlg(m_algorithm);
 				}
 #else
 				const ULONG keySizeBits = RSAKeySizeForAlg(m_algorithm);
 #endif
 
+				//for ECC, return a predefined cap
 				const bool isECC = (m_algorithm == AsymmetricAlgorithm::ECC_P256 ||
 					m_algorithm == AsymmetricAlgorithm::ECC_P384 ||
 					m_algorithm == AsymmetricAlgorithm::ECC_P521);
-
 				if (isECC) {
-					// No small-message limit like RSA; keep a safe cap
-					return 65536;
+					// use a predefined ECC cap if exists, if not use the default 65536
+					const size_t eccCap =
+#ifdef HAS_ECC_CAP_MEMBER
+						m_eccMaxPlaintextCap
+#else
+						static_cast<size_t>(65536)
+#endif
+						;
+					return eccCap;
 				}
 
+				//bit-> byte conversion for RSA
+				if (keySizeBits == 0 || (keySizeBits % 8) != 0) {
+					SS_LOG_WARN(L"CryptoUtils", L"Invalid RSA key size bits: %lu", keySizeBits);
+					return 0;
+				}
 				const size_t keySizeBytes = static_cast<size_t>(keySizeBits / 8);
 				if (keySizeBytes == 0) return 0;
 
-				// Defensive sanity cap to avoid enormous allocations if detection is wrong.
-				// Real RSA plaintext limits are < 512 bytes for 4096-bit keys.
-				const size_t sanityCap = 1024 * 1024; // 1MB absolute safety cap
-				if (keySizeBytes > sanityCap) return 0;
+				// Sanity cap: block the unrealistic key sizes
+				const size_t sanityCap = 1024 * 1024; // 1MB
+				if (keySizeBytes > sanityCap) {
+					SS_LOG_WARN(L"CryptoUtils", L"RSA key size bytes (%zu) exceeded sanity cap (%zu)", keySizeBytes, sanityCap);
+					return 0;
+				}
 
+				//maximum plaintext size for the given padding
 				switch (padding) {
 				case RSAPaddingScheme::PKCS1:
+					// PKCS#1 v1.5: max = k - 11
 					if (keySizeBytes <= 11) return 0;
 					return keySizeBytes - 11;
 
 				case RSAPaddingScheme::OAEP_SHA1: {
 					const size_t hLen = 20;
+					// OAEP: max = k - 2*hLen - 2
 					if (keySizeBytes <= (2 * hLen + 2)) return 0;
 					return keySizeBytes - (2 * hLen) - 2;
 				}
-
 				case RSAPaddingScheme::OAEP_SHA256: {
 					const size_t hLen = 32;
 					if (keySizeBytes <= (2 * hLen + 2)) return 0;
 					return keySizeBytes - (2 * hLen) - 2;
 				}
-
 				case RSAPaddingScheme::OAEP_SHA384: {
 					const size_t hLen = 48;
 					if (keySizeBytes <= (2 * hLen + 2)) return 0;
 					return keySizeBytes - (2 * hLen) - 2;
 				}
-
 				case RSAPaddingScheme::OAEP_SHA512: {
 					const size_t hLen = 64;
 					if (keySizeBytes <= (2 * hLen + 2)) return 0;
@@ -2143,10 +2332,13 @@ namespace ShadowStrike {
 					return 0;
 				}
 			}
+
+
 			size_t AsymmetricCipher::GetSignatureSize() const noexcept {
 				const ULONG keySize = RSAKeySizeForAlg(m_algorithm);
 				return keySize / 8;
 			}
+
 			bool KeyDerivation::PBKDF2(const uint8_t* password, size_t passwordLen,
 				const uint8_t* salt, size_t saltLen,
 				uint32_t iterations,
@@ -2155,7 +2347,17 @@ namespace ShadowStrike {
 				Error* err) noexcept
 			{
 				if (!password || !salt || !outKey || keyLen == 0) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid parameters"; }
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid parameters";
+					}
+					return false;
+				}
+
+				if (saltLen < 8) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Salt length should be at least 8 bytes";
+					}
 					return false;
 				}
 
@@ -2163,6 +2365,7 @@ namespace ShadowStrike {
 				// Map HashUtils::Algorithm to BCrypt algorithm
 				const wchar_t* algName = BCRYPT_SHA256_ALGORITHM;
 				switch (hashAlg) {
+				case HashUtils::Algorithm::SHA1:   algName = BCRYPT_SHA1_ALGORITHM; break;
 				case HashUtils::Algorithm::SHA256: algName = BCRYPT_SHA256_ALGORITHM; break;
 				case HashUtils::Algorithm::SHA384: algName = BCRYPT_SHA384_ALGORITHM; break;
 				case HashUtils::Algorithm::SHA512: algName = BCRYPT_SHA512_ALGORITHM; break;
@@ -2227,15 +2430,23 @@ namespace ShadowStrike {
 					hmacKey.assign(salt, salt + saltLen);
 				}
 				else {
-					hmacKey.assign(hashLen, 0); // Zero-filled salt
+					hmacKey.assign(hashLen, 0); // Zero-filled salt(RFC 5869 standard).
 				}
 
-				// FIX: Use ComputeHmac helper (one-shot) instead of non-existent HashUtils::Hmac(...) function
+				// Use ComputeHmac helper (one-shot) instead of non-existent HashUtils::Hmac(...) function
 				if (!HashUtils::ComputeHmac(hashAlg, hmacKey.data(), hmacKey.size(),
 					inputKeyMaterial, ikmLen, prk, nullptr)) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Extract failed"; }
 					return false;
 				}
+				if (keyLen > 255 * hashLen) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"HKDF keyLen too large";
+					}
+					return false;
+				}
+
 
 				// HKDF-Expand: OKM = T(1) | T(2) | T(3) | ...
 				size_t n = (keyLen + hashLen - 1) / hashLen; // Ceiling division
@@ -2251,7 +2462,7 @@ namespace ShadowStrike {
 					msg.push_back(static_cast<uint8_t>(i));
 
 					t.resize(hashLen);
-					// FIX: Use ComputeHmac here as well
+					//Use ComputeHmac here as well
 					if (!HashUtils::ComputeHmac(hashAlg, prk.data(), prk.size(),
 						msg.data(), msg.size(), t, nullptr)) {
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Expand failed"; }
@@ -2476,16 +2687,16 @@ namespace ShadowStrike {
 				// If encryption requested, encrypt the DER blob first
 				if (encrypt && !password.empty()) {
 					// PKCS#8 encrypted private key format
-					// ✅ FIXED: Increase PBKDF2 iterations from 10000 to 600000 (OWASP 2023 recommendation)
+					// Increase PBKDF2 iterations from 10000 to 600000 (OWASP 2023 recommendation)
 
 					KDFParams kdfParams{};
 					kdfParams.algorithm = KDFAlgorithm::PBKDF2_SHA256;
-					kdfParams.iterations = 600000; // ✅ FIXED: Production-grade iteration count
+					kdfParams.iterations = 600000; // Production-grade iteration count
 					kdfParams.keyLength = 32;
 
 					SecureRandom rng;
 					std::vector<uint8_t> salt;
-					if (!rng.Generate(salt, 32, err)) return false; // ✅ FIXED: 32 bytes salt instead of 16
+					if (!rng.Generate(salt, 32, err)) return false; // 32 bytes salt instead of 16
 					kdfParams.salt = salt;
 
 					std::vector<uint8_t> key;
@@ -2497,10 +2708,14 @@ namespace ShadowStrike {
 					std::vector<uint8_t> iv;
 					if (!cipher.GenerateIV(iv, err)) return false;
 
+					if(iv.size() != 16) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid IV size"; }
+						return false;
+					}
 					std::vector<uint8_t> encrypted;
 					if (!cipher.Encrypt(keyBlob.data(), keyBlob.size(), encrypted, err)) return false;
 
-					// ✅ FIXED: Format now includes iteration count for future-proofing
+					// Format now includes iteration count for future-proofing
 					// Format: [VERSION(4)] + [ITERATIONS(4)] + [SALT(32)] + [IV(16)] + [ENCRYPTED_DATA]
 					dataToEncode.clear();
 					const uint32_t version = 1;
@@ -2592,14 +2807,41 @@ namespace ShadowStrike {
 				return true;
 			}
 
-			bool PrivateKey::ImportPEM(std::string_view pem, PrivateKey& out, std::string_view password, Error* err) noexcept {
+			// Minimal ASN.1 sanity checks
+			static bool ValidatePKCS1RSAPrivateKey(const std::vector<uint8_t>& der) noexcept {
+				// Very light check: must start with SEQUENCE (0x30)
+				if (der.size() < 2 || der[0] != 0x30) return false;
+				// Optional deeper checks (heuristics): expect INTEGER tags 0x02 somewhere early
+				// We keep it minimal to avoid full ASN.1 parsing.
+				return true;
+			}
+
+			static bool ValidatePKCS8PrivateKeyInfo(const std::vector<uint8_t>& der) noexcept {
+				// Very light check: must start with SEQUENCE (0x30)
+				if (der.size() < 2 || der[0] != 0x30) return false;
+				return true;
+			}
+
+			// Read little-endian uint32 safely (portable parsing)
+			static uint32_t ReadLE32(const uint8_t* p) noexcept {
+				return (static_cast<uint32_t>(p[0])) |
+					(static_cast<uint32_t>(p[1]) << 8) |
+					(static_cast<uint32_t>(p[2]) << 16) |
+					(static_cast<uint32_t>(p[3]) << 24);
+			}
+
+			bool PrivateKey::ImportPEM(std::string_view pem,
+				PrivateKey& out,
+				std::string_view password,
+				Error* err) noexcept
+			{
 				if (pem.empty()) {
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"PEM string is empty"; }
 					return false;
 				}
 
-				// Detect if encrypted
-				bool isEncrypted = (pem.find("-----BEGIN ENCRYPTED PRIVATE KEY-----") != std::string_view::npos);
+				// Detect custom PKCS#8 encrypted vs unencrypted
+				const bool isEncrypted = (pem.find("-----BEGIN ENCRYPTED PRIVATE KEY-----") != std::string_view::npos);
 
 				const std::string_view beginMarker = isEncrypted ?
 					"-----BEGIN ENCRYPTED PRIVATE KEY-----" :
@@ -2608,20 +2850,29 @@ namespace ShadowStrike {
 					"-----END ENCRYPTED PRIVATE KEY-----" :
 					"-----END PRIVATE KEY-----";
 
-				// Also support RSA PRIVATE KEY format
+				// Fallback to PKCS#1 RSA PRIVATE KEY helper if PKCS#8 markers not found
 				if (pem.find(beginMarker) == std::string_view::npos) {
 					if (pem.find("-----BEGIN RSA PRIVATE KEY-----") != std::string_view::npos) {
-						// Fallback to RSA format
-						return ImportPEM_RSAFormat(pem, out, password, err);
+						// Import PKCS#1 (unencrypted) via helper
+						if (!ImportPEM_RSAFormat(pem, out, /*password ignored*/ std::string_view{}, err)) return false;
+						// Minimal ASN.1 sanity check
+						if (!ValidatePKCS1RSAPrivateKey(out.keyBlob)) {
+							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid PKCS#1 RSA private key"; }
+							// Zero sensitive data before returning
+							SecureZeroMemory(out.keyBlob.data(), out.keyBlob.size());
+							out.keyBlob.clear();
+							return false;
+						}
+						return true;
 					}
 				}
 
+				// Locate PEM block
 				size_t beginPos = pem.find(beginMarker);
 				if (beginPos == std::string_view::npos) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM begin marker not found"; }
 					return false;
 				}
-
 				size_t endPos = pem.find(endMarker, beginPos);
 				if (endPos == std::string_view::npos) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM end marker not found"; }
@@ -2631,7 +2882,7 @@ namespace ShadowStrike {
 				beginPos += beginMarker.size();
 				std::string_view base64Content = pem.substr(beginPos, endPos - beginPos);
 
-				// Clean base64
+				// Clean base64 (strip whitespace/newlines)
 				std::string cleanBase64;
 				cleanBase64.reserve(base64Content.size());
 				for (char c : base64Content) {
@@ -2639,7 +2890,6 @@ namespace ShadowStrike {
 						cleanBase64.push_back(c);
 					}
 				}
-
 				if (cleanBase64.empty()) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PEM content is empty"; }
 					return false;
@@ -2651,80 +2901,117 @@ namespace ShadowStrike {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 decoding failed"; }
 					return false;
 				}
-
 				if (decoded.empty()) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Decoded data is empty"; }
 					return false;
 				}
 
-				// If encrypted, decrypt
 				if (isEncrypted) {
 					if (password.empty()) {
 						if (err) { err->win32 = ERROR_INVALID_PASSWORD; err->message = L"Password required for encrypted key"; }
+						// Zero decoded buffer (contains sensitive header and ciphertext)
+						SecureZeroMemory(decoded.data(), decoded.size());
 						return false;
 					}
 
-					// ✅ FIXED: Parse new format with version and iteration count
-					// Format: [VERSION(4)] + [ITERATIONS(4)] + [SALT(32)] + [IV(16)] + [ENCRYPTED_DATA]
-					if (decoded.size() < 4 + 4 + 32 + 16) {
+					// Custom encrypted PKCS#8 header:
+					// [VERSION(4)] + [ITERATIONS(4)] + [SALT(32)] + [IV(16)] + [ENCRYPTED_DATA]
+					if (decoded.size() < (4 + 4 + 32 + 16)) {
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Encrypted data too short"; }
+						SecureZeroMemory(decoded.data(), decoded.size());
 						return false;
 					}
 
 					size_t offset = 0;
-					uint32_t version = 0;
-					std::memcpy(&version, decoded.data() + offset, sizeof(version));
-					offset += sizeof(version);
+					const uint32_t version = ReadLE32(decoded.data() + offset); offset += 4;
+					uint32_t iterations = ReadLE32(decoded.data() + offset); offset += 4;
 
-					uint32_t iterations = 100000; // Default for old format
-					if (version == 1) {
-						// New format with iteration count
-						std::memcpy(&iterations, decoded.data() + offset, sizeof(iterations));
-						offset += sizeof(iterations);
+					// Harden default if version mismatches (old blobs without iteration field should not reach here)
+					if (version != 1) {
+						// Fallback: enforce strong default
+						iterations = 600000;
 					}
 
-					// ✅ FIXED: Support both 16-byte (old) and 32-byte (new) salts
-					size_t saltSize = (version == 1) ? 32 : 16;
-					if (decoded.size() < offset + saltSize + 16) {
+					// Salt (fixed 32 bytes in v1 format)
+					if (decoded.size() < offset + 32 + 16) {
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Encrypted data format mismatch"; }
+						SecureZeroMemory(decoded.data(), decoded.size());
 						return false;
 					}
+					std::vector<uint8_t> salt(decoded.begin() + offset, decoded.begin() + offset + 32);
+					offset += 32;
 
-					std::vector<uint8_t> salt(decoded.begin() + offset, decoded.begin() + offset + saltSize);
-					offset += saltSize;
-
+					// IV (16 bytes for AES-CBC)
 					std::vector<uint8_t> iv(decoded.begin() + offset, decoded.begin() + offset + 16);
 					offset += 16;
 
 					const uint8_t* encryptedData = decoded.data() + offset;
-					size_t encryptedSize = decoded.size() - offset;
+					const size_t encryptedSize = decoded.size() - offset;
 
-					// Derive key
+					// Derive key (PBKDF2-SHA256) with hardened iteration count
+					if (iterations < 1000) iterations = 600000; // enforce minimum (OWASP 2023)
 					KDFParams kdfParams{};
 					kdfParams.algorithm = KDFAlgorithm::PBKDF2_SHA256;
-					kdfParams.iterations = iterations; // ✅ FIXED: Use stored iteration count
+					kdfParams.iterations = iterations;
 					kdfParams.keyLength = 32;
 					kdfParams.salt = salt;
 
 					std::vector<uint8_t> key;
-					if (!KeyDerivation::DeriveKey(password, kdfParams, key, err)) return false;
+					if (!KeyDerivation::DeriveKey(password, kdfParams, key, err)) {
+						SecureZeroMemory(salt.data(), salt.size());
+						SecureZeroMemory(iv.data(), iv.size());
+						SecureZeroMemory(decoded.data(), decoded.size());
+						return false;
+					}
 
-					// Decrypt
+					// Decrypt AES-256-CBC
 					SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
-					if (!cipher.SetKey(key, err)) return false;
-					if (!cipher.SetIV(iv, err)) return false;
+					if (!cipher.SetKey(key, err)) {
+						SecureZeroMemory(key.data(), key.size());
+						SecureZeroMemory(salt.data(), salt.size());
+						SecureZeroMemory(iv.data(), iv.size());
+						SecureZeroMemory(decoded.data(), decoded.size());
+						return false;
+					}
+					if (!cipher.SetIV(iv, err)) {
+						SecureZeroMemory(key.data(), key.size());
+						SecureZeroMemory(salt.data(), salt.size());
+						SecureZeroMemory(iv.data(), iv.size());
+						SecureZeroMemory(decoded.data(), decoded.size());
+						return false;
+					}
 
 					std::vector<uint8_t> decrypted;
-					if (!cipher.Decrypt(encryptedData, encryptedSize, decrypted, err)) return false;
+					const bool decOk = cipher.Decrypt(encryptedData, encryptedSize, decrypted, err);
 
-					// ✅ FIXED: Assign decrypted key blob
+					// Zero sensitive buffers regardless of success
+					SecureZeroMemory(key.data(), key.size());
+					SecureZeroMemory(salt.data(), salt.size());
+					SecureZeroMemory(iv.data(), iv.size());
+					SecureZeroMemory(decoded.data(), decoded.size());
+
+					if (!decOk) return false;
+
+					// ASN.1 minimal validation (reject obvious garbage)
+					if (!ValidatePKCS1RSAPrivateKey(decrypted) && !ValidatePKCS8PrivateKeyInfo(decrypted)) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Decrypted data is not a valid private key"; }
+						SecureZeroMemory(decrypted.data(), decrypted.size());
+						return false;
+					}
+
 					out.keyBlob = std::move(decrypted);
+					return true;
 				}
 				else {
+					// Unencrypted PKCS#8: minimal ASN.1 sanity
+					if (!ValidatePKCS8PrivateKeyInfo(decoded)) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid PKCS#8 PrivateKeyInfo"; }
+						SecureZeroMemory(decoded.data(), decoded.size());
+						return false;
+					}
 					out.keyBlob = std::move(decoded);
+					return true;
 				}
-
-				return true;
 			}
 
 			// =============================================================================
