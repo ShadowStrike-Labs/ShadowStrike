@@ -5317,7 +5317,8 @@ bool ThreatIntelDB::PerformHttpRequest(
         bool ThreatIntelDB::RestoreDatabase(std::wstring_view backupPath, DatabaseError* err) {
             SS_LOG_INFO(L"ThreatIntelDB", L"Restoring database from: %ls", backupPath.data());
 
-            if (!Utils::FileUtils::Exists(backupPath)) {
+			Utils::FileUtils::Error fileErr;
+            if (!Utils::FileUtils::Exists(backupPath,&fileErr)) {
                 if (err) {
                     err->sqliteCode = SQLITE_IOERR;
                     err->message = L"Backup file not found";

@@ -209,30 +209,35 @@ TEST_F(FileUtilsTest, NormalizePath_InvalidCharacters) {
 // EXISTS & STAT TESTS
 // ============================================================================
 
-TEST_F(FileUtilsTest, Exists_File) {
+TEST_F(FileUtilsTest, Exists_File) { 
     auto file = WriteText(L"exists_file.txt", "content");
-    EXPECT_TRUE(Exists(file));
-}
+    Error err{};
+    EXPECT_TRUE(Exists(file, &err)); }
 
-TEST_F(FileUtilsTest, Exists_Directory) {
-    EXPECT_TRUE(Exists(testRoot));
+TEST_F(FileUtilsTest, Exists_Directory) { 
+    Error err{}; 
+    EXPECT_TRUE(Exists(testRoot, &err)); 
 }
 
 TEST_F(FileUtilsTest, Exists_NonExistent) {
-    EXPECT_FALSE(Exists(Path(L"nonexistent.txt")));
+	Error err{};
+    EXPECT_FALSE(Exists(Path(L"nonexistent.txt"),&err));
 }
 
 TEST_F(FileUtilsTest, IsDirectory_File) {
+	Error err{};
     auto file = WriteText(L"isdir_file.txt", "data");
-    EXPECT_FALSE(IsDirectory(file));
+    EXPECT_FALSE(IsDirectory(file,&err));
 }
 
 TEST_F(FileUtilsTest, IsDirectory_Directory) {
-    EXPECT_TRUE(IsDirectory(testRoot));
+	Error err{};
+    EXPECT_TRUE(IsDirectory(testRoot,&err));
 }
 
 TEST_F(FileUtilsTest, IsDirectory_NonExistent) {
-    EXPECT_FALSE(IsDirectory(Path(L"nonexistent_dir")));
+	Error err{};
+    EXPECT_FALSE(IsDirectory(Path(L"nonexistent_dir"),&err));
 }
 
 TEST_F(FileUtilsTest, Stat_File) {
@@ -388,7 +393,7 @@ TEST_F(FileUtilsTest, WriteAllBytesAtomic_NewFile) {
     
     Error err{};
     ASSERT_TRUE(WriteAllBytesAtomic(path, data, &err));
-    EXPECT_TRUE(Exists(path));
+    EXPECT_TRUE(Exists(path,&err));
     EXPECT_TRUE(VerifyContent(path, data));
 }
 
@@ -408,7 +413,7 @@ TEST_F(FileUtilsTest, WriteAllBytesAtomic_EmptyData) {
     
     Error err{};
     ASSERT_TRUE(WriteAllBytesAtomic(path, empty, &err));
-    EXPECT_TRUE(Exists(path));
+    EXPECT_TRUE(Exists(path,&err));
     
     FileStat stat{};
     ASSERT_TRUE(Stat(path, stat, &err));
@@ -486,8 +491,8 @@ TEST_F(FileUtilsTest, ReplaceFileAtomic_Basic) {
     Error err{};
     ASSERT_TRUE(ReplaceFileAtomic(srcFile, dstFile, &err));
     
-    EXPECT_FALSE(Exists(srcFile));
-    EXPECT_TRUE(Exists(dstFile));
+    EXPECT_FALSE(Exists(srcFile,&err));
+    EXPECT_TRUE(Exists(dstFile,&err));
     EXPECT_TRUE(VerifyContent(dstFile, srcData));
 }
 
@@ -500,8 +505,8 @@ TEST_F(FileUtilsTest, ReplaceFileAtomic_CreateNew) {
     Error err{};
     ASSERT_TRUE(ReplaceFileAtomic(srcFile, dstFile, &err));
     
-    EXPECT_FALSE(Exists(srcFile));
-    EXPECT_TRUE(Exists(dstFile));
+    EXPECT_FALSE(Exists(srcFile,&err));
+    EXPECT_TRUE(Exists(dstFile,&err));
     EXPECT_TRUE(VerifyContent(dstFile, srcData));
 }
 
@@ -522,14 +527,14 @@ TEST_F(FileUtilsTest, CreateDirectories_SingleLevel) {
     std::wstring dirPath = Path(L"single_level");
     Error err{};
     ASSERT_TRUE(CreateDirectories(dirPath, &err));
-    EXPECT_TRUE(IsDirectory(dirPath));
+    EXPECT_TRUE(IsDirectory(dirPath,&err));
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_MultipleLevels) {
     std::wstring dirPath = Path(L"level1\\level2\\level3");
     Error err{};
     ASSERT_TRUE(CreateDirectories(dirPath, &err));
-    EXPECT_TRUE(IsDirectory(dirPath));
+    EXPECT_TRUE(IsDirectory(dirPath,&err));
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_AlreadyExists) {
@@ -568,7 +573,7 @@ TEST_F(FileUtilsTest, RemoveFile_Existing) {
     
     Error err{};
     ASSERT_TRUE(RemoveFile(file, &err));
-    EXPECT_FALSE(Exists(file));
+    EXPECT_FALSE(Exists(file,&err));
 }
 
 TEST_F(FileUtilsTest, RemoveFile_NonExistent) {
@@ -595,7 +600,7 @@ TEST_F(FileUtilsTest, RemoveDirectoryRecursive_Empty) {
     CreateDirectories(emptyDir, &err);
     
     ASSERT_TRUE(RemoveDirectoryRecursive(emptyDir, &err));
-    EXPECT_FALSE(Exists(emptyDir));
+    EXPECT_FALSE(Exists(emptyDir,&err));
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_WithFiles) {
@@ -607,7 +612,7 @@ TEST_F(FileUtilsTest, RemoveDirectoryRecursive_WithFiles) {
     WriteText(L"dir_with_files\\file2.txt", "content2");
     
     ASSERT_TRUE(RemoveDirectoryRecursive(dirPath, &err));
-    EXPECT_FALSE(Exists(dirPath));
+    EXPECT_FALSE(Exists(dirPath,&err));
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_Nested) {
@@ -621,7 +626,7 @@ TEST_F(FileUtilsTest, RemoveDirectoryRecursive_Nested) {
     WriteText(L"nested\\a\\b\\c\\file4.txt", "4");
     
     ASSERT_TRUE(RemoveDirectoryRecursive(basePath, &err));
-    EXPECT_FALSE(Exists(basePath));
+    EXPECT_FALSE(Exists(basePath,&err));
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_NonExistent) {
@@ -975,7 +980,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_SinglePass) {
     
     Error err{};
     ASSERT_TRUE(SecureEraseFile(testFile, SecureEraseMode::SinglePassZero, &err));
-    EXPECT_FALSE(Exists(testFile));
+    EXPECT_FALSE(Exists(testFile,&err));
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_TriplePass) {
@@ -984,7 +989,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_TriplePass) {
     
     Error err{};
     ASSERT_TRUE(SecureEraseFile(testFile, SecureEraseMode::TriplePass, &err));
-    EXPECT_FALSE(Exists(testFile));
+    EXPECT_FALSE(Exists(testFile,&err));
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_SmallFile) {
@@ -992,7 +997,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_SmallFile) {
     
     Error err{};
     ASSERT_TRUE(SecureEraseFile(testFile, SecureEraseMode::SinglePassZero, &err));
-    EXPECT_FALSE(Exists(testFile));
+    EXPECT_FALSE(Exists(testFile,&err));
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_Directory) {
@@ -1091,7 +1096,7 @@ TEST_F(FileUtilsTest, EdgeCase_SpecialCharacters) {
     
     Error err{};
     ASSERT_TRUE(WriteAllTextUtf8Atomic(path, "special chars", &err));
-    EXPECT_TRUE(Exists(path));
+    EXPECT_TRUE(Exists(path,&err));
 }
 
 TEST_F(FileUtilsTest, Security_PathTraversal) {

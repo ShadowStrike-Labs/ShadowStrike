@@ -87,8 +87,8 @@ namespace ShadowStrike {
 			std::wstring NormalizePath(std::wstring_view path, bool resolveFinal = false, Error* err = nullptr);
 
 			//Exists check
-			bool Exists(std::wstring_view path);
-			bool IsDirectory(std::wstring_view path);
+			bool Exists(std::wstring_view path,Error* err);
+			bool IsDirectory(std::wstring_view path,Error* err);
 			bool Stat(std::wstring_view path, FileStat& out, Error* err = nullptr);
 
 

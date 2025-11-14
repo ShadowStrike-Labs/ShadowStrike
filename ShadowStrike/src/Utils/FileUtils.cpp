@@ -53,6 +53,21 @@ namespace ShadowStrike {
                     if (err) err->win32 = ERROR_INVALID_PARAMETER;
                     return std::wstring();
                 }
+
+               
+                const wchar_t invalidChars[] = L"<>|?*\""; // Windows forbidden filename chars
+                if (input.find_first_of(invalidChars) != std::wstring::npos) {
+                    if (err) err->win32 = ERROR_INVALID_NAME;
+                    return std::wstring();
+                }
+
+                size_t colonPos = input.find(L':');
+                if (colonPos != std::wstring::npos && colonPos != 1) {
+                    // Colon found but not at position 1 (C:)
+                    if (err) err->win32 = ERROR_INVALID_NAME;
+                    return std::wstring();
+                }
+
                 // Full path
                 DWORD need = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
                 if (need == 0) {
@@ -101,20 +116,24 @@ namespace ShadowStrike {
             }
 
 
-            bool Exists(std::wstring_view path) {
+            bool Exists(std::wstring_view path,Error* err) {
                 WIN32_FILE_ATTRIBUTE_DATA fad{};
 
 				std::wstring longp = AddLongPathPrefix(path);
                 if(!GetFileAttributesExW(longp.c_str(), GetFileExInfoStandard, &fad)) {
+					if (err) err->win32 = GetLastError();
                     return false;
                 }
 				return true;
             }
 
-            bool IsDirectory(std::wstring_view path) {
+            bool IsDirectory(std::wstring_view path,Error* err) {
                 WIN32_FILE_ATTRIBUTE_DATA fad{};
                 std::wstring longp = AddLongPathPrefix(path);
-                if (!GetFileAttributesExW(longp.c_str(), GetFileExInfoStandard, &fad)) return false;
+                if (!GetFileAttributesExW(longp.c_str(), GetFileExInfoStandard, &fad)) {
+					if (err) err->win32 = GetLastError();
+                    return false;
+                }
                 return (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             }
 
@@ -149,6 +168,7 @@ namespace ShadowStrike {
                 }
                 return true;
             }
+
             std::optional<uint64_t> FileSize(std::wstring_view path, Error* err) {
                 FileStat st{};
                 if (!Stat(path, st, err) || !st.exists || st.isDirectory) return std::nullopt;
@@ -158,7 +178,7 @@ namespace ShadowStrike {
             static bool ReadAllBytesImpl(HANDLE h, std::vector<std::byte>& out, uint64_t fileSize, Error* err) {
                 out.clear();
 
-                constexpr uint64_t MAX_FILE_SIZE = 2ULL * 1024 * 1024 * 1024; //2 GB
+                constexpr uint64_t MAX_FILE_SIZE = 64ULL * 1024 * 1024 * 1024; // 256 GB
                 if (fileSize > SIZE_MAX || fileSize > MAX_FILE_SIZE ) { if (err) err->win32 = ERROR_FILE_TOO_LARGE; return false; }
                 try {
                     out.resize(static_cast<size_t>(fileSize));
@@ -324,21 +344,27 @@ namespace ShadowStrike {
 
                 std::wstring d = ToW(dir);
 
-                // ✅ FIXED: Path traversal attack prevention
+                // Path traversal attack prevention
                 if (d.find(L"..") != std::wstring::npos) {
 					if (err) err->win32 = ERROR_INVALID_PARAMETER;
 					SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Path contains .. : %s", d.c_str());
                     return false;
                 }
 
-                // ✅ FIXED: More comprehensive invalid char check
+                // More comprehensive invalid char check
                 const wchar_t invalidChars[] = L"<>\"|?*";
+
+                
                 size_t colonPos = d.find(L':');
-                // Allow colon only at position 1 for drive letter (C:)
-                if (colonPos != std::wstring::npos && colonPos != 1) {
-                    if (err) err->win32 = ERROR_INVALID_NAME;
-                    SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Invalid colon position in path");
-                    return false;
+                while (colonPos != std::wstring::npos) {
+                    
+                    if (colonPos != 1) {
+                        if (err) err->win32 = ERROR_INVALID_NAME;
+                        SS_LOG_ERROR(L"FileUtils", L"CreateDirectories: Invalid colon position in path");
+                        return false;
+                    }
+                   
+                    colonPos = d.find(L':', colonPos + 1);
                 }
                 
                 if (d.find_first_of(invalidChars) != std::wstring::npos) {
@@ -347,7 +373,7 @@ namespace ShadowStrike {
                 }
 
                 std::wstring cur;
-                // ✅ FIXED: Reserve enough space for long path prefix
+                // Reserve enough space for long path prefix
                 cur.reserve(d.size() + LONG_PATH_PREFIX.size() + 8);
 
                 for (size_t i = 0; i < d.size(); ++i) {
@@ -417,7 +443,7 @@ namespace ShadowStrike {
                 if (root.empty()) { if (err) err->win32 = ERROR_INVALID_PARAMETER; return false; }
 
                 std::wstring base = ToW(root);
-                if (!IsDirectory(base)) { if (err) err->win32 = ERROR_DIRECTORY; return false; }
+                if (!IsDirectory(base,err)) { if (err) err->win32 = ERROR_DIRECTORY; return false; }
 
                 
                 std::unordered_set<FileId, FileIdHasher> visited;
@@ -425,18 +451,18 @@ namespace ShadowStrike {
                 stack.emplace_back(base, 0);
 
                 while (!stack.empty()) {
-                    if (IsCancel(opts)) { if (err) err->win32 = ERROR_CANCELLED; return false; }
+					if (IsCancel(opts)) { if (err) err->win32 = ERROR_CANCELLED; return true; }//Cancellation is a success finish
                     auto [cur, depth] = stack.back();
                     stack.pop_back();
 
-                    // ✅ FIXED: Check depth BEFORE processing
+                    //Check depth BEFORE processing
                     if (depth > MAX_SYMLINK_DEPTH) {
                         if (err) err->win32 = ERROR_CANT_RESOLVE_FILENAME;
                         SS_LOG_ERROR(L"FileUtils", L"WalkDirectory: Maximum symlink depth exceeded: %s", cur.c_str());
                         return false;
                     }
 
-                    // ✅ FIXED: Check for symlink loops
+                    // Check for symlink loops
                     {
                         std::wstring longp = AddLongPathPrefix(cur);
                         HANDLE dh = CreateFileW(longp.c_str(), FILE_READ_ATTRIBUTES,
@@ -478,7 +504,7 @@ namespace ShadowStrike {
                     }
 
                     do {
-                        if (IsCancel(opts)) { FindClose(hFind); if (err) err->win32 = ERROR_CANCELLED; return false; }
+						if (IsCancel(opts)) { FindClose(hFind); if (err) err->win32 = ERROR_CANCELLED; return true; }//Cancellation is a success finish
                         const std::wstring_view name = fd.cFileName;
                         if (name == L"." || name == L"..") continue;
                         if (ShouldSkip(fd, opts)) continue;
@@ -513,77 +539,88 @@ namespace ShadowStrike {
                 return true;
             }
 
-
-            bool ListAlternateStreams(std::wstring_view path, std::vector<AlternateStreamInfo>& out, Error* err) {
+            bool ListAlternateStreams(std::wstring_view path,
+                std::vector<AlternateStreamInfo>& out,
+                Error* err) {
                 out.clear();
+
+                if (path.empty()) {
+                    if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = "Path cannot be empty"; }
+                    return false;
+                }
+
+                // Use FindFirstStreamW API (Windows Vista+) - reliable and simple
                 std::wstring longp = AddLongPathPrefix(path);
-                HANDLE h = CreateFileW(longp.c_str(), GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr, OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-                if (h == INVALID_HANDLE_VALUE) {
-                    DWORD lastError = GetLastError();
-                    if (err) err->win32 = lastError;
-                    // Don't log for non-existent files
-                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
-                        SS_LOG_LAST_ERROR(L"FileUtils", L"ListAlternateStreams: CreateFileW failed: %s", longp.c_str());
+
+                WIN32_FIND_STREAM_DATA findStreamData{};
+                HANDLE hFind = FindFirstStreamW(longp.c_str(), FindStreamInfoStandard, &findStreamData, 0);
+
+                if (hFind == INVALID_HANDLE_VALUE) {
+                    DWORD le = GetLastError();
+                    if (err) err->win32 = le;
+                    if (le != ERROR_FILE_NOT_FOUND && le != ERROR_PATH_NOT_FOUND && le != ERROR_HANDLE_EOF) {
+                        SS_LOG_LAST_ERROR(L"FileUtils", L"ListAlternateStreams: FindFirstStreamW failed: %s", longp.c_str());
                     }
                     return false;
                 }
 
-                BYTE buffer[64 * 1024];
-                DWORD bytesRead = 0;
-                PVOID ctx = nullptr;
-                bool success = true;
+                // Process streams
+                do {
+                    std::wstring streamName = findStreamData.cStreamName;
 
-                while (true) {
-                    BOOL ok = BackupRead(h, buffer, sizeof(buffer), &bytesRead, FALSE, FALSE, &ctx);
-                    if (!ok) {
-                        if (err) err->win32 = GetLastError();
-                        success = false;
-                        break;
+                    // Filter out main stream (unnamed or "::$DATA")
+                    bool isMainStream = false;
+                    if (streamName.empty() || streamName == L"::$DATA") {
+                        isMainStream = true;
                     }
-                    if (bytesRead == 0) break; // EOF
+                    else {
+                        // Main stream variants: ":filename:$DATA" or ":filename::$DATA"
+                        size_t colonCount = std::count(streamName.begin(), streamName.end(), L':');
+                        if (colonCount <= 1) {
+                            // Single colon or no alternate name = main stream
+                            isMainStream = true;
+                        }
+                    }
 
-                    BYTE* p = buffer;
-                    while (bytesRead >= sizeof(WIN32_STREAM_ID)) {
-                        auto* sid = reinterpret_cast<WIN32_STREAM_ID*>(p);
-                        size_t headerSize = sizeof(WIN32_STREAM_ID);
-                        size_t nameBytes = sid->dwStreamNameSize;
-                        size_t blockSize = headerSize + nameBytes + static_cast<size_t>(sid->Size.QuadPart);
-                        
-                        if (blockSize > bytesRead || nameBytes > bytesRead || headerSize > bytesRead) {
-                            BackupSeek(h, sid->Size.LowPart, sid->Size.HighPart, nullptr, nullptr, &ctx);
-                            break;
+                    if (!isMainStream) {
+                        // Clean stream name: remove leading ':' and trailing ':$DATA'
+                        if (!streamName.empty() && streamName[0] == L':') {
+                            streamName = streamName.substr(1);
                         }
 
-                        if (sid->dwStreamId == BACKUP_ALTERNATE_DATA) {
-                            std::wstring sname;
-                            if (nameBytes > 0 && nameBytes < 32768) {
-                                sname.assign(reinterpret_cast<wchar_t*>(p + headerSize), nameBytes / sizeof(wchar_t));
+                        size_t dataPos = streamName.find(L":$DATA");
+                        if (dataPos != std::wstring::npos) {
+                            streamName = streamName.substr(0, dataPos);
+                        }
+
+                        // Security: reject embedded nulls
+                        if (streamName.find(L'\0') != std::wstring::npos) {
+                            if (err && err->win32 == 0) {
+                                err->win32 = ERROR_INVALID_DATA;
+                                err->message = "Stream name contains embedded NUL";
                             }
-                            AlternateStreamInfo si{};
-                            si.name = sname;
-                            si.size = static_cast<uint64_t>(sid->Size.QuadPart);
-                            out.emplace_back(std::move(si));
+                            FindClose(hFind);
+                            return false;
                         }
 
-                        if (sid->Size.QuadPart > 0) {
-                            BackupSeek(h, sid->Size.LowPart, sid->Size.HighPart, nullptr, nullptr, &ctx);
-                        }
-
-                        size_t advance = headerSize + nameBytes;
-                        if (advance > bytesRead) break;
-                        p += advance;
-                        bytesRead -= static_cast<DWORD>(advance);
+                        // Add to output
+                        AlternateStreamInfo info{};
+                        info.name = L":" + streamName; // Keep ':' prefix for consistency
+                        info.size = static_cast<uint64_t>(findStreamData.StreamSize.QuadPart);
+                        out.emplace_back(std::move(info));
                     }
+                } while (FindNextStreamW(hFind, &findStreamData));
+
+                DWORD lastErr = GetLastError();
+                FindClose(hFind);
+
+                // ERROR_HANDLE_EOF is normal end condition
+                if (lastErr != ERROR_HANDLE_EOF && lastErr != ERROR_SUCCESS) {
+                    if (err) err->win32 = lastErr;
+                    return false;
                 }
 
-                // ALWAYS cleanup BackupRead context before closing handle
-                BackupRead(h, nullptr, 0, &bytesRead, TRUE, FALSE, &ctx);
-                CloseHandle(h);
-                
-                return success;
+                return true;
             }
 
 
@@ -658,7 +695,7 @@ namespace ShadowStrike {
 
             bool SecureEraseFile(std::wstring_view path, SecureEraseMode mode, Error* err) {
                 // Only files, not directories
-                if (IsDirectory(path)) { 
+                if (IsDirectory(path,err)) { 
                     if (err) err->win32 = ERROR_ACCESS_DENIED; 
                     return false; 
                 }
@@ -847,7 +884,7 @@ namespace ShadowStrike {
             }
 
             bool RemoveDirectoryRecursive(std::wstring_view dir, Error* err) {
-                if (!IsDirectory(dir)) return true;
+                if (!IsDirectory(dir,err)) return true;
                 return RemoveDirectoryRecursiveImpl(ToW(dir), err);
             }
 
