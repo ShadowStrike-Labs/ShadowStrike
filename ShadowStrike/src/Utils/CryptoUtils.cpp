@@ -28,14 +28,18 @@
 #  define _WIN32_WINNT 0x0A00
 #endif
 
+
 #  include <Windows.h>
+
+
 #  include <wincrypt.h>  
-#  include <wintrust.h>
-#  include <softpub.h>
-#  include <bcrypt.h>
-#  include <ncrypt.h>
-#  include <mscat.h>
-#  include <ntstatus.h>
+#  include <wintrust.h>  
+#  include <softpub.h>    
+#  include <bcrypt.h>  
+#  include <ncrypt.h>    
+#  include <mscat.h>    
+#  include <ntstatus.h>   
+
 
 #  pragma comment(lib, "crypt32.lib")
 #  pragma comment(lib, "wintrust.lib")
@@ -63,6 +67,7 @@ namespace ShadowStrike {
 				case SymmetricAlgorithm::AES_192_CFB:
 				case SymmetricAlgorithm::AES_256_CFB: return BCRYPT_AES_ALGORITHM;
 				case SymmetricAlgorithm::ChaCha20_Poly1305: return L"ChaCha20-Poly1305";
+			 
 				default: return nullptr;
 				}
 			}
@@ -104,6 +109,14 @@ namespace ShadowStrike {
 				case SymmetricAlgorithm::AES_192_GCM:
 				case SymmetricAlgorithm::AES_256_GCM: return 12;
 				case SymmetricAlgorithm::ChaCha20_Poly1305: return 12;
+				case SymmetricAlgorithm::AES_128_CBC:
+				case SymmetricAlgorithm::AES_192_CBC:
+				case SymmetricAlgorithm::AES_256_CBC:
+				case SymmetricAlgorithm::AES_128_CFB:
+				case SymmetricAlgorithm::AES_192_CFB:
+				case SymmetricAlgorithm::AES_256_CFB: return 16;
+
+					//Unknown Algorithm
 				default: return 0;
 				}
 			}
@@ -483,6 +496,39 @@ namespace ShadowStrike {
 
 				m_algHandle = h;
 
+
+
+				const wchar_t* chainMode = ChainingMode(m_algorithm);
+				if (chainMode) {
+					st = BCryptSetProperty(
+						m_algHandle,
+						BCRYPT_CHAINING_MODE,
+						(PBYTE)chainMode,
+						(ULONG)((wcslen(chainMode) + 1) * sizeof(wchar_t)),
+						0
+					);
+
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"BCryptSetProperty for chaining mode failed";
+							wchar_t tmp[256];
+							swprintf_s(tmp, L"Mode=%s NTSTATUS=0x%08X", chainMode, static_cast<unsigned>(st));
+							err->context = tmp;
+						}
+
+						if (Logger::Instance().IsInitialized()) {
+							SS_LOG_ERROR(L"CryptoUtils", L"BCryptSetProperty failed for mode %s: 0x%08X", chainMode, st);
+						}
+
+						
+						BCryptCloseAlgorithmProvider(m_algHandle, 0);
+						m_algHandle = nullptr;
+						return false;
+					}
+				}
+
 				// Prevents abort() if Logger is not initialized
 				if (Logger::Instance().IsInitialized()) {
 					SS_LOG_INFO(L"CryptoUtils", L"Algorithm provider opened: %s (handle: %p)", algName, m_algHandle);
@@ -560,7 +606,7 @@ namespace ShadowStrike {
 				if (!rng.Generate(outKey, keySize, err)) return false;
 				return SetKey(outKey, err);
 			}
-
+			
 			bool SymmetricCipher::SetIV(const uint8_t* iv, size_t ivLen, Error* err) noexcept {
 				const size_t expectedSize = GetIVSize();
 				if (expectedSize == 0) {
@@ -584,12 +630,9 @@ namespace ShadowStrike {
 
 			bool SymmetricCipher::GenerateIV(std::vector<uint8_t>& outIV, Error* err) noexcept {
 				const size_t ivSize = GetIVSize();
-				if (ivSize == 0) {
-					outIV.clear();
-					m_ivSet = true;
-					return true;
-				}
+				if (ivSize == 0) { outIV.clear(); m_ivSet = true; return true; }
 
+				outIV.resize(ivSize);
 				SecureRandom rng;
 				if (!rng.Generate(outIV, ivSize, err)) return false;
 				return SetIV(outIV, err);
@@ -649,6 +692,7 @@ namespace ShadowStrike {
 				const bool needsPadding = isCBC;
 				const size_t blockSize = GetBlockSize();
 
+
 				// ═══════════════════════════════════════════════════════════════════
 				//  PADDING STRATEGY (Manual PKCS7 - Industry Standard)
 				// ═══════════════════════════════════════════════════════════════════
@@ -665,7 +709,7 @@ namespace ShadowStrike {
 				size_t effectiveLen = plaintextLen;
 
 				if (needsPadding && m_paddingMode == PaddingMode::PKCS7) {
-					//  CRITICAL: Apply PKCS7 padding MANUALLY
+					// Apply PKCS7 padding MANUALLY
 					plaintextWithPadding.assign(plaintext, plaintext + plaintextLen);
 
 					if (!applyPadding(plaintextWithPadding, blockSize)) {
@@ -917,9 +961,10 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
+				std::vector<uint8_t> ivLocal = m_iv;
 				BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
 				BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
-				authInfo.pbNonce = m_iv.data();
+				authInfo.pbNonce = ivLocal.data();
 				authInfo.cbNonce = static_cast<ULONG>(m_iv.size());
 				authInfo.pbAuthData = const_cast<uint8_t*>(aad);
 				authInfo.cbAuthData = static_cast<ULONG>(aadLen);
@@ -1005,9 +1050,11 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
+				std::vector<uint8_t> ivLocal = m_iv;
+
 				BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
 				BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
-				authInfo.pbNonce = m_iv.data();
+				authInfo.pbNonce = ivLocal.data();
 				authInfo.cbNonce = static_cast<ULONG>(m_iv.size());
 				authInfo.pbAuthData = const_cast<uint8_t*>(aad);
 				authInfo.cbAuthData = static_cast<ULONG>(aadLen);
@@ -1951,145 +1998,216 @@ namespace ShadowStrike {
 #endif
 			}
 
-			bool AsymmetricCipher::Sign(const uint8_t* data, size_t dataLen,
-				std::vector<uint8_t>& signature,
-				HashUtils::Algorithm hashAlg,
-				RSAPaddingScheme padding,
-				Error* err) noexcept
-			{
-				if (!m_privateKeyLoaded) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Private key not loaded"; }
-					return false;
-				}
+				bool AsymmetricCipher::Sign(const uint8_t* data, size_t dataLen,
+					std::vector<uint8_t>& signature,
+					HashUtils::Algorithm hashAlg,
+					RSAPaddingScheme padding,
+					Error* err) noexcept
+				{
+					if (!m_privateKeyLoaded) {
+						if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Private key not loaded"; }
+						return false;
+					}
 
-				std::vector<uint8_t> hash;
-				if (!HashUtils::Compute(hashAlg, data, dataLen, hash, nullptr)) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Hash computation failed"; }
-					return false;
-				}
+					std::vector<uint8_t> hash;
+					if (!HashUtils::Compute(hashAlg, data, dataLen, hash, nullptr)) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Hash computation failed"; }
+						return false;
+					}
 
 #ifdef _WIN32
-				ULONG Flags = 0;
-				if (padding == RSAPaddingScheme::PKCS1) {
-				Flags = BCRYPT_PAD_PKCS1;
-				}
-				else if(padding == RSAPaddingScheme::PSS_SHA256 || padding == RSAPaddingScheme::PSS_SHA384 || padding == RSAPaddingScheme::PSS_SHA512)
-				{
-					Flags = BCRYPT_PAD_PSS;
-				}
-				else
-				{
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported padding scheme for signing"; }
-					return false;
-				}
-				
+					//Padding scheme selection
+					ULONG flags = 0;
+					void* pPaddingInfo = nullptr;
 
-				
-				BCRYPT_PKCS1_PADDING_INFO paddingInfo{};
-				switch (hashAlg) {
-					case HashUtils::Algorithm::SHA1:
-						paddingInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM; break;
-					case HashUtils::Algorithm::SHA256:
-						paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM; break;
-					case HashUtils::Algorithm::SHA384:
-						paddingInfo.pszAlgId = BCRYPT_SHA384_ALGORITHM; break;
-					case HashUtils::Algorithm::SHA512:
-						paddingInfo.pszAlgId = BCRYPT_SHA512_ALGORITHM; break;
-					default:
+					BCRYPT_PKCS1_PADDING_INFO pkcs1Info{};
+					BCRYPT_PSS_PADDING_INFO pssInfo{};
+
+					// Map hash algorithm to BCrypt algorithm name
+					auto getHashAlgName = [](HashUtils::Algorithm alg) -> LPCWSTR {
+						switch (alg) {
+						case HashUtils::Algorithm::SHA1:   return BCRYPT_SHA1_ALGORITHM;
+						case HashUtils::Algorithm::SHA256: return BCRYPT_SHA256_ALGORITHM;
+						case HashUtils::Algorithm::SHA384: return BCRYPT_SHA384_ALGORITHM;
+						case HashUtils::Algorithm::SHA512: return BCRYPT_SHA512_ALGORITHM;
+						default: return nullptr;
+						}
+						};
+
+					LPCWSTR hashAlgName = getHashAlgName(hashAlg);
+					if (!hashAlgName) {
 						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported hash algorithm for signing"; }
 						return false;
-				}
+					}
 
-				ULONG cbResult = 0;
-				NTSTATUS st = BCryptSignHash(m_privateKeyHandle,
-					&paddingInfo,
-					hash.data(), static_cast<ULONG>(hash.size()),
-					nullptr, 0, &cbResult, Flags);
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptSignHash size query failed"; }
-					return false;
-				}
+					// Use correct padding struct based on scheme
+					if (padding == RSAPaddingScheme::PKCS1) {
+						flags = BCRYPT_PAD_PKCS1;
+						pkcs1Info.pszAlgId = hashAlgName;
+						pPaddingInfo = &pkcs1Info;
+					}
+					else if (padding == RSAPaddingScheme::PSS_SHA256 ||
+						padding == RSAPaddingScheme::PSS_SHA384 ||
+						padding == RSAPaddingScheme::PSS_SHA512)
+					{
+						flags = BCRYPT_PAD_PSS;
+						pssInfo.pszAlgId = hashAlgName;
+						pssInfo.cbSalt = static_cast<ULONG>(hash.size()); // ✅ CRITICAL: Salt length = hash length (RFC 8017)
+						pPaddingInfo = &pssInfo;
+					}
+					else {
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported padding scheme for signing"; }
+						return false;
+					}
 
-				signature.resize(cbResult);
-				st = BCryptSignHash(m_privateKeyHandle,
-					&paddingInfo,
-					hash.data(), static_cast<ULONG>(hash.size()),
-					signature.data(), static_cast<ULONG>(signature.size()), &cbResult, Flags);
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptSignHash failed"; }
-					return false;
-				}
+					// Query signature size
+					ULONG cbResult = 0;
+					NTSTATUS st = BCryptSignHash(m_privateKeyHandle,
+						pPaddingInfo,
+						hash.data(), static_cast<ULONG>(hash.size()),
+						nullptr, 0, &cbResult, flags);
 
-				signature.resize(cbResult);
-				return true;
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"BCryptSignHash size query failed";
+							wchar_t tmp[128];
+							swprintf_s(tmp, L"NTSTATUS=0x%08X, Padding=%d", static_cast<unsigned>(st), static_cast<int>(padding));
+							err->context = tmp;
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptSignHash size query failed: 0x%08X (padding: %d)", st, static_cast<int>(padding));
+						return false;
+					}
+
+					signature.resize(cbResult);
+
+					// Perform signing
+					st = BCryptSignHash(m_privateKeyHandle,
+						pPaddingInfo,
+						hash.data(), static_cast<ULONG>(hash.size()),
+						signature.data(), static_cast<ULONG>(signature.size()), &cbResult, flags);
+
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"BCryptSignHash failed";
+							wchar_t tmp[256];
+							swprintf_s(tmp, L"NTSTATUS=0x%08X, HashLen=%zu, SigLen=%zu, Padding=%d",
+								static_cast<unsigned>(st), hash.size(), signature.size(), static_cast<int>(padding));
+							err->context = tmp;
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptSignHash failed: 0x%08X (hash: %zu bytes, padding: %d)",
+							st, hash.size(), static_cast<int>(padding));
+						return false;
+					}
+
+					signature.resize(cbResult);
+
+					SS_LOG_INFO(L"CryptoUtils", L"Signature generated successfully (%zu bytes, padding: %d)",
+						signature.size(), static_cast<int>(padding));
+					return true;
+
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
-				return false;
+					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+					return false;
 #endif
-			}
-
-			bool AsymmetricCipher::Verify(const uint8_t* data, size_t dataLen,
-				const uint8_t* signature, size_t signatureLen,
-				HashUtils::Algorithm hashAlg,
-				RSAPaddingScheme padding,
-				Error* err) noexcept
-			{
-				if (!m_publicKeyLoaded) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Public key not loaded"; }
-					return false;
 				}
 
-				std::vector<uint8_t> hash;
-				if (!HashUtils::Compute(hashAlg, data, dataLen, hash, nullptr)) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Hash computation failed"; }
-					return false;
-				}
+				bool AsymmetricCipher::Verify(const uint8_t* data, size_t dataLen,
+					const uint8_t* signature, size_t signatureLen,
+					HashUtils::Algorithm hashAlg,
+					RSAPaddingScheme padding,
+					Error* err) noexcept
+				{
+					if (!m_publicKeyLoaded) {
+						if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Public key not loaded"; }
+						return false;
+					}
+
+					std::vector<uint8_t> hash;
+					if (!HashUtils::Compute(hashAlg, data, dataLen, hash, nullptr)) {
+						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Hash computation failed"; }
+						return false;
+					}
 
 #ifdef _WIN32
-				BCRYPT_PKCS1_PADDING_INFO paddingInfo{};
-				switch (hashAlg) {
-										case HashUtils::Algorithm::SHA1:
-						paddingInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM; break;
-					case HashUtils::Algorithm::SHA256:
-						paddingInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM; break;
-					case HashUtils::Algorithm::SHA384:
-						paddingInfo.pszAlgId = BCRYPT_SHA384_ALGORITHM; break;
-					case HashUtils::Algorithm::SHA512:
-						paddingInfo.pszAlgId = BCRYPT_SHA512_ALGORITHM; break;
-					default:
+					// Padding scheme selection
+					ULONG flags = 0;
+					void* pPaddingInfo = nullptr;
+
+					BCRYPT_PKCS1_PADDING_INFO pkcs1Info{};
+					BCRYPT_PSS_PADDING_INFO pssInfo{};
+
+					// Map hash algorithm to BCrypt algorithm name
+					auto getHashAlgName = [](HashUtils::Algorithm alg) -> LPCWSTR {
+						switch (alg) {
+						case HashUtils::Algorithm::SHA1:   return BCRYPT_SHA1_ALGORITHM;
+						case HashUtils::Algorithm::SHA256: return BCRYPT_SHA256_ALGORITHM;
+						case HashUtils::Algorithm::SHA384: return BCRYPT_SHA384_ALGORITHM;
+						case HashUtils::Algorithm::SHA512: return BCRYPT_SHA512_ALGORITHM;
+						default: return nullptr;
+						}
+						};
+
+					LPCWSTR hashAlgName = getHashAlgName(hashAlg);
+					if (!hashAlgName) {
 						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported hash algorithm for verification"; }
 						return false;
-				}
+					}
 
-				ULONG Flags = 0;
-				if (padding == RSAPaddingScheme::PKCS1) {
-					Flags = BCRYPT_PAD_PKCS1;
-				}
-				else if(padding == RSAPaddingScheme::PSS_SHA256 || padding == RSAPaddingScheme::PSS_SHA384 || padding == RSAPaddingScheme::PSS_SHA512)
-				{
-					Flags = BCRYPT_PAD_PSS;
-				}
-				else
-				{
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported padding scheme for verification"; }
-					return false;
-				}
-				NTSTATUS st = BCryptVerifySignature(m_publicKeyHandle,
-					&paddingInfo,
-					hash.data(), static_cast<ULONG>(hash.size()),
-					const_cast<uint8_t*>(signature), static_cast<ULONG>(signatureLen),
-					Flags);
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptVerifySignature failed"; }
-					return false;
-				}
+					// Use correct padding struct based on scheme
+					if (padding == RSAPaddingScheme::PKCS1) {
+						flags = BCRYPT_PAD_PKCS1;
+						pkcs1Info.pszAlgId = hashAlgName;
+						pPaddingInfo = &pkcs1Info;
+					}
+					else if (padding == RSAPaddingScheme::PSS_SHA256 ||
+						padding == RSAPaddingScheme::PSS_SHA384 ||
+						padding == RSAPaddingScheme::PSS_SHA512)
+					{
+						flags = BCRYPT_PAD_PSS;
+						pssInfo.pszAlgId = hashAlgName;
+						pssInfo.cbSalt = static_cast<ULONG>(hash.size()); // Salt length = hash length
+						pPaddingInfo = &pssInfo;
+					}
+					else {
+						if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unsupported padding scheme for verification"; }
+						return false;
+					}
 
-				return true;
+					// Verify signature
+					NTSTATUS st = BCryptVerifySignature(m_publicKeyHandle,
+						pPaddingInfo,
+						hash.data(), static_cast<ULONG>(hash.size()),
+						const_cast<uint8_t*>(signature), static_cast<ULONG>(signatureLen),
+						flags);
+
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"BCryptVerifySignature failed";
+							wchar_t tmp[256];
+							swprintf_s(tmp, L"NTSTATUS=0x%08X, HashLen=%zu, SigLen=%zu, Padding=%d",
+								static_cast<unsigned>(st), hash.size(), signatureLen, static_cast<int>(padding));
+							err->context = tmp;
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptVerifySignature failed: 0x%08X (padding: %d)",
+							st, static_cast<int>(padding));
+						return false;
+					}
+
+					SS_LOG_INFO(L"CryptoUtils", L"Signature verified successfully (padding: %d)", static_cast<int>(padding));
+					return true;
+
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
-				return false;
+					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+					return false;
 #endif
-			}
+				}
+
 			bool AsymmetricCipher::DeriveSharedSecret(const PublicKey& peerPublicKey,
 				std::vector<uint8_t>& sharedSecret,
 				Error* err) noexcept
@@ -4814,7 +4932,7 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					// Note: Ed25519 not in AsymmetricAlgorithm enum yet (future enhancement)
+					// Note: Ed25519 not in AsymmetricAlgorithm enum yet(BCRYPT API does not support it) (future enhancement)
 					if (err) {
 						err->win32 = ERROR_NOT_SUPPORTED;
 						err->message = L"Ed25519 not yet implemented in ShadowStrike";
@@ -4958,7 +5076,8 @@ namespace ShadowStrike {
 			template class SecureBuffer<wchar_t>;
 
 			// =============================================================================
-			// SecureString Implementation			// =============================================================================
+			// SecureString Implementation	
+			// =============================================================================
 			SecureString::SecureString(std::string_view str) {
 				Assign(str);
 			}
@@ -5050,7 +5169,7 @@ namespace ShadowStrike {
 				const uint32_t ivSize = static_cast<uint32_t>(iv.size());
 				const uint32_t tagSize = static_cast<uint32_t>(tag.size());
 
-				// ✅ FIXED: Proper byte conversion
+				// Proper byte conversion
 				const std::byte* ivSizeBytes = reinterpret_cast<const std::byte*>(&ivSize);
 				const std::byte* tagSizeBytes = reinterpret_cast<const std::byte*>(&tagSize);
 
@@ -5073,7 +5192,7 @@ namespace ShadowStrike {
 				const uint8_t* key, size_t keyLen,
 				Error* err) noexcept
 			{
-				// ✅ FIXED: Input validation
+				// Input validation
 				if (!key || keyLen != 32) {
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid key (must be 32 bytes for AES-256)"; }
 					return false;
@@ -5086,7 +5205,7 @@ namespace ShadowStrike {
 					return false;
 				}
 				
-				// ✅ FIXED: Better size validation
+				// size validation
 				const size_t minSize = sizeof(uint32_t) * 2 + 12 + 16; // sizes + min salt + min iv + min tag
 				if (encrypted.size() < minSize) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid encrypted file format"; }
@@ -5098,7 +5217,7 @@ namespace ShadowStrike {
 				std::memcpy(&ivSize, encrypted.data() + offset, sizeof(ivSize));
 				offset += sizeof(ivSize);
 
-				// ✅ FIXED: Sanity check IV size
+				// Sanity check IV size
 				if (ivSize != 12 || offset + ivSize > encrypted.size()) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid IV size"; }
 					return false;
@@ -5112,7 +5231,7 @@ namespace ShadowStrike {
 				std::memcpy(&tagSize, encrypted.data() + offset, sizeof(tagSize));
 				offset += sizeof(tagSize);
 
-				// ✅ FIXED: Sanity check tag size
+				// Sanity check tag size
 				if (tagSize != 16 || offset + tagSize > encrypted.size()) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid tag size"; }
 					return false;
@@ -5380,7 +5499,7 @@ namespace ShadowStrike {
 				std::string& outPlaintext,
 				Error* err) noexcept
 			{
-				// ✅ FIXED: Input validation
+				// Input validation
 				if (!key || keyLen != 32) {
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid key (must be 32 bytes)"; }
 					return false;
@@ -5408,7 +5527,7 @@ namespace ShadowStrike {
 				std::memcpy(&ivSize, combined.data() + offset, sizeof(ivSize));
 				offset += sizeof(ivSize);
 
-				// ✅ FIXED: Validate IV size
+				// Validate IV size
 				if (ivSize != 12 || offset + ivSize > combined.size()) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid IV size"; }
 					return false;
@@ -5422,7 +5541,7 @@ namespace ShadowStrike {
 				std::memcpy(&tagSize, combined.data() + offset, sizeof(tagSize));
 				offset += sizeof(tagSize);
 
-				// ✅ FIXED: Validate tag size
+				// Validate tag size
 				if (tagSize != 16 || offset + tagSize > combined.size()) {
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid tag size"; }
 					return false;
@@ -5449,67 +5568,259 @@ namespace ShadowStrike {
 			}
 
 			// =============================================================================
-			// PE Signature Verification
-			// =============================================================================
+            // PE Signature Verification (ENTERPRISE-GRADE)
+            // =============================================================================
+
 			bool VerifyPESignature(std::wstring_view filePath,
 				SignatureInfo& info,
 				Error* err) noexcept
 			{
 #ifdef _WIN32
+				// ═══════════════════════════════════════════════════════════════════
+				//  TIER-1 INPUT VALIDATION
+				// ═══════════════════════════════════════════════════════════════════
+				if (filePath.empty()) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"File path cannot be empty";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"VerifyPESignature: Empty file path");
+					return false;
+				}
+
+				// Clear output structure
 				std::memset(&info, 0, sizeof(info));
 
-				WINTRUST_FILE_INFO fileInfo = {};
-				fileInfo.cbStruct = sizeof(fileInfo);
-				fileInfo.pcwszFilePath = filePath.data();
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 1: FILE EXISTENCE AND ACCESS VALIDATION
+				// ═══════════════════════════════════════════════════════════════════
+				DWORD fileAttribs = GetFileAttributesW(filePath.data());
+				if (fileAttribs == INVALID_FILE_ATTRIBUTES) {
+					DWORD dwErr = GetLastError();
+					if (err) {
+						err->win32 = dwErr;
+						err->message = L"File not found or access denied";
+						err->context = std::wstring(filePath);
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"File not accessible: %s (0x%08X)",
+						filePath.data(), dwErr);
+					return false;
+				}
 
-				GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+				// Reject directories
+				if (fileAttribs & FILE_ATTRIBUTE_DIRECTORY) {
+					if (err) {
+						err->win32 = ERROR_DIRECTORY;
+						err->message = L"Path is a directory, not a file";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Path is directory: %s", filePath.data());
+					return false;
+				}
 
-				WINTRUST_DATA winTrustData = {};
-				winTrustData.cbStruct = sizeof(winTrustData);
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 2: WINTRUST STRUCTURES INITIALIZATION
+				// ═══════════════════════════════════════════════════════════════════
+				WINTRUST_FILE_INFO fileInfo{};
+				std::wstring path(filePath);
+				fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+				fileInfo.pcwszFilePath = path.c_str();
+				fileInfo.hFile = nullptr;
+				fileInfo.pgKnownSubject = nullptr;
+
+				GUID actionVerify = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+				WINTRUST_DATA winTrustData{};
+				winTrustData.cbStruct = sizeof(WINTRUST_DATA);
+				winTrustData.pPolicyCallbackData = nullptr;
+				winTrustData.pSIPClientData = nullptr;
 				winTrustData.dwUIChoice = WTD_UI_NONE;
-				winTrustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+				winTrustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN; // ✅ CRITICAL: Full chain revocation
 				winTrustData.dwUnionChoice = WTD_CHOICE_FILE;
-				winTrustData.pFile = &fileInfo;
 				winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
-				winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+				winTrustData.hWVTStateData = nullptr;
+				winTrustData.pwszURLReference = nullptr;
+				winTrustData.dwProvFlags = WTD_REVOCATION_CHECK_CHAIN | WTD_CACHE_ONLY_URL_RETRIEVAL;
+				winTrustData.dwUIContext = 0;
+				winTrustData.pFile = &fileInfo;
 
-				LONG status = WinVerifyTrust(nullptr, &policyGUID, &winTrustData);
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 3: PRIMARY SIGNATURE VERIFICATION
+				// ═══════════════════════════════════════════════════════════════════
+				LONG verifyResult = WinVerifyTrust(
+					static_cast<HWND>(INVALID_HANDLE_VALUE),
+					&actionVerify,
+					&winTrustData
+				);
 
-				info.isSigned = (status == ERROR_SUCCESS || status == TRUST_E_NOSIGNATURE || status == TRUST_E_SUBJECT_NOT_TRUSTED);
-				info.isVerified = (status == ERROR_SUCCESS);
+				// Update signature status flags
+				info.isSigned = (verifyResult == ERROR_SUCCESS ||
+					verifyResult == TRUST_E_NOSIGNATURE ||
+					verifyResult == TRUST_E_SUBJECT_NOT_TRUSTED ||
+					verifyResult == CERT_E_EXPIRED ||
+					verifyResult == CERT_E_REVOKED ||
+					verifyResult == CERT_E_UNTRUSTEDROOT);
 
-				if (status == ERROR_SUCCESS) {
-					// Get signer info
+				info.isVerified = (verifyResult == ERROR_SUCCESS);
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 4: DETAILED ERROR ANALYSIS
+				// ═══════════════════════════════════════════════════════════════════
+				if (verifyResult != ERROR_SUCCESS) {
+					if (err) {
+						err->win32 = static_cast<DWORD>(verifyResult);
+
+						switch (verifyResult) {
+						case TRUST_E_NOSIGNATURE:
+							err->message = L"File is not digitally signed";
+							SS_LOG_INFO(L"CryptoUtils", L"Unsigned file: %s", filePath.data());
+							break;
+
+						case TRUST_E_SUBJECT_NOT_TRUSTED:
+							err->message = L"Signature is not trusted (untrusted publisher)";
+							SS_LOG_WARN(L"CryptoUtils", L"Untrusted signature: %s", filePath.data());
+							break;
+
+						case TRUST_E_PROVIDER_UNKNOWN:
+							err->message = L"Unknown trust provider";
+							break;
+
+						case TRUST_E_BAD_DIGEST:
+							err->message = L"Invalid signature digest (file may be tampered)";
+							SS_LOG_ERROR(L"CryptoUtils", L"Bad digest (tampering detected): %s", filePath.data());
+							break;
+
+						case CERT_E_EXPIRED:
+							err->message = L"Signing certificate has expired";
+							SS_LOG_WARN(L"CryptoUtils", L"Expired certificate: %s", filePath.data());
+							break;
+
+						case CERT_E_REVOKED:
+							err->message = L"Signing certificate has been revoked";
+							SS_LOG_ERROR(L"CryptoUtils", L"Revoked certificate: %s", filePath.data());
+							break;
+
+						case CERT_E_UNTRUSTEDROOT:
+							err->message = L"Certificate chain is not trusted (untrusted root CA)";
+							break;
+
+						case CERT_E_CHAINING:
+							err->message = L"Certificate chain verification failed";
+							break;
+
+						case CRYPT_E_FILE_ERROR:
+							err->message = L"File read error during verification";
+							break;
+
+						case CRYPT_E_SECURITY_SETTINGS:
+							err->message = L"Security settings prevent verification";
+							break;
+
+						default:
+							err->message = L"Signature verification failed (unknown error)";
+							wchar_t tmp[64];
+							swprintf_s(tmp, L"Error code: 0x%08X", verifyResult);
+							err->context = tmp;
+							break;
+						}
+					}
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 5: EXTRACT SIGNER INFORMATION (If signed)
+				// ═══════════════════════════════════════════════════════════════════
+				if (info.isSigned && winTrustData.hWVTStateData) {
 					CRYPT_PROVIDER_DATA* pProvData = WTHelperProvDataFromStateData(winTrustData.hWVTStateData);
 					if (pProvData) {
 						CRYPT_PROVIDER_SGNR* pSigner = WTHelperGetProvSignerFromChain(pProvData, 0, FALSE, 0);
 						if (pSigner) {
-							// Get the certificate context from CRYPT_PROVIDER_CERT
+							// ═══════════════════════════════════════════════════════════
+							//  STEP 5.1: EXTRACT SIGNING CERTIFICATE
+							// ═══════════════════════════════════════════════════════════
 							CRYPT_PROVIDER_CERT* pCert = WTHelperGetProvCertFromChain(pSigner, 0);
 							if (pCert && pCert->pCert) {
 								PCCERT_CONTEXT pCertContext = pCert->pCert;
 
-								// Extract subject name
-								DWORD subjectSize = CertGetNameStringW(pCertContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+								// Extract Subject Name (Signer)
+								DWORD subjectSize = CertGetNameStringW(
+									pCertContext,
+									CERT_NAME_SIMPLE_DISPLAY_TYPE,
+									0,
+									nullptr,
+									nullptr,
+									0
+								);
+
 								if (subjectSize > 1) {
 									std::wstring subject(subjectSize - 1, L'\0');
-									CertGetNameStringW(pCertContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, &subject[0], subjectSize);
+									CertGetNameStringW(
+										pCertContext,
+										CERT_NAME_SIMPLE_DISPLAY_TYPE,
+										0,
+										nullptr,
+										&subject[0],
+										subjectSize
+									);
 									info.signerName = subject;
 								}
 
-								// Extract issuer
-								DWORD issuerSize = CertGetNameStringW(pCertContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, nullptr, nullptr, 0);
+								// Extract Issuer Name (CA)
+								DWORD issuerSize = CertGetNameStringW(
+									pCertContext,
+									CERT_NAME_SIMPLE_DISPLAY_TYPE,
+									CERT_NAME_ISSUER_FLAG,
+									nullptr,
+									nullptr,
+									0
+								);
+
 								if (issuerSize > 1) {
 									std::wstring issuer(issuerSize - 1, L'\0');
-									CertGetNameStringW(pCertContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, nullptr, &issuer[0], issuerSize);
+									CertGetNameStringW(
+										pCertContext,
+										CERT_NAME_SIMPLE_DISPLAY_TYPE,
+										CERT_NAME_ISSUER_FLAG,
+										nullptr,
+										&issuer[0],
+										issuerSize
+									);
 									info.issuerName = issuer;
 								}
 
-								// Thumbprint
-								BYTE thumbprint[20] = {};
+								// Extract Email (if available)
+								DWORD emailSize = CertGetNameStringW(
+									pCertContext,
+									CERT_NAME_EMAIL_TYPE,
+									0,
+									nullptr,
+									nullptr,
+									0
+								);
+
+								if (emailSize > 1) {
+									std::wstring email(emailSize - 1, L'\0');
+									CertGetNameStringW(
+										pCertContext,
+										CERT_NAME_EMAIL_TYPE,
+										0,
+										nullptr,
+										&email[0],
+										emailSize
+									);
+									info.signerEmail = email;
+								}
+
+								// Extract Certificate Thumbprint (SHA-256)
+								BYTE thumbprint[32] = {}; // SHA-256 = 32 bytes
 								DWORD thumbprintSize = sizeof(thumbprint);
-								if (CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, thumbprint, &thumbprintSize)) {
+
+								if (CertGetCertificateContextProperty(
+									pCertContext,
+									CERT_SHA256_HASH_PROP_ID, // USE SHA-256 (not SHA-1)
+									thumbprint,
+									&thumbprintSize))
+								{
 									std::wstring thumb;
+									thumb.reserve(thumbprintSize * 2);
 									for (DWORD i = 0; i < thumbprintSize; ++i) {
 										wchar_t buf[3];
 										swprintf_s(buf, L"%02X", thumbprint[i]);
@@ -5517,17 +5828,259 @@ namespace ShadowStrike {
 									}
 									info.thumbprint = thumb;
 								}
+								else {
+									// Fallback to SHA-1 if SHA-256 not available
+									thumbprintSize = 20;
+									if (CertGetCertificateContextProperty(
+										pCertContext,
+										CERT_HASH_PROP_ID,
+										thumbprint,
+										&thumbprintSize))
+									{
+										std::wstring thumb;
+										thumb.reserve(thumbprintSize * 2);
+										for (DWORD i = 0; i < thumbprintSize; ++i) {
+											wchar_t buf[3];
+											swprintf_s(buf, L"%02X", thumbprint[i]);
+											thumb += buf;
+										}
+										info.thumbprint = thumb;
+									}
+								}
+
+								// ═══════════════════════════════════════════════════════════════════
+                                //  STEP 5.2: EXTRACT SIGNATURE TIMESTAMP (RFC 3161)
+                                // ═══════════════════════════════════════════════════════════════════
+								bool timestampFound = false;
+
+								// Method 1: Counter-signature içinde timestamp ara
+								if (pSigner->csCounterSigners > 0 && pSigner->pasCounterSigners) {
+									for (DWORD cs = 0; cs < pSigner->csCounterSigners && !timestampFound; ++cs) {
+										CRYPT_PROVIDER_SGNR* pCounterSigner = &pSigner->pasCounterSigners[cs];
+
+										if (pCounterSigner->psSigner && pCounterSigner->psSigner->AuthAttrs.cAttr > 0) {
+											// Authenticated attributes içinde szOID_RSA_signingTime ara
+											for (DWORD i = 0; i < pCounterSigner->psSigner->AuthAttrs.cAttr; ++i) {
+												const CRYPT_ATTRIBUTE& attr = pCounterSigner->psSigner->AuthAttrs.rgAttr[i];
+
+												if (strcmp(attr.pszObjId, szOID_RSA_signingTime) == 0 && attr.cValue > 0) {
+													// Decode signing time
+													FILETIME ft{};
+													DWORD cbData = sizeof(ft);
+
+													if (CryptDecodeObjectEx(
+														X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+														szOID_RSA_signingTime,
+														attr.rgValue[0].pbData,
+														attr.rgValue[0].cbData,
+														0,
+														nullptr,
+														&ft,
+														&cbData))
+													{
+														info.signTime = ft;
+														timestampFound = true;
+
+														// Logging (optional)
+														SYSTEMTIME st{};
+														if (FileTimeToSystemTime(&ft, &st)) {
+															SS_LOG_INFO(L"CryptoUtils",
+																L"Signature timestamp: %04d-%02d-%02d %02d:%02d:%02d UTC",
+																st.wYear, st.wMonth, st.wDay,
+																st.wHour, st.wMinute, st.wSecond);
+														}
+													}
+													break;
+												}
+											}
+										}
+									}
+								}
+
+								// Method 2: Fallback - Find timestamp in main signer attributes
+								if (!timestampFound && pSigner->psSigner && pSigner->psSigner->AuthAttrs.cAttr > 0) {
+									for (DWORD i = 0; i < pSigner->psSigner->AuthAttrs.cAttr; ++i) {
+										const CRYPT_ATTRIBUTE& attr = pSigner->psSigner->AuthAttrs.rgAttr[i];
+
+										if (strcmp(attr.pszObjId, szOID_RSA_signingTime) == 0 && attr.cValue > 0) {
+											FILETIME ft{};
+											DWORD cbData = sizeof(ft);
+
+											if (CryptDecodeObjectEx(
+												X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+												szOID_RSA_signingTime,
+												attr.rgValue[0].pbData,
+												attr.rgValue[0].cbData,
+												0,
+												nullptr,
+												&ft,
+												&cbData))
+											{
+												info.signTime = ft;
+												timestampFound = true;
+
+												SS_LOG_INFO(L"CryptoUtils", L"Timestamp found in main signer attributes");
+											}
+											break;
+										}
+									}
+								}
+
+								if (!timestampFound) {
+									SS_LOG_INFO(L"CryptoUtils", L"No timestamp found in signature");
+								}
+								// ═══════════════════════════════════════════════════════
+								//  STEP 5.3: BUILD CERTIFICATE CHAIN
+								// ═══════════════════════════════════════════════════════
+								for (DWORD i = 0; i < pSigner->csCertChain; ++i) {
+									CRYPT_PROVIDER_CERT* pChainCert = &pSigner->pasCertChain[i];
+									if (pChainCert && pChainCert->pCert) {
+										CertificateInfo chainInfo{};
+
+										// Extract subject
+										DWORD chainSubjectSize = CertGetNameStringW(
+											pChainCert->pCert,
+											CERT_NAME_SIMPLE_DISPLAY_TYPE,
+											0,
+											nullptr,
+											nullptr,
+											0
+										);
+
+										if (chainSubjectSize > 1) {
+											std::wstring chainSubject(chainSubjectSize - 1, L'\0');
+											CertGetNameStringW(
+												pChainCert->pCert,
+												CERT_NAME_SIMPLE_DISPLAY_TYPE,
+												0,
+												nullptr,
+												&chainSubject[0],
+												chainSubjectSize
+											);
+											chainInfo.subject = chainSubject;
+										}
+
+										// Extract issuer
+										DWORD chainIssuerSize = CertGetNameStringW(
+											pChainCert->pCert,
+											CERT_NAME_SIMPLE_DISPLAY_TYPE,
+											CERT_NAME_ISSUER_FLAG,
+											nullptr,
+											nullptr,
+											0
+										);
+
+										if (chainIssuerSize > 1) {
+											std::wstring chainIssuer(chainIssuerSize - 1, L'\0');
+											CertGetNameStringW(
+												pChainCert->pCert,
+												CERT_NAME_SIMPLE_DISPLAY_TYPE,
+												CERT_NAME_ISSUER_FLAG,
+												nullptr,
+												&chainIssuer[0],
+												chainIssuerSize
+											);
+											chainInfo.issuer = chainIssuer;
+										}
+
+										// Check if CA certificate
+										PCERT_EXTENSION pBasicConstraints = CertFindExtension(
+											szOID_BASIC_CONSTRAINTS2,
+											pChainCert->pCert->pCertInfo->cExtension,
+											pChainCert->pCert->pCertInfo->rgExtension
+										);
+
+										if (pBasicConstraints) {
+											CERT_BASIC_CONSTRAINTS2_INFO constraints{};
+											DWORD cbConstraints = sizeof(constraints);
+
+											if (CryptDecodeObjectEx(
+												X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+												szOID_BASIC_CONSTRAINTS2,
+												pBasicConstraints->Value.pbData,
+												pBasicConstraints->Value.cbData,
+												0,
+												nullptr,
+												&constraints,
+												&cbConstraints))
+											{
+												chainInfo.isCA = (constraints.fCA == TRUE);
+											}
+										}
+
+										// Check expiration
+										FILETIME now;
+										GetSystemTimeAsFileTime(&now);
+										chainInfo.isExpired = (CompareFileTime(&now, &pChainCert->pCert->pCertInfo->NotAfter) > 0);
+
+										info.certificateChain.push_back(chainInfo);
+									}
+								}
+							}
+
+							// ═══════════════════════════════════════════════════════════
+							//  STEP 5.4: VALIDATE HASH ALGORITHM (Reject SHA-1)
+							// ═══════════════════════════════════════════════════════════
+							if (pSigner->psSigner && pSigner->psSigner->HashAlgorithm.pszObjId) {
+								const char* hashOid = pSigner->psSigner->HashAlgorithm.pszObjId;
+
+								// ✅ CRITICAL: Reject weak hash algorithms
+								if (strcmp(hashOid, szOID_OIWSEC_sha1) == 0 ||
+									strcmp(hashOid, szOID_RSA_MD5) == 0) {
+
+									if (err && info.isVerified) {
+										err->win32 = TRUST_E_BAD_DIGEST;
+										err->message = L"Weak hash algorithm detected (SHA-1/MD5 not allowed)";
+										err->context = L"Hash: ";
+										err->context += (strcmp(hashOid, szOID_OIWSEC_sha1) == 0) ? L"SHA-1" : L"MD5";
+									}
+
+									SS_LOG_WARN(L"CryptoUtils",
+										L"Weak hash algorithm in signature: %s (file: %s)",
+										(strcmp(hashOid, szOID_OIWSEC_sha1) == 0) ? L"SHA-1" : L"MD5",
+										filePath.data());
+
+									// Mark as unverified due to weak crypto
+									info.isVerified = false;
+								}
 							}
 						}
 					}
 				}
 
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 6: CLEANUP WINTRUST STATE
+				// ═══════════════════════════════════════════════════════════════════
 				winTrustData.dwStateAction = WTD_STATEACTION_CLOSE;
-				WinVerifyTrust(nullptr, &policyGUID, &winTrustData);
+				WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionVerify, &winTrustData);
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 7: FINAL LOGGING
+				// ═══════════════════════════════════════════════════════════════════
+				if (info.isVerified) {
+					SS_LOG_INFO(L"CryptoUtils",
+						L"Signature verified successfully - File: %s, Signer: %s, Issuer: %s",
+						filePath.data(),
+						info.signerName.c_str(),
+						info.issuerName.c_str());
+				}
+				else if (info.isSigned) {
+					SS_LOG_WARN(L"CryptoUtils",
+						L"Signature verification failed - File: %s, Status: 0x%08X",
+						filePath.data(),
+						verifyResult);
+				}
+				else {
+					SS_LOG_INFO(L"CryptoUtils", L"File not signed: %s", filePath.data());
+				}
 
 				return true;
+
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) {
+					err->win32 = ERROR_NOT_SUPPORTED;
+					err->message = L"Platform not supported (Windows only)";
+				}
 				return false;
 #endif
 			}
@@ -5538,7 +6091,7 @@ namespace ShadowStrike {
 					Error * err) noexcept
 			{
 #ifdef _WIN32
-				// ✅ ENTERPRISE-GRADE: Windows Catalog API signature verification
+				// Windows Catalog API signature verification
 				// Used for verifying driver/system file signatures against catalog files
 
 				std::memset(&info, 0, sizeof(info));
@@ -5551,7 +6104,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ Convert hex hash string to binary
+				// Convert hex hash string to binary
 				std::vector<uint8_t> hashBytes;
 				std::string hashStr;
 				hashStr.reserve(fileHash.size());
@@ -5568,7 +6121,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ Validate hash size (must be SHA-1 or SHA-256)
+				// Validate hash size (must be SHA-1 or SHA-256)
 				if (hashBytes.size() != 20 && hashBytes.size() != 32) {
 					if (err) {
 						err->win32 = ERROR_INVALID_PARAMETER;
@@ -5578,7 +6131,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ Step 1: Acquire Catalog Admin Context
+				// Step 1: Acquire Catalog Admin Context
 				HCATADMIN hCatAdmin = nullptr;
 				if (!CryptCATAdminAcquireContext(&hCatAdmin, nullptr, 0)) {
 					DWORD dwErr = GetLastError();
@@ -5590,13 +6143,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ RAII wrapper for catalog admin context
+				// RAII wrapper for catalog admin context
 				struct CatAdminCleanup {
 					HCATADMIN h;
 					~CatAdminCleanup() { if (h) CryptCATAdminReleaseContext(h, 0); }
 				} catAdminCleanup{ hCatAdmin };
 
-				// ✅ Step 2: Open the catalog file
+				// Step 2: Open the catalog file
 				HANDLE hCatalog = CryptCATOpen(const_cast<wchar_t*>(catalogPath.data()),
 					CRYPTCAT_OPEN_EXISTING, 0, 0, 0);
 
@@ -5611,13 +6164,13 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ RAII wrapper for catalog handle
+				// RAII wrapper for catalog handle
 				struct CatalogCleanup {
 					HANDLE h;
 					~CatalogCleanup() { if (h != INVALID_HANDLE_VALUE) CryptCATClose(h); }
 				} catalogCleanup{ hCatalog };
 
-				// ✅ Step 3: Get catalog info (for signature verification)
+				// Step 3: Get catalog info (for signature verification)
 				CATALOG_INFO catInfo{};
 				catInfo.cbStruct = sizeof(catInfo);
 
@@ -5631,7 +6184,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ Step 4: Verify catalog signature using WinVerifyTrust
+				// Step 4: Verify catalog signature using WinVerifyTrust
 				WINTRUST_CATALOG_INFO wtCatInfo{};
 				wtCatInfo.cbStruct = sizeof(wtCatInfo);
 				wtCatInfo.dwCatalogVersion = 0;
@@ -5644,7 +6197,7 @@ namespace ShadowStrike {
 				wtCatInfo.pcCatalogContext = nullptr;
 				wtCatInfo.hCatAdmin = hCatAdmin;
 
-				// ✅ Step 5: Search for file hash in catalog
+				// Step 5: Search for file hash in catalog
 				CRYPTCATMEMBER* pMember = nullptr;
 				BYTE hashTag[256] = {}; // Tag buffer for hash lookup
 				DWORD hashTagSize = static_cast<DWORD>(hashBytes.size());
@@ -5687,7 +6240,7 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// ✅ Step 6: Verify catalog signature with WinVerifyTrust
+				// Step 6: Verify catalog signature with WinVerifyTrust
 				GUID policyGUID = DRIVER_ACTION_VERIFY; // Use driver policy for catalog verification
 
 				WINTRUST_DATA winTrustData{};
@@ -5711,7 +6264,7 @@ namespace ShadowStrike {
 					verifyResult == TRUST_E_SUBJECT_NOT_TRUSTED);
 				info.isVerified = (verifyResult == ERROR_SUCCESS);
 
-				// ✅ Step 7: Extract signer information if signature is valid
+				// Step 7: Extract signer information if signature is valid
 				if (verifyResult == ERROR_SUCCESS) {
 					CRYPT_PROVIDER_DATA* pProvData = WTHelperProvDataFromStateData(winTrustData.hWVTStateData);
 					if (pProvData) {
@@ -5791,7 +6344,7 @@ namespace ShadowStrike {
 						verifyResult, catalogPath.data());
 				}
 
-				// ✅ Cleanup WinVerifyTrust state
+				// Cleanup WinVerifyTrust state
 				winTrustData.dwStateAction = WTD_STATEACTION_CLOSE;
 				WinVerifyTrust(nullptr, &policyGUID, &winTrustData);
 
@@ -5802,6 +6355,44 @@ namespace ShadowStrike {
 				return false;
 #endif
 			}
+
+
+			//Will be added later.
+
+				bool CryptoUtils::CheckCodeSigningEKU(PCCERT_CONTEXT certContext,
+					Error* err) noexcept
+				{
+					if(err)
+					{
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Not implemented yet.";
+						return false;
+					}
+					return false;
+				}
+
+				bool CryptoUtils::ValidateTimestamp(const FILETIME& signTime, PCCERT_CONTEXT cert, Error* err) noexcept
+				{
+					if (err)
+					{
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Not implemented yet.";
+						return false;
+					}
+					return false;
+				}
+					bool CheckRevocationOnline(PCCERT_CONTEXT cert, Error * err) noexcept {
+					if (err)
+					{
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Not implemented yet.";
+						return false;
+					}
+					return false;
+				}
+
+					//Plus multiple signature helpers will be added later.
+
 		} // namespace CryptoUtils
 	} // namespace Utils
 } // namespace ShadowStrike

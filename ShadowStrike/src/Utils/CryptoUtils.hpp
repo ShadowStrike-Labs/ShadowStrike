@@ -575,6 +575,17 @@ namespace ShadowStrike {
 				SignatureInfo& info,
 				Error* err = nullptr) noexcept;
 
+			//EKU checking helper
+			bool CheckCodeSigningEKU(PCCERT_CONTEXT cert, Error* err) noexcept;
+
+			//Validate signature timestamp
+			bool ValidateTimestamp(const FILETIME& signTime, PCCERT_CONTEXT cert, Error* err) noexcept;
+
+			//Online revocation check via OCSP/CRL
+			bool CheckRevocationOnline(PCCERT_CONTEXT cert, Error* err) noexcept;
+
+		    //Multiple signature Support(will be added in future)
+
 			// ============================================================================
 			// Base64 Encoding/Decoding
 			// ============================================================================

@@ -2,6 +2,7 @@
 #include "../../../src/Utils/CryptoUtils.hpp"
 #include "../../../src/Utils/HashUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"
+#include"../../../src/Utils/Logger.hpp"
 #include <vector>
 #include <string>
 #include <fstream>
@@ -12,9 +13,18 @@
 // Windows CryptoAPI for test certificate generation
 #ifdef _WIN32
 #  include <Windows.h>
-#  include <wincrypt.h>
+#  include <wincrypt.h>  
+#  include <wintrust.h>  
+#  include <softpub.h>    
+#  include <bcrypt.h>  
+#  include <ncrypt.h>    
+#  include <mscat.h>    
+#  include <ntstatus.h>   
+
 #  pragma comment(lib, "crypt32.lib")
-#  pragma comment(lib, "advapi32.lib")
+#  pragma comment(lib, "wintrust.lib")
+#  pragma comment(lib, "bcrypt.lib")
+#  pragma comment(lib, "ncrypt.lib")
 #endif
 
 using namespace ShadowStrike::Utils::CryptoUtils;
@@ -50,18 +60,27 @@ static std::string WStringToUtf8(const std::wstring& w) {
 class CryptoUtilsTest : public ::testing::Test {
 protected:
     void SetUp() override {
+
+        if (!Logger::Instance().IsInitialized()) {
+            std::cerr << "[TEST FATAL] Logger not initialized before test!\n";
+            GTEST_SKIP() << "Logger not initialized";
+        }
+
         testDir = std::filesystem::temp_directory_path() / "cryptoutils_tests";
         std::filesystem::create_directories(testDir);
+        
+        err = std::make_unique<Error>();
     }
 
     void TearDown() override {
         if (std::filesystem::exists(testDir)) {
             std::filesystem::remove_all(testDir);
         }
+        err.reset(); // clear
     }
 
     std::filesystem::path testDir;
-    Error err;
+    std::unique_ptr<Error> err; 
 };
 
 // ============================================================================
@@ -72,7 +91,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_Generate_BasicFunctionality) {
     SecureRandom rng;
     
     std::vector<uint8_t> data;
-    ASSERT_TRUE(rng.Generate(data, 32, &err)) << WStringToUtf8(err.message);
+    ASSERT_TRUE(rng.Generate(data, 32, err.get())) << WStringToUtf8(err->message);
     EXPECT_EQ(data.size(), 32u);
 }
 
@@ -80,7 +99,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_Generate_ZeroSize) {
     SecureRandom rng;
     
     std::vector<uint8_t> empty;
-    ASSERT_TRUE(rng.Generate(empty, 0, &err));
+    ASSERT_TRUE(rng.Generate(empty, 0, err.get()));
     EXPECT_EQ(empty.size(), 0u);
 }
 
@@ -88,7 +107,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_Generate_LargeBuffer) {
     SecureRandom rng;
     
     std::vector<uint8_t> large;
-    ASSERT_TRUE(rng.Generate(large, 1024 * 1024, &err)); // 1MB
+    ASSERT_TRUE(rng.Generate(large, 1024 * 1024, err.get())); // 1MB
     EXPECT_EQ(large.size(), 1024u * 1024u);
 }
 
@@ -97,7 +116,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_NextUInt32_Range) {
     
     // Test 100 samples in range [10, 50)
     for (int i = 0; i < 100; ++i) {
-        uint32_t val = rng.NextUInt32(10, 50, &err);
+        uint32_t val = rng.NextUInt32(10, 50, err.get());
         EXPECT_GE(val, 10u);
         EXPECT_LT(val, 50u);
     }
@@ -107,16 +126,16 @@ TEST_F(CryptoUtilsTest, SecureRandom_NextUInt32_BoundaryConditions) {
     SecureRandom rng;
     
     // Same min/max should return min
-    EXPECT_EQ(rng.NextUInt32(42, 42, &err), 42u);
+    EXPECT_EQ(rng.NextUInt32(42, 42, err.get()), 42u);
     
     // Min > max should return min
-    EXPECT_EQ(rng.NextUInt32(100, 50, &err), 100u);
+    EXPECT_EQ(rng.NextUInt32(100, 50, err.get()), 100u);
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_GenerateAlphanumeric_CharsetValidation) {
     SecureRandom rng;
     
-    std::string str = rng.GenerateAlphanumeric(1000, &err);
+    std::string str = rng.GenerateAlphanumeric(1000, err.get());
     EXPECT_EQ(str.length(), 1000u);
     
     // Verify charset: only [0-9A-Za-z]
@@ -131,7 +150,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_GenerateAlphanumeric_CharsetValidation) {
 TEST_F(CryptoUtilsTest, SecureRandom_GenerateHex_Format) {
     SecureRandom rng;
     
-    std::string hex = rng.GenerateHex(32, &err);
+    std::string hex = rng.GenerateHex(32, err.get());
     EXPECT_EQ(hex.length(), 64u); // 32 bytes = 64 hex chars
     
     // Verify lowercase hex
@@ -147,25 +166,27 @@ TEST_F(CryptoUtilsTest, SecureRandom_GenerateHex_Format) {
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_BasicEncryptDecrypt) {
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
-    
+
     std::vector<uint8_t> key, iv;
-    ASSERT_TRUE(cipher.GenerateKey(key, &err));
-    ASSERT_TRUE(cipher.GenerateIV(iv, &err));
-    
+    EXPECT_TRUE(cipher.GenerateKey(key,err.get())) << WStringToUtf8(err->message);
+    EXPECT_TRUE(cipher.GenerateIV(iv, err.get())) << WStringToUtf8(err->message);
+
     const std::string plaintext = "Top Secret Message";
     std::vector<uint8_t> ciphertext, tag;
-    
+
+    // Encrypt
     ASSERT_TRUE(cipher.EncryptAEAD(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
-        nullptr, 0, ciphertext, tag, &err
-    )) << WStringToUtf8(err.message);
+        nullptr, 0, ciphertext, tag, err.get()
+    )) << WStringToUtf8(err->message);
+
     
     std::vector<uint8_t> decrypted;
     ASSERT_TRUE(cipher.DecryptAEAD(
         ciphertext.data(), ciphertext.size(),
-        nullptr, 0, tag.data(), tag.size(), decrypted, &err
-    )) << WStringToUtf8(err.message);
-    
+        nullptr, 0, tag.data(), tag.size(), decrypted, err.get()
+    )) << WStringToUtf8(err->message);
+
     std::string result(decrypted.begin(), decrypted.end());
     EXPECT_EQ(plaintext, result);
 }
@@ -174,8 +195,8 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_WithAAD) {
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
     
     std::vector<uint8_t> key, iv;
-    ASSERT_TRUE(cipher.GenerateKey(key, &err));
-    ASSERT_TRUE(cipher.GenerateIV(iv, &err));
+    ASSERT_TRUE(cipher.GenerateKey(key, err.get()));
+    ASSERT_TRUE(cipher.GenerateIV(iv, err.get()));
     
     const std::string plaintext = "Secret";
     const std::string aad = "Metadata";
@@ -184,14 +205,14 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_WithAAD) {
     ASSERT_TRUE(cipher.EncryptAEAD(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
         reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
-        ciphertext, tag, &err
+        ciphertext, tag, err.get()
     ));
     
     std::vector<uint8_t> decrypted;
     ASSERT_TRUE(cipher.DecryptAEAD(
         ciphertext.data(), ciphertext.size(),
         reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
-        tag.data(), tag.size(), decrypted, &err
+        tag.data(), tag.size(), decrypted, err.get()
     ));
     
     std::string result(decrypted.begin(), decrypted.end());
@@ -202,8 +223,8 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_AADMismatch) {
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
     
     std::vector<uint8_t> key, iv;
-    ASSERT_TRUE(cipher.GenerateKey(key, &err));
-    ASSERT_TRUE(cipher.GenerateIV(iv, &err));
+    ASSERT_TRUE(cipher.GenerateKey(key, err.get()));
+    ASSERT_TRUE(cipher.GenerateIV(iv, err.get()));
     
     const std::string plaintext = "Secret";
     const std::string aad1 = "Metadata1";
@@ -213,7 +234,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_AADMismatch) {
     ASSERT_TRUE(cipher.EncryptAEAD(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
         reinterpret_cast<const uint8_t*>(aad1.data()), aad1.size(),
-        ciphertext, tag, &err
+        ciphertext, tag, err.get()
     ));
     
     // Decrypt with different AAD - should fail
@@ -221,7 +242,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_AADMismatch) {
     EXPECT_FALSE(cipher.DecryptAEAD(
         ciphertext.data(), ciphertext.size(),
         reinterpret_cast<const uint8_t*>(aad2.data()), aad2.size(),
-        tag.data(), tag.size(), decrypted, &err
+        tag.data(), tag.size(), decrypted, err.get()
     ));
 }
 
@@ -229,24 +250,24 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_TruncatedTag) {
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
     
     std::vector<uint8_t> key, iv;
-    ASSERT_TRUE(cipher.GenerateKey(key, &err));
-    ASSERT_TRUE(cipher.GenerateIV(iv, &err));
+    ASSERT_TRUE(cipher.GenerateKey(key, err.get()));
+    ASSERT_TRUE(cipher.GenerateIV(iv, err.get()));
     
     const std::string plaintext = "Test";
     std::vector<uint8_t> ciphertext, tag;
     
     ASSERT_TRUE(cipher.EncryptAEAD(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
-        nullptr, 0, ciphertext, tag, &err
+        nullptr, 0, ciphertext, tag, err.get()
     ));
     
     // Try with truncated tag (15 bytes instead of 16)
     std::vector<uint8_t> decrypted;
     EXPECT_FALSE(cipher.DecryptAEAD(
         ciphertext.data(), ciphertext.size(),
-        nullptr, 0, tag.data(), 15, decrypted, &err
+        nullptr, 0, tag.data(), 15, decrypted, err.get()
     ));
-    EXPECT_EQ(err.win32, ERROR_INVALID_PARAMETER);
+    EXPECT_EQ(err->win32, ERROR_INVALID_PARAMETER);
 }
 
 // ============================================================================
@@ -258,8 +279,8 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_PKCS7Padding) {
     cipher.SetPaddingMode(PaddingMode::PKCS7);
     
     std::vector<uint8_t> key, iv;
-    ASSERT_TRUE(cipher.GenerateKey(key, &err));
-    ASSERT_TRUE(cipher.GenerateIV(iv, &err));
+    ASSERT_TRUE(cipher.GenerateKey(key, err.get()));
+    ASSERT_TRUE(cipher.GenerateIV(iv, err.get()));
     
     const std::string plaintext = "Test"; // 4 bytes (not block-aligned)
     
@@ -269,19 +290,19 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_PKCS7Padding) {
     std::vector<uint8_t> ciphertext;
     ASSERT_TRUE(cipher.Encrypt(
         reinterpret_cast<const uint8_t*>(plaintext.data()),
-        plaintext.size(), ciphertext, &err
-    )) << WStringToUtf8(err.message);
+        plaintext.size(), ciphertext, err.get()
+    )) << WStringToUtf8(err->message);
     
     // Create new cipher for decryption with original IV
     SymmetricCipher decryptCipher(SymmetricAlgorithm::AES_256_CBC);
     decryptCipher.SetPaddingMode(PaddingMode::PKCS7);
-    ASSERT_TRUE(decryptCipher.SetKey(key, &err));
-    ASSERT_TRUE(decryptCipher.SetIV(originalIV, &err));
+    ASSERT_TRUE(decryptCipher.SetKey(key, err.get()));
+    ASSERT_TRUE(decryptCipher.SetIV(originalIV, err.get()));
     
     std::vector<uint8_t> decrypted;
     ASSERT_TRUE(decryptCipher.Decrypt(
-        ciphertext.data(), ciphertext.size(), decrypted, &err
-    )) << WStringToUtf8(err.message);
+        ciphertext.data(), ciphertext.size(), decrypted, err.get()
+    )) << WStringToUtf8(err->message);
     
     std::string result(decrypted.begin(), decrypted.end());
     EXPECT_EQ(plaintext, result);
@@ -291,12 +312,12 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_StreamingEncryption) {
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
     
     std::vector<uint8_t> key, iv;
-    ASSERT_TRUE(cipher.GenerateKey(key, &err));
-    ASSERT_TRUE(cipher.GenerateIV(iv, &err));
+    ASSERT_TRUE(cipher.GenerateKey(key, err.get()));
+    ASSERT_TRUE(cipher.GenerateIV(iv, err.get()));
     
     const std::string data = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 26 bytes
     
-    ASSERT_TRUE(cipher.EncryptInit(&err));
+    ASSERT_TRUE(cipher.EncryptInit(err.get()));
     
     std::vector<uint8_t> ciphertext;
     
@@ -307,23 +328,23 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_StreamingEncryption) {
         
         ASSERT_TRUE(cipher.EncryptUpdate(
             reinterpret_cast<const uint8_t*>(data.data() + i),
-            len, chunk, &err
+            len, chunk, err.get()
         ));
         
         ciphertext.insert(ciphertext.end(), chunk.begin(), chunk.end());
     }
     
     std::vector<uint8_t> final;
-    ASSERT_TRUE(cipher.EncryptFinal(final, &err));
+    ASSERT_TRUE(cipher.EncryptFinal(final, err.get()));
     ciphertext.insert(ciphertext.end(), final.begin(), final.end());
     
     // Decrypt and verify
     SymmetricCipher decipher(SymmetricAlgorithm::AES_256_CBC);
-    ASSERT_TRUE(decipher.SetKey(key, &err));
-    ASSERT_TRUE(decipher.SetIV(iv, &err));
+    ASSERT_TRUE(decipher.SetKey(key, err.get()));
+    ASSERT_TRUE(decipher.SetIV(iv, err.get()));
     
     std::vector<uint8_t> decrypted;
-    ASSERT_TRUE(decipher.Decrypt(ciphertext.data(), ciphertext.size(), decrypted, &err));
+    ASSERT_TRUE(decipher.Decrypt(ciphertext.data(), ciphertext.size(), decrypted, err.get()));
     
     std::string result(decrypted.begin(), decrypted.end());
     EXPECT_EQ(data, result);
@@ -337,8 +358,8 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_KeyGeneration) {
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
-    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, &err)) 
-        << WStringToUtf8(err.message);
+    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, err.get())) 
+        << WStringToUtf8(err->message);
     
     EXPECT_FALSE(keyPair.publicKey.keyBlob.empty());
     EXPECT_FALSE(keyPair.privateKey.keyBlob.empty());
@@ -348,22 +369,22 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_EncryptDecrypt) {
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
-    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, &err));
-    ASSERT_TRUE(cipher.LoadPublicKey(keyPair.publicKey, &err));
-    ASSERT_TRUE(cipher.LoadPrivateKey(keyPair.privateKey, &err));
+    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, err.get()));
+    ASSERT_TRUE(cipher.LoadPublicKey(keyPair.publicKey, err.get()));
+    ASSERT_TRUE(cipher.LoadPrivateKey(keyPair.privateKey, err.get()));
     
     const std::string plaintext = "Hello RSA";
     std::vector<uint8_t> ciphertext, decrypted;
     
     ASSERT_TRUE(cipher.Encrypt(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
-        ciphertext, RSAPaddingScheme::OAEP_SHA256, &err
-    )) << WStringToUtf8(err.message);
+        ciphertext, RSAPaddingScheme::OAEP_SHA256, err.get()
+    )) << WStringToUtf8(err->message);
     
     ASSERT_TRUE(cipher.Decrypt(
         ciphertext.data(), ciphertext.size(), decrypted,
-        RSAPaddingScheme::OAEP_SHA256, &err
-    )) << WStringToUtf8(err.message);
+        RSAPaddingScheme::OAEP_SHA256, err.get()
+    )) << WStringToUtf8(err->message);
     
     std::string result(decrypted.begin(), decrypted.end());
     EXPECT_EQ(plaintext, result);
@@ -373,9 +394,9 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_MaxPlaintextSize) {
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
-    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, &err));
-    ASSERT_TRUE(cipher.LoadPublicKey(keyPair.publicKey, &err));
-    ASSERT_TRUE(cipher.LoadPrivateKey(keyPair.privateKey, &err));
+    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, err.get()));
+    ASSERT_TRUE(cipher.LoadPublicKey(keyPair.publicKey, err.get()));
+    ASSERT_TRUE(cipher.LoadPrivateKey(keyPair.privateKey, err.get()));
     
     const auto paddingScheme = RSAPaddingScheme::OAEP_SHA256;
     size_t maxSize = cipher.GetMaxPlaintextSize(paddingScheme);
@@ -392,41 +413,41 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_MaxPlaintextSize) {
     std::vector<uint8_t> ciphertext, decrypted;
     
     ASSERT_TRUE(cipher.Encrypt(plaintext.data(), plaintext.size(), ciphertext,
-        paddingScheme, &err));
+        paddingScheme, err.get()));
     
     ASSERT_TRUE(cipher.Decrypt(ciphertext.data(), ciphertext.size(), decrypted,
-        paddingScheme, &err));
+        paddingScheme, err.get()));
     
     EXPECT_EQ(plaintext, decrypted);
     
     // Test over max size (should fail)
     std::vector<uint8_t> oversized(maxSize + 1, 0xBB);
     EXPECT_FALSE(cipher.Encrypt(oversized.data(), oversized.size(), ciphertext,
-        paddingScheme, &err));
-    EXPECT_EQ(err.win32, ERROR_INVALID_PARAMETER);
+        paddingScheme, err.get()));
+    EXPECT_EQ(err->win32, ERROR_INVALID_PARAMETER);
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_SignVerify) {
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
-    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, &err));
-    ASSERT_TRUE(cipher.LoadPrivateKey(keyPair.privateKey, &err));
-    ASSERT_TRUE(cipher.LoadPublicKey(keyPair.publicKey, &err));
+    ASSERT_TRUE(cipher.GenerateKeyPair(keyPair, err.get()));
+    ASSERT_TRUE(cipher.LoadPrivateKey(keyPair.privateKey, err.get()));
+    ASSERT_TRUE(cipher.LoadPublicKey(keyPair.publicKey, err.get()));
     
     const std::string message = "Sign this message";
     std::vector<uint8_t> signature;
     
     ASSERT_TRUE(cipher.Sign(
         reinterpret_cast<const uint8_t*>(message.data()), message.size(),
-        signature, HashUtils::Algorithm::SHA256, RSAPaddingScheme::PSS_SHA256, &err
-    )) << WStringToUtf8(err.message);
+        signature, HashUtils::Algorithm::SHA256, RSAPaddingScheme::PSS_SHA256, err.get()
+    )) << WStringToUtf8(err->message);
     
     ASSERT_TRUE(cipher.Verify(
         reinterpret_cast<const uint8_t*>(message.data()), message.size(),
         signature.data(), signature.size(),
-        HashUtils::Algorithm::SHA256, RSAPaddingScheme::PSS_SHA256, &err
-    )) << WStringToUtf8(err.message);
+        HashUtils::Algorithm::SHA256, RSAPaddingScheme::PSS_SHA256, err.get()
+    )) << WStringToUtf8(err->message);
 }
 
 // ============================================================================
@@ -437,24 +458,24 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_P256_KeyAgreement) {
     // Alice generates key pair
     AsymmetricCipher alice(AsymmetricAlgorithm::ECC_P256);
     KeyPair aliceKeys;
-    ASSERT_TRUE(alice.GenerateKeyPair(aliceKeys, &err));
-    ASSERT_TRUE(alice.LoadPrivateKey(aliceKeys.privateKey, &err));
+    ASSERT_TRUE(alice.GenerateKeyPair(aliceKeys, err.get()));
+    ASSERT_TRUE(alice.LoadPrivateKey(aliceKeys.privateKey, err.get()));
     
     // Bob generates key pair
     AsymmetricCipher bob(AsymmetricAlgorithm::ECC_P256);
     KeyPair bobKeys;
-    ASSERT_TRUE(bob.GenerateKeyPair(bobKeys, &err));
-    ASSERT_TRUE(bob.LoadPrivateKey(bobKeys.privateKey, &err));
+    ASSERT_TRUE(bob.GenerateKeyPair(bobKeys, err.get()));
+    ASSERT_TRUE(bob.LoadPrivateKey(bobKeys.privateKey, err.get()));
     
     // Alice derives shared secret
     std::vector<uint8_t> aliceSecret;
-    ASSERT_TRUE(alice.DeriveSharedSecret(bobKeys.publicKey, aliceSecret, &err))
-        << WStringToUtf8(err.message);
+    ASSERT_TRUE(alice.DeriveSharedSecret(bobKeys.publicKey, aliceSecret, err.get()))
+        << WStringToUtf8(err->message);
     
     // Bob derives shared secret
     std::vector<uint8_t> bobSecret;
-    ASSERT_TRUE(bob.DeriveSharedSecret(aliceKeys.publicKey, bobSecret, &err))
-        << WStringToUtf8(err.message);
+    ASSERT_TRUE(bob.DeriveSharedSecret(aliceKeys.publicKey, bobSecret, err.get()))
+        << WStringToUtf8(err->message);
     
     // Secrets should match
     EXPECT_EQ(aliceSecret, bobSecret);
@@ -463,16 +484,16 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_P256_KeyAgreement) {
 TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_DifferentCurves) {
     AsymmetricCipher alice(AsymmetricAlgorithm::ECC_P256);
     KeyPair aliceKeys;
-    ASSERT_TRUE(alice.GenerateKeyPair(aliceKeys, &err));
-    ASSERT_TRUE(alice.LoadPrivateKey(aliceKeys.privateKey, &err));
+    ASSERT_TRUE(alice.GenerateKeyPair(aliceKeys, err.get()));
+    ASSERT_TRUE(alice.LoadPrivateKey(aliceKeys.privateKey, err.get()));
     
     AsymmetricCipher bob(AsymmetricAlgorithm::ECC_P384);
     KeyPair bobKeys;
-    ASSERT_TRUE(bob.GenerateKeyPair(bobKeys, &err));
+    ASSERT_TRUE(bob.GenerateKeyPair(bobKeys, err.get()));
     
     // Should fail due to algorithm mismatch
     std::vector<uint8_t> sharedSecret;
-    EXPECT_FALSE(alice.DeriveSharedSecret(bobKeys.publicKey, sharedSecret, &err));
+    EXPECT_FALSE(alice.DeriveSharedSecret(bobKeys.publicKey, sharedSecret, err.get()));
 }
 
 // ============================================================================
@@ -488,13 +509,13 @@ TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_Basic) {
     ASSERT_TRUE(KeyDerivation::PBKDF2(
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 10000, HashUtils::Algorithm::SHA256,
-        key1.data(), key1.size(), &err
+        key1.data(), key1.size(), err.get()
     ));
     
     ASSERT_TRUE(KeyDerivation::PBKDF2(
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 10000, HashUtils::Algorithm::SHA256,
-        key2.data(), key2.size(), &err
+        key2.data(), key2.size(), err.get()
     ));
     
     EXPECT_EQ(key1, key2);
@@ -508,13 +529,13 @@ TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_DifferentIterations) {
     ASSERT_TRUE(KeyDerivation::PBKDF2(
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 10000, HashUtils::Algorithm::SHA256,
-        key1.data(), key1.size(), &err
+        key1.data(), key1.size(), err.get()
     ));
     
     ASSERT_TRUE(KeyDerivation::PBKDF2(
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 20000, HashUtils::Algorithm::SHA256,
-        key2.data(), key2.size(), &err
+        key2.data(), key2.size(), err.get()
     ));
     
     EXPECT_NE(key1, key2);
@@ -532,14 +553,14 @@ TEST_F(CryptoUtilsTest, KeyDerivation_HKDF_WithInfo) {
         reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
         reinterpret_cast<const uint8_t*>(salt.data()), salt.size(),
         reinterpret_cast<const uint8_t*>(info1.data()), info1.size(),
-        HashUtils::Algorithm::SHA256, key1.data(), key1.size(), &err
+        HashUtils::Algorithm::SHA256, key1.data(), key1.size(), err.get()
     ));
     
     ASSERT_TRUE(KeyDerivation::HKDF(
         reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
         reinterpret_cast<const uint8_t*>(salt.data()), salt.size(),
         reinterpret_cast<const uint8_t*>(info2.data()), info2.size(),
-        HashUtils::Algorithm::SHA256, key2.data(), key2.size(), &err
+        HashUtils::Algorithm::SHA256, key2.data(), key2.size(), err.get()
     ));
     
     EXPECT_NE(key1, key2);
@@ -562,15 +583,15 @@ TEST_F(CryptoUtilsTest, EncryptFile_DecryptFile_Roundtrip) {
     
     SecureRandom rng;
     std::vector<uint8_t> key;
-    ASSERT_TRUE(rng.Generate(key, 32, &err));
+    ASSERT_TRUE(rng.Generate(key, 32, err.get()));
     
     ASSERT_TRUE(EncryptFile(inputPath.wstring(), encryptedPath.wstring(),
-                           key.data(), key.size(), &err))
-        << WStringToUtf8(err.message);
+                           key.data(), key.size(), err.get()))
+        << WStringToUtf8(err->message);
     
     ASSERT_TRUE(DecryptFile(encryptedPath.wstring(), decryptedPath.wstring(),
-                           key.data(), key.size(), &err))
-        << WStringToUtf8(err.message);
+                           key.data(), key.size(), err.get()))
+        << WStringToUtf8(err->message);
     
     std::ifstream ifs(decryptedPath);
     std::string result((std::istreambuf_iterator<char>(ifs)),
@@ -593,12 +614,12 @@ TEST_F(CryptoUtilsTest, EncryptFileWithPassword_Roundtrip) {
     }
     
     ASSERT_TRUE(EncryptFileWithPassword(inputPath.wstring(), encryptedPath.wstring(),
-                                       password, &err))
-        << WStringToUtf8(err.message);
+                                       password, err.get()))
+        << WStringToUtf8(err->message);
     
     ASSERT_TRUE(DecryptFileWithPassword(encryptedPath.wstring(), decryptedPath.wstring(),
-                                       password, &err))
-        << WStringToUtf8(err.message);
+                                       password, err.get()))
+        << WStringToUtf8(err->message);
     
     std::ifstream ifs(decryptedPath);
     std::string result((std::istreambuf_iterator<char>(ifs)),
@@ -614,17 +635,17 @@ TEST_F(CryptoUtilsTest, EncryptFileWithPassword_Roundtrip) {
 TEST_F(CryptoUtilsTest, EncryptString_DecryptString_Roundtrip) {
     SecureRandom rng;
     std::vector<uint8_t> key;
-    ASSERT_TRUE(rng.Generate(key, 32, &err));
+    ASSERT_TRUE(rng.Generate(key, 32, err.get()));
     
     const std::string plaintext = "Secret Message";
     std::string ciphertext;
     
-    ASSERT_TRUE(EncryptString(plaintext, key.data(), key.size(), ciphertext, &err))
-        << WStringToUtf8(err.message);
+    ASSERT_TRUE(EncryptString(plaintext, key.data(), key.size(), ciphertext, err.get()))
+        << WStringToUtf8(err->message);
     
     std::string decrypted;
-    ASSERT_TRUE(DecryptString(ciphertext, key.data(), key.size(), decrypted, &err))
-        << WStringToUtf8(err.message);
+    ASSERT_TRUE(DecryptString(ciphertext, key.data(), key.size(), decrypted, err.get()))
+        << WStringToUtf8(err->message);
     
     EXPECT_EQ(plaintext, decrypted);
 }
@@ -632,13 +653,13 @@ TEST_F(CryptoUtilsTest, EncryptString_DecryptString_Roundtrip) {
 TEST_F(CryptoUtilsTest, EncryptString_EmptyString) {
     SecureRandom rng;
     std::vector<uint8_t> key;
-    ASSERT_TRUE(rng.Generate(key, 32, &err));
+    ASSERT_TRUE(rng.Generate(key, 32, err.get()));
     
     std::string ciphertext;
-    ASSERT_TRUE(EncryptString("", key.data(), key.size(), ciphertext, &err));
+    ASSERT_TRUE(EncryptString("", key.data(), key.size(), ciphertext, err.get()));
     
     std::string decrypted;
-    ASSERT_TRUE(DecryptString(ciphertext, key.data(), key.size(), decrypted, &err));
+    ASSERT_TRUE(DecryptString(ciphertext, key.data(), key.size(), decrypted, err.get()));
     
     EXPECT_EQ(decrypted, "");
 }
@@ -669,7 +690,7 @@ TEST_F(CryptoUtilsTest, CalculateEntropy_KnownPatterns) {
     // Random data - high entropy
     SecureRandom rng;
     std::vector<uint8_t> random;
-    ASSERT_TRUE(rng.Generate(random, 1000, &err));
+    ASSERT_TRUE(rng.Generate(random, 1000, err.get()));
     double entropy2 = CalculateEntropy(random);
     EXPECT_GT(entropy2, 7.5);
 }
@@ -680,7 +701,7 @@ TEST_F(CryptoUtilsTest, HasHighEntropy_Threshold) {
     
     SecureRandom rng;
     std::vector<uint8_t> highEntropy;
-    ASSERT_TRUE(rng.Generate(highEntropy, 1000, &err));
+    ASSERT_TRUE(rng.Generate(highEntropy, 1000, err.get()));
     EXPECT_TRUE(HasHighEntropy(highEntropy.data(), highEntropy.size(), 7.0));
 }
 
@@ -714,9 +735,9 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_ErrorHandling_KeyNotSet) {
     
     EXPECT_FALSE(cipher.Encrypt(
         reinterpret_cast<const uint8_t*>(plaintext.data()),
-        plaintext.size(), ciphertext, &err
+        plaintext.size(), ciphertext, err.get()
     ));
-    EXPECT_EQ(err.win32, ERROR_INVALID_STATE);
+    EXPECT_EQ(err->win32, ERROR_INVALID_STATE);
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_ErrorHandling_KeyNotLoaded) {
@@ -727,7 +748,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_ErrorHandling_KeyNotLoaded) {
     
     EXPECT_FALSE(cipher.Encrypt(
         reinterpret_cast<const uint8_t*>(plaintext.data()),
-        plaintext.size(), ciphertext, RSAPaddingScheme::OAEP_SHA256, &err
+        plaintext.size(), ciphertext, RSAPaddingScheme::OAEP_SHA256, err.get()
     ));
-    EXPECT_EQ(err.win32, ERROR_INVALID_STATE);
+    EXPECT_EQ(err->win32, ERROR_INVALID_STATE);
 }
