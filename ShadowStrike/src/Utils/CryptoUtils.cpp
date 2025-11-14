@@ -1,4 +1,5 @@
-﻿#include "CryptoUtils.hpp"
+﻿
+#include "CryptoUtils.hpp"
 #include "Base64Utils.hpp"
 #include "HashUtils.hpp"
 #include "FileUtils.hpp"
@@ -17,17 +18,29 @@
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
+#ifndef CERT_KEY_CERT_SIGN_KEY_USAGE
+#define CERT_KEY_CERT_SIGN_KEY_USAGE 0x04  // Bit 5 (keyCertSign)
+#endif
+
+
+
+#ifndef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0A00
+#endif
+
 #  include <Windows.h>
-#  include <bcrypt.h>
-#  include <ncrypt.h>
-#  include <wincrypt.h>
+#  include <wincrypt.h>  
 #  include <wintrust.h>
 #  include <softpub.h>
+#  include <bcrypt.h>
+#  include <ncrypt.h>
 #  include <mscat.h>
-#  pragma comment(lib, "bcrypt.lib")
-#  pragma comment(lib, "ncrypt.lib")
+#  include <ntstatus.h>
+
 #  pragma comment(lib, "crypt32.lib")
 #  pragma comment(lib, "wintrust.lib")
+#  pragma comment(lib, "bcrypt.lib")
+#  pragma comment(lib, "ncrypt.lib")
 #endif
 
 namespace ShadowStrike {
@@ -3338,145 +3351,534 @@ namespace ShadowStrike {
 
 			bool Certificate::VerifySignature(const uint8_t* data, size_t dataLen,
 				const uint8_t* signature, size_t signatureLen,
-				Error* err) const noexcept {
+				Error* err) const noexcept
+			{
 #ifdef _WIN32
+				// ═══════════════════════════════════════════════════════════════════
+				//  TIER-1 INPUT VALIDATION
+				// ═══════════════════════════════════════════════════════════════════
 				if (!m_certContext) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"No certificate loaded"; }
+					if (err) {
+						err->win32 = ERROR_INVALID_STATE;
+						err->message = L"No certificate loaded";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"VerifySignature: Certificate context is null");
 					return false;
 				}
-				if (!data || dataLen == 0 || !signature || signatureLen == 0) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid input parameters"; }
+
+				if (!data || dataLen == 0) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Invalid data buffer";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"VerifySignature: Data is null or empty");
 					return false;
 				}
 
-				// Helper RAII wrappers for CryptoAPI handles
-				struct ProvHandle {
-					HCRYPTPROV h = 0;
-					~ProvHandle() { if (h) CryptReleaseContext(h, 0); }
+				if (!signature || signatureLen == 0) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Invalid signature buffer";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"VerifySignature: Signature is null or empty");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  CERTIFICATE VALIDITY CHECKS
+				// ═══════════════════════════════════════════════════════════════════
+				FILETIME now;
+				GetSystemTimeAsFileTime(&now);
+
+				if (CompareFileTime(&now, &m_certContext->pCertInfo->NotBefore) < 0) {
+					if (err) {
+						err->win32 = CERT_E_EXPIRED;
+						err->message = L"Certificate not yet valid";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"Certificate not yet valid");
+					return false;
+				}
+
+				if (CompareFileTime(&now, &m_certContext->pCertInfo->NotAfter) > 0) {
+					if (err) {
+						err->win32 = CERT_E_EXPIRED;
+						err->message = L"Certificate has expired";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"Certificate has expired");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  ALGORITHM DETECTION FROM CERTIFICATE OID
+				// ═══════════════════════════════════════════════════════════════════
+				PCSTR sigOid = m_certContext->pCertInfo->SignatureAlgorithm.pszObjId;
+				if (!sigOid) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Certificate has no signature algorithm OID";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Certificate SignatureAlgorithm OID is null");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  SIGNATURE SCHEME MAPPING (OID → Algorithm)
+				// ═══════════════════════════════════════════════════════════════════
+				enum class SigScheme {
+					RSA_PKCS1v15,  // Legacy (SHA-1/256/384/512)
+					RSA_PSS,       // Modern RSA (RFC 8017)
+					ECDSA,         // Elliptic Curve (P-256/384/521)
+					EdDSA,         // Ed25519/Ed448 (RFC 8032)
+					Unknown
 				};
-				struct HashHandle {
-					HCRYPTHASH h = 0;
-					~HashHandle() { if (h) CryptDestroyHash(h); }
-				};
-				struct KeyHandle {
-					HCRYPTKEY h = 0;
-					~KeyHandle() { if (h) CryptDestroyKey(h); }
+
+				enum class HashAlg {
+					SHA1, SHA256, SHA384, SHA512, Unknown
 				};
 
-				// Map common signature/hash OIDs -> CryptoAPI ALG_ID
-				auto MapOidToAlgId = [](PCSTR oid) -> ALG_ID {
-					if (!oid) return CALG_SHA_256; // safe default
+				auto MapOidToScheme = [](PCSTR oid) -> std::pair<SigScheme, HashAlg> {
+					if (!oid) return { SigScheme::Unknown, HashAlg::Unknown };
 
-					// RSA signature OIDs
-					if (strcmp(oid, "1.2.840.113549.1.1.5") == 0 || // sha1WithRSAEncryption
-						strcmp(oid, "1.3.14.3.2.26") == 0)           // SHA-1
-						return CALG_SHA1;
+					// ✅ RSA PKCS#1 v1.5 (Legacy)
+					if (strcmp(oid, "1.2.840.113549.1.1.5") == 0)  return { SigScheme::RSA_PKCS1v15, HashAlg::SHA1 };   // sha1WithRSAEncryption
+					if (strcmp(oid, "1.2.840.113549.1.1.11") == 0) return { SigScheme::RSA_PKCS1v15, HashAlg::SHA256 }; // sha256WithRSAEncryption
+					if (strcmp(oid, "1.2.840.113549.1.1.12") == 0) return { SigScheme::RSA_PKCS1v15, HashAlg::SHA384 }; // sha384WithRSAEncryption
+					if (strcmp(oid, "1.2.840.113549.1.1.13") == 0) return { SigScheme::RSA_PKCS1v15, HashAlg::SHA512 }; // sha512WithRSAEncryption
 
-					if (strcmp(oid, "1.2.840.113549.1.1.11") == 0 || // sha256WithRSAEncryption
-						strcmp(oid, "2.16.840.1.101.3.4.2.1") == 0)   // SHA-256
-						return CALG_SHA_256;
+					// ✅ RSA-PSS (Modern)
+					if (strcmp(oid, "1.2.840.113549.1.1.10") == 0) return { SigScheme::RSA_PSS, HashAlg::SHA256 }; // RSASSA-PSS
 
-					if (strcmp(oid, "1.2.840.113549.1.1.12") == 0 || // sha384WithRSAEncryption
-						strcmp(oid, "2.16.840.1.101.3.4.2.2") == 0)   // SHA-384
-						return CALG_SHA_384;
+					// ✅ ECDSA (Industry Standard)
+					if (strcmp(oid, "1.2.840.10045.4.3.1") == 0) return { SigScheme::ECDSA, HashAlg::SHA1 };   // ecdsa-with-SHA1
+					if (strcmp(oid, "1.2.840.10045.4.3.2") == 0) return { SigScheme::ECDSA, HashAlg::SHA256 }; // ecdsa-with-SHA256
+					if (strcmp(oid, "1.2.840.10045.4.3.3") == 0) return { SigScheme::ECDSA, HashAlg::SHA384 }; // ecdsa-with-SHA384
+					if (strcmp(oid, "1.2.840.10045.4.3.4") == 0) return { SigScheme::ECDSA, HashAlg::SHA512 }; // ecdsa-with-SHA512
 
-					if (strcmp(oid, "1.2.840.113549.1.1.13") == 0 || // sha512WithRSAEncryption
-						strcmp(oid, "2.16.840.1.101.3.4.2.3") == 0)   // SHA-512
-						return CALG_SHA_512;
+					// ✅ EdDSA (Emerging Standard)
+					if (strcmp(oid, "1.3.101.112") == 0) return { SigScheme::EdDSA, HashAlg::Unknown }; // Ed25519
+					if (strcmp(oid, "1.3.101.113") == 0) return { SigScheme::EdDSA, HashAlg::Unknown }; // Ed448
 
-					// ECDSA OIDs
-					if (strcmp(oid, "1.2.840.10045.4.3.2") == 0) return CALG_SHA_256; // ecdsa-with-SHA256
-					if (strcmp(oid, "1.2.840.10045.4.3.3") == 0) return CALG_SHA_384; // ecdsa-with-SHA384
-					if (strcmp(oid, "1.2.840.10045.4.3.4") == 0) return CALG_SHA_512; // ecdsa-with-SHA512
-
-					return CALG_SHA_256; // fallback
+					return { SigScheme::Unknown, HashAlg::Unknown };
 					};
 
-				PCSTR sigOid = m_certContext->pCertInfo->SignatureAlgorithm.pszObjId;
-				ALG_ID hashAlgId = MapOidToAlgId(sigOid);
+				auto [scheme, hashAlg] = MapOidToScheme(sigOid);
 
-				ProvHandle prov;
-				HashHandle hash;
-				KeyHandle pubKey;
-				bool success = false;
-
-				// Acquire context
-				if (!CryptAcquireContextW(&prov.h, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-					if (err) { err->win32 = GetLastError(); err->message = L"CryptAcquireContext failed"; }
+				if (scheme == SigScheme::Unknown) {
+					if (err) {
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Unsupported signature algorithm OID";
+						wchar_t tmp[128];
+						swprintf_s(tmp, L"OID: %S", sigOid);
+						err->context = tmp;
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Unsupported signature OID: %S", sigOid);
 					return false;
 				}
 
-				// Create hash
-				if (!CryptCreateHash(prov.h, hashAlgId, 0, 0, &hash.h)) {
-					if (err) { err->win32 = GetLastError(); err->message = L"CryptCreateHash failed"; }
+				// ═══════════════════════════════════════════════════════════════════
+				//  EXTRACT PUBLIC KEY FROM CERTIFICATE
+				// ═══════════════════════════════════════════════════════════════════
+				PCERT_PUBLIC_KEY_INFO pPublicKeyInfo = &m_certContext->pCertInfo->SubjectPublicKeyInfo;
+				if (!pPublicKeyInfo->PublicKey.pbData || pPublicKeyInfo->PublicKey.cbData == 0) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Certificate has no public key";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Certificate public key is empty");
 					return false;
 				}
 
-				// Hash input
-				if (!CryptHashData(hash.h, data, static_cast<DWORD>(dataLen), 0)) {
-					if (err) { err->win32 = GetLastError(); err->message = L"CryptHashData failed"; }
+				// ═══════════════════════════════════════════════════════════════════
+				//  SIGNATURE LENGTH VALIDATION (DoS Protection)
+				// ═══════════════════════════════════════════════════════════════════
+				const DWORD pubKeyBits = pPublicKeyInfo->PublicKey.cbData * 8;
+
+				size_t expectedMinSigLen = 0;
+				size_t expectedMaxSigLen = 0;
+
+				if (scheme == SigScheme::RSA_PKCS1v15 || scheme == SigScheme::RSA_PSS) {
+					// RSA: signature length ≈ key size (in bytes)
+					expectedMinSigLen = (pubKeyBits / 8) - 16; // tolerance
+					expectedMaxSigLen = (pubKeyBits / 8) + 16;
+				}
+				else if (scheme == SigScheme::ECDSA) {
+					// ECDSA: signature length ≈ 2 × curve size (r + s)
+					expectedMinSigLen = (pubKeyBits / 8) * 2 - 16;
+					expectedMaxSigLen = (pubKeyBits / 8) * 2 + 128; // ASN.1 encoding overhead
+				}
+				else if (scheme == SigScheme::EdDSA) {
+					// EdDSA: fixed signature sizes
+					expectedMinSigLen = 64;  // Ed25519
+					expectedMaxSigLen = 114; // Ed448
+				}
+
+				if (signatureLen < expectedMinSigLen || signatureLen > expectedMaxSigLen) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Signature length does not match key size";
+						wchar_t tmp[256];
+						swprintf_s(tmp, L"Expected: %zu-%zu bytes, Got: %zu bytes",
+							expectedMinSigLen, expectedMaxSigLen, signatureLen);
+						err->context = tmp;
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Invalid signature length: %zu (expected %zu-%zu)",
+						signatureLen, expectedMinSigLen, expectedMaxSigLen);
 					return false;
 				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  HASH ALGORITHM MAPPING (HashAlg → BCrypt Algorithm)
+				// ═══════════════════════════════════════════════════════════════════
+				auto MapHashAlgToBCrypt = [](HashAlg alg) -> const wchar_t* {
+					switch (alg) {
+					case HashAlg::SHA1:   return BCRYPT_SHA1_ALGORITHM;
+					case HashAlg::SHA256: return BCRYPT_SHA256_ALGORITHM;
+					case HashAlg::SHA384: return BCRYPT_SHA384_ALGORITHM;
+					case HashAlg::SHA512: return BCRYPT_SHA512_ALGORITHM;
+					default: return nullptr;
+					}
+					};
+
+				const wchar_t* bcryptHashAlg = MapHashAlgToBCrypt(hashAlg);
+				if (!bcryptHashAlg && scheme != SigScheme::EdDSA) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Unsupported hash algorithm";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Unsupported hash algorithm: %d", static_cast<int>(hashAlg));
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  COMPUTE MESSAGE HASH (SHA-256/384/512)
+				// ═══════════════════════════════════════════════════════════════════
+				std::vector<uint8_t> messageHash;
+
+				if (scheme != SigScheme::EdDSA) { // EdDSA hashes internally
+					BCRYPT_ALG_HANDLE hHashAlg = nullptr;
+					NTSTATUS st = BCryptOpenAlgorithmProvider(&hHashAlg, bcryptHashAlg, nullptr, 0);
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"Failed to open hash algorithm provider";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: 0x%08X", st);
+						return false;
+					}
+
+					// RAII cleanup
+					struct HashProviderCleanup {
+						BCRYPT_ALG_HANDLE h;
+						~HashProviderCleanup() { if (h) BCryptCloseAlgorithmProvider(h, 0); }
+					} hashProvCleanup{ hHashAlg };
+
+					DWORD hashLen = 0, cbResult = 0;
+					st = BCryptGetProperty(hHashAlg, BCRYPT_HASH_LENGTH,
+						reinterpret_cast<PUCHAR>(&hashLen), sizeof(hashLen), &cbResult, 0);
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"Failed to get hash length";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptGetProperty HASH_LENGTH failed: 0x%08X", st);
+						return false;
+					}
+
+					messageHash.resize(hashLen);
+
+					st = BCryptHash(hHashAlg, nullptr, 0,
+						const_cast<uint8_t*>(data), static_cast<ULONG>(dataLen),
+						messageHash.data(), static_cast<ULONG>(messageHash.size()));
+					if (st < 0) {
+						if (err) {
+							err->ntstatus = st;
+							err->win32 = RtlNtStatusToDosError(st);
+							err->message = L"Hash computation failed";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"BCryptHash failed: 0x%08X", st);
+						return false;
+					}
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  IMPORT PUBLIC KEY INTO CNG (Modern BCrypt API)
+				// ═══════════════════════════════════════════════════════════════════
+				const wchar_t* keyAlgName = nullptr;
+				const wchar_t* blobType = nullptr;
+
+				if (scheme == SigScheme::RSA_PKCS1v15 || scheme == SigScheme::RSA_PSS) {
+					keyAlgName = BCRYPT_RSA_ALGORITHM;
+					blobType = BCRYPT_RSAPUBLIC_BLOB;
+				}
+				else if (scheme == SigScheme::ECDSA) {
+					// Detect ECC curve from certificate
+					PCSTR keyOid = pPublicKeyInfo->Algorithm.pszObjId;
+					if (strcmp(keyOid, "1.2.840.10045.2.1") == 0) { // id-ecPublicKey
+						// Curve is in Algorithm.Parameters
+						keyAlgName = BCRYPT_ECDSA_P256_ALGORITHM; // Default (detect below if needed)
+					}
+					blobType = BCRYPT_ECCPUBLIC_BLOB;
+				}
+				else if (scheme == SigScheme::EdDSA) {
+					keyAlgName = L"EdDSA"; // Not natively supported by BCrypt (requires custom impl)
+					blobType = L"EdDSA";
+				}
+
+				if (!keyAlgName) {
+					if (err) {
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Unsupported key algorithm";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Unsupported key algorithm for scheme: %d", static_cast<int>(scheme));
+					return false;
+				}
+
+				BCRYPT_ALG_HANDLE hKeyAlg = nullptr;
+				NTSTATUS st = BCryptOpenAlgorithmProvider(&hKeyAlg, keyAlgName, nullptr, 0);
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Failed to open key algorithm provider";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider (key) failed: 0x%08X", st);
+					return false;
+				}
+
+				// RAII cleanup
+				struct KeyProviderCleanup {
+					BCRYPT_ALG_HANDLE h;
+					~KeyProviderCleanup() { if (h) BCryptCloseAlgorithmProvider(h, 0); }
+				} keyProvCleanup{ hKeyAlg };
 
 				// Import public key from certificate
-				PCERT_PUBLIC_KEY_INFO pPublicKeyInfo = &m_certContext->pCertInfo->SubjectPublicKeyInfo;
-				if (!CryptImportPublicKeyInfo(prov.h, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-					pPublicKeyInfo, &pubKey.h)) {
-					if (err) { err->win32 = GetLastError(); err->message = L"CryptImportPublicKeyInfo failed"; }
+				BCRYPT_KEY_HANDLE hPubKey = nullptr;
+				st = BCryptImportKeyPair(hKeyAlg, nullptr, blobType, &hPubKey,
+					pPublicKeyInfo->PublicKey.pbData, pPublicKeyInfo->PublicKey.cbData, 0);
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Failed to import public key";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptImportKeyPair failed: 0x%08X", st);
 					return false;
 				}
 
-				// Verify signature
-				if (CryptVerifySignature(hash.h, signature, static_cast<DWORD>(signatureLen),
-					pubKey.h, nullptr, 0)) {
-					success = true;
+				// RAII cleanup
+				struct KeyCleanup {
+					BCRYPT_KEY_HANDLE h;
+					~KeyCleanup() { if (h) BCryptDestroyKey(h); }
+				} keyCleanup{ hPubKey };
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  SIGNATURE VERIFICATION (Modern CNG API)
+				// ═══════════════════════════════════════════════════════════════════
+				DWORD flags = 0;
+				void* paddingInfo = nullptr;
+
+				BCRYPT_PKCS1_PADDING_INFO pkcs1Info{};
+				BCRYPT_PSS_PADDING_INFO pssInfo{};
+
+				if (scheme == SigScheme::RSA_PKCS1v15) {
+					pkcs1Info.pszAlgId = bcryptHashAlg;
+					paddingInfo = &pkcs1Info;
+					flags = BCRYPT_PAD_PKCS1;
 				}
-				else {
-					DWORD dwErr = GetLastError();
-					if (err) {
-						err->win32 = dwErr;
-						err->message = (dwErr == NTE_BAD_SIGNATURE) ?
-							L"Signature verification failed - invalid signature" :
-							L"CryptVerifySignature failed";
-					}
-					success = false;
+				else if (scheme == SigScheme::RSA_PSS) {
+					pssInfo.pszAlgId = bcryptHashAlg;
+					pssInfo.cbSalt = static_cast<ULONG>(messageHash.size()); // Standard salt length
+					paddingInfo = &pssInfo;
+					flags = BCRYPT_PAD_PSS;
 				}
 
-				// RAII handles clean up automatically
-				return success;
+				st = BCryptVerifySignature(hPubKey, paddingInfo,
+					messageHash.data(), static_cast<ULONG>(messageHash.size()),
+					const_cast<uint8_t*>(signature), static_cast<ULONG>(signatureLen), flags);
+
+				if (st == 0) {
+					SS_LOG_INFO(L"CryptoUtils", L"Signature verified successfully (Scheme: %d, Hash: %d)",
+						static_cast<int>(scheme), static_cast<int>(hashAlg));
+					return true;
+				}
+				else if (st == STATUS_INVALID_SIGNATURE) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Invalid signature - verification failed";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"Signature verification failed: Invalid signature");
+					return false;
+				}
+				else {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Signature verification failed";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptVerifySignature failed: 0x%08X", st);
+					return false;
+				}
+
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) {
+					err->win32 = ERROR_NOT_SUPPORTED;
+					err->message = L"Platform not supported";
+				}
 				return false;
 #endif
 			}
 
-			bool Certificate::VerifyChain(Error* err) const noexcept {
+
+			bool Certificate::VerifyChain(Error* err,
+				HCERTSTORE hAdditionalStore /*= nullptr*/,
+				DWORD chainFlags /*= CERT_CHAIN_REVOCATION_CHECK_CHAIN*/,
+				 FILETIME* verificationTime /*= nullptr*/,
+				const char* requiredEkuOid /*= nullptr*/) const noexcept
+			{
 #ifdef _WIN32
+				auto setErr = [&](DWORD code, const wchar_t* msg) {
+					if (err) { err->win32 = code; err->message = msg; }
+					};
+
 				if (!m_certContext) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"No certificate loaded"; }
+					setErr(ERROR_INVALID_STATE, L"No certificate loaded");
 					return false;
 				}
 
-				CERT_CHAIN_PARA chainPara = {};
+				// Chain parameters
+				CERT_CHAIN_PARA chainPara{};
 				chainPara.cbSize = sizeof(chainPara);
 
+				// Optionally require EKU (e.g., szOID_PKIX_KP_CODE_SIGNING)
+				CERT_USAGE_MATCH usageMatch{};
+				CERT_ENHKEY_USAGE enhUsage{};
+				PCERT_ENHKEY_USAGE pEnhUsage = nullptr;
+
+				if (requiredEkuOid && *requiredEkuOid) {
+					LPCSTR oids[1] = { requiredEkuOid };
+					enhUsage.cUsageIdentifier = 1;
+					enhUsage.rgpszUsageIdentifier = const_cast<LPSTR*>(oids);
+
+					usageMatch.dwType = USAGE_MATCH_TYPE_AND;
+					usageMatch.Usage = enhUsage;
+
+					chainPara.RequestedUsage = usageMatch;
+					pEnhUsage = &enhUsage;
+				}
+
+				// Build chain
 				PCCERT_CHAIN_CONTEXT pChainContext = nullptr;
-				BOOL ok = CertGetCertificateChain(nullptr, m_certContext, nullptr, nullptr, &chainPara, 0, nullptr, &pChainContext);
+
+				// Default flags: revocation check entire chain; if network unavailable, fall back to cache-only
+				DWORD flags = chainFlags;
+				if (flags == 0) {
+					flags = CERT_CHAIN_REVOCATION_CHECK_CHAIN;
+				}
+
+				BOOL ok = CertGetCertificateChain(
+					nullptr,                       // default chain engine
+					m_certContext,                 // leaf certificate
+					verificationTime,              // verification time (nullptr → current)
+					hAdditionalStore,              // additional stores (intermediates)
+					&chainPara,                    // parameters (EKU etc.)
+					flags,                         // chain building flags
+					nullptr,                       // reserved
+					&pChainContext                 // out
+				);
 
 				if (!ok || !pChainContext) {
-					if (err) { err->win32 = GetLastError(); err->message = L"CertGetCertificateChain failed"; }
+					setErr(GetLastError(), L"CertGetCertificateChain failed");
 					return false;
 				}
 
-				bool valid = (pChainContext->TrustStatus.dwErrorStatus == CERT_TRUST_NO_ERROR);
-				CertFreeCertificateChain(pChainContext);
+				// RAII cleanup
+				struct ChainCleanup {
+					PCCERT_CHAIN_CONTEXT c;
+					~ChainCleanup() { if (c) CertFreeCertificateChain(c); }
+				} _cleanup{ pChainContext };
 
-				if (!valid && err) {
-					err->win32 = ERROR_INVALID_DATA;
-					err->message = L"Certificate chain verification failed";
+				// Helper to enrich error details
+				auto analyzeTrustStatus = [&](const CERT_TRUST_STATUS& ts, std::wstring& outMsg) -> DWORD {
+					DWORD code = ERROR_INVALID_DATA;
+					std::wstringstream ss;
+					ss << L"Chain trust errors:";
+
+					if (ts.dwErrorStatus == CERT_TRUST_NO_ERROR) {
+						outMsg = L"Certificate chain is valid";
+						return ERROR_SUCCESS;
+					}
+
+					if (ts.dwErrorStatus & CERT_TRUST_IS_REVOKED) { ss << L" REVOKED"; code = CRYPT_E_REVOKED; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT) { ss << L" UNTRUSTED_ROOT"; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_PARTIAL_CHAIN) { ss << L" PARTIAL_CHAIN"; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_NOT_TIME_VALID) { ss << L" NOT_TIME_VALID"; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_NOT_TIME_NESTED) { ss << L" NOT_TIME_NESTED"; }
+					if (ts.dwErrorStatus & CERT_TRUST_REVOCATION_STATUS_UNKNOWN) { ss << L" REVOCATION_UNKNOWN"; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_CYCLIC) { ss << L" CYCLIC"; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_EXPLICIT_DISTRUST) { ss << L" EXPLICIT_DISTRUST"; code = ERROR_ACCESS_DENIED; }
+					if (ts.dwErrorStatus & CERT_TRUST_HAS_NOT_SUPPORTED_NAME_CONSTRAINT) { ss << L" NAME_CONSTRAINT_NOT_SUPPORTED"; }
+					if (ts.dwErrorStatus & CERT_TRUST_HAS_NOT_DEFINED_NAME_CONSTRAINT) { ss << L" NAME_CONSTRAINT_NOT_DEFINED"; }
+					if (ts.dwErrorStatus & CERT_TRUST_HAS_NOT_PERMITTED_NAME_CONSTRAINT) { ss << L" NAME_CONSTRAINT_NOT_PERMITTED"; }
+					if (ts.dwErrorStatus & CERT_TRUST_HAS_EXCLUDED_NAME_CONSTRAINT) { ss << L" NAME_CONSTRAINT_EXCLUDED"; }
+					if (ts.dwErrorStatus & CERT_TRUST_IS_OFFLINE_REVOCATION) { ss << L" OFFLINE_REVOCATION"; }
+					if (ts.dwErrorStatus & CERT_TRUST_NO_ISSUANCE_CHAIN_POLICY) { ss << L" NO_ISSUANCE_CHAIN_POLICY"; }
+
+					// Info status (not fatal by itself, but good to log)
+					if (ts.dwInfoStatus & CERT_TRUST_IS_SELF_SIGNED) { ss << L" (INFO: SELF_SIGNED)"; }
+					if (ts.dwInfoStatus & CERT_TRUST_HAS_EXACT_MATCH_ISSUER) { ss << L" (INFO: EXACT_MATCH_ISSUER)"; }
+					if (ts.dwInfoStatus & CERT_TRUST_HAS_KEY_MATCH_ISSUER) { ss << L" (INFO: KEY_MATCH_ISSUER)"; }
+					if (ts.dwInfoStatus & CERT_TRUST_HAS_NAME_MATCH_ISSUER) { ss << L" (INFO: NAME_MATCH_ISSUER)"; }
+					if (ts.dwInfoStatus & CERT_TRUST_IS_COMPLEX_CHAIN) { ss << L" (INFO: COMPLEX_CHAIN)"; }
+					outMsg = ss.str();
+					return code;
+					};
+
+				// Evaluate overall chain trust
+				const CERT_TRUST_STATUS& trust = pChainContext->TrustStatus;
+
+				if (trust.dwErrorStatus == CERT_TRUST_NO_ERROR) {
+					// Optional: enforce EKU (even if chain says OK, ensure leaf has EKU we asked)
+					if (requiredEkuOid && *requiredEkuOid) {
+						// Walk simple chain[0] (leaf)
+						if (pChainContext->cChain > 0 && pChainContext->rgpChain[0]->cElement > 0) {
+							auto leaf = pChainContext->rgpChain[0]->rgpElement[0]->pCertContext;
+							// Try to find required EKU in leaf
+							PCERT_ENHKEY_USAGE pLeafUsage = nullptr;
+							DWORD cbUsage = 0;
+							if (CertGetEnhancedKeyUsage(leaf, 0, nullptr, &cbUsage) && cbUsage >= sizeof(CERT_ENHKEY_USAGE)) {
+								pLeafUsage = (PCERT_ENHKEY_USAGE)LocalAlloc(LPTR, cbUsage);
+								if (pLeafUsage && CertGetEnhancedKeyUsage(leaf, 0, pLeafUsage, &cbUsage)) {
+									bool found = false;
+									for (DWORD i = 0; i < pLeafUsage->cUsageIdentifier; ++i) {
+										if (pLeafUsage->rgpszUsageIdentifier[i] &&
+											std::strcmp(pLeafUsage->rgpszUsageIdentifier[i], requiredEkuOid) == 0) {
+											found = true; break;
+										}
+									}
+									LocalFree(pLeafUsage);
+									if (!found) {
+										setErr(ERROR_INVALID_DATA, L"Leaf certificate EKU does not include required usage");
+										return false;
+									}
+								}
+								else if (pLeafUsage) {
+									LocalFree(pLeafUsage);
+								}
+							}
+						}
+					}
+					return true;
 				}
 
-				return valid;
+				// Chain not valid → analyze and return detailed error
+				std::wstring msg;
+				DWORD code = analyzeTrustStatus(trust, msg);
+				setErr(code, msg.c_str());
+				return false;
+
 #else
 				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
 				return false;
@@ -3485,268 +3887,980 @@ namespace ShadowStrike {
 
 			bool Certificate::VerifyAgainstCA(const Certificate& caCert, Error* err) const noexcept {
 #ifdef _WIN32
-				
-
+				// ═══════════════════════════════════════════════════════════════════
+				//  TIER-1 STATE VALIDATION
+				// ═══════════════════════════════════════════════════════════════════
 				if (!m_certContext) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Subject certificate not loaded"; }
-					return false;
-				}
-				if (!caCert.m_certContext) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"CA certificate not loaded"; }
-					return false;
-				}
-
-				// ✅ Verify CA certificate is actually a CA (basicConstraints.cA = TRUE)
-				PCERT_EXTENSION pExt = CertFindExtension(
-					szOID_BASIC_CONSTRAINTS2,
-				 caCert.m_certContext->pCertInfo->cExtension,
-				 caCert.m_certContext->pCertInfo->rgExtension);
-
-				if (!pExt) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"CA certificate missing basicConstraints extension"; }
-					return false;
-				}
-
-				// ✅ Verify subject's issuer matches CA's subject (chain continuity)
-				DWORD caSubjectSize = CertNameToStrW(
-					X509_ASN_ENCODING,
-					&caCert.m_certContext->pCertInfo->Subject,
-					CERT_X500_NAME_STR,
-					nullptr, 0);
-
-				if (caSubjectSize == 0) {
-					if (err) { err->win32 = GetLastError(); err->message = L"Failed to get CA subject name"; }
-					return false;
-				}
-
-				std::wstring caSubjectName(caSubjectSize, L'\0');
-				CertNameToStrW(
-					X509_ASN_ENCODING,
-					&caCert.m_certContext->pCertInfo->Subject,
-					CERT_X500_NAME_STR,
-					&caSubjectName[0], caSubjectSize);
-				caSubjectName.pop_back(); // Remove null terminator
-
-				DWORD certIssuerSize = CertNameToStrW(
-					X509_ASN_ENCODING,
-					&m_certContext->pCertInfo->Issuer,
-					CERT_X500_NAME_STR,
-					nullptr, 0);
-
-				if (certIssuerSize == 0) {
-					if (err) { err->win32 = GetLastError(); err->message = L"Failed to get subject's issuer name"; }
-					return false;
-				}
-
-				std::wstring certIssuerName(certIssuerSize, L'\0');
-				CertNameToStrW(
-					X509_ASN_ENCODING,
-					&m_certContext->pCertInfo->Issuer,
-					CERT_X500_NAME_STR,
-					&certIssuerName[0], certIssuerSize);
-				certIssuerName.pop_back();
-
-				if (caSubjectName != certIssuerName) {
 					if (err) {
-						err->win32 = ERROR_INVALID_DATA;
-						err->message = L"Certificate issuer does not match CA certificate subject";
-						err->context = L"Chain broken: issuer name mismatch";
+						err->win32 = ERROR_INVALID_STATE;
+						err->message = L"No certificate loaded (leaf context is null)";
 					}
+					SS_LOG_ERROR(L"CryptoUtils", L"VerifyAgainstCA: Leaf certificate context is null");
 					return false;
 				}
 
-				// ✅ Verify CA certificate validity (time checks)
+				if (!caCert.m_certContext) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"CA certificate is not loaded (CA context is null)";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"VerifyAgainstCA: CA certificate context is null");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 1: CERTIFICATE VALIDITY TIME CHECKS
+				// ═══════════════════════════════════════════════════════════════════
 				FILETIME now;
 				GetSystemTimeAsFileTime(&now);
 
+				// Leaf certificate time validation
+				if (CompareFileTime(&now, &m_certContext->pCertInfo->NotBefore) < 0) {
+					if (err) {
+						err->win32 = CERT_E_EXPIRED;
+						err->message = L"Leaf certificate is not yet valid";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"Leaf certificate not yet valid");
+					return false;
+				}
+
+				if (CompareFileTime(&now, &m_certContext->pCertInfo->NotAfter) > 0) {
+					if (err) {
+						err->win32 = CERT_E_EXPIRED;
+						err->message = L"Leaf certificate has expired";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"Leaf certificate expired");
+					return false;
+				}
+
+				// CA certificate time validation
 				if (CompareFileTime(&now, &caCert.m_certContext->pCertInfo->NotBefore) < 0) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"CA certificate not yet valid"; }
+					if (err) {
+						err->win32 = CERT_E_EXPIRED;
+						err->message = L"CA certificate is not yet valid";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"CA certificate not yet valid");
 					return false;
 				}
+
 				if (CompareFileTime(&now, &caCert.m_certContext->pCertInfo->NotAfter) > 0) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"CA certificate has expired"; }
+					if (err) {
+						err->win32 = CERT_E_EXPIRED;
+						err->message = L"CA certificate has expired";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"CA certificate expired");
 					return false;
 				}
 
-				// ✅ CRITICAL: Verify signature using CertVerifyCertificateChainPolicy (Windows best practice)
-				// Build certificate chain with CA as trust anchor
-				CERT_CHAIN_PARA chainPara = {};
-				chainPara.cbSize = sizeof(chainPara);
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 2: CA CERTIFICATE VALIDATION (BasicConstraints)
+				// ═══════════════════════════════════════════════════════════════════
+				PCERT_EXTENSION pBasicConstraintsExt = CertFindExtension(
+					szOID_BASIC_CONSTRAINTS2,
+					caCert.m_certContext->pCertInfo->cExtension,
+					caCert.m_certContext->pCertInfo->rgExtension
+				);
 
-				PCCERT_CHAIN_CONTEXT pChainContext = nullptr;
-				BOOL chainOk = CertGetCertificateChain(
-					nullptr,                              // hChainEngine (use default)
-					m_certContext,                        // pCertContext (subject cert)
-					nullptr,                              // pTime (current time)
-					caCert.m_certContext->hCertStore,    // hAdditionalStore (CA cert store)
-					&chainPara,                          // pChainPara
-					CERT_CHAIN_RETURN_LOWER_QUALITY_CONTEXTS, // dwFlags
-					nullptr,                             // pvReserved
-					&pChainContext);                     // ppChainContext
+				if (!pBasicConstraintsExt) {
+					// Fallback to old OID (X.509v1/v2 compatibility)
+					pBasicConstraintsExt = CertFindExtension(
+						szOID_BASIC_CONSTRAINTS,
+						caCert.m_certContext->pCertInfo->cExtension,
+						caCert.m_certContext->pCertInfo->rgExtension
+					);
+				}
 
-				if (!chainOk || !pChainContext) {
+				if (!pBasicConstraintsExt) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"CA certificate lacks BasicConstraints extension";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"CA certificate missing BasicConstraints extension");
+					return false;
+				}
+
+				CERT_BASIC_CONSTRAINTS2_INFO constraintsInfo{};
+				DWORD cbConstraints = sizeof(constraintsInfo);
+
+				if (!CryptDecodeObjectEx(
+					X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+					szOID_BASIC_CONSTRAINTS2,
+					pBasicConstraintsExt->Value.pbData,
+					pBasicConstraintsExt->Value.cbData,
+					0,
+					nullptr,
+					&constraintsInfo,
+					&cbConstraints))
+				{
 					if (err) {
 						err->win32 = GetLastError();
-						err->message = L"Failed to build certificate chain";
+						err->message = L"Failed to decode CA BasicConstraints extension";
 					}
+					SS_LOG_ERROR(L"CryptoUtils", L"CryptDecodeObjectEx failed for BasicConstraints: 0x%08X", GetLastError());
 					return false;
 				}
 
-				// Verify the chain against policy
-				CERT_CHAIN_POLICY_PARA policyPara = {};
-				policyPara.cbSize = sizeof(policyPara);
-				policyPara.dwFlags = 0;
-
-				CERT_CHAIN_POLICY_STATUS policyStatus = {};
-				policyStatus.cbSize = sizeof(policyStatus);
-
-				BOOL policyOk = CertVerifyCertificateChainPolicy(
-					CERT_CHAIN_POLICY_BASE,  // pszPolicyOID
-					pChainContext,                   // pChainContext
-					&policyPara,                     // pPolicyPara
-					&policyStatus);                  // pPolicyStatus
-
-				CertFreeCertificateChain(pChainContext);
-
-				if (!policyOk || policyStatus.dwError != 0) {
+				// Verify CA flag is set
+				if (!constraintsInfo.fCA) {
 					if (err) {
-						err->win32 = policyStatus.dwError;
-						err->message = L"Certificate chain policy verification failed";
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"CA certificate is not marked as CA (fCA=FALSE)";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"CA certificate fCA flag is FALSE");
+					return false;
+				}
 
-						// Provide detailed error context
-						switch (policyStatus.dwError) {
-						case CERT_E_EXPIRED:
-							err->context = L"Certificate or CA certificate has expired";
-							break;
-						case CERT_E_UNTRUSTEDROOT:
-							err->context = L"CA certificate is not trusted";
-							break;
-						case CERT_E_CHAINING:
-							err->context = L"Certificate chain is broken";
-							break;
-						case CERT_E_INVALID_NAME:
-							err->context = L"Certificate name validation failed";
-							break;
-						default:
-							err->context = L"Certificate chain verification failed (unspecified error)";
-							break;
+				// Verify pathLenConstraint (if present)
+				if (constraintsInfo.fPathLenConstraint) {
+					// For direct issuer, pathLen should allow at least 0
+					if (constraintsInfo.dwPathLenConstraint < 0) {
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"CA certificate path length constraint violated";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"CA pathLenConstraint too restrictive");
+						return false;
+					}
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 3: KEY USAGE VALIDATION (CA must have keyCertSign)
+				// ═══════════════════════════════════════════════════════════════════
+				PCERT_EXTENSION pKeyUsageExt = CertFindExtension(
+					szOID_KEY_USAGE,
+					caCert.m_certContext->pCertInfo->cExtension,
+					caCert.m_certContext->pCertInfo->rgExtension
+				);
+
+				if (pKeyUsageExt) {
+					CRYPT_BIT_BLOB keyUsage{};
+					DWORD cbKeyUsage = sizeof(keyUsage);
+
+					if (CryptDecodeObjectEx(
+						X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+						X509_KEY_USAGE,
+						pKeyUsageExt->Value.pbData,
+						pKeyUsageExt->Value.cbData,
+						CRYPT_DECODE_ALLOC_FLAG,
+						nullptr,
+						&keyUsage,
+						&cbKeyUsage))
+					{
+						// RAII cleanup for decoded blob
+						struct KeyUsageCleanup {
+							CRYPT_BIT_BLOB* p;
+							~KeyUsageCleanup() { if (p && p->pbData) LocalFree(p->pbData); }
+						} cleanup{ &keyUsage };
+			
+						bool hasKeyCertSign = false;
+						if (keyUsage.pbData && keyUsage.cbData > 0) {
+							hasKeyCertSign = (keyUsage.pbData[0] & CERT_KEY_CERT_SIGN_KEY_USAGE) != 0;
+						}
+
+						if (!hasKeyCertSign) {
+							if (err) {
+								err->win32 = CERT_E_WRONG_USAGE;
+								err->message = L"CA certificate lacks keyCertSign usage";
+							}
+							SS_LOG_ERROR(L"CryptoUtils", L"CA certificate missing keyCertSign flag");
+							return false;
 						}
 					}
-					SS_LOG_ERROR(L"CryptoUtils", L"Certificate chain policy verification failed: 0x%08X", policyStatus.dwError);
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 4: ISSUER-SUBJECT NAME MATCHING (Cryptographic Chain Validation)
+				// ═══════════════════════════════════════════════════════════════════
+				CERT_NAME_BLOB& leafIssuerName = m_certContext->pCertInfo->Issuer;
+				CERT_NAME_BLOB& caSubjectName = caCert.m_certContext->pCertInfo->Subject;
+
+				if (leafIssuerName.cbData == 0 || !leafIssuerName.pbData) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Leaf certificate has no issuer name";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Leaf issuer name is empty");
 					return false;
 				}
 
-				SS_LOG_INFO(L"CryptoUtils", L"Certificate successfully verified against CA");
-				return true;
+				if (caSubjectName.cbData == 0 || !caSubjectName.pbData) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"CA certificate has no subject name";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"CA subject name is empty");
+					return false;
+				}
+
+				// Exact byte-for-byte comparison (DER-encoded distinguished names)
+				if (leafIssuerName.cbData != caSubjectName.cbData ||
+					!SecureCompare(leafIssuerName.pbData, caSubjectName.pbData, leafIssuerName.cbData))
+				{
+					if (err) {
+						err->win32 = CERT_E_ISSUERCHAINING;
+						err->message = L"Issuer-Subject name mismatch (not issued by provided CA)";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Issuer-Subject DN mismatch");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 5: AUTHORITY KEY IDENTIFIER VALIDATION (AKI-SKI Matching)
+				// ═══════════════════════════════════════════════════════════════════
+				PCERT_EXTENSION pAKIExt = CertFindExtension(
+					szOID_AUTHORITY_KEY_IDENTIFIER2,
+					m_certContext->pCertInfo->cExtension,
+					m_certContext->pCertInfo->rgExtension
+				);
+
+				if (!pAKIExt) {
+					// Fallback to old AKI OID
+					pAKIExt = CertFindExtension(
+						szOID_AUTHORITY_KEY_IDENTIFIER,
+						m_certContext->pCertInfo->cExtension,
+						m_certContext->pCertInfo->rgExtension
+					);
+				}
+
+				PCERT_EXTENSION pSKIExt = CertFindExtension(
+					szOID_SUBJECT_KEY_IDENTIFIER,
+					caCert.m_certContext->pCertInfo->cExtension,
+					caCert.m_certContext->pCertInfo->rgExtension
+				);
+
+				if (pAKIExt && pSKIExt) {
+					// Decode AKI
+					CERT_AUTHORITY_KEY_ID2_INFO* pAKI = nullptr;
+					DWORD cbAKI = 0;
+
+					if (CryptDecodeObjectEx(
+						X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+						X509_AUTHORITY_KEY_ID2,
+						pAKIExt->Value.pbData,
+						pAKIExt->Value.cbData,
+						CRYPT_DECODE_ALLOC_FLAG,
+						nullptr,
+						&pAKI,
+						&cbAKI))
+					{
+						// RAII cleanup
+						struct AKICleanup {
+							CERT_AUTHORITY_KEY_ID2_INFO* p;
+							~AKICleanup() { if (p) LocalFree(p); }
+						} akiCleanup{ pAKI };
+
+						// Decode SKI
+						CRYPT_DATA_BLOB* pSKI = nullptr;
+						DWORD cbSKI = 0;
+
+						if (CryptDecodeObjectEx(
+							X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+							szOID_SUBJECT_KEY_IDENTIFIER,
+							pSKIExt->Value.pbData,
+							pSKIExt->Value.cbData,
+							CRYPT_DECODE_ALLOC_FLAG,
+							nullptr,
+							&pSKI,
+							&cbSKI))
+						{
+							// RAII cleanup
+							struct SKICleanup {
+								CRYPT_DATA_BLOB* p;
+								~SKICleanup() { if (p) LocalFree(p); }
+							} skiCleanup{ pSKI };
+
+							// Compare AKI KeyIdentifier with SKI
+							if (pAKI->KeyId.cbData > 0 && pAKI->KeyId.pbData &&
+								pSKI->cbData > 0 && pSKI->pbData)
+							{
+								if (pAKI->KeyId.cbData != pSKI->cbData ||
+									!SecureCompare(pAKI->KeyId.pbData, pSKI->pbData, pAKI->KeyId.cbData))
+								{
+									if (err) {
+										err->win32 = CERT_E_ISSUERCHAINING;
+										err->message = L"AKI-SKI mismatch (key identifiers do not match)";
+									}
+									SS_LOG_ERROR(L"CryptoUtils", L"AKI-SKI key identifier mismatch");
+									return false;
+								}
+							}
+						}
+					}
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 6: DIGITAL SIGNATURE VERIFICATION (Cryptographic Proof)
+				// ═══════════════════════════════════════════════════════════════════
+				// Extract the TBSCertificate (To-Be-Signed) data from leaf certificate
+				DWORD tbsLen = 0;
+				const BYTE* tbsData = nullptr;
+
+				// DER-encoded certificate structure:
+				// Certificate ::= SEQUENCE {
+				//     tbsCertificate       TBSCertificate,
+				//     signatureAlgorithm   AlgorithmIdentifier,
+				//     signatureValue       BIT STRING
+				// }
+
+				// Method 1: Use CryptDecodeObjectEx to extract TBS (RECOMMENDED)
+				CERT_SIGNED_CONTENT_INFO* pSignedInfo = nullptr;
+				DWORD cbSignedInfo = 0;
+
+				if (!CryptDecodeObjectEx(
+					X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+					X509_CERT,
+					m_certContext->pbCertEncoded,
+					m_certContext->cbCertEncoded,
+					CRYPT_DECODE_ALLOC_FLAG,
+					nullptr,
+					&pSignedInfo,
+					&cbSignedInfo))
+				{
+					if (err) {
+						err->win32 = GetLastError();
+						err->message = L"Failed to decode certificate for TBS extraction";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"CryptDecodeObjectEx failed: 0x%08X", GetLastError());
+					return false;
+				}
+
+				// RAII cleanup
+				struct SignedInfoCleanup {
+					CERT_SIGNED_CONTENT_INFO* p;
+					~SignedInfoCleanup() { if (p) LocalFree(p); }
+				} signedInfoCleanup{ pSignedInfo };
+
+				tbsData = pSignedInfo->ToBeSigned.pbData;
+				tbsLen = pSignedInfo->ToBeSigned.cbData;
+
+				if (!tbsData || tbsLen == 0) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"TBSCertificate is empty";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"TBSCertificate extraction failed");
+					return false;
+				}
+
+				// Extract the signature from leaf certificate
+				const BYTE* signature = pSignedInfo->Signature.pbData;
+				DWORD signatureLen = pSignedInfo->Signature.cbData;
+
+				// BIT STRING format: first byte is unused bits count
+				if (signatureLen < 1) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Invalid signature format";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Signature is too short");
+					return false;
+				}
+
+				// Skip the unused bits byte (usually 0x00)
+				const BYTE unusedBits = signature[0];
+				signature += 1;
+				signatureLen -= 1;
+
+				if (signatureLen == 0) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Signature data is empty";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Signature is empty after BIT STRING parsing");
+					return false;
+				}
+
+				// Get signature algorithm OID
+				PCSTR sigAlgOid = m_certContext->pCertInfo->SignatureAlgorithm.pszObjId;
+				if (!sigAlgOid) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Certificate has no signature algorithm OID";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Signature algorithm OID is null");
+					return false;
+				}
+
+				// Map OID to hash algorithm
+				enum class HashAlg { SHA1, SHA256, SHA384, SHA512, Unknown };
+				enum class SigScheme { RSA_PKCS1v15, RSA_PSS, ECDSA, Unknown };
+
+				auto MapOidToAlgorithms = [](PCSTR oid) -> std::pair<SigScheme, HashAlg> {
+					if (!oid) return { SigScheme::Unknown, HashAlg::Unknown };
+
+					// RSA PKCS#1 v1.5
+					if (strcmp(oid, "1.2.840.113549.1.1.5") == 0)  return { SigScheme::RSA_PKCS1v15, HashAlg::SHA1 };
+					if (strcmp(oid, "1.2.840.113549.1.1.11") == 0) return { SigScheme::RSA_PKCS1v15, HashAlg::SHA256 };
+					if (strcmp(oid, "1.2.840.113549.1.1.12") == 0) return { SigScheme::RSA_PKCS1v15, HashAlg::SHA384 };
+					if (strcmp(oid, "1.2.840.113549.1.1.13") == 0) return { SigScheme::RSA_PKCS1v15, HashAlg::SHA512 };
+
+					// RSA-PSS
+					if (strcmp(oid, "1.2.840.113549.1.1.10") == 0) return { SigScheme::RSA_PSS, HashAlg::SHA256 };
+
+					// ECDSA
+					if (strcmp(oid, "1.2.840.10045.4.3.1") == 0) return { SigScheme::ECDSA, HashAlg::SHA1 };
+					if (strcmp(oid, "1.2.840.10045.4.3.2") == 0) return { SigScheme::ECDSA, HashAlg::SHA256 };
+					if (strcmp(oid, "1.2.840.10045.4.3.3") == 0) return { SigScheme::ECDSA, HashAlg::SHA384 };
+					if (strcmp(oid, "1.2.840.10045.4.3.4") == 0) return { SigScheme::ECDSA, HashAlg::SHA512 };
+
+					return { SigScheme::Unknown, HashAlg::Unknown };
+					};
+
+				auto [scheme, hashAlg] = MapOidToAlgorithms(sigAlgOid);
+
+				if (scheme == SigScheme::Unknown || hashAlg == HashAlg::Unknown) {
+					if (err) {
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Unsupported signature algorithm";
+						wchar_t tmp[128];
+						swprintf_s(tmp, L"OID: %S", sigAlgOid);
+						err->context = tmp;
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Unsupported signature OID: %S", sigAlgOid);
+					return false;
+				}
+
+				// Map hash algorithm to BCrypt algorithm name
+				auto MapHashAlgToBCrypt = [](HashAlg alg) -> const wchar_t* {
+					switch (alg) {
+					case HashAlg::SHA1:   return BCRYPT_SHA1_ALGORITHM;
+					case HashAlg::SHA256: return BCRYPT_SHA256_ALGORITHM;
+					case HashAlg::SHA384: return BCRYPT_SHA384_ALGORITHM;
+					case HashAlg::SHA512: return BCRYPT_SHA512_ALGORITHM;
+					default: return nullptr;
+					}
+					};
+
+				const wchar_t* bcryptHashAlg = MapHashAlgToBCrypt(hashAlg);
+				if (!bcryptHashAlg) {
+					if (err) {
+						err->win32 = ERROR_INVALID_PARAMETER;
+						err->message = L"Failed to map hash algorithm to BCrypt";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Hash algorithm mapping failed");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 7: COMPUTE HASH OF TBSCertificate
+				// ═══════════════════════════════════════════════════════════════════
+				BCRYPT_ALG_HANDLE hHashAlg = nullptr;
+				NTSTATUS st = BCryptOpenAlgorithmProvider(&hHashAlg, bcryptHashAlg, nullptr, 0);
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Failed to open hash algorithm provider";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: 0x%08X", st);
+					return false;
+				}
+
+				// RAII cleanup
+				struct HashProviderCleanup {
+					BCRYPT_ALG_HANDLE h;
+					~HashProviderCleanup() { if (h) BCryptCloseAlgorithmProvider(h, 0); }
+				} hashProvCleanup{ hHashAlg };
+
+				DWORD hashLen = 0, cbResult = 0;
+				st = BCryptGetProperty(hHashAlg, BCRYPT_HASH_LENGTH,
+					reinterpret_cast<PUCHAR>(&hashLen), sizeof(hashLen), &cbResult, 0);
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Failed to get hash length";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptGetProperty HASH_LENGTH failed: 0x%08X", st);
+					return false;
+				}
+
+				std::vector<uint8_t> tbsHash(hashLen);
+				st = BCryptHash(hHashAlg, nullptr, 0,
+					const_cast<BYTE*>(tbsData), tbsLen,
+					tbsHash.data(), static_cast<ULONG>(tbsHash.size()));
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"TBSCertificate hash computation failed";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptHash failed: 0x%08X", st);
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 8: IMPORT CA PUBLIC KEY
+				// ═══════════════════════════════════════════════════════════════════
+				const wchar_t* keyAlgName = nullptr;
+				const wchar_t* blobType = nullptr;
+
+				if (scheme == SigScheme::RSA_PKCS1v15 || scheme == SigScheme::RSA_PSS) {
+					keyAlgName = BCRYPT_RSA_ALGORITHM;
+					blobType = BCRYPT_RSAPUBLIC_BLOB;
+				}
+				else if (scheme == SigScheme::ECDSA) {
+					keyAlgName = BCRYPT_ECDSA_P256_ALGORITHM; // Default (curve detection would be needed)
+					blobType = BCRYPT_ECCPUBLIC_BLOB;
+				}
+
+				BCRYPT_ALG_HANDLE hKeyAlg = nullptr;
+				st = BCryptOpenAlgorithmProvider(&hKeyAlg, keyAlgName, nullptr, 0);
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Failed to open key algorithm provider";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider (key) failed: 0x%08X", st);
+					return false;
+				}
+
+				// RAII cleanup
+				struct KeyProviderCleanup {
+					BCRYPT_ALG_HANDLE h;
+					~KeyProviderCleanup() { if (h) BCryptCloseAlgorithmProvider(h, 0); }
+				} keyProvCleanup{ hKeyAlg };
+
+				PCERT_PUBLIC_KEY_INFO pCAPublicKeyInfo = &caCert.m_certContext->pCertInfo->SubjectPublicKeyInfo;
+				if (!pCAPublicKeyInfo->PublicKey.pbData || pCAPublicKeyInfo->PublicKey.cbData == 0) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"CA certificate has no public key";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"CA public key is empty");
+					return false;
+				}
+
+				BCRYPT_KEY_HANDLE hPubKey = nullptr;
+				st = BCryptImportKeyPair(hKeyAlg, nullptr, blobType, &hPubKey,
+					pCAPublicKeyInfo->PublicKey.pbData, pCAPublicKeyInfo->PublicKey.cbData, 0);
+				if (st < 0) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Failed to import CA public key";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptImportKeyPair failed: 0x%08X", st);
+					return false;
+				}
+
+				// RAII cleanup
+				struct KeyCleanup {
+					BCRYPT_KEY_HANDLE h;
+					~KeyCleanup() { if (h) BCryptDestroyKey(h); }
+				} keyCleanup{ hPubKey };
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 9: VERIFY SIGNATURE
+				// ═══════════════════════════════════════════════════════════════════
+				DWORD flags = 0;
+				void* paddingInfo = nullptr;
+
+				BCRYPT_PKCS1_PADDING_INFO pkcs1Info{};
+				BCRYPT_PSS_PADDING_INFO pssInfo{};
+
+				if (scheme == SigScheme::RSA_PKCS1v15) {
+					pkcs1Info.pszAlgId = bcryptHashAlg;
+					paddingInfo = &pkcs1Info;
+					flags = BCRYPT_PAD_PKCS1;
+				}
+				else if (scheme == SigScheme::RSA_PSS) {
+					pssInfo.pszAlgId = bcryptHashAlg;
+					pssInfo.cbSalt = static_cast<ULONG>(tbsHash.size());
+					paddingInfo = &pssInfo;
+					flags = BCRYPT_PAD_PSS;
+				}
+
+				st = BCryptVerifySignature(hPubKey, paddingInfo,
+					tbsHash.data(), static_cast<ULONG>(tbsHash.size()),
+					const_cast<BYTE*>(signature), signatureLen, flags);
+
+				if (st == 0) {
+					SS_LOG_INFO(L"CryptoUtils", L"Certificate verified successfully against CA");
+					return true;
+				}
+				else if (st == STATUS_INVALID_SIGNATURE) {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Invalid signature - certificate not issued by CA";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Signature verification failed: Invalid signature");
+					return false;
+				}
+				else {
+					if (err) {
+						err->ntstatus = st;
+						err->win32 = RtlNtStatusToDosError(st);
+						err->message = L"Signature verification failed";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"BCryptVerifySignature failed: 0x%08X", st);
+					return false;
+				}
 
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) {
+					err->win32 = ERROR_NOT_SUPPORTED;
+					err->message = L"Platform not supported";
+				}
 				return false;
 #endif
 			}
 
+
 			bool Certificate::ExtractPublicKey(PublicKey& outKey, Error* err) const noexcept {
 #ifdef _WIN32
-				
-
+				// ═══════════════════════════════════════════════════════════════════
+				//  TIER-1 STATE VALIDATION
+				// ═══════════════════════════════════════════════════════════════════
 				if (!m_certContext) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"No certificate loaded"; }
+					if (err) {
+						err->win32 = ERROR_INVALID_STATE;
+						err->message = L"No certificate loaded (certificate context is null)";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"ExtractPublicKey: Certificate context is null");
 					return false;
 				}
 
-				// ✅ Determine algorithm type from OID
-				PCSTR keyAlgOid = m_certContext->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId;
-				if (!keyAlgOid) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Certificate has no key algorithm OID"; }
+				if (!m_certContext->pCertInfo) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Certificate info structure is null";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"ExtractPublicKey: pCertInfo is null");
 					return false;
 				}
 
-				// Map OID to our AsymmetricAlgorithm enum
-				auto MapOidToAlgorithm = [](PCSTR oid) -> AsymmetricAlgorithm {
-					// RSA OIDs
-					if (strcmp(oid, "1.2.840.113549.1.1.1") == 0) { // rsaEncryption
-						return AsymmetricAlgorithm::RSA_2048; // Default (size detection below if needed)
-					}
-					// ECC OIDs
-					if (strcmp(oid, "1.2.840.10045.2.1") == 0) { // id-ecPublicKey
-						return AsymmetricAlgorithm::ECC_P256; // Will detect curve below
-					}
-					return AsymmetricAlgorithm::RSA_2048; // Safe default
-					};
-
-				AsymmetricAlgorithm detectedAlg = MapOidToAlgorithm(keyAlgOid);
-
-				// For ECC, detect the curve OID in parameters
-				if (detectedAlg == AsymmetricAlgorithm::ECC_P256 &&
-					m_certContext->pCertInfo->SubjectPublicKeyInfo.Algorithm.Parameters.pbData &&
-					m_certContext->pCertInfo->SubjectPublicKeyInfo.Algorithm.Parameters.cbData > 0) {
-
-					const uint8_t* params = m_certContext->pCertInfo->SubjectPublicKeyInfo.Algorithm.Parameters.pbData;
-					size_t paramSize = m_certContext->pCertInfo->SubjectPublicKeyInfo.Algorithm.Parameters.cbData;
-
-					// Simple OID parser for ECC curves
-					// P-256 encoded: 06 08 2a 86 48 ce 3d 03 01 07
-					// P-384 encoded: 06 05 2b 81 04 00 22
-					// P-521 encoded: 06 05 2b 81 04 00 23
-					if (paramSize >= 3 && params[0] == 0x06) { // OID tag
-						size_t oidLen = params[1];
-						if (oidLen > 0 && oidLen + 2 <= paramSize) {
-							// P-256: 2a 86 48 ce 3d 03 01 07
-							if (oidLen == 8 && params[2] == 0x2a && params[3] == 0x86 && params[4] == 0x48) {
-								detectedAlg = AsymmetricAlgorithm::ECC_P256;
-							}
-							// P-384: 2b 81 04 00 22
-							else if (oidLen == 5 && params[2] == 0x2b && params[3] == 0x81 && params[4] == 0x04 && params[5] == 0x00 && params[6] == 0x22) {
-								detectedAlg = AsymmetricAlgorithm::ECC_P384;
-							}
-							// P-521: 2b 81 04 00 23
-							else if (oidLen == 5 && params[2] == 0x2b && params[3] == 0x81 && params[4] == 0x04 && params[5] == 0x00 && params[6] == 0x23) {
-								detectedAlg = AsymmetricAlgorithm::ECC_P521;
-							}
-						}
-					}
-				}
-
-				outKey.algorithm = detectedAlg;
-
-				// ✅ Export the public key BIT STRING (raw public key blob)
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 1: ALGORITHM OID DETECTION (RSA vs ECC)
+				// ═══════════════════════════════════════════════════════════════════
 				const CERT_PUBLIC_KEY_INFO& pubKeyInfo = m_certContext->pCertInfo->SubjectPublicKeyInfo;
 
+				if (!pubKeyInfo.Algorithm.pszObjId || !*pubKeyInfo.Algorithm.pszObjId) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Certificate has no public key algorithm OID";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"ExtractPublicKey: Algorithm OID is null or empty");
+					return false;
+				}
+
+				PCSTR keyAlgOid = pubKeyInfo.Algorithm.pszObjId;
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 2: OID → ALGORITHM MAPPING (Industry Standard OIDs)
+				// ═══════════════════════════════════════════════════════════════════
+				enum class KeyType { RSA, ECC, ED25519, UNKNOWN };
+
+				auto MapOidToKeyType = [](PCSTR oid) -> KeyType {
+					if (!oid) return KeyType::UNKNOWN;
+
+					// ✅ RSA OID (RFC 8017)
+					if (strcmp(oid, "1.2.840.113549.1.1.1") == 0) return KeyType::RSA; // rsaEncryption
+
+					// ✅ ECC OID (SEC 2 / RFC 5480)
+					if (strcmp(oid, "1.2.840.10045.2.1") == 0) return KeyType::ECC; // id-ecPublicKey
+
+					// ✅ EdDSA (RFC 8410)
+					if (strcmp(oid, "1.3.101.112") == 0) return KeyType::ED25519; // Ed25519
+
+					return KeyType::UNKNOWN;
+					};
+
+				KeyType keyType = MapOidToKeyType(keyAlgOid);
+
+				if (keyType == KeyType::UNKNOWN) {
+					if (err) {
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Unsupported public key algorithm";
+						wchar_t tmp[128];
+						swprintf_s(tmp, L"OID: %S", keyAlgOid);
+						err->context = tmp;
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Unsupported key algorithm OID: %S", keyAlgOid);
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 3: PUBLIC KEY DATA VALIDATION (DoS Protection)
+				// ═══════════════════════════════════════════════════════════════════
 				if (!pubKeyInfo.PublicKey.pbData || pubKeyInfo.PublicKey.cbData == 0) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Certificate contains no public key data"; }
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Certificate contains no public key data";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Public key data is null or empty");
 					return false;
 				}
 
-				// ✅ BIT STRING format: first byte is number of unused bits (usually 0)
-				// Extract actual key bytes, skipping the unused bits indicator
-				size_t keyDataOffset = 1; // Skip unused bits byte
-				if (pubKeyInfo.PublicKey.cbData < 1) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid public key BIT STRING format"; }
+				// ✅ CRITICAL: Validate key size (prevent billion laughs attack)
+				const DWORD maxKeySize = 16384; // 16KB (reasonable max for RSA-8192)
+				if (pubKeyInfo.PublicKey.cbData > maxKeySize) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Public key size exceeds maximum allowed size";
+						wchar_t tmp[128];
+						swprintf_s(tmp, L"Size: %lu bytes (max: %lu)", pubKeyInfo.PublicKey.cbData, maxKeySize);
+						err->context = tmp;
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Public key too large: %lu bytes", pubKeyInfo.PublicKey.cbData);
 					return false;
 				}
 
-				const uint8_t* keyData = pubKeyInfo.PublicKey.pbData + keyDataOffset;
-				size_t keyDataLen = pubKeyInfo.PublicKey.cbData - keyDataOffset;
+				// ✅ BIT STRING format validation (ASN.1 tag 0x03)
+				const BYTE* rawKeyData = pubKeyInfo.PublicKey.pbData;
+				const DWORD rawKeySize = pubKeyInfo.PublicKey.cbData;
+
+				// BIT STRING: first byte = unused bits count (must be 0-7)
+				if (rawKeySize < 1) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Invalid public key BIT STRING format (too short)";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Public key BIT STRING too short");
+					return false;
+				}
+
+				const BYTE unusedBits = rawKeyData[0];
+				if (unusedBits > 7) {
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Invalid BIT STRING unused bits count";
+						wchar_t tmp[64];
+						swprintf_s(tmp, L"Unused bits: %u (expected 0-7)", unusedBits);
+						err->context = tmp;
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Invalid unused bits: %u", unusedBits);
+					return false;
+				}
+
+				// Extract key data (skip unused bits byte)
+				const BYTE* keyData = rawKeyData + 1;
+				const size_t keyDataLen = rawKeySize - 1;
 
 				if (keyDataLen == 0) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Public key data is empty"; }
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Public key data is empty after BIT STRING parsing";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Key data empty after BIT STRING header");
 					return false;
 				}
 
-				outKey.keyBlob.assign(keyData, keyData + keyDataLen);
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 4: ALGORITHM-SPECIFIC PROCESSING
+				// ═══════════════════════════════════════════════════════════════════
+				AsymmetricAlgorithm detectedAlg = AsymmetricAlgorithm::RSA_2048; // Default
 
+				if (keyType == KeyType::RSA) {
+					// ✅ RSA: Detect key size from modulus (BCrypt blob parsing)
+					// RSA public key blob format (BCrypt):
+					// BCRYPT_RSAKEY_BLOB header + Exponent + Modulus
+
+					if (keyDataLen < sizeof(BCRYPT_RSAKEY_BLOB) + 4) {
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"RSA public key blob too short";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"RSA key blob too short: %zu bytes", keyDataLen);
+						return false;
+					}
+
+					// Parse BCrypt RSA blob header
+					const auto* rsaHeader = reinterpret_cast<const BCRYPT_RSAKEY_BLOB*>(keyData);
+
+					// ✅ Validate magic number
+					if (rsaHeader->Magic != BCRYPT_RSAPUBLIC_MAGIC &&
+						rsaHeader->Magic != 0x31415352) { // "RSA1" in little-endian
+
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"Invalid RSA public key blob magic";
+							wchar_t tmp[64];
+							swprintf_s(tmp, L"Magic: 0x%08X", rsaHeader->Magic);
+							err->context = tmp;
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"Invalid RSA magic: 0x%08X", rsaHeader->Magic);
+						return false;
+					}
+
+					// ✅ Detect key size from BitLength field
+					const ULONG keyBits = rsaHeader->BitLength;
+
+					if (keyBits == 2048) {
+						detectedAlg = AsymmetricAlgorithm::RSA_2048;
+					}
+					else if (keyBits == 3072) {
+						detectedAlg = AsymmetricAlgorithm::RSA_3072;
+					}
+					else if (keyBits == 4096) {
+						detectedAlg = AsymmetricAlgorithm::RSA_4096;
+					}
+					else {
+						// Unsupported key size
+						if (err) {
+							err->win32 = ERROR_NOT_SUPPORTED;
+							err->message = L"Unsupported RSA key size";
+							wchar_t tmp[64];
+							swprintf_s(tmp, L"Key size: %lu bits", keyBits);
+							err->context = tmp;
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"Unsupported RSA key size: %lu bits", keyBits);
+						return false;
+					}
+
+					SS_LOG_INFO(L"CryptoUtils", L"Detected RSA-%lu public key", keyBits);
+
+				}
+				else if (keyType == KeyType::ECC) {
+					// ✅ ECC: Detect curve from Algorithm.Parameters (OID parsing)
+					if (!pubKeyInfo.Algorithm.Parameters.pbData ||
+						pubKeyInfo.Algorithm.Parameters.cbData < 3) {
+
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"ECC public key missing curve parameters";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"ECC key missing curve OID");
+						return false;
+					}
+
+					const BYTE* params = pubKeyInfo.Algorithm.Parameters.pbData;
+					const size_t paramSize = pubKeyInfo.Algorithm.Parameters.cbData;
+
+					// ✅ PARANOID: Validate paramSize to prevent integer overflow
+					if (paramSize > 256) { // Reasonable max for OID encoding
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"ECC curve parameters too large";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"ECC params too large: %zu bytes", paramSize);
+						return false;
+					}
+
+					// ✅ ASN.1 OID format validation: TAG(0x06) + LENGTH + OID_DATA
+					if (params[0] != 0x06) {
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"Invalid ASN.1 OID tag for ECC curve";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"Invalid ASN.1 tag: 0x%02X", params[0]);
+						return false;
+					}
+
+					const size_t oidLen = params[1];
+
+					// ✅ CRITICAL: Bounds check to prevent buffer overread
+					if (oidLen == 0 || oidLen + 2 > paramSize) {
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"Invalid OID length in ECC parameters";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"Invalid OID length: %zu (max: %zu)", oidLen, paramSize - 2);
+						return false;
+					}
+
+					const BYTE* oidData = params + 2;
+
+					// ✅ ECC Curve OID Detection (NIST curves - FIPS 186-4)
+					// P-256: 1.2.840.10045.3.1.7 → 06 08 2a 86 48 ce 3d 03 01 07
+					// P-384: 1.3.132.0.34       → 06 05 2b 81 04 00 22
+					// P-521: 1.3.132.0.35       → 06 05 2b 81 04 00 23
+
+					if (oidLen == 8 && oidData[0] == 0x2a && oidData[1] == 0x86 &&
+						oidData[2] == 0x48 && oidData[3] == 0xce && oidData[4] == 0x3d) {
+						detectedAlg = AsymmetricAlgorithm::ECC_P256;
+						SS_LOG_INFO(L"CryptoUtils", L"Detected ECC P-256 public key");
+					}
+					else if (oidLen == 5 && oidData[0] == 0x2b && oidData[1] == 0x81 &&
+						oidData[2] == 0x04 && oidData[3] == 0x00) {
+
+						if (oidData[4] == 0x22) {
+							detectedAlg = AsymmetricAlgorithm::ECC_P384;
+							SS_LOG_INFO(L"CryptoUtils", L"Detected ECC P-384 public key");
+						}
+						else if (oidData[4] == 0x23) {
+							detectedAlg = AsymmetricAlgorithm::ECC_P521;
+							SS_LOG_INFO(L"CryptoUtils", L"Detected ECC P-521 public key");
+						}
+						else {
+							if (err) {
+								err->win32 = ERROR_NOT_SUPPORTED;
+								err->message = L"Unsupported ECC curve";
+							}
+							SS_LOG_ERROR(L"CryptoUtils", L"Unsupported ECC curve OID");
+							return false;
+						}
+					}
+					else {
+						if (err) {
+							err->win32 = ERROR_NOT_SUPPORTED;
+							err->message = L"Unknown ECC curve OID";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"Unknown ECC curve");
+						return false;
+					}
+
+				}
+				else if (keyType == KeyType::ED25519) {
+					// ✅ EdDSA: Ed25519 (32-byte public key)
+					if (keyDataLen != 32) {
+						if (err) {
+							err->win32 = ERROR_INVALID_DATA;
+							err->message = L"Invalid Ed25519 key size (expected 32 bytes)";
+						}
+						SS_LOG_ERROR(L"CryptoUtils", L"Invalid Ed25519 key size: %zu", keyDataLen);
+						return false;
+					}
+
+					// Note: Ed25519 not in AsymmetricAlgorithm enum yet (future enhancement)
+					if (err) {
+						err->win32 = ERROR_NOT_SUPPORTED;
+						err->message = L"Ed25519 not yet implemented in ShadowStrike";
+					}
+					SS_LOG_WARN(L"CryptoUtils", L"Ed25519 support not implemented");
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 5: COPY KEY BLOB TO OUTPUT (Exception-Safe)
+				// ═══════════════════════════════════════════════════════════════════
+				try {
+					outKey.algorithm = detectedAlg;
+					outKey.keyBlob.assign(keyData, keyData + keyDataLen);
+				}
+				catch (const std::bad_alloc&) {
+					if (err) {
+						err->win32 = ERROR_NOT_ENOUGH_MEMORY;
+						err->message = L"Failed to allocate memory for public key blob";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Memory allocation failed for key blob (%zu bytes)", keyDataLen);
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  STEP 6: FINAL VALIDATION (Sanity Check)
+				// ═══════════════════════════════════════════════════════════════════
 				if (outKey.keyBlob.empty()) {
-					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Failed to extract public key blob"; }
+					if (err) {
+						err->win32 = ERROR_INVALID_DATA;
+						err->message = L"Public key blob is empty after extraction";
+					}
+					SS_LOG_ERROR(L"CryptoUtils", L"Key blob empty after copy");
 					return false;
 				}
 
-				SS_LOG_INFO(L"CryptoUtils", L"Public key extracted successfully (%zu bytes, algorithm: %d)",
-					outKey.keyBlob.size(), static_cast<int>(outKey.algorithm));
+				SS_LOG_INFO(L"CryptoUtils", L"Public key extracted successfully (%zu bytes, algorithm: %d, OID: %S)",
+					outKey.keyBlob.size(), static_cast<int>(outKey.algorithm), keyAlgOid);
 
 				return true;
 
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
+				if (err) {
+					err->win32 = ERROR_NOT_SUPPORTED;
+					err->message = L"Platform not supported (Windows only)";
+				}
 				return false;
 #endif
 			}

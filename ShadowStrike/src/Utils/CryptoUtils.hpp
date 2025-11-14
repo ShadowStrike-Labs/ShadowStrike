@@ -56,9 +56,6 @@ namespace ShadowStrike {
 				AES_128_GCM,
 				AES_192_GCM,
 				AES_256_GCM,
-				AES_128_ECB,     // Not recommended, only for compatibility
-				AES_192_ECB,
-				AES_256_ECB,
 				AES_128_CFB,
 				AES_192_CFB,
 				AES_256_CFB,
@@ -76,7 +73,6 @@ namespace ShadowStrike {
 			// ============================================================================
 
 			enum class AsymmetricAlgorithm : uint8_t {
-				RSA_1024,    // Legacy, not recommended
 				RSA_2048,
 				RSA_3072,
 				RSA_4096,
@@ -427,7 +423,11 @@ namespace ShadowStrike {
 					const uint8_t* signature, size_t signatureLen,
 					Error* err = nullptr) const noexcept;
 
-				bool VerifyChain(Error* err = nullptr) const noexcept;
+				bool VerifyChain(Error* err,
+					HCERTSTORE hAdditionalStore /*= nullptr*/,
+					DWORD chainFlags /*= CERT_CHAIN_REVOCATION_CHECK_CHAIN*/,
+					 FILETIME* verificationTime /*= nullptr*/,
+					const char* requiredEkuOid /*= nullptr*/) const noexcept;
 				bool VerifyAgainstCA(const Certificate& caCert, Error* err = nullptr) const noexcept;
 
 				// Extract public key
