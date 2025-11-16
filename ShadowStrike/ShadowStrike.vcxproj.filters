@@ -138,19 +138,7 @@
     <ClCompile Include="tests\unit\Utils\MemoryUtils_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="tests\unit\Utils\NetworkUtils_Tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\Utils\ProcessUtils_Tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="tests\unit\Utils\RegistryUtilsTests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\Utils\StringUtils_Tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\Utils\SystemUtils_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\Utils\ThreadPool_Tests.cpp">
@@ -160,6 +148,15 @@
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\Utils\XMLUtils_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Utils\NetworkUtils_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Utils\ProcessUtils_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Utils\SystemUtils_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
   </ItemGroup>

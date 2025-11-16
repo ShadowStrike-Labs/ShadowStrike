@@ -133,7 +133,7 @@ namespace ShadowStrike {
 			bool FromHex(std::string_view hex, std::vector<uint8_t>& out) {
 				out.clear();
 
-				// ? FIX: Prevent DoS via large hex input
+				// Prevent DoS via large hex input
 				constexpr size_t MAX_HEX_INPUT = 20 * 1024 * 1024; // 20MB hex = 10MB binary (reasonable limit)
 				if (hex.size() > MAX_HEX_INPUT) {
 					return false;
@@ -147,7 +147,7 @@ namespace ShadowStrike {
 					};
 				if ((hex.size() & 1) != 0) return false;
 
-				// ? FIX: Protect against bad_alloc
+				// Protect against bad_alloc
 				try {
 					out.resize(hex.size() / 2);
 				}
@@ -176,7 +176,7 @@ namespace ShadowStrike {
 
 			uint64_t Fnv1a64(const void* data, size_t len) noexcept {
 				const uint8_t* p = static_cast<const uint8_t*>(data);
-				uint64_t h = 1469598103934665603ull;
+				uint64_t h = 14695981039346656037ull; // FIX: Correct FNV-1a 64-bit offset basis
 				for (size_t i = 0; i < len; ++i) {
 					h ^= p[i];
 					h *= 1099511628211ull;
@@ -192,6 +192,53 @@ namespace ShadowStrike {
 				resetState();
 			}
 
+			// Move constructor
+			Hasher::Hasher(Hasher&& other) noexcept 
+				: m_objBuf(other.m_objBuf)
+				, m_objLen(other.m_objLen)
+#ifdef _WIN32
+				, m_hash(other.m_hash)
+#endif
+				, m_alg(other.m_alg)
+				, m_hashLen(other.m_hashLen)
+				, m_inited(other.m_inited)
+			{
+				// Transfer ownership - nullify source
+				other.m_objBuf = nullptr;
+				other.m_objLen = 0;
+#ifdef _WIN32
+				other.m_hash = nullptr;
+#endif
+				other.m_inited = false;
+			}
+
+			// Move assignment
+			Hasher& Hasher::operator=(Hasher&& other) noexcept {
+				if (this != &other) {
+					// Clean up current state
+					resetState();
+					
+					// Transfer ownership
+					m_objBuf = other.m_objBuf;
+					m_objLen = other.m_objLen;
+#ifdef _WIN32
+					m_hash = other.m_hash;
+#endif
+					m_alg = other.m_alg;
+					m_hashLen = other.m_hashLen;
+					m_inited = other.m_inited;
+					
+					// Nullify source
+					other.m_objBuf = nullptr;
+					other.m_objLen = 0;
+#ifdef _WIN32
+					other.m_hash = nullptr;
+#endif
+					other.m_inited = false;
+				}
+				return *this;
+			}
+
 
 			void Hasher::resetState() noexcept {
 #ifdef _WIN32
@@ -201,7 +248,7 @@ namespace ShadowStrike {
 				}
 				if (m_objBuf) {
 					SecureZeroMemory(m_objBuf, m_objLen);
-					delete[] static_cast<uint8_t*>(m_objBuf);
+					free(m_objBuf); // FIX: Use free() instead of delete[] to match malloc()
 					m_objBuf = nullptr;
 				}
 				m_objLen = 0;

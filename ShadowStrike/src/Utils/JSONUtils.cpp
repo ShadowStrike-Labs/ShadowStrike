@@ -133,24 +133,50 @@ namespace ShadowStrike {
 
             bool Parse(std::string_view jsonText, Json& out, Error* err, const ParseOptions& opt) noexcept {
                 try {
-                    // ? FIX: Depth limit callback
-                    auto depthCallback = [maxDepth = opt.maxDepth](int depth, nlohmann::json::parse_event_t event, Json& parsed) -> bool {
-                        if (static_cast<size_t>(depth) > maxDepth) {
-                            return false; // Reject parsing
+                    // Manual depth tracking since nlohmann callback may not work reliably
+                    size_t currentDepth = 0;
+                    size_t maxObservedDepth = 0;
+                    
+                    auto depthCallback = [&currentDepth, &maxObservedDepth, maxDepth = opt.maxDepth](
+                        int depth, 
+                        nlohmann::json::parse_event_t event, 
+                        Json& parsed) -> bool {
+                        
+                        // Track depth manually
+                        if (event == nlohmann::json::parse_event_t::object_start || 
+                            event == nlohmann::json::parse_event_t::array_start) {
+                            currentDepth++;
+                            if (currentDepth > maxObservedDepth) {
+                                maxObservedDepth = currentDepth;
+                            }
+                            if (currentDepth > maxDepth) {
+                                return false; // Reject
+                            }
+                        } else if (event == nlohmann::json::parse_event_t::object_end || 
+                                   event == nlohmann::json::parse_event_t::array_end) {
+                            if (currentDepth > 0) currentDepth--;
                         }
-                        return true; // Continue parsing
+                        
+                        return true;
                     };
 
-                    //if allowExceptions is false, parse errors will not throw but return discarded json
                     out = Json::parse(jsonText, depthCallback, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);
+                    
+                    // Check if parsing succeeded but depth was exceeded
+                    if (maxObservedDepth > opt.maxDepth) {
+                        setErr(err, "JSON depth exceeds maximum allowed depth", {}, jsonText, 0);
+                        out = Json(); // Clear output
+                        return false;
+                    }
+                    
                     if (!opt.allowExceptions && out.is_discarded()) {
                         setErr(err, "JSON parse failed", {}, jsonText, 0);
                         return false;
                     }
+                    
                     return true;
                 }
                 catch (const nlohmann::json::parse_error& e) {
-                    // e.byte: 1-based ofset
                     size_t byteOff = e.byte > 0 ? static_cast<size_t>(e.byte - 1) : 0;
                     setErr(err, e.what(), {}, jsonText, byteOff);
                     return false;
@@ -283,16 +309,43 @@ namespace ShadowStrike {
 
                     stripUtf8BOM(buf);
 
-                    // ? FIX: Use depth callback for parsing
+                    // ? FIX: Use depth callback for parsing with manual tracking
                     try {
-                        auto depthCallback = [maxDepth = opt.maxDepth](int depth, nlohmann::json::parse_event_t event, Json& parsed) -> bool {
-                            if (static_cast<size_t>(depth) > maxDepth) {
-                                return false;
+                        size_t currentDepth = 0;
+                        size_t maxObservedDepth = 0;
+                        
+                        auto depthCallback = [&currentDepth, &maxObservedDepth, maxDepth = opt.maxDepth](
+                            int depth, 
+                            nlohmann::json::parse_event_t event, 
+                            Json& parsed) -> bool {
+                            
+                            // Track depth manually
+                            if (event == nlohmann::json::parse_event_t::object_start || 
+                                event == nlohmann::json::parse_event_t::array_start) {
+                                currentDepth++;
+                                if (currentDepth > maxObservedDepth) {
+                                    maxObservedDepth = currentDepth;
+                                }
+                                if (currentDepth > maxDepth) {
+                                    return false; // Reject
+                                }
+                            } else if (event == nlohmann::json::parse_event_t::object_end || 
+                                       event == nlohmann::json::parse_event_t::array_end) {
+                                if (currentDepth > 0) currentDepth--;
                             }
+                            
                             return true;
                         };
 
                         out = Json::parse(buf, depthCallback, /*allow_exceptions*/ opt.allowExceptions, /*ignore_comments*/ opt.allowComments);
+                        
+                        // Check if parsing succeeded but depth was exceeded
+                        if (maxObservedDepth > opt.maxDepth) {
+                            setErr(err, "JSON depth exceeds maximum allowed depth", path, buf, 0);
+                            out = Json();
+                            return false;
+                        }
+                        
                         if (!opt.allowExceptions && out.is_discarded()) {
                             setErr(err, "JSON parse failed", path, buf, 0);
                             return false;
@@ -333,7 +386,8 @@ namespace ShadowStrike {
 
                     // ? FIX: Secure temp file name using high-resolution clock + random
                     auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-                    std::mt19937_64 rng(static_cast<uint64_t>(now) ^ reinterpret_cast<uintptr_t>(&rng));
+                    std::random_device rd;
+                    std::mt19937_64 rng(static_cast<uint64_t>(now) ^ static_cast<uint64_t>(rd()));
                     std::uniform_int_distribution<uint64_t> dist;
                     uint64_t randomId = dist(rng);
 
@@ -432,18 +486,26 @@ namespace ShadowStrike {
             bool RequireKeys(const Json& j, std::string_view objectPathLike, const std::vector<std::string>& requiredKeys, Error* err) noexcept {
                 try {
                     const auto objPtr = ToJsonPointer(objectPathLike);
-                    const nlohmann::json::json_pointer jp(objPtr);
-                    if (!j.contains(jp)) {
-                        if (err) err->message = "Object path not found: " + objPtr;
-                        return false;
+                    
+                    // Handle root path "/" specially
+                    const Json* node = nullptr;
+                    if (objPtr == "/") {
+                        node = &j;
+                    } else {
+                        const nlohmann::json::json_pointer jp(objPtr);
+                        if (!j.contains(jp)) {
+                            if (err) err->message = "Object path not found: " + objPtr;
+                            return false;
+                        }
+                        node = &j.at(jp);
                     }
-                    const auto& node = j.at(jp);
-                    if (!node.is_object()) {
+                    
+                    if (!node->is_object()) {
                         if (err) err->message = "Target is not an object: " + objPtr;
                         return false;
                     }
                     for (const auto& k : requiredKeys) {
-                        if (!node.contains(k)) {
+                        if (!node->contains(k)) {
                             if (err) err->message = "Missing required key: " + k;
                             return false;
                         }

@@ -60,6 +60,14 @@ namespace ShadowStrike {
 			public:
 				explicit Hasher(Algorithm alg) noexcept;
 				~Hasher();
+				
+				// Delete copy operations (non-copyable)
+				Hasher(const Hasher&) = delete;
+				Hasher& operator=(const Hasher&) = delete;
+				
+				// Move operations
+				Hasher(Hasher&& other) noexcept;
+				Hasher& operator=(Hasher&& other) noexcept;
 
 				//Start a new stream
 				bool Init(Error* err = nullptr) noexcept;

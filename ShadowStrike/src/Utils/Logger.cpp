@@ -60,7 +60,11 @@ namespace ShadowStrike {
                 def.toEventLog = false;
                 def.toConsole = true;
 
-                m_cfg = def;
+                
+                {
+                    std::lock_guard<std::mutex> lk(m_cfgmutex);
+                    m_cfg = def;
+                }
                 m_minLevel.store(def.minimalLevel, std::memory_order_release);
                 m_accepting.store(true, std::memory_order_release);
             }
@@ -69,26 +73,30 @@ namespace ShadowStrike {
         void Logger::Initialize(const LoggerConfig& cfg) {
             bool expected = false;
             if (!m_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                m_cfg = cfg;
-                m_minLevel.store(cfg.minimalLevel, std::memory_order_release);
+              
                 return;
             }
 
-            m_cfg = cfg;
+      
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                m_cfg = cfg;
+            }
             m_minLevel.store(cfg.minimalLevel, std::memory_order_release);
 
             try {
 #ifdef _WIN32
-                if (m_cfg.toFile) {
+                if (cfg.toFile) {
                     EnsureLogDirectory();
                     OpenLogFileIfNeeded();
                 }
-                if (m_cfg.toEventLog) {
+                if (cfg.toEventLog) {
                     OpenEventLog();
                 }
 #endif
             }
             catch (...) {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
                 m_cfg.toFile = false;
                 m_cfg.toEventLog = false;
                 OutputDebugStringW(L"[Logger] File init failed\n");
@@ -96,12 +104,13 @@ namespace ShadowStrike {
 
             m_stop.store(false, std::memory_order_release);
 
-            if (m_cfg.async) {
+            if (cfg.async) {
                 try {
                     m_worker = std::thread([this]() { WorkerLoop(); });
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
                 catch (...) {
+                    std::lock_guard<std::mutex> lk(m_cfgmutex);
                     m_cfg.async = false;
                     OutputDebugStringW(L"[Logger] Async disabled\n");
                 }
@@ -120,29 +129,69 @@ namespace ShadowStrike {
             m_stop.store(true, std::memory_order_release);
             m_queueCv.notify_all();
 
+			//thread join with timeout
             if (m_worker.joinable()) {
                 try {
-                    m_worker.join();
+                    //5 seconds timeout
+                    auto start = std::chrono::steady_clock::now();
+                    while (m_worker.joinable()) {
+                        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
+                            // Timeout → force detach
+                            OutputDebugStringW(L"[Logger] Worker thread join timeout, forcing detach\n");
+                            m_worker.detach();
+                            break;
+                        }
+                        m_queueCv.notify_all();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                        
+                        if (!m_worker.joinable()) break;
+
+                        
+                        try {
+                            m_worker.join();
+                            break;
+                        }
+                        catch (...) {
+                            // Join failed, retry
+                        }
+                    }
                 }
                 catch (...) {
-                    m_worker.detach();
+                    if (m_worker.joinable()) {
+                        m_worker.detach();
+                    }
                 }
             }
 
+			//Lock Management 
             LogItem item;
+            bool asyncCfg = false;
+            bool toConsoleCfg = false;
+            bool toFileCfg = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                asyncCfg = m_cfg.async;
+                toConsoleCfg = m_cfg.toConsole;
+                toFileCfg = m_cfg.toFile;
+            }
+
             while (Dequeue(item)) {
                 try {
-                    if (m_cfg.toConsole) WriteConsole(item);
-                    if (m_cfg.toFile) WriteFile(item);
+                    if (toConsoleCfg) WriteConsole(item);
+                    if (toFileCfg) WriteFile(item);
                 }
                 catch (...) {}
             }
 
 #ifdef _WIN32
-            if (m_file && m_file != INVALID_HANDLE_VALUE) {
-                FlushFileBuffers(m_file);
-                CloseHandle(m_file);
-                m_file = INVALID_HANDLE_VALUE;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                if (m_file && m_file != INVALID_HANDLE_VALUE) {
+                    FlushFileBuffers(m_file);
+                    CloseHandle(m_file);
+                    m_file = INVALID_HANDLE_VALUE;
+                }
             }
             CloseEventLog();
 #endif
@@ -157,9 +206,24 @@ namespace ShadowStrike {
             if (!IsInitialized()) return;
             if (!IsEnabled(item.level)) return;
 
-            if (m_cfg.async) {
+            bool asyncCfg = false;
+            bool toConsoleCfg = false;
+            bool toFileCfg = false;
+            bool toEventLogCfg = false;
+            size_t maxQueueSz = 0;
+
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                asyncCfg = m_cfg.async;
+                toConsoleCfg = m_cfg.toConsole;
+                toFileCfg = m_cfg.toFile;
+                toEventLogCfg = m_cfg.toEventLog;
+                maxQueueSz = m_cfg.maxQueueSize;
+            }
+
+            if (asyncCfg) {
                 std::lock_guard<std::mutex> lk(m_queueMutex);
-                if (m_queue.size() >= m_cfg.maxQueueSize) {
+                if (m_queue.size() >= maxQueueSz) {
                     m_queue.pop_front();
                 }
                 m_queue.emplace_back(std::move(item));
@@ -167,9 +231,9 @@ namespace ShadowStrike {
             }
             else {
                 try {
-                    if (m_cfg.toConsole) WriteConsole(item);
-                    if (m_cfg.toFile) WriteFile(item);
-                    if (m_cfg.toEventLog && item.level >= LogLevel::Warn) WriteEventLog(item);
+                    if (toConsoleCfg) WriteConsole(item);
+                    if (toFileCfg) WriteFile(item);
+                    if (toEventLogCfg && item.level >= LogLevel::Warn) WriteEventLog(item);
                 }
                 catch (...) {}
             }
@@ -186,6 +250,7 @@ namespace ShadowStrike {
         void Logger::WorkerLoop() {
             while (!m_stop.load(std::memory_order_acquire)) {
                 LogItem item;
+                bool hasItem = false;
                 {
                     std::unique_lock<std::mutex> lk(m_queueMutex);
                     m_queueCv.wait_for(lk, std::chrono::seconds(1), [this]() {
@@ -197,12 +262,26 @@ namespace ShadowStrike {
 
                     item = std::move(m_queue.front());
                     m_queue.pop_front();
+                    hasItem = true;
+                }
+
+                if (!hasItem) continue;
+
+                 
+                bool toConsoleCfg = false;
+                bool toFileCfg = false;
+                bool toEventLogCfg = false;
+                {
+                    std::lock_guard<std::mutex> lk(m_cfgmutex);
+                    toConsoleCfg = m_cfg.toConsole;
+                    toFileCfg = m_cfg.toFile;
+                    toEventLogCfg = m_cfg.toEventLog;
                 }
 
                 try {
-                    if (m_cfg.toConsole) WriteConsole(item);
-                    if (m_cfg.toFile) WriteFile(item);
-                    if (m_cfg.toEventLog && item.level >= LogLevel::Warn) WriteEventLog(item);
+                    if (toConsoleCfg) WriteConsole(item);
+                    if (toFileCfg) WriteFile(item);
+                    if (toEventLogCfg && item.level >= LogLevel::Warn) WriteEventLog(item);
                 }
                 catch (...) {}
             }
@@ -254,13 +333,31 @@ namespace ShadowStrike {
 
             Enqueue(std::move(item));
 
-            if (static_cast<int>(level) >= static_cast<int>(m_cfg.flushLevel))
+            LogLevel flushLvl = LogLevel::Error;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                flushLvl = m_cfg.flushLevel;
+            }
+
+            if (static_cast<int>(level) >= static_cast<int>(flushLvl))
                 Flush();
         }
 
         void Logger::Flush() {
 #ifdef _WIN32
-            if (m_cfg.async) {
+            bool asyncCfg = false;
+            bool toConsoleCfg = false;
+            bool toFileCfg = false;
+            bool toEventLogCfg = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                asyncCfg = m_cfg.async;
+                toConsoleCfg = m_cfg.toConsole;
+                toFileCfg = m_cfg.toFile;
+                toEventLogCfg = m_cfg.toEventLog;
+            }
+
+            if (asyncCfg) {
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 while (std::chrono::steady_clock::now() < deadline) {
                     {
@@ -274,16 +371,19 @@ namespace ShadowStrike {
                 LogItem x{};
                 while (Dequeue(x)) {
                     try {
-                        if (m_cfg.toConsole) WriteConsole(x);
-                        if (m_cfg.toFile) WriteFile(x);
-                        if (m_cfg.toEventLog && x.level >= LogLevel::Warn) WriteEventLog(x);
+                        if (toConsoleCfg) WriteConsole(x);
+                        if (toFileCfg) WriteFile(x);
+                        if (toEventLogCfg && x.level >= LogLevel::Warn) WriteEventLog(x);
                     }
                     catch (...) {}
                 }
             }
 
-            if (m_file && m_file != INVALID_HANDLE_VALUE) {
-                FlushFileBuffers(m_file);
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                if (m_file && m_file != INVALID_HANDLE_VALUE) {
+                    FlushFileBuffers(m_file);
+                }
             }
 #endif
         }
@@ -295,9 +395,11 @@ namespace ShadowStrike {
 
             int len = static_cast<int>(strlen(s));
             if (len <= 0) { buff.clear(); return buff.c_str(); }
+            if (len > 100000) { buff = L"[Too long]"; return buff.c_str(); }
 
             int wlen = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
             if (wlen <= 0) { buff.clear(); return buff.c_str(); }
+            if (wlen > 100000) { buff = L"[Too long]"; return buff.c_str(); }
 
             buff.resize(wlen);
             if (MultiByteToWideChar(CP_UTF8, 0, s, len, &buff[0], wlen) <= 0) {
@@ -314,6 +416,7 @@ namespace ShadowStrike {
         std::wstring Logger::FormatMessageV(const wchar_t* fmt, va_list args) {
             if (!fmt) return L"";
 
+            
             std::wstring out;
             out.resize(512);
 
@@ -322,26 +425,28 @@ namespace ShadowStrike {
             int needed = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
             va_end(args_copy);
 
-            if (needed < 0) {
-                size_t cap = 1024;
-                while (cap <= (1u << 20)) {
-                    out.resize(cap);
-                    va_copy(args_copy, args);
-                    int n = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
-                    va_end(args_copy);
-
-                    if (n >= 0 && static_cast<size_t>(n) < out.size()) {
-                        out.resize(static_cast<size_t>(n));
-                        return out;
-                    }
-                    cap *= 2;
-                }
-                out = L"[Logger] Message too large";
-            }
-            else {
+            if (needed >= 0 && static_cast<size_t>(needed) < out.size()) {
                 out.resize(static_cast<size_t>(needed));
+                return out;
             }
-            return out;
+
+            //Try big buffer
+            size_t cap = 1024;
+            constexpr size_t MAX_CAP = 1u << 20; // 1MB limit
+            while (cap <= MAX_CAP) {
+                out.resize(cap);
+
+                va_copy(args_copy, args);
+                int n = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
+                va_end(args_copy);
+
+                if (n >= 0 && static_cast<size_t>(n) < out.size()) {
+                    out.resize(static_cast<size_t>(n));
+                    return out;
+                }
+                cap *= 2;
+            }
+            return L"[Logger] Message too large";
         }
 
         std::wstring Logger::FormatWinError(DWORD err) {
@@ -445,7 +550,15 @@ namespace ShadowStrike {
                 s += L"]";
             }
 
-            if (m_cfg.includeProcThreadId) {
+            bool includeProcThreadIdCfg = false;
+            bool includeSrcLocationCfg = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                includeProcThreadIdCfg = m_cfg.includeProcThreadId;
+                includeSrcLocationCfg = m_cfg.includeSrcLocation;
+            }
+
+            if (includeProcThreadIdCfg) {
                 s += L" (";
                 s += std::to_wstring(item.pid);
                 s += L":";
@@ -453,7 +566,7 @@ namespace ShadowStrike {
                 s += L")";
             }
 
-            if (m_cfg.includeSrcLocation && !item.file.empty()) {
+            if (includeSrcLocationCfg && !item.file.empty()) {
                 s += L" ";
                 s += item.file;
                 s += L":";
@@ -484,14 +597,22 @@ namespace ShadowStrike {
                 s += L"\"";
             }
 
-            if (m_cfg.includeProcThreadId) {
+            bool includeProcThreadIdCfg = false;
+            bool includeSrcLocationCfg = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                includeProcThreadIdCfg = m_cfg.includeProcThreadId;
+                includeSrcLocationCfg = m_cfg.includeSrcLocation;
+            }
+
+            if (includeProcThreadIdCfg) {
                 s += L",\"pid\":";
                 s += std::to_wstring(item.pid);
                 s += L",\"tid\":";
                 s += std::to_wstring(item.tid);
             }
 
-            if (m_cfg.includeSrcLocation && !item.file.empty()) {
+            if (includeSrcLocationCfg && !item.file.empty()) {
                 s += L",\"file\":\"";
                 s += EscapeJson(item.file);
                 s += L"\",\"line\":";
@@ -529,14 +650,27 @@ namespace ShadowStrike {
             case LogLevel::Fatal: color = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY; break;
             }
 
+            
             CONSOLE_SCREEN_BUFFER_INFO csbi{};
-            GetConsoleScreenBufferInfo(m_console, &csbi);
+            if (!GetConsoleScreenBufferInfo(m_console, &csbi)) {
+                
+                csbi.wAttributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+            }
+
             SetConsoleTextAttribute(m_console, color);
 
-            std::wstring line = m_cfg.jsonLines ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+            bool jsonLinesCfg = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                jsonLinesCfg = m_cfg.jsonLines;
+            }
+
+            std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
             line += L"\r\n";
 
-            if (line.size() > std::numeric_limits<DWORD>::max() / sizeof(wchar_t)) {
+            // ✅ FIX: Integer overflow check BEFORE cast
+            constexpr size_t MAX_CONSOLE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
+            if (line.size() > MAX_CONSOLE_WRITE) {
                 line = L"[Logger] Message too large\r\n";
             }
 
@@ -548,14 +682,20 @@ namespace ShadowStrike {
 
         void Logger::OpenLogFileIfNeeded() {
 #ifdef _WIN32
-            std::lock_guard<std::mutex> lk(m_cfgmutex);
+            
             if (m_file && m_file != INVALID_HANDLE_VALUE) return;
 
             std::wstring path = BaseLogPath();
             m_file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
-            if (m_file == INVALID_HANDLE_VALUE) return;
+            if (m_file == INVALID_HANDLE_VALUE) {
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                m_file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (m_file == INVALID_HANDLE_VALUE) return;
+            }
 
             m_actualLogPath = path;
             LARGE_INTEGER size{};
@@ -568,11 +708,17 @@ namespace ShadowStrike {
 
         void Logger::RotateIfNeeded(size_t nextWriteBytes) {
 #ifdef _WIN32
-            if (!m_cfg.toFile) return;
+            
+            bool toFileCfg = m_cfg.toFile;
+            uint64_t maxFileSizeBytesCfg = m_cfg.maxFileSizeBytes;
+
+            if (!toFileCfg) return;
             if (!m_file || m_file == INVALID_HANDLE_VALUE) return;
-            if (m_currentSize + nextWriteBytes <= m_cfg.maxFileSizeBytes) return;
+            if (m_currentSize + nextWriteBytes <= maxFileSizeBytesCfg) return;
 
             PerformRotation();
+
+            
             if (m_file && m_file != INVALID_HANDLE_VALUE) {
                 CloseHandle(m_file);
                 m_file = INVALID_HANDLE_VALUE;
@@ -593,7 +739,7 @@ namespace ShadowStrike {
                 ~RotationGuard() { flag.store(false, std::memory_order_release); }
             } guard{ m_insideRotation };
 
-            std::lock_guard<std::mutex> lock(m_cfgmutex);
+            // ⚠️ NOTE: m_cfgmutex already locked by caller!
 
             try {
                 if (m_file && m_file != INVALID_HANDLE_VALUE) {
@@ -603,16 +749,21 @@ namespace ShadowStrike {
                 }
 
                 const std::wstring base = BaseLogPath();
+                size_t maxFileCountCfg = m_cfg.maxFileCount;
 
-                if (m_cfg.maxFileCount > 1) {
-                    std::wstring oldestFile = base + L"." + std::to_wstring(m_cfg.maxFileCount);
+                if (maxFileCountCfg > 1) {
+                    std::wstring oldestFile = base + L"." + std::to_wstring(maxFileCountCfg);
+
+                   
                     DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
                     if (attrs != INVALID_FILE_ATTRIBUTES) {
                         ::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL);
-                        ::DeleteFileW(oldestFile.c_str());
+                        if (!::DeleteFileW(oldestFile.c_str())) {
+                            // Delete failed, continue
+                        }
                     }
 
-                    for (size_t idx = m_cfg.maxFileCount - 1; idx >= 1; --idx) {
+                    for (size_t idx = maxFileCountCfg - 1; idx >= 1; --idx) {
                         std::wstring srcFile = base + L"." + std::to_wstring(idx);
                         std::wstring dstFile = base + L"." + std::to_wstring(idx + 1);
 
@@ -622,13 +773,16 @@ namespace ShadowStrike {
                             continue;
                         }
 
+                        
                         attrs = ::GetFileAttributesW(dstFile.c_str());
                         if (attrs != INVALID_FILE_ATTRIBUTES) {
                             ::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
                             ::DeleteFileW(dstFile.c_str());
                         }
 
-                        ::MoveFileExW(srcFile.c_str(), dstFile.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                        if (!::MoveFileExW(srcFile.c_str(), dstFile.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+							// Move failed, continue
+                        }
                         if (idx == 1) break;
                     }
 
@@ -640,7 +794,9 @@ namespace ShadowStrike {
                             ::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
                             ::DeleteFileW(firstRotated.c_str());
                         }
-                        ::MoveFileExW(base.c_str(), firstRotated.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                        if (!::MoveFileExW(base.c_str(), firstRotated.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+							// Move failed, continue
+                        }
                     }
                 }
                 else {
@@ -654,23 +810,32 @@ namespace ShadowStrike {
                 m_currentSize = 0;
                 m_actualLogPath.clear();
             }
-            catch (...) {}
+            catch (...) {
+                // Rotation failed, continue
+            }
 #endif
         }
 
         void Logger::EnsureLogDirectory() {
 #ifdef _WIN32
-            if (m_cfg.logDirectory.empty()) return;
-            DWORD attrs = GetFileAttributesW(m_cfg.logDirectory.c_str());
+            std::wstring logDirCfg;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                logDirCfg = m_cfg.logDirectory;
+            }
+            if (logDirCfg.empty()) return;
+
+            DWORD attrs = GetFileAttributesW(logDirCfg.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 return;
             }
-            CreateDirectoryW(m_cfg.logDirectory.c_str(), nullptr);
+            CreateDirectoryW(logDirCfg.c_str(), nullptr);
 #endif
         }
 
         std::wstring Logger::BaseLogPath() const {
 #ifdef _WIN32
+            // ⚠️ NOTE: Caller should lock m_cfgmutex OR accept stale read
             std::wstring path = m_cfg.logDirectory;
             if (!path.empty()) {
                 if (path.back() != L'\\' && path.back() != L'/')
@@ -685,6 +850,7 @@ namespace ShadowStrike {
         }
 
         std::wstring Logger::CurrentLogPath() const {
+            std::lock_guard<std::mutex> lk(m_cfgmutex);
             return m_actualLogPath.empty() ? BaseLogPath() : m_actualLogPath;
         }
 
@@ -694,23 +860,30 @@ namespace ShadowStrike {
             OpenLogFileIfNeeded();
             if (!m_file || m_file == INVALID_HANDLE_VALUE) return;
 
-            std::wstring line = m_cfg.jsonLines ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+            bool jsonLinesCfg = m_cfg.jsonLines;
+            std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
             line += L"\r\n";
+
+            // Integer overflow check BEFORE calculation
+            constexpr size_t MAX_FILE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
+            if (line.size() > MAX_FILE_WRITE) {
+                return;
+            }
 
             const BYTE* data = reinterpret_cast<const BYTE*>(line.c_str());
             const DWORD bytesToWrite = static_cast<DWORD>(line.size() * sizeof(wchar_t));
 
-            if (line.size() > std::numeric_limits<DWORD>::max() / sizeof(wchar_t)) {
-                return;
-            }
-
             RotateIfNeeded(bytesToWrite);
 
             DWORD written = 0;
-            ::WriteFile(m_file, data, bytesToWrite, &written, nullptr);
+            if (!::WriteFile(m_file, data, bytesToWrite, &written, nullptr)) {
+                // Write failed,return
+                return;
+            }
             m_currentSize += written;
 
-            if (static_cast<int>(item.level) >= static_cast<int>(m_cfg.flushLevel))
+            LogLevel flushLevelCfg = m_cfg.flushLevel;
+            if (static_cast<int>(item.level) >= static_cast<int>(flushLevelCfg))
                 FlushFileBuffers(m_file);
 #endif
         }
@@ -718,7 +891,12 @@ namespace ShadowStrike {
         void Logger::OpenEventLog() {
 #ifdef _WIN32
             if (m_eventSrc) return;
-            m_eventSrc = RegisterEventSourceW(nullptr, m_cfg.eventLogSource.c_str());
+            std::wstring eventLogSourceCfg;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                eventLogSourceCfg = m_cfg.eventLogSource;
+            }
+            m_eventSrc = RegisterEventSourceW(nullptr, eventLogSourceCfg.c_str());
 #endif
         }
 
@@ -733,7 +911,15 @@ namespace ShadowStrike {
 
         void Logger::WriteEventLog(const LogItem& item) {
 #ifdef _WIN32
-            if (!m_cfg.toEventLog) return;
+            bool toEventLogCfg = false;
+            bool jsonLinesCfg = false;
+            {
+                std::lock_guard<std::mutex> lk(m_cfgmutex);
+                toEventLogCfg = m_cfg.toEventLog;
+                jsonLinesCfg = m_cfg.jsonLines;
+            }
+
+            if (!toEventLogCfg) return;
             if (!m_eventSrc) OpenEventLog();
             if (!m_eventSrc) return;
 
@@ -745,7 +931,7 @@ namespace ShadowStrike {
             default:              type = EVENTLOG_INFORMATION_TYPE; break;
             }
 
-            std::wstring payload = m_cfg.jsonLines ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+            std::wstring payload = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
             const wchar_t* strings[1] = { payload.c_str() };
             ::ReportEventW(m_eventSrc, type, 0, 0, nullptr, 1, 0, strings, nullptr);
 #endif

@@ -9,7 +9,7 @@ namespace ShadowStrike {
 		namespace MemoryUtils {
 
 			static inline size_t AlignUp(size_t v, size_t a) noexcept {
-				// ? FIX: Check for overflow before addition
+				//check for overflow before aligning
 				if (a == 0) return v; // Avoid division by zero
 				if (v > SIZE_MAX - (a - 1)) {
 					// Overflow would occur - return max aligned value
@@ -85,7 +85,7 @@ namespace ShadowStrike {
         }
         return true;
     } else if (freeType == MEM_DECOMMIT) {
-        // ? FIX: Validate size doesn't exceed reasonable limits
+        // Validate size doesn't exceed reasonable limits
         const size_t page = PageSize();
         if (size == 0 || (size % page) != 0) {
             SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) requires non-zero size aligned to page size (size=%llu, page=%llu)",
@@ -93,7 +93,7 @@ namespace ShadowStrike {
             return false;
         }
         
-        // ? FIX: Sanity check - prevent absurdly large sizes
+        // Sanity check - prevent absurdly large sizes
         constexpr size_t MAX_DECOMMIT_SIZE = 1ULL << 40; // 1TB limit
         if (size > MAX_DECOMMIT_SIZE) {
             SS_LOG_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) size too large (size=%llu)",
@@ -215,7 +215,7 @@ namespace ShadowStrike {
         return false;
     }
 
-    // ? FIX: Commit guard pages with PAGE_NOACCESS to trigger exceptions
+    // Commit guard pages with PAGE_NOACCESS to trigger exceptions
     BYTE* guardFront = reinterpret_cast<BYTE*>(base);
     if (!::VirtualAlloc(guardFront, page, MEM_COMMIT, PAGE_NOACCESS)) {
         SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: Failed to commit front guard page");
@@ -233,7 +233,7 @@ namespace ShadowStrike {
         return false;
     }
 
-    // ? FIX: Commit back guard page
+    //: Commit back guard page
     BYTE* guardBack = dataPtr + dataSizeAligned;
     if (!::VirtualAlloc(guardBack, page, MEM_COMMIT, PAGE_NOACCESS)) {
         SS_LOG_LAST_ERROR(L"MemoryUtils", L"AllocateWithGuards: Failed to commit back guard page");
@@ -311,35 +311,58 @@ namespace ShadowStrike {
 				DWORD& granularity) noexcept {
 #ifdef _WIN32
 				addresses.clear();
-				ULONG_PTR count = 0;
-				DWORD res = ::GetWriteWatch(0, base, regionSize, nullptr, &count, &granularity);
-				if (res != 0 && res != ERROR_INSUFFICIENT_BUFFER) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"GetWriteWatch size query failed (res=%lu)", res);
+				if (!base || regionSize == 0) {
+					SS_LOG_ERROR(L"MemoryUtils", L"Invalid parameters");
 					return false;
 				}
+
+				ULONG_PTR count = 0;
+				DWORD gran = 0;
+
+				// First call: get count
+				UINT res = ::GetWriteWatch(0, base, regionSize, nullptr, &count, &gran);
+
+				// GetWriteWatch returns ~0U on failure, not an error code
+				if (res != 0) {
+					DWORD lastError = ::GetLastError();
+					SS_LOG_ERROR(L"MemoryUtils",
+						L"GetWriteWatch failed (res=%u, base=%p, size=%llu, error=%lu)",
+						res, base, static_cast<unsigned long long>(regionSize), lastError);
+					return false;
+				}
+
 				if (count == 0) {
+					granularity = gran;
 					return true;
 				}
-				addresses.resize(count, nullptr);
-				
-				// ? FIX: Update count variable for second call (it's in/out parameter)
+
+				addresses.resize(count);
 				ULONG_PTR actualCount = count;
-				res = ::GetWriteWatch(0, base, regionSize, reinterpret_cast<void**>(addresses.data()), &actualCount, &granularity);
+				gran = 0;
+
+				// Second call: get addresses
+				res = ::GetWriteWatch(0, base, regionSize,
+					addresses.data(),
+					&actualCount,
+					&gran);
+
 				if (res != 0) {
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"GetWriteWatch addresses failed (res=%lu)", res);
+					DWORD lastError = ::GetLastError();
+					SS_LOG_ERROR(L"MemoryUtils",
+						L"GetWriteWatch failed (res=%u, error=%lu)",
+						res, lastError);
 					addresses.clear();
 					return false;
 				}
-				
-				// ? FIX: Always resize to actual count returned
+
 				addresses.resize(actualCount);
+				granularity = gran;
 				return true;
 #else
-				(void)base; (void)regionSize; (void)addresses; (void)granularity; return false;
+				(void)base; (void)regionSize; (void)addresses; (void)granularity;
+				return false;
 #endif
 			}
-
-
 
 			bool ResetWriteWatchRegion(void* base, size_t regionSize) noexcept {
 #ifdef _WIN32
@@ -499,7 +522,7 @@ namespace ShadowStrike {
     m_rw = true;
     m_size = sz;
 
-    // ? FIX: Handle empty files - cannot create mapping for 0-byte files
+    // Handle empty files - cannot create mapping for 0-byte files
     if (m_size == 0) {
         // File is empty - valid state but no mapping needed
         SS_LOG_WARN(L"MemoryUtils", L"mapReadWrite: Cannot map empty file: %ls", path.c_str());
@@ -558,7 +581,7 @@ namespace ShadowStrike {
 			void* AlignedAlloc(size_t size, size_t alignment) noexcept {
 				if (size == 0 || alignment == 0) return nullptr;
 				
-				// ? FIX: Add sanity checks before allocation
+				//  Add sanity checks before allocation
 				constexpr size_t MAX_ALIGNMENT = 1ULL << 20; // 1MB max alignment
 				constexpr size_t MAX_ALLOC_SIZE = 1ULL << 32; // 4GB max allocation
 				

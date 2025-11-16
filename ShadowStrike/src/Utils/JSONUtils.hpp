@@ -100,23 +100,94 @@ namespace ShadowStrike {
 				try {
 					const auto jpStr = ToJsonPointer(pathLike);
 					const nlohmann::json::json_pointer jp(jpStr);
-					// Create intermediate paths
-                    // nlohmann::json does not create intermediate paths directly; we do.
-					if (jpStr == "/") { j = std::forward<T>(value); return true; }
-					Json* cur = &j;
-					std::string acc;
-					for (const auto& tok : jp) {
-						acc.push_back('/');
-						acc.append(tok);
-						nlohmann::json::json_pointer partial(acc);
-						if (!j.contains(partial)) {
-							
-							bool isIndex = !tok.empty() && std::all_of(tok.begin(), tok.end(), [](char c) { return c >= '0' && c <= '9'; });
-							(*cur)[tok] = isIndex ? Json::array() : Json::object();
-						}
-						cur = &j.at(partial);
+					
+					if (jpStr == "/") { 
+						j = std::forward<T>(value); 
+						return true; 
 					}
-					j[nlohmann::json::json_pointer(jpStr)] = std::forward<T>(value);
+					
+					// Parse tokens from json pointer string manually
+					std::vector<std::string> tokens;
+					std::string current;
+					for (size_t i = 1; i < jpStr.size(); ++i) { // Skip leading '/'
+						if (jpStr[i] == '/') {
+							if (!current.empty()) {
+								tokens.push_back(current);
+								current.clear();
+							}
+						} else {
+							current.push_back(jpStr[i]);
+						}
+					}
+					if (!current.empty()) {
+						tokens.push_back(current);
+					}
+					
+					if (tokens.empty()) {
+						j = std::forward<T>(value);
+						return true;
+					}
+					
+					// Create intermediate paths
+					Json* cur = &j;
+					for (size_t i = 0; i < tokens.size() - 1; ++i) {
+						const auto& tok = tokens[i];
+						bool isIndex = !tok.empty() && std::all_of(tok.begin(), tok.end(), [](char c) { return c >= '0' && c <= '9'; });
+						
+						// Initialize current node if null
+						if (cur->is_null()) {
+							*cur = isIndex ? Json::array() : Json::object();
+						}
+						
+						// Ensure correct type
+						if (isIndex && !cur->is_array()) {
+							return false; // Type mismatch
+						}
+						if (!isIndex && !cur->is_object()) {
+							return false; // Type mismatch
+						}
+						
+						// Navigate or create intermediate node
+						if (isIndex) {
+							size_t idx = std::stoull(tok);
+							// Expand array if needed
+							while (cur->size() <= idx) {
+								cur->push_back(Json::object());
+							}
+							cur = &(*cur)[idx];
+						} else {
+							if (!cur->contains(tok)) {
+								// Look ahead to determine what to create
+								bool nextIsIndex = (i + 1 < tokens.size() - 1) && 
+								                   !tokens[i + 1].empty() && 
+								                   std::all_of(tokens[i + 1].begin(), tokens[i + 1].end(), [](char c) { return c >= '0' && c <= '9'; });
+								(*cur)[tok] = nextIsIndex ? Json::array() : Json::object();
+							}
+							cur = &(*cur)[tok];
+						}
+					}
+					
+					// Set final value
+					const auto& finalTok = tokens.back();
+					bool isFinalIndex = !finalTok.empty() && std::all_of(finalTok.begin(), finalTok.end(), [](char c) { return c >= '0' && c <= '9'; });
+					
+					if (cur->is_null()) {
+						*cur = isFinalIndex ? Json::array() : Json::object();
+					}
+					
+					if (isFinalIndex) {
+						if (!cur->is_array()) return false;
+						size_t idx = std::stoull(finalTok);
+						// Expand array if needed
+						while (cur->size() <= idx) {
+							cur->push_back(nullptr);
+						}
+						(*cur)[idx] = std::forward<T>(value);
+					} else {
+						if (!cur->is_object()) return false;
+						(*cur)[finalTok] = std::forward<T>(value);
+					}
+					
 					return true;
 				}
 				catch (...) {
@@ -134,6 +205,12 @@ namespace ShadowStrike {
 		}// namespace JSON
 	}// namespace Utils
 }// namespace ShadowStrike
+
+
+
+
+
+
 
 
 

@@ -176,10 +176,10 @@ namespace ShadowStrike {
 			std::atomic<bool> m_initialized{ false };
 			std::atomic<LogLevel> m_minLevel{ LogLevel::Info };
 			LoggerConfig m_cfg{};
-			std::mutex m_cfgmutex;
+			mutable std::mutex m_cfgmutex;
 
 			std::deque<LogItem> m_queue;
-			std::mutex m_queueMutex;
+			mutable std::mutex m_queueMutex;
 			std::condition_variable m_queueCv;
 
 			std::thread m_worker;

@@ -1696,10 +1696,16 @@ std::optional<ProcessThreadInfo> GetThreadInfo(ThreadId tid, Error* err) noexcep
         ti.kernelTime = kt;
         ti.userTime = ut;
     }
-    DWORD prev = ::SuspendThread(hThread);
-    if (prev != (DWORD)-1) {
-        ti.isSuspended = (prev > 0);
-        ::ResumeThread(hThread);
+    ThreadId currentTid = ::GetCurrentThreadId();
+    if (tid != currentTid) { 
+        DWORD prev = ::SuspendThread(hThread);
+        if (prev != (DWORD)-1) {
+            ti.isSuspended = (prev > 0);
+            ::ResumeThread(hThread);
+        }
+    }
+    else {
+        ti.isSuspended = false; 
     }
     CloseHandle(hThread);
     return ti;

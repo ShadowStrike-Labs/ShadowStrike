@@ -1,10 +1,5 @@
-
 #pragma once
 
-#include <string>
-#include <string_view>
-#include <vector>
-#include <Windows.h>
 
 #ifdef _WIN32
 
@@ -16,7 +11,14 @@
 #define WIN32_LEAN_AND_MEAN
 #endif // Exclude rarely-used stuff from Windows headers
 
+#include <Windows.h>
+
 #endif // _WIN32
+
+#include <string>
+#include <string_view>
+#include <vector>
+
 
 namespace ShadowStrike {
 
@@ -34,13 +36,13 @@ namespace ShadowStrike {
 
 			//LOWER/UPPER case conversions (Locale independent)
 
-			void toLower(std::wstring& str);
+			void ToLower(std::wstring& str);
 
-			std::wstring toLowerCopy(std::wstring_view str);
+			std::wstring ToLowerCopy(std::wstring_view str);
 
-			void toUpper(std::wstring& str);
+			void ToUpper(std::wstring& str);
 
-			std::wstring toUpperCopy(std::wstring_view str);
+			std::wstring ToUpperCopy(std::wstring_view str);
 
 
 			//Trimming functions
