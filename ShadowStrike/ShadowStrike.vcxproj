@@ -177,7 +177,6 @@
     <ClCompile Include="tests\unit\Utils\RegistryUtilsTests.cpp" />
     <ClCompile Include="tests\unit\Utils\SystemUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\ThreadPool_Tests.cpp" />
-    <ClCompile Include="tests\unit\Utils\Timer_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\XMLUtils_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>

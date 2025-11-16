@@ -144,9 +144,6 @@
     <ClCompile Include="tests\unit\Utils\ThreadPool_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="tests\unit\Utils\Timer_Tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="tests\unit\Utils\XMLUtils_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>

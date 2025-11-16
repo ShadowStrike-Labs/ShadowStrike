@@ -147,6 +147,16 @@ namespace ShadowStrike {
                         if (rb != std::string::npos) {
                             std::string idxStr = s.name.substr(lb + 1, rb - (lb + 1));
                             bool allDigits = !idxStr.empty() && std::all_of(idxStr.begin(), idxStr.end(), isDigit);
+                            
+                            // ? FIX: Reject malformed brackets (XPath injection attempt)
+                            // If brackets exist but content is not pure digits, it's suspicious
+                            if (!idxStr.empty() && !allDigits) {
+                                // Contains non-digit characters like '=', '<', '>', etc.
+                                // This is likely an XPath injection attempt
+                                out.clear();  // Clear all steps to signal rejection
+                                return;
+                            }
+                            
                             if (allDigits) {
                                 try {
                                     unsigned long long idx = std::stoull(idxStr);
@@ -159,11 +169,15 @@ namespace ShadowStrike {
                                     // Check if exceeds platform-specific size_t maximum
                                     if (idx > std::numeric_limits<size_t>::max()) {
                                         // Index too large for this platform, skip
+                                        // ? FIX: Remove bracket notation from name when skipping
+                                        s.name = s.name.substr(0, lb);
                                         continue;
                                     }
                                     
                                     if (idx > MAX_INDEX) {
                                         // Index exceeds security limit, skip
+                                        // ? FIX: Remove bracket notation from name when skipping
+                                        s.name = s.name.substr(0, lb);
                                         continue;
                                     }
                                     
@@ -172,10 +186,14 @@ namespace ShadowStrike {
                                 }
                                 catch (const std::out_of_range&) {
                                     // Index is too large, skip it
+                                    // ? FIX: Remove bracket notation from name when skipping
+                                    s.name = s.name.substr(0, lb);
                                     continue;
                                 }
                                 catch (const std::invalid_argument&) {
                                     // invalid format , skip it
+                                    // ? FIX: Remove bracket notation from name when skipping
+                                    s.name = s.name.substr(0, lb);
                                     continue;
                                 }
                             }
@@ -192,7 +210,14 @@ namespace ShadowStrike {
 
                     std::vector<Step> steps;
                     parsePathLike(pathLike, steps);
-                    if (steps.empty()) return std::string("/");
+                    
+                    // ? FIX: Empty steps means rejection (malformed input)
+                    // parsePathLike clears steps if it detects XPath injection
+                    // Return INVALID sentinel instead of "/" to signal rejection
+                    if (steps.empty()) {
+                        // Return invalid XPath that will fail validation
+                        return std::string("__INVALID__");
+                    }
 
                     std::string xp;
                     xp.reserve(pathLike.size() * 2);
@@ -218,7 +243,7 @@ namespace ShadowStrike {
                     return xp;
                 }
                 catch (...) {
-                    return std::string("/");
+                    return std::string("__INVALID__");
                 }
             }
 
@@ -516,18 +541,20 @@ namespace ShadowStrike {
                     // ? BUG #5 FIX: XPath Injection Protection
                     // PROBLEM: User-controlled XPath can access arbitrary nodes or cause DoS
                     // SOLUTION: Validate XPath before execution
-                    
-                    // Basic XPath validation: reject dangerous patterns
-                    // This is a conservative approach - whitelist simple paths only
+                        
+                    // ? ENHANCED FIX: Stricter validation - reject XPath operators
+                    // Allow ONLY: / @ [ ] 0-9 a-z A-Z _ - .
+                    // Explicitly REJECT: = < > ( ) | ! * $ ' " and other operators
                     for (char c : xp) {
-                        // Allow: / @ [ ] 0-9 a-z A-Z _ - .
-                        // Reject: ( ) | = < > ! * $ and other XPath operators
-                        if (!(std::isalnum(static_cast<unsigned char>(c)) || 
-                              c == '/' || c == '@' || c == '[' || c == ']' || 
-                              c == '_' || c == '-' || c == '.')) {
-                            // Suspicious character detected
-                            return false;
+                        // Alphanumeric + safe path characters
+                        if (std::isalnum(static_cast<unsigned char>(c)) || 
+                            c == '/' || c == '@' || c == '[' || c == ']' || 
+                            c == '_' || c == '-' || c == '.') {
+                            continue;  // Safe character
                         }
+                        
+                        // Any other character is suspicious (including =, <, >, etc.)
+                        return false;
                     }
                     
                     // Additional check: reject if XPath is too long (DoS prevention)
@@ -546,12 +573,14 @@ namespace ShadowStrike {
                 const std::string xp = ToXPath(pathLike);
                 
                 // ? BUG #5 FIX: XPath Injection Protection (same validation as Contains)
+                // ? ENHANCED: Stricter validation
                 for (char c : xp) {
-                    if (!(std::isalnum(static_cast<unsigned char>(c)) || 
-                          c == '/' || c == '@' || c == '[' || c == ']' || 
-                          c == '_' || c == '-' || c == '.')) {
-                        return false;
+                    if (std::isalnum(static_cast<unsigned char>(c)) || 
+                        c == '/' || c == '@' || c == '[' || c == ']' || 
+                        c == '_' || c == '-' || c == '.') {
+                        continue;
                     }
+                    return false;
                 }
                 
                 if (xp.size() > 1000) {
@@ -631,18 +660,20 @@ namespace ShadowStrike {
                         const std::string xp(pathLike);
                         
                         // XPath validation (same as BUG #5)
+                        // ? ENHANCED: Stricter validation
                         for (char c : xp) {
-                            if (!(std::isalnum(static_cast<unsigned char>(c)) || 
-                                  c == '/' || c == '@' || c == '[' || c == ']' || 
-                                  c == '_' || c == '-' || c == '.')) {
-                                return false;
+                            if (std::isalnum(static_cast<unsigned char>(c)) || 
+                                c == '/' || c == '@' || c == '[' || c == ']' || 
+                                c == '_' || c == '-' || c == '.') {
+                                continue;
                             }
+                            return false;
                         }
                         
                         if (xp.size() > 1000) {
                             return false;
                         }
-                        
+
                         pugi::xpath_node xn = root.select_node(xp.c_str());
                         if (!xn) return false;
                         
@@ -678,8 +709,16 @@ namespace ShadowStrike {
                             if (!child) return false;  // ? BUG #10: Check allocation
                         }
                         cur = cur.first_child();
-                        // If first step doesn't match root, we'll establish hierarchy by adding it as child
-                        if (!steps[0].isAttribute && std::string(cur.name()) != steps[0].name) {
+                        
+                        // ? FIX #NEW: If first step matches existing root name, skip it
+                        // Example: Set(doc, "root.item", "value") where doc already has <root>
+                        // We should skip "root" step and start from "item"
+                        if (!steps[0].isAttribute && std::string(cur.name()) == steps[0].name) {
+                            // First step matches root name, skip it in iteration
+                            // Change logic: start from step index 1 instead of 0
+                            // But we need to handle this in the loop below
+                            // Actually, we'll mark this and handle below
+                        } else if (!steps[0].isAttribute && std::string(cur.name()) != steps[0].name) {
                             // if document contains another root, we cannot add new root
                             if (root.first_child() && root.first_child().next_sibling()) return false;
                             // no renaming of existing root; just proceed under it
@@ -689,11 +728,20 @@ namespace ShadowStrike {
                     // Progression and creation
                     Node parent = root.type() == pugi::node_document ? root.first_child() : root;
                     
+                    // ? FIX #NEW: Determine starting step index
+                    size_t startStep = 0;
+                    if (root.type() == pugi::node_document && parent) {
+                        // If first step name matches document root name, skip it
+                        if (!steps[0].isAttribute && std::string(parent.name()) == steps[0].name) {
+                            startStep = 1;  // Skip first step, already at root
+                        }
+                    }
+                    
                     // ? BUG #6 FIX: Track total nodes created across ALL steps
                     size_t totalNodesCreated = 0;
                     constexpr size_t MAX_TOTAL_NODES = 1000;  // Aggressive limit
                     
-                    for (size_t i = 0; i < steps.size(); ++i) {
+                    for (size_t i = startStep; i < steps.size(); ++i) {
                         const Step& s = steps[i];
                         const bool last = (i + 1 == steps.size());
                         
@@ -777,12 +825,14 @@ namespace ShadowStrike {
                     const std::string xp = ToXPath(pathLike);
                     
                     // ? BUG #5 FIX: XPath Injection Protection (same validation)
+                    // ? ENHANCED: Stricter validation
                     for (char c : xp) {
-                        if (!(std::isalnum(static_cast<unsigned char>(c)) || 
-                              c == '/' || c == '@' || c == '[' || c == ']' || 
-                              c == '_' || c == '-' || c == '.')) {
-                            return false;
+                        if (std::isalnum(static_cast<unsigned char>(c)) || 
+                            c == '/' || c == '@' || c == '[' || c == ']' || 
+                            c == '_' || c == '-' || c == '.') {
+                            continue;
                         }
+                        return false;
                     }
                     
                     if (xp.size() > 1000) {

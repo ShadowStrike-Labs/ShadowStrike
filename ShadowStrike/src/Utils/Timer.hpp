@@ -9,7 +9,8 @@
 #include <atomic>
 #include <memory>
 #include <string>
-#include<queue>
+#include <queue>
+#include <unordered_map>  // ? FIX #NEW20: Added for m_activeTimers
 
 #include "ThreadPool.hpp"
 
@@ -73,6 +74,33 @@ namespace ShadowStrike {
 				}
 			};
 
+			// ? FIX #NEW18: Metadata for tracking active timers (race condition protection)
+			struct TimerMetadata {
+				TimerId id;
+				bool isPeriodic;
+				std::atomic<bool> isCancelled{ false };
+
+				// ? FIX #NEW21: Explicit constructors for atomic member
+				TimerMetadata() = default;
+				TimerMetadata(TimerId id_, bool periodic_, bool cancelled_)
+					: id(id_), isPeriodic(periodic_), isCancelled(cancelled_) {}
+
+				// ? FIX #NEW22: Delete copy, allow move
+				TimerMetadata(const TimerMetadata&) = delete;
+				TimerMetadata& operator=(const TimerMetadata&) = delete;
+				TimerMetadata(TimerMetadata&& other) noexcept
+					: id(other.id), isPeriodic(other.isPeriodic),
+					isCancelled(other.isCancelled.load()) {}
+				TimerMetadata& operator=(TimerMetadata&& other) noexcept {
+					if (this != &other) {
+						id = other.id;
+						isPeriodic = other.isPeriodic;
+						isCancelled.store(other.isCancelled.load());
+					}
+					return *this;
+				}
+			};
+
 			//main core for the timermanager
 			void managerThread();
 
@@ -85,6 +113,7 @@ namespace ShadowStrike {
 			std::shared_ptr<ThreadPool> m_threadPool;
 
 			std::priority_queue<TimerTask, std::vector<TimerTask>, std::greater<TimerTask>> m_taskQueue;
+			std::unordered_map<TimerId, TimerMetadata> m_activeTimers;  // ? FIX #NEW19: Track active timers
 			mutable std::mutex m_mutex;
 			std::condition_variable m_cv;
 			std::atomic<TimerId> m_nextTimerId{ 1 };
@@ -109,4 +138,4 @@ namespace ShadowStrike {
 
 	}// namespace Utils
 	
-}// namespace ShadowStrike}// namespace ShadowStrike
+}// namespace ShadowStrike
