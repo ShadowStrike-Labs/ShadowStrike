@@ -278,6 +278,9 @@
     <ClInclude Include="src\Utils\Base64Utils.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
+    <ClInclude Include="src\Utils\ThreadPoolEvents.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.github\copilot-instructions.md" />

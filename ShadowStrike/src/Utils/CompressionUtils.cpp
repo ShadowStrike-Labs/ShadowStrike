@@ -44,7 +44,7 @@ namespace ShadowStrike {
                     HMODULE h = ::GetModuleHandleW(L"cabinet.dll");
                     if (!h) h = ::LoadLibraryW(L"cabinet.dll");
                     if (!h) {
-                        SS_LOG_LAST_ERROR(L"CompressionUtils", L"cabinet.dll yüklenemedi");
+                        SS_LOG_LAST_ERROR(L"CompressionUtils", L"cabinet.dll failed to load");
                         return;
                     }
                     g.hCabinet = h;

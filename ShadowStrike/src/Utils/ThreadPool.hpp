@@ -24,6 +24,9 @@
 #include <evntprov.h>
 #include <cstdarg>
 #include <chrono>
+#include"ThreadPoolEvents.h"
+
+#include "Logger.hpp"
 
 namespace ShadowStrike {
     namespace Utils {
@@ -179,17 +182,23 @@ namespace ShadowStrike {
 
             void logThreadPoolEvent(const wchar_t* category, const wchar_t* format, ...);
 
+                void validateInternalState() const;
+
             // members
             std::vector<std::thread> m_threads;
             std::vector<HANDLE> m_threadHandles;
+            std::deque<Task> m_criticalPriorityQueue;  // Separate queue for Critical tasks
             std::deque<Task> m_highPriorityQueue;
             std::deque<Task> m_normalPriorityQueue;
             std::deque<Task> m_lowPriorityQueue;
 
             mutable std::mutex m_queueMutex;
             mutable std::mutex m_groupMutex;
+            // Protects m_threads and m_threadHandles for concurrent resize/shutdown/destructor
+            mutable std::mutex m_threadContainerMutex;
             std::condition_variable m_taskCv;
             std::condition_variable m_waitAllCv;
+            std::condition_variable m_startCv;
 
             std::atomic<bool> m_paused{ false };
             std::atomic<bool> m_shutdown{ false };
@@ -199,11 +208,13 @@ namespace ShadowStrike {
             std::atomic<size_t> m_totalTasksProcessed{ 0 };
             std::atomic<size_t> m_peakQueueSize{ 0 };
             std::atomic<uint64_t> m_totalExecutionTimeMs{ 0 };
+            std::atomic<bool> m_startReady{ false };
 
             std::unordered_map<TaskGroupId, std::shared_ptr<TaskGroup>> m_taskGroups;
             ThreadPoolConfig m_config;
             ThreadPoolStatistics m_stats;
-
+          
+            std::mutex m_startMutex;
             // Windows ETW Provider
             REGHANDLE m_etwProvider{ 0 };
         };
@@ -229,23 +240,7 @@ namespace ShadowStrike {
                 throw std::runtime_error("ThreadPool is shutting down, cannot accept new tasks");
             }
 
-            // ? BUG #24 FIX: MOVE-ONLY TYPES SUPPORT
-            // PROBLEM: std::bind with perfect forwarding doesn't support move-only types
-            //          (e.g., std::unique_ptr, move-only lambdas, std::packaged_task)
-            // SOLUTION: Use move-capture lambda instead of std::bind
-            //
-            // BEFORE (broken):
-            //   auto task = std::make_shared<PackagedTask>(std::bind(f, args...));
-            //
-            // AFTER (fixed):
-            //   auto bound = std::bind(f, args...);
-            //   auto task = std::make_shared<PackagedTask>([bound = std::move(bound)]() mutable { ... });
-            //
-            // This allows submitting:
-            //   - std::unique_ptr<Data> objects
-            //   - Move-only lambdas with captured state
-            //   - std::function with move-only state
-            //   - Other non-copyable types
+            
             
             auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
@@ -266,13 +261,10 @@ namespace ShadowStrike {
             {
                 std::unique_lock<std::mutex> lock(m_queueMutex);
 
-                // ? BUG #22 FIX: RACE CONDITION - Prevent TOCTOU (Time-Of-Check-Time-Of-Use)
-                // PROBLEM: After wait() wakes, multiple threads can wake simultaneously
-                // Solution: Re-check queue size with lock held BEFORE inserting
                 
                 if (m_config.maxQueueSize > 0) {
                     // WAIT with shutdown check and timeout
-                    bool waitResult = m_taskCv.wait_for(lock, std::chrono::seconds(30), [this]() {
+                    bool waitResult = m_taskCv.wait_for(lock, std::chrono::seconds(5), [this]() {
                         size_t total = m_highPriorityQueue.size() +
                             m_normalPriorityQueue.size() +
                             m_lowPriorityQueue.size();
@@ -308,8 +300,11 @@ namespace ShadowStrike {
                 auto taskWrapper = [task]() { (*task)(); };
                 Task newTask(taskId, 0, priority, std::move(taskWrapper));
 
+              
                 switch (priority) {
                 case TaskPriority::Critical:
+                    m_criticalPriorityQueue.push_back(std::move(newTask));
+                    break;
                 case TaskPriority::High:
                     m_highPriorityQueue.push_back(std::move(newTask));
                     break;
@@ -323,7 +318,8 @@ namespace ShadowStrike {
                 }
 
                 // ATOMIC PEAK UPDATE
-                size_t totalSize = m_highPriorityQueue.size() +
+                size_t totalSize = m_criticalPriorityQueue.size() +
+                    m_highPriorityQueue.size() +
                     m_normalPriorityQueue.size() +
                     m_lowPriorityQueue.size();
                 size_t oldPeak = m_peakQueueSize.load(std::memory_order_relaxed);
@@ -335,6 +331,18 @@ namespace ShadowStrike {
             }
 
             m_taskCv.notify_one();
+#ifndef NDEBUG
+            try {
+                validateInternalState();
+            }
+            catch (const std::exception& ex) {
+                if (m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool", L"Internal invariant failed: %hs", ex.what());
+                }
+                // debug: rethrow veya swallow tercihine göre
+                throw;
+            }
+#endif
 
             if (m_config.enableLogging) {
                 logThreadPoolEvent(L"ThreadPool", L"Task submitted with priority %d, ID: %llu",
@@ -418,6 +426,18 @@ namespace ShadowStrike {
             }
 
             m_taskCv.notify_one();
+#ifndef NDEBUG
+            try {
+                validateInternalState();
+            }
+            catch (const std::exception& ex) {
+                if (m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool", L"Internal invariant failed: %hs", ex.what());
+                }
+                // debug: rethrow veya swallow tercihine göre
+                throw;
+            }
+#endif
 
             if (m_config.enableLogging) {
                 logThreadPoolEvent(L"ThreadPool", L"Task submitted to group %llu, ID: %llu",
@@ -440,7 +460,7 @@ namespace ShadowStrike {
 
             auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
-            // ? BUG #24 FIX: Move capture for move-only types
+          
             auto task = std::make_shared<PackagedTask>(
                 [bound = std::move(bound)]() mutable -> ReturnType {
                     if constexpr (std::is_void_v<ReturnType>) {
@@ -476,6 +496,18 @@ namespace ShadowStrike {
             }
 
             m_taskCv.notify_one();
+#ifndef NDEBUG
+            try {
+                validateInternalState();
+            }
+            catch (const std::exception& ex) {
+                if (m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool", L"Internal invariant failed: %hs", ex.what());
+                }
+                // debug: rethrow veya swallow tercihine göre
+                throw;
+            }
+#endif
 
             if (m_config.enableLogging) {
                 logThreadPoolEvent(L"ThreadPool", L"Task trySubmit successful, ID: %llu", static_cast<unsigned long long>(taskId));
