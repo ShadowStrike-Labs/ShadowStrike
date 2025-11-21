@@ -26,6 +26,7 @@
 #include <array>
 #include <processthreadsapi.h>
 #include <unordered_set>
+#include<cassert>
 
 
 
@@ -98,7 +99,92 @@ namespace ShadowStrike {
             }
             catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"ThreadPool", L"Initialization failed: %S", ex.what());
+
+                // Mark shutdown so workers will notice and exit
                 m_shutdown.store(true, std::memory_order_release);
+
+                // Wake any waiters so threads can observe shutdown
+                m_taskCv.notify_all();
+                m_waitAllCv.notify_all();
+                m_startCv.notify_all();
+
+                // Snapshot and teardown any threads/handles created during partial initialization
+                {
+                    std::vector<std::thread> localThreads;
+                    std::vector<HANDLE> localHandles;
+                    {
+                        std::lock_guard<std::mutex> tlk(m_threadContainerMutex);
+                        localThreads = std::move(m_threads);
+                        localHandles = std::move(m_threadHandles);
+                    }
+
+                    if (localHandles.size() < localThreads.size()) localHandles.resize(localThreads.size(), nullptr);
+
+                    // Give threads a short time to exit; otherwise detach and close handles
+                    constexpr auto JOIN_TIMEOUT = std::chrono::seconds(2);
+                    auto deadline = std::chrono::steady_clock::now() + JOIN_TIMEOUT;
+
+                    for (size_t i = 0; i < localThreads.size(); ++i) {
+                        try {
+                            std::thread& th = localThreads[i];
+                            HANDLE h = (i < localHandles.size()) ? localHandles[i] : nullptr;
+
+                            if (h && h != INVALID_HANDLE_VALUE) {
+                                HANDLE dup = nullptr;
+                                if (::DuplicateHandle(::GetCurrentProcess(), h, ::GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                                    auto timeLeft = deadline - std::chrono::steady_clock::now();
+                                    DWORD waitMs = (timeLeft <= std::chrono::milliseconds(0)) ? 0 : static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(timeLeft).count());
+                                    DWORD r = ::WaitForSingleObject(dup, waitMs);
+                                    ::CloseHandle(dup);
+
+                                    if (r == WAIT_OBJECT_0) {
+                                        if (th.joinable()) { try { th.join(); } catch (...) {} }
+                                    }
+                                    else {
+                                        if (th.joinable()) { try { th.detach(); } catch (...) {} }
+                                    }
+                                }
+                                else {
+                                    if (th.joinable()) { try { th.detach(); } catch (...) {} }
+                                }
+                            }
+                            else {
+                                if (th.joinable()) {
+                                    auto start = std::chrono::steady_clock::now();
+                                    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(200)) {
+                                        if (!th.joinable()) break;
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                                    }
+                                    if (th.joinable()) { try { th.detach(); } catch (...) {} }
+                                }
+                            }
+
+                            if (h && h != INVALID_HANDLE_VALUE) {
+                                HANDLE dup2 = nullptr;
+                                if (::DuplicateHandle(::GetCurrentProcess(), h, ::GetCurrentProcess(), &dup2, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                                    ::CloseHandle(dup2);
+                                    ::CloseHandle(h);
+                                }
+                            }
+                        }
+                        catch (...) {}
+                    }
+                }
+
+                // Clear queues under queue mutex
+                {
+                    std::lock_guard<std::mutex> ql(m_queueMutex);
+                    m_criticalPriorityQueue.clear();
+                    m_highPriorityQueue.clear();
+                    m_normalPriorityQueue.clear();
+                    m_lowPriorityQueue.clear();
+                }
+
+                if (m_etwProvider != 0) {
+                    EventUnregister(m_etwProvider);
+                    m_etwProvider = 0;
+                }
+
                 throw std::exception("ThreadPool initialization failed");
             }
         }
@@ -116,7 +202,53 @@ namespace ShadowStrike {
             }
             catch (...) {
                 SS_LOG_ERROR(L"ThreadPool", L"Initialization failed for pool %s", m_config.poolName.c_str());
+
+                // Mark shutdown and wake waiters
                 m_shutdown.store(true, std::memory_order_release);
+                m_taskCv.notify_all();
+                m_waitAllCv.notify_all();
+                m_startCv.notify_all();
+
+                // Snapshot and teardown created threads/handles
+                {
+                    std::vector<std::thread> localThreads;
+                    std::vector<HANDLE> localHandles;
+                    {
+                        std::lock_guard<std::mutex> tlk(m_threadContainerMutex);
+                        localThreads = std::move(m_threads);
+                        localHandles = std::move(m_threadHandles);
+                    }
+
+                    if (localHandles.size() < localThreads.size()) localHandles.resize(localThreads.size(), nullptr);
+
+                    for (size_t i = 0; i < localThreads.size(); ++i) {
+                        try {
+                            if (localThreads[i].joinable()) { try { localThreads[i].detach(); } catch (...) {} }
+                            HANDLE h = (i < localHandles.size()) ? localHandles[i] : nullptr;
+                            if (h && h != INVALID_HANDLE_VALUE) {
+                                HANDLE dup2 = nullptr;
+                                if (::DuplicateHandle(::GetCurrentProcess(), h, ::GetCurrentProcess(), &dup2, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                                    ::CloseHandle(dup2);
+                                    ::CloseHandle(h);
+                                }
+                            }
+                        }
+                        catch (...) {}
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> ql(m_queueMutex);
+                    m_criticalPriorityQueue.clear();
+                    m_highPriorityQueue.clear();
+                    m_normalPriorityQueue.clear();
+                    m_lowPriorityQueue.clear();
+                }
+
+                if (m_etwProvider != 0) { EventUnregister(m_etwProvider); m_etwProvider = 0; }
+
+                // Reset shutdown flag (match original behavior) and rethrow
+                m_shutdown.store(false, std::memory_order_release);
                 throw;
             }
         }
@@ -731,6 +863,11 @@ namespace ShadowStrike {
                             continue;
                         }
 
+#if defined(_DEBUG)
+                        // Ensure we really own the queue lock before calling getNextTask()
+                        assert(lock.owns_lock() && "workerThread must hold m_queueMutex before calling getNextTask");
+#endif
+
                         // retrieve next task while still holding the queue lock
                         task = getNextTask();
                         hasTask = (task.function != nullptr);
@@ -867,44 +1004,18 @@ namespace ShadowStrike {
 
         ThreadPool::Task ThreadPool::getNextTask()
         {
-            // Debug-mode check: caller should hold m_queueMutex. If not, warn and try to recover.
 #if defined(_DEBUG)
-    // try to acquire; if we succeed, that means caller didn't hold it
+            // Debug: caller MUST hold m_queueMutex. If we can acquire it here, caller didn't own it.
             if (m_queueMutex.try_lock()) {
-                // we unexpectedly acquired the lock -> caller did not hold it
-                if (m_config.enableLogging) {
-                    SS_LOG_WARN(L"ThreadPool", L"getNextTask called without owning m_queueMutex (recovering).");
-                }
-                // release and proceed to attempt safe path
                 m_queueMutex.unlock();
-
-                // Safe fallback: lock and pop
-                std::lock_guard<std::mutex> guard(m_queueMutex);
-                if (!m_criticalPriorityQueue.empty()) {
-                    Task task = std::move(m_criticalPriorityQueue.front());
-                    m_criticalPriorityQueue.pop_front();
-                    return task;
+                if (m_config.enableLogging) {
+                    SS_LOG_ERROR(L"ThreadPool", L"getNextTask called without owning m_queueMutex");
                 }
-                if (!m_highPriorityQueue.empty()) {
-                    Task task = std::move(m_highPriorityQueue.front());
-                    m_highPriorityQueue.pop_front();
-                    return task;
-                }
-                if (!m_normalPriorityQueue.empty()) {
-                    Task task = std::move(m_normalPriorityQueue.front());
-                    m_normalPriorityQueue.pop_front();
-                    return task;
-                }
-                if (!m_lowPriorityQueue.empty()) {
-                    Task task = std::move(m_lowPriorityQueue.front());
-                    m_lowPriorityQueue.pop_front();
-                    return task;
-                }
-                return Task(0, 0, TaskPriority::Normal, nullptr);
+                assert(false && "getNextTask must be called while holding m_queueMutex");
             }
 #endif
 
-            // Normal (expected) path: caller already holds the queue mutex
+            // Normal path: caller owns the queue mutex
             if (!m_criticalPriorityQueue.empty()) {
                 Task task = std::move(m_criticalPriorityQueue.front());
                 m_criticalPriorityQueue.pop_front();
