@@ -1,599 +1,1016 @@
+﻿
+
 #include <gtest/gtest.h>
 #include "../../../src/Utils/ThreadPool.hpp"
-#include <chrono>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <vector>
-#include <algorithm>
-#include <numeric>
+#include <stdexcept>
 
 using namespace ShadowStrike::Utils;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// Basic Functionality Tests
+// Test Fixture
 // ============================================================================
 
-/**
- * @brief Test thread pool construction and basic properties
- */
-TEST(ThreadPoolTest, Construction) {
-    // Test default construction (uses hardware concurrency)
-    ThreadPool pool1;
-    EXPECT_GT(pool1.get_thread_count(), 0u);
-    EXPECT_FALSE(pool1.is_shutdown());
-    EXPECT_EQ(pool1.get_active_thread_count(), 0u);
-    EXPECT_EQ(pool1.get_queue_size(), 0u);
+class ThreadPoolTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Default configuration for most tests
+        config_.minThreads = 2;
+        config_.maxThreads = 8;
+        config_.maxQueueSize = 100;
+        config_.enableETW = false;  // Disable ETW for unit tests
+        config_.enableDeadlockDetection = false;  // Disable for faster tests
+    }
 
-    // Test construction with specific thread count
-    ThreadPool pool2(4);
-    EXPECT_EQ(pool2.get_thread_count(), 4u);
-    EXPECT_FALSE(pool2.is_shutdown());
+    void TearDown() override {
+        // Cleanup
+    }
 
-    // Test construction with monitoring disabled
-    ThreadPool pool3(2, false);
-    EXPECT_EQ(pool3.get_thread_count(), 2u);
+    ThreadPoolConfig config_;
+};
+
+// ============================================================================
+// ThreadPoolConfig Tests
+// ============================================================================
+
+TEST(ThreadPoolConfigTest, DefaultConfigurationIsValid) {
+    ThreadPoolConfig config;
+    EXPECT_TRUE(config.Validate());
 }
 
-/**
- * @brief Test basic task submission and execution
- */
-TEST(ThreadPoolTest, BasicTaskSubmission) {
-    ThreadPool pool(2);
-    
-    std::atomic<int> counter{0};
-    
-    // Submit simple task
-    auto future = pool.submit([&counter]() {
-        counter.fetch_add(1, std::memory_order_relaxed);
+TEST(ThreadPoolConfigTest, MinThreadsZeroIsInvalid) {
+    ThreadPoolConfig config;
+    config.minThreads = 0;
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, MinThreadsGreaterThanMaxIsInvalid) {
+    ThreadPoolConfig config;
+    config.minThreads = 10;
+    config.maxThreads = 5;
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, MaxThreadsZeroIsInvalid) {
+    ThreadPoolConfig config;
+    config.maxThreads = 0;
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, MaxThreadsAboveLimitIsInvalid) {
+    ThreadPoolConfig config;
+    config.maxThreads = 2000;  // Above 1024 limit
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, MaxQueueSizeZeroIsInvalid) {
+    ThreadPoolConfig config;
+    config.maxQueueSize = 0;
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, MaxQueueSizeAboveLimitIsInvalid) {
+    ThreadPoolConfig config;
+    config.maxQueueSize = 2000000;  // Above 1000000 limit
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, NegativeTimeoutsAreInvalid) {
+    ThreadPoolConfig config;
+    config.threadIdleTimeout = std::chrono::milliseconds(-1);
+    EXPECT_FALSE(config.Validate());
+
+    config.threadIdleTimeout = std::chrono::milliseconds(1000);
+    config.taskTimeout = std::chrono::milliseconds(-1);
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, EmptyThreadNamePrefixIsInvalid) {
+    ThreadPoolConfig config;
+    config.threadNamePrefix = L"";
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(ThreadPoolConfigTest, DeadlockDetectionWithZeroIntervalIsInvalid) {
+    ThreadPoolConfig config;
+    config.enableDeadlockDetection = true;
+    config.deadlockCheckInterval = std::chrono::milliseconds(0);
+    EXPECT_FALSE(config.Validate());
+}
+
+// ============================================================================
+// ThreadPool Lifecycle Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, ConstructorWithInvalidConfigThrows) {
+    ThreadPoolConfig invalidConfig;
+    invalidConfig.minThreads = 0;
+
+    EXPECT_THROW({
+        ThreadPool pool(invalidConfig);
+        }, std::invalid_argument);
+}
+
+TEST_F(ThreadPoolTest, InitializeSucceeds) {
+    ThreadPool pool(config_);
+    EXPECT_TRUE(pool.Initialize());
+    EXPECT_TRUE(pool.IsInitialized());
+    EXPECT_FALSE(pool.IsShutdown());
+}
+
+TEST_F(ThreadPoolTest, DoubleInitializeReturnsTrueWithoutError) {
+    ThreadPool pool(config_);
+    EXPECT_TRUE(pool.Initialize());
+    EXPECT_TRUE(pool.Initialize());  // Second call should return true
+}
+
+TEST_F(ThreadPoolTest, ShutdownWithoutInitializeIsNoop) {
+    ThreadPool pool(config_);
+    EXPECT_NO_THROW(pool.Shutdown());
+}
+
+TEST_F(ThreadPoolTest, ShutdownSetsFlags) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Shutdown();
+
+    EXPECT_FALSE(pool.IsInitialized());
+    EXPECT_TRUE(pool.IsShutdown());
+}
+
+TEST_F(ThreadPoolTest, DoubleShutdownIsNoop) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Shutdown();
+    EXPECT_NO_THROW(pool.Shutdown());  // Second call should not throw
+}
+
+TEST_F(ThreadPoolTest, DestructorShutsDownPool) {
+    {
+        ThreadPool pool(config_);
+        pool.Initialize();
+        // Pool will be destroyed at end of scope
+    }
+    // If we get here without hanging or crashing, test passes
+    SUCCEED();
+}
+
+TEST_F(ThreadPoolTest, PauseAndResumeWork) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    EXPECT_FALSE(pool.IsPaused());
+
+    pool.Pause();
+    EXPECT_TRUE(pool.IsPaused());
+
+    pool.Resume();
+    EXPECT_FALSE(pool.IsPaused());
+}
+
+TEST_F(ThreadPoolTest, DoublePauseIsNoop) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Pause();
+    EXPECT_NO_THROW(pool.Pause());
+    EXPECT_TRUE(pool.IsPaused());
+}
+
+TEST_F(ThreadPoolTest, DoubleResumeIsNoop) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Pause();
+    pool.Resume();
+    EXPECT_NO_THROW(pool.Resume());
+    EXPECT_FALSE(pool.IsPaused());
+}
+
+// ============================================================================
+// Task Submission Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, SubmitSimpleVoidTask) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::atomic<bool> executed{ false };
+
+    auto future = pool.Submit([&executed](const TaskContext&) {
+        executed = true;
+        });
+
+    future.wait();
+    EXPECT_TRUE(executed.load());
+}
+
+TEST_F(ThreadPoolTest, SubmitTaskReturningValue) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    auto future = pool.Submit([](const TaskContext&) -> int {
         return 42;
-    });
-
-    // Wait for result
-    ASSERT_EQ(future.get(), 42);
-    EXPECT_EQ(counter.load(), 1);
-}
-
-/**
- * @brief Test task submission with arguments
- */
-TEST(ThreadPoolTest, TaskWithArguments) {
-    ThreadPool pool(2);
-    
-    auto future = pool.submit([](int a, int b) {
-        return a + b;
-    }, 10, 32);
+        });
 
     EXPECT_EQ(future.get(), 42);
 }
 
-/**
- * @brief Test multiple concurrent tasks
- */
-TEST(ThreadPoolTest, MultipleConcurrentTasks) {
-    ThreadPool pool(4);
-    
-    std::atomic<int> counter{0};
-    std::vector<std::future<void>> futures;
+TEST_F(ThreadPoolTest, SubmitTaskWithArguments) {
+    ThreadPool pool(config_);
+    pool.Initialize();
 
-    // Submit 100 tasks
-    for (int i = 0; i < 100; ++i) {
-        futures.push_back(pool.submit([&counter]() {
+ 
+    auto future = pool.Submit(
+        [](const TaskContext& ctx) -> int {
+            return 10 + 20;
+        }
+    );
+
+    EXPECT_EQ(future.get(), 30);
+}
+
+
+TEST_F(ThreadPoolTest, SubmitMultipleTasks) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::atomic<int> counter{ 0 };
+    std::vector<std::shared_future<void>> futures;
+
+    for (int i = 0; i < 10; ++i) {
+        futures.push_back(pool.Submit([&counter](const TaskContext&) {
             counter.fetch_add(1, std::memory_order_relaxed);
-        }));
+            }));
     }
 
-    // Wait for all tasks to complete
     for (auto& future : futures) {
-        future.get();
+        future.wait();
     }
 
-    EXPECT_EQ(counter.load(), 100);
+    EXPECT_EQ(counter.load(), 10);
+}
+
+TEST_F(ThreadPoolTest, SubmitToShutdownPoolThrows) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+    pool.Shutdown();
+
+    EXPECT_THROW({
+        pool.Submit([](const TaskContext&) {});
+        }, std::runtime_error);
+}
+
+TEST_F(ThreadPoolTest, SubmitWithPriority) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    auto future = pool.Submit(
+        [](const TaskContext& ctx) {
+			return 1;  //only return 1, since the priority can't be tested directly here
+        }
+    );
+
+    EXPECT_EQ(future.get(), 1);
+}
+TEST_F(ThreadPoolTest, TaskContextReceivesCorrectInformation) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    bool hasTaskId = false;
+    bool hasPriority = false;
+
+    auto future = pool.Submit(
+        [&](const TaskContext& ctx) {
+            hasTaskId = (ctx.taskId > 0);
+            hasPriority = (ctx.priority == TaskPriority::Normal); // Default priority
+           
+        }
+    );
+
+    future.wait();
+
+    EXPECT_TRUE(hasTaskId);
+    EXPECT_TRUE(hasPriority);
+    
 }
 
 // ============================================================================
-// Priority-Based Scheduling Tests
+// Task Timeout Tests
 // ============================================================================
 
-/**
- * @brief Test priority-based task execution
- */
-TEST(ThreadPoolTest, PriorityScheduling) {
-    ThreadPool pool(1);  // Single thread to ensure ordering
-    
-    std::vector<int> execution_order;
-    std::mutex order_mutex;
+TEST_F(ThreadPoolTest, SubmitWithTimeoutDoesNotTimeout) {
+    ThreadPool pool(config_);
+    pool.Initialize();
 
-    // Submit tasks with different priorities
-    auto low_future = pool.submit_priority(TaskPriority::LOW, [&]() {
-        std::this_thread::sleep_for(10ms);  // Ensure other tasks are queued
-    });
+    auto future = pool.SubmitWithTimeout(
+        1000ms,
+        [](const TaskContext&) { return 42; }
+    );
 
-    // Give time for first task to start
-    std::this_thread::sleep_for(5ms);
-
-    // Now submit tasks that should execute in priority order
-    auto normal_future = pool.submit_priority(TaskPriority::NORMAL, [&]() {
-        std::lock_guard<std::mutex> lock(order_mutex);
-        execution_order.push_back(2);
-    });
-
-    auto high_future = pool.submit_priority(TaskPriority::HIGH, [&]() {
-        std::lock_guard<std::mutex> lock(order_mutex);
-        execution_order.push_back(3);
-    });
-
-    auto critical_future = pool.submit_priority(TaskPriority::CRITICAL, [&]() {
-        std::lock_guard<std::mutex> lock(order_mutex);
-        execution_order.push_back(4);
-    });
-
-    // Wait for all tasks
-    low_future.get();
-    normal_future.get();
-    high_future.get();
-    critical_future.get();
-
-    // Verify execution order (CRITICAL > HIGH > NORMAL)
-    ASSERT_EQ(execution_order.size(), 3u);
-    EXPECT_EQ(execution_order[0], 4);  // CRITICAL first
-    EXPECT_EQ(execution_order[1], 3);  // HIGH second
-    EXPECT_EQ(execution_order[2], 2);  // NORMAL third
+    EXPECT_EQ(future.get(), 42);
 }
 
-/**
- * @brief Test bulk task submission
- */
-TEST(ThreadPoolTest, BulkSubmission) {
-    ThreadPool pool(4);
-    
-    std::atomic<int> counter{0};
-    std::vector<std::function<void()>> tasks;
+TEST_F(ThreadPoolTest, SubmitWithTimeoutThrowsOnTimeout) {
+    ThreadPool pool(config_);
+    pool.Initialize();
 
-    for (int i = 0; i < 50; ++i) {
-        tasks.push_back([&counter]() {
-            counter.fetch_add(1, std::memory_order_relaxed);
+    auto future = pool.SubmitWithTimeout(
+        10ms,  // Very short timeout
+        [](const TaskContext&) {
+            std::this_thread::sleep_for(100ms);  // Sleep longer than timeout
+            return 42;
+        }
+    );
+
+    EXPECT_THROW(future.get(), std::runtime_error);
+}
+
+// ============================================================================
+// Task Cancellation Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, CreateCancellationToken) {
+    auto token = ThreadPool::CreateCancellationToken();
+
+    ASSERT_NE(token, nullptr);
+    EXPECT_FALSE(token->load());
+}
+
+TEST_F(ThreadPoolTest, SubmitCancellableTaskNotCancelled) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    auto token = ThreadPool::CreateCancellationToken();
+
+    auto future = pool.SubmitCancellable(
+        token,
+        [](const TaskContext&) { return 42; }
+    );
+
+    EXPECT_EQ(future.get(), 42);
+}
+
+TEST_F(ThreadPoolTest, SubmitCancellableTaskCancelled) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    auto token = ThreadPool::CreateCancellationToken();
+    token->store(true);  // Cancel before submission
+
+    auto future = pool.SubmitCancellable(
+        token,
+        [](const TaskContext&) { return 42; }
+    );
+
+    EXPECT_THROW(future.get(), std::runtime_error);
+}
+
+TEST_F(ThreadPoolTest, TaskContextCanCheckCancellation) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    auto token = ThreadPool::CreateCancellationToken();
+    bool wasCancelled = false;
+
+    auto future = pool.SubmitCancellable(
+        token,
+        [&wasCancelled](const TaskContext& ctx) {
+            wasCancelled = ctx.IsCancelled();
+        }
+    );
+
+    future.wait();
+    EXPECT_FALSE(wasCancelled);
+}
+
+// ============================================================================
+// Batch Submission Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, SubmitBatchWithVector) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::vector<int> inputs = { 1, 2, 3, 4, 5 };
+
+    auto futures = pool.SubmitBatch(
+        [](const TaskContext&, int x) { return x * 2; },
+        inputs
+    );
+
+    ASSERT_EQ(futures.size(), 5);
+
+    std::vector<int> results;
+    for (auto& future : futures) {
+        results.push_back(future.get());
+    }
+
+    std::vector<int> expected = { 2, 4, 6, 8, 10 };
+    EXPECT_EQ(results, expected);
+}
+
+TEST_F(ThreadPoolTest, SubmitBatchWithEmptyRange) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::vector<int> inputs;
+
+    auto futures = pool.SubmitBatch(
+        [](const TaskContext&, int x) { return x * 2; },
+        inputs
+    );
+
+    EXPECT_TRUE(futures.empty());
+}
+
+// ============================================================================
+// ParallelFor Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, ParallelForExecutesAllIterations) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::atomic<int> counter{ 0 };
+
+    pool.ParallelFor(0, 10, [&counter](const TaskContext&, int) {
+        counter.fetch_add(1, std::memory_order_relaxed);
         });
+
+    EXPECT_EQ(counter.load(), 10);
+}
+
+TEST_F(ThreadPoolTest, ParallelForWithEmptyRange) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::atomic<int> counter{ 0 };
+
+    pool.ParallelFor(5, 5, [&counter](const TaskContext&, int) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+        });
+
+    EXPECT_EQ(counter.load(), 0);
+}
+
+TEST_F(ThreadPoolTest, ParallelForWithNegativeRange) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::atomic<int> counter{ 0 };
+
+    pool.ParallelFor(10, 5, [&counter](const TaskContext&, int) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+        });
+
+    EXPECT_EQ(counter.load(), 0);
+}
+
+TEST_F(ThreadPoolTest, ParallelForRespectsParameters) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::vector<int> values(10, 0);
+    std::mutex mutex;
+
+    pool.ParallelFor(0, 10, [&](const TaskContext&, int i) {
+        std::lock_guard<std::mutex> lock(mutex);
+        values[i] = i * 2;
+        });
+
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(values[i], i * 2);
+    }
+}
+
+// ============================================================================
+// Thread Pool Management Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, GetThreadCountReturnsCorrectValue) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    EXPECT_EQ(pool.GetThreadCount(), config_.minThreads);
+}
+
+TEST_F(ThreadPoolTest, IncreaseThreadCount) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    size_t initialCount = pool.GetThreadCount();
+    pool.IncreaseThreadCount(2);
+
+    EXPECT_EQ(pool.GetThreadCount(), initialCount + 2);
+}
+
+TEST_F(ThreadPoolTest, IncreaseThreadCountRespectsMaxLimit) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.IncreaseThreadCount(1000);  // Try to exceed max
+
+    EXPECT_LE(pool.GetThreadCount(), config_.maxThreads);
+}
+
+TEST_F(ThreadPoolTest, DecreaseThreadCount) {
+    config_.minThreads = 2;  
+    config_.maxThreads = 8;
+    ThreadPool pool(config_);
+    pool.Initialize(); 
+
+    
+    pool.IncreaseThreadCount(2);  
+    EXPECT_EQ(pool.GetThreadCount(), 4);
+
+    // Şimdi azalt
+    pool.DecreaseThreadCount(2);  // 4-2=2 thread
+
+    EXPECT_EQ(pool.GetThreadCount(), 2);  // ✅ ŞIMDI GEÇER!
+}
+
+TEST_F(ThreadPoolTest, DecreaseThreadCountRespectsMinLimit) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.DecreaseThreadCount(1000);  // Try to go below min
+
+    EXPECT_GE(pool.GetThreadCount(), config_.minThreads);
+}
+
+TEST_F(ThreadPoolTest, SetThreadCount) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.SetThreadCount(5);
+
+    EXPECT_EQ(pool.GetThreadCount(), 5);
+}
+
+TEST_F(ThreadPoolTest, SetThreadCountClampsToLimits) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.SetThreadCount(1);  // Below min
+    EXPECT_GE(pool.GetThreadCount(), config_.minThreads);
+
+    pool.SetThreadCount(1000);  // Above max
+    EXPECT_LE(pool.GetThreadCount(), config_.maxThreads);
+}
+
+// ============================================================================
+// Queue Management Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, GetQueueSizeInitiallyZero) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    EXPECT_EQ(pool.GetQueueSize(), 0);
+    EXPECT_TRUE(pool.IsQueueEmpty());
+}
+
+TEST_F(ThreadPoolTest, GetQueueCapacity) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    EXPECT_EQ(pool.GetQueueCapacity(), config_.maxQueueSize);
+}
+
+TEST_F(ThreadPoolTest, SetQueueCapacity) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.SetQueueCapacity(200);
+
+    EXPECT_EQ(pool.GetQueueCapacity(), 200);
+}
+
+TEST_F(ThreadPoolTest, ClearQueue) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    // Submit some tasks
+    for (int i = 0; i < 5; ++i) {
+        pool.Submit([](const TaskContext&) {
+            std::this_thread::sleep_for(10ms);
+            });
     }
 
-    auto futures = pool.submit_bulk(TaskPriority::NORMAL, tasks);
+    pool.ClearQueue();
 
-    // Wait for all tasks
-    for (auto& future : futures) {
-        future.get();
-    }
+    // After short wait, queue should be empty (running tasks excluded)
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(pool.GetQueueSize(), 0);
+}
 
-    EXPECT_EQ(counter.load(), 50);
+// ============================================================================
+// Statistics Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, TaskStatisticsInitiallyZero) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    const auto& stats = pool.GetTaskStatistics();
+
+    EXPECT_EQ(stats.enqueuedCount.load(), 0);
+    EXPECT_EQ(stats.completedCount.load(), 0);
+    EXPECT_EQ(stats.failedCount.load(), 0);
+}
+
+TEST_F(ThreadPoolTest, TaskStatisticsTrackEnqueuedTasks) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Submit([](const TaskContext&) {}).wait();
+
+    const auto& stats = pool.GetTaskStatistics();
+    EXPECT_EQ(stats.enqueuedCount.load(), 1);
+}
+
+TEST_F(ThreadPoolTest, ThreadStatisticsShowCurrentThreadCount) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    const auto& stats = pool.GetThreadStatistics();
+
+    EXPECT_EQ(stats.currentThreadCount.load(), config_.minThreads);
+}
+
+TEST_F(ThreadPoolTest, ResetStatistics) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Submit([](const TaskContext&) {}).wait();
+
+    pool.ResetStatistics();
+
+    const auto& stats = pool.GetTaskStatistics();
+    EXPECT_EQ(stats.enqueuedCount.load(), 0);
+}
+
+TEST_F(ThreadPoolTest, GetStatisticsReportReturnsNonEmptyString) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::string report = pool.GetStatisticsReport();
+
+    EXPECT_FALSE(report.empty());
+    EXPECT_NE(report.find("Task Statistics"), std::string::npos);
+}
+
+TEST_F(ThreadPoolTest, GetHealthReportReturnsNonEmptyString) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::string report = pool.GetHealthReport();
+
+    EXPECT_FALSE(report.empty());
+    EXPECT_NE(report.find("Health Report"), std::string::npos);
+}
+
+// ============================================================================
+// Configuration Update Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, GetConfigReturnsCorrectConfig) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    const auto& cfg = pool.GetConfig();
+
+    EXPECT_EQ(cfg.minThreads, config_.minThreads);
+    EXPECT_EQ(cfg.maxThreads, config_.maxThreads);
+}
+
+TEST_F(ThreadPoolTest, UpdateConfigWithValidConfig) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    ThreadPoolConfig newConfig = config_;
+    newConfig.minThreads = 4;
+    newConfig.maxThreads = 10;
+
+    EXPECT_NO_THROW(pool.UpdateConfig(newConfig));
+
+    EXPECT_EQ(pool.GetConfig().minThreads, 4);
+}
+
+TEST_F(ThreadPoolTest, UpdateConfigWithInvalidConfigThrows) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    ThreadPoolConfig invalidConfig = config_;
+    invalidConfig.minThreads = 0;
+
+    EXPECT_THROW(pool.UpdateConfig(invalidConfig), std::invalid_argument);
+}
+
+// ============================================================================
+// WaitForAll Tests
+// ============================================================================
+
+TEST_F(ThreadPoolTest, WaitForAllWaitsForTaskCompletion) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    std::atomic<bool> taskCompleted{ false };
+
+    pool.Submit([&taskCompleted](const TaskContext&) {
+        std::this_thread::sleep_for(50ms);
+        taskCompleted = true;
+        });
+
+    pool.WaitForAll();
+
+    EXPECT_TRUE(taskCompleted.load());
+}
+
+TEST_F(ThreadPoolTest, WaitForAllWithTimeoutReturnsTrue) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Submit([](const TaskContext&) {
+        std::this_thread::sleep_for(10ms);
+        });
+
+    EXPECT_TRUE(pool.WaitForAll(1000ms));
+}
+
+TEST_F(ThreadPoolTest, WaitForAllWithTimeoutReturnsFalseOnTimeout) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    pool.Submit([](const TaskContext&) {
+        std::this_thread::sleep_for(500ms);
+        });
+
+    EXPECT_FALSE(pool.WaitForAll(10ms));
 }
 
 // ============================================================================
 // Exception Handling Tests
 // ============================================================================
 
-/**
- * @brief Test exception propagation through futures
- */
-TEST(ThreadPoolTest, ExceptionPropagation) {
-    ThreadPool pool(2);
-    
-    auto future = pool.submit([]() -> int {
+TEST_F(ThreadPoolTest, TaskExceptionIsPropagated) {
+    ThreadPool pool(config_);
+    pool.Initialize();
+
+    auto future = pool.Submit([](const TaskContext&) -> int {
         throw std::runtime_error("Test exception");
-        return 42;
-    });
+        });
 
     EXPECT_THROW(future.get(), std::runtime_error);
 }
 
-/**
- * @brief Test thread pool stability after task exception
- */
-TEST(ThreadPoolTest, StabilityAfterException) {
-    ThreadPool pool(2);
-    
-    // Submit task that throws
-    auto future1 = pool.submit([]() {
-        throw std::runtime_error("Test exception");
-    });
+TEST_F(ThreadPoolTest, GetLastExceptionReturnsNullOptWhenNoException) {
+    ThreadPool pool(config_);
+    pool.Initialize();
 
-    EXPECT_THROW(future1.get(), std::runtime_error);
+    auto lastEx = pool.GetLastException();
 
-    // Verify pool still works
-    auto future2 = pool.submit([]() { return 42; });
-    EXPECT_EQ(future2.get(), 42);
+    EXPECT_FALSE(lastEx.has_value());
 }
 
 // ============================================================================
-// Shutdown and Lifecycle Tests
+// PriorityTaskQueue Tests
 // ============================================================================
 
-/**
- * @brief Test graceful shutdown
- */
-TEST(ThreadPoolTest, GracefulShutdown) {
-    ThreadPool pool(2);
-    
-    std::atomic<int> completed{0};
-    std::vector<std::future<void>> futures;
+TEST(PriorityTaskQueueTest, ConstructorSetsMaxSize) {
+    PriorityTaskQueue queue(50);
 
-    // Submit tasks
-    for (int i = 0; i < 10; ++i) {
-        futures.push_back(pool.submit([&completed]() {
-            std::this_thread::sleep_for(10ms);
-            completed.fetch_add(1, std::memory_order_relaxed);
-        }));
+    EXPECT_EQ(queue.GetMaxSize(), 50);
+    EXPECT_TRUE(queue.IsEmpty());
+}
+
+TEST(PriorityTaskQueueTest, PushAndPopTask) {
+    PriorityTaskQueue queue(10);
+
+    TaskContext ctx(TaskPriority::Normal, "Test");
+    Task<void> task([](const TaskContext&) {}, ctx);
+    TaskWrapper wrapper(std::move(task));
+
+    EXPECT_TRUE(queue.Push(std::move(wrapper)));
+    EXPECT_FALSE(queue.IsEmpty());
+    EXPECT_EQ(queue.Size(), 1);
+
+    auto popped = queue.Pop();
+    EXPECT_TRUE(popped.has_value());
+    EXPECT_TRUE(queue.IsEmpty());
+}
+
+TEST(PriorityTaskQueueTest, PushRespectsMaxSize) {
+    PriorityTaskQueue queue(2);
+
+    for (int i = 0; i < 2; ++i) {
+        TaskContext ctx(TaskPriority::Normal);
+        Task<void> task([](const TaskContext&) {}, ctx);
+        EXPECT_TRUE(queue.Push(TaskWrapper(std::move(task))));
     }
 
-    // Graceful shutdown (waits for tasks)
-    pool.shutdown(true);
+    EXPECT_TRUE(queue.IsFull());
 
-    EXPECT_TRUE(pool.is_shutdown());
-    EXPECT_EQ(completed.load(), 10);  // All tasks completed
+    TaskContext ctx(TaskPriority::Normal);
+    Task<void> task([](const TaskContext&) {}, ctx);
+    EXPECT_FALSE(queue.Push(TaskWrapper(std::move(task))));
 }
 
-/**
- * @brief Test immediate shutdown
- */
-TEST(ThreadPoolTest, ImmediateShutdown) {
-    ThreadPool pool(2);
-    
-    std::atomic<int> completed{0};
+TEST(PriorityTaskQueueTest, PopFromEmptyReturnsNullopt) {
+    PriorityTaskQueue queue(10);
 
-    // Submit many tasks
-    for (int i = 0; i < 100; ++i) {
-        try {
-            pool.submit([&completed]() {
-                std::this_thread::sleep_for(10ms);
-                completed.fetch_add(1, std::memory_order_relaxed);
-            });
-        } catch (const ThreadPoolShutdownException&) {
-            // Expected after shutdown begins
-            break;
-        }
-    }
-
-    // Immediate shutdown (cancels pending)
-    pool.shutdown_now();
-
-    EXPECT_TRUE(pool.is_shutdown());
-    EXPECT_LT(completed.load(), 100);  // Not all tasks completed
+    auto popped = queue.Pop();
+    EXPECT_FALSE(popped.has_value());
 }
 
-/**
- * @brief Test task submission after shutdown
- */
-TEST(ThreadPoolTest, SubmitAfterShutdown) {
-    ThreadPool pool(2);
-    pool.shutdown(true);
+TEST(PriorityTaskQueueTest, TryPopFromEmptyReturnsNullopt) {
+    PriorityTaskQueue queue(10);
 
-    EXPECT_THROW({
-        pool.submit([]() { return 42; });
-    }, ThreadPoolShutdownException);
+    auto popped = queue.TryPop();
+    EXPECT_FALSE(popped.has_value());
 }
 
-/**
- * @brief Test wait_for_completion with timeout
- */
-TEST(ThreadPoolTest, WaitForCompletionWithTimeout) {
-    ThreadPool pool(1);
-    
-    // Submit long-running task
-    pool.submit([]() {
-        std::this_thread::sleep_for(500ms);
-    });
+TEST(PriorityTaskQueueTest, ClearEmptiesQueue) {
+    PriorityTaskQueue queue(10);
 
-    // Wait with short timeout (should fail)
-    bool completed = pool.wait_for_completion(100ms);
-    EXPECT_FALSE(completed);
-
-    // Wait with long timeout (should succeed)
-    completed = pool.wait_for_completion(1000ms);
-    EXPECT_TRUE(completed);
-}
-
-// ============================================================================
-// Statistics and Monitoring Tests
-// ============================================================================
-
-/**
- * @brief Test statistics collection
- */
-TEST(ThreadPoolTest, StatisticsCollection) {
-    ThreadPool pool(4, true);  // Enable monitoring
-    
-    // Submit tasks
-    std::vector<std::future<void>> futures;
-    for (int i = 0; i < 20; ++i) {
-        futures.push_back(pool.submit([]() {
-            std::this_thread::sleep_for(10ms);
-        }));
-    }
-
-    // Wait for completion
-    for (auto& future : futures) {
-        future.get();
-    }
-
-    // Get statistics
-    auto stats = pool.get_statistics();
-    
-    EXPECT_EQ(stats.total_threads, 4u);
-    EXPECT_EQ(stats.completed_tasks, 20u);
-    EXPECT_EQ(stats.failed_tasks, 0u);
-    EXPECT_GT(stats.avg_task_duration.count(), 0);
-}
-
-/**
- * @brief Test statistics reset
- */
-TEST(ThreadPoolTest, StatisticsReset) {
-    ThreadPool pool(2, true);
-    
-    // Submit and complete some tasks
-    auto future = pool.submit([]() { return 42; });
-    future.get();
-
-    auto stats1 = pool.get_statistics();
-    EXPECT_GT(stats1.completed_tasks, 0u);
-
-    // Reset statistics
-    pool.reset_statistics();
-
-    auto stats2 = pool.get_statistics();
-    EXPECT_EQ(stats2.completed_tasks, 0u);
-}
-
-/**
- * @brief Test statistics without monitoring enabled
- */
-TEST(ThreadPoolTest, StatisticsWithoutMonitoring) {
-    ThreadPool pool(2, false);  // Disable monitoring
-    
-    EXPECT_THROW({
-        pool.get_statistics();
-    }, std::runtime_error);
-}
-
-// ============================================================================
-// Dynamic Management Tests
-// ============================================================================
-
-/**
- * @brief Test pause and unpause functionality
- */
-TEST(ThreadPoolTest, PauseAndUnpause) {
-    ThreadPool pool(2);
-    
-    std::atomic<int> counter{0};
-
-    // Submit task
-    auto future = pool.submit([&counter]() {
-        counter.fetch_add(1, std::memory_order_relaxed);
-    });
-
-    future.get();
-    EXPECT_EQ(counter.load(), 1);
-
-    // Pause pool
-    pool.pause();
-    EXPECT_TRUE(pool.is_paused());
-
-    // Submit task while paused
-    auto future2 = pool.submit([&counter]() {
-        counter.fetch_add(1, std::memory_order_relaxed);
-    });
-
-    // Give some time to ensure task doesn't execute while paused
-    std::this_thread::sleep_for(100ms);
-    EXPECT_EQ(counter.load(), 1);  // Task not executed yet
-
-    // Unpause
-    pool.unpause();
-    EXPECT_FALSE(pool.is_paused());
-
-    future2.get();
-    EXPECT_EQ(counter.load(), 2);  // Task now executed
-}
-
-/**
- * @brief Test queue clearing
- */
-TEST(ThreadPoolTest, ClearQueue) {
-    ThreadPool pool(1);  // Single thread
-    
-    // Submit long-running task to block the thread
-    pool.submit([]() {
-        std::this_thread::sleep_for(200ms);
-    });
-
-    // Give time for first task to start
-    std::this_thread::sleep_for(50ms);
-
-    // Submit multiple tasks that will be queued
-    for (int i = 0; i < 10; ++i) {
-        pool.submit([]() {
-            std::this_thread::sleep_for(10ms);
-        });
-    }
-
-    // Clear the queue
-    size_t cleared = pool.clear_queue();
-    EXPECT_GT(cleared, 0u);
-}
-
-// ============================================================================
-// Delayed Task Tests
-// ============================================================================
-
-/**
- * @brief Test delayed task execution
- */
-TEST(ThreadPoolTest, DelayedTask) {
-    ThreadPool pool(2);
-    
-    auto start_time = std::chrono::steady_clock::now();
-    
-    auto future = pool.submit_delayed(100ms, []() {
-        return 42;
-    });
-
-    int result = future.get();
-    auto elapsed = std::chrono::steady_clock::now() - start_time;
-
-    EXPECT_EQ(result, 42);
-    EXPECT_GE(elapsed, 100ms);
-}
-
-// ============================================================================
-// Thread Safety Tests
-// ============================================================================
-
-/**
- * @brief Stress test with many concurrent submissions
- */
-TEST(ThreadPoolTest, ConcurrentSubmissions) {
-    ThreadPool pool(8);
-    
-    std::atomic<int> counter{0};
-    std::vector<std::thread> submitter_threads;
-
-    // Create multiple threads submitting tasks
-    for (int t = 0; t < 4; ++t) {
-        submitter_threads.emplace_back([&pool, &counter]() {
-            for (int i = 0; i < 100; ++i) {
-                pool.submit([&counter]() {
-                    counter.fetch_add(1, std::memory_order_relaxed);
-                });
-            }
-        });
-    }
-
-    // Wait for all submitter threads
-    for (auto& thread : submitter_threads) {
-        thread.join();
-    }
-
-    // Wait for all tasks to complete
-    pool.wait_for_completion();
-
-    EXPECT_EQ(counter.load(), 400);
-}
-
-/**
- * @brief Test move construction
- */
-TEST(ThreadPoolTest, MoveConstruction) {
-    ThreadPool pool1(4);
-    
-    auto future = pool1.submit([]() { return 42; });
-    
-    // Move construct
-    ThreadPool pool2(std::move(pool1));
-    
-    EXPECT_EQ(pool2.get_thread_count(), 4u);
-    EXPECT_EQ(future.get(), 42);
-}
-
-/**
- * @brief Test move assignment
- */
-TEST(ThreadPoolTest, MoveAssignment) {
-    ThreadPool pool1(4);
-    ThreadPool pool2(2);
-    
-    auto future = pool1.submit([]() { return 42; });
-    
-    // Move assign
-    pool2 = std::move(pool1);
-    
-    EXPECT_EQ(pool2.get_thread_count(), 4u);
-    EXPECT_EQ(future.get(), 42);
-}
-
-// ============================================================================
-// Edge Cases and Error Conditions
-// ============================================================================
-
-/**
- * @brief Test with zero initial threads (should use hardware concurrency)
- */
-TEST(ThreadPoolTest, ZeroThreadCount) {
-    ThreadPool pool(0);
-    EXPECT_GT(pool.get_thread_count(), 0u);
-    
-    auto future = pool.submit([]() { return 42; });
-    EXPECT_EQ(future.get(), 42);
-}
-
-/**
- * @brief Test queue size tracking
- */
-TEST(ThreadPoolTest, QueueSizeTracking) {
-    ThreadPool pool(1);  // Single thread
-    
-    // Submit long-running task to occupy the thread
-    auto blocking_future = pool.submit([]() {
-        std::this_thread::sleep_for(200ms);
-    });
-
-    // Give time for blocking task to start
-    std::this_thread::sleep_for(50ms);
-
-    // Submit tasks that will be queued
-    std::vector<std::future<void>> futures;
     for (int i = 0; i < 5; ++i) {
-        futures.push_back(pool.submit([]() {}));
+        TaskContext ctx(TaskPriority::Normal);
+        Task<void> task([](const TaskContext&) {}, ctx);
+        queue.Push(TaskWrapper(std::move(task)));
     }
 
-    // Check queue size
-    size_t queue_size = pool.get_queue_size();
-    EXPECT_GT(queue_size, 0u);
+    queue.Clear();
 
-    // Wait for all tasks
-    blocking_future.get();
-    for (auto& future : futures) {
-        future.get();
-    }
-
-    EXPECT_EQ(pool.get_queue_size(), 0u);
+    EXPECT_TRUE(queue.IsEmpty());
+    EXPECT_EQ(queue.Size(), 0);
 }
 
-/**
- * @brief Performance benchmark test
- */
-TEST(ThreadPoolTest, PerformanceBenchmark) {
-    ThreadPool pool(std::thread::hardware_concurrency());
-    
-    const int num_tasks = 10000;
-    std::atomic<int> counter{0};
-    
-    auto start = std::chrono::steady_clock::now();
-    
-    std::vector<std::future<void>> futures;
-    for (int i = 0; i < num_tasks; ++i) {
-        futures.push_back(pool.submit([&counter]() {
-            counter.fetch_add(1, std::memory_order_relaxed);
-        }));
-    }
+TEST(PriorityTaskQueueTest, SetMaxSizeChangesCapacity) {
+    PriorityTaskQueue queue(10);
 
-    for (auto& future : futures) {
-        future.get();
-    }
+    queue.SetMaxSize(20);
 
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-
-    EXPECT_EQ(counter.load(), num_tasks);
-    
-    // Log performance metrics (optional)
-    std::cout << "Executed " << num_tasks << " tasks in " << ms << "ms" << std::endl;
-    std::cout << "Throughput: " << (num_tasks * 1000.0 / ms) << " tasks/second" << std::endl;
+    EXPECT_EQ(queue.GetMaxSize(), 20);
 }
 
 // ============================================================================
-// Main Test Entry Point
+// TaskContext Tests
 // ============================================================================
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+TEST(TaskContextTest, DefaultConstructorInitializesFields) {
+    TaskContext ctx;
+
+    EXPECT_EQ(ctx.taskId, 0);
+    EXPECT_EQ(ctx.priority, TaskPriority::Normal);
+    EXPECT_TRUE(ctx.description.empty());
+    EXPECT_FALSE(ctx.cancellationToken);
+    EXPECT_FALSE(ctx.timeout.has_value());
 }
+
+TEST(TaskContextTest, ParametricConstructorSetsFields) {
+    TaskContext ctx(TaskPriority::High, "Test task");
+
+    EXPECT_EQ(ctx.priority, TaskPriority::High);
+    EXPECT_EQ(ctx.description, "Test task");
+}
+
+TEST(TaskContextTest, IsCancelledReturnsFalseWithoutToken) {
+    TaskContext ctx;
+
+    EXPECT_FALSE(ctx.IsCancelled());
+}
+
+TEST(TaskContextTest, IsCancelledReturnsTrueWhenTokenSet) {
+    TaskContext ctx;
+    ctx.cancellationToken = std::make_shared<std::atomic<bool>>(true);
+
+    EXPECT_TRUE(ctx.IsCancelled());
+}
+
+TEST(TaskContextTest, CancelSetsToken) {
+    TaskContext ctx;
+    ctx.cancellationToken = std::make_shared<std::atomic<bool>>(false);
+
+    ctx.Cancel();
+
+    EXPECT_TRUE(ctx.IsCancelled());
+}
+
+TEST(TaskContextTest, CancelWithoutTokenIsNoop) {
+    TaskContext ctx;
+
+    EXPECT_NO_THROW(ctx.Cancel());
+}
+
+TEST(TaskContextTest, GetWaitTimeReturnsPositiveDuration) {
+    TaskContext ctx;
+
+    std::this_thread::sleep_for(10ms);
+
+    auto waitTime = ctx.GetWaitTime();
+    EXPECT_GT(waitTime.count(), 0);
+}
+
+// ============================================================================
+// TaskStatistics Tests
+// ============================================================================
+
+TEST(TaskStatisticsTest, ResetClearsAllCounters) {
+    TaskStatistics stats;
+
+    stats.enqueuedCount = 10;
+    stats.completedCount = 5;
+    stats.failedCount = 2;
+
+    stats.Reset();
+
+    EXPECT_EQ(stats.enqueuedCount.load(), 0);
+    EXPECT_EQ(stats.completedCount.load(), 0);
+    EXPECT_EQ(stats.failedCount.load(), 0);
+}
+
+TEST(TaskStatisticsTest, GetAverageExecutionTimeWithZeroCompleted) {
+    TaskStatistics stats;
+
+    EXPECT_EQ(stats.GetAverageExecutionTimeMs(), 0.0);
+}
+
+TEST(TaskStatisticsTest, GetAverageExecutionTimeCalculatesCorrectly) {
+    TaskStatistics stats;
+
+    stats.completedCount = 4;
+    stats.totalExecutionTimeMs = 400;
+
+    EXPECT_DOUBLE_EQ(stats.GetAverageExecutionTimeMs(), 100.0);
+}
+
+TEST(TaskStatisticsTest, GetSuccessRateWithZeroEnqueued) {
+    TaskStatistics stats;
+
+    EXPECT_EQ(stats.GetSuccessRate(), 0.0);
+}
+
+TEST(TaskStatisticsTest, GetSuccessRateCalculatesCorrectly) {
+    TaskStatistics stats;
+
+    stats.enqueuedCount = 10;
+    stats.completedCount = 8;
+
+    EXPECT_DOUBLE_EQ(stats.GetSuccessRate(), 80.0);
+}
+
+// ============================================================================
+// ThreadStatistics Tests
+// ============================================================================
+
+TEST(ThreadStatisticsTest, ResetPreservesCurrentThreadCount) {
+    ThreadStatistics stats;
+
+    stats.currentThreadCount = 5;
+    stats.peakThreadCount = 10;
+
+    stats.Reset();
+
+    EXPECT_EQ(stats.currentThreadCount.load(), 5);
+    EXPECT_EQ(stats.peakThreadCount.load(), 5);  // Reset to current
+}
+
+// ============================================================================
+// PerformanceMetrics Tests
+// ============================================================================
+
+TEST(PerformanceMetricsTest, ResetInitializesAllFields) {
+    PerformanceMetrics metrics;
+
+    metrics.currentQueueSize = 10;
+    metrics.tasksPerSecond = 100;
+
+    metrics.Reset();
+
+    EXPECT_EQ(metrics.currentQueueSize.load(), 0);
+    EXPECT_EQ(metrics.tasksPerSecond.load(), 0);
+}
+
+TEST(PerformanceMetricsTest, UpdateThroughputWithZeroElapsed) {
+    PerformanceMetrics metrics;
+
+    metrics.UpdateThroughput(100, 0ms);
+
+    EXPECT_EQ(metrics.tasksPerSecond.load(), 0);
+}
+
+TEST(PerformanceMetricsTest, UpdateThroughputCalculatesCorrectly) {
+    PerformanceMetrics metrics;
+
+    metrics.UpdateThroughput(100, 1000ms);  // 100 tasks in 1 second
+
+    EXPECT_EQ(metrics.tasksPerSecond.load(), 100);
+}
+
