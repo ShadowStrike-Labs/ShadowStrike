@@ -158,6 +158,7 @@
     <ClCompile Include="src\Utils\Logger.cpp" />
     <ClCompile Include="src\Utils\MemoryUtils.cpp" />
     <ClCompile Include="src\Utils\NetworkUtils.cpp" />
+    <ClCompile Include="src\Utils\PE_sig_verf.cpp" />
     <ClCompile Include="src\Utils\ProcessUtils.cpp" />
     <ClCompile Include="src\Utils\RegistryUtils.cpp" />
     <ClCompile Include="src\Utils\StringUtils.cpp" />
@@ -213,6 +214,7 @@
     <ClInclude Include="src\Utils\Logger.hpp" />
     <ClInclude Include="src\Utils\MemoryUtils.hpp" />
     <ClInclude Include="src\Utils\NetworkUtils.hpp" />
+    <ClInclude Include="src\Utils\PE_sig_verf.hpp" />
     <ClInclude Include="src\Utils\ProcessUtils.hpp" />
     <ClInclude Include="src\Utils\RegistryUtils.hpp" />
     <ClInclude Include="src\Utils\StringUtils.hpp" />

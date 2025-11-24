@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cwctype>
+#include<stdexcept>
 
 namespace ShadowStrike {
 	namespace Utils {
@@ -182,7 +183,30 @@ namespace ShadowStrike {
                 return s;
             }
 
+            std::wstring utf8_to_wstring(const char* utf8)
+            {
+                if (!utf8)
+                    return L"";
 
+                int size_needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                    utf8, -1, nullptr, 0);
+                if (size_needed == 0)
+                    throw std::runtime_error("MultiByteToWideChar failed");
+
+                std::wstring wstr(size_needed, 0);
+
+                int result = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                    utf8, -1,
+                    &wstr[0], size_needed);
+
+                if (result == 0)
+                    throw std::runtime_error("MultiByteToWideChar failed");
+
+                //it came with null terminator, remove it
+                wstr.pop_back();
+
+                return wstr;
+            }
             //Comparing
             bool IEquals(std::wstring_view s1, std::wstring_view s2) {
                 // Validate sizes don't exceed INT_MAX

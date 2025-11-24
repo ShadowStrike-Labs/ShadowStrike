@@ -681,29 +681,6 @@ TEST_F(CryptoUtilsTest, SecureCompare_TimingSafety) {
     EXPECT_FALSE(SecureCompare(data1, data4));
 }
 
-TEST_F(CryptoUtilsTest, CalculateEntropy_KnownPatterns) {
-    // All zeros - minimum entropy
-    std::vector<uint8_t> zeros(1000, 0x00);
-    double entropy1 = CalculateEntropy(zeros);
-    EXPECT_LT(entropy1, 0.1);
-    
-    // Random data - high entropy
-    SecureRandom rng;
-    std::vector<uint8_t> random;
-    ASSERT_TRUE(rng.Generate(random, 1000, err.get()));
-    double entropy2 = CalculateEntropy(random);
-    EXPECT_GT(entropy2, 7.5);
-}
-
-TEST_F(CryptoUtilsTest, HasHighEntropy_Threshold) {
-    std::vector<uint8_t> lowEntropy(1000, 0xAA);
-    EXPECT_FALSE(HasHighEntropy(lowEntropy.data(), lowEntropy.size(), 7.0));
-    
-    SecureRandom rng;
-    std::vector<uint8_t> highEntropy;
-    ASSERT_TRUE(rng.Generate(highEntropy, 1000, err.get()));
-    EXPECT_TRUE(HasHighEntropy(highEntropy.data(), highEntropy.size(), 7.0));
-}
 
 // ============================================================================
 // TIER 10: Error Handling Tests

@@ -377,72 +377,7 @@ namespace ShadowStrike {
 				static bool GenerateSalt(std::vector<uint8_t>& salt, size_t size = 32, Error* err = nullptr) noexcept;
 			};
 
-			// ============================================================================
-			// Certificate Management
-			// ============================================================================
-
-			struct CertificateInfo {
-				std::wstring subject;
-				std::wstring issuer;
-				std::wstring serialNumber;
-				std::wstring thumbprint;
-				FILETIME notBefore{};
-				FILETIME notAfter{};
-				std::vector<std::wstring> subjectAltNames;
-				bool isCA = false;
-				bool isExpired = false;
-				bool isRevoked = false;
-			};
-
-			class Certificate {
-			public:
-				Certificate() noexcept = default;
-				~Certificate();
-
-				// No copy, allow move
-				Certificate(const Certificate&) = delete;
-				Certificate& operator=(const Certificate&) = delete;
-				Certificate(Certificate&&) noexcept;
-				Certificate& operator=(Certificate&&) noexcept;
-
-				// Load certificate
-				bool LoadFromFile(std::wstring_view path, Error* err = nullptr) noexcept;
-				bool LoadFromMemory(const uint8_t* data, size_t len, Error* err = nullptr) noexcept;
-				bool LoadFromStore(std::wstring_view storeName, std::wstring_view thumbprint, Error* err = nullptr) noexcept;
-				bool LoadFromPEM(std::string_view pem, Error* err = nullptr) noexcept;
-
-				// Export certificate
-				bool Export(std::vector<uint8_t>& out, Error* err = nullptr) const noexcept;
-				bool ExportPEM(std::string& out, Error* err = nullptr) const noexcept;
-
-				// Certificate info
-				bool GetInfo(CertificateInfo& info, Error* err = nullptr) const noexcept;
-
-				// Verification
-				bool VerifySignature(const uint8_t* data, size_t dataLen,
-					const uint8_t* signature, size_t signatureLen,
-					Error* err = nullptr) const noexcept;
-
-				bool VerifyChain(Error* err,
-					HCERTSTORE hAdditionalStore /*= nullptr*/,
-					DWORD chainFlags /*= CERT_CHAIN_REVOCATION_CHECK_CHAIN*/,
-					 FILETIME* verificationTime /*= nullptr*/,
-					const char* requiredEkuOid /*= nullptr*/) const noexcept;
-				bool VerifyAgainstCA(const Certificate& caCert, Error* err = nullptr) const noexcept;
-
-				// Extract public key
-				bool ExtractPublicKey(PublicKey& outKey, Error* err = nullptr) const noexcept;
-
-				// Properties
-				bool IsValid() const noexcept { return m_certContext != nullptr; }
-
-			private:
-#ifdef _WIN32
-				PCCERT_CONTEXT m_certContext = nullptr;
-#endif
-				void cleanup() noexcept;
-			};
-
+			
 			// ============================================================================
 			// Secure Memory Management
 			// ============================================================================
@@ -549,42 +484,6 @@ namespace ShadowStrike {
 				std::string& outPlaintext,
 				Error* err = nullptr) noexcept;
 
-			// ============================================================================
-			// Digital Signature Verification (for malware detection)
-			// ============================================================================
-
-			struct SignatureInfo {
-				bool isSigned = false;
-				bool isVerified = false;
-				std::wstring signerName;
-				std::wstring signerEmail;
-				std::wstring issuerName;
-				std::wstring thumbprint;
-				FILETIME signTime{};
-				std::vector<CertificateInfo> certificateChain;
-			};
-
-			// Verify PE file signature (for whitelisting trusted software)
-			bool VerifyPESignature(std::wstring_view filePath,
-				SignatureInfo& info,
-				Error* err = nullptr) noexcept;
-
-			// Verify catalog signature
-			bool VerifyCatalogSignature(std::wstring_view catalogPath,
-				std::wstring_view fileHash,
-				SignatureInfo& info,
-				Error* err = nullptr) noexcept;
-
-			//EKU checking helper
-			bool CheckCodeSigningEKU(PCCERT_CONTEXT cert, Error* err) noexcept;
-
-			//Validate signature timestamp
-			bool ValidateTimestamp(const FILETIME& signTime, PCCERT_CONTEXT cert, Error* err) noexcept;
-
-			//Online revocation check via OCSP/CRL
-			bool CheckRevocationOnline(PCCERT_CONTEXT cert, Error* err) noexcept;
-
-		    //Multiple signature Support(will be added in future)
 
 			// ============================================================================
 			// Base64 Encoding/Decoding
@@ -609,16 +508,7 @@ namespace ShadowStrike {
 
 			void SecureZeroMemory(void* ptr, size_t size) noexcept;
 
-			// ============================================================================
-			// Entropy Testing (for malware detection)
-			// ============================================================================
-
-			// Calculate Shannon entropy of data (0.0 to 8.0 for bytes)
-			double CalculateEntropy(const uint8_t* data, size_t len) noexcept;
-			double CalculateEntropy(const std::vector<uint8_t>& data) noexcept;
-
-			// Check if data appears to be encrypted/compressed (high entropy)
-			bool HasHighEntropy(const uint8_t* data, size_t len, double threshold = 7.0) noexcept;
+			
 
 		} // namespace CryptoUtils
 	} // namespace Utils

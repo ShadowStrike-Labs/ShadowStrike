@@ -44,7 +44,7 @@ namespace ShadowStrike {
 
 			std::wstring ToUpperCopy(std::wstring_view str);
 
-
+			std::wstring utf8_to_wstring(const char* utf8str);
 			//Trimming functions
 
 			void Trim(std::wstring& str);

@@ -1,3 +1,5 @@
+
+/*
 #if !defined(_X86_) && !defined(_AMD64_)
 #ifdef _M_X64
 #define _AMD64_
@@ -11,7 +13,7 @@
 #include"Timer.hpp"
 #include"Logger.hpp"
 
-#include <unordered_map>  // ? FIX #NEW1: Track active timers for cancel
+#include <unordered_map>  
 
 namespace ShadowStrike {
 
@@ -415,3 +417,5 @@ namespace ShadowStrike {
 
 	}//namespace Utils
 }//namespace ShadowStrike
+
+*/

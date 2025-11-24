@@ -21,9 +21,6 @@
     <ClCompile Include="src\Utils\Logger.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="src\Utils\ThreadPool.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="src\Utils\Timer.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
@@ -156,6 +153,12 @@
     <ClCompile Include="tests\unit\Utils\SystemUtils_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
+    <ClCompile Include="src\Utils\PE_sig_verf.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Utils\ThreadPool.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Utils\Logger.hpp">
@@ -279,6 +282,9 @@
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
     <ClInclude Include="src\Utils\ThreadPoolEvents.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Utils\PE_sig_verf.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
   </ItemGroup>
