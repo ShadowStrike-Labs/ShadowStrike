@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <sqlite3.h>  // For SQLite constants
@@ -30,6 +30,7 @@
 namespace ShadowStrike {
     namespace Database {
 
+        class DatabaseManager; //Forward Declaration
         // ============================================================================
         // Error Handling
         // ============================================================================
@@ -96,7 +97,30 @@ namespace ShadowStrike {
         class QueryResult {
         public:
             QueryResult() = default;
-            explicit QueryResult(std::unique_ptr<SQLite::Statement>&& stmt) noexcept;
+            explicit QueryResult(std::unique_ptr<SQLite::Statement>&& stmt) noexcept
+                : m_statement(std::move(stmt))
+            {
+                if (m_statement) {
+                    m_hasRows = (m_statement->getColumnCount() > 0);
+                }
+            }
+
+
+            explicit QueryResult(
+                std::unique_ptr<SQLite::Statement>&& stmt,
+                std::shared_ptr<SQLite::Database> conn,
+                DatabaseManager* manager
+            ) noexcept;
+
+            ~QueryResult();
+
+            //Disable copy
+            QueryResult(const QueryResult&) = delete;
+            QueryResult& operator=(const QueryResult&) = delete;
+
+            //Enable move
+            QueryResult(QueryResult&& other) noexcept;
+            QueryResult& operator=(QueryResult&& other) noexcept;
             
             bool Next();
             bool HasRows() const noexcept { return m_hasRows; }
@@ -131,6 +155,8 @@ namespace ShadowStrike {
             int getColumnIndex(std::string_view columnName) const;
             
             std::unique_ptr<SQLite::Statement> m_statement;
+            std::shared_ptr<SQLite::Database> m_connection;  
+            DatabaseManager* m_manager = nullptr;             
             bool m_hasRows = false;
             mutable std::unordered_map<std::string, int> m_columnIndexCache;
         };
@@ -222,6 +248,8 @@ namespace ShadowStrike {
             
             explicit Transaction(
                 SQLite::Database& db,
+				std::shared_ptr<SQLite::Database> conn,
+                DatabaseManager* manager,
                 Type type = Type::Deferred,
                 DatabaseError* err = nullptr
             );
@@ -236,6 +264,12 @@ namespace ShadowStrike {
             bool Commit(DatabaseError* err = nullptr);
             bool Rollback(DatabaseError* err = nullptr);
             bool IsActive() const noexcept { return m_active; }
+
+			bool Execute(std::string_view sql, DatabaseError* err = nullptr);
+
+            template<typename... Args>
+            bool ExecuteWithParams(std::string_view sql, DatabaseError* err, Args&&... args);
+              
             
             // Savepoint support
             bool CreateSavepoint(std::string_view name, DatabaseError* err = nullptr);
@@ -244,6 +278,8 @@ namespace ShadowStrike {
             
         private:
             SQLite::Database* m_db = nullptr;
+			std::shared_ptr<SQLite::Database> m_connection;
+			DatabaseManager* m_manager = nullptr;
             bool m_active = false;
             bool m_committed = false;
         };
@@ -346,6 +382,15 @@ namespace ShadowStrike {
             // Connection access (use with caution)
             std::shared_ptr<SQLite::Database> AcquireConnection(DatabaseError* err = nullptr);
             void ReleaseConnection(std::shared_ptr<SQLite::Database> conn);
+
+            // Helper for binding parameters
+            template<typename T>
+            void bindParameter(SQLite::Statement& stmt, int index, T&& value);
+
+            template<typename T, typename... Args>
+            void bindParameters(SQLite::Statement& stmt, int index, T&& first, Args&&... rest);
+
+            void bindParameters(SQLite::Statement& stmt, int index) {}  // Base case
             
         private:
             DatabaseManager();
@@ -371,14 +416,7 @@ namespace ShadowStrike {
             void setError(DatabaseError* err, int code, std::wstring_view msg, std::wstring_view ctx = L"") const;
             void setError(DatabaseError* err, const SQLite::Exception& ex, std::wstring_view ctx = L"") const;
             
-            // Helper for binding parameters
-            template<typename T>
-            void bindParameter(SQLite::Statement& stmt, int index, T&& value);
-            
-            template<typename T, typename... Args>
-            void bindParameters(SQLite::Statement& stmt, int index, T&& first, Args&&... rest);
-            
-            void bindParameters(SQLite::Statement& stmt, int index) {}  // Base case
+           
             
             // State
             std::atomic<bool> m_initialized{ false };
@@ -406,56 +444,101 @@ namespace ShadowStrike {
         // ============================================================================
 
         template<typename... Args>
-        bool DatabaseManager::ExecuteWithParams(
-            std::string_view sql,
-            DatabaseError* err,
-            Args&&... args
-        ) {
-            try {
-                auto conn = AcquireConnection(err);
-                if (!conn) return false;
-                
-                auto stmt = m_statementCache->Get(*conn, sql, err);
-                if (!stmt) {
-                    ReleaseConnection(conn);
-                    return false;
+        bool Transaction::ExecuteWithParams(std::string_view sql, DatabaseError* err, Args&&... args) {
+            if (!m_active || !m_db) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Transaction not active";
                 }
-                
-                bindParameters(*stmt, 1, std::forward<Args>(args)...);
-                
-                stmt->exec();
-                m_totalQueries.fetch_add(1, std::memory_order_relaxed);
-                
-                ReleaseConnection(conn);
+                return false;
+            }
+
+            try {
+                SQLite::Statement stmt(*m_db, sql.data());
+
+                // ✅ Now DatabaseManager is fully defined, so this works!
+                if (m_manager) {
+                    m_manager->bindParameters(stmt, 1, std::forward<Args>(args)...);
+                }
+
+                stmt.exec();
                 return true;
             }
             catch (const SQLite::Exception& ex) {
-                setError(err, ex, L"ExecuteWithParams");
+                if (err) {
+                    err->sqliteCode = ex.getErrorCode();
+                    err->extendedCode = ex.getExtendedErrorCode();
+
+                    // Convert exception message to wide string
+                    std::string msg = ex.what();
+                    err->message = std::wstring(msg.begin(), msg.end());
+                    err->context = L"Transaction::ExecuteWithParams";
+                }
                 return false;
             }
         }
 
         template<typename... Args>
-        QueryResult DatabaseManager::QueryWithParams(
-            std::string_view sql,
-            DatabaseError* err,
-            Args&&... args
-        ) {
+        bool DatabaseManager::ExecuteWithParams(std::string_view sql, DatabaseError* err, Args&&... args) {
+            auto conn = this->AcquireConnection(err);
+            if (!conn) return false;
+
+            struct ConnectionGuard {
+                DatabaseManager* mgr;
+                std::shared_ptr<SQLite::Database> conn;
+
+                ~ConnectionGuard() {
+                    if (conn && mgr) {
+                        mgr->ReleaseConnection(conn);
+                    }
+                }
+            } guard{ this, conn };
+
             try {
-                auto conn = AcquireConnection(err);
-                if (!conn) return QueryResult{};
-                
                 auto stmt = std::make_unique<SQLite::Statement>(*conn, sql.data());
-                
-                bindParameters(*stmt, 1, std::forward<Args>(args)...);
-                
-                m_totalQueries.fetch_add(1, std::memory_order_relaxed);
-                
-                // Note: Connection released when QueryResult is destroyed
-                return QueryResult{ std::move(stmt) };
+                this->bindParameters(*stmt, 1, std::forward<Args>(args)...);
+                stmt->exec();
+                this->m_totalQueries.fetch_add(1, std::memory_order_relaxed);
+
+                // ConnectionGuard handles release automatically!
+                return true;
             }
             catch (const SQLite::Exception& ex) {
-                setError(err, ex, L"QueryWithParams");
+                this->setError(err, ex, L"ExecuteWithParams");
+                // ConnectionGuard handles release even on exception!
+                return false;
+            }
+        }
+
+        template<typename... Args>
+        QueryResult DatabaseManager::QueryWithParams(std::string_view sql, DatabaseError* err, Args&&... args) {
+            auto conn = this->AcquireConnection(err);
+            if (!conn) return QueryResult{};
+
+            struct ConnectionGuard {
+                DatabaseManager* mgr;
+                std::shared_ptr<SQLite::Database> conn;
+                bool released = false;
+
+                ~ConnectionGuard() {
+                    if (conn && mgr && !released) {
+                        mgr->ReleaseConnection(conn);
+                    }
+                }
+            } guard{ this, conn };
+
+            try {
+                auto stmt = std::make_unique<SQLite::Statement>(*conn, sql.data());
+                this->bindParameters(*stmt, 1, std::forward<Args>(args)...);
+                this->m_totalQueries.fetch_add(1, std::memory_order_relaxed);
+
+                // QueryResult will handle release, so mark as released
+                guard.released = true;
+                return QueryResult{ std::move(stmt), conn, this };
+            }
+            catch (const SQLite::Exception& ex) {
+                this->setError(err, ex, L"QueryWithParams");
+                // ConnectionGuard handles release on exception!
                 return QueryResult{};
             }
         }

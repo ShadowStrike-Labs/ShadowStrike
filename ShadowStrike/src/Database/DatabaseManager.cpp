@@ -1,4 +1,4 @@
-#include "DatabaseManager.hpp"
+﻿#include "DatabaseManager.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
@@ -54,12 +54,61 @@ namespace ShadowStrike {
         // QueryResult Implementation
         // ============================================================================
 
-        QueryResult::QueryResult(std::unique_ptr<SQLite::Statement>&& stmt) noexcept
+        QueryResult::QueryResult(
+            std::unique_ptr<SQLite::Statement>&& stmt,
+            std::shared_ptr<SQLite::Database> conn,
+            DatabaseManager* manager
+        ) noexcept
             : m_statement(std::move(stmt))
+            , m_connection(std::move(conn))
+            , m_manager(manager)
         {
             if (m_statement) {
                 m_hasRows = (m_statement->getColumnCount() > 0);
             }
+        }
+
+        QueryResult::~QueryResult() {
+            
+            m_statement.reset();
+
+           
+            if (m_connection && m_manager) {
+                m_manager->ReleaseConnection(m_connection);
+            }
+        }
+        QueryResult::QueryResult(QueryResult&& other) noexcept
+            : m_statement(std::move(other.m_statement))
+            , m_connection(std::move(other.m_connection))
+            , m_manager(other.m_manager)
+            , m_hasRows(other.m_hasRows)
+            , m_columnIndexCache(std::move(other.m_columnIndexCache))
+        {
+            other.m_manager = nullptr;
+            other.m_hasRows = false;
+        }
+
+        QueryResult& QueryResult::operator=(QueryResult&& other) noexcept {
+            if (this != &other) {
+                
+                m_statement.reset();
+
+                if (m_connection && m_manager) {
+                    m_manager->ReleaseConnection(m_connection);
+                }
+
+                
+                m_statement = std::move(other.m_statement);
+                m_connection = std::move(other.m_connection);
+                m_manager = other.m_manager;
+                m_hasRows = other.m_hasRows;
+                m_columnIndexCache = std::move(other.m_columnIndexCache);
+
+                
+                other.m_manager = nullptr;
+                other.m_hasRows = false;
+            }
+            return *this;
         }
 
         bool QueryResult::Next() {
@@ -292,10 +341,30 @@ namespace ShadowStrike {
         }
 
         void ConnectionPool::Shutdown() {
+
+            bool wasShutdown = m_shutdown.exchange(true, std::memory_order_acq_rel);
+            if (wasShutdown) {
+                SS_LOG_DEBUG(L"Database", L"Connection pool already shut down");
+                return;  // Already shut down
+            }
+
             std::lock_guard<std::mutex> lock(m_mutex);
             
             m_shutdown.store(true, std::memory_order_release);
             m_cv.notify_all();
+
+            for (auto& pooled : m_connections) {
+                if (pooled.connection) {
+                    try {
+                        // Force close connection
+                        pooled.connection.reset();
+                    }
+                    catch (const std::exception& ex) {
+                        SS_LOG_ERROR(L"Database", L"Error closing connection: %ls",
+                            ToWide(ex.what()).c_str());
+                    }
+                }
+            }
             
             m_connections.clear();
             m_activeCount.store(0, std::memory_order_release);
@@ -489,27 +558,31 @@ namespace ShadowStrike {
 
         Transaction::Transaction(
             SQLite::Database& db,
+            std::shared_ptr<SQLite::Database> conn,
+            DatabaseManager* manager,
             Type type,
             DatabaseError* err
         ) : m_db(&db)
+            , m_connection(std::move(conn))
+            , m_manager(manager)
         {
             try {
                 const char* sql = nullptr;
                 switch (type) {
-                    case Type::Deferred:
-                        sql = "BEGIN DEFERRED TRANSACTION";
-                        break;
-                    case Type::Immediate:
-                        sql = "BEGIN IMMEDIATE TRANSACTION";
-                        break;
-                    case Type::Exclusive:
-                        sql = "BEGIN EXCLUSIVE TRANSACTION";
-                        break;
+                case Type::Deferred:
+                    sql = "BEGIN DEFERRED TRANSACTION";
+                    break;
+                case Type::Immediate:
+                    sql = "BEGIN IMMEDIATE TRANSACTION";
+                    break;
+                case Type::Exclusive:
+                    sql = "BEGIN EXCLUSIVE TRANSACTION";
+                    break;
                 }
-                
+
                 m_db->exec(sql);
                 m_active = true;
-                
+
                 SS_LOG_DEBUG(L"Database", L"Transaction started");
             }
             catch (const SQLite::Exception& ex) {
@@ -525,7 +598,7 @@ namespace ShadowStrike {
         }
 
         Transaction::~Transaction() {
-            if (m_active && !m_committed) {
+            if (m_active && !m_committed && m_db) {
                 try {
                     m_db->exec("ROLLBACK");
                     SS_LOG_DEBUG(L"Database", L"Transaction rolled back (destructor)");
@@ -534,36 +607,80 @@ namespace ShadowStrike {
                     SS_LOG_ERROR(L"Database", L"Failed to rollback transaction: %ls", ToWide(ex.what()).c_str());
                 }
             }
+
+            // ✅ Release connection
+            if (m_connection && m_manager) {
+                m_manager->ReleaseConnection(m_connection);
+            }
+        }
+
+        // ✅ NEW: Execute on transaction's connection
+        bool Transaction::Execute(std::string_view sql, DatabaseError* err) {
+            if (!m_active || !m_db) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Transaction not active";
+                }
+                return false;
+            }
+
+            try {
+                m_db->exec(sql.data());
+                return true;
+            }
+            catch (const SQLite::Exception& ex) {
+                if (err) {
+                    err->sqliteCode = ex.getErrorCode();
+                    err->extendedCode = ex.getExtendedErrorCode();
+                    err->message = ToWide(ex.what());
+                    err->context = L"Transaction::Execute";
+                }
+                return false;
+            }
         }
 
         Transaction::Transaction(Transaction&& other) noexcept
             : m_db(other.m_db)
+            , m_connection(std::move(other.m_connection))
+            , m_manager(other.m_manager)
             , m_active(other.m_active)
             , m_committed(other.m_committed)
         {
             other.m_db = nullptr;
+            other.m_manager = nullptr;
             other.m_active = false;
             other.m_committed = false;
         }
 
         Transaction& Transaction::operator=(Transaction&& other) noexcept {
             if (this != &other) {
+                // Cleanup
                 if (m_active && !m_committed && m_db) {
                     try {
                         m_db->exec("ROLLBACK");
                     }
                     catch (...) {}
                 }
-                
+
+                if (m_connection && m_manager) {
+                    m_manager->ReleaseConnection(m_connection);
+                }
+
+                // Move
                 m_db = other.m_db;
+                m_connection = std::move(other.m_connection);
+                m_manager = other.m_manager;
                 m_active = other.m_active;
                 m_committed = other.m_committed;
-                
+
+                // Clear other
                 other.m_db = nullptr;
+                other.m_manager = nullptr;
                 other.m_active = false;
                 other.m_committed = false;
             }
             return *this;
+        
         }
 
         bool Transaction::Commit(DatabaseError* err) {
@@ -695,57 +812,68 @@ namespace ShadowStrike {
                 SS_LOG_WARN(L"Database", L"DatabaseManager already initialized");
                 return true;
             }
-            
+
             SS_LOG_SCOPE(L"Database");
             SS_LOG_INFO(L"Database", L"Initializing DatabaseManager...");
-            
+
             std::unique_lock<std::shared_mutex> lock(m_configMutex);
             m_config = config;
-            
-            // Create database file if needed
+
+            if (m_connectionPool) {
+                m_connectionPool->Shutdown();
+                m_connectionPool.reset();
+            }
+
             if (!createDatabaseFile(err)) {
                 return false;
             }
-            
-            // Initialize connection pool
+
             m_connectionPool = std::make_unique<ConnectionPool>(m_config);
             if (!m_connectionPool->Initialize(err)) {
                 SS_LOG_ERROR(L"Database", L"Failed to initialize connection pool");
+                m_connectionPool.reset();
                 return false;
             }
-            
-            // Initialize statement cache
+
             m_statementCache = std::make_unique<PreparedStatementCache>(100);
-            
+
+            // ✅ CRITICAL: Set initialized flag BEFORE calling Execute()
+            // This allows AcquireConnection() to work during table creation
+            m_initialized.store(true, std::memory_order_release);
+
             // Create metadata table
             if (!Execute(SQL_CREATE_METADATA_TABLE, err)) {
                 SS_LOG_ERROR(L"Database", L"Failed to create metadata table");
+                m_initialized.store(false, std::memory_order_release);
+                m_connectionPool->Shutdown();
+                m_connectionPool.reset();
+                m_statementCache.reset();
                 return false;
             }
-            
+
             // Create application tables
             if (!CreateTables(err)) {
                 SS_LOG_ERROR(L"Database", L"Failed to create application tables");
+                m_initialized.store(false, std::memory_order_release);
+                m_connectionPool->Shutdown();
+                m_connectionPool.reset();
+                m_statementCache.reset();
                 return false;
             }
-            
+
             // Start background backup thread if enabled
             if (m_config.autoBackup) {
                 m_lastBackup = std::chrono::steady_clock::now();
                 m_backupThread = std::thread(&DatabaseManager::backgroundBackupThread, this);
             }
-            
-            m_initialized.store(true, std::memory_order_release);
-            
+
             SS_LOG_INFO(L"Database", L"DatabaseManager initialized successfully");
             return true;
         }
-
         void DatabaseManager::Shutdown() {
-            if (!m_initialized.load(std::memory_order_acquire)) {
-                return;
-            }
-            
+           
+            bool wasInitialized = m_initialized.exchange(false, std::memory_order_acq_rel);
+
             SS_LOG_INFO(L"Database", L"Shutting down DatabaseManager...");
             
             // Stop backup thread
@@ -764,6 +892,7 @@ namespace ShadowStrike {
             // Shutdown connection pool
             if (m_connectionPool) {
                 m_connectionPool->Shutdown();
+				m_statementCache.reset();//clear the unique ptr
             }
             
             m_initialized.store(false, std::memory_order_release);
@@ -876,14 +1005,24 @@ namespace ShadowStrike {
         }
 
         bool DatabaseManager::Execute(std::string_view sql, DatabaseError* err) {
-            try {
-                auto conn = AcquireConnection(err);
+                  auto conn = AcquireConnection(err);
                 if (!conn) return false;
                 
+                struct ConnectionGuard {
+                    DatabaseManager* mgr;
+                    std::shared_ptr<SQLite::Database> conn;
+
+                    ~ConnectionGuard() {
+                        if (conn && mgr) {
+                            mgr->ReleaseConnection(conn);
+                        }
+                    }
+                } guard{ this, conn };
+                try{
                 conn->exec(sql.data());
                 m_totalQueries.fetch_add(1, std::memory_order_relaxed);
                 
-                ReleaseConnection(conn);
+               
                 return true;
             }
             catch (const SQLite::Exception& ex) {
@@ -893,33 +1032,73 @@ namespace ShadowStrike {
         }
 
         bool DatabaseManager::ExecuteMany(const std::vector<std::string>& statements, DatabaseError* err) {
-            auto trans = BeginTransaction(Transaction::Type::Immediate, err);
-            if (!trans || !trans->IsActive()) {
+            
+            auto conn = AcquireConnection(err);
+            if (!conn) return false;
+
+            struct ConnectionGuard {
+                DatabaseManager* mgr;
+                std::shared_ptr<SQLite::Database> conn;
+
+                ~ConnectionGuard() {
+                    if (conn && mgr) {
+                        mgr->ReleaseConnection(conn);
+                    }
+                }
+            } guard{ this, conn };
+
+            try {
+                // Start transaction on THIS connection
+                conn->exec("BEGIN IMMEDIATE TRANSACTION");
+
+                // Execute all statements on SAME connection
+                for (const auto& sql : statements) {
+                    try {
+                        conn->exec(sql);
+                        m_totalQueries.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    catch (const SQLite::Exception& ex) {
+                        // Rollback on error
+                        try {
+                            conn->exec("ROLLBACK");
+                        }
+                        catch (...) {}
+
+                        setError(err, ex, L"ExecuteMany");
+                        return false;
+                    }
+                }
+
+                // Commit transaction
+                conn->exec("COMMIT");
+                return true;
+            }
+            catch (const SQLite::Exception& ex) {
+                // Rollback on error
+                try {
+                    conn->exec("ROLLBACK");
+                }
+                catch (...) {}
+
+                setError(err, ex, L"ExecuteMany");
                 return false;
             }
-            
-            for (const auto& sql : statements) {
-                if (!Execute(sql, err)) {
-                    trans->Rollback(err);
-                    return false;
-                }
-            }
-            
-            return trans->Commit(err);
         }
 
         QueryResult DatabaseManager::Query(std::string_view sql, DatabaseError* err) {
+            auto conn = AcquireConnection(err);
+            if (!conn) return QueryResult{};
+
             try {
-                auto conn = AcquireConnection(err);
-                if (!conn) return QueryResult{};
-                
                 auto stmt = std::make_unique<SQLite::Statement>(*conn, sql.data());
                 m_totalQueries.fetch_add(1, std::memory_order_relaxed);
-                
-                return QueryResult{ std::move(stmt) };
+
+               
+                return QueryResult{ std::move(stmt), conn, this };
             }
             catch (const SQLite::Exception& ex) {
                 setError(err, ex, L"Query");
+                ReleaseConnection(conn);  
                 return QueryResult{};
             }
         }
@@ -933,7 +1112,7 @@ namespace ShadowStrike {
             
             m_totalTransactions.fetch_add(1, std::memory_order_relaxed);
             
-            return std::make_unique<Transaction>(*conn, type, err);
+            return std::make_unique<Transaction>(*conn,conn,this, type, err);
         }
 
         int64_t DatabaseManager::LastInsertRowId() {
@@ -1178,39 +1357,38 @@ namespace ShadowStrike {
 
         DatabaseManager::DatabaseStats DatabaseManager::GetStats(DatabaseError* err) {
             DatabaseStats stats;
-            
+
             try {
-                auto conn = AcquireConnection(err);
-                if (!conn) return stats;
                 
+
                 // Get page count and page size
                 auto result = Query("PRAGMA page_count", err);
                 if (result.Next()) {
                     stats.pageCount = result.GetInt64(0);
                 }
-                
+
                 result = Query("PRAGMA page_size", err);
                 if (result.Next()) {
                     stats.pageSize = result.GetInt64(0);
                 }
-                
+
                 stats.totalSize = stats.pageCount * stats.pageSize;
-                
+
                 // Get free pages
                 result = Query("PRAGMA freelist_count", err);
                 if (result.Next()) {
                     stats.freePages = result.GetInt64(0);
                 }
-                
+
                 stats.totalQueries = m_totalQueries.load(std::memory_order_relaxed);
                 stats.totalTransactions = m_totalTransactions.load(std::memory_order_relaxed);
+
                 
-                ReleaseConnection(conn);
             }
             catch (const SQLite::Exception& ex) {
                 setError(err, ex, L"GetStats");
             }
-            
+
             return stats;
         }
 

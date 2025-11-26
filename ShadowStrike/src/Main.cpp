@@ -5,6 +5,7 @@
 #include <exception>
 #include "../../../src/Utils/Logger.hpp"
 
+
 using namespace ShadowStrike::Utils;
 
 class DetailedTestListener : public ::testing::TestEventListener {

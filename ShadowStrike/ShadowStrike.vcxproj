@@ -111,7 +111,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;shell32.lib;advapi32.lib;gtest.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;shell32.lib;advapi32.lib;gtest.lib;gtest_main.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>C:\Program Files %28x86%29\Windows Kits\10\Lib\10.0.26100.0\um\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -140,13 +140,10 @@
     <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Statement.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp" />
-    <ClCompile Include="src\Database\CacheDB.cpp" />
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\Database\LogDB.cpp" />
     <ClCompile Include="src\Database\QuarantineDB.cpp" />
-    <ClCompile Include="src\Database\SignatureDB.cpp" />
-    <ClCompile Include="src\Database\ThreatIntelDB.cpp" />
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\Utils\Base64Utils.cpp" />
     <ClCompile Include="src\Utils\CacheManager.cpp" />
@@ -166,6 +163,10 @@
     <ClCompile Include="src\Utils\ThreadPool.cpp" />
     <ClCompile Include="src\Utils\Timer.cpp" />
     <ClCompile Include="src\Utils\XMLUtils.cpp" />
+    <ClCompile Include="tests\unit\Database\configuration_db_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\database_manager_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\Log_db_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\Quarantine_db_tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CompressionUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CryptoUtils_Tests.cpp" />
@@ -197,13 +198,10 @@
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Utils.h" />
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\VariadicBind.h" />
     <ClInclude Include="external\SQLiteCpp\sqlite3\sqlite3.h" />
-    <ClInclude Include="src\Database\CacheDB.hpp" />
     <ClInclude Include="src\Database\ConfigurationDB.hpp" />
     <ClInclude Include="src\Database\DatabaseManager.hpp" />
     <ClInclude Include="src\Database\LogDB.hpp" />
     <ClInclude Include="src\Database\QuarantineDB.hpp" />
-    <ClInclude Include="src\Database\SignatureDB.hpp" />
-    <ClInclude Include="src\Database\ThreatIntelDB.hpp" />
     <ClInclude Include="src\Utils\Base64Utils.hpp" />
     <ClInclude Include="src\Utils\CacheManager.hpp" />
     <ClInclude Include="src\Utils\CompressionUtils.hpp" />
