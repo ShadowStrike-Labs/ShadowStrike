@@ -1,4 +1,4 @@
-#include "ConfigurationDB.hpp"
+﻿#include "ConfigurationDB.hpp"
 #include"DatabaseManager.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/XMLUtils.hpp"
@@ -57,19 +57,12 @@ namespace ShadowStrike {
         bool ConfigurationDB::Initialize(const Config& config, DatabaseError* err) {
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing ConfigurationDB");
 
-            if (m_config.enableHotReload) {
-                m_shutdownHotReload.store(false, std::memory_order_release);
-				m_shutdownHotReload.store(false, std::memory_order_release);
-                {
-                   auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        +std::chrono::system_clock::now().time_since_epoch()).count());
-                    m_lastHotReloadMs.store(nowMs, std::memory_order_release);
-                    
-                }
-                m_hotReloadThread = std::thread([this]() { hotReloadThread(); });
-            }
             if (m_initialized.load(std::memory_order_acquire)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"ConfigurationDB already initialized");
+                {
+                    std::unique_lock lock(m_configMutex);
+                    m_config = config;
+                }
                 return true;
             }
 
@@ -82,6 +75,7 @@ namespace ShadowStrike {
                     if (m_config.masterKey.empty()) {
                         SS_LOG_ERROR(LOG_CATEGORY, L"Encryption enabled but no master key provided");
                         if (err) {
+                            err->sqliteCode = SQLITE_ERROR;
                             err->message = L"Encryption enabled but no master key provided";
                         }
                         return false;
@@ -90,6 +84,7 @@ namespace ShadowStrike {
                     if (m_config.requireStrongKeys && m_config.masterKey.size() < MIN_KEY_LENGTH) {
                         SS_LOG_ERROR(LOG_CATEGORY, L"Master key too short (minimum %zu bytes required)", MIN_KEY_LENGTH);
                         if (err) {
+                            err->sqliteCode = SQLITE_ERROR;
                             err->message = L"Master key too short for strong encryption";
                         }
                         return false;
@@ -104,7 +99,7 @@ namespace ShadowStrike {
                 dbConfig.databasePath = m_config.dbPath;
                 dbConfig.enableWAL = true;
                 dbConfig.enableSecureDelete = true;
-                dbConfig.cacheSizeKB = 8192;  // 8MB cache
+                dbConfig.cacheSizeKB = 8192;
 
                 if (!dbMgr.Initialize(dbConfig, err)) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize DatabaseManager");
@@ -127,14 +122,19 @@ namespace ShadowStrike {
                 }
             }
 
-            // Start hot-reload thread if enabled
+           
+            m_initialized.store(true, std::memory_order_release);
+
+            SS_LOG_INFO(LOG_CATEGORY, L"ConfigurationDB initialized successfully with %zu keys", m_stats.totalKeys);
+
+          
             if (m_config.enableHotReload) {
                 m_shutdownHotReload.store(false, std::memory_order_release);
+                auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+                m_lastHotReloadMs.store(nowMs, std::memory_order_release);
                 m_hotReloadThread = std::thread([this]() { hotReloadThread(); });
             }
-
-            m_initialized.store(true, std::memory_order_release);
-            SS_LOG_INFO(LOG_CATEGORY, L"ConfigurationDB initialized successfully with %zu keys", m_stats.totalKeys);
 
             return true;
         }
@@ -287,9 +287,13 @@ namespace ShadowStrike {
             }
 
             if (key.empty()) {
-                if (err) err->message = L"Configuration key cannot be empty";
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Configuration key cannot be empty";
+                }
                 return false;
             }
+
 
             // Check if key is read-only
             auto existing = dbRead(key, err);
@@ -329,6 +333,10 @@ namespace ShadowStrike {
             entry.modifiedAt = entry.createdAt;
             entry.modifiedBy = changedBy;
             entry.version = existing ? existing->version + 1 : 1;
+
+            if (existing) {
+                entry.createdAt = existing->createdAt;  // PRESERVE!
+            }
 
             // Write to database
             if (!dbWrite(entry, changedBy, reason, err)) {
@@ -406,6 +414,11 @@ namespace ShadowStrike {
             return Set(key, value, scope, changedBy, L"", err);
         }
 
+        void ConfigurationDB::SetEnforceValidation(bool enabled) {
+            std::unique_lock lock(m_configMutex);
+            m_config.enforceValidation = enabled;
+        }
+
         // ============================================================================
         // Basic Operations - Get
         // ============================================================================
@@ -418,7 +431,7 @@ namespace ShadowStrike {
                 if (err) err->message = L"ConfigurationDB not initialized";
                 return std::nullopt;
             }
-
+           
             // Try cache first
             if (m_config.enableCaching) {
                 auto cached = cacheGet(key);
@@ -589,6 +602,12 @@ namespace ShadowStrike {
                 return false;
             }
 
+            // UPDATE STATS!
+            {
+                std::lock_guard<std::mutex> lock(m_statsMutex);
+                m_stats.totalDeletes++;
+            }
+
             // Invalidate cache
             if (m_config.enableCaching) {
                 cacheInvalidate(key);
@@ -723,11 +742,17 @@ namespace ShadowStrike {
 
             if (entry->isEncrypted) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Key already encrypted: %ls", key.data());
-                return true;  // Already encrypted
+                return true;
             }
+
+            // SAVE ORIGINAL TYPE! (ALREADY FIXED!)
+            ValueType originalType = entry->type;
 
             // Convert value to binary
             auto plaintext = valueToBlob(entry->value);
+
+            // PREPEND TYPE BYTE! (ALREADY FIXED!)
+            plaintext.insert(plaintext.begin(), static_cast<uint8_t>(originalType));
 
             // Encrypt
             auto ciphertext = encryptData(plaintext, err);
@@ -850,7 +875,6 @@ namespace ShadowStrike {
         // ============================================================================
         // Database Operations (Internal)
         // ============================================================================
-
         bool ConfigurationDB::dbWrite(
             const ConfigEntry& entry,
             std::wstring_view changedBy,
@@ -859,29 +883,52 @@ namespace ShadowStrike {
         ) {
             auto& dbMgr = DatabaseManager::Instance();
 
+            // FIX: Read config flags with lock BEFORE transaction!
+            bool enableVersioning, enableAuditLog;
+            {
+                std::shared_lock lock(m_configMutex);
+                enableVersioning = m_config.enableVersioning;
+                enableAuditLog = m_config.enableAuditLog;
+            }
+
+            // START TRANSACTION!
+            auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
+            if (!trans || !trans->IsActive()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to start transaction for key: %ls", entry.key.c_str());
+                return false;
+            }
+
+            // CHECK IF KEY EXISTS TO PRESERVE created_at!
+            auto utf8Key = wstringToUtf8(entry.key);
+
+            const char* checkSql = "SELECT created_at FROM configurations WHERE key = ?";
+            auto existingResult = dbMgr.QueryWithParams(checkSql, nullptr, utf8Key);
+
+            int64_t finalCreatedMs;
+            if (existingResult.Next()) {
+                finalCreatedMs = existingResult.GetInt64(0);
+            }
+            else {
+                finalCreatedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    entry.createdAt.time_since_epoch()).count();
+            }
+
             // Convert value to BLOB
             auto valueBlob = valueToBlob(entry.value);
-
-            // Convert timestamps to Unix epoch (milliseconds)
-            auto createdMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                entry.createdAt.time_since_epoch()).count();
             auto modifiedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 entry.modifiedAt.time_since_epoch()).count();
-
-            // Convert wstrings to UTF-8 for SQL binding
-            auto utf8Key = wstringToUtf8(entry.key);
             auto utf8Desc = wstringToUtf8(entry.description);
             auto utf8ModifiedBy = wstringToUtf8(entry.modifiedBy);
 
-            // Insert or replace
+            // MAIN INSERT
             const char* sql = R"SQL(
-                INSERT OR REPLACE INTO configurations 
-                (key, value, type, scope, is_encrypted, is_readonly, description, 
-                 created_at, modified_at, modified_by, version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            )SQL";
+        INSERT OR REPLACE INTO configurations 
+        (key, value, type, scope, is_encrypted, is_readonly, description, 
+         created_at, modified_at, modified_by, version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )SQL";
 
-            bool success = dbMgr.ExecuteWithParams(
+            if (!trans->ExecuteWithParams(
                 sql, err,
                 utf8Key,
                 valueBlob,
@@ -890,52 +937,76 @@ namespace ShadowStrike {
                 entry.isEncrypted ? 1 : 0,
                 entry.isReadOnly ? 1 : 0,
                 utf8Desc,
-                createdMs,
+                finalCreatedMs,
                 modifiedMs,
                 utf8ModifiedBy,
                 entry.version
-            );
-
-            if (!success) {
+            )) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to write configuration to database: %ls", entry.key.c_str());
+                trans->Rollback(nullptr);
                 return false;
             }
 
-            // Write to history if versioning enabled
-            if (m_config.enableVersioning) {
-                const char* historySql = R"SQL(
-                    INSERT INTO configuration_history 
-                    (key, value, type, scope, version, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                )SQL";
+            // HISTORY INSERT (using local variable!)
+            if (enableVersioning) {
+                auto versionTimestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
 
-                dbMgr.ExecuteWithParams(
-                    historySql, nullptr,
+                const char* historySql = R"SQL(
+            INSERT INTO configuration_history 
+            (key, value, type, scope, version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        )SQL";
+
+                if (!trans->ExecuteWithParams(
+                    historySql, err,
                     utf8Key,
                     valueBlob,
                     static_cast<int>(entry.type),
                     static_cast<int>(entry.scope),
                     entry.version,
-                    modifiedMs
-                );
+                    versionTimestampMs
+                )) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to write history for key: %ls (continuing)", entry.key.c_str());
+                }
             }
 
-            // Write change record
-            if (m_config.enableAuditLog) {
-                ChangeRecord change;
-                change.key = entry.key;
-                change.action = ChangeAction::Modified;
-                change.newValue = entry.value;
-                change.changedBy = changedBy;
-                change.timestamp = std::chrono::system_clock::now();
-                change.reason = reason;
+            // CHANGE RECORD (using local variable!)
+            if (enableAuditLog) {
+                auto timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
 
-                dbWriteChangeRecord(change, nullptr);
+                auto newValueBlob = valueToBlob(entry.value);
+                auto utf8ChangedBy = wstringToUtf8(changedBy);
+                auto utf8Reason = wstringToUtf8(reason);
+
+                const char* changeSql = R"SQL(
+            INSERT INTO configuration_changes 
+            (key, action, old_value, new_value, changed_by, timestamp, reason)
+            VALUES (?, ?, NULL, ?, ?, ?, ?)
+        )SQL";
+
+                if (!trans->ExecuteWithParams(
+                    changeSql, err,
+                    utf8Key,
+                    static_cast<int>(ChangeAction::Modified),
+                    newValueBlob,
+                    utf8ChangedBy,
+                    timestampMs,
+                    utf8Reason
+                )) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to write change record for key: %ls", entry.key.c_str());
+                }
+            }
+
+            // COMMIT!
+            if (!trans->Commit(err)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to commit transaction for key: %ls", entry.key.c_str());
+                return false;
             }
 
             return true;
         }
-
         std::optional<ConfigurationDB::ConfigEntry> ConfigurationDB::dbRead(
             std::wstring_view key,
             DatabaseError* err
@@ -990,11 +1061,20 @@ namespace ShadowStrike {
             // Get old value for change record
             auto oldEntry = dbRead(key, nullptr);
 
+            //check if key exists
+            if (!oldEntry.has_value()) {
+                if (err) {
+                    err->sqliteCode = SQLITE_ERROR;
+                    err->message = L"Configuration key not found";
+                }
+                return false;
+            }
+
             const char* sql = "DELETE FROM configurations WHERE key = ?";
             auto utf8Key = wstringToUtf8(key);
             bool success = dbMgr.ExecuteWithParams(sql, err, utf8Key);
 
-            if (success && m_config.enableAuditLog && oldEntry) {
+            if (success && m_config.enableAuditLog) {
                 ChangeRecord change;
                 change.key = std::wstring(key);
                 change.action = ChangeAction::Deleted;
@@ -1581,7 +1661,6 @@ namespace ShadowStrike {
         // ============================================================================
         // Batch Operations
         // ============================================================================
-
         bool ConfigurationDB::SetBatch(
             const std::vector<std::pair<std::wstring, ConfigValue>>& entries,
             ConfigScope scope,
@@ -1594,8 +1673,49 @@ namespace ShadowStrike {
                 return false;
             }
 
+            
             for (const auto& [key, value] : entries) {
-                if (!Set(key, value, scope, changedBy, L"Batch operation", err)) {
+               
+
+                // Determine value type
+                ValueType type = ValueType::String;
+                if (std::holds_alternative<std::wstring>(value)) type = ValueType::String;
+                else if (std::holds_alternative<int64_t>(value)) type = ValueType::Integer;
+                else if (std::holds_alternative<double>(value)) type = ValueType::Real;
+                else if (std::holds_alternative<bool>(value)) type = ValueType::Boolean;
+                else if (std::holds_alternative<Utils::JSON::Json>(value)) type = ValueType::Json;
+                else if (std::holds_alternative<std::vector<uint8_t>>(value)) type = ValueType::Binary;
+
+                // Convert value to BLOB
+                auto valueBlob = valueToBlob(value);
+
+                // Get timestamps
+                auto now = std::chrono::system_clock::now();
+                auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count();
+
+                // Convert strings to UTF-8
+                auto utf8Key = wstringToUtf8(key);
+                auto utf8ChangedBy = wstringToUtf8(changedBy);
+
+                // USE TRANSACTION'S ExecuteWithParams!
+                const char* sql = R"SQL(
+            INSERT OR REPLACE INTO configurations 
+            (key, value, type, scope, is_encrypted, is_readonly, description, 
+             created_at, modified_at, modified_by, version)
+            VALUES (?, ?, ?, ?, 0, 0, '', ?, ?, ?, 1)
+        )SQL";
+
+                if (!trans->ExecuteWithParams(
+                    sql, err,
+                    utf8Key,
+                    valueBlob,
+                    static_cast<int>(type),
+                    static_cast<int>(scope),
+                    nowMs,  // created_at
+                    nowMs,  // modified_at
+                    utf8ChangedBy
+                )) {
                     trans->Rollback(nullptr);
                     return false;
                 }
@@ -1632,13 +1752,46 @@ namespace ShadowStrike {
             }
 
             for (const auto& key : keys) {
-                if (!Remove(key, changedBy, L"Batch operation", err)) {
+                auto utf8Key = wstringToUtf8(key);
+
+                const char* checkSql = "SELECT COUNT(*) FROM configurations WHERE key = ?";
+                auto result = dbMgr.QueryWithParams(checkSql, err, utf8Key);
+
+                if (!result.Next() || result.GetInt(0) == 0) {
+                    trans->Rollback(nullptr);
+                    if (err) {
+                        err->sqliteCode = SQLITE_ERROR;
+                        err->message = L"Key not found: " + key;
+                    }
+                    return false;
+                }
+
+                const char* deleteSql = "DELETE FROM configurations WHERE key = ?";
+                if (!trans->ExecuteWithParams(deleteSql, err, utf8Key)) {
                     trans->Rollback(nullptr);
                     return false;
                 }
             }
 
-            return trans->Commit(err);
+            // COMMIT FIRST!
+            if (!trans->Commit(err)) {
+                return false;
+            }
+
+            // INVALIDATE CACHE AFTER COMMIT!
+            if (m_config.enableCaching) {
+                for (const auto& key : keys) {
+                    cacheInvalidate(key);
+                }
+            }
+
+            // UPDATE STATS AFTER SUCCESSFUL COMMIT!
+            {
+                std::lock_guard<std::mutex> lock(m_statsMutex);
+                m_stats.totalDeletes += keys.size();
+            }
+
+            return true;
         }
 
    // ============================================================================
@@ -2450,7 +2603,11 @@ namespace ShadowStrike {
             }
 
             if (!result.Next()) {
-                if (err) err->message = L"Version not found in history";
+                if (err)
+                {
+                    err->message = L"Version not found in history";
+                    err->sqliteCode = SQLITE_ERROR;
+                }
                 SS_LOG_ERROR(LOG_CATEGORY, L"Rollback: Version %d not found for key: %ls", version, key.data());
                 return false;
             }

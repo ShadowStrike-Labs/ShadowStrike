@@ -1,4 +1,4 @@
-#include "QuarantineDB.hpp"
+ï»¿#include "QuarantineDB.hpp"
 #include"../Utils/CompressionUtils.hpp"
 #include"../Utils/HashUtils.hpp"
 #include"../Utils/JSONUtils.hpp"
@@ -25,45 +25,45 @@ namespace ShadowStrike {
 
             // SQL statements
             constexpr const char* SQL_CREATE_QUARANTINE_TABLE = R"(
-                CREATE TABLE IF NOT EXISTS quarantine_entries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    quarantine_time TEXT NOT NULL,
-                    last_access_time TEXT NOT NULL,
-                    original_path TEXT NOT NULL,
-                    original_filename TEXT NOT NULL,
-                    original_directory TEXT NOT NULL,
-                    original_size INTEGER NOT NULL,
-                    original_creation_time TEXT,
-                    original_modification_time TEXT,
-                    quarantine_path TEXT NOT NULL UNIQUE,
-                    quarantine_filename TEXT NOT NULL,
-                    quarantine_size INTEGER NOT NULL,
-                    threat_type INTEGER NOT NULL,
-                    severity INTEGER NOT NULL,
-                    threat_name TEXT NOT NULL,
-                    threat_signature TEXT,
-                    scan_engine TEXT,
-                    scan_engine_version TEXT,
-                    md5_hash TEXT,
-                    sha1_hash TEXT,
-                    sha256_hash TEXT NOT NULL,
-                    status INTEGER NOT NULL DEFAULT 0,
-                    user_name TEXT,
-                    machine_name TEXT,
-                    process_id INTEGER,
-                    process_name TEXT,
-                    is_encrypted INTEGER NOT NULL DEFAULT 1,
-                    encryption_method TEXT,
-                    notes TEXT,
-                    detection_reason TEXT,
-                    restoration_time TEXT,
-                    restored_by TEXT,
-                    restoration_reason TEXT,
-                    can_restore INTEGER NOT NULL DEFAULT 1,
-                    can_delete INTEGER NOT NULL DEFAULT 1,
-                    requires_password INTEGER NOT NULL DEFAULT 0
-                );
-            )";
+    CREATE TABLE IF NOT EXISTS quarantine_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quarantine_time TEXT NOT NULL,
+        last_access_time TEXT NOT NULL,
+        original_path TEXT NOT NULL,
+        original_filename TEXT NOT NULL,
+        original_directory TEXT NOT NULL,
+        original_size INTEGER NOT NULL,
+        original_creation_time TEXT,
+        original_modification_time TEXT,
+        quarantine_path TEXT NOT NULL,
+        quarantine_filename TEXT NOT NULL,
+        quarantine_size INTEGER NOT NULL,
+        threat_type INTEGER NOT NULL,
+        severity INTEGER NOT NULL,
+        threat_name TEXT NOT NULL,
+        threat_signature TEXT,
+        scan_engine TEXT,
+        scan_engine_version TEXT,
+        md5_hash TEXT,
+        sha1_hash TEXT,
+        sha256_hash TEXT NOT NULL,
+        status INTEGER NOT NULL DEFAULT 0,
+        user_name TEXT,
+        machine_name TEXT,
+        process_id INTEGER,
+        process_name TEXT,
+        is_encrypted INTEGER NOT NULL DEFAULT 1,
+        encryption_method TEXT,
+        notes TEXT,
+        detection_reason TEXT,
+        restoration_time TEXT,
+        restored_by TEXT,
+        restoration_reason TEXT,
+        can_restore INTEGER NOT NULL DEFAULT 1,
+        can_delete INTEGER NOT NULL DEFAULT 1,
+        requires_password INTEGER NOT NULL DEFAULT 0
+    );
+)";
 
             constexpr const char* SQL_CREATE_INDICES = R"(
                 CREATE INDEX IF NOT EXISTS idx_quar_time ON quarantine_entries(quarantine_time DESC);
@@ -114,16 +114,18 @@ namespace ShadowStrike {
             )";
 
             constexpr const char* SQL_UPDATE_ENTRY = R"(
-                UPDATE quarantine_entries SET
-                    last_access_time = ?,
-                    status = ?,
-                    restoration_time = ?,
-                    restored_by = ?,
-                    restoration_reason = ?,
-                    notes = ?
-                WHERE id = ?
-            )";
-
+    UPDATE quarantine_entries SET
+        last_access_time = ?,
+        quarantine_path = ?,
+        quarantine_filename = ?,
+        quarantine_size = ?,
+        status = ?,
+        restoration_time = ?,
+        restored_by = ?,
+        restoration_reason = ?,
+        notes = ?
+    WHERE id = ?
+)";
             constexpr const char* SQL_SELECT_ENTRY = R"(
                 SELECT * FROM quarantine_entries WHERE id = ?
             )";
@@ -255,6 +257,12 @@ namespace ShadowStrike {
 
             std::unique_lock<std::shared_mutex> lock(m_configMutex);
             m_config = config;
+
+            if (DatabaseManager::Instance().IsInitialized()) {
+                SS_LOG_INFO(L"QuarantineDB", L"Shutting down existing DatabaseManager instance");
+                DatabaseManager::Instance().Shutdown();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Allow cleanup
+            }
 
             // Initialize DatabaseManager
             DatabaseConfig dbConfig;
@@ -416,7 +424,7 @@ namespace ShadowStrike {
             }
 
             // Calculate hashes
-            // std::byte -> uint8_t dönüþümü açýk cast gerektirir; doðrudan iterator ctor çalýþmaz.
+            // std::byte -> uint8_t dÃ¶nÃ¼ÅŸÃ¼mÃ¼ aÃ§Ä±k cast gerektirir; doÄŸrudan iterator ctor Ã§alÄ±ÅŸmaz.
             std::vector<uint8_t> rawData;
             rawData.resize(fileData.size());
             std::transform(fileData.begin(), fileData.end(), rawData.begin(),
@@ -499,10 +507,10 @@ namespace ShadowStrike {
         {
             SS_LOG_INFO(L"QuarantineDB", L"Restoring file from quarantine. Entry ID: %lld", entryId);
 
-            // Get entry
             auto entryOpt = GetEntry(entryId, err);
             if (!entryOpt) {
                 if (err) {
+                    err->sqliteCode = SQLITE_NOTFOUND;  
                     err->message = L"Entry not found";
                 }
                 return false;
@@ -621,6 +629,7 @@ namespace ShadowStrike {
             auto entryOpt = GetEntry(entryId, err);
             if (!entryOpt) {
                 if (err) {
+					err->sqliteCode = SQLITE_NOTFOUND;
                     err->message = L"Entry not found";
                 }
                 return false;
@@ -676,40 +685,30 @@ namespace ShadowStrike {
         // ========================================================================
 
         bool QuarantineDB::QuarantineBatch(const std::vector<std::wstring>& filePaths,
-                                          ThreatType threatType,
-                                          ThreatSeverity severity,
-                                          std::wstring_view threatName,
-                                          DatabaseError* err)
+            ThreatType threatType,
+            ThreatSeverity severity,
+            std::wstring_view threatName,
+            DatabaseError* err)
         {
             if (filePaths.empty()) return true;
 
             SS_LOG_INFO(L"QuarantineDB", L"Batch quarantine: %zu files", filePaths.size());
 
-            auto trans = DatabaseManager::Instance().BeginTransaction(
-                Transaction::Type::Immediate, err);
-            
-            if (!trans || !trans->IsActive()) {
-                return false;
-            }
-
+           
             size_t successCount = 0;
             for (const auto& path : filePaths) {
                 if (QuarantineFile(path, threatType, severity, threatName, L"", err) > 0) {
                     successCount++;
-                } else {
+                }
+                else {
                     SS_LOG_WARN(L"QuarantineDB", L"Failed to quarantine file: %ls", path.c_str());
                 }
             }
 
-            if (!trans->Commit(err)) {
-                return false;
-            }
-
-            SS_LOG_INFO(L"QuarantineDB", L"Batch quarantine completed: %zu/%zu successful", 
-                       successCount, filePaths.size());
+            SS_LOG_INFO(L"QuarantineDB", L"Batch quarantine completed: %zu/%zu successful",
+                successCount, filePaths.size());
             return successCount > 0;
         }
-
         bool QuarantineDB::RestoreBatch(const std::vector<int64_t>& entryIds,
                                        std::wstring_view restoredBy,
                                        DatabaseError* err)
@@ -1085,6 +1084,9 @@ namespace ShadowStrike {
                 SQL_UPDATE_ENTRY,
                 err,
                 lastAccessTime,
+                ToUTF8(entry.quarantinePath),           
+                ToUTF8(entry.quarantineFileName),      
+                static_cast<int64_t>(entry.quarantineSize),  
                 static_cast<int>(entry.status),
                 restorationTime,
                 ToUTF8(entry.restoredBy),
@@ -1146,67 +1148,56 @@ namespace ShadowStrike {
             sql << "SELECT * FROM quarantine_entries WHERE 1=1";
 
             if (filter.threatType) {
-                sql << " AND threat_type = ?";
-                outParams.push_back(std::to_string(static_cast<int>(*filter.threatType)));
+                sql << " AND threat_type = " << static_cast<int>(*filter.threatType);  // Direct value
             }
 
             if (filter.minSeverity) {
-                sql << " AND severity >= ?";
-                outParams.push_back(std::to_string(static_cast<int>(*filter.minSeverity)));
+                sql << " AND severity >= " << static_cast<int>(*filter.minSeverity);
             }
 
             if (filter.maxSeverity) {
-                sql << " AND severity <= ?";
-                outParams.push_back(std::to_string(static_cast<int>(*filter.maxSeverity)));
+                sql << " AND severity <= " << static_cast<int>(*filter.maxSeverity);
             }
 
             if (filter.status) {
-                sql << " AND status = ?";
-                outParams.push_back(std::to_string(static_cast<int>(*filter.status)));
+                sql << " AND status = " << static_cast<int>(*filter.status);  // Direct value
             }
 
             if (filter.startTime) {
-                sql << " AND quarantine_time >= ?";
-                outParams.push_back(timePointToString(*filter.startTime));
+                sql << " AND quarantine_time >= '" << timePointToString(*filter.startTime) << "'";
             }
 
             if (filter.endTime) {
-                sql << " AND quarantine_time <= ?";
-                outParams.push_back(timePointToString(*filter.endTime));
+                sql << " AND quarantine_time <= '" << timePointToString(*filter.endTime) << "'";
             }
 
             if (filter.originalPathPattern) {
-                sql << " AND original_path LIKE ?";
-                outParams.push_back(ToUTF8(*filter.originalPathPattern));
+                sql << " AND original_path LIKE '" << ToUTF8(*filter.originalPathPattern) << "'";
             }
 
             if (filter.threatNamePattern) {
-                sql << " AND threat_name LIKE ?";
-                outParams.push_back(ToUTF8(*filter.threatNamePattern));
+                sql << " AND threat_name LIKE '" << ToUTF8(*filter.threatNamePattern) << "'";
             }
 
             if (filter.fileHashPattern) {
-                sql << " AND (md5_hash LIKE ? OR sha1_hash LIKE ? OR sha256_hash LIKE ?)";
                 std::string hashPattern = ToUTF8(*filter.fileHashPattern);
-                outParams.push_back(hashPattern);
-                outParams.push_back(hashPattern);
-                outParams.push_back(hashPattern);
+                sql << " AND (md5_hash LIKE '" << hashPattern << "' OR sha1_hash LIKE '"
+                    << hashPattern << "' OR sha256_hash LIKE '" << hashPattern << "')";
             }
 
             if (filter.userNamePattern) {
-                sql << " AND user_name LIKE ?";
-                outParams.push_back(ToUTF8(*filter.userNamePattern));
+                sql << " AND user_name LIKE '" << ToUTF8(*filter.userNamePattern) << "'";
             }
 
             if (filter.machineNamePattern) {
-                sql << " AND machine_name LIKE ?";
-                outParams.push_back(ToUTF8(*filter.machineNamePattern));
+                sql << " AND machine_name LIKE '" << ToUTF8(*filter.machineNamePattern) << "'";
             }
 
             // Order and limit
             if (filter.sortDescending) {
                 sql << " ORDER BY quarantine_time DESC";
-            } else {
+            }
+            else {
                 sql << " ORDER BY quarantine_time ASC";
             }
 
@@ -1219,15 +1210,12 @@ namespace ShadowStrike {
             std::ostringstream sql;
             sql << "SELECT COUNT(*) FROM quarantine_entries WHERE 1=1";
 
-            // Apply same filters as buildQuerySQL (simplified version)
             if (filter.threatType) {
-                sql << " AND threat_type = ?";
-                outParams.push_back(std::to_string(static_cast<int>(*filter.threatType)));
+                sql << " AND threat_type = " << static_cast<int>(*filter.threatType);  // Direct
             }
 
             if (filter.status) {
-                sql << " AND status = ?";
-                outParams.push_back(std::to_string(static_cast<int>(*filter.status)));
+                sql << " AND status = " << static_cast<int>(*filter.status);  // Direct
             }
 
             return sql.str();
@@ -1419,75 +1407,80 @@ namespace ShadowStrike {
             return true;
         }
 
-        bool QuarantineDB::compressData(const std::vector<uint8_t>& input,
-                                       std::vector<uint8_t>& output)
-        {
-            // Quick check: nothing to do for empty input
-            output.clear();
-            if (input.empty()) return true;
+            bool QuarantineDB::compressData(const std::vector<uint8_t>& input,
+                std::vector<uint8_t>& output)
+            {
+                output.clear();
+                if (input.empty()) return true;
 
-            using namespace ShadowStrike::Utils::CompressionUtils;
+                using namespace ShadowStrike::Utils::CompressionUtils;
 
-            // check API availability
-            if (!IsCompressionApiAvailable()) {
-                SS_LOG_WARN(L"QuarantineDB", L"Windows Compression API not available");
-                return false;
-            }
+                if (!IsCompressionApiAvailable()) {
+                    SS_LOG_WARN(L"QuarantineDB", L"Compression API not available - storing uncompressed");
+                    output = input; 
+                    return true;
+                }
 
-            Compressor compressor;
-            if (!compressor.open(Algorithm::Xpress)) {
-                SS_LOG_ERROR(L"QuarantineDB", L"Failed to open compressor (Algorithm::Xpress)");
-                return false;
-            }
+                Compressor compressor;
+                if (!compressor.open(Algorithm::Xpress)) {
+                    SS_LOG_WARN(L"QuarantineDB", L"Failed to open compressor - storing uncompressed");
+                    output = input;
+                    return true;
+                }
 
-            const void* src = static_cast<const void*>(input.data());
-            size_t size = input.size(); // byte count (uint8_t => 1 byte)
+                const void* src = static_cast<const void*>(input.data());
+                size_t size = input.size();
 
-            bool ok = compressor.compress(src, size, output);
-            if (!ok) {
-                SS_LOG_ERROR(L"QuarantineDB", L"Compression failed");
+                bool ok = compressor.compress(src, size, output);
                 compressor.close();
-                return false;
+
+                if (!ok || output.size() >= input.size()) {
+                   
+                    SS_LOG_DEBUG(L"QuarantineDB", L"Compression not beneficial (%zu -> %zu), storing uncompressed",
+                        input.size(), output.size());
+                    output = input;
+                }
+
+                return true;
             }
 
-            compressor.close();
-            return true;
-        }
+            bool QuarantineDB::decompressData(const std::vector<uint8_t>& input,
+                std::vector<uint8_t>& output)
+            {
+                output.clear();
+                if (input.empty()) return true;
 
-        bool QuarantineDB::decompressData(const std::vector<uint8_t>& input,
-                                         std::vector<uint8_t>& output)
-        {
-            output.clear();
-            if (input.empty()) return true;
+                using namespace ShadowStrike::Utils::CompressionUtils;
 
-            using namespace ShadowStrike::Utils::CompressionUtils;
+                if (!IsCompressionApiAvailable()) {
+                    SS_LOG_WARN(L"QuarantineDB", L"Compression API not available - assuming uncompressed");
+                    output = input;
+                    return true;
+                }
 
-            if (!IsCompressionApiAvailable()) {
-                SS_LOG_WARN(L"QuarantineDB", L"Windows Compression API not available");
-                return false;
-            }
+                Decompressor decompressor;
+                if (!decompressor.open(Algorithm::Xpress)) {
+                    SS_LOG_WARN(L"QuarantineDB", L"Failed to open decompressor - assuming uncompressed");
+                    output = input;
+                    return true;
+                }
 
-            Decompressor decompressor;
-            if (!decompressor.open(Algorithm::Xpress)) {
-                SS_LOG_ERROR(L"QuarantineDB", L"Failed to open decompressor (Algorithm::Xpress)");
-                return false;
-            }
+                const void* src = static_cast<const void*>(input.data());
+                size_t size = input.size();
 
-            const void* src = static_cast<const void*>(input.data());
-            size_t size = input.size();
+                
+                size_t maxDecompressedSize = std::min(size * 10, size_t(100 * 1024 * 1024));
 
-            // If you know the expected uncompressed size (e.g. from DB), pass it here to avoid decompression bombs.
-            size_t expectedUncompressedSize = 0; // 0 = unknown
-            bool ok = decompressor.decompress(src, size, output, expectedUncompressedSize);
-            if (!ok) {
-                SS_LOG_ERROR(L"QuarantineDB", L"Decompression failed");
+                bool ok = decompressor.decompress(src, size, output, maxDecompressedSize);
                 decompressor.close();
-                return false;
-            }
 
-            decompressor.close();
-            return true;
-        }
+                if (!ok) {
+                    SS_LOG_WARN(L"QuarantineDB", L"Decompression failed - assuming data was uncompressed");
+                    output = input;
+                }
+
+                return true;
+            }
 
         bool QuarantineDB::calculateHashes(const std::vector<uint8_t>& data,
                                           std::wstring& md5,
@@ -1606,13 +1599,18 @@ namespace ShadowStrike {
         }
 
         std::wstring QuarantineDB::generateQuarantinePath(int64_t entryId) {
+            auto now = std::chrono::system_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
             std::wostringstream oss;
             oss << m_config.quarantineBasePath;
-            if (!m_config.quarantineBasePath.empty() && 
+            if (!m_config.quarantineBasePath.empty() &&
                 m_config.quarantineBasePath.back() != L'\\') {
                 oss << L"\\";
             }
-            oss << L"quar_" << std::setfill(L'0') << std::setw(10) << entryId << L".dat";
+            
+            oss << L"quar_" << std::setfill(L'0') << std::setw(10) << entryId
+                << L"_" << ms << L".dat";
             return oss.str();
         }
 
@@ -2409,7 +2407,7 @@ namespace ShadowStrike {
             auto entries = filter ? Query(*filter, err) : GetActiveEntries(10000, err);
 
             // Open file for writing
-            std::wofstream csvFile(std::wstring(filePath), std::ios::out | std::ios::trunc);
+            std::ofstream csvFile(std::wstring(filePath), std::ios::out | std::ios::trunc | std::ios::binary);
             if (!csvFile.is_open()) {
                 if (err) {
                     err->sqliteCode = SQLITE_ERROR;
@@ -2418,45 +2416,51 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // Write BOM for UTF-8
-            csvFile << L"\xFEFF";
+            // Write UTF-8 BOM correctly
+            csvFile.write("\xEF\xBB\xBF", 3);  // Correct UTF-8 BOM
 
-            // Write CSV header
-            csvFile << L"Entry ID,Original Path,Original Filename,File Size (bytes),Quarantine Time,"
-                   << L"Threat Type,Threat Name,Severity,Status,SHA256 Hash,User,Machine,Detection Reason,Notes\n";
+            // Write CSV header (convert to UTF-8)
+            std::string header = "Entry ID,Original Path,Original Filename,File Size (bytes),Quarantine Time,"
+                "Threat Type,Threat Name,Severity,Status,SHA256 Hash,User,Machine,Detection Reason,Notes\n";
+            csvFile.write(header.c_str(), header.size());
 
-            // Helper lambda to escape CSV fields
-            auto escapeCsv = [](const std::wstring& field) -> std::wstring {
-                if (field.find(L',') != std::wstring::npos || 
-                    field.find(L'"') != std::wstring::npos || 
-                    field.find(L'\n') != std::wstring::npos) {
-                    std::wstring escaped = L"\"";
-                    for (wchar_t c : field) {
-                        if (c == L'"') escaped += L"\"\"";
+            // Helper lambda for CSV escape (keep same)
+            auto escapeCsv = [](const std::wstring& field) -> std::string {
+                std::string utf8Field = ToUTF8(field);
+                if (utf8Field.find(',') != std::string::npos ||
+                    utf8Field.find('"') != std::string::npos ||
+                    utf8Field.find('\n') != std::string::npos) {
+                    std::string escaped = "\"";
+                    for (char c : utf8Field) {
+                        if (c == '"') escaped += "\"\"";
                         else escaped += c;
                     }
-                    escaped += L"\"";
+                    escaped += "\"";
                     return escaped;
                 }
-                return field;
-            };
+                return utf8Field;
+                };
 
-            // Write entries
+            // Write entries (convert each field to UTF-8)
             for (const auto& entry : entries) {
-                csvFile << entry.id << L","
-                       << escapeCsv(entry.originalPath) << L","
-                       << escapeCsv(entry.originalFileName) << L","
-                       << entry.originalSize << L","
-                       << escapeCsv(ToWide(timePointToString(entry.quarantineTime))) << L","
-                       << escapeCsv(ThreatTypeToString(entry.threatType)) << L","
-                       << escapeCsv(entry.threatName) << L","
-                       << escapeCsv(ThreatSeverityToString(entry.severity)) << L","
-                       << escapeCsv(QuarantineStatusToString(entry.status)) << L","
-                       << escapeCsv(entry.sha256Hash) << L","
-                       << escapeCsv(entry.userName) << L","
-                       << escapeCsv(entry.machineName) << L","
-                       << escapeCsv(entry.detectionReason) << L","
-                       << escapeCsv(entry.notes) << L"\n";
+                std::ostringstream line;
+                line << entry.id << ","
+                    << escapeCsv(entry.originalPath) << ","
+                    << escapeCsv(entry.originalFileName) << ","
+                    << entry.originalSize << ","
+                    << escapeCsv(ToWide(timePointToString(entry.quarantineTime))) << ","
+                    << escapeCsv(ThreatTypeToString(entry.threatType)) << ","
+                    << escapeCsv(entry.threatName) << ","
+                    << escapeCsv(ThreatSeverityToString(entry.severity)) << ","
+                    << escapeCsv(QuarantineStatusToString(entry.status)) << ","
+                    << escapeCsv(entry.sha256Hash) << ","
+                    << escapeCsv(entry.userName) << ","
+                    << escapeCsv(entry.machineName) << ","
+                    << escapeCsv(entry.detectionReason) << ","
+                    << escapeCsv(entry.notes) << "\n";
+
+                std::string lineStr = line.str();
+                csvFile.write(lineStr.c_str(), lineStr.size());
             }
 
             csvFile.close();
@@ -2586,10 +2590,10 @@ namespace ShadowStrike {
             return true;
         }
 
+        // âœ… FIXED VERSION
         bool QuarantineDB::RestoreQuarantine(std::wstring_view backupPath, DatabaseError* err) {
             SS_LOG_INFO(L"QuarantineDB", L"Restoring quarantine from backup: %ls", backupPath.data());
 
-            // Load backup file
             using namespace ShadowStrike::Utils::JSON;
             Json backup;
             Error jsonErr;
@@ -2603,7 +2607,6 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // Validate backup format
             if (!backup.contains("backup_format") || !backup.contains("entries")) {
                 if (err) {
                     err->sqliteCode = SQLITE_ERROR;
@@ -2612,7 +2615,6 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // Get entries array
             const Json& entriesArray = backup["entries"];
             size_t totalEntries = entriesArray.size();
             size_t successCount = 0;
@@ -2620,21 +2622,11 @@ namespace ShadowStrike {
 
             SS_LOG_INFO(L"QuarantineDB", L"Restoring %zu entries from backup", totalEntries);
 
-            // Start transaction for bulk insert
-            auto trans = DatabaseManager::Instance().BeginTransaction(
-                Transaction::Type::Immediate, err);
-            
-            if (!trans || !trans->IsActive()) {
-                SS_LOG_ERROR(L"QuarantineDB", L"Failed to begin transaction for restore");
-                return false;
-            }
-
-            // Restore each entry
             for (const auto& entryBackup : entriesArray) {
                 try {
                     QuarantineEntry entry;
 
-                    // Parse entry data
+                    //PARSE ALL FIELDS FIRST!
                     entry.originalPath = ToWide(entryBackup["original"]["path"].get<std::string>());
                     entry.originalFileName = ToWide(entryBackup["original"]["filename"].get<std::string>());
                     entry.originalDirectory = ToWide(entryBackup["original"]["directory"].get<std::string>());
@@ -2651,6 +2643,7 @@ namespace ShadowStrike {
                     entry.scanEngine = ToWide(entryBackup["scan"]["engine"].get<std::string>());
                     entry.scanEngineVersion = ToWide(entryBackup["scan"]["engine_version"].get<std::string>());
 
+                    // PARSE HASHES BEFORE VERIFICATION!
                     entry.md5Hash = ToWide(entryBackup["hashes"]["md5"].get<std::string>());
                     entry.sha1Hash = ToWide(entryBackup["hashes"]["sha1"].get<std::string>());
                     entry.sha256Hash = ToWide(entryBackup["hashes"]["sha256"].get<std::string>());
@@ -2682,11 +2675,12 @@ namespace ShadowStrike {
                         continue;
                     }
 
-                    // Verify hash
+                    // NOW VERIFY HASH (entry.sha256Hash is populated!)
                     std::wstring md5, sha1, sha256;
                     if (calculateHashes(fileData, md5, sha1, sha256)) {
                         if (sha256 != entry.sha256Hash) {
-                            SS_LOG_WARN(L"QuarantineDB", L"Hash mismatch for restored entry");
+                            SS_LOG_WARN(L"QuarantineDB", L"Hash mismatch for restored entry (expected: %ls, got: %ls)",
+                                entry.sha256Hash.c_str(), sha256.c_str());
                             failureCount++;
                             continue;
                         }
@@ -2696,31 +2690,27 @@ namespace ShadowStrike {
                     int64_t newId = QuarantineFileDetailed(entry, fileData, nullptr);
                     if (newId > 0) {
                         successCount++;
-                    } else {
+                    }
+                    else {
                         failureCount++;
                     }
 
-                } catch (const std::exception& e) {
+                }
+                catch (const std::exception& e) {
                     SS_LOG_WARN(L"QuarantineDB", L"Exception restoring entry: %hs", e.what());
                     failureCount++;
                     continue;
                 }
             }
 
-            // Commit transaction
-            if (!trans->Commit(err)) {
-                SS_LOG_ERROR(L"QuarantineDB", L"Failed to commit restore transaction");
-                return false;
-            }
-
             // Log audit event
-            logAuditEvent(QuarantineAction::Restored, 0, 
-                         L"Restored from backup: " + std::wstring(backupPath) + 
-                         L" (Success: " + std::to_wstring(successCount) + 
-                         L", Failed: " + std::to_wstring(failureCount) + L")");
+            logAuditEvent(QuarantineAction::Restored, 0,
+                L"Restored from backup: " + std::wstring(backupPath) +
+                L" (Success: " + std::to_wstring(successCount) +
+                L", Failed: " + std::to_wstring(failureCount) + L")");
 
-            SS_LOG_INFO(L"QuarantineDB", L"Restore completed. Success: %zu, Failed: %zu", 
-                       successCount, failureCount);
+            SS_LOG_INFO(L"QuarantineDB", L"Restore completed. Success: %zu, Failed: %zu",
+                successCount, failureCount);
 
             return successCount > 0;
         }

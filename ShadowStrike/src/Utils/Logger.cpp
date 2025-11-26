@@ -4,6 +4,7 @@
 #include <ctime>
 #include <io.h>
 #include <chrono>
+#include<shared_mutex>
 
 #ifdef _WIN32
 #  include <Shlwapi.h>
@@ -739,8 +740,6 @@ namespace ShadowStrike {
                 ~RotationGuard() { flag.store(false, std::memory_order_release); }
             } guard{ m_insideRotation };
 
-            // ⚠️ NOTE: m_cfgmutex already locked by caller!
-
             try {
                 if (m_file && m_file != INVALID_HANDLE_VALUE) {
                     ::FlushFileBuffers(m_file);
@@ -749,18 +748,15 @@ namespace ShadowStrike {
                 }
 
                 const std::wstring base = BaseLogPath();
-                size_t maxFileCountCfg = m_cfg.maxFileCount;
+                size_t maxFileCountCfg = m_cfg.maxFileCount;  // ✅ Use m_cfg!
 
                 if (maxFileCountCfg > 1) {
                     std::wstring oldestFile = base + L"." + std::to_wstring(maxFileCountCfg);
 
-                   
                     DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
                     if (attrs != INVALID_FILE_ATTRIBUTES) {
                         ::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL);
-                        if (!::DeleteFileW(oldestFile.c_str())) {
-                            // Delete failed, continue
-                        }
+                        ::DeleteFileW(oldestFile.c_str());
                     }
 
                     for (size_t idx = maxFileCountCfg - 1; idx >= 1; --idx) {
@@ -773,16 +769,14 @@ namespace ShadowStrike {
                             continue;
                         }
 
-                        
                         attrs = ::GetFileAttributesW(dstFile.c_str());
                         if (attrs != INVALID_FILE_ATTRIBUTES) {
                             ::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
                             ::DeleteFileW(dstFile.c_str());
                         }
 
-                        if (!::MoveFileExW(srcFile.c_str(), dstFile.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-							// Move failed, continue
-                        }
+                        ::MoveFileExW(srcFile.c_str(), dstFile.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+
                         if (idx == 1) break;
                     }
 
@@ -794,9 +788,7 @@ namespace ShadowStrike {
                             ::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
                             ::DeleteFileW(firstRotated.c_str());
                         }
-                        if (!::MoveFileExW(base.c_str(), firstRotated.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-							// Move failed, continue
-                        }
+                        ::MoveFileExW(base.c_str(), firstRotated.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
                     }
                 }
                 else {

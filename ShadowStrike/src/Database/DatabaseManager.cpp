@@ -1103,6 +1103,43 @@ namespace ShadowStrike {
             }
         }
 
+        QueryResult DatabaseManager::QueryWithParamsVector(
+            std::string_view sql,
+            const std::vector<std::string>& params,
+            DatabaseError* err
+        ) {
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                setError(err, SQLITE_MISUSE, L"DatabaseManager not initialized");
+                return QueryResult();
+            }
+
+            auto conn = AcquireConnection(err);
+            if (!conn) {
+                return QueryResult();
+            }
+
+            try {
+              
+                auto stmt = std::make_unique<SQLite::Statement>(*conn, std::string(sql));
+
+             
+                for (size_t i = 0; i < params.size(); ++i) {
+                    stmt->bind(static_cast<int>(i + 1), params[i]);
+                }
+
+                m_totalQueries.fetch_add(1, std::memory_order_relaxed);
+
+               
+                return QueryResult(std::move(stmt), conn, this);
+
+            }
+            catch (const SQLite::Exception& ex) {
+                setError(err, ex, L"QueryWithParamsVector");
+                ReleaseConnection(conn);
+                return QueryResult();
+            }
+        } 
+
         std::unique_ptr<Transaction> DatabaseManager::BeginTransaction(
             Transaction::Type type,
             DatabaseError* err
@@ -1114,23 +1151,41 @@ namespace ShadowStrike {
             
             return std::make_unique<Transaction>(*conn,conn,this, type, err);
         }
-
         int64_t DatabaseManager::LastInsertRowId() {
-            auto conn = AcquireConnection();
-            if (!conn) return -1;
-            
-            int64_t id = conn->getLastInsertRowid();
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                return -1;
+            }
+
+            DatabaseError err;
+            auto conn = AcquireConnection(&err);
+            if (!conn) {
+                return -1;
+            }
+
+            int64_t rowid = conn->getLastInsertRowid();
             ReleaseConnection(conn);
-            return id;
+
+            return rowid;
+        }
+        int DatabaseManager::GetChanges() {
+            return GetChangedRowCount();  
         }
 
         int DatabaseManager::GetChangedRowCount() {
-            auto conn = AcquireConnection();
-            if (!conn) return -1;
-            
-            int count = conn->getChanges();
+            if (!m_initialized.load(std::memory_order_acquire)) {
+                return 0;
+            }
+
+            DatabaseError err;
+            auto conn = AcquireConnection(&err);
+            if (!conn) {
+                return 0;
+            }
+
+            int changes = sqlite3_changes(conn->getHandle());
             ReleaseConnection(conn);
-            return count;
+
+            return changes;
         }
 
         bool DatabaseManager::TableExists(std::string_view tableName, DatabaseError* err) {

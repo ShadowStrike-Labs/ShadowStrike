@@ -321,15 +321,18 @@ namespace ShadowStrike {
             QueryResult QueryWithParams(
                 std::string_view sql,
                 DatabaseError* err,
-                Args&&... args
+                Args&&... args 
             );
+
+            QueryResult QueryWithParamsVector(std::string_view sql,
+                const std::vector<std::string>& params,
+                DatabaseError* err = nullptr);
             
-            // Transaction support
             std::unique_ptr<Transaction> BeginTransaction(
                 Transaction::Type type = Transaction::Type::Deferred,
                 DatabaseError* err = nullptr
             );
-            
+
             // Batch operations
             template<typename Func>
             bool BatchInsert(
@@ -343,6 +346,7 @@ namespace ShadowStrike {
             // Utility functions
             int64_t LastInsertRowId();
             int GetChangedRowCount();
+            int GetChanges();
             
             bool TableExists(std::string_view tableName, DatabaseError* err = nullptr);
             bool ColumnExists(std::string_view tableName, std::string_view columnName, DatabaseError* err = nullptr);

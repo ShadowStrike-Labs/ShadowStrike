@@ -1,4 +1,4 @@
-#include "LogDB.hpp"
+﻿#include "LogDB.hpp"
 #include "../Utils/FileUtils.hpp"
 
 #include <algorithm>
@@ -182,25 +182,44 @@ namespace ShadowStrike {
             Shutdown();
         }
 
+       
         bool LogDB::Initialize(const Config& config, DatabaseError* err) {
             if (m_initialized.load(std::memory_order_acquire)) {
                 SS_LOG_WARN(L"LogDB", L"Already initialized");
+
+                {
+                    std::unique_lock<std::shared_mutex> lock(m_configMutex);
+                    m_config = config;
+                }
                 return true;
             }
 
             SS_LOG_INFO(L"LogDB", L"Initializing LogDB...");
 
-            std::unique_lock<std::shared_mutex> lock(m_configMutex);
-            m_config = config;
+            // Use scope to release lock early
+            {
+                std::unique_lock<std::shared_mutex> lock(m_configMutex);
+                m_config = config;
+            }  // Lock released here!
 
-            // Initialize DatabaseManager
+            // FORCE SHUTDOWN FIRST to ensure clean state!
+            if (DatabaseManager::Instance().IsInitialized()) {
+                SS_LOG_INFO(L"LogDB", L"Shutting down existing DatabaseManager instance");
+                DatabaseManager::Instance().Shutdown();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            // Initialize DatabaseManager with OUR config
             DatabaseConfig dbConfig;
-            dbConfig.databasePath = m_config.dbPath;
-            dbConfig.enableWAL = m_config.enableWAL;
-            dbConfig.cacheSizeKB = m_config.dbCacheSizeKB;
-            dbConfig.maxConnections = m_config.maxConnections;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                dbConfig.databasePath = m_config.dbPath;
+                dbConfig.enableWAL = m_config.enableWAL;
+                dbConfig.cacheSizeKB = m_config.dbCacheSizeKB;
+                dbConfig.maxConnections = m_config.maxConnections;
+            }
             dbConfig.minConnections = 2;
-            dbConfig.autoBackup = false;  // We handle rotation manually
+            dbConfig.autoBackup = false;
 
             if (!DatabaseManager::Instance().Initialize(dbConfig, err)) {
                 SS_LOG_ERROR(L"LogDB", L"Failed to initialize DatabaseManager");
@@ -215,7 +234,13 @@ namespace ShadowStrike {
             }
 
             // Start batch write thread if async logging is enabled
-            if (m_config.asyncLogging) {
+            bool asyncEnabled;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                asyncEnabled = m_config.asyncLogging;
+            }
+
+            if (asyncEnabled) {
                 m_shutdownBatch.store(false, std::memory_order_release);
                 m_batchThread = std::thread(&LogDB::batchWriteThread, this);
             }
@@ -226,22 +251,18 @@ namespace ShadowStrike {
             m_initialized.store(true, std::memory_order_release);
 
             SS_LOG_INFO(L"LogDB", L"LogDB initialized successfully");
-            
-            // Log initialization event
-            LogInfo(L"LogDB", L"Database logging system initialized");
+
+          
 
             return true;
         }
-
+        
         void LogDB::Shutdown() {
             if (!m_initialized.load(std::memory_order_acquire)) {
                 return;
             }
 
             SS_LOG_INFO(L"LogDB", L"Shutting down LogDB...");
-
-            // Log shutdown event
-            LogInfo(L"LogDB", L"Database logging system shutting down");
 
             // Flush pending writes
             DatabaseError err;
@@ -258,6 +279,18 @@ namespace ShadowStrike {
             // Shutdown database manager
             DatabaseManager::Instance().Shutdown();
 
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+            // RESET CONFIG TO DEFAULT STATE - DON'T USE Config{}!
+            {
+                std::unique_lock<std::shared_mutex> lock(m_configMutex);
+                m_config.asyncLogging = false;  // ✅ EXPLICITLY SET TO FALSE!
+                m_config.minLogLevel = LogLevel::Info;
+                m_config.enableFullTextSearch = false;
+                // DON'T reset paths - they will be set by Initialize()
+            }
+
             m_initialized.store(false, std::memory_order_release);
 
             SS_LOG_INFO(L"LogDB", L"LogDB shut down");
@@ -268,12 +301,21 @@ namespace ShadowStrike {
         // ============================================================================
 
         int64_t LogDB::Log(LogLevel level,
-                          LogCategory category,
-                          std::wstring_view source,
-                          std::wstring_view message,
-                          DatabaseError* err)
+            LogCategory category,
+            std::wstring_view source,
+            std::wstring_view message,
+            DatabaseError* err)
         {
-            if (level < m_config.minLogLevel) {
+            //Read config with shared lock
+            bool asyncEnabled;
+            LogLevel minLevel;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                minLevel = m_config.minLogLevel;
+                asyncEnabled = m_config.asyncLogging;
+            }
+
+            if (level < minLevel) {
                 return 0;  // Below threshold
             }
 
@@ -288,21 +330,31 @@ namespace ShadowStrike {
             entry.userName = m_userName;
             entry.machineName = m_machineName;
 
-            if (m_config.asyncLogging) {
+            if (asyncEnabled) {
                 enqueuePendingWrite(entry);
                 return -1;  // ID not available yet for async
-            } else {
+            }
+            else {
                 return dbInsertEntry(entry, err);
             }
         }
 
         int64_t LogDB::LogDetailed(const LogEntry& entry, DatabaseError* err) {
-            if (entry.level < m_config.minLogLevel) {
+            // Read config with shared lock
+            bool asyncEnabled;
+            LogLevel minLevel;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                minLevel = m_config.minLogLevel;
+                asyncEnabled = m_config.asyncLogging;
+            }
+
+            if (entry.level < minLevel) {
                 return 0;
             }
 
             LogEntry completeEntry = entry;
-            
+
             // Fill in missing system information
             if (completeEntry.processId == 0) {
                 completeEntry.processId = GetCurrentProcessId();
@@ -317,10 +369,11 @@ namespace ShadowStrike {
                 completeEntry.machineName = m_machineName;
             }
 
-            if (m_config.asyncLogging) {
+            if (asyncEnabled) {
                 enqueuePendingWrite(completeEntry);
                 return -1;
-            } else {
+            }
+            else {
                 return dbInsertEntry(completeEntry, err);
             }
         }
@@ -394,34 +447,70 @@ namespace ShadowStrike {
         bool LogDB::LogBatch(const std::vector<LogEntry>& entries, DatabaseError* err) {
             if (entries.empty()) return true;
 
+            // Read config with shared lock
+            LogLevel minLevel;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                minLevel = m_config.minLogLevel;
+            }
+
+            //BEGIN TRANSACTION
             auto trans = DatabaseManager::Instance().BeginTransaction(
                 Transaction::Type::Immediate, err);
-            
+
             if (!trans || !trans->IsActive()) {
                 return false;
             }
 
+            // USE TRANSACTION'S OWN CONNECTION!
             for (const auto& entry : entries) {
-                if (entry.level < m_config.minLogLevel) {
+                if (entry.level < minLevel) {
                     continue;
                 }
 
-                if (dbInsertEntry(entry, err) < 0) {
+                // PREPARE DATA
+                std::string timestamp = timePointToString(entry.timestamp);
+
+                // USE TRANSACTION'S ExecuteWithParams() METHOD!
+                bool success = trans->ExecuteWithParams(
+                    SQL_INSERT_ENTRY,
+                    err,
+                    timestamp,
+                    static_cast<int>(entry.level),
+                    static_cast<int>(entry.category),
+                    ToUTF8(entry.source),
+                    ToUTF8(entry.message),
+                    ToUTF8(entry.details),
+                    static_cast<int>(entry.processId),
+                    static_cast<int>(entry.threadId),
+                    ToUTF8(entry.userName),
+                    ToUTF8(entry.machineName),
+                    ToUTF8(entry.metadata),
+                    static_cast<int>(entry.errorCode),
+                    ToUTF8(entry.errorContext),
+                    entry.durationMs,
+                    ToUTF8(entry.filePath),
+                    entry.lineNumber,
+                    ToUTF8(entry.functionName)
+                );
+
+                if (!success) {
                     trans->Rollback(err);
                     return false;
                 }
             }
 
+            // COMMIT TRANSACTION
             if (!trans->Commit(err)) {
                 return false;
             }
 
+            // Update statistics
             std::lock_guard<std::mutex> lock(m_statsMutex);
             m_stats.totalWrites += entries.size();
 
             return true;
         }
-
         // ============================================================================
         // Query Operations
         // ============================================================================
@@ -502,27 +591,34 @@ namespace ShadowStrike {
         }
 
         std::vector<LogDB::LogEntry> LogDB::SearchText(std::wstring_view searchText,
-                                                       bool useFullText,
-                                                       size_t maxCount,
-                                                       DatabaseError* err)
+            bool useFullText,
+            size_t maxCount,
+            DatabaseError* err)
         {
             QueryFilter filter;
+
             
-            if (useFullText && m_config.enableFullTextSearch) {
+            bool enableFTS;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                enableFTS = m_config.enableFullTextSearch;
+            }
+
+            if (useFullText && enableFTS) {
                 filter.fullTextSearch = searchText;
-            } else {
+            }
+            else {
                 std::wstring pattern = L"%";
                 pattern += searchText;
                 pattern += L"%";
                 filter.messagePattern = pattern;
             }
-            
+
             filter.maxResults = maxCount;
             filter.sortDescending = true;
 
             return Query(filter, err);
         }
-
         int64_t LogDB::CountEntries(const QueryFilter* filter, DatabaseError* err) {
             std::vector<std::string> params;
             std::string sql;
@@ -551,11 +647,25 @@ namespace ShadowStrike {
                 SQL_DELETE_ENTRY, err, id);
 
             if (success) {
-                std::lock_guard<std::mutex> lock(m_statsMutex);
-                m_stats.totalDeletes++;
+                
+                int affectedRows = DatabaseManager::Instance().GetChanges();
+
+                if (affectedRows > 0) {
+                    std::lock_guard<std::mutex> lock(m_statsMutex);
+                    m_stats.totalDeletes++;
+                    return true;
+                }
+                else {
+                   
+                    if (err) {
+                        err->sqliteCode = SQLITE_OK;
+                        err->message = L"No entry found with given ID";
+                    }
+                    return false;
+                }
             }
 
-            return success;
+            return false;
         }
 
         bool LogDB::DeleteBefore(std::chrono::system_clock::time_point timestamp,
@@ -616,7 +726,14 @@ namespace ShadowStrike {
         }
 
         bool LogDB::CheckAndRotate(DatabaseError* err) {
-            if (!m_config.enableRotation) {
+
+            bool enableRotation;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                enableRotation = m_config.enableRotation;
+            }
+
+            if (!enableRotation) {
                 return true;
             }
 
@@ -628,7 +745,14 @@ namespace ShadowStrike {
         }
 
         bool LogDB::Flush(DatabaseError* err) {
-            if (!m_config.asyncLogging) {
+            
+            bool asyncLogging;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                asyncLogging = m_config.asyncLogging;
+            }
+
+            if (!asyncLogging) {
                 return true;
             }
 
@@ -877,13 +1001,21 @@ namespace ShadowStrike {
             std::vector<std::wstring> issues;
             return DatabaseManager::Instance().CheckIntegrity(issues, err);
         }
-
         bool LogDB::Optimize(DatabaseError* err) {
             SS_LOG_INFO(L"LogDB", L"Optimizing database...");
-            
+
+          
+            bool enableRotation;
+            std::chrono::hours maxLogAge;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                enableRotation = m_config.enableRotation;
+                maxLogAge = m_config.maxLogAge;
+            }
+
             // Delete old entries if configured
-            if (m_config.enableRotation) {
-                auto cutoffTime = std::chrono::system_clock::now() - m_config.maxLogAge;
+            if (enableRotation) {
+                auto cutoffTime = std::chrono::system_clock::now() - maxLogAge;
                 DeleteBefore(cutoffTime, err);
             }
 
@@ -920,14 +1052,26 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // Create full-text search if enabled
-            if (m_config.enableFullTextSearch) {
-                if (!DatabaseManager::Instance().Execute(SQL_CREATE_FTS_TABLE, err)) {
+            //read config with lock
+            bool enableFTS;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                enableFTS = m_config.enableFullTextSearch;
+            }
+
+            //  FIX: Create full-text search ONLY if enabled AND successful!
+            if (enableFTS) {
+                bool ftsSuccess = DatabaseManager::Instance().Execute(SQL_CREATE_FTS_TABLE, err);
+
+                if (!ftsSuccess) {
                     SS_LOG_WARN(L"LogDB", L"Failed to create FTS table, continuing without it");
+                    //  DON'T CREATE TRIGGERS IF TABLE FAILED!
                 }
-                
-                if (!DatabaseManager::Instance().Execute(SQL_CREATE_FTS_TRIGGERS, err)) {
-                    SS_LOG_WARN(L"LogDB", L"Failed to create FTS triggers");
+                else {
+                    // ONLY CREATE TRIGGERS IF TABLE EXISTS!
+                    if (!DatabaseManager::Instance().Execute(SQL_CREATE_FTS_TRIGGERS, err)) {
+                        SS_LOG_WARN(L"LogDB", L"Failed to create FTS triggers");
+                    }
                 }
             }
 
@@ -945,6 +1089,7 @@ namespace ShadowStrike {
 
             std::string timestamp = timePointToString(entry.timestamp);
 
+            
             bool success = DatabaseManager::Instance().ExecuteWithParams(
                 SQL_INSERT_ENTRY,
                 err,
@@ -968,12 +1113,14 @@ namespace ShadowStrike {
             );
 
             if (success) {
+               
                 int64_t id = DatabaseManager::Instance().LastInsertRowId();
-                
+
                 auto endTime = std::chrono::steady_clock::now();
                 auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-                updateStatistics(entry);
+                
+                this->updateStatistics(entry);
 
                 std::lock_guard<std::mutex> lock(m_statsMutex);
                 m_stats.totalWrites++;
@@ -986,7 +1133,6 @@ namespace ShadowStrike {
 
             return -1;
         }
-
         std::optional<LogDB::LogEntry> LogDB::dbSelectEntry(int64_t id, DatabaseError* err) {
             auto result = DatabaseManager::Instance().QueryWithParams(
                 SQL_SELECT_ENTRY, err, id);
@@ -1002,14 +1148,22 @@ namespace ShadowStrike {
         }
 
         std::vector<LogDB::LogEntry> LogDB::dbSelectEntries(std::string_view sql,
-                                                            const std::vector<std::string>& params,
-                                                            DatabaseError* err)
+            const std::vector<std::string>& params,
+            DatabaseError* err)
         {
             std::vector<LogEntry> entries;
 
-            // This is simplified - in reality you'd need a variadic approach
-            // or build a prepared statement dynamically
-            auto result = DatabaseManager::Instance().Query(sql, err);
+            QueryResult result;
+
+            if (params.empty()) {
+                result = DatabaseManager::Instance().Query(sql, err);
+            }
+            else {
+              
+                result = DatabaseManager::Instance().QueryWithParamsVector(sql,params,err);
+
+              
+            }
 
             while (result.Next()) {
                 entries.push_back(rowToLogEntry(result));
@@ -1024,6 +1178,12 @@ namespace ShadowStrike {
         std::string LogDB::buildQuerySQL(const QueryFilter& filter, std::vector<std::string>& outParams) {
             std::ostringstream sql;
             sql << "SELECT * FROM log_entries WHERE 1=1";
+
+            bool enableFTS;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                enableFTS = m_config.enableFullTextSearch;
+            }
 
             if (filter.minLevel) {
                 sql << " AND level >= ?";
@@ -1076,7 +1236,7 @@ namespace ShadowStrike {
             }
 
             // Full-text search
-            if (filter.fullTextSearch && m_config.enableFullTextSearch) {
+            if (filter.fullTextSearch && enableFTS) {
                 sql << " AND id IN (SELECT rowid FROM log_fts WHERE log_fts MATCH ?)";
                 outParams.push_back(ToUTF8(*filter.fullTextSearch));
             }
@@ -1158,10 +1318,19 @@ namespace ShadowStrike {
             while (!m_shutdownBatch.load(std::memory_order_acquire)) {
                 std::unique_lock<std::mutex> lock(m_batchMutex);
 
-                m_batchCV.wait_for(lock, m_config.batchFlushInterval, [this]() {
+               
+                std::chrono::milliseconds flushInterval;
+                size_t batchSize;
+                {
+                    std::shared_lock<std::shared_mutex> configLock(m_configMutex);
+                    flushInterval = m_config.batchFlushInterval;
+                    batchSize = m_config.batchSize;
+                }
+
+                m_batchCV.wait_for(lock, flushInterval, [this, batchSize]() {
                     return m_shutdownBatch.load(std::memory_order_acquire) ||
-                           m_pendingWrites.size() >= m_config.batchSize;
-                });
+                        m_pendingWrites.size() >= batchSize;
+                    });
 
                 if (m_shutdownBatch.load(std::memory_order_acquire)) {
                     break;
@@ -1189,7 +1358,13 @@ namespace ShadowStrike {
 
             m_pendingWrites.push_back(std::move(pending));
 
-            if (m_pendingWrites.size() >= m_config.batchSize) {
+            size_t batchSize;
+            {
+                std::shared_lock<std::shared_mutex> configLock(m_configMutex);
+                batchSize = m_config.batchSize;
+            }
+
+            if (m_pendingWrites.size() >= batchSize) {
                 m_batchCV.notify_one();
             }
         }
@@ -1212,11 +1387,20 @@ namespace ShadowStrike {
         }
 
         bool LogDB::shouldRotate(DatabaseError* err) {
+            // READ CONFIG WITH LOCK FIRST!
+            size_t maxLogSizeMB;
+            std::chrono::hours maxLogAge;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                maxLogSizeMB = m_config.maxLogSizeMB;
+                maxLogAge = m_config.maxLogAge;
+            }
+
             auto stats = DatabaseManager::Instance().GetStats(err);
-            
+
             size_t currentSizeMB = stats.totalSize / (1024 * 1024);
-            
-            if (currentSizeMB >= m_config.maxLogSizeMB) {
+
+            if (currentSizeMB >= maxLogSizeMB) {  
                 return true;
             }
 
@@ -1226,8 +1410,8 @@ namespace ShadowStrike {
                 std::string oldestStr = result.GetString(0);
                 auto oldest = stringToTimePoint(oldestStr);
                 auto age = std::chrono::system_clock::now() - oldest;
-                
-                if (age >= m_config.maxLogAge) {
+
+                if (age >= maxLogAge) {  
                     return true;
                 }
             }
@@ -1236,11 +1420,19 @@ namespace ShadowStrike {
         }
 
         bool LogDB::performRotation(DatabaseError* err) {
+           
+            std::chrono::hours maxLogAge;
+            std::wstring archivePath;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                maxLogAge = m_config.maxLogAge;
+                archivePath = m_config.archivePath;
+            }
+
             // Create archive
             auto now = std::chrono::system_clock::now();
-            auto cutoffTime = now - m_config.maxLogAge;
+            auto cutoffTime = now - maxLogAge;  
 
-            std::wstring archivePath = m_config.archivePath;
             if (!archivePath.empty() && archivePath.back() != L'\\') {
                 archivePath += L'\\';
             }
@@ -1249,10 +1441,10 @@ namespace ShadowStrike {
             auto time_t_now = std::chrono::system_clock::to_time_t(now);
             std::tm tmBuf;
             localtime_s(&tmBuf, &time_t_now);
-            
+
             wchar_t timeStr[64];
             std::wcsftime(timeStr, 64, L"%Y%m%d_%H%M%S", &tmBuf);
-            
+
             archivePath += L"logs_archive_";
             archivePath += timeStr;
             archivePath += L".db";
@@ -1304,32 +1496,41 @@ namespace ShadowStrike {
         }
 
         void LogDB::cleanupOldArchives() {
+            // READ CONFIG WITH LOCK FIRST!
+            std::wstring archivePath;
+            size_t maxArchivedLogs;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_configMutex);
+                archivePath = m_config.archivePath;
+                maxArchivedLogs = m_config.maxArchivedLogs;
+            }
+
             // Find and delete archives exceeding maxArchivedLogs
-            std::filesystem::path archiveDir(m_config.archivePath);
-            
+            std::filesystem::path archiveDir(archivePath);  // ✅ Use local var!
+
             if (!std::filesystem::exists(archiveDir)) {
                 return;
             }
 
             std::vector<std::filesystem::path> archives;
-            
+
             for (const auto& entry : std::filesystem::directory_iterator(archiveDir)) {
                 if (entry.is_regular_file() && entry.path().extension() == L".db") {
                     archives.push_back(entry.path());
                 }
             }
 
-            if (archives.size() <= m_config.maxArchivedLogs) {
+            if (archives.size() <= maxArchivedLogs) {  // ✅ Use local var!
                 return;
             }
 
             // Sort by modification time
             std::sort(archives.begin(), archives.end(), [](const auto& a, const auto& b) {
                 return std::filesystem::last_write_time(a) < std::filesystem::last_write_time(b);
-            });
+                });
 
             // Delete oldest
-            size_t toDelete = archives.size() - m_config.maxArchivedLogs;
+            size_t toDelete = archives.size() - maxArchivedLogs;  // ✅ Use local var!
             for (size_t i = 0; i < toDelete; ++i) {
                 std::error_code ec;
                 std::filesystem::remove(archives[i], ec);

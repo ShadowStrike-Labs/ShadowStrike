@@ -218,6 +218,7 @@ namespace ShadowStrike {
                         std::wstring_view changedBy = L"System",
                         DatabaseError* err = nullptr);
 
+
             // Get configuration value
             std::optional<ConfigValue> Get(std::wstring_view key,
                                           DatabaseError* err = nullptr) const;
@@ -327,6 +328,8 @@ namespace ShadowStrike {
 
             // Remove validation rule
             void RemoveValidationRule(std::wstring_view key);
+
+            void SetEnforceValidation(bool enabled);
 
             // Validate a value against registered rules
             bool Validate(std::wstring_view key,
