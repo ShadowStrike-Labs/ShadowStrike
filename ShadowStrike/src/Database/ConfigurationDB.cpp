@@ -883,7 +883,7 @@ namespace ShadowStrike {
         ) {
             auto& dbMgr = DatabaseManager::Instance();
 
-            // FIX: Read config flags with lock BEFORE transaction!
+            // Read config flags BEFORE transaction
             bool enableVersioning, enableAuditLog;
             {
                 std::shared_lock lock(m_configMutex);
@@ -891,26 +891,39 @@ namespace ShadowStrike {
                 enableAuditLog = m_config.enableAuditLog;
             }
 
-            // START TRANSACTION!
+            auto utf8Key = wstringToUtf8(entry.key);
+
+            // ✅ FIX: READ OLD VERSION **BEFORE** STARTING TRANSACTION!
+            const char* checkSql = "SELECT created_at, version, value, type, scope FROM configurations WHERE key = ?";
+            auto existingResult = dbMgr.QueryWithParams(checkSql, nullptr, utf8Key);
+
+            int64_t finalCreatedMs;
+            std::optional<int> oldVersion;
+            std::optional<std::vector<uint8_t>> oldValueBlob;
+            std::optional<ValueType> oldType;
+            std::optional<ConfigScope> oldScope;
+            bool keyExists = false;
+
+            if (existingResult.Next()) {
+                // Key exists — preserve created_at and save old version for history
+                keyExists = true;
+                finalCreatedMs = existingResult.GetInt64(0);
+                oldVersion = existingResult.GetInt(1);
+                oldValueBlob = existingResult.GetBlob(2);
+                oldType = static_cast<ValueType>(existingResult.GetInt(3));
+                oldScope = static_cast<ConfigScope>(existingResult.GetInt(4));
+            }
+            else {
+                // New key
+                finalCreatedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    entry.createdAt.time_since_epoch()).count();
+            }
+
+            // NOW START TRANSACTION
             auto trans = dbMgr.BeginTransaction(Transaction::Type::Immediate, err);
             if (!trans || !trans->IsActive()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to start transaction for key: %ls", entry.key.c_str());
                 return false;
-            }
-
-            // CHECK IF KEY EXISTS TO PRESERVE created_at!
-            auto utf8Key = wstringToUtf8(entry.key);
-
-            const char* checkSql = "SELECT created_at FROM configurations WHERE key = ?";
-            auto existingResult = dbMgr.QueryWithParams(checkSql, nullptr, utf8Key);
-
-            int64_t finalCreatedMs;
-            if (existingResult.Next()) {
-                finalCreatedMs = existingResult.GetInt64(0);
-            }
-            else {
-                finalCreatedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    entry.createdAt.time_since_epoch()).count();
             }
 
             // Convert value to BLOB
@@ -920,36 +933,75 @@ namespace ShadowStrike {
             auto utf8Desc = wstringToUtf8(entry.description);
             auto utf8ModifiedBy = wstringToUtf8(entry.modifiedBy);
 
-            // MAIN INSERT
-            const char* sql = R"SQL(
-        INSERT OR REPLACE INTO configurations 
-        (key, value, type, scope, is_encrypted, is_readonly, description, 
-         created_at, modified_at, modified_by, version)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )SQL";
+            // ✅ CRITICAL FIX: Use UPDATE for existing keys, INSERT for new keys
+            // This prevents foreign key constraint violation when inserting history
+            const char* sql = nullptr;
+            if (keyExists) {
+                // UPDATE existing key - preserves foreign key relationship
+                sql = R"SQL(
+            UPDATE configurations 
+            SET value = ?, 
+                type = ?, 
+                scope = ?, 
+                is_encrypted = ?, 
+                is_readonly = ?, 
+                description = ?, 
+                modified_at = ?, 
+                modified_by = ?, 
+                version = ?
+            WHERE key = ?
+        )SQL";
 
-            if (!trans->ExecuteWithParams(
-                sql, err,
-                utf8Key,
-                valueBlob,
-                static_cast<int>(entry.type),
-                static_cast<int>(entry.scope),
-                entry.isEncrypted ? 1 : 0,
-                entry.isReadOnly ? 1 : 0,
-                utf8Desc,
-                finalCreatedMs,
-                modifiedMs,
-                utf8ModifiedBy,
-                entry.version
-            )) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to write configuration to database: %ls", entry.key.c_str());
-                trans->Rollback(nullptr);
-                return false;
+                if (!trans->ExecuteWithParams(
+                    sql, err,
+                    valueBlob,
+                    static_cast<int>(entry.type),
+                    static_cast<int>(entry.scope),
+                    entry.isEncrypted ? 1 : 0,
+                    entry.isReadOnly ? 1 : 0,
+                    utf8Desc,
+                    modifiedMs,
+                    utf8ModifiedBy,
+                    entry.version,
+                    utf8Key  // WHERE clause
+                )) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to update configuration: %ls", entry.key.c_str());
+                    trans->Rollback(nullptr);
+                    return false;
+                }
+            }
+            else {
+                // INSERT new key
+                sql = R"SQL(
+            INSERT INTO configurations 
+            (key, value, type, scope, is_encrypted, is_readonly, description, 
+             created_at, modified_at, modified_by, version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )SQL";
+
+                if (!trans->ExecuteWithParams(
+                    sql, err,
+                    utf8Key,
+                    valueBlob,
+                    static_cast<int>(entry.type),
+                    static_cast<int>(entry.scope),
+                    entry.isEncrypted ? 1 : 0,
+                    entry.isReadOnly ? 1 : 0,
+                    utf8Desc,
+                    finalCreatedMs,
+                    modifiedMs,
+                    utf8ModifiedBy,
+                    entry.version
+                )) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to insert configuration: %ls", entry.key.c_str());
+                    trans->Rollback(nullptr);
+                    return false;
+                }
             }
 
-            // HISTORY INSERT (using local variable!)
-            if (enableVersioning) {
-                auto versionTimestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            // ✅ HISTORY INSERT - Now works correctly because UPDATE preserves foreign key
+            if (enableVersioning && oldVersion.has_value() && oldValueBlob.has_value()) {
+                auto historyTimestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
 
                 const char* historySql = R"SQL(
@@ -961,17 +1013,19 @@ namespace ShadowStrike {
                 if (!trans->ExecuteWithParams(
                     historySql, err,
                     utf8Key,
-                    valueBlob,
-                    static_cast<int>(entry.type),
-                    static_cast<int>(entry.scope),
-                    entry.version,
-                    versionTimestampMs
+                    *oldValueBlob,
+                    static_cast<int>(*oldType),
+                    static_cast<int>(*oldScope),
+                    *oldVersion,
+                    historyTimestampMs
                 )) {
-                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to write history for key: %ls (continuing)", entry.key.c_str());
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to write history for key: %ls - ROLLING BACK!", entry.key.c_str());
+                    trans->Rollback(nullptr);
+                    return false;  // ✅ Changed from WARN to ERROR - fail transaction if history fails
                 }
             }
 
-            // CHANGE RECORD (using local variable!)
+            // CHANGE RECORD
             if (enableAuditLog) {
                 auto timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -983,23 +1037,25 @@ namespace ShadowStrike {
                 const char* changeSql = R"SQL(
             INSERT INTO configuration_changes 
             (key, action, old_value, new_value, changed_by, timestamp, reason)
-            VALUES (?, ?, NULL, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         )SQL";
 
                 if (!trans->ExecuteWithParams(
                     changeSql, err,
                     utf8Key,
-                    static_cast<int>(ChangeAction::Modified),
+                    static_cast<int>(oldVersion.has_value() ? ChangeAction::Modified : ChangeAction::Created),
+                    oldValueBlob.has_value() ? *oldValueBlob : std::vector<uint8_t>{},
                     newValueBlob,
                     utf8ChangedBy,
                     timestampMs,
                     utf8Reason
                 )) {
                     SS_LOG_WARN(LOG_CATEGORY, L"Failed to write change record for key: %ls", entry.key.c_str());
+                    // Don't fail transaction for audit log errors
                 }
             }
 
-            // COMMIT!
+            // COMMIT
             if (!trans->Commit(err)) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to commit transaction for key: %ls", entry.key.c_str());
                 return false;

@@ -1,5 +1,7 @@
 ﻿
 #include "CertUtils.hpp"
+#include<algorithm>
+#include<cwchar>
 
 using namespace ShadowStrike::Utils::CertUtils;
 
@@ -176,6 +178,168 @@ bool Certificate::LoadFromMemory(const uint8_t* data, size_t len, Error* err) no
     return false;
 #endif
 }
+// ========================
+// Load from Windows Certificate Store (by thumbprint)
+// ========================
+bool Certificate::LoadFromStore(std::wstring_view storeName, std::wstring_view thumbprint, Error* err) noexcept {
+#ifdef _WIN32
+    cleanup();
+
+    if (storeName.empty() || thumbprint.empty()) {
+        set_err(err, L"LoadFromStore: invalid parameters", ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    // Open system certificate store
+    HCERTSTORE hStore = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W,
+        0,
+        NULL,
+        CERT_SYSTEM_STORE_CURRENT_USER,
+        storeName.data()
+    );
+
+    if (!hStore) {
+        // Fallback: try Local Machine store
+        hStore = CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W,
+            0,
+            NULL,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            storeName.data()
+        );
+
+        if (!hStore) {
+            set_err(err, L"LoadFromStore: CertOpenStore failed", GetLastError());
+            return false;
+        }
+    }
+
+    // Convert thumbprint hex string to binary
+    std::wstring thumbHex(thumbprint);
+    // Remove spaces and colons (common in thumbprint displays)
+    thumbHex.erase(std::remove_if(thumbHex.begin(), thumbHex.end(),
+        [](wchar_t c) { return c == L' ' || c == L':' || c == L'-'; }), thumbHex.end());
+
+    if (thumbHex.length() % 2 != 0 || thumbHex.empty()) {
+        set_err(err, L"LoadFromStore: invalid thumbprint format", ERROR_INVALID_PARAMETER);
+        CertCloseStore(hStore, 0);
+        return false;
+    }
+
+    std::vector<BYTE> thumbBytes(thumbHex.length() / 2);
+    for (size_t i = 0; i < thumbBytes.size(); ++i) {
+        wchar_t hexByte[3] = { thumbHex[i * 2], thumbHex[i * 2 + 1], L'\0' };
+        thumbBytes[i] = static_cast<BYTE>(wcstoul(hexByte, nullptr, 16));
+    }
+
+    // Find certificate by SHA-1 thumbprint
+    CRYPT_HASH_BLOB hashBlob{};
+    hashBlob.cbData = static_cast<DWORD>(thumbBytes.size());
+    hashBlob.pbData = thumbBytes.data();
+
+    PCCERT_CONTEXT ctx = CertFindCertificateInStore(
+        hStore,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        0,
+        CERT_FIND_HASH,
+        &hashBlob,
+        nullptr
+    );
+
+    if (!ctx) {
+        set_err(err, L"LoadFromStore: certificate not found", GetLastError());
+        CertCloseStore(hStore, 0);
+        return false;
+    }
+
+    // Duplicate to own context
+    m_certContext = CertDuplicateCertificateContext(ctx);
+    CertFreeCertificateContext(ctx);
+    CertCloseStore(hStore, 0);
+
+    if (!m_certContext) {
+        set_err(err, L"LoadFromStore: CertDuplicateCertificateContext failed", GetLastError());
+        return false;
+    }
+
+    return true;
+#else
+    (void)storeName; (void)thumbprint; (void)err;
+    return false;
+#endif
+}
+
+// ========================
+// Load from PEM string (convenience wrapper)
+// ========================
+bool Certificate::LoadFromPEM(std::string_view pem, Error* err) noexcept {
+#ifdef _WIN32
+    cleanup();
+
+    if (pem.empty()) {
+        set_err(err, L"LoadFromPEM: empty PEM string", ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    // Verify PEM header/footer presence
+    if (pem.find("-----BEGIN CERTIFICATE-----") == std::string_view::npos ||
+        pem.find("-----END CERTIFICATE-----") == std::string_view::npos) {
+        set_err(err, L"LoadFromPEM: invalid PEM format (missing markers)", ERROR_INVALID_DATA);
+        return false;
+    }
+
+    // Decode PEM → DER using CryptStringToBinaryA
+    DWORD derSize = 0;
+    if (!CryptStringToBinaryA(
+        pem.data(),
+        static_cast<DWORD>(pem.length()),
+        CRYPT_STRING_BASE64HEADER,
+        nullptr,
+        &derSize,
+        nullptr,
+        nullptr)) {
+        set_err(err, L"LoadFromPEM: CryptStringToBinaryA size query failed", GetLastError());
+        return false;
+    }
+
+    if (derSize == 0) {
+        set_err(err, L"LoadFromPEM: decoded size is zero", ERROR_INVALID_DATA);
+        return false;
+    }
+
+    std::vector<uint8_t> der(derSize);
+    if (!CryptStringToBinaryA(
+        pem.data(),
+        static_cast<DWORD>(pem.length()),
+        CRYPT_STRING_BASE64HEADER,
+        der.data(),
+        &derSize,
+        nullptr,
+        nullptr)) {
+        set_err(err, L"LoadFromPEM: CryptStringToBinaryA decode failed", GetLastError());
+        return false;
+    }
+
+    // Create certificate context from DER
+    m_certContext = CertCreateCertificateContext(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        der.data(),
+        derSize
+    );
+
+    if (!m_certContext) {
+        set_err(err, L"LoadFromPEM: CertCreateCertificateContext failed", GetLastError());
+        return false;
+    }
+
+    return true;
+#else
+    (void)pem; (void)err;
+    return false;
+#endif
+}
+
 
 // ========================
 // Export (DER) and GetRawDER alias

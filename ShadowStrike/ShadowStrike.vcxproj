@@ -106,7 +106,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\projects\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\projects\vcpkg\vcpkg\packages\yara_x64-windows\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -140,6 +140,8 @@
     <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Statement.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp" />
+    <ClCompile Include="src\Cache\MemoryCache.cpp" />
+    <ClCompile Include="src\Cache\PersistentCache.cpp" />
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\Database\LogDB.cpp" />
@@ -173,6 +175,8 @@
     <ClCompile Include="src\Utils\ThreadPool.cpp" />
     <ClCompile Include="src\Utils\Timer.cpp" />
     <ClCompile Include="src\Utils\XMLUtils.cpp" />
+    <ClCompile Include="src\Whitelist\WhiteListFormat.cpp" />
+    <ClCompile Include="src\Whitelist\WhiteListStore.cpp" />
     <ClCompile Include="tests\unit\Database\configuration_db_tests.cpp" />
     <ClCompile Include="tests\unit\Database\database_manager_tests.cpp" />
     <ClCompile Include="tests\unit\Database\Log_db_tests.cpp" />
@@ -208,6 +212,8 @@
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Utils.h" />
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\VariadicBind.h" />
     <ClInclude Include="external\SQLiteCpp\sqlite3\sqlite3.h" />
+    <ClInclude Include="src\Cache\MemoryCache.hpp" />
+    <ClInclude Include="src\Cache\PersistentCache.hpp" />
     <ClInclude Include="src\Database\ConfigurationDB.hpp" />
     <ClInclude Include="src\Database\DatabaseManager.hpp" />
     <ClInclude Include="src\Database\LogDB.hpp" />
@@ -241,9 +247,12 @@
     <ClInclude Include="src\Utils\ThreadPoolEvents.h" />
     <ClInclude Include="src\Utils\Timer.hpp" />
     <ClInclude Include="src\Utils\XMLUtils.hpp" />
+    <ClInclude Include="src\Whitelist\WhiteListFormat.hpp" />
+    <ClInclude Include="src\Whitelist\WhiteListStore.hpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.github\copilot-instructions.md" />
+    <None Include="src\SignatureStore\ARCHITECTURE.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
