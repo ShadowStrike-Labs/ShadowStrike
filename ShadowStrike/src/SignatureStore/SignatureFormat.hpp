@@ -364,10 +364,24 @@ struct MemoryMappedView {
     
     template<typename T>
     [[nodiscard]] T* GetAtMutable(uint64_t offset) noexcept {
-        if (readOnly || offset + sizeof(T) > fileSize) return nullptr;
+       
+        if (readOnly) {
+            
+            return nullptr;
+        }
+
+        if (offset >= fileSize) {
+            return nullptr;
+        }
+
+        if (offset + sizeof(T) > fileSize) {
+            return nullptr;
+        }
+
+        
         return reinterpret_cast<T*>(
             static_cast<uint8_t*>(baseAddress) + offset
-        );
+            );
     }
     
     [[nodiscard]] std::span<const uint8_t> GetSpan(uint64_t offset, size_t length) const noexcept {
@@ -467,7 +481,7 @@ namespace Format {
 }
 
 // Convert hash type to string
-[[nodiscard]] const char* HashTypeToString(HashType type) noexcept;
+ const char* HashTypeToString(HashType type) noexcept;
 
 // Parse hash string to HashValue
 [[nodiscard]] std::optional<HashValue> ParseHashString(

@@ -20,11 +20,13 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
 #include"../Utils/JSONUtils.hpp"
+#include"../Utils/StringUtils.hpp"
 #include<fuzzy.h>
 #include<tlsh.h>
 #include<format>
 #include <algorithm>
 #include <cmath>
+#include<atomic>
 #include <bit>
 #include<map>
 #include <sstream>
@@ -34,39 +36,47 @@
 // Windows Crypto API for hash computation
 #include <wincrypt.h>
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib,"tlsh.lib")
 #pragma comment(lib, "crypt32.lib")
 
 namespace ShadowStrike {
     namespace SignatureStore {
 
-        // ============================================================================
-        // BLOOM FILTER IMPLEMENTATION
-        // ============================================================================
+       
+#include <vector>
+#include <atomic>
+#include <cstdint>
+#include <cmath>
+#include <algorithm>
+#include <cstring>
+
+// ====================================================
+// BloomFilter - Thread-safe, high-performance
+// ====================================================
 
         BloomFilter::BloomFilter(size_t expectedElements, double falsePositiveRate) {
-            // Calculate optimal bit array size
-            // m = -n * ln(p) / (ln(2)^2)
-            double ln2 = std::log(2.0);
+            const double ln2 = std::log(2.0);
+
             m_size = static_cast<size_t>(
                 -static_cast<double>(expectedElements) * std::log(falsePositiveRate) / (ln2 * ln2)
                 );
 
-            // Calculate optimal number of hash functions
-            // k = (m/n) * ln(2)
             m_numHashes = static_cast<size_t>(
                 (static_cast<double>(m_size) / expectedElements) * ln2
                 );
 
-            // Clamp to reasonable values
             if (m_numHashes < 1) m_numHashes = 1;
-            if (m_numHashes > 10) m_numHashes = 10; // Diminishing returns after 10
+            if (m_numHashes > 10) m_numHashes = 10;
 
-            // Allocate bit array (using atomic uint64_t for thread-safety)
-            size_t uint64Count = (m_size + 63) / 64;
-            m_bits.resize(uint64Count);
-            for (auto& b : m_bits) {
-                b.store(0, std::memory_order_relaxed);
+            // 64-bit slot sayısı
+            const size_t uint64Count = (m_size + 63) / 64;
+
+            // Atomikler için taze bir vektör kur ve swap et (reallocation/move/copy yok)
+            std::vector<std::atomic<uint64_t>> fresh(uint64Count);
+            m_bits.swap(fresh);
+
+            // Her elemanı atomik olarak sıfırla
+            for (auto& w : m_bits) {
+                w.store(0ULL, std::memory_order_relaxed);
             }
 
             SS_LOG_INFO(L"BloomFilter",
@@ -74,15 +84,18 @@ namespace ShadowStrike {
                 m_size, m_numHashes, expectedElements, falsePositiveRate);
         }
 
+
         void BloomFilter::Add(uint64_t hash) noexcept {
             for (size_t i = 0; i < m_numHashes; ++i) {
                 uint64_t bitIndex = Hash(hash, i) % m_size;
                 size_t arrayIndex = bitIndex / 64;
                 size_t bitOffset = bitIndex % 64;
 
-                // Atomic OR to set bit
                 uint64_t mask = 1ULL << bitOffset;
+
+                // ✅ atomic_ref ile thread-safe set
                 m_bits[arrayIndex].fetch_or(mask, std::memory_order_relaxed);
+
             }
         }
 
@@ -92,31 +105,29 @@ namespace ShadowStrike {
                 size_t arrayIndex = bitIndex / 64;
                 size_t bitOffset = bitIndex % 64;
 
-                uint64_t bits = m_bits[arrayIndex].load(std::memory_order_relaxed);
-                if ((bits & (1ULL << bitOffset)) == 0) {
-                    return false; // Definitely not present
+                // ✅ atomic_ref ile thread-safe load
+                uint64_t word = std::atomic_ref<const uint64_t>(m_bits[arrayIndex]).load(std::memory_order_relaxed);
+                if ((word & (1ULL << bitOffset)) == 0) {
+                    return false;
                 }
             }
-
-            return true; // Might be present (or false positive)
+            return true;
         }
 
         void BloomFilter::Clear() noexcept {
-            for (auto& b : m_bits) {
-                b.store(0, std::memory_order_relaxed);
+            for (auto& w : m_bits) {
+                w.store(0ULL, std::memory_order_relaxed);
             }
         }
 
         double BloomFilter::EstimatedFillRate() const noexcept {
             size_t setBits = 0;
-            for (const auto& b : m_bits) {
-                uint64_t bits = b.load(std::memory_order_relaxed);
-                setBits += std::popcount(bits); // C++20 popcount
+            for (const auto& w : m_bits) {
+                uint64_t word = std::atomic_ref<const uint64_t>(w).load(std::memory_order_relaxed);
+                setBits += std::popcount(word);
             }
-
-            return static_cast<double>(setBits) / static_cast<double>(m_size);
+            return (m_size == 0) ? 0.0 : static_cast<double>(setBits) / static_cast<double>(m_size);
         }
-
         uint64_t BloomFilter::Hash(uint64_t value, size_t seed) const noexcept {
             // FNV-1a hash with seed
             uint64_t hash = 14695981039346656037ULL + seed;
@@ -129,7 +140,9 @@ namespace ShadowStrike {
 
             return hash;
         }
-        
+
+
+
         // ============================================================================
         // HASH BUCKET IMPLEMENTATION
         // ============================================================================
@@ -733,7 +746,9 @@ namespace ShadowStrike {
                     // Extract blocksize from query hash
                     const char* colonPtr = std::strchr(hashString, ':');
                     if (colonPtr) {
-                        std::string blockSizeStr(hashString, colonPtr);
+                        std::string blockSizeStr = ShadowStrike::Utils::StringUtils::ToNarrow(
+                            std::wstring(hashString, colonPtr)
+                        );
                         uint32_t queryBlockSize = std::stoi(blockSizeStr);
 
                         SS_LOG_DEBUG(L"HashStore",
@@ -957,10 +972,9 @@ namespace ShadowStrike {
                         L" [Fuzzy Match: {}% similarity]",
                         similarityScore
                     );
-                    result.description += std::string(
-                        similarityInfo.begin(),
-                        similarityInfo.end()
-                    );
+                   
+                    result.description += ShadowStrike::Utils::StringUtils::ToNarrow(similarityInfo);
+                   
 
                     results.push_back(std::move(result));
                     matchesFound++;
@@ -2917,8 +2931,7 @@ namespace ShadowStrike {
             for (auto& [type, bucket] : m_buckets) {
                 if (!bucket) continue;
 
-                StoreError flushErr = bucket->m_index->Flush();
-                if (!flushErr.IsSuccess()) {
+                if (auto flushErr = bucket->m_index->Flush(); !flushErr.IsSuccess()) {
                     SS_LOG_WARN(L"HashStore",
                         L"Compact: Failed to flush bucket %S: %S",
                         Format::HashTypeToString(type), flushErr.message.c_str());
@@ -2927,7 +2940,11 @@ namespace ShadowStrike {
 
             if (m_mappedView.IsValid()) {
                 StoreError mmapFlush{};
-                MemoryMapping::FlushView(m_mappedView, mmapFlush);
+                if (m_mappedView.IsValid()) {
+                    StoreError mmapFlush{};
+                    auto ret = MemoryMapping::FlushView(m_mappedView, mmapFlush);
+                    (void)ret; 
+                }
             }
 
             // ========================================================================

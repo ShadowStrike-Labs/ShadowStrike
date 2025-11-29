@@ -26,6 +26,7 @@
 #include <sstream>
 #include <cstring>
 #include <random>
+#include <ctime>
 #include <execution>
 #include <tuple>
 
@@ -4173,10 +4174,17 @@ StoreError SignatureBuilder::SerializeMetadata() noexcept {
     // ========================================================================
     // BUILD METADATA JSON
     // ========================================================================
+
+    time_t now = time(nullptr);
+	char buf[26]; //typical buffer size for ctime_s
+    ctime_s(buf, sizeof(buf), &now);
+
+    std::string createdAt(buf);
+
     std::string jsonContent = R"({
   "database": {
     "version": "1.0",
-    "createdAt": ")" + std::string(std::ctime(nullptr)) + R"(",
+    "createdAt": ")" + createdAt + R"(",
     "totalSignatures": )" + std::to_string(m_pendingHashes.size() + m_pendingPatterns.size() + m_pendingYaraRules.size()) + R"(
   },
   "hashes": {

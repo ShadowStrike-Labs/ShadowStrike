@@ -26,7 +26,7 @@
 #include"../Utils/StringUtils.hpp"
 #include"../Utils/MemoryUtils.hpp"
 #include"../Utils/JSONUtils.hpp"
-
+#include<set>
 #include<variant>
 #include <algorithm>
 #include <fstream>
@@ -1138,7 +1138,274 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
     return matches;
 }
 
+StoreError YaraRuleStore::AddRulesFromSource(
+    const std::string& ruleSource,
+    const std::string& namespace_
+) noexcept {
+    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromSource: namespace=%S, size=%zu bytes",
+        namespace_.c_str(), ruleSource.length());
 
+    // ========================================================================
+    // STEP 1: VALIDATION
+    // ========================================================================
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromSource: Database is read-only");
+        return StoreError{ SignatureStoreError::AccessDenied, 0, "Database is read-only" };
+    }
+
+    if (ruleSource.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromSource: Empty rule source");
+        return StoreError{ SignatureStoreError::InvalidSignature, 0, "Rule source cannot be empty" };
+    }
+
+    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024; // 10MB limit
+    if (ruleSource.length() > MAX_RULE_SOURCE_SIZE) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: Rule source too large (%zu > %zu bytes)",
+            ruleSource.length(), MAX_RULE_SOURCE_SIZE);
+        return StoreError{ SignatureStoreError::TooLarge, 0, "Rule source exceeds 10MB limit" };
+    }
+
+    if (namespace_.empty() || namespace_.length() > 128) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: Invalid namespace (length: %zu)", namespace_.length());
+        return StoreError{ SignatureStoreError::InvalidSignature, 0, "Invalid namespace" };
+    }
+
+    // Validate namespace characters (alphanumeric + underscore only)
+    if (!std::all_of(namespace_.begin(), namespace_.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_';
+        })) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: Namespace contains invalid characters: %S",
+            namespace_.c_str());
+        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                          "Namespace must be alphanumeric with underscores only" };
+    }
+
+    // ========================================================================
+    // STEP 2: SYNTAX VALIDATION (Before compilation)
+    // ========================================================================
+    std::vector<std::string> syntaxErrors;
+    if (!YaraUtils::ValidateRuleSyntax(ruleSource, syntaxErrors)) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: YARA syntax validation failed");
+
+        // Log first 5 errors for debugging
+        for (size_t i = 0; i < std::min(syntaxErrors.size(), size_t(5)); ++i) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"  Syntax Error: %S",
+                syntaxErrors[i].c_str());
+        }
+
+        if (syntaxErrors.size() > 5) {
+            SS_LOG_ERROR(L"YaraRuleStore",
+                L"  ... and %zu more errors", syntaxErrors.size() - 5);
+        }
+
+        std::string allErrors;
+        for (const auto& err : syntaxErrors) {
+            allErrors += err + "; ";
+        }
+
+        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                          "YARA syntax errors: " + allErrors };
+    }
+
+    SS_LOG_DEBUG(L"YaraRuleStore",
+        L"AddRulesFromSource: Syntax validation passed");
+
+    // ========================================================================
+    // STEP 3: COMPILATION
+    // ========================================================================
+    LARGE_INTEGER compileStartTime;
+    QueryPerformanceCounter(&compileStartTime);
+
+    YaraCompiler compiler;
+
+    StoreError addErr = compiler.AddString(ruleSource, namespace_);
+    if (!addErr.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: Failed to add rule string to compiler: %S",
+            addErr.message.c_str());
+
+        // Log compiler errors
+        auto errors = compiler.GetErrors();
+        for (size_t i = 0; i < std::min(errors.size(), size_t(3)); ++i) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"  Compiler Error: %S",
+                errors[i].c_str());
+        }
+
+        return addErr;
+    }
+
+    YR_RULES* compiledRules = compiler.GetRules();
+    if (!compiledRules) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: Failed to get compiled rules from compiler");
+        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                          "Failed to compile YARA rules" };
+    }
+
+    LARGE_INTEGER compileEndTime;
+    QueryPerformanceCounter(&compileEndTime);
+    uint64_t compileTimeUs =
+        ((compileEndTime.QuadPart - compileStartTime.QuadPart) * 1000000ULL) /
+        m_perfFrequency.QuadPart;
+
+    SS_LOG_DEBUG(L"YaraRuleStore",
+        L"AddRulesFromSource: Compilation completed in %llu microseconds",
+        compileTimeUs);
+
+    // ========================================================================
+    // STEP 4: EXTRACT METADATA FROM COMPILED RULES
+    // ========================================================================
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+
+    size_t rulesAdded = 0;
+    size_t rulesSkipped = 0;
+
+    YR_RULE* rule = nullptr;
+    yr_rules_foreach(compiledRules, rule) {
+        if (!rule || !rule->identifier) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"AddRulesFromSource: Encountered rule with null identifier, skipping");
+            rulesSkipped++;
+            continue;
+        }
+
+        std::string ruleName = rule->identifier;
+        std::string ruleNamespace = rule->ns ? rule->ns->name : namespace_;
+        std::string fullName = ruleNamespace + "::" + ruleName;
+
+        // Check if rule already exists
+        if (m_ruleMetadata.find(fullName) != m_ruleMetadata.end()) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"AddRulesFromSource: Rule already exists, skipping: %S",
+                fullName.c_str());
+            rulesSkipped++;
+            continue;
+        }
+
+        // ====================================================================
+        // CREATE METADATA ENTRY
+        // ====================================================================
+        YaraRuleMetadata metadata{};
+        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
+        metadata.ruleName = ruleName;
+        metadata.namespace_ = ruleNamespace;
+        metadata.threatLevel = ThreatLevel::Medium; // Default
+        metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
+        metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
+        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
+        metadata.hitCount = 0;
+        metadata.averageMatchTimeMicroseconds = 0;
+
+        // ====================================================================
+        // EXTRACT TAGS
+        // ====================================================================
+        const char* tag = nullptr;
+        yr_rule_tags_foreach(rule, tag) {
+            if (tag && std::strlen(tag) > 0 && std::strlen(tag) <= 64) {
+                metadata.tags.emplace_back(tag);
+            }
+        }
+
+        // ====================================================================
+        // EXTRACT METADATA (author, description, reference, severity)
+        // ====================================================================
+        YR_META* meta = nullptr;
+        yr_rule_metas_foreach(rule, meta) {
+            if (!meta || !meta->identifier) {
+                continue;
+            }
+
+            std::string metaKey = meta->identifier;
+
+            if (metaKey == "author" && meta->type == META_TYPE_STRING && meta->string) {
+                metadata.author = meta->string;
+            }
+            else if (metaKey == "description" && meta->type == META_TYPE_STRING && meta->string) {
+                metadata.description = meta->string;
+            }
+            else if (metaKey == "reference" && meta->type == META_TYPE_STRING && meta->string) {
+                metadata.reference = meta->string;
+            }
+            else if (metaKey == "severity" && meta->type == META_TYPE_STRING && meta->string) {
+                // Parse threat level from metadata
+                auto threatMap = std::map<std::string, std::string>{
+                    {"severity", meta->string}
+                };
+                metadata.threatLevel = YaraUtils::ParseThreatLevel(threatMap);
+            }
+        }
+
+        // ====================================================================
+        // EXTRACT STRING INFORMATION (for statistics)
+        // ====================================================================
+        uint32_t stringCount = 0;
+        YR_STRING* string = nullptr;
+        yr_rule_strings_foreach(rule, string) {
+            if (string) {
+                stringCount++;
+            }
+        }
+
+        SS_LOG_DEBUG(L"YaraRuleStore",
+            L"AddRulesFromSource: Added rule: %S (tags: %zu, strings: %u, global: %s, private: %s)",
+            fullName.c_str(), metadata.tags.size(), stringCount,
+            metadata.isGlobal ? "yes" : "no",
+            metadata.isPrivate ? "yes" : "no");
+
+        // ====================================================================
+        // STORE METADATA
+        // ====================================================================
+        m_ruleMetadata[fullName] = std::move(metadata);
+        rulesAdded++;
+    }
+
+    // ========================================================================
+    // STEP 5: MERGE COMPILED RULES
+    // ========================================================================
+    if (rulesAdded > 0) {
+        // If we have existing rules, we need to merge
+        if (m_rules) {
+            // In a production system, you'd implement proper rule merging
+            // For now, we replace (this is a limitation)
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"AddRulesFromSource: Replacing existing rules (merge not yet implemented)");
+            int destroyResult = yr_rules_destroy(m_rules);
+            if (destroyResult != ERROR_SUCCESS) {
+                SS_LOG_WARN(L"YaraRuleStore",
+                    L"AddRulesFromSource: Failed to destroy old rules (error: %d)",
+                    destroyResult);
+            }
+        }
+
+        m_rules = compiledRules;
+
+        SS_LOG_INFO(L"YaraRuleStore",
+            L"AddRulesFromSource: Successfully added %zu rules (%zu skipped)",
+            rulesAdded, rulesSkipped);
+
+        return StoreError{ SignatureStoreError::Success };
+    }
+    else {
+        // No rules were added
+        SS_LOG_WARN(L"YaraRuleStore",
+            L"AddRulesFromSource: No rules were added (%zu skipped)",
+            rulesSkipped);
+
+        int destroyResult = yr_rules_destroy(compiledRules);
+        if (destroyResult != ERROR_SUCCESS) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"AddRulesFromSource: Failed to destroy compiled rules (error: %d)",
+                destroyResult);
+        }
+
+        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                          "No valid rules found in source" };
+    }
+}
 
 StoreError YaraRuleStore::AddRulesFromFile(
     const std::wstring& filePath,

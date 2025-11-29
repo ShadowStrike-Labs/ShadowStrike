@@ -107,7 +107,7 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\tlsh\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\ssdeep</AdditionalIncludeDirectories>
-      <CompileAs>CompileAsCpp</CompileAs>
+      <CompileAs>Default</CompileAs>
       <StructMemberAlignment>Default</StructMemberAlignment>
     </ClCompile>
     <Link>
@@ -142,8 +142,8 @@
     <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Statement.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp" />
+    <ClCompile Include="external\ssdeep\edit_dist.c" />
     <ClCompile Include="external\ssdeep\fuzzy.c" />
-    <ClCompile Include="external\tlsh\src\gen_arr2.cpp" />
     <ClCompile Include="external\tlsh\src\input_desc.cpp" />
     <ClCompile Include="external\tlsh\src\shared_file_functions.cpp" />
     <ClCompile Include="external\tlsh\src\tlsh.cpp" />
@@ -190,6 +190,7 @@
     <ClCompile Include="tests\unit\Database\database_manager_tests.cpp" />
     <ClCompile Include="tests\unit\Database\Log_db_tests.cpp" />
     <ClCompile Include="tests\unit\Database\Quarantine_db_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\sig_store\sig_indx_tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CompressionUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CryptoUtils_Tests.cpp" />
@@ -221,6 +222,8 @@
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Utils.h" />
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\VariadicBind.h" />
     <ClInclude Include="external\SQLiteCpp\sqlite3\sqlite3.h" />
+    <ClInclude Include="external\ssdeep\edit_dist.h" />
+    <ClInclude Include="external\ssdeep\fuzzy.h" />
     <ClInclude Include="external\tlsh\include\tlsh.h" />
     <ClInclude Include="external\tlsh\include\tlsh_impl.h" />
     <ClInclude Include="external\tlsh\include\tlsh_util.h" />

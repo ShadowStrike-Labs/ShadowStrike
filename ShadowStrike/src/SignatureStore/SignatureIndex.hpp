@@ -57,7 +57,7 @@ public:
 
     // Initialize from existing memory-mapped database
     [[nodiscard]] StoreError Initialize(
-        const MemoryMappedView& view,
+         const MemoryMappedView& view,
         uint64_t indexOffset,
         uint64_t indexSize
     ) noexcept;
@@ -214,7 +214,7 @@ private:
     // Split node during insertion
     [[nodiscard]] StoreError SplitNode(
         BPlusTreeNode* node,
-        uint64_t splitKey,
+        uint64_t& splitKey,
         BPlusTreeNode** newNode
     ) noexcept;
 
@@ -271,6 +271,17 @@ private:
     void* m_baseAddress{nullptr};
     uint64_t m_indexOffset{0};
     uint64_t m_indexSize{0};
+    uint64_t m_currentOffset{ 0 };
+
+    // Return a mutable pointer to the memory-mapped view only if the underlying view exists
+        // and is not marked readOnly. This centralizes the const_cast and enforces a runtime check.
+    MemoryMappedView* MutableView() noexcept {
+        if (!m_view) return nullptr;
+        if (m_view->readOnly) return nullptr;
+        return const_cast<MemoryMappedView*>(m_view);
+        
+    }
+
 
     // Tree root
     std::atomic<uint32_t> m_rootOffset{0};
@@ -370,6 +381,7 @@ public:
     private:
         friend class PatternIndex;
         std::vector<uint8_t> m_buffer;
+       
         size_t m_position{0};
     };
 
@@ -417,7 +429,10 @@ private:
     void* m_baseAddress{nullptr};
     uint64_t m_indexOffset{0};
     uint64_t m_indexSize{0};
-    
+
+    LARGE_INTEGER m_perfFrequency{};
+
+  
     std::atomic<uint32_t> m_rootOffset{0};
     mutable std::atomic<uint64_t> m_totalSearches{0};
     mutable std::atomic<uint64_t> m_totalMatches{0};

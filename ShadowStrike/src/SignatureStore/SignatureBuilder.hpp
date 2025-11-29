@@ -382,6 +382,26 @@ public:
     // CRC64-ECMA polynomial
     static constexpr uint64_t CRC64_POLY = 0x42F0E1EBA9EA3693ULL;
 
+    //Public helpers
+    
+    // Compute hash of file
+    [[nodiscard]] std::optional<HashValue> ComputeFileHash(
+        const std::wstring& filePath,
+        HashType type
+    ) const noexcept;
+
+    // Compute hash of memory buffer
+    [[nodiscard]] std::optional<HashValue> ComputeBufferHash(
+        std::span<const uint8_t> buffer,
+        HashType type
+    ) const noexcept;
+
+    // Compare two hashes for equality
+    [[nodiscard]] bool CompareHashes(
+        const HashValue& a,
+        const HashValue& b
+    ) const noexcept;
+
 private:
 
     // ========================================================================
@@ -456,23 +476,7 @@ private:
 
     [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
 
-    // Compute hash of file
-    [[nodiscard]] std::optional<HashValue> ComputeFileHash(
-        const std::wstring& filePath,
-        HashType type
-    ) const noexcept;
-
-    // Compute hash of memory buffer
-    [[nodiscard]] std::optional<HashValue> ComputeBufferHash(
-        std::span<const uint8_t> buffer,
-        HashType type
-    ) const noexcept;
-
-    // Compare two hashes for equality
-    [[nodiscard]] bool CompareHashes(
-        const HashValue& a,
-        const HashValue& b
-    ) const noexcept;
+   
   
     // ========================================================================
     // INTERNAL STATE

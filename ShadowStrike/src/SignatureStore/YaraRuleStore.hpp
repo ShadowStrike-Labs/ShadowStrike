@@ -38,7 +38,7 @@
 #pragma once
 #include<yara.h>
 #include "SignatureFormat.hpp"
-#include"SignatureStore.hpp"
+
 #include <memory>
 #include <vector>
 #include <string>
@@ -231,7 +231,7 @@ private:
 
 class YaraRuleStore {
 public:
-    YaraRuleStore() = default;
+    YaraRuleStore();
     ~YaraRuleStore();
 
     // Disable copy, enable move

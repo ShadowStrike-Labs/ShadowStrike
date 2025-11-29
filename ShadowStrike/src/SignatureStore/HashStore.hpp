@@ -186,7 +186,7 @@ private:
 
 class HashStore {
 public:
-    HashStore() = default;
+    HashStore();
     ~HashStore();
 
     // Disable copy, enable move
@@ -350,7 +350,7 @@ public:
     ) const noexcept;
 
     // Flush changes to disk
-    [[nodiscard]] StoreError Flush() noexcept;
+    StoreError Flush() noexcept;
 
     void ClearCache() noexcept;
 

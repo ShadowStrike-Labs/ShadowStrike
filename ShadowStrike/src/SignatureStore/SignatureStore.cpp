@@ -17,7 +17,7 @@
  *
  * ============================================================================
  */
-
+#define _CRT_SECURE_NO_WARNINGS
 #include "SignatureStore.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -29,6 +29,9 @@
 
 namespace ShadowStrike {
 namespace SignatureStore {
+
+
+   
 
 // ============================================================================
 // CONSTRUCTOR & DESTRUCTOR
@@ -454,9 +457,9 @@ std::optional<DetectionResult> SignatureStore::LookupFileHash(
     if (!m_hashStoreEnabled.load() || !m_hashStore) {
         return std::nullopt;
     }
-
+    ShadowStrike::SignatureStore::SignatureBuilder builder;
     // Compute file hash
-    auto hash = HashUtils::ComputeFileHash(filePath, type);
+    auto hash = builder.ComputeFileHash(filePath, type);
     if (!hash.has_value()) {
         SS_LOG_ERROR(L"SignatureStore", L"Failed to compute file hash");
         return std::nullopt;
@@ -1241,16 +1244,16 @@ StoreError SignatureStore::CreateDatabase(
     return builder.Build();
 }
 
+
+
 StoreError SignatureStore::MergeDatabases(
     std::span<const std::wstring> sourcePaths,
-    const std::wstring& outputPath
+    const std::wstring & outputPath
 ) noexcept {
     SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu databases to %s",
         sourcePaths.size(), outputPath.c_str());
 
-    // ========================================================================
     // VALIDATION
-    // ========================================================================
     if (sourcePaths.empty()) {
         SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: No source databases provided");
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source paths cannot be empty" };
@@ -1261,71 +1264,71 @@ StoreError SignatureStore::MergeDatabases(
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output path cannot be empty" };
     }
 
-    // Validate source paths
     for (size_t i = 0; i < sourcePaths.size(); ++i) {
         if (sourcePaths[i].empty()) {
             SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source path %zu is empty", i);
             return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source path cannot be empty" };
         }
-
         if (sourcePaths[i] == outputPath) {
             SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source and output paths are the same");
             return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source and output paths cannot be identical" };
         }
     }
 
-    // ========================================================================
-    // USE INSTANCE METHODS VIA TEMPORARY OR SINGLETON
-    // ========================================================================
     SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Opening %zu source databases", sourcePaths.size());
 
-    std::vector<HashStore> sourceHashStores;
-    std::vector<PatternStore> sourcePatternStores;
-    std::vector<YaraRuleStore> sourceYaraStores;
+    // Use vectors of unique_ptr to avoid attempts to copy non-copyable classes
+    std::vector<std::unique_ptr<HashStore>> sourceHashStores;
+    std::vector<std::unique_ptr<PatternStore>> sourcePatternStores;
+    std::vector<std::unique_ptr<YaraRuleStore>> sourceYaraStores;
 
     try {
-        // Open all source databases
+        // Open all source databases (store as unique_ptr)
         for (size_t i = 0; i < sourcePaths.size(); ++i) {
             SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Opening source [%zu]: %ls",
                 i, sourcePaths[i].c_str());
 
-            // Try to open HashStore
-            HashStore hashStore;
-            StoreError hashErr = hashStore.Initialize(sourcePaths[i], true);
-            if (hashErr.IsSuccess()) {
-                sourceHashStores.push_back(std::move(hashStore));
-            }
-            else {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open HashStore at %ls",
-                    sourcePaths[i].c_str());
-            }
-
-            // Try to open PatternStore
-            PatternStore patternStore;
-            StoreError patternErr = patternStore.Initialize(sourcePaths[i], true);
-            if (patternErr.IsSuccess()) {
-                sourcePatternStores.push_back(std::move(patternStore));
-            }
-            else {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open PatternStore at %ls",
-                    sourcePaths[i].c_str());
+            // HashStore
+            {
+                auto hs = std::make_unique<HashStore>();
+                StoreError hashErr = hs->Initialize(sourcePaths[i], true);
+                if (hashErr.IsSuccess()) {
+                    sourceHashStores.push_back(std::move(hs));
+                }
+                else {
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open HashStore at %ls",
+                        sourcePaths[i].c_str());
+                }
             }
 
-            // Try to open YaraRuleStore
-            YaraRuleStore yaraStore;
-            StoreError yaraErr = yaraStore.Initialize(sourcePaths[i], true);
-            if (yaraErr.IsSuccess()) {
-                sourceYaraStores.push_back(std::move(yaraStore));
+            // PatternStore
+            {
+                auto ps = std::make_unique<PatternStore>();
+                StoreError patternErr = ps->Initialize(sourcePaths[i], true);
+                if (patternErr.IsSuccess()) {
+                    sourcePatternStores.push_back(std::move(ps));
+                }
+                else {
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open PatternStore at %ls",
+                        sourcePaths[i].c_str());
+                }
             }
-            else {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open YaraStore at %ls",
-                    sourcePaths[i].c_str());
+
+            // YaraRuleStore
+            {
+                auto ys = std::make_unique<YaraRuleStore>();
+                StoreError yaraErr = ys->Initialize(sourcePaths[i], true);
+                if (yaraErr.IsSuccess()) {
+                    sourceYaraStores.push_back(std::move(ys));
+                }
+                else {
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open YaraStore at %ls",
+                        sourcePaths[i].c_str());
+                }
             }
         }
 
-        // ====================================================================
         // CREATE OUTPUT DATABASES
-        // ====================================================================
         SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Creating output databases");
 
         HashStore outputHashStore;
@@ -1350,20 +1353,18 @@ StoreError SignatureStore::MergeDatabases(
             return yaraCreateErr;
         }
 
-        // ====================================================================
         // MERGE HASH STORES
-        // ====================================================================
         if (!sourceHashStores.empty()) {
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu hash stores",
                 sourceHashStores.size());
 
             uint64_t totalHashesMerged = 0;
             for (size_t i = 0; i < sourceHashStores.size(); ++i) {
-                auto sourceStats = sourceHashStores[i].GetStatistics();
+                auto sourceStats = sourceHashStores[i]->GetStatistics();
                 SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu]: %llu hashes",
                     i, sourceStats.totalHashes);
 
-                std::string hashesJson = sourceHashStores[i].ExportToJson();
+                std::string hashesJson = sourceHashStores[i]->ExportToJson();
                 if (hashesJson.empty()) {
                     SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] export empty", i);
                     continue;
@@ -1393,20 +1394,18 @@ StoreError SignatureStore::MergeDatabases(
             }
         }
 
-        // ====================================================================
         // MERGE PATTERN STORES
-        // ====================================================================
         if (!sourcePatternStores.empty()) {
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu pattern stores",
                 sourcePatternStores.size());
 
             uint64_t totalPatternsMerged = 0;
             for (size_t i = 0; i < sourcePatternStores.size(); ++i) {
-                auto sourceStats = sourcePatternStores[i].GetStatistics();
+                auto sourceStats = sourcePatternStores[i]->GetStatistics();
                 SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu]: %llu patterns",
                     i, sourceStats.totalPatterns);
 
-                std::string patternsJson = sourcePatternStores[i].ExportToJson();
+                std::string patternsJson = sourcePatternStores[i]->ExportToJson();
                 if (!patternsJson.empty()) {
                     totalPatternsMerged += sourceStats.totalPatterns;
                 }
@@ -1427,16 +1426,14 @@ StoreError SignatureStore::MergeDatabases(
             }
         }
 
-        // ====================================================================
         // MERGE YARA STORES
-        // ====================================================================
         if (!sourceYaraStores.empty()) {
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu YARA stores",
                 sourceYaraStores.size());
 
             uint64_t totalRulesMerged = 0;
             for (size_t i = 0; i < sourceYaraStores.size(); ++i) {
-                auto sourceStats = sourceYaraStores[i].GetStatistics();
+                auto sourceStats = sourceYaraStores[i]->GetStatistics();
                 SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: YARA store [%zu]: %llu rules",
                     i, sourceStats.totalRules);
 
@@ -1497,7 +1494,9 @@ ScanResult SignatureStore::ExecuteParallelScan(
     // Hash lookup (fast, inline)
     if (options.enableHashLookup && m_hashStoreEnabled.load()) {
         // Hash lookup is so fast, do it inline
-        auto hash = HashUtils::ComputeBufferHash(buffer, HashType::SHA256);
+        ShadowStrike::SignatureStore::SignatureBuilder builder;
+
+        auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
         if (hash.has_value()) {
             auto detection = m_hashStore->LookupHash(*hash);
             if (detection.has_value()) {
@@ -1554,7 +1553,8 @@ ScanResult SignatureStore::ExecuteSequentialScan(
 
     // Hash lookup
     if (options.enableHashLookup && m_hashStoreEnabled.load() && m_hashStore) {
-        auto hash = HashUtils::ComputeBufferHash(buffer, HashType::SHA256);
+        ShadowStrike::SignatureStore::SignatureBuilder builder;
+        auto hash =builder.ComputeBufferHash(buffer, HashType::SHA256);
         if (hash.has_value()) {
             auto detection = m_hashStore->LookupHash(*hash);
             if (detection.has_value()) {
@@ -1610,7 +1610,8 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
     std::span<const uint8_t> buffer
 ) const noexcept {
     // Compute SHA-256 of buffer for cache key
-    auto hash = HashUtils::ComputeBufferHash(buffer, HashType::SHA256);
+    ShadowStrike::SignatureStore::SignatureBuilder builder;
+    auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
     if (!hash.has_value()) {
         return std::nullopt;
     }
@@ -1630,7 +1631,8 @@ void SignatureStore::AddToQueryCache(
     std::span<const uint8_t> buffer,
     const ScanResult& result
 ) const  noexcept {
-    auto hash = HashUtils::ComputeBufferHash(buffer, HashType::SHA256);
+    ShadowStrike::SignatureStore::SignatureBuilder builder;
+    auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
     if (!hash.has_value()) {
         return;
     }

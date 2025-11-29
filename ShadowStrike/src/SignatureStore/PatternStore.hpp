@@ -65,7 +65,7 @@ namespace ShadowStrike {
             // ========================================================================
 
             // Add pattern to automaton (before compilation)
-            [[nodiscard]] bool AddPattern(
+            bool AddPattern(
                 std::span<const uint8_t> pattern,
                 uint64_t patternId
             ) noexcept;
@@ -219,7 +219,7 @@ namespace ShadowStrike {
 
         class PatternStore {
         public:
-            PatternStore() = default;
+            PatternStore();
             ~PatternStore();
 
             // Disable copy, enable move

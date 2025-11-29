@@ -46,9 +46,9 @@
 #include "SignatureFormat.hpp"
 #include "HashStore.hpp"
 #include "PatternStore.hpp"
-#include "YaraRuleStore.hpp"
 #include "SignatureIndex.hpp"
 #include "SignatureBuilder.hpp"
+#include "YaraRuleStore.hpp"
 #include "../Utils/Logger.hpp"
 
 #include <memory>
@@ -63,6 +63,10 @@
 
 namespace ShadowStrike {
 namespace SignatureStore {
+
+	//forward declarations
+    struct YaraMatch;
+    class YaraRuleStore;
 
 // ============================================================================
 // UNIFIED SCAN OPTIONS
@@ -265,6 +269,18 @@ public:
         std::vector<uint8_t> m_buffer;
         ScanOptions m_options;
         size_t m_bytesProcessed{0};
+
+        std::optional<HashValue> ComputeFileHash(
+            const std::wstring& filePath,
+            HashType type
+        ) const noexcept;
+
+        bool CompareHashes(const HashValue& a, const HashValue& b) const noexcept;
+
+        std::optional<HashValue> ComputeBufferHash(
+            std::span<const uint8_t> buffer,
+            HashType type
+        ) const noexcept;
     };
 
     [[nodiscard]] StreamScanner CreateStreamScanner(

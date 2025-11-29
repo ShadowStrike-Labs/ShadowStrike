@@ -22,6 +22,7 @@
  *     http://www.samba.org/ftp/unpacked/junkcode/spamsum/
  *     http://ssdeep.sf.net/
  */
+#define _CRT_SECURE_NO_WARNINGS
 
 #ifndef MIN
 #define MIN(a,b) ((a)<(b)?(a):(b))
@@ -30,6 +31,12 @@
 #ifndef MAX
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #endif
+
+#ifdef _WIN32
+#define ftello _ftelli64
+#define fseeko _fseeki64
+#endif
+
 
 #include <assert.h>
 #include <errno.h>
