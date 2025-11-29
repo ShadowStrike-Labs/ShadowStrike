@@ -108,6 +108,7 @@
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\tlsh\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\ssdeep</AdditionalIncludeDirectories>
       <CompileAs>CompileAsCpp</CompileAs>
+      <StructMemberAlignment>Default</StructMemberAlignment>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -232,6 +233,7 @@
     <ClInclude Include="src\Database\QuarantineDB.hpp" />
     <ClInclude Include="src\SignatureStore\HashStore.hpp" />
     <ClInclude Include="src\SignatureStore\PatternStore.hpp" />
+    <ClInclude Include="src\SignatureStore\pragma_pack.h" />
     <ClInclude Include="src\SignatureStore\SignatureBuilder.hpp" />
     <ClInclude Include="src\SignatureStore\SignatureFormat.hpp" />
     <ClInclude Include="src\SignatureStore\SignatureIndex.hpp" />

@@ -398,6 +398,9 @@
     <ClInclude Include="external\tlsh\include\tlsh_win_version.h">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
+    <ClInclude Include="src\SignatureStore\pragma_pack.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.github\copilot-instructions.md" />

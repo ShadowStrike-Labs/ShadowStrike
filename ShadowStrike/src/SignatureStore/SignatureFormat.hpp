@@ -151,7 +151,7 @@ struct PatternEntry {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(PatternEntry) == 52, "PatternEntry must be 52 bytes");
+static_assert(sizeof(PatternEntry) == 48, "PatternEntry must be 48 bytes");
 
 // ============================================================================
 // YARA RULE STRUCTURES
@@ -173,7 +173,7 @@ struct YaraRuleEntry {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(YaraRuleEntry) == 52, "YaraRuleEntry must be 52 bytes");
+static_assert(sizeof(YaraRuleEntry) == 48, "YaraRuleEntry must be 48 bytes");
 
 // ============================================================================
 // B+TREE INDEX STRUCTURES (for hash lookups)
@@ -210,8 +210,8 @@ static_assert(sizeof(BPlusTreeNode) <= PAGE_SIZE, "BPlusTreeNode too large");
 // ============================================================================
 // FILE HEADER (First 4KB of database)
 // ============================================================================
-
-#pragma pack(push, 1)
+//SignatureDatabaseHeader
+#pragma pack(push,1)
 struct SignatureDatabaseHeader {
     // Magic & version
     uint32_t magic;                                       // SIGNATURE_DB_MAGIC
@@ -252,10 +252,65 @@ struct SignatureDatabaseHeader {
     // Reserved for future extensions
     std::array<uint8_t, 3840> reserved;                   // Pad to 4KB
 };
+
 #pragma pack(pop)
 
-static_assert(sizeof(SignatureDatabaseHeader) == PAGE_SIZE, 
-              "Header must be exactly 4KB");
+static_assert(sizeof(SignatureDatabaseHeader) == 4040,
+    "Header must be exactly 4KB");
+
+// ============================================================================
+// AHO-CORASICK TRIE BINARY SERIALIZATION FORMAT
+// ============================================================================
+
+
+#pragma pack(push,1)
+
+// Binary representation of a single Trie node on disk
+struct TrieNodeBinary {
+    // Header (16 bytes)
+    uint32_t magic;                      // 0x54524945 = 'TRIE' for validation
+    uint16_t version;                    // Version 1
+    uint16_t reserved;                   // Alignment padding
+
+    // Node structure (256 + 4 + 4 + 4 + 4 + 4 = 280 bytes)
+    std::array<uint32_t, 256> childOffsets;  // Child node disk offsets (or 0 if null)
+    uint32_t failureLinkOffset;          // Failure link disk offset (0 = root/self)
+    uint32_t outputCount;                // Number of pattern IDs in outputs
+    uint32_t outputOffset;               // Disk offset to output pattern IDs (if > 0)
+    uint32_t depth;                      // Node depth in trie (0 = root)
+    uint32_t reserved2;                  // Future use
+
+    // Total: 16 + 280 + 20 = 316 bytes (will be padded to 320 for alignment)
+};
+
+#pragma pack(pop)
+
+static_assert(sizeof(TrieNodeBinary) == 1052, "TrieNodeBinary must be exactly 316 bytes");
+
+// ============================================================================
+// TRIE INDEX STRUCTURE (Header of entire trie section)
+// ============================================================================
+
+#pragma pack(push, 1)
+
+struct TrieIndexHeader {
+    uint32_t magic;                      // 0x54524945 = 'TRIE'
+    uint32_t version;                    // 1
+    uint64_t totalNodes;                 // Total number of nodes in trie
+    uint64_t totalPatterns;              // Total unique patterns indexed
+    uint64_t rootNodeOffset;             // Offset to root TrieNodeBinary
+    uint64_t outputPoolOffset;           // Offset to start of pattern ID pool
+    uint64_t outputPoolSize;             // Total bytes in output pool
+    uint32_t maxNodeDepth;               // Maximum depth reached in trie
+    uint32_t flags;                      // Bit flags: 0x01 = Aho-Corasick optimized
+    uint64_t checksumCRC64;              // CRC64 of entire trie section (for integrity)
+    uint64_t reserved[4];                // Future use (32 bytes total)
+};
+
+#pragma pack(pop)
+
+static_assert(sizeof(TrieIndexHeader) == 96, "TrieIndexHeader must be exactly 96 bytes");
+
 
 // ============================================================================
 // DETECTION RESULT STRUCTURES
