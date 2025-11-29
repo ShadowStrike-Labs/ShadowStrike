@@ -102,11 +102,12 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_AMD64_;TLSH_BUCKETS=256;TLSH_CHECKSUM_1B=OFF;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\tlsh\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\ssdeep</AdditionalIncludeDirectories>
+      <CompileAs>CompileAsCpp</CompileAs>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -140,6 +141,13 @@
     <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Statement.cpp" />
     <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp" />
+    <ClCompile Include="external\ssdeep\fuzzy.c" />
+    <ClCompile Include="external\tlsh\src\gen_arr2.cpp" />
+    <ClCompile Include="external\tlsh\src\input_desc.cpp" />
+    <ClCompile Include="external\tlsh\src\shared_file_functions.cpp" />
+    <ClCompile Include="external\tlsh\src\tlsh.cpp" />
+    <ClCompile Include="external\tlsh\src\tlsh_impl.cpp" />
+    <ClCompile Include="external\tlsh\src\tlsh_util.cpp" />
     <ClCompile Include="src\Cache\MemoryCache.cpp" />
     <ClCompile Include="src\Cache\PersistentCache.cpp" />
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
@@ -212,6 +220,10 @@
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\Utils.h" />
     <ClInclude Include="external\SQLiteCpp\include\SQLiteCpp\VariadicBind.h" />
     <ClInclude Include="external\SQLiteCpp\sqlite3\sqlite3.h" />
+    <ClInclude Include="external\tlsh\include\tlsh.h" />
+    <ClInclude Include="external\tlsh\include\tlsh_impl.h" />
+    <ClInclude Include="external\tlsh\include\tlsh_util.h" />
+    <ClInclude Include="external\tlsh\include\tlsh_win_version.h" />
     <ClInclude Include="src\Cache\MemoryCache.hpp" />
     <ClInclude Include="src\Cache\PersistentCache.hpp" />
     <ClInclude Include="src\Database\ConfigurationDB.hpp" />

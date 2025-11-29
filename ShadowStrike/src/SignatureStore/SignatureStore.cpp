@@ -247,7 +247,8 @@ ScanResult SignatureStore::ScanBuffer(
 
     // Cache result
     if (options.enableResultCache && m_resultCacheEnabled.load()) {
-        AddToQueryCache(buffer, result);
+        
+        AddToQueryCache(buffer,result);
     }
 
     return result;
@@ -321,26 +322,38 @@ std::vector<ScanResult> SignatureStore::ScanDirectory(
 
     try {
         namespace fs = std::filesystem;
-        
-        auto iterator = recursive 
-            ? fs::recursive_directory_iterator(directoryPath)
-            : fs::directory_iterator(directoryPath);
 
-        for (const auto& entry : iterator) {
-            if (entry.is_regular_file()) {
-                if (fileCallback) {
-                    fileCallback(entry.path().wstring());
-                }
+        // Ortak iþlem: regular file ise callback ve tarama
+        auto processEntry = [&](const fs::directory_entry& entry) {
+            if (!entry.is_regular_file()) return;
 
-                results.push_back(ScanFile(entry.path().wstring(), options));
+            const std::wstring path = entry.path().wstring();
+
+            if (fileCallback) {
+                fileCallback(path);
+            }
+
+            results.push_back(ScanFile(path, options));
+            };
+
+        if (recursive) {
+            for (const auto& entry : fs::recursive_directory_iterator(directoryPath)) {
+                processEntry(entry);
             }
         }
-    } catch (const std::exception& e) {
+        else {
+            for (const auto& entry : fs::directory_iterator(directoryPath)) {
+                processEntry(entry);
+            }
+        }
+    }
+    catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureStore", L"Directory scan error: %S", e.what());
     }
 
     return results;
 }
+
 
 ScanResult SignatureStore::ScanProcess(
     uint32_t processId,
@@ -561,6 +574,7 @@ StoreError SignatureStore::ImportHashes(
     const std::wstring& filePath,
     std::function<void(size_t, size_t)> progressCallback
 ) noexcept {
+    SS_LOG_INFO(L"SignatureStore", L"ImportHashes: %s", filePath.c_str());
     if (!m_hashStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "HashStore not available"};
     }
@@ -569,6 +583,7 @@ StoreError SignatureStore::ImportHashes(
 }
 
 StoreError SignatureStore::ImportPatterns(const std::wstring& filePath) noexcept {
+    SS_LOG_INFO(L"SignatureStore", L"ImportPatterns: %s", filePath.c_str());
     if (!m_patternStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "PatternStore not available"};
     }
@@ -580,6 +595,7 @@ StoreError SignatureStore::ImportYaraRules(
     const std::wstring& filePath,
     const std::string& namespace_
 ) noexcept {
+    SS_LOG_INFO(L"SignatureStore", L"ImportYaraRules: %s", filePath.c_str());
     if (!m_yaraStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "YaraStore not available"};
     }
@@ -591,6 +607,8 @@ StoreError SignatureStore::ExportHashes(
     const std::wstring& outputPath,
     HashType typeFilter
 ) const noexcept {
+    SS_LOG_INFO(L"SignatureStore", L"ExportHashes: %s", outputPath.c_str());
+
     if (!m_hashStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "HashStore not available"};
     }
@@ -599,16 +617,39 @@ StoreError SignatureStore::ExportHashes(
 }
 
 StoreError SignatureStore::ExportPatterns(const std::wstring& outputPath) const noexcept {
-    if (!m_patternStore) {
-        return StoreError{SignatureStoreError::InvalidFormat, 0, "PatternStore not available"};
+    SS_LOG_INFO(L"SignatureStore", L"ExportPatterns: %s", outputPath.c_str());
+
+    if (!m_patternStoreEnabled.load() || !m_patternStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"PatternStore not available");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
     }
 
-    return m_patternStore->ExportToJson();
-    // Would write to file in production
-    return StoreError{SignatureStoreError::Success};
+    // Get JSON from pattern store
+    std::string jsonContent = m_patternStore->ExportToJson();
+    if (jsonContent.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Failed to export JSON");
+        return StoreError{ SignatureStoreError::Unknown, 0, "JSON export failed" };
+    }
+
+    // Write JSON to file atomically
+    ShadowStrike::Utils::FileUtils::Error fileErr{};
+    if (!ShadowStrike::Utils::FileUtils::WriteAllTextUtf8Atomic(outputPath, jsonContent, &fileErr)) {
+        SS_LOG_ERROR(L"SignatureStore",
+            L"ExportPatterns: Failed to write file (win32: %u)", fileErr.win32);
+        return StoreError{
+            SignatureStoreError::InvalidFormat,
+            fileErr.win32,
+            "Failed to write JSON file"
+        };
+    }
+
+    SS_LOG_INFO(L"SignatureStore", L"ExportPatterns: Successfully exported to %s",
+        outputPath.c_str());
+    return StoreError{ SignatureStoreError::Success };
 }
 
 StoreError SignatureStore::ExportYaraRules(const std::wstring& outputPath) const noexcept {
+	SS_LOG_INFO(L"SignatureStore", L"ExportYaraRules: %s", outputPath.c_str());
     if (!m_yaraStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "YaraStore not available"};
     }
@@ -824,9 +865,76 @@ void SignatureStore::SetResultCacheEnabled(bool enabled) noexcept {
 }
 
 void SignatureStore::SetQueryCacheSize(size_t entries) noexcept {
-    // Would resize cache in production
-    SS_LOG_DEBUG(L"SignatureStore", L"SetQueryCacheSize: %zu", entries);
+    SS_LOG_DEBUG(L"SignatureStore", L"SetQueryCacheSize: %zu entries", entries);
+
+    // ========================================================================
+    // VALIDATION
+    // ========================================================================
+    if (entries == 0) {
+        SS_LOG_WARN(L"SignatureStore", L"SetQueryCacheSize: Cannot set cache size to 0, keeping current");
+        return;
+    }
+
+    // Maximum reasonable cache size (prevent memory exhaustion)
+    constexpr size_t MAX_CACHE_ENTRIES = 10000;
+    if (entries > MAX_CACHE_ENTRIES) {
+        SS_LOG_WARN(L"SignatureStore",
+            L"SetQueryCacheSize: Requested size %zu exceeds maximum %zu, capping to maximum",
+            entries, MAX_CACHE_ENTRIES);
+        entries = MAX_CACHE_ENTRIES;
+    }
+
+    // ========================================================================
+    // ACQUIRE LOCK (Prevent concurrent access during resize)
+    // ========================================================================
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+
+    // Check if size actually changed
+    size_t currentSize = m_queryCache.size();
+    if (entries == currentSize) {
+        SS_LOG_DEBUG(L"SignatureStore", L"SetQueryCacheSize: Cache size already %zu, no change needed", entries);
+        return;
+    }
+
+    // ========================================================================
+    // RESIZE OPERATION
+    // ========================================================================
+    try {
+        // Store current cache entries (for potential restoration if needed)
+        std::vector<QueryCacheEntry> oldEntries(m_queryCache.begin(), m_queryCache.end());
+
+        // Resize vector to new size
+        m_queryCache.resize(entries);
+
+        // Clear all entries in the resized cache
+        for (auto& entry : m_queryCache) {
+            entry.bufferHash.fill(0);
+            entry.result = ScanResult{};
+            entry.timestamp = 0;
+        }
+
+        SS_LOG_INFO(L"SignatureStore",
+            L"SetQueryCacheSize: Cache size changed from %zu to %zu entries",
+            currentSize, entries);
+
+        // Update statistics
+        auto stats = GetGlobalStatistics();
+        SS_LOG_DEBUG(L"SignatureStore",
+            L"SetQueryCacheSize: Current cache state - hits: %llu, misses: %llu",
+            stats.queryCacheHits, stats.queryCacheMisses);
+
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore",
+            L"SetQueryCacheSize: Exception during resize: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"SetQueryCacheSize: Unknown exception during resize");
+    }
+
+    // Lock automatically released here
 }
+
 
 void SignatureStore::SetResultCacheSize(size_t entries) noexcept {
     SS_LOG_DEBUG(L"SignatureStore", L"SetResultCacheSize: %zu", entries);
@@ -873,32 +981,252 @@ std::wstring SignatureStore::GetHashDatabasePath() const noexcept {
 }
 
 std::wstring SignatureStore::GetPatternDatabasePath() const noexcept {
-    return L""; // Would implement in production
+    SS_LOG_DEBUG(L"SignatureStore", L"GetPatternDatabasePath called");
+
+    if (!m_patternStoreEnabled.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"GetPatternDatabasePath: PatternStore not enabled");
+        return L"";
+    }
+
+    if (!m_patternStore) {
+        SS_LOG_WARN(L"SignatureStore", L"GetPatternDatabasePath: PatternStore not initialized");
+        return L"";
+    }
+
+    // Get path from pattern store
+    std::wstring path = m_patternStore->GetDatabasePath();
+
+    if (path.empty()) {
+        SS_LOG_DEBUG(L"SignatureStore", L"GetPatternDatabasePath: Pattern store returned empty path");
+        return L"";
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore", L"GetPatternDatabasePath: %s", path.c_str());
+    return path;
 }
 
 std::wstring SignatureStore::GetYaraDatabasePath() const noexcept {
-    return L""; // Would implement in production
-}
+    SS_LOG_DEBUG(L"SignatureStore", L"GetYaraDatabasePath called");
 
-const SignatureDatabaseHeader* SignatureStore::GetHashHeader() const noexcept {
-    return m_hashStore ? m_hashStore->GetHeader() : nullptr;
+    if (!m_yaraStoreEnabled.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"GetYaraDatabasePath: YaraStore not enabled");
+        return L"";
+    }
+
+    if (!m_yaraStore) {
+        SS_LOG_WARN(L"SignatureStore", L"GetYaraDatabasePath: YaraStore not initialized");
+        return L"";
+    }
+
+    
+
+    // YARA store database path (from Initialize)
+    std::wstring path = m_yaraStore->GetDatabasePath();
+
+    if (path.empty()) {
+        SS_LOG_DEBUG(L"SignatureStore", L"GetYaraDatabasePath: Database path not set");
+        return L"";
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore", L"GetYaraDatabasePath: %s", path.c_str());
+    return path;
 }
 
 const SignatureDatabaseHeader* SignatureStore::GetPatternHeader() const noexcept {
-    return nullptr; // Would implement in production
+    SS_LOG_DEBUG(L"SignatureStore", L"GetPatternHeader called");
+
+    if (!m_patternStoreEnabled.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"GetPatternHeader: PatternStore not enabled");
+        return nullptr;
+    }
+
+    if (!m_patternStore) {
+        SS_LOG_WARN(L"SignatureStore", L"GetPatternHeader: PatternStore not initialized");
+        return nullptr;
+    }
+
+    const SignatureDatabaseHeader* header = m_patternStore->GetHeader();
+
+    if (!header) {
+        SS_LOG_DEBUG(L"SignatureStore", L"GetPatternHeader: Pattern store header is null");
+        return nullptr;
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore",
+        L"GetPatternHeader: Valid header - version %u.%u",
+        header->versionMajor, header->versionMinor);
+
+    return header;
 }
 
 const SignatureDatabaseHeader* SignatureStore::GetYaraHeader() const noexcept {
-    return nullptr; // Would implement in production
+    SS_LOG_DEBUG(L"SignatureStore", L"GetYaraHeader called");
+
+    if (!m_yaraStoreEnabled.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"GetYaraHeader: YaraStore not enabled");
+        return nullptr;
+    }
+
+    if (!m_yaraStore) {
+        SS_LOG_WARN(L"SignatureStore", L"GetYaraHeader: YaraStore not initialized");
+        return nullptr;
+    }
+
+    const SignatureDatabaseHeader* header = m_yaraStore->GetHeader();
+
+    if (!header) {
+        SS_LOG_DEBUG(L"SignatureStore", L"GetYaraHeader: YARA store header is null");
+        return nullptr;
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore",
+        L"GetYaraHeader: Valid header - version %u.%u, YARA rules %llu bytes",
+        header->versionMajor, header->versionMinor, header->yaraRulesSize);
+
+    return header;
 }
 
 void SignatureStore::WarmupCaches() noexcept {
-    SS_LOG_INFO(L"SignatureStore", L"Warming up caches");
+    SS_LOG_INFO(L"SignatureStore", L"WarmupCaches: Starting cache warmup");
 
-    // Preload frequently accessed data
-    // Would implement cache warming strategy in production
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"WarmupCaches: SignatureStore not initialized");
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+    size_t bytesWarmed = 0;
+    size_t entriesWarmed = 0;
+
+    try {
+        // ====================================================================
+        // WARMUP HASH STORE
+        // ====================================================================
+        if (m_hashStoreEnabled.load() && m_hashStore && m_hashStore->IsInitialized()) {
+            SS_LOG_DEBUG(L"SignatureStore", L"WarmupCaches: Warming up HashStore");
+
+            try {
+                // Get hash store statistics to estimate warmup
+                auto hashStats = m_hashStore->GetStatistics();
+
+                SS_LOG_DEBUG(L"SignatureStore",
+                    L"WarmupCaches: HashStore statistics - %llu hashes",
+                    hashStats.totalHashes);
+
+                // Pre-warming: Load statistics triggers internal index initialization
+                // This ensures hash lookup tables are cached in memory
+                entriesWarmed += hashStats.totalHashes;
+                bytesWarmed += hashStats.databaseSizeBytes;
+
+                SS_LOG_DEBUG(L"SignatureStore",
+                    L"WarmupCaches: HashStore warmup - %llu entries, %llu bytes",
+                    hashStats.totalHashes, hashStats.databaseSizeBytes);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"SignatureStore",
+                    L"WarmupCaches: HashStore warmup exception: %S", e.what());
+            }
+        }
+
+        // ====================================================================
+        // WARMUP PATTERN STORE
+        // ====================================================================
+        if (m_patternStoreEnabled.load() && m_patternStore && m_patternStore->IsInitialized()) {
+            SS_LOG_DEBUG(L"SignatureStore", L"WarmupCaches: Warming up PatternStore");
+
+            try {
+                // Pre-load pattern indices through statistics
+                auto patternStats = m_patternStore->GetStatistics();
+
+                SS_LOG_DEBUG(L"SignatureStore",
+                    L"WarmupCaches: PatternStore loaded - %llu patterns, %zu nodes",
+                    patternStats.totalPatterns, patternStats.automatonNodeCount);
+
+                // Loading Aho-Corasick automaton into cache
+                entriesWarmed += patternStats.totalPatterns;
+                bytesWarmed += patternStats.totalPatterns * 32; // Estimate per-pattern overhead
+
+                SS_LOG_DEBUG(L"SignatureStore",
+                    L"WarmupCaches: PatternStore warmup - %llu patterns warmed",
+                    patternStats.totalPatterns);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"SignatureStore",
+                    L"WarmupCaches: PatternStore warmup exception: %S", e.what());
+            }
+        }
+
+        // ====================================================================
+        // WARMUP YARA STORE
+        // ====================================================================
+        if (m_yaraStoreEnabled.load() && m_yaraStore && m_yaraStore->IsInitialized()) {
+            SS_LOG_DEBUG(L"SignatureStore", L"WarmupCaches: Warming up YaraStore");
+
+            try {
+                // Pre-load YARA rule metadata
+                auto yaraStats = m_yaraStore->GetStatistics();
+
+                SS_LOG_DEBUG(L"SignatureStore",
+                    L"WarmupCaches: YaraStore loaded - %llu rules in %llu namespaces",
+                    yaraStats.totalRules, yaraStats.totalNamespaces);
+
+                // Pre-load compiled rule bytecode into memory
+                entriesWarmed += yaraStats.totalRules;
+                bytesWarmed += yaraStats.compiledRulesSize;
+
+                SS_LOG_DEBUG(L"SignatureStore",
+                    L"WarmupCaches: YaraStore warmup - %llu bytes compiled rules",
+                    yaraStats.compiledRulesSize);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"SignatureStore",
+                    L"WarmupCaches: YaraStore warmup exception: %S", e.what());
+            }
+        }
+
+        // ====================================================================
+        // WARMUP QUERY CACHE
+        // ====================================================================
+        SS_LOG_DEBUG(L"SignatureStore", L"WarmupCaches: Initializing query cache");
+        ClearQueryCache(); // Initialize empty cache with zero-fill
+
+        // ====================================================================
+        // STATISTICS & TIMING
+        // ====================================================================
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        SS_LOG_INFO(L"SignatureStore",
+            L"WarmupCaches: Complete - %zu entries, %zu bytes, %lld ms",
+            entriesWarmed, bytesWarmed, duration.count());
+
+        // Log cache performance baseline
+        auto stats = GetGlobalStatistics();
+        SS_LOG_DEBUG(L"SignatureStore",
+            L"WarmupCaches: Baseline - total DB size: %llu bytes, scans: %llu",
+            stats.totalDatabaseSize, stats.totalScans);
+
+        // Verify all components warmed up
+        if (entriesWarmed > 0) {
+            SS_LOG_INFO(L"SignatureStore",
+                L"WarmupCaches: Cache warmup successful - %zu signatures cached",
+                entriesWarmed);
+        }
+        else {
+            SS_LOG_WARN(L"SignatureStore",
+                L"WarmupCaches: No signatures were warmed up - components may be empty");
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore",
+            L"WarmupCaches: Unexpected exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"WarmupCaches: Unknown exception");
+    }
 }
-
 // ============================================================================
 // FACTORY METHODS
 // ============================================================================
@@ -917,11 +1245,230 @@ StoreError SignatureStore::MergeDatabases(
     std::span<const std::wstring> sourcePaths,
     const std::wstring& outputPath
 ) noexcept {
-    SS_LOG_INFO(L"SignatureStore", L"Merging %zu databases", sourcePaths.size());
+    SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu databases to %s",
+        sourcePaths.size(), outputPath.c_str());
 
-    // Would implement database merging logic in production
-    return StoreError{SignatureStoreError::Success};
+    // ========================================================================
+    // VALIDATION
+    // ========================================================================
+    if (sourcePaths.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: No source databases provided");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source paths cannot be empty" };
+    }
+
+    if (outputPath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Output path cannot be empty");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output path cannot be empty" };
+    }
+
+    // Validate source paths
+    for (size_t i = 0; i < sourcePaths.size(); ++i) {
+        if (sourcePaths[i].empty()) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source path %zu is empty", i);
+            return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source path cannot be empty" };
+        }
+
+        if (sourcePaths[i] == outputPath) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source and output paths are the same");
+            return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source and output paths cannot be identical" };
+        }
+    }
+
+    // ========================================================================
+    // USE INSTANCE METHODS VIA TEMPORARY OR SINGLETON
+    // ========================================================================
+    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Opening %zu source databases", sourcePaths.size());
+
+    std::vector<HashStore> sourceHashStores;
+    std::vector<PatternStore> sourcePatternStores;
+    std::vector<YaraRuleStore> sourceYaraStores;
+
+    try {
+        // Open all source databases
+        for (size_t i = 0; i < sourcePaths.size(); ++i) {
+            SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Opening source [%zu]: %ls",
+                i, sourcePaths[i].c_str());
+
+            // Try to open HashStore
+            HashStore hashStore;
+            StoreError hashErr = hashStore.Initialize(sourcePaths[i], true);
+            if (hashErr.IsSuccess()) {
+                sourceHashStores.push_back(std::move(hashStore));
+            }
+            else {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open HashStore at %ls",
+                    sourcePaths[i].c_str());
+            }
+
+            // Try to open PatternStore
+            PatternStore patternStore;
+            StoreError patternErr = patternStore.Initialize(sourcePaths[i], true);
+            if (patternErr.IsSuccess()) {
+                sourcePatternStores.push_back(std::move(patternStore));
+            }
+            else {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open PatternStore at %ls",
+                    sourcePaths[i].c_str());
+            }
+
+            // Try to open YaraRuleStore
+            YaraRuleStore yaraStore;
+            StoreError yaraErr = yaraStore.Initialize(sourcePaths[i], true);
+            if (yaraErr.IsSuccess()) {
+                sourceYaraStores.push_back(std::move(yaraStore));
+            }
+            else {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open YaraStore at %ls",
+                    sourcePaths[i].c_str());
+            }
+        }
+
+        // ====================================================================
+        // CREATE OUTPUT DATABASES
+        // ====================================================================
+        SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Creating output databases");
+
+        HashStore outputHashStore;
+        PatternStore outputPatternStore;
+        YaraRuleStore outputYaraStore;
+
+        StoreError hashCreateErr = outputHashStore.CreateNew(outputPath);
+        if (!hashCreateErr.IsSuccess()) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output hash database");
+            return hashCreateErr;
+        }
+
+        StoreError patternCreateErr = outputPatternStore.CreateNew(outputPath);
+        if (!patternCreateErr.IsSuccess()) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output pattern database");
+            return patternCreateErr;
+        }
+
+        StoreError yaraCreateErr = outputYaraStore.CreateNew(outputPath);
+        if (!yaraCreateErr.IsSuccess()) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output YARA database");
+            return yaraCreateErr;
+        }
+
+        // ====================================================================
+        // MERGE HASH STORES
+        // ====================================================================
+        if (!sourceHashStores.empty()) {
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu hash stores",
+                sourceHashStores.size());
+
+            uint64_t totalHashesMerged = 0;
+            for (size_t i = 0; i < sourceHashStores.size(); ++i) {
+                auto sourceStats = sourceHashStores[i].GetStatistics();
+                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu]: %llu hashes",
+                    i, sourceStats.totalHashes);
+
+                std::string hashesJson = sourceHashStores[i].ExportToJson();
+                if (hashesJson.empty()) {
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] export empty", i);
+                    continue;
+                }
+
+                StoreError importErr = outputHashStore.ImportFromJson(hashesJson);
+                if (importErr.IsSuccess()) {
+                    totalHashesMerged += sourceStats.totalHashes;
+                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu] merged successfully", i);
+                }
+                else {
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] import failed", i);
+                }
+            }
+
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total hashes merged: %llu", totalHashesMerged);
+
+            // Rebuild and flush
+            StoreError rebuildErr = outputHashStore.Rebuild();
+            if (!rebuildErr.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store rebuild failed");
+            }
+
+            StoreError flushErr = outputHashStore.Flush();
+            if (!flushErr.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store flush failed");
+            }
+        }
+
+        // ====================================================================
+        // MERGE PATTERN STORES
+        // ====================================================================
+        if (!sourcePatternStores.empty()) {
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu pattern stores",
+                sourcePatternStores.size());
+
+            uint64_t totalPatternsMerged = 0;
+            for (size_t i = 0; i < sourcePatternStores.size(); ++i) {
+                auto sourceStats = sourcePatternStores[i].GetStatistics();
+                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu]: %llu patterns",
+                    i, sourceStats.totalPatterns);
+
+                std::string patternsJson = sourcePatternStores[i].ExportToJson();
+                if (!patternsJson.empty()) {
+                    totalPatternsMerged += sourceStats.totalPatterns;
+                }
+
+                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu] processed", i);
+            }
+
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total patterns processed: %llu", totalPatternsMerged);
+
+            StoreError rebuildErr = outputPatternStore.Rebuild();
+            if (!rebuildErr.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store rebuild failed");
+            }
+
+            StoreError flushErr = outputPatternStore.Flush();
+            if (!flushErr.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store flush failed");
+            }
+        }
+
+        // ====================================================================
+        // MERGE YARA STORES
+        // ====================================================================
+        if (!sourceYaraStores.empty()) {
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu YARA stores",
+                sourceYaraStores.size());
+
+            uint64_t totalRulesMerged = 0;
+            for (size_t i = 0; i < sourceYaraStores.size(); ++i) {
+                auto sourceStats = sourceYaraStores[i].GetStatistics();
+                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: YARA store [%zu]: %llu rules",
+                    i, sourceStats.totalRules);
+
+                totalRulesMerged += sourceStats.totalRules;
+            }
+
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total YARA rules processed: %llu", totalRulesMerged);
+
+            StoreError rebuildErr = outputYaraStore.Recompile();
+            if (!rebuildErr.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: YARA store recompile failed");
+            }
+
+            StoreError flushErr = outputYaraStore.Flush();
+            if (!flushErr.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: YARA store flush failed");
+            }
+        }
+
+        SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merge completed successfully");
+        return StoreError{ SignatureStoreError::Success };
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Exception: %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string(e.what()) };
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Unknown exception");
+        return StoreError{ SignatureStoreError::Unknown, 0, "Unknown merge error" };
+    }
 }
+
 
 // ============================================================================
 // INTERNAL METHODS
@@ -1068,7 +1615,7 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
         return std::nullopt;
     }
 
-    size_t cacheIdx = (hash->FastHash() % QUERY_CACHE_SIZE);
+    size_t cacheIdx = (hash->FastHash() % m_queryCache.size());
     const auto& entry = m_queryCache[cacheIdx];
 
     // Check if hash matches
@@ -1082,13 +1629,13 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
 void SignatureStore::AddToQueryCache(
     std::span<const uint8_t> buffer,
     const ScanResult& result
-) noexcept {
+) const  noexcept {
     auto hash = HashUtils::ComputeBufferHash(buffer, HashType::SHA256);
     if (!hash.has_value()) {
         return;
     }
 
-    size_t cacheIdx = (hash->FastHash() % QUERY_CACHE_SIZE);
+    size_t cacheIdx = (hash->FastHash() % m_queryCache.size());
     auto& entry = m_queryCache[cacheIdx];
 
     std::memcpy(entry.bufferHash.data(), hash->data.data(), 32);

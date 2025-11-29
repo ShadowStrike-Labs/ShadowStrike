@@ -2343,5 +2343,49 @@ std::vector<std::wstring> FindYaraFiles(
 
 } // namespace YaraUtils
 
+const SignatureDatabaseHeader* YaraRuleStore::GetHeader() const noexcept {
+    SS_LOG_DEBUG(L"YaraRuleStore", L"GetHeader called");
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"GetHeader: YaraStore not initialized");
+        return nullptr;
+    }
+
+    if (!m_mappedView.IsValid()) {
+        SS_LOG_WARN(L"YaraRuleStore", L"GetHeader: Memory mapping not valid");
+        return nullptr;
+    }
+
+    // Get header from memory-mapped file at offset 0
+    const SignatureDatabaseHeader* header = m_mappedView.GetAt<SignatureDatabaseHeader>(0);
+
+    if (!header) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"GetHeader: Failed to get header from memory-mapped view");
+        return nullptr;
+    }
+
+    // Validate header magic
+    if (header->magic != SIGNATURE_DB_MAGIC) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"GetHeader: Invalid magic 0x%08X, expected 0x%08X",
+            header->magic, SIGNATURE_DB_MAGIC);
+        return nullptr;
+    }
+
+    // Validate version
+    if (header->versionMajor != SIGNATURE_DB_VERSION_MAJOR) {
+        SS_LOG_WARN(L"YaraRuleStore",
+            L"GetHeader: Version mismatch - file: %u.%u, expected: %u.%u",
+            header->versionMajor, header->versionMinor,
+            SIGNATURE_DB_VERSION_MAJOR, SIGNATURE_DB_VERSION_MINOR);
+    }
+
+    SS_LOG_DEBUG(L"YaraRuleStore",
+        L"GetHeader: Valid header - version %u.%u, YARA rules %llu bytes",
+        header->versionMajor, header->versionMinor, header->yaraRulesSize);
+
+    return header;
+}
+
 } // namespace SignatureStore
 } // namespace ShadowStrike

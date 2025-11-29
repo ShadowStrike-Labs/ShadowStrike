@@ -38,6 +38,7 @@
 #pragma once
 
 #include "SignatureFormat.hpp"
+#include"../Utils/HashUtils.hpp"
 #include "SignatureIndex.hpp"
 #include <memory>
 #include <unordered_map>
@@ -160,10 +161,12 @@ public:
     [[nodiscard]] BucketStatistics GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
 
-private:
-    HashType m_type;
     std::unique_ptr<SignatureIndex> m_index;
     std::unique_ptr<BloomFilter> m_bloomFilter;
+
+private:
+    HashType m_type;
+    
     
     const MemoryMappedView* m_view{nullptr};
     uint64_t m_bucketOffset{0};
@@ -172,6 +175,7 @@ private:
     mutable std::atomic<uint64_t> m_lookupCount{0};
     mutable std::atomic<uint64_t> m_bloomHits{0};
     mutable std::atomic<uint64_t> m_bloomMisses{0};
+  
     
     mutable std::shared_mutex m_rwLock;
 };
@@ -348,6 +352,8 @@ public:
     // Flush changes to disk
     [[nodiscard]] StoreError Flush() noexcept;
 
+    void ClearCache() noexcept;
+
     // ========================================================================
     // ADVANCED FEATURES
     // ========================================================================
@@ -409,9 +415,9 @@ private:
     void AddToCache(
         const HashValue& hash,
         const std::optional<DetectionResult>& result
-    ) noexcept;
+    ) const noexcept;
 
-    void ClearCache() noexcept;
+  
 
     // ========================================================================
     // INTERNAL STATE
@@ -435,6 +441,8 @@ private:
     mutable std::atomic<uint64_t> m_totalLookups{0};
     mutable std::atomic<uint64_t> m_cacheHits{0};
     mutable std::atomic<uint64_t> m_cacheMisses{0};
+    mutable std::atomic<uint64_t> m_totalMatches{ 0 };      // Fuzzy matching results counter
+
 
     // Bloom filter configuration
     size_t m_bloomExpectedElements{1'000'000};
@@ -445,45 +453,18 @@ private:
 
     // Performance monitoring
     LARGE_INTEGER m_perfFrequency{};
+
+
+
+    // ============================================================================
+    // UTILITY FUNCTIONS
+    // ============================================================================
+
+    
 };
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
 
-namespace HashUtils {
 
-// Compute hash of file
-[[nodiscard]] std::optional<HashValue> ComputeFileHash(
-    const std::wstring& filePath,
-    HashType type
-) noexcept;
-
-// Compute hash of memory buffer
-[[nodiscard]] std::optional<HashValue> ComputeBufferHash(
-    std::span<const uint8_t> buffer,
-    HashType type
-) noexcept;
-
-// Compare two hashes for equality
-[[nodiscard]] bool CompareHashes(
-    const HashValue& a,
-    const HashValue& b
-) noexcept;
-
-// Compute SSDEEP similarity score (0-100)
-[[nodiscard]] uint32_t ComputeSSDEEPSimilarity(
-    const HashValue& a,
-    const HashValue& b
-) noexcept;
-
-// Compute TLSH distance
-[[nodiscard]] uint32_t ComputeTLSHDistance(
-    const HashValue& a,
-    const HashValue& b
-) noexcept;
-
-} // namespace HashUtils
 
 } // namespace SignatureStore
 } // namespace ShadowStrike
