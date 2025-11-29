@@ -37,6 +37,8 @@
 #pragma once
 
 #include "SignatureFormat.hpp"
+#include"../Utils/StringUtils.hpp"
+#include"../Utils/JSONUtils.hpp"
 #include "HashStore.hpp"
 #include "PatternStore.hpp"
 #include "YaraRuleStore.hpp"
@@ -87,6 +89,7 @@ struct BuildConfiguration {
     uint32_t bloomFilterElements{1'000'000};              // Expected hash count
     double bloomFilterFPR{0.01};                          // False positive rate
 };
+
 
 // ============================================================================
 // BUILD STATISTICS
@@ -351,6 +354,8 @@ public:
         const std::wstring& databasePath
     ) const noexcept;
 
+    bool ValidateDatabaseChecksum(const std::wstring& databasePath) noexcept;
+
     // ========================================================================
     // ADVANCED FEATURES
     // ========================================================================
@@ -371,7 +376,42 @@ public:
     // Set build priority (thread priority)
     void SetBuildPriority(int priority) noexcept;
 
+    //CRC64 for checking integrity.
+    uint64_t ComputeCRC64(const uint8_t* data, size_t length);
+
+    // CRC64-ECMA polynomial
+    static constexpr uint64_t CRC64_POLY = 0x42F0E1EBA9EA3693ULL;
+
 private:
+
+    // ========================================================================
+   // TRIE SERIALIZATION HELPERS (Private)
+   // ========================================================================
+
+   // Helper structure for building trie in memory before serialization
+    struct TrieNodeMemory {
+        std::array<uint32_t, 256> childOffsets{};        // Offsets or 0
+        uint32_t failureLinkOffset{ 0 };                   // Offset or 0
+        std::vector<uint64_t> outputs;                   // Pattern IDs at this node
+        uint32_t depth{ 0 };
+        uint64_t diskOffset{ 0 };                          // Will be calculated during serialization
+    };
+
+    // Serialize Aho-Corasick automaton to disk trie format
+    [[nodiscard]] StoreError SerializeAhoCorasickToDisk(
+        uint64_t& currentOffset
+    ) noexcept;
+
+    // Write single trie node to disk
+    [[nodiscard]] StoreError WriteTrieNodeToDisk(
+        const TrieNodeMemory& nodeMemory,
+        uint64_t diskOffset
+    ) noexcept;
+
+    // Build output pattern ID pool
+    [[nodiscard]] StoreError BuildOutputPool(
+        uint64_t poolOffset
+    ) noexcept;
     // ========================================================================
     // INTERNAL BUILD STAGES
     // ========================================================================
@@ -416,6 +456,24 @@ private:
 
     [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
 
+    // Compute hash of file
+    [[nodiscard]] std::optional<HashValue> ComputeFileHash(
+        const std::wstring& filePath,
+        HashType type
+    ) const noexcept;
+
+    // Compute hash of memory buffer
+    [[nodiscard]] std::optional<HashValue> ComputeBufferHash(
+        std::span<const uint8_t> buffer,
+        HashType type
+    ) const noexcept;
+
+    // Compare two hashes for equality
+    [[nodiscard]] bool CompareHashes(
+        const HashValue& a,
+        const HashValue& b
+    ) const noexcept;
+  
     // ========================================================================
     // INTERNAL STATE
     // ========================================================================
@@ -455,6 +513,8 @@ private:
     // Performance monitoring
     LARGE_INTEGER m_perfFrequency{};
     LARGE_INTEGER m_buildStartTime{};
+
+
 };
 
 // ============================================================================
@@ -531,10 +591,7 @@ enum class FileFormat {
     const std::wstring& filePath
 ) noexcept;
 
-// Validate database file integrity
-[[nodiscard]] bool ValidateDatabaseChecksum(
-    const std::wstring& databasePath
-) noexcept;
+
 
 } // namespace BuilderUtils
 
