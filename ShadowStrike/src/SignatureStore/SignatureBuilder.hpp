@@ -356,6 +356,27 @@ public:
 
     bool ValidateDatabaseChecksum(const std::wstring& databasePath) noexcept;
 
+    bool ValidatePatternSyntax(
+        const std::string& pattern,
+        std::string& errorMessage
+    ) noexcept;
+
+    bool IsRegexSafe(
+        const std::string& pattern,
+        std::string& errorMessage
+    ) noexcept;
+
+    bool IsYaraRuleSafe(
+        const std::string& ruleSource,
+        std::string& errorMessage
+    ) noexcept;
+
+    bool TestYaraRuleCompilation(
+        const std::string& ruleSource,
+        const std::string& namespace_,
+        std::vector<std::string>& errors
+    ) noexcept;
+
     // ========================================================================
     // ADVANCED FEATURES
     // ========================================================================
@@ -476,7 +497,7 @@ private:
 
     [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
 
-   
+    std::atomic<uint32_t> m_consecutiveDuplicates{ 0 };  // Track duplicate rate
   
     // ========================================================================
     // INTERNAL STATE
