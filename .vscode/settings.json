@@ -1,5 +1,8 @@
 {
     "files.associations": {
-        "atomic": "cpp"
+        "atomic": "cpp",
+        "shared_mutex": "cpp",
+        "mutex": "cpp",
+        "type_traits": "cpp"
     }
 }
