@@ -128,197 +128,196 @@ namespace {
 
 } // anonymous namespace
 
-namespace ShadowStrike {
-namespace SignatureStore {
 namespace Format {
 
-// ============================================================================
-// HEADER VALIDATION (Enterprise-Grade with Overflow Protection)
-// ============================================================================
+    // ============================================================================
+    // HEADER VALIDATION (Enterprise-Grade with Overflow Protection)
+    // ============================================================================
 
-bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
-    if (!header) {
-        SS_LOG_ERROR(L"SignatureStore", L"ValidateHeader: null header pointer");
-        return false;
-    }
-
-    // ========================================================================
-    // STEP 1: MAGIC NUMBER & VERSION CHECK
-    // ========================================================================
-
-    if (header->magic != SIGNATURE_DB_MAGIC) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Invalid magic number: expected 0x%08X, got 0x%08X", 
-            SIGNATURE_DB_MAGIC, header->magic);
-        return false;
-    }
-
-    if (header->versionMajor != SIGNATURE_DB_VERSION_MAJOR) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Version mismatch: expected %u.x, got %u.%u",
-            SIGNATURE_DB_VERSION_MAJOR, 
-            header->versionMajor, 
-            header->versionMinor);
-        return false;
-    }
-
-    // ========================================================================
-    // STEP 2: PAGE ALIGNMENT VALIDATION (Critical for Memory Mapping)
-    // ========================================================================
-
-    // Helper lambda for alignment check
-    auto checkPageAlignment = [](uint64_t offset, const wchar_t* name) -> bool {
-        if (offset != 0 && (offset % PAGE_SIZE != 0)) {
-            SS_LOG_ERROR(L"SignatureStore", 
-                L"%s offset 0x%llX not page-aligned (PAGE_SIZE=%zu)",
-                name, offset, PAGE_SIZE);
+    bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
+        if (!header) {
+            SS_LOG_ERROR(L"SignatureStore", L"ValidateHeader: null header pointer");
             return false;
         }
-        return true;
-    };
 
-    if (!checkPageAlignment(header->hashIndexOffset, L"Hash index")) return false;
-    if (!checkPageAlignment(header->patternIndexOffset, L"Pattern index")) return false;
-    if (!checkPageAlignment(header->yaraRulesOffset, L"YARA rules")) return false;
-    if (!checkPageAlignment(header->metadataOffset, L"Metadata")) return false;
-    if (!checkPageAlignment(header->stringPoolOffset, L"String pool")) return false;
+        // ========================================================================
+        // STEP 1: MAGIC NUMBER & VERSION CHECK
+        // ========================================================================
 
-    // ========================================================================
-    // STEP 3: SIZE LIMIT VALIDATION
-    // ========================================================================
-
-    auto checkSizeLimit = [](uint64_t size, const wchar_t* name) -> bool {
-        if (size > MAX_DATABASE_SIZE) {
-            SS_LOG_ERROR(L"SignatureStore", 
-                L"%s size %llu exceeds maximum %llu",
-                name, size, MAX_DATABASE_SIZE);
+        if (header->magic != SIGNATURE_DB_MAGIC) {
+            SS_LOG_ERROR(L"SignatureStore",
+                L"Invalid magic number: expected 0x%08X, got 0x%08X",
+                SIGNATURE_DB_MAGIC, header->magic);
             return false;
         }
-        return true;
-    };
 
-    if (!checkSizeLimit(header->hashIndexSize, L"Hash index")) return false;
-    if (!checkSizeLimit(header->patternIndexSize, L"Pattern index")) return false;
-    if (!checkSizeLimit(header->yaraRulesSize, L"YARA rules")) return false;
-    if (!checkSizeLimit(header->metadataSize, L"Metadata")) return false;
-    if (!checkSizeLimit(header->stringPoolSize, L"String pool")) return false;
+        if (header->versionMajor != SIGNATURE_DB_VERSION_MAJOR) {
+            SS_LOG_ERROR(L"SignatureStore",
+                L"Version mismatch: expected %u.x, got %u.%u",
+                SIGNATURE_DB_VERSION_MAJOR,
+                header->versionMajor,
+                header->versionMinor);
+            return false;
+        }
 
-    // ========================================================================
-    // STEP 4: OVERFLOW-SAFE SECTION BOUNDS VALIDATION
-    // ========================================================================
+        // ========================================================================
+        // STEP 2: PAGE ALIGNMENT VALIDATION (Critical for Memory Mapping)
+        // ========================================================================
 
-    // Check that offset + size doesn't overflow
-    auto checkNoOverflow = [](uint64_t offset, uint64_t size, const wchar_t* name) -> bool {
-        if (offset > 0 && size > 0) {
-            // Check for uint64_t overflow
-            if (offset > UINT64_MAX - size) {
-                SS_LOG_ERROR(L"SignatureStore", 
-                    L"%s offset+size overflow: 0x%llX + 0x%llX",
-                    name, offset, size);
+        // Helper lambda for alignment check
+        auto checkPageAlignment = [](uint64_t offset, const wchar_t* name) -> bool {
+            if (offset != 0 && (offset % PAGE_SIZE != 0)) {
+                SS_LOG_ERROR(L"SignatureStore",
+                    L"%s offset 0x%llX not page-aligned (PAGE_SIZE=%zu)",
+                    name, offset, PAGE_SIZE);
                 return false;
             }
-        }
-        return true;
-    };
+            return true;
+            };
 
-    if (!checkNoOverflow(header->hashIndexOffset, header->hashIndexSize, L"Hash index")) return false;
-    if (!checkNoOverflow(header->patternIndexOffset, header->patternIndexSize, L"Pattern index")) return false;
-    if (!checkNoOverflow(header->yaraRulesOffset, header->yaraRulesSize, L"YARA rules")) return false;
-    if (!checkNoOverflow(header->metadataOffset, header->metadataSize, L"Metadata")) return false;
-    if (!checkNoOverflow(header->stringPoolOffset, header->stringPoolSize, L"String pool")) return false;
+        if (!checkPageAlignment(header->hashIndexOffset, L"Hash index")) return false;
+        if (!checkPageAlignment(header->patternIndexOffset, L"Pattern index")) return false;
+        if (!checkPageAlignment(header->yaraRulesOffset, L"YARA rules")) return false;
+        if (!checkPageAlignment(header->metadataOffset, L"Metadata")) return false;
+        if (!checkPageAlignment(header->stringPoolOffset, L"String pool")) return false;
 
-    // ========================================================================
-    // STEP 5: SECTION OVERLAP DETECTION (with size consideration)
-    // ========================================================================
+        // ========================================================================
+        // STEP 3: SIZE LIMIT VALIDATION
+        // ========================================================================
 
-    struct SectionInfo {
-        uint64_t offset;
-        uint64_t size;
-        const wchar_t* name;
-    };
-
-    // Only include non-empty sections
-    std::array<SectionInfo, 5> sections = {{
-        { header->hashIndexOffset, header->hashIndexSize, L"HashIndex" },
-        { header->patternIndexOffset, header->patternIndexSize, L"PatternIndex" },
-        { header->yaraRulesOffset, header->yaraRulesSize, L"YaraRules" },
-        { header->metadataOffset, header->metadataSize, L"Metadata" },
-        { header->stringPoolOffset, header->stringPoolSize, L"StringPool" }
-    }};
-
-    // Check each pair of sections for overlap
-    for (size_t i = 0; i < sections.size(); ++i) {
-        if (sections[i].offset == 0 || sections[i].size == 0) continue;
-
-        uint64_t end_i = sections[i].offset + sections[i].size;
-
-        for (size_t j = i + 1; j < sections.size(); ++j) {
-            if (sections[j].offset == 0 || sections[j].size == 0) continue;
-
-            uint64_t end_j = sections[j].offset + sections[j].size;
-
-            // Check for overlap: [start_i, end_i) overlaps [start_j, end_j)
-            bool overlaps = (sections[i].offset < end_j) && (sections[j].offset < end_i);
-
-            if (overlaps) {
-                SS_LOG_ERROR(L"SignatureStore", 
-                    L"Section overlap: %s [0x%llX-0x%llX) overlaps %s [0x%llX-0x%llX)",
-                    sections[i].name, sections[i].offset, end_i,
-                    sections[j].name, sections[j].offset, end_j);
+        auto checkSizeLimit = [](uint64_t size, const wchar_t* name) -> bool {
+            if (size > MAX_DATABASE_SIZE) {
+                SS_LOG_ERROR(L"SignatureStore",
+                    L"%s size %llu exceeds maximum %llu",
+                    name, size, MAX_DATABASE_SIZE);
                 return false;
             }
+            return true;
+            };
+
+        if (!checkSizeLimit(header->hashIndexSize, L"Hash index")) return false;
+        if (!checkSizeLimit(header->patternIndexSize, L"Pattern index")) return false;
+        if (!checkSizeLimit(header->yaraRulesSize, L"YARA rules")) return false;
+        if (!checkSizeLimit(header->metadataSize, L"Metadata")) return false;
+        if (!checkSizeLimit(header->stringPoolSize, L"String pool")) return false;
+
+        // ========================================================================
+        // STEP 4: OVERFLOW-SAFE SECTION BOUNDS VALIDATION
+        // ========================================================================
+
+        // Check that offset + size doesn't overflow
+        auto checkNoOverflow = [](uint64_t offset, uint64_t size, const wchar_t* name) -> bool {
+            if (offset > 0 && size > 0) {
+                // Check for uint64_t overflow
+                if (offset > UINT64_MAX - size) {
+                    SS_LOG_ERROR(L"SignatureStore",
+                        L"%s offset+size overflow: 0x%llX + 0x%llX",
+                        name, offset, size);
+                    return false;
+                }
+            }
+            return true;
+            };
+
+        if (!checkNoOverflow(header->hashIndexOffset, header->hashIndexSize, L"Hash index")) return false;
+        if (!checkNoOverflow(header->patternIndexOffset, header->patternIndexSize, L"Pattern index")) return false;
+        if (!checkNoOverflow(header->yaraRulesOffset, header->yaraRulesSize, L"YARA rules")) return false;
+        if (!checkNoOverflow(header->metadataOffset, header->metadataSize, L"Metadata")) return false;
+        if (!checkNoOverflow(header->stringPoolOffset, header->stringPoolSize, L"String pool")) return false;
+
+        // ========================================================================
+        // STEP 5: SECTION OVERLAP DETECTION (with size consideration)
+        // ========================================================================
+
+        struct SectionInfo {
+            uint64_t offset;
+            uint64_t size;
+            const wchar_t* name;
+        };
+
+        // Only include non-empty sections
+        std::array<SectionInfo, 5> sections = { {
+            { header->hashIndexOffset, header->hashIndexSize, L"HashIndex" },
+            { header->patternIndexOffset, header->patternIndexSize, L"PatternIndex" },
+            { header->yaraRulesOffset, header->yaraRulesSize, L"YaraRules" },
+            { header->metadataOffset, header->metadataSize, L"Metadata" },
+            { header->stringPoolOffset, header->stringPoolSize, L"StringPool" }
+        } };
+
+        // Check each pair of sections for overlap
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (sections[i].offset == 0 || sections[i].size == 0) continue;
+
+            uint64_t end_i = sections[i].offset + sections[i].size;
+
+            for (size_t j = i + 1; j < sections.size(); ++j) {
+                if (sections[j].offset == 0 || sections[j].size == 0) continue;
+
+                uint64_t end_j = sections[j].offset + sections[j].size;
+
+                // Check for overlap: [start_i, end_i) overlaps [start_j, end_j)
+                bool overlaps = (sections[i].offset < end_j) && (sections[j].offset < end_i);
+
+                if (overlaps) {
+                    SS_LOG_ERROR(L"SignatureStore",
+                        L"Section overlap: %s [0x%llX-0x%llX) overlaps %s [0x%llX-0x%llX)",
+                        sections[i].name, sections[i].offset, end_i,
+                        sections[j].name, sections[j].offset, end_j);
+                    return false;
+                }
+            }
         }
-    }
 
-    // ========================================================================
-    // STEP 6: STATISTICS SANITY CHECK (Warnings only)
-    // ========================================================================
+        // ========================================================================
+        // STEP 6: STATISTICS SANITY CHECK (Warnings only)
+        // ========================================================================
 
-    if (header->totalHashes > 1'000'000'000ULL) {
-        SS_LOG_WARN(L"SignatureStore", 
-            L"Suspicious hash count: %llu (>1 billion)", 
-            header->totalHashes);
-    }
-
-    if (header->totalPatterns > 10'000'000ULL) {
-        SS_LOG_WARN(L"SignatureStore", 
-            L"Suspicious pattern count: %llu (>10 million)", 
-            header->totalPatterns);
-    }
-
-    if (header->totalYaraRules > 100'000ULL) {
-        SS_LOG_WARN(L"SignatureStore", 
-            L"Suspicious YARA rule count: %llu (>100K)", 
-            header->totalYaraRules);
-    }
-
-    // ========================================================================
-    // STEP 7: TIMESTAMP VALIDATION
-    // ========================================================================
-
-    // Creation time should be before or equal to last update time
-    if (header->creationTime > 0 && header->lastUpdateTime > 0) {
-        if (header->creationTime > header->lastUpdateTime) {
-            SS_LOG_WARN(L"SignatureStore", 
-                L"Creation time (%llu) > last update time (%llu) - possible corruption",
-                header->creationTime, header->lastUpdateTime);
+        if (header->totalHashes > 1'000'000'000ULL) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"Suspicious hash count: %llu (>1 billion)",
+                header->totalHashes);
         }
+
+        if (header->totalPatterns > 10'000'000ULL) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"Suspicious pattern count: %llu (>10 million)",
+                header->totalPatterns);
+        }
+
+        if (header->totalYaraRules > 100'000ULL) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"Suspicious YARA rule count: %llu (>100K)",
+                header->totalYaraRules);
+        }
+
+        // ========================================================================
+        // STEP 7: TIMESTAMP VALIDATION
+        // ========================================================================
+
+        // Creation time should be before or equal to last update time
+        if (header->creationTime > 0 && header->lastUpdateTime > 0) {
+            if (header->creationTime > header->lastUpdateTime) {
+                SS_LOG_WARN(L"SignatureStore",
+                    L"Creation time (%llu) > last update time (%llu) - possible corruption",
+                    header->creationTime, header->lastUpdateTime);
+            }
+        }
+
+        // Reasonable timestamp range: 2020-2100 (in seconds since epoch)
+        constexpr uint64_t MIN_TIMESTAMP = 1577836800ULL;  // 2020-01-01
+        constexpr uint64_t MAX_TIMESTAMP = 4102444800ULL;  // 2100-01-01
+
+        if (header->creationTime > 0 &&
+            (header->creationTime < MIN_TIMESTAMP || header->creationTime > MAX_TIMESTAMP)) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"Creation timestamp %llu outside expected range [2020-2100]",
+                header->creationTime);
+        }
+
+        SS_LOG_DEBUG(L"SignatureStore", L"Header validation passed");
+        return true;
     }
 
-    // Reasonable timestamp range: 2020-2100 (in seconds since epoch)
-    constexpr uint64_t MIN_TIMESTAMP = 1577836800ULL;  // 2020-01-01
-    constexpr uint64_t MAX_TIMESTAMP = 4102444800ULL;  // 2100-01-01
-
-    if (header->creationTime > 0 && 
-        (header->creationTime < MIN_TIMESTAMP || header->creationTime > MAX_TIMESTAMP)) {
-        SS_LOG_WARN(L"SignatureStore", 
-            L"Creation timestamp %llu outside expected range [2020-2100]",
-            header->creationTime);
-    }
-
-    SS_LOG_DEBUG(L"SignatureStore", L"Header validation passed");
-    return true;
-}
 
 // ============================================================================
 // CACHE SIZE CALCULATION
@@ -664,7 +663,7 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
      */
 
     // Close any existing view first
-    CloseView(view);
+    MemoryMapping::CloseView(view);
 
     // ========================================================================
     // STEP 1: INPUT VALIDATION
@@ -847,5 +846,5 @@ bool FlushView(MemoryMappedView& view, StoreError& error) noexcept {
 
 } // namespace MemoryMapping
 
-} // namespace SignatureStore
-} // namespace ShadowStrike
+} 
+}

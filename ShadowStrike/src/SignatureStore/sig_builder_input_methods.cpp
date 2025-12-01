@@ -240,7 +240,7 @@ namespace SignatureStore {
                         if (m_consecutiveDuplicates > 1000) {
                             SS_LOG_WARN(L"SignatureBuilder",
                                 L"AddHash: High duplicate rate detected (%u) - possible attack",
-                                m_consecutiveDuplicates);
+                                m_consecutiveDuplicates.load());
                         }
 
                         return StoreError{ SignatureStoreError::DuplicateEntry, 0,

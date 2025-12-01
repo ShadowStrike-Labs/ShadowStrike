@@ -1552,7 +1552,11 @@ std::vector<DetectionResult> PatternStore::Scan(
         // Thread-safe hit count update using atomic
         if (m_heatmapEnabled.load(std::memory_order_acquire)) {
             if (result.signatureId < m_hitCounters.size()) {
-                m_hitCounters[result.signatureId].fetch_add(1, std::memory_order_relaxed);
+                // Use atomic_ref for safe concurrent access
+                std::atomic_ref<uint64_t> counter(
+                    const_cast<std::vector<uint64_t>&>(m_hitCounters)[result.signatureId]
+                );
+                counter.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -2397,7 +2401,7 @@ StoreError PatternStore::BuildAutomaton() noexcept {
     
     // Sync hit counts from cache to atomic counters
     for (size_t i = 0; i < m_patternCache.size(); ++i) {
-        m_hitCounters[i].store(m_patternCache[i].hitCount, std::memory_order_relaxed);
+        m_hitCounters[i] = m_patternCache[i].hitCount;
     }
 
     SS_LOG_INFO(L"PatternStore", 
@@ -2495,15 +2499,14 @@ void PatternStore::UpdateHitCount(uint64_t patternId) noexcept {
     // Thread-safe hit count update using atomic counters
     // Note: m_hitCounters must be resized when patterns are added
     if (patternId < m_hitCounters.size()) {
-        m_hitCounters[patternId].fetch_add(1, std::memory_order_relaxed);
+        std::atomic_ref<uint64_t> counter(m_hitCounters[patternId]);
+        counter.fetch_add(1, std::memory_order_relaxed);
     }
     
     // Also update the cache copy under lock for persistence
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
     if (patternId < m_patternCache.size()) {
-        // Sync from atomic counter
-        m_patternCache[patternId].hitCount = 
-            static_cast<uint32_t>(m_hitCounters[patternId].load(std::memory_order_relaxed));
+        m_patternCache[patternId].hitCount = m_hitCounters[patternId];
     }
 }
 
@@ -2659,24 +2662,23 @@ std::vector<std::pair<uint64_t, uint32_t>> PatternStore::GetHeatmap() const noex
 
     std::vector<std::pair<uint64_t, uint32_t>> heatmap;
     heatmap.reserve(m_patternCache.size());
-    
-    // Read hit counts from atomic counters for thread-safe access
+
+    // Read hit counts safely
     for (size_t i = 0; i < m_patternCache.size(); ++i) {
         const auto& meta = m_patternCache[i];
         uint32_t hitCount = 0;
-        
-        // Prefer atomic counter if available, fall back to cache
+
         if (i < m_hitCounters.size()) {
+            // Use atomic_ref for safe read
+            std::atomic_ref<const uint64_t> counter(m_hitCounters[i]);
             hitCount = static_cast<uint32_t>(
-                m_hitCounters[i].load(std::memory_order_relaxed));
-        } else {
-            hitCount = meta.hitCount;
+                counter.load(std::memory_order_relaxed)
+                );
         }
-        
+
         heatmap.emplace_back(meta.signatureId, hitCount);
     }
 
-    // Sort by hit count (descending)
     std::sort(heatmap.begin(), heatmap.end(),
         [](const auto& a, const auto& b) { return a.second > b.second; });
 
