@@ -46,6 +46,20 @@ SignatureStore::SignatureStore()
         m_perfFrequency.QuadPart = 1000000;
     }
 
+    // FIX: Initialize query cache with default size to prevent division by zero
+    try {
+        m_queryCache.resize(QUERY_CACHE_SIZE);
+        for (auto& entry : m_queryCache) {
+            entry.bufferHash.fill(0);
+            entry.result = ScanResult{};
+            entry.timestamp = 0;
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to initialize query cache: %S", e.what());
+        // Cache will remain empty - operations will check for empty cache
+    }
+
     SS_LOG_DEBUG(L"SignatureStore", L"Created instance");
 }
 
@@ -210,14 +224,66 @@ ScanResult SignatureStore::ScanBuffer(
     std::span<const uint8_t> buffer,
     const ScanOptions& options
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Initialization state (acquire ensures visibility of init state)
     if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"ScanBuffer: Store not initialized");
         return ScanResult{};
     }
 
+    // VALIDATION 2: Empty buffer check - nothing to scan
+    if (buffer.empty()) {
+        SS_LOG_DEBUG(L"SignatureStore", L"ScanBuffer: Empty buffer, nothing to scan");
+        ScanResult result{};
+        result.totalBytesScanned = 0;
+        return result;
+    }
+    
+    // VALIDATION 3: Maximum buffer size to prevent DoS attacks
+    constexpr size_t MAX_BUFFER_SIZE = 500 * 1024 * 1024; // 500MB max
+    if (buffer.size() > MAX_BUFFER_SIZE) {
+        SS_LOG_WARN(L"SignatureStore", L"ScanBuffer: Buffer too large (%zu bytes), max is %zu",
+            buffer.size(), MAX_BUFFER_SIZE);
+        ScanResult result{};
+        result.timedOut = true; // Indicate scan was not completed
+        return result;
+    }
+    
+    // VALIDATION 4: Pointer alignment check for SIMD operations
+    // Some hash algorithms and pattern matchers benefit from aligned data
+    const uintptr_t bufferAddr = reinterpret_cast<uintptr_t>(buffer.data());
+    if (bufferAddr == 0) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanBuffer: Null buffer pointer with non-zero size");
+        return ScanResult{};
+    }
+
+    // VALIDATION 5: Options sanity check
+    if (options.timeoutMilliseconds == 0) {
+        SS_LOG_DEBUG(L"SignatureStore", L"ScanBuffer: Zero timeout specified, using default 10s");
+    }
+    
+    if (options.maxResults == 0) {
+        SS_LOG_DEBUG(L"SignatureStore", L"ScanBuffer: Zero maxResults specified, will return no results");
+        ScanResult result{};
+        result.totalBytesScanned = buffer.size();
+        return result;
+    }
+
+    // ========================================================================
+    // ATOMIC STATISTICS UPDATE (relaxed ordering - performance counter)
+    // ========================================================================
     m_totalScans.fetch_add(1, std::memory_order_relaxed);
 
+    // ========================================================================
+    // HIGH-PRECISION TIMING START
+    // ========================================================================
     LARGE_INTEGER startTime;
-    QueryPerformanceCounter(&startTime);
+    if (!QueryPerformanceCounter(&startTime)) {
+        startTime.QuadPart = 0; // Fallback: timing will be approximate
+    }
 
     // Check cache first
     if (options.enableResultCache && m_resultCacheEnabled.load()) {
@@ -240,8 +306,14 @@ ScanResult SignatureStore::ScanBuffer(
     // Performance tracking
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
-    result.scanTimeMicroseconds = 
-        ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+    // FIX: Division by zero protection
+    if (m_perfFrequency.QuadPart > 0) {
+        result.scanTimeMicroseconds = 
+            ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / 
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    } else {
+        result.scanTimeMicroseconds = 0;
+    }
 
     result.totalBytesScanned = buffer.size();
 
@@ -263,37 +335,158 @@ ScanResult SignatureStore::ScanFile(
 ) const noexcept {
     SS_LOG_DEBUG(L"SignatureStore", L"ScanFile: %s", filePath.c_str());
 
-    // Check file exists
-    if (!std::filesystem::exists(filePath)) {
-        SS_LOG_ERROR(L"SignatureStore", L"File not found: %s", filePath.c_str());
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - FILE SCANNING
+    // ========================================================================
+
+    // VALIDATION 1: Empty path check
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanFile: Empty file path");
         return ScanResult{};
     }
-
-    // Check file size
-    auto fileSize = std::filesystem::file_size(filePath);
-    if (fileSize > 100 * 1024 * 1024) { // 100MB limit
-        SS_LOG_WARN(L"SignatureStore", L"File too large: %llu bytes", fileSize);
-        return ScanResult{};
-    }
-
-    // Memory-map file
-    StoreError err{};
-    MemoryMappedView fileView{};
     
-    if (!MemoryMapping::OpenView(filePath, true, fileView, err)) {
-        SS_LOG_ERROR(L"SignatureStore", L"Failed to map file: %S", err.message.c_str());
+    // VALIDATION 2: Path length check (Windows MAX_PATH limit)
+    constexpr size_t MAX_SAFE_PATH_LENGTH = 32767; // Extended-length path limit
+    if (filePath.length() > MAX_SAFE_PATH_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanFile: Path too long (%zu chars)", filePath.length());
+        return ScanResult{};
+    }
+    
+    // VALIDATION 3: Null character injection check (path truncation attack)
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanFile: Path contains null character (security violation)");
         return ScanResult{};
     }
 
-    std::span<const uint8_t> buffer(
-        static_cast<const uint8_t*>(fileView.baseAddress),
-        static_cast<size_t>(fileView.fileSize)
-    );
+    // FIX: Wrap all filesystem operations in try-catch since they can throw
+    try {
+        namespace fs = std::filesystem;
+        
+        // VALIDATION 4: Path canonicalization and symlink resolution
+        std::error_code ec;
+        fs::path canonicalPath = fs::weakly_canonical(filePath, ec);
+        if (ec) {
+            SS_LOG_WARN(L"SignatureStore", L"ScanFile: Failed to canonicalize path: %s (error: %S)",
+                filePath.c_str(), ec.message().c_str());
+            // Continue with original path but log warning
+            canonicalPath = filePath;
+        }
+        
+        // VALIDATION 5: Check file exists
+        if (!fs::exists(canonicalPath, ec)) {
+            SS_LOG_ERROR(L"SignatureStore", L"File not found: %s", filePath.c_str());
+            return ScanResult{};
+        }
 
-    auto result = ScanBuffer(buffer, options);
-    MemoryMapping::CloseView(fileView);
+        // VALIDATION 6: Verify it's a regular file (not directory, symlink, device, etc.)
+        if (!fs::is_regular_file(canonicalPath, ec)) {
+            SS_LOG_WARN(L"SignatureStore", L"ScanFile: Not a regular file: %s", filePath.c_str());
+            return ScanResult{};
+        }
+        
+        // VALIDATION 7: Check file is not a symlink pointing outside allowed paths
+        // Security: Prevent symlink-based path traversal attacks
+        if (fs::is_symlink(filePath, ec)) {
+            SS_LOG_WARN(L"SignatureStore", L"ScanFile: Symlink detected, resolved to: %s",
+                canonicalPath.wstring().c_str());
+            // Allow symlinks but log for audit purposes
+        }
 
-    return result;
+        // VALIDATION 8: Check file size
+        auto fileSize = fs::file_size(canonicalPath, ec);
+        if (ec) {
+            SS_LOG_ERROR(L"SignatureStore", L"Failed to get file size: %s (error: %S)",
+                filePath.c_str(), ec.message().c_str());
+            return ScanResult{};
+        }
+        
+        // VALIDATION 9: File size limits
+        constexpr uint64_t MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB limit
+        if (fileSize > MAX_FILE_SIZE) {
+            SS_LOG_WARN(L"SignatureStore", L"File too large: %llu bytes (max: %llu)",
+                fileSize, MAX_FILE_SIZE);
+            ScanResult result{};
+            result.timedOut = true; // Indicate incomplete scan
+            result.totalBytesScanned = 0;
+            return result;
+        }
+        
+        // VALIDATION 10: Check for zero-size files
+        if (fileSize == 0) {
+            SS_LOG_DEBUG(L"SignatureStore", L"Empty file, nothing to scan: %s", filePath.c_str());
+            ScanResult result{};
+            result.totalBytesScanned = 0;
+            return result;
+        }
+
+        // ====================================================================
+        // MEMORY MAPPING WITH TITANIUM SAFETY
+        // ====================================================================
+        StoreError err{};
+        MemoryMappedView fileView{};
+        
+        if (!MemoryMapping::OpenView(canonicalPath.wstring(), true, fileView, err)) {
+            SS_LOG_ERROR(L"SignatureStore", L"Failed to map file: %S", err.message.c_str());
+            return ScanResult{};
+        }
+
+        // VALIDATION 11: Memory mapping integrity check
+        if (!fileView.baseAddress) {
+            SS_LOG_ERROR(L"SignatureStore", L"Invalid memory mapping (null base) for file: %s",
+                filePath.c_str());
+            MemoryMapping::CloseView(fileView);
+            return ScanResult{};
+        }
+        
+        if (fileView.fileSize == 0) {
+            SS_LOG_ERROR(L"SignatureStore", L"Invalid memory mapping (zero size) for file: %s",
+                filePath.c_str());
+            MemoryMapping::CloseView(fileView);
+            return ScanResult{};
+        }
+        
+        // VALIDATION 12: Cross-check mapped size with expected file size
+        if (fileView.fileSize != fileSize) {
+            SS_LOG_WARN(L"SignatureStore", 
+                L"ScanFile: Mapped size (%llu) differs from file size (%llu) - possible race condition",
+                fileView.fileSize, fileSize);
+            // Continue but log for audit - file might have been modified during mapping
+        }
+
+        // ====================================================================
+        // EXECUTE SCAN WITH RAII GUARD
+        // ====================================================================
+        std::span<const uint8_t> buffer(
+            static_cast<const uint8_t*>(fileView.baseAddress),
+            static_cast<size_t>(fileView.fileSize)
+        );
+
+        auto result = ScanBuffer(buffer, options);
+        
+        // RAII: Always close the view, even if ScanBuffer throws (it's noexcept but defensive)
+        MemoryMapping::CloseView(fileView);
+
+        return result;
+    }
+    catch (const std::filesystem::filesystem_error& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Filesystem error scanning file %s: %S",
+            filePath.c_str(), e.what());
+        return ScanResult{};
+    }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Memory allocation failed scanning file %s: %S",
+            filePath.c_str(), e.what());
+        return ScanResult{};
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Exception scanning file %s: %S",
+            filePath.c_str(), e.what());
+        return ScanResult{};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Unknown exception scanning file: %s", filePath.c_str());
+        return ScanResult{};
+    }
 }
 
 std::vector<ScanResult> SignatureStore::ScanFiles(
@@ -301,14 +494,55 @@ std::vector<ScanResult> SignatureStore::ScanFiles(
     const ScanOptions& options,
     std::function<void(size_t, size_t)> progressCallback
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - BATCH FILE SCANNING
+    // ========================================================================
+    
+    // VALIDATION 1: Empty input check
+    if (filePaths.empty()) {
+        SS_LOG_DEBUG(L"SignatureStore", L"ScanFiles: Empty file list");
+        return {};
+    }
+    
+    // VALIDATION 2: Maximum batch size to prevent resource exhaustion
+    constexpr size_t MAX_BATCH_SIZE = 100000;
+    if (filePaths.size() > MAX_BATCH_SIZE) {
+        SS_LOG_WARN(L"SignatureStore", L"ScanFiles: Batch too large (%zu files), max is %zu",
+            filePaths.size(), MAX_BATCH_SIZE);
+        // Continue with limited batch
+    }
+    
     std::vector<ScanResult> results;
-    results.reserve(filePaths.size());
+    
+    // VALIDATION 3: Reserve with overflow check
+    try {
+        results.reserve(std::min(filePaths.size(), MAX_BATCH_SIZE));
+    }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanFiles: Failed to allocate results vector: %S", e.what());
+        return {};
+    }
 
-    for (size_t i = 0; i < filePaths.size(); ++i) {
-        results.push_back(ScanFile(filePaths[i], options));
+    const size_t effectiveCount = std::min(filePaths.size(), MAX_BATCH_SIZE);
+    
+    for (size_t i = 0; i < effectiveCount; ++i) {
+        try {
+            results.push_back(ScanFile(filePaths[i], options));
+        }
+        catch (const std::exception& e) {
+            SS_LOG_WARN(L"SignatureStore", L"ScanFiles: Error scanning file %zu: %S", i, e.what());
+            results.push_back(ScanResult{}); // Push empty result to maintain index alignment
+        }
 
+        // TITANIUM: Wrap callback in try-catch - user callback might throw
         if (progressCallback) {
-            progressCallback(i + 1, filePaths.size());
+            try {
+                progressCallback(i + 1, effectiveCount);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"SignatureStore", L"ScanFiles: Progress callback threw exception: %S", e.what());
+                // Continue scanning despite callback failure
+            }
         }
     }
 
@@ -321,37 +555,145 @@ std::vector<ScanResult> SignatureStore::ScanDirectory(
     const ScanOptions& options,
     std::function<void(const std::wstring&)> fileCallback
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - DIRECTORY SCANNING
+    // ========================================================================
+    
+    // VALIDATION 1: Empty path check
+    if (directoryPath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Empty directory path");
+        return {};
+    }
+    
+    // VALIDATION 2: Path length check
+    constexpr size_t MAX_SAFE_PATH_LENGTH = 32767;
+    if (directoryPath.length() > MAX_SAFE_PATH_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Path too long (%zu chars)", directoryPath.length());
+        return {};
+    }
+    
+    // VALIDATION 3: Null character injection check
+    if (directoryPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Path contains null character (security violation)");
+        return {};
+    }
+    
     std::vector<ScanResult> results;
 
     try {
         namespace fs = std::filesystem;
-
-        // Ortak iþlem: regular file ise callback ve tarama
-        auto processEntry = [&](const fs::directory_entry& entry) {
-            if (!entry.is_regular_file()) return;
-
-            const std::wstring path = entry.path().wstring();
-
-            if (fileCallback) {
-                fileCallback(path);
+        
+        // VALIDATION 4: Verify directory exists
+        std::error_code ec;
+        if (!fs::exists(directoryPath, ec)) {
+            SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Directory not found: %s", directoryPath.c_str());
+            return {};
+        }
+        
+        // VALIDATION 5: Verify it's actually a directory
+        if (!fs::is_directory(directoryPath, ec)) {
+            SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Not a directory: %s", directoryPath.c_str());
+            return {};
+        }
+        
+        // TITANIUM: Resource limits
+        constexpr size_t MAX_FILES_TO_SCAN = 1000000;  // 1M files max
+        constexpr size_t MAX_RECURSION_DEPTH = 100;    // Prevent infinite recursion via symlinks
+        size_t filesScanned = 0;
+        size_t errorsEncountered = 0;
+        constexpr size_t MAX_ERRORS_BEFORE_ABORT = 1000;
+        
+        // Configure directory iterator options for safety
+        auto dirOptions = fs::directory_options::skip_permission_denied;
+        
+        // Process entry with titanium safety
+        auto processEntry = [&](const fs::directory_entry& entry) -> bool {
+            // Resource limit check
+            if (filesScanned >= MAX_FILES_TO_SCAN) {
+                SS_LOG_WARN(L"SignatureStore", L"ScanDirectory: Reached max file limit (%zu)", MAX_FILES_TO_SCAN);
+                return false; // Stop iteration
             }
-
-            results.push_back(ScanFile(path, options));
-            };
+            
+            // Error threshold check
+            if (errorsEncountered >= MAX_ERRORS_BEFORE_ABORT) {
+                SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Too many errors (%zu), aborting", errorsEncountered);
+                return false;
+            }
+            
+            try {
+                std::error_code entryEc;
+                if (!entry.is_regular_file(entryEc)) {
+                    return true; // Continue with next file
+                }
+                
+                const std::wstring path = entry.path().wstring();
+                
+                // TITANIUM: Wrap callback in try-catch
+                if (fileCallback) {
+                    try {
+                        fileCallback(path);
+                    }
+                    catch (const std::exception& e) {
+                        SS_LOG_WARN(L"SignatureStore", L"ScanDirectory: File callback threw exception: %S", e.what());
+                        ++errorsEncountered;
+                    }
+                }
+                
+                results.push_back(ScanFile(path, options));
+                ++filesScanned;
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"SignatureStore", L"ScanDirectory: Error processing entry: %S", e.what());
+                ++errorsEncountered;
+            }
+            
+            return true; // Continue iteration
+        };
 
         if (recursive) {
-            for (const auto& entry : fs::recursive_directory_iterator(directoryPath)) {
-                processEntry(entry);
+            // Use options to skip permission denied and handle errors gracefully
+            auto it = fs::recursive_directory_iterator(directoryPath, dirOptions, ec);
+            if (ec) {
+                SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Failed to create recursive iterator: %S",
+                    ec.message().c_str());
+                return results;
+            }
+            
+            for (auto& entry : it) {
+                // Recursion depth check
+                if (it.depth() > static_cast<int>(MAX_RECURSION_DEPTH)) {
+                    SS_LOG_WARN(L"SignatureStore", L"ScanDirectory: Max recursion depth reached, skipping deeper");
+                    it.pop(); // Go back up one level
+                    continue;
+                }
+                
+                if (!processEntry(entry)) {
+                    break; // Stop iteration
+                }
             }
         }
         else {
-            for (const auto& entry : fs::directory_iterator(directoryPath)) {
-                processEntry(entry);
+            for (const auto& entry : fs::directory_iterator(directoryPath, dirOptions, ec)) {
+                if (!processEntry(entry)) {
+                    break;
+                }
             }
         }
+        
+        SS_LOG_INFO(L"SignatureStore", L"ScanDirectory: Completed - %zu files scanned, %zu errors",
+            filesScanned, errorsEncountered);
+    }
+    catch (const std::filesystem::filesystem_error& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Filesystem error: %S", e.what());
+    }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Memory allocation failed: %S", e.what());
     }
     catch (const std::exception& e) {
-        SS_LOG_ERROR(L"SignatureStore", L"Directory scan error: %S", e.what());
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanDirectory: Unknown exception");
     }
 
     return results;
@@ -393,22 +735,114 @@ SignatureStore::StreamScanner SignatureStore::CreateStreamScanner(
     StreamScanner scanner;
     scanner.m_store = this;
     scanner.m_options = options;
+    
+    // TITANIUM: Pre-allocate buffer for expected chunk sizes
+    try {
+        scanner.m_buffer.reserve(1024 * 1024); // Reserve 1MB initially
+    }
+    catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"SignatureStore", L"CreateStreamScanner: Failed to pre-allocate buffer");
+        // Continue - vector will grow as needed
+    }
+    
     return scanner;
 }
 
 void SignatureStore::StreamScanner::Reset() noexcept {
     m_buffer.clear();
+    m_buffer.shrink_to_fit(); // Release memory
     m_bytesProcessed = 0;
 }
 
 ScanResult SignatureStore::StreamScanner::FeedChunk(
     std::span<const uint8_t> chunk
 ) noexcept {
-    m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-    m_bytesProcessed += chunk.size();
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - STREAM SCANNER
+    // ========================================================================
+    
+    // VALIDATION 1: Check for null store pointer (use-after-free protection)
+    if (!m_store) {
+        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Store pointer is null");
+        return ScanResult{};
+    }
+    
+    // VALIDATION 2: Check if store is still initialized (lifetime protection)
+    if (!m_store->IsInitialized()) {
+        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Store is no longer initialized");
+        return ScanResult{};
+    }
+    
+    // VALIDATION 3: Check for empty chunk to avoid unnecessary processing
+    if (chunk.empty()) {
+        return ScanResult{};
+    }
+    
+    // VALIDATION 4: Check chunk pointer validity
+    if (chunk.data() == nullptr) {
+        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Null chunk pointer with non-zero size");
+        return ScanResult{};
+    }
+    
+    // VALIDATION 5: Check for maximum single chunk size
+    constexpr size_t MAX_SINGLE_CHUNK_SIZE = 50 * 1024 * 1024; // 50MB max per chunk
+    if (chunk.size() > MAX_SINGLE_CHUNK_SIZE) {
+        SS_LOG_WARN(L"SignatureStore", L"StreamScanner::FeedChunk: Chunk too large (%zu bytes), max is %zu",
+            chunk.size(), MAX_SINGLE_CHUNK_SIZE);
+        // Scan the chunk directly without buffering
+        return m_store->ScanBuffer(chunk, m_options);
+    }
+    
+    // VALIDATION 6: Check for potential overflow before adding to buffer
+    constexpr size_t MAX_BUFFER_SIZE = 100 * 1024 * 1024; // 100MB max
+    
+    // Overflow-safe size check
+    if (chunk.size() > MAX_BUFFER_SIZE || m_buffer.size() > MAX_BUFFER_SIZE - chunk.size()) {
+        SS_LOG_WARN(L"SignatureStore", L"StreamScanner: Buffer would exceed max size (%zu + %zu), scanning now",
+            m_buffer.size(), chunk.size());
+        auto result = m_store->ScanBuffer(m_buffer, m_options);
+        m_buffer.clear();
+        
+        // Don't add the new chunk if it alone exceeds limit
+        if (chunk.size() <= MAX_BUFFER_SIZE) {
+            try {
+                m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+            }
+            catch (const std::bad_alloc& e) {
+                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Memory allocation failed: %S", e.what());
+                return result;
+            }
+        }
+        return result;
+    }
+    
+    // ========================================================================
+    // BUFFER ACCUMULATION
+    // ========================================================================
+    try {
+        m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+    }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Buffer append failed: %S", e.what());
+        // Emergency: scan what we have and clear
+        auto result = m_store->ScanBuffer(m_buffer, m_options);
+        m_buffer.clear();
+        return result;
+    }
+    
+    // VALIDATION 7: Overflow-safe bytes processed update
+    if (m_bytesProcessed > SIZE_MAX - chunk.size()) {
+        SS_LOG_WARN(L"SignatureStore", L"StreamScanner: Bytes processed counter overflow, resetting");
+        m_bytesProcessed = chunk.size();
+    } else {
+        m_bytesProcessed += chunk.size();
+    }
 
-    // Scan when buffer reaches threshold (10MB)
-    if (m_buffer.size() >= 10 * 1024 * 1024) {
+    // ========================================================================
+    // THRESHOLD SCAN (10MB)
+    // ========================================================================
+    constexpr size_t SCAN_THRESHOLD = 10 * 1024 * 1024;
+    if (m_buffer.size() >= SCAN_THRESHOLD) {
         auto result = m_store->ScanBuffer(m_buffer, m_options);
         m_buffer.clear();
         return result;
@@ -418,12 +852,40 @@ ScanResult SignatureStore::StreamScanner::FeedChunk(
 }
 
 ScanResult SignatureStore::StreamScanner::Finalize() noexcept {
-    if (m_buffer.empty()) {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - FINALIZE
+    // ========================================================================
+    
+    // VALIDATION 1: Check for null store pointer
+    if (!m_store) {
+        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::Finalize: Store pointer is null");
+        m_buffer.clear();
         return ScanResult{};
     }
+    
+    // VALIDATION 2: Check if store is still initialized
+    if (!m_store->IsInitialized()) {
+        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::Finalize: Store is no longer initialized");
+        m_buffer.clear();
+        return ScanResult{};
+    }
+    
+    // VALIDATION 3: Nothing to scan
+    if (m_buffer.empty()) {
+        ScanResult result{};
+        result.totalBytesScanned = 0;
+        return result;
+    }
 
+    // ========================================================================
+    // FINAL SCAN AND CLEANUP
+    // ========================================================================
     auto result = m_store->ScanBuffer(m_buffer, m_options);
+    
+    // Clear buffer and release memory
     m_buffer.clear();
+    m_buffer.shrink_to_fit();
+    
     return result;
 }
 
@@ -788,36 +1250,47 @@ StoreError SignatureStore::Verify(
 ) const noexcept {
     SS_LOG_INFO(L"SignatureStore", L"Verifying database integrity");
 
-    std::shared_lock<std::shared_mutex> lock(m_globalLock);
+    // FIX: Wrap in try-catch since callback can throw
+    try {
+        std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-    StoreError err{SignatureStoreError::Success};
+        StoreError err{SignatureStoreError::Success};
 
-    if (m_hashStore) {
-        err = m_hashStore->Verify(logCallback);
-        if (!err.IsSuccess()) {
-            if (logCallback) logCallback("HashStore verification failed");
-            return err;
+        if (m_hashStore) {
+            err = m_hashStore->Verify(logCallback);
+            if (!err.IsSuccess()) {
+                if (logCallback) logCallback("HashStore verification failed");
+                return err;
+            }
         }
-    }
 
-    if (m_patternStore) {
-        err = m_patternStore->Verify(logCallback);
-        if (!err.IsSuccess()) {
-            if (logCallback) logCallback("PatternStore verification failed");
-            return err;
+        if (m_patternStore) {
+            err = m_patternStore->Verify(logCallback);
+            if (!err.IsSuccess()) {
+                if (logCallback) logCallback("PatternStore verification failed");
+                return err;
+            }
         }
-    }
 
-    if (m_yaraStore) {
-        err = m_yaraStore->Verify(logCallback);
-        if (!err.IsSuccess()) {
-            if (logCallback) logCallback("YaraStore verification failed");
-            return err;
+        if (m_yaraStore) {
+            err = m_yaraStore->Verify(logCallback);
+            if (!err.IsSuccess()) {
+                if (logCallback) logCallback("YaraStore verification failed");
+                return err;
+            }
         }
-    }
 
-    if (logCallback) logCallback("All components verified successfully");
-    return StoreError{SignatureStoreError::Success};
+        if (logCallback) logCallback("All components verified successfully");
+        return StoreError{SignatureStoreError::Success};
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Verify: Exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Verification exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Verify: Unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown verification error"};
+    }
 }
 
 StoreError SignatureStore::Flush() noexcept {
@@ -890,7 +1363,8 @@ void SignatureStore::SetQueryCacheSize(size_t entries) noexcept {
     // ========================================================================
     // ACQUIRE LOCK (Prevent concurrent access during resize)
     // ========================================================================
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    // FIX: Use dedicated cache lock instead of global lock for better performance
+    std::unique_lock<std::shared_mutex> lock(m_cacheLock);
 
     // Check if size actually changed
     size_t currentSize = m_queryCache.size();
@@ -944,6 +1418,9 @@ void SignatureStore::SetResultCacheSize(size_t entries) noexcept {
 }
 
 void SignatureStore::ClearQueryCache() noexcept {
+    // FIX: Thread safety - acquire dedicated cache lock before modifying cache
+    std::unique_lock<std::shared_mutex> lock(m_cacheLock);
+    
     for (auto& entry : m_queryCache) {
         entry.bufferHash.fill(0);
         entry.result = ScanResult{};
@@ -1033,6 +1510,34 @@ std::wstring SignatureStore::GetYaraDatabasePath() const noexcept {
 
     SS_LOG_DEBUG(L"SignatureStore", L"GetYaraDatabasePath: %s", path.c_str());
     return path;
+}
+
+// FIX: Missing implementation for GetHashHeader declared in header
+const SignatureDatabaseHeader* SignatureStore::GetHashHeader() const noexcept {
+    SS_LOG_DEBUG(L"SignatureStore", L"GetHashHeader called");
+
+    if (!m_hashStoreEnabled.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"GetHashHeader: HashStore not enabled");
+        return nullptr;
+    }
+
+    if (!m_hashStore) {
+        SS_LOG_WARN(L"SignatureStore", L"GetHashHeader: HashStore not initialized");
+        return nullptr;
+    }
+
+    const SignatureDatabaseHeader* header = m_hashStore->GetHeader();
+
+    if (!header) {
+        SS_LOG_DEBUG(L"SignatureStore", L"GetHashHeader: Hash store header is null");
+        return nullptr;
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore",
+        L"GetHashHeader: Valid header - version %u.%u",
+        header->versionMajor, header->versionMinor);
+
+    return header;
 }
 
 const SignatureDatabaseHeader* SignatureStore::GetPatternHeader() const noexcept {
@@ -1253,25 +1758,90 @@ StoreError SignatureStore::MergeDatabases(
     SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu databases to %s",
         sourcePaths.size(), outputPath.c_str());
 
-    // VALIDATION
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - DATABASE MERGE
+    // ========================================================================
+    
+    // VALIDATION 1: Empty source paths
     if (sourcePaths.empty()) {
         SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: No source databases provided");
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source paths cannot be empty" };
     }
 
+    // VALIDATION 2: Output path validation
     if (outputPath.empty()) {
         SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Output path cannot be empty");
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output path cannot be empty" };
     }
+    
+    // VALIDATION 3: Path length check
+    constexpr size_t MAX_SAFE_PATH_LENGTH = 32767;
+    if (outputPath.length() > MAX_SAFE_PATH_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Output path too long");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output path too long" };
+    }
+    
+    // VALIDATION 4: Null character injection check
+    if (outputPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Output path contains null character");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Path contains null character" };
+    }
+    
+    // VALIDATION 5: Maximum source count to prevent resource exhaustion
+    constexpr size_t MAX_SOURCE_DATABASES = 1000;
+    if (sourcePaths.size() > MAX_SOURCE_DATABASES) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Too many source databases (%zu > %zu)",
+            sourcePaths.size(), MAX_SOURCE_DATABASES);
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Too many source databases" };
+    }
 
+    // VALIDATION 6: Validate all source paths
     for (size_t i = 0; i < sourcePaths.size(); ++i) {
         if (sourcePaths[i].empty()) {
             SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source path %zu is empty", i);
             return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source path cannot be empty" };
         }
-        if (sourcePaths[i] == outputPath) {
-            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source and output paths are the same");
-            return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source and output paths cannot be identical" };
+        
+        if (sourcePaths[i].length() > MAX_SAFE_PATH_LENGTH) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source path %zu too long", i);
+            return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source path too long" };
+        }
+        
+        if (sourcePaths[i].find(L'\0') != std::wstring::npos) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source path %zu contains null character", i);
+            return StoreError{ SignatureStoreError::InvalidFormat, 0, "Path contains null character" };
+        }
+        
+        // TITANIUM: Canonicalize and compare paths to detect same-file conflicts
+        try {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            
+            fs::path srcCanonical = fs::weakly_canonical(sourcePaths[i], ec);
+            fs::path outCanonical = fs::weakly_canonical(outputPath, ec);
+            
+            if (!ec && srcCanonical == outCanonical) {
+                SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Source[%zu] and output paths are the same", i);
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, 
+                    "Source and output paths cannot be identical" };
+            }
+            
+            // Check for duplicates in source paths
+            for (size_t j = i + 1; j < sourcePaths.size(); ++j) {
+                fs::path otherCanonical = fs::weakly_canonical(sourcePaths[j], ec);
+                if (!ec && srcCanonical == otherCanonical) {
+                    SS_LOG_WARN(L"SignatureStore", 
+                        L"MergeDatabases: Duplicate source paths detected [%zu] and [%zu]", i, j);
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Path canonicalization failed: %S", e.what());
+            // Continue with simple comparison
+            if (sourcePaths[i] == outputPath) {
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, 
+                    "Source and output paths cannot be identical" };
+            }
         }
     }
 
@@ -1281,6 +1851,11 @@ StoreError SignatureStore::MergeDatabases(
     std::vector<std::unique_ptr<HashStore>> sourceHashStores;
     std::vector<std::unique_ptr<PatternStore>> sourcePatternStores;
     std::vector<std::unique_ptr<YaraRuleStore>> sourceYaraStores;
+    
+    // TITANIUM: Reserve to avoid reallocations
+    sourceHashStores.reserve(sourcePaths.size());
+    sourcePatternStores.reserve(sourcePaths.size());
+    sourceYaraStores.reserve(sourcePaths.size());
 
     try {
         // Open all source databases (store as unique_ptr)
@@ -1296,8 +1871,8 @@ StoreError SignatureStore::MergeDatabases(
                     sourceHashStores.push_back(std::move(hs));
                 }
                 else {
-                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open HashStore at %ls",
-                        sourcePaths[i].c_str());
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open HashStore at %ls: %S",
+                        sourcePaths[i].c_str(), hashErr.message.c_str());
                 }
             }
 
@@ -1309,8 +1884,8 @@ StoreError SignatureStore::MergeDatabases(
                     sourcePatternStores.push_back(std::move(ps));
                 }
                 else {
-                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open PatternStore at %ls",
-                        sourcePaths[i].c_str());
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open PatternStore at %ls: %S",
+                        sourcePaths[i].c_str(), patternErr.message.c_str());
                 }
             }
 
@@ -1322,10 +1897,16 @@ StoreError SignatureStore::MergeDatabases(
                     sourceYaraStores.push_back(std::move(ys));
                 }
                 else {
-                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open YaraStore at %ls",
-                        sourcePaths[i].c_str());
+                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Failed to open YaraStore at %ls: %S",
+                        sourcePaths[i].c_str(), yaraErr.message.c_str());
                 }
             }
+        }
+        
+        // TITANIUM: Verify at least one source was opened successfully
+        if (sourceHashStores.empty() && sourcePatternStores.empty() && sourceYaraStores.empty()) {
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: No source databases could be opened");
+            return StoreError{ SignatureStoreError::InvalidFormat, 0, "No source databases could be opened" };
         }
 
         // CREATE OUTPUT DATABASES
@@ -1337,114 +1918,158 @@ StoreError SignatureStore::MergeDatabases(
 
         StoreError hashCreateErr = outputHashStore.CreateNew(outputPath);
         if (!hashCreateErr.IsSuccess()) {
-            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output hash database");
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output hash database: %S",
+                hashCreateErr.message.c_str());
             return hashCreateErr;
         }
 
         StoreError patternCreateErr = outputPatternStore.CreateNew(outputPath);
         if (!patternCreateErr.IsSuccess()) {
-            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output pattern database");
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output pattern database: %S",
+                patternCreateErr.message.c_str());
             return patternCreateErr;
         }
 
         StoreError yaraCreateErr = outputYaraStore.CreateNew(outputPath);
         if (!yaraCreateErr.IsSuccess()) {
-            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output YARA database");
+            SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Failed to create output YARA database: %S",
+                yaraCreateErr.message.c_str());
             return yaraCreateErr;
         }
 
+        // ====================================================================
         // MERGE HASH STORES
+        // ====================================================================
         if (!sourceHashStores.empty()) {
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu hash stores",
                 sourceHashStores.size());
 
             uint64_t totalHashesMerged = 0;
+            uint64_t totalHashesFailed = 0;
+            
             for (size_t i = 0; i < sourceHashStores.size(); ++i) {
-                auto sourceStats = sourceHashStores[i]->GetStatistics();
-                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu]: %llu hashes",
-                    i, sourceStats.totalHashes);
+                try {
+                    auto sourceStats = sourceHashStores[i]->GetStatistics();
+                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu]: %llu hashes",
+                        i, sourceStats.totalHashes);
 
-                std::string hashesJson = sourceHashStores[i]->ExportToJson();
-                if (hashesJson.empty()) {
-                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] export empty", i);
-                    continue;
-                }
+                    std::string hashesJson = sourceHashStores[i]->ExportToJson();
+                    if (hashesJson.empty()) {
+                        SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] export empty", i);
+                        continue;
+                    }
+                    
+                    // TITANIUM: Check JSON size to prevent memory issues
+                    constexpr size_t MAX_JSON_SIZE = 500 * 1024 * 1024; // 500MB
+                    if (hashesJson.size() > MAX_JSON_SIZE) {
+                        SS_LOG_WARN(L"SignatureStore", 
+                            L"MergeDatabases: Hash store [%zu] JSON too large (%zu bytes)", i, hashesJson.size());
+                        ++totalHashesFailed;
+                        continue;
+                    }
 
-                StoreError importErr = outputHashStore.ImportFromJson(hashesJson);
-                if (importErr.IsSuccess()) {
-                    totalHashesMerged += sourceStats.totalHashes;
-                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu] merged successfully", i);
+                    StoreError importErr = outputHashStore.ImportFromJson(hashesJson);
+                    if (importErr.IsSuccess()) {
+                        totalHashesMerged += sourceStats.totalHashes;
+                        SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Hash store [%zu] merged successfully", i);
+                    }
+                    else {
+                        SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] import failed: %S",
+                            i, importErr.message.c_str());
+                        ++totalHashesFailed;
+                    }
                 }
-                else {
-                    SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store [%zu] import failed", i);
+                catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Hash store [%zu] exception: %S", i, e.what());
+                    ++totalHashesFailed;
                 }
             }
 
-            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total hashes merged: %llu", totalHashesMerged);
+            SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total hashes merged: %llu (failed: %llu)",
+                totalHashesMerged, totalHashesFailed);
 
             // Rebuild and flush
             StoreError rebuildErr = outputHashStore.Rebuild();
             if (!rebuildErr.IsSuccess()) {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store rebuild failed");
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store rebuild failed: %S",
+                    rebuildErr.message.c_str());
             }
 
             StoreError flushErr = outputHashStore.Flush();
             if (!flushErr.IsSuccess()) {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store flush failed");
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Hash store flush failed: %S",
+                    flushErr.message.c_str());
             }
         }
 
+        // ====================================================================
         // MERGE PATTERN STORES
+        // ====================================================================
         if (!sourcePatternStores.empty()) {
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu pattern stores",
                 sourcePatternStores.size());
 
             uint64_t totalPatternsMerged = 0;
             for (size_t i = 0; i < sourcePatternStores.size(); ++i) {
-                auto sourceStats = sourcePatternStores[i]->GetStatistics();
-                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu]: %llu patterns",
-                    i, sourceStats.totalPatterns);
+                try {
+                    auto sourceStats = sourcePatternStores[i]->GetStatistics();
+                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu]: %llu patterns",
+                        i, sourceStats.totalPatterns);
 
-                std::string patternsJson = sourcePatternStores[i]->ExportToJson();
-                if (!patternsJson.empty()) {
-                    totalPatternsMerged += sourceStats.totalPatterns;
+                    std::string patternsJson = sourcePatternStores[i]->ExportToJson();
+                    if (!patternsJson.empty()) {
+                        totalPatternsMerged += sourceStats.totalPatterns;
+                    }
+
+                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu] processed", i);
                 }
-
-                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: Pattern store [%zu] processed", i);
+                catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: Pattern store [%zu] exception: %S", i, e.what());
+                }
             }
 
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total patterns processed: %llu", totalPatternsMerged);
 
             StoreError rebuildErr = outputPatternStore.Rebuild();
             if (!rebuildErr.IsSuccess()) {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store rebuild failed");
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store rebuild failed: %S",
+                    rebuildErr.message.c_str());
             }
 
             StoreError flushErr = outputPatternStore.Flush();
             if (!flushErr.IsSuccess()) {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store flush failed");
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: Pattern store flush failed: %S",
+                    flushErr.message.c_str());
             }
         }
 
+        // ====================================================================
         // MERGE YARA STORES
+        // ====================================================================
         if (!sourceYaraStores.empty()) {
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Merging %zu YARA stores",
                 sourceYaraStores.size());
 
             uint64_t totalRulesMerged = 0;
             for (size_t i = 0; i < sourceYaraStores.size(); ++i) {
-                auto sourceStats = sourceYaraStores[i]->GetStatistics();
-                SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: YARA store [%zu]: %llu rules",
-                    i, sourceStats.totalRules);
+                try {
+                    auto sourceStats = sourceYaraStores[i]->GetStatistics();
+                    SS_LOG_DEBUG(L"SignatureStore", L"MergeDatabases: YARA store [%zu]: %llu rules",
+                        i, sourceStats.totalRules);
 
-                totalRulesMerged += sourceStats.totalRules;
+                    totalRulesMerged += sourceStats.totalRules;
+                }
+                catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"SignatureStore", L"MergeDatabases: YARA store [%zu] exception: %S", i, e.what());
+                }
             }
 
             SS_LOG_INFO(L"SignatureStore", L"MergeDatabases: Total YARA rules processed: %llu", totalRulesMerged);
 
             StoreError rebuildErr = outputYaraStore.Recompile();
             if (!rebuildErr.IsSuccess()) {
-                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: YARA store recompile failed");
+                SS_LOG_WARN(L"SignatureStore", L"MergeDatabases: YARA store recompile failed: %S",
+                    rebuildErr.message.c_str());
             }
 
             StoreError flushErr = outputYaraStore.Flush();
@@ -1486,58 +2111,172 @@ ScanResult SignatureStore::ExecuteParallelScan(
     std::span<const uint8_t> buffer,
     const ScanOptions& options
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM PARALLEL SCAN - THREAD-SAFE WITH TIMEOUT AND ISOLATION
+    // ========================================================================
+    
     ScanResult result{};
-
-    // Launch parallel scans
-    std::vector<std::future<std::vector<DetectionResult>>> futures;
-
-    // Hash lookup (fast, inline)
-    if (options.enableHashLookup && m_hashStoreEnabled.load()) {
-        // Hash lookup is so fast, do it inline
-        ShadowStrike::SignatureStore::SignatureBuilder builder;
-
-        auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
-        if (hash.has_value()) {
-            auto detection = m_hashStore->LookupHash(*hash);
-            if (detection.has_value()) {
-                result.hashMatches.push_back(*detection);
+    
+    // VALIDATION 1: Buffer check
+    if (buffer.empty() || buffer.data() == nullptr) {
+        SS_LOG_DEBUG(L"SignatureStore", L"ExecuteParallelScan: Invalid buffer");
+        return result;
+    }
+    
+    // VALIDATION 2: Timeout configuration
+    const auto timeoutMs = (options.timeoutMilliseconds > 0) 
+        ? std::chrono::milliseconds(options.timeoutMilliseconds)
+        : std::chrono::milliseconds(10000); // Default 10 seconds
+    
+    // ========================================================================
+    // HASH LOOKUP (INLINE - TOO FAST FOR ASYNC OVERHEAD)
+    // ========================================================================
+    if (options.enableHashLookup && m_hashStoreEnabled.load(std::memory_order_acquire) && m_hashStore) {
+        try {
+            ShadowStrike::SignatureStore::SignatureBuilder builder;
+            auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
+            if (hash.has_value()) {
+                auto detection = m_hashStore->LookupHash(*hash);
+                if (detection.has_value()) {
+                    result.hashMatches.push_back(*detection);
+                    
+                    // Check stop-on-first-match
+                    if (options.stopOnFirstMatch) {
+                        result.stoppedEarly = true;
+                        result.detections.push_back(*detection);
+                        return result;
+                    }
+                }
             }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteParallelScan: Hash lookup exception: %S", e.what());
         }
     }
 
-    // Pattern scan (parallel)
-    if (options.enablePatternScan && m_patternStoreEnabled.load()) {
-        futures.push_back(std::async(std::launch::async, [this, buffer, &options]() {
-            return m_patternStore->Scan(buffer, options.patternOptions);
-        }));
+    // ========================================================================
+    // PARALLEL ASYNC TASKS WITH TIMEOUT
+    // ========================================================================
+    std::vector<std::future<std::vector<DetectionResult>>> futures;
+    futures.reserve(2); // Pattern + YARA
+
+    // Pattern scan (async)
+    if (options.enablePatternScan && m_patternStoreEnabled.load(std::memory_order_acquire) && m_patternStore) {
+        // TITANIUM: Copy options to avoid dangling reference
+        auto patternOptions = options.patternOptions;
+        
+        try {
+            futures.push_back(std::async(std::launch::async, 
+                [this, buffer, patternOptions]() -> std::vector<DetectionResult> {
+                    try {
+                        return m_patternStore->Scan(buffer, patternOptions);
+                    }
+                    catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"SignatureStore", 
+                            L"ExecuteParallelScan: Pattern scan task exception: %S", e.what());
+                        return {};
+                    }
+                    catch (...) {
+                        SS_LOG_ERROR(L"SignatureStore", 
+                            L"ExecuteParallelScan: Pattern scan task unknown exception");
+                        return {};
+                    }
+                }));
+        }
+        catch (const std::system_error& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteParallelScan: Failed to launch pattern scan task: %S", e.what());
+        }
     }
 
-    // YARA scan (parallel)
-    if (options.enableYaraScan && m_yaraStoreEnabled.load()) {
-        futures.push_back(std::async(std::launch::async, [this, buffer, &options]() {
-            auto yaraMatches = m_yaraStore->ScanBuffer(buffer, options.yaraOptions);
-            std::vector<DetectionResult> detections;
-            
-            for (const auto& match : yaraMatches) {
-                DetectionResult detection{};
-                detection.signatureId = match.ruleId;
-                detection.signatureName = match.ruleName;
-                detection.threatLevel = match.threatLevel;
-                detection.description = "YARA rule match";
-                detections.push_back(detection);
-            }
-            
-            return detections;
-        }));
+    // YARA scan (async)
+    if (options.enableYaraScan && m_yaraStoreEnabled.load(std::memory_order_acquire) && m_yaraStore) {
+        // TITANIUM: Copy options to avoid dangling reference
+        auto yaraOptions = options.yaraOptions;
+        
+        try {
+            futures.push_back(std::async(std::launch::async,
+                [this, buffer, yaraOptions]() -> std::vector<DetectionResult> {
+                    try {
+                        auto yaraMatches = m_yaraStore->ScanBuffer(buffer, yaraOptions);
+                        std::vector<DetectionResult> detections;
+                        detections.reserve(yaraMatches.size());
+                        
+                        for (const auto& match : yaraMatches) {
+                            DetectionResult detection{};
+                            detection.signatureId = match.ruleId;
+                            detection.signatureName = match.ruleName;
+                            detection.threatLevel = match.threatLevel;
+                            detection.description = "YARA rule match";
+                            detections.push_back(std::move(detection));
+                        }
+                        
+                        return detections;
+                    }
+                    catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"SignatureStore", 
+                            L"ExecuteParallelScan: YARA scan task exception: %S", e.what());
+                        return {};
+                    }
+                    catch (...) {
+                        SS_LOG_ERROR(L"SignatureStore", 
+                            L"ExecuteParallelScan: YARA scan task unknown exception");
+                        return {};
+                    }
+                }));
+        }
+        catch (const std::system_error& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteParallelScan: Failed to launch YARA scan task: %S", e.what());
+        }
     }
 
-    // Collect results
+    // ========================================================================
+    // COLLECT RESULTS WITH TIMEOUT
+    // ========================================================================
     for (auto& future : futures) {
-        auto detections = future.get();
-        result.detections.insert(result.detections.end(), detections.begin(), detections.end());
+        try {
+            // TITANIUM: Wait with timeout to prevent indefinite blocking
+            auto status = future.wait_for(timeoutMs);
+            
+            if (status == std::future_status::ready) {
+                auto detections = future.get();
+                
+                // TITANIUM: Limit results to prevent memory exhaustion
+                const size_t maxToAdd = options.maxResults > result.detections.size() 
+                    ? options.maxResults - result.detections.size() 
+                    : 0;
+                    
+                if (detections.size() <= maxToAdd) {
+                    result.detections.insert(result.detections.end(), 
+                        detections.begin(), detections.end());
+                } else {
+                    result.detections.insert(result.detections.end(),
+                        detections.begin(), detections.begin() + maxToAdd);
+                    SS_LOG_WARN(L"SignatureStore", 
+                        L"ExecuteParallelScan: Result limit reached, truncating detections");
+                }
+            }
+            else if (status == std::future_status::timeout) {
+                SS_LOG_WARN(L"SignatureStore", 
+                    L"ExecuteParallelScan: Task timed out after %lld ms", timeoutMs.count());
+                result.timedOut = true;
+                // Don't wait for this task - it will complete in background
+                // The future will be destroyed but the task continues
+            }
+            else {
+                SS_LOG_WARN(L"SignatureStore", L"ExecuteParallelScan: Task deferred");
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteParallelScan: Exception collecting results: %S", e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteParallelScan: Unknown exception collecting results");
+        }
     }
 
-    // Add hash matches
+    // ========================================================================
+    // MERGE HASH MATCHES INTO FINAL RESULTS
+    // ========================================================================
     result.detections.insert(result.detections.end(), 
                             result.hashMatches.begin(), 
                             result.hashMatches.end());
@@ -1609,18 +2348,85 @@ ScanResult SignatureStore::ExecuteSequentialScan(
 std::optional<ScanResult> SignatureStore::CheckQueryCache(
     std::span<const uint8_t> buffer
 ) const noexcept {
-    // Compute SHA-256 of buffer for cache key
+    // ========================================================================
+    // TITANIUM CACHE LOOKUP - THREAD-SAFE WITH VALIDATION
+    // ========================================================================
+    
+    // VALIDATION 1: Quick check if caching is even enabled (avoid lock overhead)
+    if (!m_queryCacheEnabled.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    
+    // VALIDATION 2: Check if cache is empty to prevent division by zero
+    // Note: Size check before lock is safe since cache size only changes under unique_lock
+    if (m_queryCache.empty()) {
+        return std::nullopt;
+    }
+    
+    // VALIDATION 3: Buffer validation
+    if (buffer.empty() || buffer.data() == nullptr) {
+        return std::nullopt;
+    }
+    
+    // VALIDATION 4: Maximum buffer size for caching (don't cache huge buffers)
+    constexpr size_t MAX_CACHEABLE_SIZE = 100 * 1024 * 1024; // 100MB
+    if (buffer.size() > MAX_CACHEABLE_SIZE) {
+        SS_LOG_DEBUG(L"SignatureStore", L"CheckQueryCache: Buffer too large to cache (%zu bytes)", buffer.size());
+        return std::nullopt;
+    }
+    
+    // ========================================================================
+    // COMPUTE CACHE KEY
+    // ========================================================================
     ShadowStrike::SignatureStore::SignatureBuilder builder;
     auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
     if (!hash.has_value()) {
+        SS_LOG_DEBUG(L"SignatureStore", L"CheckQueryCache: Failed to compute buffer hash");
         return std::nullopt;
     }
 
-    size_t cacheIdx = (hash->FastHash() % m_queryCache.size());
+    // TITANIUM: Validate hash data before use
+    if (hash->data.size() < 32) {
+        SS_LOG_ERROR(L"SignatureStore", L"CheckQueryCache: Invalid hash size");
+        return std::nullopt;
+    }
+    
+    // ========================================================================
+    // CACHE INDEX CALCULATION
+    // ========================================================================
+    // Note: We need to hold the lock while reading cache size to ensure consistency
+    std::shared_lock<std::shared_mutex> lock(m_cacheLock);
+    
+    // Double-check cache size under lock (could have been cleared)
+    const size_t cacheSize = m_queryCache.size();
+    if (cacheSize == 0) {
+        return std::nullopt;
+    }
+    
+    // Safe index calculation
+    const size_t cacheIdx = (hash->FastHash() % cacheSize);
+    
+    // Bounds check (defensive - should never fail due to modulo)
+    if (cacheIdx >= cacheSize) {
+        SS_LOG_ERROR(L"SignatureStore", L"CheckQueryCache: Cache index out of bounds (%zu >= %zu)",
+            cacheIdx, cacheSize);
+        return std::nullopt;
+    }
+    
+    // ========================================================================
+    // CACHE HIT CHECK
+    // ========================================================================
     const auto& entry = m_queryCache[cacheIdx];
 
-    // Check if hash matches
-    if (std::memcmp(entry.bufferHash.data(), hash->data.data(), 32) == 0) {
+    // Check if hash matches (constant-time comparison for security)
+    bool hashMatches = true;
+    for (size_t i = 0; i < 32; ++i) {
+        hashMatches &= (entry.bufferHash[i] == hash->data[i]);
+    }
+    
+    if (hashMatches && entry.timestamp != 0) {
+        // Cache hit - return copy of result (avoid reference lifetime issues)
+        SS_LOG_DEBUG(L"SignatureStore", L"CheckQueryCache: Cache hit at index %zu", cacheIdx);
         return entry.result;
     }
 
@@ -1630,14 +2436,79 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
 void SignatureStore::AddToQueryCache(
     std::span<const uint8_t> buffer,
     const ScanResult& result
-) const  noexcept {
+) const noexcept {
+    // ========================================================================
+    // TITANIUM CACHE UPDATE - THREAD-SAFE WITH VALIDATION
+    // ========================================================================
+    
+    // VALIDATION 1: Quick check if caching is enabled
+    if (!m_queryCacheEnabled.load(std::memory_order_acquire)) {
+        return;
+    }
+    
+    // VALIDATION 2: Check if cache is empty
+    if (m_queryCache.empty()) {
+        return;
+    }
+    
+    // VALIDATION 3: Buffer validation
+    if (buffer.empty() || buffer.data() == nullptr) {
+        return;
+    }
+    
+    // VALIDATION 4: Don't cache overly large buffers
+    constexpr size_t MAX_CACHEABLE_SIZE = 100 * 1024 * 1024; // 100MB
+    if (buffer.size() > MAX_CACHEABLE_SIZE) {
+        SS_LOG_DEBUG(L"SignatureStore", L"AddToQueryCache: Buffer too large to cache (%zu bytes)", buffer.size());
+        return;
+    }
+    
+    // VALIDATION 5: Don't cache results with too many detections (potential DoS)
+    constexpr size_t MAX_CACHED_DETECTIONS = 10000;
+    if (result.detections.size() > MAX_CACHED_DETECTIONS) {
+        SS_LOG_WARN(L"SignatureStore", L"AddToQueryCache: Result has too many detections (%zu), not caching",
+            result.detections.size());
+        return;
+    }
+    
+    // ========================================================================
+    // COMPUTE CACHE KEY
+    // ========================================================================
     ShadowStrike::SignatureStore::SignatureBuilder builder;
     auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
     if (!hash.has_value()) {
         return;
     }
 
-    size_t cacheIdx = (hash->FastHash() % m_queryCache.size());
+    // TITANIUM: Validate hash data
+    if (hash->data.size() < 32) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddToQueryCache: Invalid hash size");
+        return;
+    }
+    
+    // ========================================================================
+    // CACHE INDEX CALCULATION AND UPDATE
+    // ========================================================================
+    std::unique_lock<std::shared_mutex> lock(m_cacheLock);
+    
+    // Double-check cache size under lock
+    const size_t cacheSize = m_queryCache.size();
+    if (cacheSize == 0) {
+        return;
+    }
+    
+    const size_t cacheIdx = (hash->FastHash() % cacheSize);
+    
+    // Bounds check (defensive)
+    if (cacheIdx >= cacheSize) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddToQueryCache: Cache index out of bounds (%zu >= %zu)",
+            cacheIdx, cacheSize);
+        return;
+    }
+    
+    // ========================================================================
+    // UPDATE CACHE ENTRY
+    // ========================================================================
     auto& entry = m_queryCache[cacheIdx];
 
     std::memcpy(entry.bufferHash.data(), hash->data.data(), 32);

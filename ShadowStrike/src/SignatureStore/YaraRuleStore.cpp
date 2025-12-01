@@ -57,8 +57,12 @@ YaraCompiler::YaraCompiler()
         SS_LOG_ERROR(L"YaraCompiler", L"Failed to create YARA compiler instance: %d", result);
         m_compiler = nullptr;
         return;
-	}
-    SS_LOG_DEBUG(L"YaraCompiler", L"Created compiler instance");
+    }
+    
+    // TITANIUM: Set error callback to capture compilation errors/warnings
+    yr_compiler_set_callback(m_compiler, ErrorCallback, this);
+    
+    SS_LOG_DEBUG(L"YaraCompiler", L"Created compiler instance with error callback");
 }
 
 YaraCompiler::~YaraCompiler() {
@@ -406,6 +410,7 @@ void YaraCompiler::ErrorCallback(
     int errorLevel,
     const char* fileName,
     int lineNumber,
+    const YR_RULE* rule,          // New YARA API includes rule pointer
     const char* message,
     void* userData
 ) {
@@ -416,6 +421,12 @@ void YaraCompiler::ErrorCallback(
     if (fileName) {
         oss << fileName << "(" << lineNumber << "): ";
     }
+    
+    // Include rule name if available
+    if (rule && rule->identifier) {
+        oss << "[" << rule->identifier << "] ";
+    }
+    
     oss << message;
 
     if (errorLevel == 0) { // Error
@@ -426,13 +437,22 @@ void YaraCompiler::ErrorCallback(
 }
 
 // ============================================================================
-// YARA RULE STORE IMPLEMENTATION
+// YARA RULE STORE IMPLEMENTATION - TITANIUM HARDENED
 // ============================================================================
 
 YaraRuleStore::YaraRuleStore() {
-    if (!QueryPerformanceFrequency(&m_perfFrequency)) {
-        m_perfFrequency.QuadPart = 1000000;
+    // Initialize performance counter with fallback
+    if (!QueryPerformanceFrequency(&m_perfFrequency) || m_perfFrequency.QuadPart == 0) {
+        m_perfFrequency.QuadPart = 1000000; // Fallback to 1MHz (1 tick = 1 microsecond)
+        SS_LOG_WARN(L"YaraRuleStore", L"Constructor: Using fallback performance frequency");
     }
+    
+    // Initialize atomic members explicitly
+    m_initialized.store(false, std::memory_order_relaxed);
+    m_readOnly.store(false, std::memory_order_relaxed);
+    m_totalScans.store(0, std::memory_order_relaxed);
+    m_totalMatches.store(0, std::memory_order_relaxed);
+    m_totalBytesScanned.store(0, std::memory_order_relaxed);
 }
 
 YaraRuleStore::~YaraRuleStore() {
@@ -488,35 +508,77 @@ StoreError YaraRuleStore::Initialize(
 ) noexcept {
     SS_LOG_INFO(L"YaraRuleStore", L"Initialize: %s", databasePath.c_str());
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Already initialized check
     if (m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"Initialize: Already initialized");
         return StoreError{SignatureStoreError::Success};
     }
+    
+    // VALIDATION 2: Path validation
+    if (databasePath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"Initialize: Empty database path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Database path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check
+    if (databasePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"Initialize: Path too long (%zu chars)", databasePath.length());
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Database path too long"};
+    }
+    
+    // VALIDATION 4: Null character injection check
+    if (databasePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"Initialize: Path contains null character (security violation)");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+    
+    // VALIDATION 5: Performance counter initialization
+    if (m_perfFrequency.QuadPart == 0) {
+        if (!QueryPerformanceFrequency(&m_perfFrequency) || m_perfFrequency.QuadPart == 0) {
+            m_perfFrequency.QuadPart = 1000000; // Fallback to 1MHz
+            SS_LOG_WARN(L"YaraRuleStore", L"Initialize: Using fallback performance frequency");
+        }
+    }
 
-    // Ensure YARA is initialized
+    // ========================================================================
+    // YARA INITIALIZATION
+    // ========================================================================
     StoreError err = InitializeYara();
     if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"Initialize: YARA initialization failed");
         return err;
     }
 
     m_databasePath = databasePath;
     m_readOnly.store(readOnly, std::memory_order_release);
 
-    // Open memory mapping
+    // ========================================================================
+    // MEMORY MAPPING
+    // ========================================================================
     err = OpenMemoryMapping(databasePath, readOnly);
     if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"Initialize: Memory mapping failed");
         return err;
     }
 
-    // Load rules
+    // ========================================================================
+    // RULE LOADING
+    // ========================================================================
     err = LoadRulesInternal();
     if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"Initialize: Rule loading failed");
         CloseMemoryMapping();
         return err;
     }
 
     m_initialized.store(true, std::memory_order_release);
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Initialized successfully");
+    SS_LOG_INFO(L"YaraRuleStore", L"Initialized successfully (readOnly=%s)", 
+        readOnly ? L"true" : L"false");
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -581,31 +643,72 @@ StoreError YaraRuleStore::LoadCompiledRules(const std::wstring& compiledRulePath
     return StoreError{ SignatureStoreError::Success };
 }
 
+// ============================================================================
+// TITANIUM: SAFE CLOSE OPERATION
+// ============================================================================
 
 void YaraRuleStore::Close() noexcept {
+    // VALIDATION: Already closed check
     if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_DEBUG(L"YaraRuleStore", L"Close: Already closed or not initialized");
         return;
     }
 
+    SS_LOG_INFO(L"YaraRuleStore", L"Closing YaraRuleStore...");
+
+    // ========================================================================
+    // STEP 1: ACQUIRE EXCLUSIVE LOCK
+    // ========================================================================
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    //free the rules if exists
+    // Double-check after lock acquisition
+    if (!m_initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    // ========================================================================
+    // STEP 2: FREE COMPILED RULES
+    // ========================================================================
     if (m_rules) {
+        // Note: yr_rules_destroy should be called while no scans are in progress
+        // The global lock ensures this
         int destroyResult = yr_rules_destroy(m_rules);
         if (destroyResult != ERROR_SUCCESS) {
-            SS_LOG_ERROR(L"YaraRuleStore", L"Failed to destroy rules during close (error: %d)", destroyResult);
+            SS_LOG_ERROR(L"YaraRuleStore", L"Close: Failed to destroy rules (error: %d)", destroyResult);
+            // Continue closing despite error
         }
         m_rules = nullptr;
     }
 
-    // clear  Metadata
+    // ========================================================================
+    // STEP 3: CLEAR METADATA (with logging)
+    // ========================================================================
+    size_t metadataCount = m_ruleMetadata.size();
     m_ruleMetadata.clear();
+    SS_LOG_DEBUG(L"YaraRuleStore", L"Close: Cleared %zu rule metadata entries", metadataCount);
 
-    //close Memory Mapping
+    // ========================================================================
+    // STEP 4: CLOSE MEMORY MAPPING
+    // ========================================================================
     CloseMemoryMapping();
 
-    // Initialized flag reset
+    // ========================================================================
+    // STEP 5: LOG FINAL STATISTICS
+    // ========================================================================
+    uint64_t totalScans = m_totalScans.load(std::memory_order_relaxed);
+    uint64_t totalMatches = m_totalMatches.load(std::memory_order_relaxed);
+    uint64_t totalBytes = m_totalBytesScanned.load(std::memory_order_relaxed);
+    
+    SS_LOG_INFO(L"YaraRuleStore", 
+        L"Close: Statistics - Scans: %llu, Matches: %llu, Bytes: %llu",
+        totalScans, totalMatches, totalBytes);
+
+    // ========================================================================
+    // STEP 6: RESET STATE
+    // ========================================================================
     m_initialized.store(false, std::memory_order_release);
+    m_readOnly.store(false, std::memory_order_release);
+    // Don't reset statistics - they may be queried after close
 
     SS_LOG_INFO(L"YaraRuleStore", L"Closed successfully");
 }
@@ -618,7 +721,38 @@ std::vector<YaraMatch> YaraRuleStore::ScanBuffer(
     std::span<const uint8_t> buffer,
     const YaraScanOptions& options
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - BUFFER SCANNING
+    // ========================================================================
+    
+    // VALIDATION 1: Initialization state
     if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanBuffer: Store not initialized");
+        return {};
+    }
+    
+    // VALIDATION 2: Empty buffer check
+    if (buffer.empty()) {
+        SS_LOG_DEBUG(L"YaraRuleStore", L"ScanBuffer: Empty buffer, nothing to scan");
+        return {};
+    }
+    
+    // VALIDATION 3: Null pointer check with non-zero size
+    if (buffer.data() == nullptr) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanBuffer: Null buffer pointer with non-empty span");
+        return {};
+    }
+    
+    // VALIDATION 4: Maximum buffer size (DoS protection)
+    if (buffer.size() > YaraTitaniumLimits::MAX_SCAN_BUFFER_SIZE) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanBuffer: Buffer too large (%zu > %zu bytes)",
+            buffer.size(), YaraTitaniumLimits::MAX_SCAN_BUFFER_SIZE);
+        return {};
+    }
+    
+    // VALIDATION 5: Rules loaded check
+    if (!m_rules) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanBuffer: No compiled rules loaded");
         return {};
     }
 
@@ -629,9 +763,39 @@ std::vector<YaraMatch> YaraRuleStore::ScanFile(
     const std::wstring& filePath,
     const YaraScanOptions& options
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - FILE SCANNING
+    // ========================================================================
+    
     SS_LOG_DEBUG(L"YaraRuleStore", L"ScanFile: %s", filePath.c_str());
+    
+    // VALIDATION 1: Empty path check
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Empty file path");
+        return {};
+    }
+    
+    // VALIDATION 2: Path length check
+    if (filePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Path too long (%zu chars)", filePath.length());
+        return {};
+    }
+    
+    // VALIDATION 3: Null character injection check
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Path contains null character (security violation)");
+        return {};
+    }
+    
+    // VALIDATION 4: Initialization state
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanFile: Store not initialized");
+        return {};
+    }
 
-    // Check file size
+    // ========================================================================
+    // FILE SIZE CHECK WITH RAII
+    // ========================================================================
     HANDLE hFile = CreateFileW(
         filePath.c_str(),
         GENERIC_READ,
@@ -643,26 +807,67 @@ std::vector<YaraMatch> YaraRuleStore::ScanFile(
     );
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"Failed to open file");
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to open file (error: %u)", winErr);
         return {};
     }
+
+    // RAII guard for file handle
+    struct FileHandleGuard {
+        HANDLE h;
+        ~FileHandleGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    } handleGuard{ hFile };
 
     LARGE_INTEGER fileSize{};
-    GetFileSizeEx(hFile, &fileSize);
+    if (!GetFileSizeEx(hFile, &fileSize)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to get file size");
+        return {};
+    }
+    
+    // Close handle early - we don't need it for memory mapping
     CloseHandle(hFile);
+    handleGuard.h = INVALID_HANDLE_VALUE; // Prevent double-close in guard
 
+    // VALIDATION 5: File size checks
+    if (fileSize.QuadPart == 0) {
+        SS_LOG_DEBUG(L"YaraRuleStore", L"ScanFile: Empty file, nothing to scan");
+        return {};
+    }
+    
     if (static_cast<uint64_t>(fileSize.QuadPart) > options.maxFileSizeBytes) {
-        SS_LOG_WARN(L"YaraRuleStore", L"File too large: %lld bytes", fileSize.QuadPart);
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanFile: File too large (%lld > %zu bytes)",
+            fileSize.QuadPart, options.maxFileSizeBytes);
         return {};
     }
 
-    // Memory-map file
+    // ========================================================================
+    // MEMORY MAPPING WITH TITANIUM SAFETY
+    // ========================================================================
     StoreError err{};
     MemoryMappedView fileView{};
     
-    if (!ShadowStrike::SignatureStore::MemoryMapping::OpenView(filePath,true,fileView,err)) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"Failed to map file: %S", err.message.c_str());
+    if (!ShadowStrike::SignatureStore::MemoryMapping::OpenView(filePath, true, fileView, err)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to map file: %S", err.message.c_str());
         return {};
+    }
+    
+    // RAII guard for memory mapping
+    struct MappingGuard {
+        MemoryMappedView* view;
+        ~MappingGuard() { if (view) ShadowStrike::SignatureStore::MemoryMapping::CloseView(*view); }
+    } mappingGuard{ &fileView };
+    
+    // VALIDATION 6: Memory mapping integrity
+    if (!fileView.baseAddress || fileView.fileSize == 0) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Invalid memory mapping");
+        return {};
+    }
+    
+    // VALIDATION 7: Cross-check sizes
+    if (fileView.fileSize != static_cast<uint64_t>(fileSize.QuadPart)) {
+        SS_LOG_WARN(L"YaraRuleStore", 
+            L"ScanFile: Mapped size differs from file size (TOCTOU warning)");
+        // Continue but log for audit
     }
 
     std::span<const uint8_t> buffer(
@@ -670,31 +875,61 @@ std::vector<YaraMatch> YaraRuleStore::ScanFile(
         static_cast<size_t>(fileView.fileSize)
     );
 
-    auto results = ScanBuffer(buffer, options);
-    ShadowStrike::SignatureStore::MemoryMapping::CloseView(fileView);
-    
-    return results;
+    // Execute scan - mapping will be closed by RAII guard
+    return ScanBuffer(buffer, options);
 }
 
 std::vector<YaraMatch> YaraRuleStore::ScanProcess(
     uint32_t processId,
     const YaraScanOptions& options
 ) const noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - PROCESS SCANNING
+    // ========================================================================
+    
     SS_LOG_DEBUG(L"YaraRuleStore", L"ScanProcess: PID=%u", processId);
 
     std::vector<YaraMatch> matches;
 
+    // VALIDATION 1: Process ID sanity check
+    if (processId == 0) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: Invalid PID 0 (System Idle Process)");
+        return matches;
+    }
+    
+    // VALIDATION 2: Self-scan protection (debugging only)
+    if (processId == GetCurrentProcessId()) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanProcess: Scanning self (PID=%u) - use with caution", processId);
+        // Allow but warn
+    }
+    
+    // VALIDATION 3: System process protection (PID 4 = System)
+    if (processId == 4) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ScanProcess: Scanning System process (PID=4)");
+        // Allow but warn - may fail due to permissions
+    }
+
+    // VALIDATION 4: Initialization state
     if (!m_initialized.load(std::memory_order_acquire)) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"Not initialized");
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: Store not initialized");
         return matches;
     }
 
+    // VALIDATION 5: Rules loaded check
     if (!m_rules) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"No compiled rules loaded");
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: No compiled rules loaded");
+        return matches;
+    }
+    
+    // VALIDATION 6: Performance counter (prevent division by zero)
+    if (m_perfFrequency.QuadPart == 0) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: Performance counter not initialized");
         return matches;
     }
 
-    // Open process with appropriate access rights
+    // ========================================================================
+    // PROCESS HANDLE ACQUISITION WITH RAII
+    // ========================================================================
     HANDLE hProcess = OpenProcess(
         PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
         FALSE,
@@ -703,7 +938,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
 
     if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
         DWORD winErr = GetLastError();
-        SS_LOG_ERROR(L"YaraRuleStore", L"OpenProcess failed for PID=%u (error: %u)",
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: OpenProcess failed for PID=%u (error: %u)",
             processId, winErr);
         return matches;
     }
@@ -711,20 +946,28 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
     // RAII handle guard
     struct ProcessHandleGuard {
         HANDLE handle;
-        ~ProcessHandleGuard() { if (handle) CloseHandle(handle); }
+        ~ProcessHandleGuard() { if (handle && handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
     } guard{ hProcess };
 
-    // Statistics
+    // ========================================================================
+    // STATISTICS & TIMING
+    // ========================================================================
     m_totalScans.fetch_add(1, std::memory_order_relaxed);
 
-    LARGE_INTEGER startTime;
-    QueryPerformanceCounter(&startTime);
+    LARGE_INTEGER startTime{};
+    if (!QueryPerformanceCounter(&startTime)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: Failed to get start time");
+        return matches;
+    }
 
-    // Context for callback
+    // ========================================================================
+    // CALLBACK CONTEXT SETUP (TITANIUM SAFE)
+    // ========================================================================
     struct ScanCallbackContext {
         const YaraRuleStore* store;
         std::vector<YaraMatch>* matches;
-        uint64_t scanStartUs;
+        LARGE_INTEGER scanStartTime;
+        LARGE_INTEGER perfFrequency;
         uint32_t maxMatchesPerRule;
         ThreatLevel minThreatLevel;
     };
@@ -732,25 +975,41 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
     ScanCallbackContext ctx{};
     ctx.store = this;
     ctx.matches = &matches;
-    ctx.scanStartUs = 0;
+    ctx.scanStartTime = startTime;
+    ctx.perfFrequency = m_perfFrequency;
     ctx.maxMatchesPerRule = options.maxMatchesPerRule;
     ctx.minThreatLevel = options.minThreatLevel;
 
-    // YARA callback for process scan
+    // ========================================================================
+    // YARA CALLBACK FOR PROCESS SCAN (TITANIUM SAFE)
+    // ========================================================================
     auto callback = [](YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data) -> int {
+        // VALIDATION: Null user_data check
+        if (!user_data) {
+            return CALLBACK_ABORT;
+        }
+        
         auto* ctx = static_cast<ScanCallbackContext*>(user_data);
+        
+        // VALIDATION: Context sanity
+        if (!ctx->store || !ctx->matches) {
+            return CALLBACK_ABORT;
+        }
 
         if (message == CALLBACK_MSG_RULE_MATCHING) {
             auto* rule = static_cast<YR_RULE*>(message_data);
 
+            // VALIDATION: Rule pointer and identifier
             if (!rule || !rule->identifier) {
                 return CALLBACK_CONTINUE;
             }
 
             std::string ruleName = rule->identifier;
+            std::string ruleNamespace = rule->ns ? rule->ns->name : "default";
+            std::string fullName = ruleNamespace + "::" + ruleName;
 
-            // Get rule metadata
-            auto metadataIt = ctx->store->m_ruleMetadata.find(ruleName);
+            // Get rule metadata (read access - should be thread-safe if caller holds shared lock)
+            auto metadataIt = ctx->store->m_ruleMetadata.find(fullName);
             if (metadataIt != ctx->store->m_ruleMetadata.end()) {
                 // Filter by threat level
                 if (static_cast<uint8_t>(metadataIt->second.threatLevel) <
@@ -762,58 +1021,62 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
             // Build match result
             YaraMatch match{};
             match.ruleName = ruleName;
-            match.namespace_ = rule->ns ? rule->ns->name : "default";
+            match.namespace_ = ruleNamespace;
 
-            // Get metadata
+            // Get metadata if available
             if (metadataIt != ctx->store->m_ruleMetadata.end()) {
                 match.ruleId = metadataIt->second.ruleId;
                 match.threatLevel = metadataIt->second.threatLevel;
                 match.tags = metadataIt->second.tags;
             }
 
-            // Extract string matches
+            // Extract string matches with bounds checking
             YR_STRING* string = nullptr;
             yr_rule_strings_foreach(rule, string) {
+                if (!string || !string->identifier) continue;
+                
                 YR_MATCH* match_info = nullptr;
                 yr_string_matches_foreach(context, string, match_info) {
+                    if (!match_info) continue;
+                    
                     YaraMatch::StringMatch strMatch{};
                     strMatch.identifier = string->identifier;
                     strMatch.offsets.push_back(match_info->offset);
 
-                    // Add match data if requested and available
+                    // Add match data if available with size limit
                     if (match_info->data && match_info->data_length > 0) {
+                        size_t safeLen = std::min(static_cast<size_t>(match_info->data_length), 
+                                                   static_cast<size_t>(1024)); // 1KB limit
                         std::string matchData(
                             reinterpret_cast<const char*>(match_info->data),
-                            match_info->data_length
+                            safeLen
                         );
-                        strMatch.data.push_back(matchData);
+                        strMatch.data.push_back(std::move(matchData));
                     }
 
-                    match.stringMatches.push_back(strMatch);
+                    match.stringMatches.push_back(std::move(strMatch));
 
                     // Limit matches per rule
                     if (match.stringMatches.size() >= ctx->maxMatchesPerRule) {
-                        break;
+                        goto process_string_matches_done;
                     }
                 }
-
-                if (match.stringMatches.size() >= ctx->maxMatchesPerRule) {
-                    break;
-                }
             }
+        process_string_matches_done:
 
-            // Calculate match time
-            LARGE_INTEGER endTime;
-            QueryPerformanceCounter(&endTime);
-            LARGE_INTEGER freq;
-            QueryPerformanceFrequency(&freq);
-            match.matchTimeMicroseconds =
-                ((endTime.QuadPart - ctx->scanStartUs) * 1000000ULL) / freq.QuadPart;
+            // Calculate match time (division by zero safe)
+            if (ctx->perfFrequency.QuadPart > 0) {
+                LARGE_INTEGER endTime{};
+                QueryPerformanceCounter(&endTime);
+                match.matchTimeMicroseconds =
+                    ((endTime.QuadPart - ctx->scanStartTime.QuadPart) * 1000000ULL) / 
+                    ctx->perfFrequency.QuadPart;
+            }
 
             ctx->matches->push_back(std::move(match));
 
-            // Update hit count
-            const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(ruleName);
+            // Update hit count (use fullName that includes namespace)
+            const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(fullName);
         }
 
         return CALLBACK_CONTINUE;
@@ -871,26 +1134,75 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
     return matches;
 }
 
+// ============================================================================
+// SCAN CONTEXT (STREAMING INTERFACE) - TITANIUM HARDENED
+// ============================================================================
+
 YaraRuleStore::ScanContext YaraRuleStore::CreateScanContext(
     const YaraScanOptions& options
 ) const noexcept {
     ScanContext ctx;
     ctx.m_store = this;
     ctx.m_options = options;
+    ctx.m_isValid = m_initialized.load(std::memory_order_acquire) && m_rules != nullptr;
     return ctx;
 }
 
 void YaraRuleStore::ScanContext::Reset() noexcept {
     m_buffer.clear();
+    m_buffer.shrink_to_fit(); // Release memory
+    m_totalBytesProcessed = 0;
 }
 
 std::vector<YaraMatch> YaraRuleStore::ScanContext::FeedChunk(
     std::span<const uint8_t> chunk
 ) noexcept {
-    m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+    // ========================================================================
+    // TITANIUM VALIDATION
+    // ========================================================================
+    
+    // VALIDATION 1: Context validity
+    if (!m_isValid || !m_store) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanContext::FeedChunk: Invalid context");
+        return {};
+    }
+    
+    // VALIDATION 2: Empty chunk check
+    if (chunk.empty()) {
+        return {};
+    }
+    
+    // VALIDATION 3: Null pointer with non-empty span
+    if (chunk.data() == nullptr) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanContext::FeedChunk: Null chunk pointer");
+        return {};
+    }
+    
+    // VALIDATION 4: Buffer overflow protection
+    constexpr size_t MAX_CONTEXT_BUFFER = 100 * 1024 * 1024; // 100MB max
+    if (m_buffer.size() + chunk.size() > MAX_CONTEXT_BUFFER) {
+        SS_LOG_ERROR(L"YaraRuleStore", 
+            L"ScanContext::FeedChunk: Buffer would exceed limit (%zu + %zu > %zu)",
+            m_buffer.size(), chunk.size(), MAX_CONTEXT_BUFFER);
+        // Force scan current buffer and clear
+        auto results = m_store->ScanBuffer(m_buffer, m_options);
+        m_buffer.clear();
+        return results;
+    }
+    
+    // Add chunk to buffer
+    try {
+        m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+        m_totalBytesProcessed += chunk.size();
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanContext::FeedChunk: Memory allocation failed");
+        m_buffer.clear();
+        return {};
+    }
 
-    // Scan when buffer reaches threshold
-    if (m_buffer.size() >= 10 * 1024 * 1024) { // 10MB
+    // Scan when buffer reaches threshold (10MB)
+    constexpr size_t SCAN_THRESHOLD = 10 * 1024 * 1024;
+    if (m_buffer.size() >= SCAN_THRESHOLD) {
         auto results = m_store->ScanBuffer(m_buffer, m_options);
         m_buffer.clear();
         return results;
@@ -900,17 +1212,24 @@ std::vector<YaraMatch> YaraRuleStore::ScanContext::FeedChunk(
 }
 
 std::vector<YaraMatch> YaraRuleStore::ScanContext::Finalize() noexcept {
+    // VALIDATION: Context validity
+    if (!m_isValid || !m_store) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanContext::Finalize: Invalid context");
+        return {};
+    }
+    
     if (m_buffer.empty()) {
         return {};
     }
 
     auto results = m_store->ScanBuffer(m_buffer, m_options);
     m_buffer.clear();
+    m_buffer.shrink_to_fit(); // Release memory
     return results;
 }
 
 // ============================================================================
-// RULE MANAGEMENT
+// RULE MANAGEMENT - TITANIUM CORE SCAN ENGINE
 // ============================================================================
 
 std::vector<YaraMatch> YaraRuleStore::PerformScan(
@@ -921,20 +1240,54 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
     std::vector<YaraMatch> matches;
 
     // ========================================================================
-    // VALIDATION
+    // TITANIUM VALIDATION LAYER
     // ========================================================================
-    if (!buffer || size == 0) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"Invalid buffer");
+    
+    // VALIDATION 1: Buffer pointer
+    if (!buffer) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"PerformScan: Null buffer pointer");
+        return matches;
+    }
+    
+    // VALIDATION 2: Buffer size
+    if (size == 0) {
+        SS_LOG_DEBUG(L"YaraRuleStore", L"PerformScan: Zero-size buffer, nothing to scan");
+        return matches;
+    }
+    
+    // VALIDATION 3: Maximum buffer size (DoS protection)
+    if (size > YaraTitaniumLimits::MAX_SCAN_BUFFER_SIZE) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"PerformScan: Buffer exceeds limit (%zu > %zu)",
+            size, YaraTitaniumLimits::MAX_SCAN_BUFFER_SIZE);
         return matches;
     }
 
+    // VALIDATION 4: Rules loaded
     if (!m_rules) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"No compiled rules loaded");
+        SS_LOG_ERROR(L"YaraRuleStore", L"PerformScan: No compiled rules loaded");
         return matches;
     }
+    
+    // VALIDATION 5: Performance counter (prevent division by zero)
+    if (m_perfFrequency.QuadPart == 0) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"PerformScan: Performance counter not initialized");
+        return matches;
+    }
+    
+    // VALIDATION 6: Options sanity
+    const uint32_t safeMaxMatches = std::min(options.maxMatchesPerRule, 
+                                              YaraTitaniumLimits::ABSOLUTE_MAX_MATCHES_PER_RULE);
+    const uint32_t safeTimeout = std::clamp(options.timeoutSeconds,
+                                             YaraTitaniumLimits::MIN_TIMEOUT_SECONDS,
+                                             YaraTitaniumLimits::MAX_TIMEOUT_SECONDS);
 
-    // Reserve space to minimize reallocations
-    matches.reserve(options.maxMatchesPerRule * 10);
+    // Reserve space to minimize reallocations (conservative estimate)
+    try {
+        matches.reserve(std::min(static_cast<size_t>(safeMaxMatches * 10), static_cast<size_t>(1000)));
+    } catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"YaraRuleStore", L"PerformScan: Failed to reserve match vector");
+        // Continue - vector will grow as needed
+    }
 
     // ========================================================================
     // STATISTICS & TIMING
@@ -942,12 +1295,18 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
     m_totalScans.fetch_add(1, std::memory_order_relaxed);
     m_totalBytesScanned.fetch_add(size, std::memory_order_relaxed);
 
-    LARGE_INTEGER startTime;
-    QueryPerformanceCounter(&startTime);
+    LARGE_INTEGER startTime{};
+    if (!QueryPerformanceCounter(&startTime)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"PerformScan: Failed to get start time");
+        startTime.QuadPart = 0;
+    }
 
     // ========================================================================
-    // CALLBACK CONTEXT SETUP
+    // CALLBACK CONTEXT SETUP (TITANIUM SAFE)
     // ========================================================================
+    // DoS protection constant - absolute max matches allowed per scan
+    constexpr size_t MAX_TOTAL_MATCHES = 100000;
+    
     struct ScanCallbackContext {
         std::vector<YaraMatch>* matches;
         const YaraRuleStore* store;
@@ -956,16 +1315,19 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
         bool captureMatchData;
         LARGE_INTEGER perfFrequency;
         LARGE_INTEGER scanStartTime;
+        size_t totalMatchesAdded{0};          // Track total matches to prevent DoS
+        size_t maxTotalMatches;               // Max total matches allowed
     };
 
     ScanCallbackContext ctx{};
     ctx.matches = &matches;
     ctx.store = this;
-    ctx.maxMatchesPerRule = options.maxMatchesPerRule;
+    ctx.maxMatchesPerRule = safeMaxMatches;
     ctx.minThreatLevel = options.minThreatLevel;
     ctx.captureMatchData = options.captureMatchData;
     ctx.perfFrequency = m_perfFrequency;
     ctx.scanStartTime = startTime;
+    ctx.maxTotalMatches = MAX_TOTAL_MATCHES;
 
     // ========================================================================
     // CALLBACK FUNCTION (C-compatible static function)
@@ -1071,8 +1433,15 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
                 ((currentTime.QuadPart - ctx->scanStartTime.QuadPart) * 1000000ULL) /
                 ctx->perfFrequency.QuadPart;
 
+            // DoS protection: Check total matches limit
+            if (ctx->totalMatchesAdded >= ctx->maxTotalMatches) {
+                SS_LOG_WARN(L"YaraRuleStore", L"PerformScan: Maximum total matches reached, aborting scan");
+                return CALLBACK_ABORT;
+            }
+
             // Add to results
             ctx->matches->push_back(std::move(match));
+            ctx->totalMatchesAdded++;
 
             // Update hit count (const_cast safe here - we own the mutex)
             const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(fullName);
@@ -1091,7 +1460,7 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
         scanFlags |= SCAN_FLAGS_FAST_MODE;
     }
 
-    // Execute YARA scan
+    // Execute YARA scan with safe timeout
     int result = yr_rules_scan_mem(
         m_rules,
         static_cast<const uint8_t*>(buffer),
@@ -1099,17 +1468,21 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
         scanFlags,
         callback,
         &ctx,
-        static_cast<int>(options.timeoutSeconds)
+        static_cast<int>(safeTimeout)
     );
 
     // ========================================================================
-    // POST-PROCESSING
+    // POST-PROCESSING (TITANIUM)
     // ========================================================================
-    LARGE_INTEGER endTime;
-    QueryPerformanceCounter(&endTime);
+    LARGE_INTEGER endTime{};
+    if (!QueryPerformanceCounter(&endTime)) {
+        endTime.QuadPart = startTime.QuadPart; // Fallback
+    }
 
-    uint64_t totalScanTimeUs =
-        ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+    uint64_t totalScanTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        totalScanTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+    }
 
     // Handle scan result
     if (result == ERROR_SUCCESS) {
@@ -1419,17 +1792,87 @@ StoreError YaraRuleStore::AddRulesFromFile(
     return compiler.AddFile(filePath, namespace_);
 }
 
+// ============================================================================
+// TITANIUM: DIRECTORY-BASED RULE LOADING
+// ============================================================================
+
 StoreError YaraRuleStore::AddRulesFromDirectory(
     const std::wstring& directoryPath,
     const std::string& namespace_,
     std::function<void(size_t, size_t)> progressCallback
 ) noexcept {
+    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromDirectory: %s", directoryPath.c_str());
+    
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromDirectory: Database is read-only");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Database is read-only"};
+    }
+    
+    // VALIDATION 2: Directory path validation
+    if (directoryPath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromDirectory: Empty directory path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Directory path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check
+    if (directoryPath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromDirectory: Path too long");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Path too long"};
+    }
+    
+    // VALIDATION 4: Null character check
+    if (directoryPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromDirectory: Path contains null character");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+    
+    // VALIDATION 5: Namespace validation
+    if (namespace_.length() > YaraTitaniumLimits::MAX_NAMESPACE_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromDirectory: Namespace too long");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace too long"};
+    }
+    
+    // VALIDATION 6: Namespace character check
+    if (!namespace_.empty()) {
+        if (!std::all_of(namespace_.begin(), namespace_.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_';
+        })) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromDirectory: Invalid namespace characters");
+            return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace must be alphanumeric"};
+        }
+    }
+    
+    // ========================================================================
+    // FIND YARA FILES
+    // ========================================================================
     auto yaraFiles = YaraUtils::FindYaraFiles(directoryPath, true);
     
     if (yaraFiles.empty()) {
+        SS_LOG_WARN(L"YaraRuleStore", L"AddRulesFromDirectory: No YARA files found in %s", 
+            directoryPath.c_str());
         return StoreError{SignatureStoreError::FileNotFound, 0, "No YARA files found"};
     }
+    
+    // VALIDATION 7: File count limit (DoS protection)
+    if (yaraFiles.size() > YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO) {
+        SS_LOG_ERROR(L"YaraRuleStore", 
+            L"AddRulesFromDirectory: Too many YARA files (%zu > %zu limit)",
+            yaraFiles.size(), YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO);
+        return StoreError{SignatureStoreError::TooLarge, 0, 
+            "Directory contains too many YARA files (max: " + 
+            std::to_string(YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO) + ")"};
+    }
+    
+    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromDirectory: Found %zu YARA files", yaraFiles.size());
 
+    // ========================================================================
+    // COMPILE ALL FILES
+    // ========================================================================
     YaraCompiler compiler;
     return compiler.AddFiles(yaraFiles, namespace_, progressCallback);
 }
@@ -2078,10 +2521,54 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
     return StoreError{ SignatureStoreError::Success };
 }
 
+// ============================================================================
+// TITANIUM: THREAD-SAFE HIT COUNT UPDATE
+// ============================================================================
+
 void YaraRuleStore::UpdateRuleHitCount(const std::string& ruleName) noexcept {
+    // TITANIUM: This function is called from YARA callbacks during scanning.
+    // The scan mutex (m_scanMutex) is already held by the caller, but we need
+    // the global lock for m_ruleMetadata access.
+    //
+    // CRITICAL: Use try_lock to avoid deadlock. If we can't acquire the lock
+    // immediately, skip the update - hit counts are best-effort statistics.
+    
+    // VALIDATION: Empty rule name check
+    if (ruleName.empty()) {
+        return;
+    }
+    
+    // Try to acquire shared lock first (read-only lookup)
+    // If metadata doesn't exist, we don't need to update
+    {
+        std::shared_lock<std::shared_mutex> readLock(m_globalLock, std::try_to_lock);
+        if (!readLock.owns_lock()) {
+            // Can't acquire lock - skip update to avoid deadlock
+            SS_LOG_DEBUG(L"YaraRuleStore", L"UpdateRuleHitCount: Skipped (lock contention)");
+            return;
+        }
+        
+        auto it = m_ruleMetadata.find(ruleName);
+        if (it == m_ruleMetadata.end()) {
+            return; // Rule not found, nothing to update
+        }
+    }
+    
+    // Now try to acquire exclusive lock for write
+    std::unique_lock<std::shared_mutex> writeLock(m_globalLock, std::try_to_lock);
+    if (!writeLock.owns_lock()) {
+        // Can't acquire lock - skip update to avoid deadlock
+        SS_LOG_DEBUG(L"YaraRuleStore", L"UpdateRuleHitCount: Skipped write (lock contention)");
+        return;
+    }
+    
+    // Double-check after acquiring write lock (the map could have changed)
     auto it = m_ruleMetadata.find(ruleName);
     if (it != m_ruleMetadata.end()) {
-        it->second.hitCount++;
+        // Safe increment (overflow protection)
+        if (it->second.hitCount < UINT32_MAX) {
+            it->second.hitCount++;
+        }
     }
 }
 
@@ -2229,7 +2716,7 @@ StoreError YaraRuleStore::TestRule(
 }
 
 // ============================================================================
-// EXPORT/IMPORT OPERATIONS
+// EXPORT/IMPORT OPERATIONS - TITANIUM HARDENED
 // ============================================================================
 
 StoreError YaraRuleStore::ExportCompiled(
@@ -2237,33 +2724,113 @@ StoreError YaraRuleStore::ExportCompiled(
 ) const noexcept {
     SS_LOG_INFO(L"YaraRuleStore", L"ExportCompiled: %s", outputPath.c_str());
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Empty path check
+    if (outputPath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Empty output path");
+        return StoreError{ SignatureStoreError::FileNotFound, 0, "Output path is empty" };
+    }
+    
+    // VALIDATION 2: Path length check
+    if (outputPath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Path too long");
+        return StoreError{ SignatureStoreError::FileNotFound, 0, "Output path too long" };
+    }
+    
+    // VALIDATION 3: Null character check
+    if (outputPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Path contains null character");
+        return StoreError{ SignatureStoreError::AccessDenied, 0, "Path contains null character" };
+    }
+    
+    // VALIDATION 4: Rules exist check
     if (!m_rules) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: No compiled rules to export");
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "No compiled rules to export" };
     }
 
-    std::ofstream file(outputPath, std::ios::binary);
-    if (!file.is_open()) {
-        return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot create export file" };
+    // ========================================================================
+    // ATOMIC FILE WRITE (Write to temp, then rename)
+    // ========================================================================
+    std::wstring tempPath = outputPath + L".tmp";
+    
+    {
+        std::ofstream file(tempPath, std::ios::binary);
+        if (!file.is_open()) {
+            DWORD winErr = GetLastError();
+            SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Cannot create temp file (error: %u)", winErr);
+            return StoreError{ SignatureStoreError::FileNotFound, winErr, "Cannot create export file" };
+        }
+
+        // Use shared lock for reading metadata
+        std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+        // Write header
+        constexpr uint32_t magic = 0x59415241; // 'YARA'
+        file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        
+        if (!file.good()) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Failed to write magic number");
+            lock.unlock();
+            DeleteFileW(tempPath.c_str());
+            return StoreError{ SignatureStoreError::MappingFailed, 0, "Failed to write to file" };
+        }
+
+        uint32_t ruleCount = static_cast<uint32_t>(m_ruleMetadata.size());
+        file.write(reinterpret_cast<const char*>(&ruleCount), sizeof(ruleCount));
+
+        // Write rule metadata
+        for (const auto& [name, metadata] : m_ruleMetadata) {
+            // Validate name length before cast
+            if (name.length() > UINT32_MAX) {
+                SS_LOG_WARN(L"YaraRuleStore", L"ExportCompiled: Rule name too long, skipping");
+                continue;
+            }
+            
+            uint32_t nameLen = static_cast<uint32_t>(name.length());
+            file.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
+            file.write(name.data(), nameLen);
+
+            if (metadata.namespace_.length() > UINT32_MAX) {
+                SS_LOG_WARN(L"YaraRuleStore", L"ExportCompiled: Namespace too long, skipping");
+                continue;
+            }
+            
+            uint32_t nsLen = static_cast<uint32_t>(metadata.namespace_.length());
+            file.write(reinterpret_cast<const char*>(&nsLen), sizeof(nsLen));
+            file.write(metadata.namespace_.data(), nsLen);
+            
+            if (!file.good()) {
+                SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Write error during export");
+                lock.unlock();
+                file.close();
+                DeleteFileW(tempPath.c_str());
+                return StoreError{ SignatureStoreError::MappingFailed, 0, "Write error during export" };
+            }
+        }
+
+        file.close();
     }
-
-    uint32_t magic = 0x59415241; // 'YARA'
-    file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-
-    uint32_t ruleCount = static_cast<uint32_t>(m_ruleMetadata.size());
-    file.write(reinterpret_cast<const char*>(&ruleCount), sizeof(ruleCount));
-
-    for (const auto& [name, metadata] : m_ruleMetadata) {
-        uint32_t nameLen = static_cast<uint32_t>(name.length());
-        file.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
-        file.write(name.data(), nameLen);
-
-        uint32_t nsLen = static_cast<uint32_t>(metadata.namespace_.length());
-        file.write(reinterpret_cast<const char*>(&nsLen), sizeof(nsLen));
-        file.write(metadata.namespace_.data(), nsLen);
+    
+    // ========================================================================
+    // ATOMIC RENAME
+    // ========================================================================
+    // Delete target if exists
+    DeleteFileW(outputPath.c_str());
+    
+    // Rename temp to target
+    if (!MoveFileW(tempPath.c_str(), outputPath.c_str())) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"ExportCompiled: Failed to rename temp file (error: %u)", winErr);
+        DeleteFileW(tempPath.c_str());
+        return StoreError{ SignatureStoreError::MappingFailed, winErr, "Failed to finalize export" };
     }
-
-    file.close();
-    SS_LOG_INFO(L"YaraRuleStore", L"Exported %u rules", ruleCount);
+    
+    SS_LOG_INFO(L"YaraRuleStore", L"ExportCompiled: Exported %zu rules successfully", 
+        m_ruleMetadata.size());
     return StoreError{ SignatureStoreError::Success };
 }
 
@@ -2294,26 +2861,70 @@ std::string YaraRuleStore::ExportToJson() const noexcept {
     return json.str();
 }
 
+// ============================================================================
+// TITANIUM: REPOSITORY IMPORT
+// ============================================================================
+
 StoreError YaraRuleStore::ImportFromYaraRulesRepo(
     const std::wstring& repoPath,
     std::function<void(size_t current, size_t total)> progressCallback
 ) noexcept {
     SS_LOG_INFO(L"YaraRuleStore", L"ImportFromYaraRulesRepo: %s", repoPath.c_str());
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
     if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Database is read-only");
         return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
     }
-
-    auto yaraFiles = YaraUtils::FindYaraFiles(repoPath, true);
-    if (yaraFiles.empty()) {
-        SS_LOG_WARN(L"YaraRuleStore", L"No YARA files found in repository");
-        return StoreError{ SignatureStoreError::FileNotFound, 0, "No YARA files found" };
+    
+    // VALIDATION 2: Path validation
+    if (repoPath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Empty repository path");
+        return StoreError{ SignatureStoreError::FileNotFound, 0, "Repository path is empty" };
+    }
+    
+    // VALIDATION 3: Path length check
+    if (repoPath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Path too long");
+        return StoreError{ SignatureStoreError::FileNotFound, 0, "Path too long" };
+    }
+    
+    // VALIDATION 4: Null character check
+    if (repoPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Path contains null character");
+        return StoreError{ SignatureStoreError::AccessDenied, 0, "Path contains null character" };
     }
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Found %zu YARA files in repository", yaraFiles.size());
+    // ========================================================================
+    // FIND YARA FILES
+    // ========================================================================
+    auto yaraFiles = YaraUtils::FindYaraFiles(repoPath, true);
+    if (yaraFiles.empty()) {
+        SS_LOG_WARN(L"YaraRuleStore", L"ImportFromYaraRulesRepo: No YARA files found");
+        return StoreError{ SignatureStoreError::FileNotFound, 0, "No YARA files found" };
+    }
+    
+    // VALIDATION 5: File count limit (DoS protection)
+    if (yaraFiles.size() > YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO) {
+        SS_LOG_ERROR(L"YaraRuleStore", 
+            L"ImportFromYaraRulesRepo: Too many files (%zu > %zu)",
+            yaraFiles.size(), YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO);
+        return StoreError{ SignatureStoreError::TooLarge, 0, 
+            "Repository contains too many files" };
+    }
 
+    SS_LOG_INFO(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Found %zu YARA files", yaraFiles.size());
+
+    // ========================================================================
+    // COMPILE FILES
+    // ========================================================================
     YaraCompiler compiler;
     size_t successCount = 0;
+    size_t failCount = 0;
 
     for (size_t i = 0; i < yaraFiles.size(); ++i) {
         std::string namespace_ = "default";
@@ -2323,23 +2934,41 @@ StoreError YaraRuleStore::ImportFromYaraRulesRepo(
             successCount++;
         }
         else {
-            SS_LOG_WARN(L"YaraRuleStore", L"Failed to compile: %s", yaraFiles[i].c_str());
+            failCount++;
+            SS_LOG_WARN(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Failed to compile: %s", 
+                yaraFiles[i].c_str());
         }
 
         if (progressCallback) {
-            progressCallback(i + 1, yaraFiles.size());
+            try {
+                progressCallback(i + 1, yaraFiles.size());
+            } catch (...) {
+                SS_LOG_WARN(L"YaraRuleStore", L"ImportFromYaraRulesRepo: Progress callback threw exception");
+            }
         }
     }
+
+    // ========================================================================
+    // ACQUIRE LOCK AND UPDATE RULES
+    // ========================================================================
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
     YR_RULES* newRules = compiler.GetRules();
     if (newRules) {
+        // Destroy old rules safely
         if (m_rules) {
             yr_rules_destroy(m_rules);
+            m_rules = nullptr;
         }
         m_rules = newRules;
+    } else {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: No rules compiled");
+        return StoreError{ SignatureStoreError::Unknown, 0, "No rules compiled successfully" };
     }
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Import complete: %zu succeeded", successCount);
+    SS_LOG_INFO(L"YaraRuleStore", 
+        L"ImportFromYaraRulesRepo: Complete - %zu succeeded, %zu failed", 
+        successCount, failCount);
     return StoreError{ SignatureStoreError::Success };
 }
 

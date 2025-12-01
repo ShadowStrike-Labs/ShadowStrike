@@ -45,11 +45,11 @@ public:
     SignatureIndex() = default;
     ~SignatureIndex();
 
-    // Disable copy, enable move
+    // Disable copy AND move - class contains mutex and atomics that cannot be safely moved
     SignatureIndex(const SignatureIndex&) = delete;
     SignatureIndex& operator=(const SignatureIndex&) = delete;
-    SignatureIndex(SignatureIndex&&) noexcept = default;
-    SignatureIndex& operator=(SignatureIndex&&) noexcept = default;
+    SignatureIndex(SignatureIndex&&) = delete;
+    SignatureIndex& operator=(SignatureIndex&&) = delete;
 
     // ========================================================================
     // INITIALIZATION
@@ -263,6 +263,26 @@ private:
     void RollbackCOW() noexcept;
 
     // ========================================================================
+    // INTERNAL LOOKUP (no lock - caller must hold lock)
+    // ========================================================================
+
+    // Internal lookup without acquiring lock (for use when lock already held)
+    [[nodiscard]] std::optional<uint64_t> LookupByFastHashInternal(
+        uint64_t fastHash
+    ) const noexcept;
+
+    // ========================================================================
+    // INTERNAL MODIFICATION (no lock - caller must hold exclusive lock)
+    // ========================================================================
+
+    // Internal insert without acquiring lock (for BatchInsert/Rebuild - avoids deadlock)
+    // Caller must hold exclusive lock (m_rwLock) before calling
+    [[nodiscard]] StoreError InsertInternal(
+        const HashValue& hash,
+        uint64_t signatureOffset
+    ) noexcept;
+
+    // ========================================================================
     // INTERNAL STATE
     // ========================================================================
 
@@ -297,13 +317,14 @@ private:
     static constexpr size_t CACHE_SIZE = 1024;            // Cache 1024 hot nodes
     mutable std::array<CachedNode, CACHE_SIZE> m_nodeCache{};
     mutable std::atomic<uint64_t> m_cacheAccessCounter{0};
+    mutable std::shared_mutex m_cacheLock;                // Protects cache writes
 
     // Synchronization (readers-writer lock, readers don't block)
     mutable std::shared_mutex m_rwLock;
 
     // COW state for updates
     std::vector<std::unique_ptr<BPlusTreeNode>> m_cowNodes;
-    bool m_inCOWTransaction{false};
+    std::atomic<bool> m_inCOWTransaction{false};          // Atomic for thread safety
 
     // Performance monitoring
     mutable LARGE_INTEGER m_perfFrequency{};
@@ -335,11 +356,11 @@ public:
     PatternIndex() = default;
     ~PatternIndex();
 
-    // Disable copy, enable move
+    // Disable copy AND move - class contains mutex and atomics
     PatternIndex(const PatternIndex&) = delete;
     PatternIndex& operator=(const PatternIndex&) = delete;
-    PatternIndex(PatternIndex&&) noexcept = default;
-    PatternIndex& operator=(PatternIndex&&) noexcept = default;
+    PatternIndex(PatternIndex&&) = delete;
+    PatternIndex& operator=(PatternIndex&&) = delete;
 
     // ========================================================================
     // INITIALIZATION

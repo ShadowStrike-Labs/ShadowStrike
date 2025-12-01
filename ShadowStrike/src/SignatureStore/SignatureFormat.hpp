@@ -118,6 +118,20 @@ struct HashValue {
 
 static_assert(sizeof(HashValue) == 68, "HashValue must be 68 bytes for alignment");
 
+// Compile-time hash length lookup (constexpr for optimal codegen)
+[[nodiscard]] constexpr uint8_t GetHashLengthForType(HashType type) noexcept {
+    switch (type) {
+        case HashType::MD5:     return 16;
+        case HashType::SHA1:    return 20;
+        case HashType::SHA256:  return 32;
+        case HashType::SHA512:  return 64;
+        case HashType::IMPHASH: return 16;
+        case HashType::SSDEEP:  return 64;
+        case HashType::TLSH:    return 35;
+        default:                return 0;
+    }
+}
+
 // ============================================================================
 // PATTERN STRUCTURES
 // ============================================================================
@@ -250,13 +264,13 @@ struct SignatureDatabaseHeader {
     std::array<uint8_t, 32> sha256Checksum;              // SHA-256 of entire database
     
     // Reserved for future extensions
-    std::array<uint8_t, 3840> reserved;                   // Pad to 4KB
+    std::array<uint8_t, 3896> reserved;                   // Pad to exactly 4KB (4096 bytes)
 };
 
 #pragma pack(pop)
 
-static_assert(sizeof(SignatureDatabaseHeader) == 4040,
-    "Header must be exactly 4KB");
+static_assert(sizeof(SignatureDatabaseHeader) == 4096,
+    "Header must be exactly 4KB (4096 bytes)");
 
 // ============================================================================
 // AHO-CORASICK TRIE BINARY SERIALIZATION FORMAT
@@ -285,7 +299,7 @@ struct TrieNodeBinary {
 
 #pragma pack(pop)
 
-static_assert(sizeof(TrieNodeBinary) == 1052, "TrieNodeBinary must be exactly 316 bytes");
+static_assert(sizeof(TrieNodeBinary) == 1052, "TrieNodeBinary size mismatch");
 
 // ============================================================================
 // TRIE INDEX STRUCTURE (Header of entire trie section)
@@ -325,18 +339,32 @@ enum class ThreatLevel : uint8_t {
     Critical = 100      // Critical threat
 };
 
-// Detection result
+// Detection result (move-optimized for performance)
 struct DetectionResult {
-    uint64_t signatureId;                                 // Matched signature ID
+    uint64_t signatureId{0};                              // Matched signature ID
     std::string signatureName;                            // Human-readable name
-    ThreatLevel threatLevel;                              // Severity
-    uint64_t fileOffset;                                  // Where in file (for patterns)
+    ThreatLevel threatLevel{ThreatLevel::Info};           // Severity
+    uint64_t fileOffset{0};                               // Where in file (for patterns)
     std::string description;                              // Threat description
     std::vector<std::string> tags;                        // Metadata tags
-    uint64_t matchTimestamp;                              // Detection time (us precision)
-    
-    // Performance metrics
-    uint64_t matchTimeNanoseconds;                        // Time to match (profiling)
+    uint64_t matchTimestamp{0};                           // Detection time (us precision)
+    uint64_t matchTimeNanoseconds{0};                     // Time to match (profiling)
+
+    // Default constructor
+    DetectionResult() = default;
+
+    // Move constructor (noexcept for optimal container performance)
+    DetectionResult(DetectionResult&&) noexcept = default;
+    DetectionResult& operator=(DetectionResult&&) noexcept = default;
+
+    // Copy constructor
+    DetectionResult(const DetectionResult&) = default;
+    DetectionResult& operator=(const DetectionResult&) = default;
+
+    // Comparison for sorting by threat level
+    [[nodiscard]] bool operator<(const DetectionResult& other) const noexcept {
+        return static_cast<uint8_t>(threatLevel) > static_cast<uint8_t>(other.threatLevel);
+    }
 };
 
 // ============================================================================
@@ -424,6 +452,26 @@ struct StoreError {
     
     [[nodiscard]] explicit operator bool() const noexcept {
         return IsSuccess();
+    }
+
+    // Factory methods for common errors (exception-safe)
+    [[nodiscard]] static StoreError Success() noexcept {
+        return StoreError{ SignatureStoreError::Success, 0, {} };
+    }
+
+    [[nodiscard]] static StoreError FromWin32(SignatureStoreError code, DWORD win32Err) noexcept {
+        StoreError err;
+        err.code = code;
+        err.win32Error = win32Err;
+        // Message intentionally empty - caller should set if needed
+        return err;
+    }
+
+    // Clear error state
+    void Clear() noexcept {
+        code = SignatureStoreError::Success;
+        win32Error = 0;
+        message.clear();
     }
 };
 

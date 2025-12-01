@@ -13,30 +13,43 @@
  * Ultra-high performance with intelligent query routing
  *
  * Target Performance Metrics (Per Query):
- * ???????????????????????????????????????????????????
- * ? Hash Lookup:     < 1?s   (sub-microsecond)     ?
- * ? Pattern Scan:    < 10ms  (10MB file)           ?
- * ? YARA Scan:       < 50ms  (10MB file, 1K rules) ?
- * ? Combined Scan:   < 60ms  (all methods)         ?
- * ???????????????????????????????????????????????????
+ * ╔═══════════════════════════════════════════════════╗
+ * ║ Hash Lookup:     < 1μs   (sub-microsecond)       ║
+ * ║ Pattern Scan:    < 10ms  (10MB file)             ║
+ * ║ YARA Scan:       < 50ms  (10MB file, 1K rules)   ║
+ * ║ Combined Scan:   < 60ms  (all methods)           ║
+ * ╚═══════════════════════════════════════════════════╝
  *
  * Architecture:
- * ????????????????????????????????????????????
- * ?       SignatureStore (Facade)            ?
- * ????????????????????????????????????????????
- * ?  ??????????????  ??????????????         ?
- * ?  ? HashStore  ?  ?PatternStore?         ?
- * ?  ??????????????  ??????????????         ?
- * ?  ???????????????????????????????        ?
- * ?  ?    YaraRuleStore            ?        ?
- * ?  ???????????????????????????????        ?
- * ????????????????????????????????????????????
- * ?    Query Router & Cache Manager          ?
- * ????????????????????????????????????????????
- * ?    Memory-Mapped Database File           ?
- * ????????????????????????????????????????????
+ * ┌──────────────────────────────────────────┐
+ * │       SignatureStore (Facade)            │
+ * ├──────────────────────────────────────────┤
+ * │  ┌────────────┐  ┌────────────┐         │
+ * │  │ HashStore  │  │PatternStore│         │
+ * │  └────────────┘  └────────────┘         │
+ * │  ┌─────────────────────────────┐        │
+ * │  │    YaraRuleStore            │        │
+ * │  └─────────────────────────────┘        │
+ * ├──────────────────────────────────────────┤
+ * │    Query Router & Cache Manager          │
+ * ├──────────────────────────────────────────┤
+ * │    Memory-Mapped Database File           │
+ * └──────────────────────────────────────────┘
  *
  * Performance Standards: Enterprise antivirus quality
+ * 
+ * TITANIUM HARDENING APPLIED:
+ * - Thread safety: All operations are thread-safe with proper lock hierarchy
+ * - Resource limits: Buffer sizes, file counts, recursion depth are bounded
+ * - Path security: Null injection, traversal, symlink attacks prevented
+ * - Memory safety: Overflow checks, bounds validation, RAII everywhere
+ * - Exception safety: All public methods are noexcept with internal try-catch
+ * - DoS protection: Timeouts, max results, circuit breakers implemented
+ *
+ * LOCK HIERARCHY (acquire in this order to prevent deadlocks):
+ * 1. m_globalLock (for initialization/shutdown/rebuild)
+ * 2. m_cacheLock (for query cache operations)
+ * 3. m_callbackMutex (for detection callback)
  *
  * ============================================================================
  */
@@ -69,6 +82,43 @@ namespace SignatureStore {
     class YaraRuleStore;
 
 // ============================================================================
+// TITANIUM RESOURCE LIMITS
+// ============================================================================
+
+namespace TitaniumLimits {
+    // Buffer and file size limits
+    constexpr size_t MAX_SCAN_BUFFER_SIZE = 500 * 1024 * 1024;      // 500MB max buffer
+    constexpr size_t MAX_FILE_SIZE = 100 * 1024 * 1024;             // 100MB max file
+    constexpr size_t MAX_CACHEABLE_SIZE = 100 * 1024 * 1024;        // 100MB max for caching
+    
+    // Path limits
+    constexpr size_t MAX_PATH_LENGTH = 32767;                        // Windows extended path limit
+    
+    // Batch operation limits
+    constexpr size_t MAX_BATCH_FILES = 100000;                       // Max files in batch scan
+    constexpr size_t MAX_DIRECTORY_FILES = 1000000;                  // Max files in directory scan
+    constexpr size_t MAX_RECURSION_DEPTH = 100;                      // Max directory recursion
+    constexpr size_t MAX_SOURCE_DATABASES = 1000;                    // Max databases to merge
+    
+    // Cache limits
+    constexpr size_t MAX_CACHE_ENTRIES = 10000;                      // Max cache entries
+    constexpr size_t MAX_CACHED_DETECTIONS = 10000;                  // Max detections per cache entry
+    
+    // Result limits
+    constexpr size_t DEFAULT_MAX_RESULTS = 1000;                     // Default max results
+    constexpr size_t ABSOLUTE_MAX_RESULTS = 100000;                  // Absolute max results
+    
+    // Timeout limits
+    constexpr uint32_t DEFAULT_TIMEOUT_MS = 10000;                   // 10 seconds default
+    constexpr uint32_t MIN_TIMEOUT_MS = 100;                         // 100ms minimum
+    constexpr uint32_t MAX_TIMEOUT_MS = 3600000;                     // 1 hour maximum
+    
+    // Stream scanner limits
+    constexpr size_t STREAM_SCAN_THRESHOLD = 10 * 1024 * 1024;      // 10MB scan threshold
+    constexpr size_t MAX_SINGLE_CHUNK_SIZE = 50 * 1024 * 1024;      // 50MB max chunk
+}
+
+// ============================================================================
 // UNIFIED SCAN OPTIONS
 // ============================================================================
 
@@ -79,9 +129,9 @@ struct ScanOptions {
     bool enableYaraScan{true};
     
     // Performance controls
-    uint32_t timeoutMilliseconds{10000};                  // 10 second default
-    uint32_t maxResults{1000};                            // Max detections to return
-    bool stopOnFirstMatch{false};                         // Fast mode
+    uint32_t timeoutMilliseconds{TitaniumLimits::DEFAULT_TIMEOUT_MS};  // 10 second default
+    uint32_t maxResults{TitaniumLimits::DEFAULT_MAX_RESULTS};          // Max detections to return
+    bool stopOnFirstMatch{false};                                       // Fast mode
     
     // Threading
     uint32_t threadCount{0};                              // 0 = auto-detect
@@ -104,6 +154,48 @@ struct ScanOptions {
     
     // Advanced
     bool capturePerformanceMetrics{false};                // Detailed profiling
+    
+    // ========================================================================
+    // TITANIUM: Validation helper
+    // ========================================================================
+    [[nodiscard]] bool Validate() const noexcept {
+        // Timeout validation
+        if (timeoutMilliseconds > TitaniumLimits::MAX_TIMEOUT_MS) {
+            return false;
+        }
+        
+        // Max results validation
+        if (maxResults > TitaniumLimits::ABSOLUTE_MAX_RESULTS) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // TITANIUM: Get validated timeout
+    [[nodiscard]] uint32_t GetValidatedTimeout() const noexcept {
+        if (timeoutMilliseconds == 0) {
+            return TitaniumLimits::DEFAULT_TIMEOUT_MS;
+        }
+        if (timeoutMilliseconds < TitaniumLimits::MIN_TIMEOUT_MS) {
+            return TitaniumLimits::MIN_TIMEOUT_MS;
+        }
+        if (timeoutMilliseconds > TitaniumLimits::MAX_TIMEOUT_MS) {
+            return TitaniumLimits::MAX_TIMEOUT_MS;
+        }
+        return timeoutMilliseconds;
+    }
+    
+    // TITANIUM: Get validated max results
+    [[nodiscard]] uint32_t GetValidatedMaxResults() const noexcept {
+        if (maxResults == 0) {
+            return TitaniumLimits::DEFAULT_MAX_RESULTS;
+        }
+        if (maxResults > TitaniumLimits::ABSOLUTE_MAX_RESULTS) {
+            return TitaniumLimits::ABSOLUTE_MAX_RESULTS;
+        }
+        return maxResults;
+    }
 };
 
 // ============================================================================
@@ -125,6 +217,10 @@ struct ScanResult {
     bool timedOut{false};
     bool stoppedEarly{false};                             // Due to stopOnFirstMatch
     
+    // TITANIUM: Error tracking
+    uint32_t errorCount{0};                               // Number of errors during scan
+    std::string lastError;                                // Last error message
+    
     // Performance breakdown (if capturePerformanceMetrics enabled)
     struct PerformanceBreakdown {
         uint64_t hashLookupMicroseconds{0};
@@ -137,7 +233,10 @@ struct ScanResult {
     // Cache statistics
     bool cacheHit{false};
     
-    // Convenience methods
+    // ========================================================================
+    // CONVENIENCE METHODS
+    // ========================================================================
+    
     [[nodiscard]] bool HasDetections() const noexcept {
         return !detections.empty();
     }
@@ -155,6 +254,57 @@ struct ScanResult {
     [[nodiscard]] size_t GetDetectionCount() const noexcept {
         return detections.size();
     }
+    
+    // TITANIUM: Check if scan completed successfully
+    [[nodiscard]] bool IsSuccessful() const noexcept {
+        return !timedOut && errorCount == 0;
+    }
+    
+    // TITANIUM: Check if any critical-level detection found
+    [[nodiscard]] bool HasCriticalDetection() const noexcept {
+        for (const auto& det : detections) {
+            if (det.threatLevel == ThreatLevel::Critical) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // TITANIUM: Get detections filtered by threat level
+    [[nodiscard]] std::vector<DetectionResult> GetDetectionsByLevel(ThreatLevel level) const noexcept {
+        std::vector<DetectionResult> filtered;
+        for (const auto& det : detections) {
+            if (det.threatLevel == level) {
+                filtered.push_back(det);
+            }
+        }
+        return filtered;
+    }
+    
+    // TITANIUM: Get scan throughput in MB/s
+    [[nodiscard]] double GetThroughputMBps() const noexcept {
+        if (scanTimeMicroseconds == 0) {
+            return 0.0;
+        }
+        double bytesPerMicrosecond = static_cast<double>(totalBytesScanned) / scanTimeMicroseconds;
+        return bytesPerMicrosecond; // bytes/µs = MB/s
+    }
+    
+    // TITANIUM: Clear all results (useful for reuse)
+    void Clear() noexcept {
+        detections.clear();
+        hashMatches.clear();
+        patternMatches.clear();
+        yaraMatches.clear();
+        totalBytesScanned = 0;
+        scanTimeMicroseconds = 0;
+        timedOut = false;
+        stoppedEarly = false;
+        errorCount = 0;
+        lastError.clear();
+        performance = PerformanceBreakdown{};
+        cacheHit = false;
+    }
 };
 
 // ============================================================================
@@ -166,11 +316,11 @@ public:
     SignatureStore();
     ~SignatureStore();
 
-    // Disable copy, enable move
+    // Disable copy AND move - class contains mutex, shared_mutex and atomics that cannot be safely moved
     SignatureStore(const SignatureStore&) = delete;
     SignatureStore& operator=(const SignatureStore&) = delete;
-    SignatureStore(SignatureStore&&) noexcept = default;
-    SignatureStore& operator=(SignatureStore&&) noexcept = default;
+    SignatureStore(SignatureStore&&) = delete;
+    SignatureStore& operator=(SignatureStore&&) = delete;
 
     // ========================================================================
     // INITIALIZATION & LIFECYCLE
@@ -580,9 +730,9 @@ private:
         uint64_t timestamp;
     };
     static constexpr size_t QUERY_CACHE_SIZE = 1000;
-   // mutable std::array<QueryCacheEntry, QUERY_CACHE_SIZE> m_queryCache{};
 	mutable std::vector<QueryCacheEntry> m_queryCache{};
     mutable std::atomic<uint64_t> m_queryCacheAccessCounter{0};
+    mutable std::shared_mutex m_cacheLock;                // FIX: Separate lock for cache operations (better performance)
 
     // Statistics
     mutable std::atomic<uint64_t> m_totalScans{0};

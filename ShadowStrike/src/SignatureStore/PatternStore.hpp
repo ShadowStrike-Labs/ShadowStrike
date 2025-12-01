@@ -491,6 +491,10 @@ private:
         std::string deprecationReason;              // Why deprecated
     };
    mutable std::vector<PatternMetadata> m_patternCache;
+   
+    // Lock-free hit counters for thread-safe updates during scanning
+    // Indexed by signatureId, resized when patterns are added
+    mutable std::vector<std::atomic<uint64_t>> m_hitCounters;
 
     // Statistics
     mutable std::atomic<uint64_t> m_totalScans{0};

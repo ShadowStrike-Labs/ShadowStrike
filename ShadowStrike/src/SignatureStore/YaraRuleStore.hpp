@@ -56,6 +56,45 @@ namespace ShadowStrike {
 namespace SignatureStore {
 
 // ============================================================================
+// TITANIUM RESOURCE LIMITS FOR YARA
+// ============================================================================
+
+namespace YaraTitaniumLimits {
+    // Buffer size limits
+    constexpr size_t MAX_SCAN_BUFFER_SIZE = 500 * 1024 * 1024;      // 500MB max scan buffer
+    constexpr size_t MAX_FILE_SIZE = 100 * 1024 * 1024;             // 100MB max file
+    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024;       // 10MB max rule source
+    constexpr size_t MAX_COMPILED_RULES_SIZE = 500 * 1024 * 1024;   // 500MB max compiled rules
+    
+    // Stream scanner limits
+    constexpr size_t STREAM_SCAN_THRESHOLD = 10 * 1024 * 1024;      // 10MB threshold
+    constexpr size_t MAX_STREAM_BUFFER_SIZE = 100 * 1024 * 1024;    // 100MB max stream buffer
+    constexpr size_t MAX_SINGLE_CHUNK_SIZE = 50 * 1024 * 1024;      // 50MB max single chunk
+    
+    // Rule and namespace limits
+    constexpr size_t MAX_NAMESPACE_LENGTH = 128;
+    constexpr size_t MAX_RULE_NAME_LENGTH = 256;
+    constexpr size_t MAX_TAG_LENGTH = 64;
+    constexpr size_t MAX_TAGS_PER_RULE = 100;
+    
+    // Match limits
+    constexpr uint32_t DEFAULT_MAX_MATCHES_PER_RULE = 100;
+    constexpr uint32_t ABSOLUTE_MAX_MATCHES_PER_RULE = 10000;
+    constexpr size_t MAX_MATCH_DATA_CAPTURE = 1024;                 // 1KB max per match
+    
+    // Timeout limits
+    constexpr uint32_t DEFAULT_TIMEOUT_SECONDS = 300;               // 5 minutes
+    constexpr uint32_t MIN_TIMEOUT_SECONDS = 1;
+    constexpr uint32_t MAX_TIMEOUT_SECONDS = 3600;                  // 1 hour
+    
+    // Path limits
+    constexpr size_t MAX_PATH_LENGTH = 32767;                       // Windows extended path
+    
+    // Repository import limits
+    constexpr size_t MAX_YARA_FILES_IN_REPO = 100000;              // 100K files max
+}
+
+// ============================================================================
 // YARA RULE METADATA
 // ============================================================================
 
@@ -216,10 +255,12 @@ private:
     std::vector<std::string> m_warnings;
     std::vector<std::wstring> m_includePaths;
 
+    // YARA callback signature (matches YR_COMPILER_CALLBACK_FUNC)
     static void ErrorCallback(
         int errorLevel,
         const char* fileName,
         int lineNumber,
+        const YR_RULE* rule,          // Added for new YARA API
         const char* message,
         void* userData
     );
@@ -234,11 +275,12 @@ public:
     YaraRuleStore();
     ~YaraRuleStore();
 
-    // Disable copy, enable move
+    // TITANIUM: Disable copy AND move - class contains std::shared_mutex, std::mutex,
+    // and std::atomic members that cannot be safely moved
     YaraRuleStore(const YaraRuleStore&) = delete;
     YaraRuleStore& operator=(const YaraRuleStore&) = delete;
-    YaraRuleStore(YaraRuleStore&&) noexcept = default;
-    YaraRuleStore& operator=(YaraRuleStore&&) noexcept = default;
+    YaraRuleStore(YaraRuleStore&&) = delete;
+    YaraRuleStore& operator=(YaraRuleStore&&) = delete;
 
     // ========================================================================
     // INITIALIZATION & LIFECYCLE
@@ -296,25 +338,45 @@ public:
         const YaraScanOptions& options = {}
     ) const noexcept;
 
-    // Incremental scanning (streaming)
+    // ========================================================================
+    // INCREMENTAL SCANNING (STREAMING) - TITANIUM HARDENED
+    // ========================================================================
     class ScanContext {
     public:
         ScanContext() = default;
         ~ScanContext() = default;
+        
+        // Move semantics for context transfer
+        ScanContext(ScanContext&& other) noexcept = default;
+        ScanContext& operator=(ScanContext&& other) noexcept = default;
+        
+        // Copy disabled (holds buffer and state)
+        ScanContext(const ScanContext&) = delete;
+        ScanContext& operator=(const ScanContext&) = delete;
 
+        // Reset and clear buffer
         void Reset() noexcept;
         
+        // Feed data chunk - may trigger intermediate scan
         [[nodiscard]] std::vector<YaraMatch> FeedChunk(
             std::span<const uint8_t> chunk
         ) noexcept;
 
+        // Finalize and scan remaining buffer
         [[nodiscard]] std::vector<YaraMatch> Finalize() noexcept;
+        
+        // Query context state
+        [[nodiscard]] bool IsValid() const noexcept { return m_isValid && m_store != nullptr; }
+        [[nodiscard]] size_t GetBufferSize() const noexcept { return m_buffer.size(); }
+        [[nodiscard]] size_t GetTotalBytesProcessed() const noexcept { return m_totalBytesProcessed; }
 
     private:
         friend class YaraRuleStore;
         const YaraRuleStore* m_store{nullptr};
         std::vector<uint8_t> m_buffer;
         YaraScanOptions m_options;
+        bool m_isValid{false};                           // Context validity flag
+        size_t m_totalBytesProcessed{0};                 // Statistics
     };
 
     [[nodiscard]] ScanContext CreateScanContext(

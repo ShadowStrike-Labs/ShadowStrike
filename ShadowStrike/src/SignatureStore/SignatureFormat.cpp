@@ -9,6 +9,7 @@
  * PROPRIETARY AND CONFIDENTIAL
  *
  * Binary format validation and utility functions
+ * RAII-based resource management for exception safety
  * Ultra-careful implementation - EVERY BYTE MATTERS
  *
  * ============================================================================
@@ -22,17 +23,117 @@
 #include <iomanip>
 #include <cstring>
 #include <cwchar>
+#include <charconv>
 
 // Windows crypto API for SHA-256 validation
+#include <windows.h>
 #include <wincrypt.h>
 #pragma comment(lib, "advapi32.lib")
+
+namespace ShadowStrike {
+namespace SignatureStore {
+
+// ============================================================================
+// RAII HELPER CLASSES FOR WINDOWS RESOURCES
+// ============================================================================
+namespace {
+
+    // RAII wrapper for Windows HANDLE (file/mapping handles)
+    class HandleGuard {
+    public:
+        explicit HandleGuard(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+        ~HandleGuard() noexcept { Close(); }
+
+        HandleGuard(const HandleGuard&) = delete;
+        HandleGuard& operator=(const HandleGuard&) = delete;
+
+        HandleGuard(HandleGuard&& other) noexcept : m_handle(other.m_handle) {
+            other.m_handle = INVALID_HANDLE_VALUE;
+        }
+
+        HandleGuard& operator=(HandleGuard&& other) noexcept {
+            if (this != &other) {
+                Close();
+                m_handle = other.m_handle;
+                other.m_handle = INVALID_HANDLE_VALUE;
+            }
+            return *this;
+        }
+
+        void Close() noexcept {
+            if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
+                CloseHandle(m_handle);
+                m_handle = INVALID_HANDLE_VALUE;
+            }
+        }
+
+        [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+        [[nodiscard]] bool IsValid() const noexcept { 
+            return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr; 
+        }
+
+        // Release ownership (caller takes responsibility)
+        [[nodiscard]] HANDLE Release() noexcept {
+            HANDLE h = m_handle;
+            m_handle = INVALID_HANDLE_VALUE;
+            return h;
+        }
+
+    private:
+        HANDLE m_handle;
+    };
+
+    // RAII wrapper for MapViewOfFile (memory-mapped view)
+    class MappedViewGuard {
+    public:
+        explicit MappedViewGuard(void* addr = nullptr) noexcept : m_address(addr) {}
+        ~MappedViewGuard() noexcept { Unmap(); }
+
+        MappedViewGuard(const MappedViewGuard&) = delete;
+        MappedViewGuard& operator=(const MappedViewGuard&) = delete;
+
+        MappedViewGuard(MappedViewGuard&& other) noexcept : m_address(other.m_address) {
+            other.m_address = nullptr;
+        }
+
+        MappedViewGuard& operator=(MappedViewGuard&& other) noexcept {
+            if (this != &other) {
+                Unmap();
+                m_address = other.m_address;
+                other.m_address = nullptr;
+            }
+            return *this;
+        }
+
+        void Unmap() noexcept {
+            if (m_address != nullptr) {
+                UnmapViewOfFile(m_address);
+                m_address = nullptr;
+            }
+        }
+
+        [[nodiscard]] void* Get() noexcept { return m_address; }
+        [[nodiscard]] const void* Get() const noexcept { return m_address; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_address != nullptr; }
+
+        [[nodiscard]] void* Release() noexcept {
+            void* addr = m_address;
+            m_address = nullptr;
+            return addr;
+        }
+
+    private:
+        void* m_address;
+    };
+
+} // anonymous namespace
 
 namespace ShadowStrike {
 namespace SignatureStore {
 namespace Format {
 
 // ============================================================================
-// HEADER VALIDATION
+// HEADER VALIDATION (Enterprise-Grade with Overflow Protection)
 // ============================================================================
 
 bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
@@ -41,7 +142,10 @@ bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
         return false;
     }
 
-    // Check magic number
+    // ========================================================================
+    // STEP 1: MAGIC NUMBER & VERSION CHECK
+    // ========================================================================
+
     if (header->magic != SIGNATURE_DB_MAGIC) {
         SS_LOG_ERROR(L"SignatureStore", 
             L"Invalid magic number: expected 0x%08X, got 0x%08X", 
@@ -49,7 +153,6 @@ bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
         return false;
     }
 
-    // Check version
     if (header->versionMajor != SIGNATURE_DB_VERSION_MAJOR) {
         SS_LOG_ERROR(L"SignatureStore", 
             L"Version mismatch: expected %u.x, got %u.%u",
@@ -59,103 +162,161 @@ bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
         return false;
     }
 
-    // Validate section alignment (CRITICAL for memory mapping)
-    if (header->hashIndexOffset % PAGE_SIZE != 0) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Hash index offset 0x%llX not page-aligned (PAGE_SIZE=%zu)",
-            header->hashIndexOffset, PAGE_SIZE);
-        return false;
-    }
+    // ========================================================================
+    // STEP 2: PAGE ALIGNMENT VALIDATION (Critical for Memory Mapping)
+    // ========================================================================
 
-    if (header->patternIndexOffset % PAGE_SIZE != 0) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Pattern index offset 0x%llX not page-aligned",
-            header->patternIndexOffset);
-        return false;
-    }
-
-    if (header->yaraRulesOffset % PAGE_SIZE != 0) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"YARA rules offset 0x%llX not page-aligned",
-            header->yaraRulesOffset);
-        return false;
-    }
-
-    if (header->metadataOffset % PAGE_SIZE != 0) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Metadata offset 0x%llX not page-aligned",
-            header->metadataOffset);
-        return false;
-    }
-
-    if (header->stringPoolOffset % PAGE_SIZE != 0) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"String pool offset 0x%llX not page-aligned",
-            header->stringPoolOffset);
-        return false;
-    }
-
-    // Validate section ordering (sections must not overlap)
-    uint64_t offsets[] = {
-        header->hashIndexOffset,
-        header->patternIndexOffset,
-        header->yaraRulesOffset,
-        header->metadataOffset,
-        header->stringPoolOffset
+    // Helper lambda for alignment check
+    auto checkPageAlignment = [](uint64_t offset, const wchar_t* name) -> bool {
+        if (offset != 0 && (offset % PAGE_SIZE != 0)) {
+            SS_LOG_ERROR(L"SignatureStore", 
+                L"%s offset 0x%llX not page-aligned (PAGE_SIZE=%zu)",
+                name, offset, PAGE_SIZE);
+            return false;
+        }
+        return true;
     };
 
-    for (size_t i = 0; i < 4; ++i) {
-        if (offsets[i] != 0 && offsets[i + 1] != 0) {
-            if (offsets[i] >= offsets[i + 1]) {
+    if (!checkPageAlignment(header->hashIndexOffset, L"Hash index")) return false;
+    if (!checkPageAlignment(header->patternIndexOffset, L"Pattern index")) return false;
+    if (!checkPageAlignment(header->yaraRulesOffset, L"YARA rules")) return false;
+    if (!checkPageAlignment(header->metadataOffset, L"Metadata")) return false;
+    if (!checkPageAlignment(header->stringPoolOffset, L"String pool")) return false;
+
+    // ========================================================================
+    // STEP 3: SIZE LIMIT VALIDATION
+    // ========================================================================
+
+    auto checkSizeLimit = [](uint64_t size, const wchar_t* name) -> bool {
+        if (size > MAX_DATABASE_SIZE) {
+            SS_LOG_ERROR(L"SignatureStore", 
+                L"%s size %llu exceeds maximum %llu",
+                name, size, MAX_DATABASE_SIZE);
+            return false;
+        }
+        return true;
+    };
+
+    if (!checkSizeLimit(header->hashIndexSize, L"Hash index")) return false;
+    if (!checkSizeLimit(header->patternIndexSize, L"Pattern index")) return false;
+    if (!checkSizeLimit(header->yaraRulesSize, L"YARA rules")) return false;
+    if (!checkSizeLimit(header->metadataSize, L"Metadata")) return false;
+    if (!checkSizeLimit(header->stringPoolSize, L"String pool")) return false;
+
+    // ========================================================================
+    // STEP 4: OVERFLOW-SAFE SECTION BOUNDS VALIDATION
+    // ========================================================================
+
+    // Check that offset + size doesn't overflow
+    auto checkNoOverflow = [](uint64_t offset, uint64_t size, const wchar_t* name) -> bool {
+        if (offset > 0 && size > 0) {
+            // Check for uint64_t overflow
+            if (offset > UINT64_MAX - size) {
                 SS_LOG_ERROR(L"SignatureStore", 
-                    L"Section overlap detected: offset[%zu]=0x%llX >= offset[%zu]=0x%llX",
-                    i, offsets[i], i + 1, offsets[i + 1]);
+                    L"%s offset+size overflow: 0x%llX + 0x%llX",
+                    name, offset, size);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!checkNoOverflow(header->hashIndexOffset, header->hashIndexSize, L"Hash index")) return false;
+    if (!checkNoOverflow(header->patternIndexOffset, header->patternIndexSize, L"Pattern index")) return false;
+    if (!checkNoOverflow(header->yaraRulesOffset, header->yaraRulesSize, L"YARA rules")) return false;
+    if (!checkNoOverflow(header->metadataOffset, header->metadataSize, L"Metadata")) return false;
+    if (!checkNoOverflow(header->stringPoolOffset, header->stringPoolSize, L"String pool")) return false;
+
+    // ========================================================================
+    // STEP 5: SECTION OVERLAP DETECTION (with size consideration)
+    // ========================================================================
+
+    struct SectionInfo {
+        uint64_t offset;
+        uint64_t size;
+        const wchar_t* name;
+    };
+
+    // Only include non-empty sections
+    std::array<SectionInfo, 5> sections = {{
+        { header->hashIndexOffset, header->hashIndexSize, L"HashIndex" },
+        { header->patternIndexOffset, header->patternIndexSize, L"PatternIndex" },
+        { header->yaraRulesOffset, header->yaraRulesSize, L"YaraRules" },
+        { header->metadataOffset, header->metadataSize, L"Metadata" },
+        { header->stringPoolOffset, header->stringPoolSize, L"StringPool" }
+    }};
+
+    // Check each pair of sections for overlap
+    for (size_t i = 0; i < sections.size(); ++i) {
+        if (sections[i].offset == 0 || sections[i].size == 0) continue;
+
+        uint64_t end_i = sections[i].offset + sections[i].size;
+
+        for (size_t j = i + 1; j < sections.size(); ++j) {
+            if (sections[j].offset == 0 || sections[j].size == 0) continue;
+
+            uint64_t end_j = sections[j].offset + sections[j].size;
+
+            // Check for overlap: [start_i, end_i) overlaps [start_j, end_j)
+            bool overlaps = (sections[i].offset < end_j) && (sections[j].offset < end_i);
+
+            if (overlaps) {
+                SS_LOG_ERROR(L"SignatureStore", 
+                    L"Section overlap: %s [0x%llX-0x%llX) overlaps %s [0x%llX-0x%llX)",
+                    sections[i].name, sections[i].offset, end_i,
+                    sections[j].name, sections[j].offset, end_j);
                 return false;
             }
         }
     }
 
-    // Validate sizes are reasonable
-    if (header->hashIndexSize > MAX_DATABASE_SIZE) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Hash index size %llu exceeds maximum %llu",
-            header->hashIndexSize, MAX_DATABASE_SIZE);
-        return false;
-    }
+    // ========================================================================
+    // STEP 6: STATISTICS SANITY CHECK (Warnings only)
+    // ========================================================================
 
-    if (header->patternIndexSize > MAX_DATABASE_SIZE) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"Pattern index size %llu exceeds maximum %llu",
-            header->patternIndexSize, MAX_DATABASE_SIZE);
-        return false;
-    }
-
-    if (header->yaraRulesSize > MAX_DATABASE_SIZE) {
-        SS_LOG_ERROR(L"SignatureStore", 
-            L"YARA rules size %llu exceeds maximum %llu",
-            header->yaraRulesSize, MAX_DATABASE_SIZE);
-        return false;
-    }
-
-    // Validate statistics (sanity check)
-    if (header->totalHashes > 1'000'000'000ULL) { // 1 billion signatures max
+    if (header->totalHashes > 1'000'000'000ULL) {
         SS_LOG_WARN(L"SignatureStore", 
-            L"Suspicious hash count: %llu (very large)", 
+            L"Suspicious hash count: %llu (>1 billion)", 
             header->totalHashes);
     }
 
-    if (header->totalPatterns > 10'000'000ULL) { // 10 million patterns max
+    if (header->totalPatterns > 10'000'000ULL) {
         SS_LOG_WARN(L"SignatureStore", 
-            L"Suspicious pattern count: %llu (very large)", 
+            L"Suspicious pattern count: %llu (>10 million)", 
             header->totalPatterns);
     }
 
-    if (header->totalYaraRules > 100'000ULL) { // 100K YARA rules max
+    if (header->totalYaraRules > 100'000ULL) {
         SS_LOG_WARN(L"SignatureStore", 
-            L"Suspicious YARA rule count: %llu (very large)", 
+            L"Suspicious YARA rule count: %llu (>100K)", 
             header->totalYaraRules);
     }
 
+    // ========================================================================
+    // STEP 7: TIMESTAMP VALIDATION
+    // ========================================================================
+
+    // Creation time should be before or equal to last update time
+    if (header->creationTime > 0 && header->lastUpdateTime > 0) {
+        if (header->creationTime > header->lastUpdateTime) {
+            SS_LOG_WARN(L"SignatureStore", 
+                L"Creation time (%llu) > last update time (%llu) - possible corruption",
+                header->creationTime, header->lastUpdateTime);
+        }
+    }
+
+    // Reasonable timestamp range: 2020-2100 (in seconds since epoch)
+    constexpr uint64_t MIN_TIMESTAMP = 1577836800ULL;  // 2020-01-01
+    constexpr uint64_t MAX_TIMESTAMP = 4102444800ULL;  // 2100-01-01
+
+    if (header->creationTime > 0 && 
+        (header->creationTime < MIN_TIMESTAMP || header->creationTime > MAX_TIMESTAMP)) {
+        SS_LOG_WARN(L"SignatureStore", 
+            L"Creation timestamp %llu outside expected range [2020-2100]",
+            header->creationTime);
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore", L"Header validation passed");
     return true;
 }
 
@@ -258,19 +419,41 @@ uint8_t GetHashLength(HashType type) noexcept {
 } // anonymous namespace
 
 std::optional<HashValue> ParseHashString(const std::string& hashStr, HashType type) noexcept {
+    /*
+     * ========================================================================
+     * EXCEPTION-SAFE HASH STRING PARSING
+     * ========================================================================
+     *
+     * Parses hex-encoded hash strings with validation.
+     * Uses stack-based cleaning to avoid allocation failures.
+     *
+     * ========================================================================
+     */
+
     if (hashStr.empty()) {
         SS_LOG_ERROR(L"SignatureStore", L"ParseHashString: empty hash string");
         return std::nullopt;
     }
 
-    // Remove any whitespace
-    std::string cleaned;
-    cleaned.reserve(hashStr.length());
-    for (char c : hashStr) {
+    // Maximum reasonable hash string length (SHA-512 = 128 hex chars + some whitespace)
+    constexpr size_t MAX_HASH_STRING_LEN = 256;
+    if (hashStr.length() > MAX_HASH_STRING_LEN) {
+        SS_LOG_ERROR(L"SignatureStore", L"ParseHashString: string too long (%zu)",
+            hashStr.length());
+        return std::nullopt;
+    }
+
+    // Stack-based cleaning to avoid heap allocation failures
+    char cleaned[MAX_HASH_STRING_LEN + 1];
+    size_t cleanedLen = 0;
+
+    for (size_t i = 0; i < hashStr.length() && cleanedLen < MAX_HASH_STRING_LEN; ++i) {
+        char c = hashStr[i];
         if (!std::isspace(static_cast<unsigned char>(c))) {
-            cleaned += c;
+            cleaned[cleanedLen++] = c;
         }
     }
+    cleaned[cleanedLen] = '\0';
 
     // Validate length
     uint8_t expectedLen = GetHashLength(type);
@@ -280,47 +463,93 @@ std::optional<HashValue> ParseHashString(const std::string& hashStr, HashType ty
         return std::nullopt;
     }
 
-    // For SSDEEP and TLSH, length can vary
+    // For fixed-length hashes, validate exact length
     if (type != HashType::SSDEEP && type != HashType::TLSH) {
-        if (cleaned.length() != expectedLen * 2) {
+        if (cleanedLen != static_cast<size_t>(expectedLen) * 2) {
             SS_LOG_ERROR(L"SignatureStore", 
-                L"ParseHashString: invalid length %zu for %S (expected %u bytes)",
-                cleaned.length(), HashTypeToString(type), expectedLen);
+                L"ParseHashString: invalid length %zu for %S (expected %u hex chars)",
+                cleanedLen, HashTypeToString(type), expectedLen * 2);
             return std::nullopt;
         }
     }
 
-    // Parse hex string
-    HashValue hash{};
-    hash.type = type;
-    hash.length = expectedLen;
-
-    if (!HexStringToBytes(cleaned, hash.data.data(), hash.data.size())) {
-        SS_LOG_ERROR(L"SignatureStore", L"ParseHashString: invalid hex string");
+    // Validate hex string length is even
+    if (cleanedLen % 2 != 0) {
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"ParseHashString: odd length %zu (must be even for hex)", cleanedLen);
         return std::nullopt;
     }
 
-    // For variable-length hashes, update actual length
+    // Parse hex string directly (avoid std::string allocation)
+    HashValue hash{};
+    hash.type = type;
+
+    size_t byteCount = cleanedLen / 2;
+    if (byteCount > hash.data.size()) {
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"ParseHashString: hash too long (%zu bytes)", byteCount);
+        return std::nullopt;
+    }
+
+    for (size_t i = 0; i < byteCount; ++i) {
+        uint8_t high = HexCharToValue(cleaned[i * 2]);
+        uint8_t low = HexCharToValue(cleaned[i * 2 + 1]);
+
+        if (high == 0xFF || low == 0xFF) {
+            SS_LOG_ERROR(L"SignatureStore", 
+                L"ParseHashString: invalid hex character at position %zu", i * 2);
+            return std::nullopt;
+        }
+
+        hash.data[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+
+    // Set actual length
     if (type == HashType::SSDEEP || type == HashType::TLSH) {
-        hash.length = static_cast<uint8_t>(cleaned.length() / 2);
+        hash.length = static_cast<uint8_t>(byteCount);
+    } else {
+        hash.length = expectedLen;
     }
 
     return hash;
 }
 
 // ============================================================================
-// HASH FORMATTING
+// HASH FORMATTING (Exception-Safe Version)
 // ============================================================================
 
 std::string FormatHashString(const HashValue& hash) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
+    /*
+     * ========================================================================
+     * HIGH-PERFORMANCE HASH FORMATTING
+     * ========================================================================
+     *
+     * Converts binary hash to hex string.
+     * Uses lookup table for optimal performance.
+     * May throw std::bad_alloc (documented behavior).
+     *
+     * ========================================================================
+     */
 
-    for (size_t i = 0; i < hash.length; ++i) {
-        oss << std::setw(2) << static_cast<unsigned>(hash.data[i]);
+    // Validate input
+    if (hash.length == 0 || hash.length > hash.data.size()) {
+        return {};
     }
 
-    return oss.str();
+    // Pre-allocate exact size needed
+    std::string result;
+    result.reserve(static_cast<size_t>(hash.length) * 2);
+
+    // Lookup table for hex conversion (faster than sprintf/stringstream)
+    static constexpr char hexChars[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < hash.length; ++i) {
+        uint8_t byte = hash.data[i];
+        result.push_back(hexChars[(byte >> 4) & 0x0F]);
+        result.push_back(hexChars[byte & 0x0F]);
+    }
+
+    return result;
 }
 
 } // namespace Format
@@ -416,85 +645,142 @@ void* MapViewOfFileForAccess(HANDLE hMapping, bool readOnly, uint64_t size, DWOR
 } // anonymous namespace
 
 // ============================================================================
-// PUBLIC MEMORY-MAPPED VIEW FUNCTIONS
+// PUBLIC MEMORY-MAPPED VIEW FUNCTIONS (RAII-Based)
 // ============================================================================
 
 namespace MemoryMapping {
 
-// Open memory-mapped view
+// Open memory-mapped view with RAII for exception safety
 bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, StoreError& error) noexcept {
-    // Close any existing view
+    /*
+     * ========================================================================
+     * RAII-BASED MEMORY-MAPPED FILE OPENING
+     * ========================================================================
+     *
+     * Uses RAII guards to ensure cleanup on any error path.
+     * Resources are only "released" (not closed) on success.
+     *
+     * ========================================================================
+     */
+
+    // Close any existing view first
     CloseView(view);
 
-    // Open file
+    // ========================================================================
+    // STEP 1: INPUT VALIDATION
+    // ========================================================================
+
+    if (path.empty()) {
+        error.code = SignatureStoreError::InvalidFormat;
+        error.win32Error = 0;
+        error.message = "Empty file path";
+        return false;
+    }
+
+    // Path length validation (Windows MAX_PATH limit consideration)
+    constexpr size_t MAX_PATH_LEN = 32767;
+    if (path.length() > MAX_PATH_LEN) {
+        error.code = SignatureStoreError::InvalidFormat;
+        error.win32Error = 0;
+        error.message = "File path too long";
+        return false;
+    }
+
+    // ========================================================================
+    // STEP 2: OPEN FILE WITH RAII
+    // ========================================================================
+
     DWORD win32Error = 0;
-    view.fileHandle = OpenFileForMapping(path, readOnly, win32Error);
-    if (view.fileHandle == INVALID_HANDLE_VALUE) {
+    HandleGuard fileGuard(OpenFileForMapping(path, readOnly, win32Error));
+    
+    if (!fileGuard.IsValid()) {
         error.code = SignatureStoreError::FileNotFound;
         error.win32Error = win32Error;
         error.message = "Failed to open database file";
         return false;
     }
 
-    // Get file size
-    if (!GetFileSizeEx(view.fileHandle, view.fileSize, win32Error)) {
+    // ========================================================================
+    // STEP 3: GET AND VALIDATE FILE SIZE
+    // ========================================================================
+
+    uint64_t fileSize = 0;
+    if (!GetFileSizeEx(fileGuard.Get(), fileSize, win32Error)) {
         error.code = SignatureStoreError::InvalidFormat;
         error.win32Error = win32Error;
         error.message = "Failed to get file size";
-        CloseHandle(view.fileHandle);
-        view.fileHandle = INVALID_HANDLE_VALUE;
         return false;
     }
 
-    // Validate minimum size (must fit header)
-    if (view.fileSize < sizeof(SignatureDatabaseHeader)) {
+    // Minimum size validation
+    if (fileSize < sizeof(SignatureDatabaseHeader)) {
         error.code = SignatureStoreError::InvalidFormat;
         error.win32Error = 0;
         error.message = "File too small to contain valid header";
-        CloseHandle(view.fileHandle);
-        view.fileHandle = INVALID_HANDLE_VALUE;
         return false;
     }
 
-    // Create file mapping
-    view.mappingHandle = CreateFileMappingForView(view.fileHandle, readOnly, view.fileSize, win32Error);
-    if (view.mappingHandle == nullptr) {
+    // Maximum size validation
+    if (fileSize > MAX_DATABASE_SIZE) {
+        error.code = SignatureStoreError::TooLarge;
+        error.win32Error = 0;
+        error.message = "Database file exceeds maximum size";
+        return false;
+    }
+
+    // ========================================================================
+    // STEP 4: CREATE FILE MAPPING WITH RAII
+    // ========================================================================
+
+    HandleGuard mappingGuard(CreateFileMappingForView(fileGuard.Get(), readOnly, fileSize, win32Error));
+    
+    if (!mappingGuard.IsValid()) {
         error.code = SignatureStoreError::MappingFailed;
         error.win32Error = win32Error;
         error.message = "Failed to create file mapping";
-        CloseHandle(view.fileHandle);
-        view.fileHandle = INVALID_HANDLE_VALUE;
         return false;
     }
 
-    // Map view
-    view.baseAddress = MapViewOfFileForAccess(view.mappingHandle, readOnly, view.fileSize, win32Error);
-    if (view.baseAddress == nullptr) {
+    // ========================================================================
+    // STEP 5: MAP VIEW WITH RAII
+    // ========================================================================
+
+    MappedViewGuard viewGuard(MapViewOfFileForAccess(mappingGuard.Get(), readOnly, fileSize, win32Error));
+    
+    if (!viewGuard.IsValid()) {
         error.code = SignatureStoreError::MappingFailed;
         error.win32Error = win32Error;
         error.message = "Failed to map view of file";
-        CloseHandle(view.mappingHandle);
-        CloseHandle(view.fileHandle);
-        view.mappingHandle = nullptr;
-        view.fileHandle = INVALID_HANDLE_VALUE;
         return false;
     }
 
-    view.readOnly = readOnly;
+    // ========================================================================
+    // STEP 6: VALIDATE HEADER BEFORE COMMITTING
+    // ========================================================================
 
-    // Validate header
-    const auto* header = view.GetAt<SignatureDatabaseHeader>(0);
-    if (!header || !Format::ValidateHeader(header)) {
+    const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(viewGuard.Get());
+    if (!Format::ValidateHeader(header)) {
         error.code = SignatureStoreError::InvalidFormat;
         error.win32Error = 0;
         error.message = "Invalid database header";
-        CloseView(view);
         return false;
+        // RAII guards will clean up automatically
     }
+
+    // ========================================================================
+    // STEP 7: SUCCESS - TRANSFER OWNERSHIP TO OUTPUT VIEW
+    // ========================================================================
+
+    // Release ownership from guards (caller now owns these resources)
+    view.fileHandle = fileGuard.Release();
+    view.mappingHandle = mappingGuard.Release();
+    view.baseAddress = viewGuard.Release();
+    view.fileSize = fileSize;
+    view.readOnly = readOnly;
 
     SS_LOG_INFO(L"SignatureStore", 
         L"Opened memory-mapped view: %s (%llu bytes, %s)",
-        path.c_str(), view.fileSize, readOnly ? L"read-only" : L"read-write");
+        path.c_str(), fileSize, readOnly ? L"read-only" : L"read-write");
 
     error.code = SignatureStoreError::Success;
     return true;

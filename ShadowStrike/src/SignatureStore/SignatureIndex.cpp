@@ -30,7 +30,7 @@ namespace ShadowStrike {
 namespace SignatureStore {
 
  // ============================================================================
-// HELPER FUNCTION: GetCurrentTimeNs
+// HELPER FUNCTION: GetCurrentTimeNs (Overflow-Safe Implementation)
 // ============================================================================
 
     static uint64_t GetCurrentTimeNs() noexcept {
@@ -48,9 +48,25 @@ namespace SignatureStore {
             return 0;
         }
 
-        // Convert to nanoseconds: (counter * 1,000,000,000) / frequency
-        // Use 128-bit arithmetic to prevent overflow
-        return (counter.QuadPart * 1000000000ULL) / frequency.QuadPart;
+        // Convert to nanoseconds with overflow protection
+        // Use division first to prevent overflow: (counter / frequency) * 1e9
+        // This loses some precision but prevents overflow for large counter values
+        
+        // Alternative: use 128-bit arithmetic or split calculation
+        // For values up to 2^63 / 1e9 ≈ 9.2e9 seconds (~292 years), this is safe
+        constexpr uint64_t NANOS_PER_SECOND = 1000000000ULL;
+        
+        // Check if direct multiplication would overflow
+        // counter * 1e9 overflows when counter > UINT64_MAX / 1e9 ≈ 18.4e9
+        if (static_cast<uint64_t>(counter.QuadPart) > UINT64_MAX / NANOS_PER_SECOND) {
+            // Use division-first approach (loses precision but safe)
+            return (static_cast<uint64_t>(counter.QuadPart) / 
+                    static_cast<uint64_t>(frequency.QuadPart)) * NANOS_PER_SECOND;
+        }
+        
+        // Safe to multiply directly
+        return (static_cast<uint64_t>(counter.QuadPart) * NANOS_PER_SECOND) / 
+               static_cast<uint64_t>(frequency.QuadPart);
     }
 
 // ============================================================================
@@ -190,18 +206,8 @@ std::optional<uint64_t> SignatureIndex::Lookup(const HashValue& hash) const noex
     return LookupByFastHash(hash.FastHash());
 }
 
-std::optional<uint64_t> SignatureIndex::LookupByFastHash(uint64_t fastHash) const noexcept {
-    // Performance tracking
-    m_totalLookups.fetch_add(1, std::memory_order_relaxed);
-
-    LARGE_INTEGER startTime;
-    if (m_perfFrequency.QuadPart > 0) {
-        QueryPerformanceCounter(&startTime);
-    }
-
-    // Lock-free read (shared lock allows concurrent readers)
-    std::shared_lock<std::shared_mutex> lock(m_rwLock);
-
+// Internal lookup helper - CALLER MUST HOLD LOCK (shared or exclusive)
+std::optional<uint64_t> SignatureIndex::LookupByFastHashInternal(uint64_t fastHash) const noexcept {
     // Find leaf node
     const BPlusTreeNode* leaf = FindLeaf(fastHash);
     if (!leaf) {
@@ -213,19 +219,35 @@ std::optional<uint64_t> SignatureIndex::LookupByFastHash(uint64_t fastHash) cons
 
     // Check if key found
     if (pos < leaf->keyCount && leaf->keys[pos] == fastHash) {
-        uint64_t signatureOffset = leaf->children[pos];
-        
-        // Performance tracking
-        if (m_perfFrequency.QuadPart > 0) {
-            LARGE_INTEGER endTime;
-            QueryPerformanceCounter(&endTime);
-            // Could track average lookup time here
-        }
-
-        return signatureOffset;
+        return static_cast<uint64_t>(leaf->children[pos]);
     }
 
     return std::nullopt;
+}
+
+std::optional<uint64_t> SignatureIndex::LookupByFastHash(uint64_t fastHash) const noexcept {
+    // Performance tracking
+    m_totalLookups.fetch_add(1, std::memory_order_relaxed);
+
+    LARGE_INTEGER startTime{};
+    bool hasTimer = (m_perfFrequency.QuadPart > 0);
+    if (hasTimer) {
+        QueryPerformanceCounter(&startTime);
+    }
+
+    // Lock-free read (shared lock allows concurrent readers)
+    std::shared_lock<std::shared_mutex> lock(m_rwLock);
+
+    auto result = LookupByFastHashInternal(fastHash);
+    
+    // Performance tracking (only if we have valid timer)
+    if (hasTimer && result.has_value()) {
+        LARGE_INTEGER endTime;
+        QueryPerformanceCounter(&endTime);
+        // Could track average lookup time here
+    }
+
+    return result;
 }
 
 std::vector<uint64_t> SignatureIndex::RangeQuery(
@@ -269,13 +291,20 @@ void SignatureIndex::BatchLookup(
     std::vector<std::optional<uint64_t>>& results
 ) const noexcept {
     results.clear();
-    results.reserve(hashes.size());
+    
+    // Reserve space - use try/catch for noexcept safety
+    try {
+        results.reserve(hashes.size());
+    } catch (...) {
+        // Failed to reserve - continue with default capacity
+    }
 
+    // Single lock acquisition for entire batch - avoids deadlock
     std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
-    // Process batch (cache-friendly)
+    // Process batch using internal helper (no nested locks)
     for (const auto& hash : hashes) {
-        results.push_back(LookupByFastHash(hash.FastHash()));
+        results.push_back(LookupByFastHashInternal(hash.FastHash()));
     }
 }
 
@@ -283,12 +312,11 @@ void SignatureIndex::BatchLookup(
 // MODIFICATION OPERATIONS
 // ============================================================================
 
-StoreError SignatureIndex::Insert(
+// Internal insert helper - CALLER MUST HOLD EXCLUSIVE LOCK
+StoreError SignatureIndex::InsertInternal(
     const HashValue& hash,
     uint64_t signatureOffset
 ) noexcept {
-    std::unique_lock<std::shared_mutex> lock(m_rwLock);
-
     uint64_t fastHash = hash.FastHash();
 
     // Find leaf for insertion
@@ -323,7 +351,7 @@ StoreError SignatureIndex::Insert(
         leaf->keyCount++;
 
         m_totalEntries.fetch_add(1, std::memory_order_release);
-        return CommitCOW();
+        return StoreError{SignatureStoreError::Success}; // Don't commit here for batch
     } else {
         // Node is full, need to split
         BPlusTreeNode* newLeaf = nullptr;
@@ -331,7 +359,6 @@ StoreError SignatureIndex::Insert(
 
         StoreError err = SplitNode(leaf, splitKey, &newLeaf);
         if (!err.IsSuccess()) {
-            RollbackCOW();
             return err;
         }
 
@@ -349,8 +376,25 @@ StoreError SignatureIndex::Insert(
         targetLeaf->keyCount++;
 
         m_totalEntries.fetch_add(1, std::memory_order_release);
-        return CommitCOW();
+        return StoreError{SignatureStoreError::Success}; // Don't commit here for batch
     }
+}
+
+StoreError SignatureIndex::Insert(
+    const HashValue& hash,
+    uint64_t signatureOffset
+) noexcept {
+    // Acquire exclusive lock
+    std::unique_lock<std::shared_mutex> lock(m_rwLock);
+
+    // Use internal helper
+    StoreError err = InsertInternal(hash, signatureOffset);
+    if (!err.IsSuccess()) {
+        return err;
+    }
+
+    // Commit COW transaction
+    return CommitCOW();
 }
 
 // ============================================================================
@@ -576,20 +620,7 @@ StoreError SignatureIndex::Remove(const HashValue& hash) noexcept {
     }
 
     // ========================================================================
-    // STEP 10: UPDATE STATISTICS
-    // ========================================================================
-
-    uint64_t totalEntries = m_totalEntries.load(std::memory_order_acquire);
-    if (totalEntries > 0) {
-        m_totalEntries.fetch_sub(1, std::memory_order_release);
-        totalEntries--;
-    }
-
-    SS_LOG_TRACE(L"SignatureIndex",
-        L"Remove: Statistics updated - totalEntries=%llu", totalEntries);
-
-    // ========================================================================
-    // STEP 11: COMMIT COW TRANSACTION
+    // STEP 10: COMMIT COW TRANSACTION (Before stats update for consistency)
     // ========================================================================
 
     StoreError commitErr = CommitCOW();
@@ -600,15 +631,31 @@ StoreError SignatureIndex::Remove(const HashValue& hash) noexcept {
         RollbackCOW();
         m_inCOWTransaction = false;
 
-        // Restore statistics
-        m_totalEntries.fetch_add(1, std::memory_order_release);
-
         return commitErr;
     }
 
     m_inCOWTransaction = false;
 
     SS_LOG_TRACE(L"SignatureIndex", L"Remove: COW transaction committed");
+
+    // ========================================================================
+    // STEP 11: UPDATE STATISTICS (After successful commit for consistency)
+    // ========================================================================
+
+    // FIX: Use fetch_sub return value which returns the value BEFORE decrement
+    // This is atomic and thread-safe. The returned value minus 1 gives us the
+    // new count correctly.
+    uint64_t previousCount = m_totalEntries.load(std::memory_order_acquire);
+    uint64_t entriesAfterRemoval = 0;
+    
+    if (previousCount > 0) {
+        // fetch_sub returns value BEFORE subtraction, so we know the new value
+        uint64_t prevValue = m_totalEntries.fetch_sub(1, std::memory_order_acq_rel);
+        entriesAfterRemoval = (prevValue > 0) ? (prevValue - 1) : 0;
+    }
+
+    SS_LOG_TRACE(L"SignatureIndex",
+        L"Remove: Statistics updated - totalEntries=%llu", entriesAfterRemoval);
 
     // ========================================================================
     // STEP 12: INVALIDATE CACHE ENTRIES
@@ -628,30 +675,34 @@ StoreError SignatureIndex::Remove(const HashValue& hash) noexcept {
 
     LARGE_INTEGER removeEndTime;
     QueryPerformanceCounter(&removeEndTime);
-    uint64_t removeTimeUs =
-        ((removeEndTime.QuadPart - removeStartTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    
+    // FIX: Division by zero protection
+    uint64_t removeTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        removeTimeUs = ((removeEndTime.QuadPart - removeStartTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     SS_LOG_INFO(L"SignatureIndex",
         L"Remove: Successfully removed hash (fastHash=0x%llX, offset=0x%llX, "
         L"time=%llu µs, remaining=%llu entries)",
-        fastHash, removedOffset, removeTimeUs, totalEntries);
+        fastHash, removedOffset, removeTimeUs, entriesAfterRemoval);
 
     // ========================================================================
     // STEP 14: CHECK IF REBUILD RECOMMENDED
     // ========================================================================
 
     // If tree has become very sparse, recommend rebuild
-    if (totalEntries > 0) {
+    if (entriesAfterRemoval > 0) {
         uint32_t treeHeight = m_treeHeight.load(std::memory_order_acquire);
-        double idealHeight = std::log2(static_cast<double>(totalEntries)) /
+        double idealHeight = std::log2(static_cast<double>(entriesAfterRemoval)) /
             std::log2(MIN_KEYS);
 
         if (treeHeight > idealHeight * 2.0) {
             SS_LOG_WARN(L"SignatureIndex",
                 L"Remove: Tree height (%u) is suboptimal for %llu entries - "
                 L"rebuild recommended (ideal: %.1f)",
-                treeHeight, totalEntries, idealHeight);
+                treeHeight, entriesAfterRemoval, idealHeight);
         }
     }
 
@@ -888,8 +939,9 @@ StoreError SignatureIndex::BatchInsert(
     for (size_t i = 0; i < sortedEntries.size(); ++i) {
         const auto& [hash, offset] = sortedEntries[i];
 
-        // Insert into B+Tree
-        StoreError err = Insert(hash, offset);
+        // Insert into B+Tree using internal helper (no lock - we already hold it)
+        // FIX: Use InsertInternal to avoid deadlock - BatchInsert already holds lock
+        StoreError err = InsertInternal(hash, offset);
 
         if (err.IsSuccess()) {
             successCount++;
@@ -961,9 +1013,13 @@ StoreError SignatureIndex::BatchInsert(
 
     LARGE_INTEGER batchEndTime;
     QueryPerformanceCounter(&batchEndTime);
-    uint64_t batchTimeUs =
-        ((batchEndTime.QuadPart - batchStartTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    
+    // FIX: Division by zero protection
+    uint64_t batchTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        batchTimeUs = ((batchEndTime.QuadPart - batchStartTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     double throughput = (batchTimeUs > 0) ?
         (static_cast<double>(successCount) / (batchTimeUs / 1'000'000.0)) : 0.0;
@@ -1307,36 +1363,76 @@ StoreError SignatureIndex::Rebuild() noexcept {
     SS_LOG_INFO(L"SignatureIndex",
         L"Rebuild: Rebuilding B+Tree with %llu entries", allEntries.size());
 
-    // Re-insert all entries using batch insert (optimized for tree construction)
+    // Re-insert all entries using InsertInternal (we already hold the lock)
+    // FIX: CRITICAL DEADLOCK FIX - Cannot call BatchInsert() while holding lock
+    // because BatchInsert() also tries to acquire the same non-recursive lock.
+    // Use InsertInternal() directly since we already hold exclusive lock.
     if (!allEntries.empty()) {
-        // Convert to expected format for BatchInsert
-        std::vector<std::pair<HashValue, uint64_t>> batchEntries;
-        batchEntries.reserve(allEntries.size());
+        m_inCOWTransaction = true;
+        
+        size_t successCount = 0;
+        StoreError lastError{ SignatureStoreError::Success };
 
-        for (const auto& [fastHash, offset] : allEntries) {
+        for (size_t i = 0; i < allEntries.size(); ++i) {
+            const auto& [fastHash, offset] = allEntries[i];
+            
+            // Create HashValue from fastHash for InsertInternal
             HashValue hash{};
             hash.type = HashType::SHA256; // Placeholder type (actual type info lost in rebuild)
             hash.length = 8; // Placeholder
-            // We don't have actual hash data, but fastHash is available
+            // Store fastHash in data for FastHash() to return correctly
+            std::memcpy(hash.data.data(), &fastHash, sizeof(fastHash));
 
-            batchEntries.emplace_back(hash, offset);
+            // Insert using internal method (no lock - we already hold it)
+            StoreError err = InsertInternal(hash, offset);
 
-            if (batchEntries.size() % 100000 == 0) {
+            if (err.IsSuccess()) {
+                successCount++;
+
+                if ((i + 1) % 10000 == 0) {
+                    SS_LOG_DEBUG(L"SignatureIndex",
+                        L"Rebuild: Progress - %zu/%zu entries inserted",
+                        successCount, allEntries.size());
+                }
+            }
+            else if (err.code == SignatureStoreError::DuplicateEntry) {
+                // Skip duplicates
                 SS_LOG_DEBUG(L"SignatureIndex",
-                    L"Rebuild: Prepared %llu entries for insertion",
-                    batchEntries.size());
+                    L"Rebuild: Entry %zu is duplicate, skipping", i);
+                continue;
+            }
+            else {
+                // Critical error - stop rebuild
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"Rebuild: Insert failed at entry %zu: %S",
+                    i, err.message.c_str());
+                lastError = err;
+                break;
             }
         }
 
-        // Use internal batch insert logic
-        // This will rebuild the tree optimally
-        StoreError batchErr = BatchInsert(batchEntries);
-        if (!batchErr.IsSuccess()) {
-            SS_LOG_ERROR(L"SignatureIndex",
-                L"Rebuild: Batch insert failed during rebuild: %S",
-                batchErr.message.c_str());
-            return batchErr;
+        // Commit COW transaction
+        if (lastError.IsSuccess() && successCount > 0) {
+            StoreError commitErr = CommitCOW();
+            if (!commitErr.IsSuccess()) {
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"Rebuild: Failed to commit COW: %S",
+                    commitErr.message.c_str());
+                RollbackCOW();
+                m_inCOWTransaction = false;
+                return commitErr;
+            }
         }
+        else if (!lastError.IsSuccess()) {
+            RollbackCOW();
+            m_inCOWTransaction = false;
+            return lastError;
+        }
+
+        m_inCOWTransaction = false;
+        
+        SS_LOG_INFO(L"SignatureIndex",
+            L"Rebuild: Successfully inserted %zu entries", successCount);
     }
 
     // ========================================================================
@@ -1395,9 +1491,13 @@ StoreError SignatureIndex::Rebuild() noexcept {
     // ========================================================================
 
     QueryPerformanceCounter(&rebuildEndTime);
-    uint64_t rebuildTimeUs =
-        ((rebuildEndTime.QuadPart - rebuildStartTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    
+    // FIX: Division by zero protection
+    uint64_t rebuildTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        rebuildTimeUs = ((rebuildEndTime.QuadPart - rebuildStartTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     double entriesPerSecond = (rebuildTimeUs > 0) ?
         (static_cast<double>(newEntries) / (rebuildTimeUs / 1'000'000.0)) : 0.0;
@@ -1717,6 +1817,13 @@ StoreError SignatureIndex::Compact() noexcept {
                 // Remove merged children from parent
                 uint32_t removeCount = static_cast<uint32_t>(childIndices.size()) - 1;
                 for (uint32_t i = 0; i < removeCount; ++i) {
+                    // FIX: Check keyCount > 0 to prevent underflow
+                    if (clonedParent->keyCount == 0) {
+                        SS_LOG_WARN(L"SignatureIndex",
+                            L"Compact: Parent keyCount is 0, cannot remove more entries");
+                        break;
+                    }
+                    
                     // Remove entry from parent
                     uint32_t removePos = 0;
                     for (uint32_t j = 0; j < clonedParent->keyCount; ++j) {
@@ -1728,9 +1835,12 @@ StoreError SignatureIndex::Compact() noexcept {
                     }
 
                     // Shift entries
-                    for (uint32_t j = removePos; j < clonedParent->keyCount - 1; ++j) {
-                        clonedParent->keys[j] = clonedParent->keys[j + 1];
-                        clonedParent->children[j + 1] = clonedParent->children[j + 2];
+                    // FIX: Check keyCount > 1 to prevent underflow in loop condition
+                    if (clonedParent->keyCount > 1) {
+                        for (uint32_t j = removePos; j < clonedParent->keyCount - 1; ++j) {
+                            clonedParent->keys[j] = clonedParent->keys[j + 1];
+                            clonedParent->children[j + 1] = clonedParent->children[j + 2];
+                        }
                     }
                     clonedParent->keyCount--;
                 }
@@ -1813,9 +1923,13 @@ StoreError SignatureIndex::Compact() noexcept {
 
     LARGE_INTEGER compactEndTime;
     QueryPerformanceCounter(&compactEndTime);
-    uint64_t compactTimeUs =
-        ((compactEndTime.QuadPart - compactStartTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    
+    // FIX: Division by zero protection
+    uint64_t compactTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        compactTimeUs = ((compactEndTime.QuadPart - compactStartTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     uint32_t heightAfter = m_treeHeight.load(std::memory_order_acquire);
 
@@ -2480,16 +2594,15 @@ void SignatureIndex::InvalidateCacheEntry(uint32_t nodeOffset) noexcept {
      * Purpose:
      * - Remove single cached node from cache (after modification)
      * - Maintain cache consistency during COW updates
-     * - Non-blocking operation using compare-and-swap
+     * - Thread-safe operation with proper locking
      *
      * Performance:
      * - O(1) average case lookup (hash-based)
-     * - Non-blocking for readers
-     * - Minimal lock contention
+     * - Minimal lock contention with exclusive lock only during write
      *
      * Thread Safety:
-     * - Lock-free for invalidation
-     * - Readers continue using cache during invalidation
+     * - Exclusive lock for cache modification
+     * - Readers must hold shared lock during access
      * - Safe concurrent access to other cache entries
      *
      * ========================================================================
@@ -2504,6 +2617,9 @@ void SignatureIndex::InvalidateCacheEntry(uint32_t nodeOffset) noexcept {
     // Hash the node offset to cache index
     size_t cacheIndex = HashNodeOffset(nodeOffset) % CACHE_SIZE;
 
+    // Acquire exclusive lock for cache modification
+    std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock);
+
     // Linear probing for collision resolution
     size_t attempts = 0;
     constexpr size_t MAX_PROBE_ATTEMPTS = 16;
@@ -2516,15 +2632,24 @@ void SignatureIndex::InvalidateCacheEntry(uint32_t nodeOffset) noexcept {
 
         if (cacheEntry.node != nullptr) {
             // Calculate node offset from cached pointer
-            uint32_t cachedOffset = static_cast<uint32_t>(
-                reinterpret_cast<const uint8_t*>(cacheEntry.node) -
-                static_cast<const uint8_t*>(m_baseAddress)
-                );
+            const uint8_t* cachedPtr = reinterpret_cast<const uint8_t*>(cacheEntry.node);
+            const uint8_t* basePtr = static_cast<const uint8_t*>(m_baseAddress);
+            
+            // Safety check: ensure cached pointer is within bounds
+            if (cachedPtr < basePtr || cachedPtr >= basePtr + m_indexSize) {
+                // Invalid cached pointer - clear it
+                cacheEntry.node = nullptr;
+                cacheEntry.accessCount = 0;
+                cacheEntry.lastAccessTime = 0;
+                attempts++;
+                continue;
+            }
+            
+            uint32_t cachedOffset = static_cast<uint32_t>(cachedPtr - basePtr);
 
             if (cachedOffset == nodeOffset) {
-                // Found the entry - invalidate it atomically
-                // Use acquire semantics to ensure visibility
-                const_cast<BPlusTreeNode*&>(cacheEntry.node) = nullptr;
+                // Found the entry - invalidate it (already under exclusive lock)
+                cacheEntry.node = nullptr;
                 cacheEntry.accessCount = 0;
                 cacheEntry.lastAccessTime = 0;
 
@@ -2549,7 +2674,7 @@ void SignatureIndex::InvalidateCacheEntry(uint32_t nodeOffset) noexcept {
 void SignatureIndex::ClearCache() noexcept {
     /*
      * ========================================================================
-     * COMPLETE CACHE CLEARANCE - THREAD-SAFE, BLOCKING-FREE
+     * COMPLETE CACHE CLEARANCE - THREAD-SAFE
      * ========================================================================
      *
      * Purpose:
@@ -2563,19 +2688,20 @@ void SignatureIndex::ClearCache() noexcept {
      * - No stale data served
      *
      * Thread Safety:
-     * - Safe concurrent access during clear
-     * - Readers may get cache miss but will reload correctly
-     * - Writers have exclusive lock (precondition)
+     * - Exclusive lock for cache modification
+     * - Readers must acquire shared lock before access
      *
      * Performance:
      * - O(n) where n = CACHE_SIZE (fixed constant)
      * - Amortized constant per entry (simple zeroing)
-     * - No locks needed (atomic operations not required for clear)
      *
      * ========================================================================
      */
 
     SS_LOG_DEBUG(L"SignatureIndex", L"ClearCache: Clearing %zu cache entries", CACHE_SIZE);
+
+    // Acquire exclusive lock for cache modification
+    std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock);
 
     // Zero out all cache entries
     for (size_t i = 0; i < CACHE_SIZE; ++i) {
@@ -2758,9 +2884,12 @@ StoreError SignatureIndex::Flush() noexcept {
     LARGE_INTEGER flushEndTime;
     QueryPerformanceCounter(&flushEndTime);
 
-    uint64_t flushTimeUs =
-        ((flushEndTime.QuadPart - flushStartTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    // FIX: Division by zero protection
+    uint64_t flushTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        flushTimeUs = ((flushEndTime.QuadPart - flushStartTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     // ========================================================================
     // STEP 7: SUCCESS LOGGING
@@ -2791,16 +2920,20 @@ StoreError SignatureIndex::Flush() noexcept {
 const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE NODE RETRIEVAL WITH CACHING
+     * ENTERPRISE-GRADE NODE RETRIEVAL WITH THREAD-SAFE CACHING
      * ========================================================================
      *
-     * Already production-grade, but adding extra validation
+     * Thread Safety:
+     * - Cache reads are protected by shared lock (multiple concurrent readers)
+     * - Cache writes are protected by exclusive lock on m_cacheLock
+     * - Atomic access counter prevents data races
+     *
      * ========================================================================
      */
 
-     // ========================================================================
-     // STEP 1: BOUNDS CHECKING
-     // ========================================================================
+    // ========================================================================
+    // STEP 1: BOUNDS CHECKING
+    // ========================================================================
 
     if (nodeOffset >= m_indexSize) {
         SS_LOG_ERROR(L"SignatureIndex",
@@ -2809,60 +2942,57 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
         return nullptr;
     }
 
-    // Validate offset is properly aligned (optional but good practice)
+    // Validate offset is properly aligned
     if (nodeOffset % alignof(BPlusTreeNode) != 0) {
         SS_LOG_WARN(L"SignatureIndex",
             L"GetNode: Offset 0x%X is not properly aligned (alignment=%zu)",
             nodeOffset, alignof(BPlusTreeNode));
-        // Continue anyway - might be valid in memory-mapped file
     }
 
     // ========================================================================
-    // STEP 2: CHECK CACHE
+    // STEP 2: CHECK CACHE (Thread-Safe Read)
     // ========================================================================
 
-    size_t cacheIdx = HashNodeOffset(nodeOffset) % CACHE_SIZE;
-    auto& cached = m_nodeCache[cacheIdx];
+    const size_t cacheIdx = HashNodeOffset(nodeOffset) % CACHE_SIZE;
+    
+    // Read cache entry under shared lock
+    {
+        std::shared_lock<std::shared_mutex> cacheLock(m_cacheLock);
+        
+        const auto& cached = m_nodeCache[cacheIdx];
+        
+        if (cached.node != nullptr) {
+            // Validate cached pointer is still within bounds
+            const uint8_t* nodePtr = reinterpret_cast<const uint8_t*>(cached.node);
+            const uint8_t* basePtr = static_cast<const uint8_t*>(m_baseAddress);
 
-    if (cached.node != nullptr) {
-        // Validate cached pointer is still within bounds
-        const uint8_t* nodePtr = reinterpret_cast<const uint8_t*>(cached.node);
-        const uint8_t* basePtr = static_cast<const uint8_t*>(m_baseAddress);
+            // Safety check: ensure cached pointer is within mapped region
+            bool inBounds = (nodePtr >= basePtr) && 
+                            ((nodePtr + sizeof(BPlusTreeNode)) <= (basePtr + m_indexSize));
 
-        // Paranoid validation: ensure cached pointer is within mapped region
-        if (nodePtr < basePtr ||
-            (nodePtr + sizeof(BPlusTreeNode)) >(basePtr + m_indexSize)) {
-            SS_LOG_WARN(L"SignatureIndex",
-                L"GetNode: Cached node pointer out of bounds - invalidating cache entry");
-            cached.node = nullptr;
-            goto cache_miss;
-        }
+            if (inBounds) {
+                const uint64_t actualOffset = static_cast<uint64_t>(nodePtr - basePtr);
 
-        uint64_t actualOffset = nodePtr - basePtr;
+                if (actualOffset == nodeOffset) {
+                    // Cache hit!
+                    m_cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    
+                    SS_LOG_TRACE(L"SignatureIndex",
+                        L"GetNode: Cache hit for offset 0x%X",
+                        nodeOffset);
 
-        if (actualOffset == nodeOffset) {
-            // Cache hit!
-            m_cacheHits.fetch_add(1, std::memory_order_relaxed);
-            cached.accessCount++;
-            cached.lastAccessTime = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
-
-            SS_LOG_TRACE(L"SignatureIndex",
-                L"GetNode: Cache hit for offset 0x%X (accessCount=%llu)",
-                nodeOffset, cached.accessCount);
-
-            return cached.node;
+                    return cached.node;
+                }
+            }
+            // If out of bounds or wrong offset, fall through to cache miss
         }
     }
 
-cache_miss:
     // ========================================================================
     // STEP 3: CACHE MISS - LOAD FROM MEMORY
     // ========================================================================
 
     m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
-
-    // Calculate node address
-    const uint8_t* nodeAddr = static_cast<const uint8_t*>(m_baseAddress) + nodeOffset;
 
     // Validate we have enough space for full node
     if (nodeOffset + sizeof(BPlusTreeNode) > m_indexSize) {
@@ -2873,13 +3003,14 @@ cache_miss:
         return nullptr;
     }
 
+    // Calculate node address
+    const uint8_t* nodeAddr = static_cast<const uint8_t*>(m_baseAddress) + nodeOffset;
     const auto* node = reinterpret_cast<const BPlusTreeNode*>(nodeAddr);
 
     // ========================================================================
     // STEP 4: VALIDATE NODE STRUCTURE (Corruption Detection)
     // ========================================================================
 
-    // Quick sanity check on retrieved node
     if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"GetNode: Retrieved node has invalid keyCount %u (max=%zu) at offset 0x%X",
@@ -2888,12 +3019,17 @@ cache_miss:
     }
 
     // ========================================================================
-    // STEP 5: UPDATE CACHE
+    // STEP 5: UPDATE CACHE (Thread-Safe Write)
     // ========================================================================
 
-    cached.node = node;
-    cached.accessCount = 1;
-    cached.lastAccessTime = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock);
+        
+        auto& cached = m_nodeCache[cacheIdx];
+        cached.node = node;
+        cached.accessCount = 1;
+        cached.lastAccessTime = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
+    }
 
     SS_LOG_TRACE(L"SignatureIndex",
         L"GetNode: Cache miss - loaded node from offset 0x%X (keyCount=%u, isLeaf=%d)",
@@ -3119,16 +3255,19 @@ StoreError SignatureIndex::CommitCOW() noexcept {
         }
 
         // Verify key ordering (keys must be strictly increasing)
-        for (uint32_t j = 0; j < node->keyCount - 1; ++j) {
-            if (node->keys[j] >= node->keys[j + 1]) {
-                SS_LOG_ERROR(L"SignatureIndex",
-                    L"CommitCOW: Key ordering violation at index %zu, pos %u: "
-                    L"0x%llX >= 0x%llX",
-                    i, j, node->keys[j], node->keys[j + 1]);
-                RollbackCOW();
-                m_inCOWTransaction = false;
-                return StoreError{ SignatureStoreError::IndexCorrupted, 0,
-                                  "Key ordering violation in COW node" };
+        // FIX: Check keyCount > 1 to prevent underflow (keyCount - 1 when keyCount == 0)
+        if (node->keyCount > 1) {
+            for (uint32_t j = 0; j < node->keyCount - 1; ++j) {
+                if (node->keys[j] >= node->keys[j + 1]) {
+                    SS_LOG_ERROR(L"SignatureIndex",
+                        L"CommitCOW: Key ordering violation at index %zu, pos %u: "
+                        L"0x%llX >= 0x%llX",
+                        i, j, node->keys[j], node->keys[j + 1]);
+                    RollbackCOW();
+                    m_inCOWTransaction = false;
+                    return StoreError{ SignatureStoreError::IndexCorrupted, 0,
+                                      "Key ordering violation in COW node" };
+                }
             }
         }
 
@@ -3359,9 +3498,13 @@ StoreError SignatureIndex::CommitCOW() noexcept {
 
     LARGE_INTEGER commitEndTime;
     QueryPerformanceCounter(&commitEndTime);
-    uint64_t commitTimeUs =
-        ((commitEndTime.QuadPart - commitStartTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    
+    // FIX: Division by zero protection
+    uint64_t commitTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        commitTimeUs = ((commitEndTime.QuadPart - commitStartTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     // ========================================================================
     // STEP 14: SUCCESS LOGGING
@@ -3425,10 +3568,32 @@ uint32_t SignatureIndex::BinarySearch(
 
 uint64_t SignatureIndex::GetCurrentTimeNs() noexcept {
     LARGE_INTEGER counter, frequency;
-    QueryPerformanceCounter(&counter);
-    QueryPerformanceFrequency(&frequency);
-
-    return (counter.QuadPart * 1000000000ULL) / frequency.QuadPart;
+    
+    if (!QueryPerformanceCounter(&counter)) {
+        return 0;
+    }
+    
+    if (!QueryPerformanceFrequency(&frequency)) {
+        return 0;
+    }
+    
+    if (frequency.QuadPart == 0) {
+        return 0;
+    }
+    
+    // FIX: Overflow-safe nanosecond calculation
+    // Same approach as global static GetCurrentTimeNs()
+    constexpr uint64_t NANOS_PER_SECOND = 1000000000ULL;
+    
+    // Check if direct multiplication would overflow
+    if (static_cast<uint64_t>(counter.QuadPart) > UINT64_MAX / NANOS_PER_SECOND) {
+        // Use division-first approach (loses precision but safe)
+        return (static_cast<uint64_t>(counter.QuadPart) / 
+                static_cast<uint64_t>(frequency.QuadPart)) * NANOS_PER_SECOND;
+    }
+    
+    return (static_cast<uint64_t>(counter.QuadPart) * NANOS_PER_SECOND) / 
+           static_cast<uint64_t>(frequency.QuadPart);
 }
 
 size_t SignatureIndex::HashNodeOffset(uint32_t offset) noexcept {
@@ -3901,9 +4066,12 @@ std::vector<DetectionResult> PatternIndex::Search(
             LARGE_INTEGER currentTime;
             QueryPerformanceCounter(&currentTime);
 
-            uint64_t elapsedMs =
-                ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                m_perfFrequency.QuadPart;
+            // FIX: Division by zero protection
+            uint64_t elapsedMs = 0;
+            if (m_perfFrequency.QuadPart > 0) {
+                elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
+                    static_cast<uint64_t>(m_perfFrequency.QuadPart);
+            }
 
             if (elapsedMs > options.timeoutMilliseconds) {
                 SS_LOG_WARN(L"PatternIndex",
@@ -3942,6 +4110,15 @@ std::vector<DetectionResult> PatternIndex::Search(
 
                 if (outputPool) {
                     uint32_t count = *outputPool;
+                    
+                    // FIX: Bounds check on pattern count to prevent DoS
+                    constexpr uint32_t MAX_PATTERNS_PER_NODE = 10000;
+                    if (count > MAX_PATTERNS_PER_NODE) {
+                        SS_LOG_WARN(L"PatternIndex",
+                            L"Search: Suspicious pattern count %u at node, limiting to %u",
+                            count, MAX_PATTERNS_PER_NODE);
+                        count = MAX_PATTERNS_PER_NODE;
+                    }
 
                     const auto* patternIds = reinterpret_cast<const uint64_t*>(
                         reinterpret_cast<const uint8_t*>(outputPool) + sizeof(uint32_t)
@@ -3994,9 +4171,12 @@ std::vector<DetectionResult> PatternIndex::Search(
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
 
-    uint64_t searchTimeUs =
-        ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    // FIX: Division by zero protection
+    uint64_t searchTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        searchTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
+            static_cast<uint64_t>(m_perfFrequency.QuadPart);
+    }
 
     m_totalSearches.fetch_add(1, std::memory_order_relaxed);
     m_totalMatches.fetch_add(results.size(), std::memory_order_relaxed);

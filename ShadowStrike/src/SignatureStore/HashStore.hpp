@@ -401,11 +401,12 @@ private:
         uint64_t signatureOffset
     ) const noexcept;
 
-    // Query result cache
-    struct CacheEntry {
-        HashValue hash;
+    // Query result cache with SeqLock for lock-free reads
+    struct alignas(64) CacheEntry {  // Cache-line aligned to prevent false sharing
+        mutable std::atomic<uint64_t> seqlock{0};         // SeqLock: odd = writing, even = valid
+        HashValue hash{};
         std::optional<DetectionResult> result;
-        uint64_t timestamp;                               // For LRU eviction
+        uint64_t timestamp{0};                            // For LRU eviction
     };
 
     [[nodiscard]] std::optional<DetectionResult> GetFromCache(

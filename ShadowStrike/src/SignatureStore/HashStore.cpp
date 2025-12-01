@@ -32,6 +32,7 @@
 #include <sstream>
 #include <fstream>
 #include<unordered_set>
+#include <thread>
 
 // Windows Crypto API for hash computation
 #include <wincrypt.h>
@@ -40,14 +41,6 @@
 
 namespace ShadowStrike {
     namespace SignatureStore {
-
-       
-#include <vector>
-#include <atomic>
-#include <cstdint>
-#include <cmath>
-#include <algorithm>
-#include <cstring>
 
 // ====================================================
 // BloomFilter - Thread-safe, high-performance
@@ -91,11 +84,15 @@ namespace ShadowStrike {
                 size_t arrayIndex = bitIndex / 64;
                 size_t bitOffset = bitIndex % 64;
 
+                // Bounds check for safety
+                if (arrayIndex >= m_bits.size()) {
+                    continue;  // Should never happen, but be safe
+                }
+
                 uint64_t mask = 1ULL << bitOffset;
 
-                // ✅ atomic_ref ile thread-safe set
+                // Thread-safe atomic set
                 m_bits[arrayIndex].fetch_or(mask, std::memory_order_relaxed);
-
             }
         }
 
@@ -105,8 +102,13 @@ namespace ShadowStrike {
                 size_t arrayIndex = bitIndex / 64;
                 size_t bitOffset = bitIndex % 64;
 
-                // ✅ atomic_ref ile thread-safe load
-                uint64_t word = std::atomic_ref<const uint64_t>(m_bits[arrayIndex]).load(std::memory_order_relaxed);
+                // Bounds check for safety
+                if (arrayIndex >= m_bits.size()) {
+                    return false;  // Invalid state, return false to be safe
+                }
+
+                // m_bits is already std::atomic<uint64_t>, load directly
+                uint64_t word = m_bits[arrayIndex].load(std::memory_order_relaxed);
                 if ((word & (1ULL << bitOffset)) == 0) {
                     return false;
                 }
@@ -122,8 +124,9 @@ namespace ShadowStrike {
 
         double BloomFilter::EstimatedFillRate() const noexcept {
             size_t setBits = 0;
-            for (const auto& w : m_bits) {
-                uint64_t word = std::atomic_ref<const uint64_t>(w).load(std::memory_order_relaxed);
+            for (size_t i = 0; i < m_bits.size(); ++i) {
+                // m_bits is already std::atomic<uint64_t>, load directly
+                uint64_t word = m_bits[i].load(std::memory_order_relaxed);
                 setBits += std::popcount(word);
             }
             return (m_size == 0) ? 0.0 : static_cast<double>(setBits) / static_cast<double>(m_size);
@@ -743,33 +746,55 @@ namespace ShadowStrike {
                 filteredCandidates.reserve(candidates.size() / 10);
 
                 if (hash.type == HashType::SSDEEP) {
-                    // Extract blocksize from query hash
+                    // Extract blocksize from query hash with exception safety
                     const char* colonPtr = std::strchr(hashString, ':');
-                    if (colonPtr) {
-                        std::string blockSizeStr = ShadowStrike::Utils::StringUtils::ToNarrow(
-                            std::wstring(hashString, colonPtr)
-                        );
-                        uint32_t queryBlockSize = std::stoi(blockSizeStr);
+                    if (colonPtr && colonPtr > hashString) {
+                        try {
+                            std::string blockSizeStr(hashString, colonPtr);
+                            // Validate it's a number before parsing
+                            if (!blockSizeStr.empty() && std::all_of(blockSizeStr.begin(), blockSizeStr.end(), ::isdigit)) {
+                                uint32_t queryBlockSize = static_cast<uint32_t>(std::stoul(blockSizeStr));
 
-                        SS_LOG_DEBUG(L"HashStore",
-                            L"FuzzyMatch: SSDEEP blocksize filter (query=%u)",
-                            queryBlockSize);
+                                SS_LOG_DEBUG(L"HashStore",
+                                    L"FuzzyMatch: SSDEEP blocksize filter (query=%u)",
+                                    queryBlockSize);
 
-                        // Filter candidates by blocksize (±50%)
-                        for (const auto& [offset, candidateHash] : candidates) {
-                            const char* candidateStr =
-                                reinterpret_cast<const char*>(candidateHash.data.data());
-                            const char* candidateColon = std::strchr(candidateStr, ':');
+                                // Filter candidates by blocksize (±50%)
+                                for (const auto& [offset, candidateHash] : candidates) {
+                                    // Null-terminate safety check
+                                    if (candidateHash.length == 0 || candidateHash.length > 64) {
+                                        continue;
+                                    }
 
-                            if (candidateColon) {
-                                std::string candBlockSizeStr(candidateStr, candidateColon);
-                                uint32_t candBlockSize = std::stoi(candBlockSizeStr);
+                                    const char* candidateStr =
+                                        reinterpret_cast<const char*>(candidateHash.data.data());
+                                    const char* candidateColon = static_cast<const char*>(
+                                        std::memchr(candidateStr, ':', candidateHash.length));
 
-                                if (candBlockSize >= queryBlockSize / 2 &&
-                                    candBlockSize <= queryBlockSize * 2) {
-                                    filteredCandidates.emplace_back(offset, candidateHash);
+                                    if (candidateColon && candidateColon > candidateStr) {
+                                        try {
+                                            std::string candBlockSizeStr(candidateStr, candidateColon);
+                                            if (!candBlockSizeStr.empty() && std::all_of(candBlockSizeStr.begin(), candBlockSizeStr.end(), ::isdigit)) {
+                                                uint32_t candBlockSize = static_cast<uint32_t>(std::stoul(candBlockSizeStr));
+
+                                                if (candBlockSize >= queryBlockSize / 2 &&
+                                                    candBlockSize <= queryBlockSize * 2) {
+                                                    filteredCandidates.emplace_back(offset, candidateHash);
+                                                }
+                                            }
+                                        }
+                                        catch (...) {
+                                            // Skip invalid candidate, continue with others
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        catch (const std::exception& ex) {
+                            SS_LOG_WARN(L"HashStore",
+                                L"FuzzyMatch: Failed to parse SSDEEP blocksize: %S", ex.what());
+                            // Fall through without filtering
                         }
                     }
                 }
@@ -1378,9 +1403,11 @@ namespace ShadowStrike {
 
             std::map<HashType, std::vector<size_t>> indexesByType;
 
+            // Use unordered_set for O(1) invalid index lookup instead of O(n)
+            std::unordered_set<size_t> invalidSet(invalidIndices.begin(), invalidIndices.end());
+
             for (size_t i = 0; i < hashes.size(); ++i) {
-                if (std::find(invalidIndices.begin(), invalidIndices.end(), i)
-                    == invalidIndices.end()) {
+                if (invalidSet.find(i) == invalidSet.end()) {
                     indexesByType[hashes[i].type].push_back(i);
                 }
             }
@@ -1407,39 +1434,39 @@ namespace ShadowStrike {
                 }
 
                 // ============================================================
-                // PRE-CHECK FOR DUPLICATES WITHIN BATCH
+                // PRE-CHECK FOR DUPLICATES WITHIN BATCH (O(n) using hash set)
                 // ============================================================
 
                 std::vector<std::pair<HashValue, uint64_t>> batchEntries;
                 batchEntries.reserve(typeIndices.size());
 
+                // Use hash set for O(1) duplicate detection instead of O(n²)
+                std::unordered_set<uint64_t> seenFastHashes;
+                seenFastHashes.reserve(typeIndices.size());
+
                 for (size_t idx : typeIndices) {
-                    // Check for duplicates within this batch
-                    bool isDuplicate = false;
                     uint64_t fastHash = hashes[idx].FastHash();
 
-                    for (const auto& [prevHash, _] : batchEntries) {
-                        if (prevHash.FastHash() == fastHash) {
-                            SS_LOG_WARN(L"HashStore",
-                                L"AddHashBatch: Duplicate within batch at index %zu",
-                                idx);
-                            isDuplicate = true;
-                            failureCount++;
-                            break;
-                        }
+                    // O(1) duplicate check within batch
+                    if (seenFastHashes.find(fastHash) != seenFastHashes.end()) {
+                        SS_LOG_WARN(L"HashStore",
+                            L"AddHashBatch: Duplicate within batch at index %zu",
+                            idx);
+                        failureCount++;
+                        continue;
                     }
 
-                    if (!isDuplicate) {
-                        // Check against existing database
-                        if (!bucket->Contains(hashes[idx])) {
-                            batchEntries.emplace_back(hashes[idx], 0);
-                        }
-                        else {
-                            SS_LOG_WARN(L"HashStore",
-                                L"AddHashBatch: Hash already exists at index %zu",
-                                idx);
-                            failureCount++;
-                        }
+                    seenFastHashes.insert(fastHash);
+
+                    // Check against existing database
+                    if (!bucket->Contains(hashes[idx])) {
+                        batchEntries.emplace_back(hashes[idx], 0);
+                    }
+                    else {
+                        SS_LOG_WARN(L"HashStore",
+                            L"AddHashBatch: Hash already exists at index %zu",
+                            idx);
+                        failureCount++;
                     }
                 }
 
@@ -3084,10 +3111,25 @@ namespace ShadowStrike {
         }
 
         void HashStore::ClearCache() noexcept {
+            // Clear cache using SeqLock protocol to prevent torn reads
             for (auto& entry : m_queryCache) {
+                // Acquire write lock (set to odd)
+                uint64_t oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+                while (oldSeq & 1 || !entry.seqlock.compare_exchange_weak(
+                        oldSeq, oldSeq + 1, 
+                        std::memory_order_acquire, 
+                        std::memory_order_relaxed)) {
+                    std::this_thread::yield();
+                    oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+                }
+                
+                // Clear the entry
                 entry.hash = HashValue{};
                 entry.result = std::nullopt;
                 entry.timestamp = 0;
+                
+                // Release write lock (increment to even)
+                entry.seqlock.store(oldSeq + 2, std::memory_order_release);
             }
         }
 
@@ -3157,9 +3199,13 @@ const HashBucket* HashStore::GetBucket(HashType type) const noexcept {
 }
 
 uint64_t HashStore::AllocateSignatureEntry(size_t size) noexcept {
-    static uint64_t currentOffset = PAGE_SIZE * 100;
-    uint64_t offset = currentOffset;
-    currentOffset += Format::AlignToPage(size);
+    // Thread-safe allocation using atomic fetch_add
+    // Initial offset starts after header pages (100 pages reserved)
+    static std::atomic<uint64_t> currentOffset{ PAGE_SIZE * 100 };
+    
+    const size_t alignedSize = Format::AlignToPage(size);
+    // Atomically reserve space and return the starting offset
+    uint64_t offset = currentOffset.fetch_add(alignedSize, std::memory_order_acq_rel);
     return offset;
 }
 
@@ -3180,9 +3226,35 @@ DetectionResult HashStore::BuildDetectionResult(
 std::optional<DetectionResult> HashStore::GetFromCache(const HashValue& hash) const noexcept {
     size_t cacheIdx = (hash.FastHash() % CACHE_SIZE);
     const auto& entry = m_queryCache[cacheIdx];
-    if (entry.hash == hash) {
-        return entry.result;
+    
+    // SeqLock read: retry if writer is active or sequence changed
+    constexpr int MAX_RETRIES = 3;
+    for (int retry = 0; retry < MAX_RETRIES; ++retry) {
+        uint64_t seq1 = entry.seqlock.load(std::memory_order_acquire);
+        
+        // Odd sequence means write in progress - spin briefly
+        if (seq1 & 1) {
+            std::this_thread::yield();
+            continue;
+        }
+        
+        // Read the data
+        HashValue readHash = entry.hash;
+        std::optional<DetectionResult> readResult = entry.result;
+        
+        // Memory fence before reading sequence again
+        std::atomic_thread_fence(std::memory_order_acquire);
+        
+        uint64_t seq2 = entry.seqlock.load(std::memory_order_acquire);
+        
+        // If sequence unchanged, read was consistent
+        if (seq1 == seq2 && readHash == hash) {
+            return readResult;
+        }
+        // Sequence changed during read - retry
     }
+    
+    // Cache miss or too many retries
     return std::nullopt;
 }
 
@@ -3192,9 +3264,27 @@ void HashStore::AddToCache(
 ) const noexcept {
     size_t cacheIdx = (hash.FastHash() % CACHE_SIZE);
     auto& entry = m_queryCache[cacheIdx];
+    
+    // SeqLock write: increment to odd (writing), write data, increment to even (done)
+    uint64_t oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+    
+    // Try to acquire write lock (set to odd)
+    // Simple spin if another writer is active
+    while (oldSeq & 1 || !entry.seqlock.compare_exchange_weak(
+            oldSeq, oldSeq + 1, 
+            std::memory_order_acquire, 
+            std::memory_order_relaxed)) {
+        std::this_thread::yield();
+        oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+    }
+    
+    // Now we hold the write lock (sequence is odd)
     entry.hash = hash;
     entry.result = result;
     entry.timestamp = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
+    
+    // Release write lock (increment to even)
+    entry.seqlock.store(oldSeq + 2, std::memory_order_release);
 }
 
 const SignatureDatabaseHeader* HashStore::GetHeader() const noexcept {

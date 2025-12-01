@@ -423,6 +423,11 @@ public:
         const HashValue& b
     ) const noexcept;
 
+    // Performance monitoring
+    LARGE_INTEGER m_perfFrequency{};
+    LARGE_INTEGER m_buildStartTime{};
+
+
 private:
 
     // ========================================================================
@@ -535,16 +540,8 @@ private:
     // Configuration flags
     bool m_incrementalMode{false};
 
-    // Performance monitoring
-    LARGE_INTEGER m_perfFrequency{};
-    LARGE_INTEGER m_buildStartTime{};
-
 
 };
-
-// ============================================================================
-// BATCH BUILDER (For Large-Scale Builds)
-// ============================================================================
 
 class BatchSignatureBuilder {
 public:
@@ -567,12 +564,17 @@ public:
     [[nodiscard]] StoreError BuildParallel() noexcept;
 
     // Get progress information
+    struct BatchError {
+        std::wstring filePath;
+        std::string errorMessage;
+    };
+
     struct BatchProgress {
-        size_t totalFiles{0};
-        size_t processedFiles{0};
-        size_t successfulFiles{0};
-        size_t failedFiles{0};
-        std::vector<std::string> errors;
+        size_t totalFiles{ 0 };
+        size_t processedFiles{ 0 };
+        size_t successfulFiles{ 0 };
+        size_t failedFiles{ 0 };
+        std::vector<BatchError> errors;
     };
 
     [[nodiscard]] BatchProgress GetProgress() const noexcept;
@@ -584,6 +586,8 @@ private:
     BatchProgress m_progress{};
     mutable std::mutex m_progressMutex;
 };
+
+
 
 // ============================================================================
 // UTILITY FUNCTIONS

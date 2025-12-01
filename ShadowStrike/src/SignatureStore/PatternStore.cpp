@@ -24,11 +24,14 @@
 #include <algorithm>
 #include <queue>
 #include <cctype>
-#include<sstream>
-#include<bit>
-#include<iomanip>
-#include<string>
-#include<iostream>
+#include <sstream>
+#include <bit>
+#include <iomanip>
+#include <string>
+#include <iostream>
+#include <chrono>
+#include <mutex>
+#include <cstdint>
 #include <immintrin.h> // AVX2/AVX-512 intrinsics
 
 namespace ShadowStrike {
@@ -55,33 +58,78 @@ bool AhoCorasickAutomaton::AddPattern(
         SS_LOG_ERROR(L"AhoCorasick", L"Empty pattern");
         return false;
     }
+    
+    // Security: Limit pattern length to prevent DoS
+    constexpr size_t MAX_PATTERN_LENGTH = 4096;
+    if (pattern.size() > MAX_PATTERN_LENGTH) {
+        SS_LOG_ERROR(L"AhoCorasick", L"Pattern too long: %zu bytes (max %zu)", 
+            pattern.size(), MAX_PATTERN_LENGTH);
+        return false;
+    }
+    
+    // Security: Limit total nodes to prevent memory exhaustion
+    constexpr size_t MAX_TOTAL_NODES = 10'000'000; // 10M nodes max
+    if (m_nodeCount >= MAX_TOTAL_NODES) {
+        SS_LOG_ERROR(L"AhoCorasick", L"Node limit reached: %zu nodes", m_nodeCount);
+        return false;
+    }
 
     // Ensure root node exists
     if (m_nodes.empty()) {
-        m_nodes.emplace_back(); // Root node
-        m_nodeCount = 1;
+        try {
+            m_nodes.emplace_back(); // Root node
+            m_nodeCount = 1;
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"AhoCorasick", L"Failed to allocate root node");
+            return false;
+        }
     }
 
     // Insert pattern into trie
     uint32_t currentNode = 0; // Root
 
     for (uint8_t byte : pattern) {
+        // Bounds check before access
+        if (currentNode >= m_nodes.size()) {
+            SS_LOG_ERROR(L"AhoCorasick", L"Invalid node index during insertion");
+            return false;
+        }
+        
         uint32_t& child = m_nodes[currentNode].children[byte];
         
         if (child == 0) {
-            // Create new node
-            child = static_cast<uint32_t>(m_nodes.size());
-            m_nodes.emplace_back();
-            m_nodes.back().depth = m_nodes[currentNode].depth + 1;
-            m_nodeCount++;
+            // Check node limit before creating new
+            if (m_nodeCount >= MAX_TOTAL_NODES) {
+                SS_LOG_ERROR(L"AhoCorasick", L"Node limit reached during pattern insertion");
+                return false;
+            }
+            
+            try {
+                // Create new node with exception safety
+                child = static_cast<uint32_t>(m_nodes.size());
+                m_nodes.emplace_back();
+                m_nodes.back().depth = m_nodes[currentNode].depth + 1;
+                m_nodeCount++;
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"AhoCorasick", L"Memory allocation failed");
+                child = 0; // Reset to invalid
+                return false;
+            }
         }
 
         currentNode = child;
     }
 
     // Mark as output node
-    m_nodes[currentNode].outputs.push_back(patternId);
-    m_patternCount++;
+    if (currentNode < m_nodes.size()) {
+        try {
+            m_nodes[currentNode].outputs.push_back(patternId);
+            m_patternCount++;
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"AhoCorasick", L"Failed to add pattern output");
+            return false;
+        }
+    }
 
     return true;
 }
@@ -124,21 +172,64 @@ void AhoCorasickAutomaton::Search(
         return;
     }
 
+    // Safety check: ensure we have at least root node
+    if (m_nodes.empty()) {
+        SS_LOG_ERROR(L"AhoCorasick", L"Search called with empty automaton");
+        return;
+    }
+
     uint32_t currentNode = 0; // Start at root
+    
+    // Limit iterations to prevent infinite loops from corrupted failure links
+    constexpr size_t MAX_FAILURE_CHAIN = 10000;
 
     for (size_t offset = 0; offset < buffer.size(); ++offset) {
         uint8_t byte = buffer[offset];
 
         // Follow failure links until we find a match or reach root
-        while (currentNode != 0 && m_nodes[currentNode].children[byte] == 0) {
-            currentNode = m_nodes[currentNode].failureLink;
+        // Added bounds check and iteration limit for safety
+        size_t failureChainLen = 0;
+        while (currentNode != 0 && 
+               currentNode < m_nodes.size() && 
+               m_nodes[currentNode].children[byte] == 0) {
+            
+            uint32_t nextNode = m_nodes[currentNode].failureLink;
+            
+            // Prevent infinite loop from corrupted failure links
+            if (++failureChainLen > MAX_FAILURE_CHAIN) {
+                SS_LOG_ERROR(L"AhoCorasick", 
+                    L"Failure chain too long at offset %zu - possible corruption", offset);
+                currentNode = 0; // Reset to root
+                break;
+            }
+            
+            // Bounds check on failure link
+            if (nextNode >= m_nodes.size()) {
+                SS_LOG_ERROR(L"AhoCorasick", 
+                    L"Invalid failure link %u at node %u", nextNode, currentNode);
+                currentNode = 0;
+                break;
+            }
+            
+            currentNode = nextNode;
         }
 
-        // Transition
-        currentNode = m_nodes[currentNode].children[byte];
+        // Transition with bounds check
+        if (currentNode < m_nodes.size()) {
+            uint32_t nextNode = m_nodes[currentNode].children[byte];
+            if (nextNode < m_nodes.size()) {
+                currentNode = nextNode;
+            } else if (nextNode != 0) {
+                // Non-zero but out of bounds = corruption
+                SS_LOG_ERROR(L"AhoCorasick", 
+                    L"Invalid child node %u for byte 0x%02X", nextNode, byte);
+                currentNode = 0;
+                continue;
+            }
+        }
 
-        // Check for matches
-        if (!m_nodes[currentNode].outputs.empty()) {
+        // Check for matches with bounds validation
+        if (currentNode < m_nodes.size() && !m_nodes[currentNode].outputs.empty()) {
             for (uint64_t patternId : m_nodes[currentNode].outputs) {
                 callback(patternId, offset);
             }
@@ -540,7 +631,10 @@ std::vector<size_t> SIMDMatcher::SearchAVX2(
     std::vector<size_t> matches;
 
 #ifdef __AVX2__
-    if (!IsAVX2Available() || pattern.empty() || pattern.size() > 32) {
+    // Static check for AVX2 - cache result to avoid repeated CPUID calls
+    static const bool hasAVX2 = IsAVX2Available();
+    
+    if (!hasAVX2 || pattern.empty() || pattern.size() > 32) {
         return matches; // Fallback to scalar
     }
 
@@ -551,35 +645,40 @@ std::vector<size_t> SIMDMatcher::SearchAVX2(
     // Load pattern into SIMD register (first byte)
     __m256i patternVec = _mm256_set1_epi8(static_cast<char>(pattern[0]));
 
-    size_t searchLen = buffer.size() - pattern.size() + 1;
+    const size_t searchLen = buffer.size() - pattern.size() + 1;
+    const size_t patternLen = pattern.size();
     size_t i = 0;
 
     // Process 32 bytes at a time
     for (; i + 32 <= searchLen; i += 32) {
-        // Load buffer chunk
+        // Load buffer chunk (using unaligned load for safety)
         __m256i bufferVec = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(buffer.data() + i)
         );
 
-        // Compare
+        // Compare first byte
         __m256i cmp = _mm256_cmpeq_epi8(bufferVec, patternVec);
         int mask = _mm256_movemask_epi8(cmp);
 
-        // Check each match
+        // Check each potential match
         while (mask != 0) {
-            int pos = _tzcnt_u32(mask); // Trailing zero count
+            int pos = _tzcnt_u32(static_cast<unsigned int>(mask)); // Trailing zero count
+            size_t matchPos = i + static_cast<size_t>(pos);
             
-            // Verify full pattern match
-            bool fullMatch = true;
-            for (size_t j = 1; j < pattern.size(); ++j) {
-                if (buffer[i + pos + j] != pattern[j]) {
-                    fullMatch = false;
-                    break;
+            // Bounds check before full pattern verification
+            if (matchPos + patternLen <= buffer.size()) {
+                // Verify full pattern match
+                bool fullMatch = true;
+                for (size_t j = 1; j < patternLen; ++j) {
+                    if (buffer[matchPos + j] != pattern[j]) {
+                        fullMatch = false;
+                        break;
+                    }
                 }
-            }
 
-            if (fullMatch) {
-                matches.push_back(i + pos);
+                if (fullMatch) {
+                    matches.push_back(matchPos);
+                }
             }
 
             mask &= (mask - 1); // Clear lowest set bit
@@ -628,7 +727,7 @@ std::vector<size_t> SIMDMatcher::SearchAVX512(
      * vs AVX2: 32 bytes per iteration
      * Real-world speedup: 1.8-2.3x over AVX2 on Skylake-X, Ice Lake
      *
-     * Antivirüs scanning speed: 10 GB/sec on modern CPUs
+     * Antivirï¿½s scanning speed: 10 GB/sec on modern CPUs
      * ========================================================================
      */
 
@@ -1440,13 +1539,21 @@ std::vector<DetectionResult> PatternStore::Scan(
     uint64_t scanTimeUs = 
         ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
 
-    // Update statistics
+    // Update statistics with safe integer arithmetic
     for (auto& result : results) {
-        result.matchTimeNanoseconds = scanTimeUs * 1000;
+        // Prevent integer overflow: check before multiplication
+        if (scanTimeUs <= UINT64_MAX / 1000ULL) {
+            result.matchTimeNanoseconds = scanTimeUs * 1000ULL;
+        } else {
+            result.matchTimeNanoseconds = UINT64_MAX; // Saturate on overflow
+        }
         m_totalMatches.fetch_add(1, std::memory_order_relaxed);
         
+        // Thread-safe hit count update using atomic
         if (m_heatmapEnabled.load(std::memory_order_acquire)) {
-            const_cast<PatternStore*>(this)->UpdateHitCount(result.signatureId);
+            if (result.signatureId < m_hitCounters.size()) {
+                m_hitCounters[result.signatureId].fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -1503,9 +1610,24 @@ std::vector<DetectionResult> PatternStore::ScanContext::FeedChunk(
     m_totalBytesProcessed += chunk.size();
 
     // Scan when buffer reaches threshold
-    if (m_buffer.size() >= 1024 * 1024) { // 1MB threshold
+    constexpr size_t SCAN_THRESHOLD = 1024 * 1024; // 1MB
+    constexpr size_t MAX_PATTERN_LEN = 256;        // Keep overlap for pattern boundary
+    
+    if (m_buffer.size() >= SCAN_THRESHOLD) {
         auto results = m_store->Scan(m_buffer, m_options);
-        m_buffer.clear();
+        
+        // Keep last MAX_PATTERN_LEN bytes to handle patterns crossing chunk boundaries
+        // This prevents missing patterns that span two chunks
+        if (m_buffer.size() > MAX_PATTERN_LEN) {
+            std::vector<uint8_t> overlap(
+                m_buffer.end() - MAX_PATTERN_LEN,
+                m_buffer.end()
+            );
+            m_buffer = std::move(overlap);
+        } else {
+            m_buffer.clear();
+        }
+        
         return results;
     }
 
@@ -1966,6 +2088,31 @@ std::string PatternStore::ExportToJson(uint32_t maxEntries) const noexcept {
 
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
+    // JSON string escape helper (prevents injection attacks)
+    auto escapeJson = [](const std::string& input) -> std::string {
+        std::ostringstream escaped;
+        for (char c : input) {
+            switch (c) {
+                case '"':  escaped << "\\\""; break;
+                case '\\': escaped << "\\\\"; break;
+                case '\b': escaped << "\\b"; break;
+                case '\f': escaped << "\\f"; break;
+                case '\n': escaped << "\\n"; break;
+                case '\r': escaped << "\\r"; break;
+                case '\t': escaped << "\\t"; break;
+                default:
+                    // Control characters (0x00-0x1F) must be escaped
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        escaped << "\\u" << std::hex << std::setfill('0') 
+                                << std::setw(4) << static_cast<int>(c);
+                    } else {
+                        escaped << c;
+                    }
+            }
+        }
+        return escaped.str();
+    };
+
     std::ostringstream oss;
     oss << "{\n";
     oss << "  \"version\": \"1.0\",\n";
@@ -1980,7 +2127,7 @@ std::string PatternStore::ExportToJson(uint32_t maxEntries) const noexcept {
 
         oss << "    {\n";
         oss << "      \"id\": " << meta.signatureId << ",\n";
-        oss << "      \"name\": \"" << meta.name << "\",\n";
+        oss << "      \"name\": \"" << escapeJson(meta.name) << "\",\n";
         oss << "      \"threat_level\": " << static_cast<int>(meta.threatLevel) << ",\n";
         oss << "      \"mode\": " << static_cast<int>(meta.mode) << ",\n";
         oss << "      \"pattern\": \"" << PatternUtils::BytesToHexString(meta.pattern) << "\",\n";
@@ -2216,18 +2363,45 @@ void PatternStore::CloseMemoryMapping() noexcept {
 }
 
 StoreError PatternStore::BuildAutomaton() noexcept {
-    m_automaton = std::make_unique<AhoCorasickAutomaton>();
+    // Create new automaton separately for exception safety
+    // Only replace m_automaton if compilation succeeds
+    auto newAutomaton = std::make_unique<AhoCorasickAutomaton>();
 
     // Add patterns from cache to automaton
+    size_t addedCount = 0;
     for (const auto& meta : m_patternCache) {
         if (meta.mode == PatternMode::Exact) {
-            m_automaton->AddPattern(meta.pattern, meta.signatureId);
+            if (!newAutomaton->AddPattern(meta.pattern, meta.signatureId)) {
+                SS_LOG_WARN(L"PatternStore", 
+                    L"BuildAutomaton: Failed to add pattern %llu", meta.signatureId);
+                // Continue with other patterns, don't fail entire build
+            } else {
+                addedCount++;
+            }
         }
     }
 
-    if (!m_automaton->Compile()) {
+    // Compile the automaton
+    if (!newAutomaton->Compile()) {
+        SS_LOG_ERROR(L"PatternStore", L"BuildAutomaton: Compilation failed");
+        // Keep old automaton if compilation fails (better than nothing)
         return StoreError{ SignatureStoreError::Unknown, 0, "Automaton compilation failed" };
     }
+
+    // Success - atomically swap in new automaton
+    m_automaton = std::move(newAutomaton);
+    
+    // Resize atomic hit counters to match pattern cache size
+    // This enables lock-free hit count updates during scanning
+    m_hitCounters.resize(m_patternCache.size());
+    
+    // Sync hit counts from cache to atomic counters
+    for (size_t i = 0; i < m_patternCache.size(); ++i) {
+        m_hitCounters[i].store(m_patternCache[i].hitCount, std::memory_order_relaxed);
+    }
+
+    SS_LOG_INFO(L"PatternStore", 
+        L"BuildAutomaton: Success - %zu patterns added", addedCount);
 
     return StoreError{ SignatureStoreError::Success };
 }
@@ -2240,8 +2414,14 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 
     if (!m_automaton) return results;
 
+    // Take reader lock for thread-safe access to pattern cache
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
+    
+    // Capture cache size once under lock to avoid TOCTOU
+    const size_t cacheSize = m_patternCache.size();
+
     m_automaton->Search(buffer, [&](uint64_t patternId, size_t offset) {
-        if (patternId < m_patternCache.size()) {
+        if (patternId < cacheSize) {
             const auto& meta = m_patternCache[patternId];
 
             DetectionResult result{};
@@ -2253,7 +2433,7 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 
             results.push_back(result);
         }
-        });
+    });
 
     return results;
 }
@@ -2263,6 +2443,9 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
     const QueryOptions& options
 ) const noexcept {
     std::vector<DetectionResult> results;
+
+    // Take reader lock for thread-safe access to pattern cache
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
     // Use SIMD for exact patterns only
     for (const auto& meta : m_patternCache) {
@@ -2309,8 +2492,18 @@ DetectionResult PatternStore::BuildDetectionResult(
 }
 
 void PatternStore::UpdateHitCount(uint64_t patternId) noexcept {
+    // Thread-safe hit count update using atomic counters
+    // Note: m_hitCounters must be resized when patterns are added
+    if (patternId < m_hitCounters.size()) {
+        m_hitCounters[patternId].fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    // Also update the cache copy under lock for persistence
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
     if (patternId < m_patternCache.size()) {
-        m_patternCache[patternId].hitCount++;
+        // Sync from atomic counter
+        m_patternCache[patternId].hitCount = 
+            static_cast<uint32_t>(m_hitCounters[patternId].load(std::memory_order_relaxed));
     }
 }
 
@@ -2445,7 +2638,7 @@ std::map<size_t, size_t> PatternStore::GetLengthHistogram() const noexcept {
             totalPatterns, minLen, maxLen, avgLength, stdDev, modeLen);
 
         SS_LOG_INFO(L"PatternStore",
-            L"  Histogram buckets: %zu, Computation time: %lld µs",
+            L"  Histogram buckets: %zu, Computation time: %lld ï¿½s",
             histogram.size(), duration.count());
     }
     else {
@@ -2465,8 +2658,22 @@ std::vector<std::pair<uint64_t, uint32_t>> PatternStore::GetHeatmap() const noex
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
     std::vector<std::pair<uint64_t, uint32_t>> heatmap;
-    for (const auto& meta : m_patternCache) {
-        heatmap.emplace_back(meta.signatureId, meta.hitCount);
+    heatmap.reserve(m_patternCache.size());
+    
+    // Read hit counts from atomic counters for thread-safe access
+    for (size_t i = 0; i < m_patternCache.size(); ++i) {
+        const auto& meta = m_patternCache[i];
+        uint32_t hitCount = 0;
+        
+        // Prefer atomic counter if available, fall back to cache
+        if (i < m_hitCounters.size()) {
+            hitCount = static_cast<uint32_t>(
+                m_hitCounters[i].load(std::memory_order_relaxed));
+        } else {
+            hitCount = meta.hitCount;
+        }
+        
+        heatmap.emplace_back(meta.signatureId, hitCount);
     }
 
     // Sort by hit count (descending)
