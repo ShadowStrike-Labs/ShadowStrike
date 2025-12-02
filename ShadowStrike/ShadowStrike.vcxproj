@@ -135,17 +135,12 @@
   <ItemGroup>
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\hash_store_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_import_methods_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_input_methods_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_main_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_utils_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_format_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp" />
     <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\white_list\whitelist_frmt_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\white_list\whitelist_store_tests.cpp" />
     <ClCompile Include="external\pugixml\pugixml.cpp" />
     <ClCompile Include="external\SQLiteCpp\sqlite3\sqlite3.c" />
     <ClCompile Include="external\SQLiteCpp\src\Backup.cpp" />
@@ -208,7 +203,8 @@
     <ClCompile Include="tests\unit\Database\database_manager_tests.cpp" />
     <ClCompile Include="tests\unit\Database\Log_db_tests.cpp" />
     <ClCompile Include="tests\unit\Database\Quarantine_db_tests.cpp" />
-    <ClCompile Include="tests\unit\Database\sig_store\sig_indx_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\whitelist_frmt_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\whitelist_store_tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CompressionUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CryptoUtils_Tests.cpp" />

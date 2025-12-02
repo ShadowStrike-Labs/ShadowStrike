@@ -60,14 +60,14 @@ namespace ShadowStrike {
             if (m_numHashes < 1) m_numHashes = 1;
             if (m_numHashes > 10) m_numHashes = 10;
 
-            // 64-bit slot sayısı
+            // 64-bit slot count
             const size_t uint64Count = (m_size + 63) / 64;
 
-            // Atomikler için taze bir vektör kur ve swap et (reallocation/move/copy yok)
+            // create fresh vector of atomics and swap (no reallocation/move/copy)
             std::vector<std::atomic<uint64_t>> fresh(uint64Count);
             m_bits.swap(fresh);
 
-            // Her elemanı atomik olarak sıfırla
+            // Atomically zero each element
             for (auto& w : m_bits) {
                 w.store(0ULL, std::memory_order_relaxed);
             }

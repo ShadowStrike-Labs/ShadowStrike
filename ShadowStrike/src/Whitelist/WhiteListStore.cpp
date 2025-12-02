@@ -25,7 +25,7 @@
 #include "WhiteListStore.hpp"
 #include "WhiteListFormat.hpp"
 #include "../Utils/Logger.hpp"
-#include "../external/nlohmann/json.hpp"
+#include "../json"
 
 #include <algorithm>
 #include <cmath>

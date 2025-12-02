@@ -13,7 +13,8 @@
                 "C:\\Users\\RTX40\\source\\repos\\ShadowStrike\\ShadowStrike\\external\\ssdeep",
                 "C:\\Users\\RTX40\\source\\repos\\ShadowStrike\\ShadowStrike\\external\\tlsh\\include",
                 "C:\\Users\\RTX40\\source\\repos\\ShadowStrike\\vcpkg\\vcpkg\\packages\\gtest_x64-windows\\include",
-                "C:\\Users\\RTX40\\source\\repos\\ShadowStrike\\vcpkg\\vcpkg\\packages\\yara_x64-windows\\include"
+                "C:\\Users\\RTX40\\source\\repos\\ShadowStrike\\vcpkg\\vcpkg\\packages\\yara_x64-windows\\include",
+                "C:\\Users\\RTX40\\source\\repos\\vscode\\ShadowStrike\\ShadowStrike\\src\\Whitelist"
             ],
             "defines": [
                 "_DEBUG",
