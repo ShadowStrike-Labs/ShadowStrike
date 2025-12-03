@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include "../../../src/Utils/FileUtils.hpp"
 
+#include <Objbase.h>
 #include <vector>
 #include <string>
 #include <random>

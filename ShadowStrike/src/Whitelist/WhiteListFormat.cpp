@@ -8,9 +8,29 @@
  *
  * PROPRIETARY AND CONFIDENTIAL
  *
- * Binary format validation and utility functions
- * RAII-based resource management for exception safety
- * Enterprise-grade implementation - zero tolerance for errors
+ * Binary format validation and utility functions for whitelist database.
+ * RAII-based resource management for exception safety.
+ * Enterprise-grade implementation - zero tolerance for errors.
+ *
+ * Security Features:
+ * - Comprehensive header validation with overflow protection
+ * - Section overlap detection to prevent memory corruption
+ * - FIPS-compliant SHA-256 checksums via Windows CryptoAPI
+ * - CRC32 integrity checks for quick validation
+ * - RAII wrappers for all Windows handles (exception-safe cleanup)
+ * - Bounds-checked memory access for memory-mapped views
+ * - Path normalization and secure pattern matching
+ *
+ * Performance Characteristics:
+ * - Memory-mapped I/O for zero-copy access
+ * - Pre-computed CRC32 lookup table (compile-time)
+ * - Chunked hashing for large files (1MB chunks)
+ * - Cache-optimized data structures
+ *
+ * Thread Safety:
+ * - All read operations are thread-safe
+ * - Write operations require external synchronization
+ * - Atomic statistics updates via std::atomic
  *
  * ============================================================================
  */
@@ -18,6 +38,7 @@
 #include "WhiteListFormat.hpp"
 #include "../Utils/Logger.hpp"
 
+// Standard library headers
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -25,11 +46,22 @@
 #include <cwchar>
 #include <charconv>
 #include <locale>
+#include <limits>
+#include <type_traits>
 
 // Windows API headers
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
 #include <windows.h>
 #include <wincrypt.h>
+#include <objbase.h>  // For CoCreateGuid
+
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")  // For CoCreateGuid
 
 namespace ShadowStrike {
 namespace Whitelist {
@@ -37,27 +69,59 @@ namespace Whitelist {
 // ============================================================================
 // RAII HELPER CLASSES (Internal)
 // ============================================================================
+// 
+// These RAII wrappers ensure proper cleanup of Windows resources even in the
+// presence of exceptions. All classes are move-only to prevent accidental
+// resource duplication.
+//
+// ============================================================================
 
 namespace {
 
-/// @brief RAII wrapper for Windows HANDLE (file/mapping handles)
-class HandleGuard {
+/**
+ * @brief RAII wrapper for Windows HANDLE (file/mapping handles).
+ *
+ * Automatically closes the handle on destruction. Handles both
+ * INVALID_HANDLE_VALUE and nullptr as invalid states.
+ *
+ * Thread Safety: Not thread-safe. Each instance should be owned by one thread.
+ */
+class HandleGuard final {
 public:
-    explicit HandleGuard(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+    /**
+     * @brief Construct with optional handle.
+     * @param h Handle to take ownership of (default: INVALID_HANDLE_VALUE)
+     */
+    explicit HandleGuard(HANDLE h = INVALID_HANDLE_VALUE) noexcept 
+        : m_handle(h) 
+    {}
     
+    /**
+     * @brief Destructor - closes handle if valid.
+     */
     ~HandleGuard() noexcept { 
         Close(); 
     }
     
-    // Disable copy
+    // Disable copy - handles cannot be duplicated safely this way
     HandleGuard(const HandleGuard&) = delete;
     HandleGuard& operator=(const HandleGuard&) = delete;
     
-    // Enable move
-    HandleGuard(HandleGuard&& other) noexcept : m_handle(other.m_handle) {
+    /**
+     * @brief Move constructor - transfers ownership.
+     * @param other Source guard (will be invalidated)
+     */
+    HandleGuard(HandleGuard&& other) noexcept 
+        : m_handle(other.m_handle) 
+    {
         other.m_handle = INVALID_HANDLE_VALUE;
     }
     
+    /**
+     * @brief Move assignment - transfers ownership.
+     * @param other Source guard (will be invalidated)
+     * @return Reference to this
+     */
     HandleGuard& operator=(HandleGuard&& other) noexcept {
         if (this != &other) {
             Close();
@@ -67,47 +131,102 @@ public:
         return *this;
     }
     
+    /**
+     * @brief Explicitly close the handle.
+     *
+     * Safe to call multiple times. Sets handle to INVALID_HANDLE_VALUE
+     * after closing.
+     */
     void Close() noexcept {
-        if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
-            CloseHandle(m_handle);
+        if (IsValid()) {
+            // CloseHandle can technically fail, but we can't do much about it
+            // in a destructor context. Just ignore the return value.
+            (void)::CloseHandle(m_handle);
             m_handle = INVALID_HANDLE_VALUE;
         }
     }
     
-    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+    /**
+     * @brief Get the raw handle value.
+     * @return The underlying HANDLE
+     */
+    [[nodiscard]] HANDLE Get() const noexcept { 
+        return m_handle; 
+    }
     
+    /**
+     * @brief Check if handle is valid.
+     * @return true if handle is not INVALID_HANDLE_VALUE and not nullptr
+     */
     [[nodiscard]] bool IsValid() const noexcept {
         return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr;
     }
     
+    /**
+     * @brief Release ownership and return the handle.
+     * @return The underlying HANDLE (caller takes ownership)
+     */
     [[nodiscard]] HANDLE Release() noexcept {
         HANDLE h = m_handle;
         m_handle = INVALID_HANDLE_VALUE;
         return h;
     }
+    
+    /**
+     * @brief Implicit bool conversion for if-checks.
+     * @return true if handle is valid
+     */
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return IsValid();
+    }
 
 private:
-    HANDLE m_handle;
+    HANDLE m_handle;  ///< The underlying Windows handle
 };
 
-/// @brief RAII wrapper for MapViewOfFile (memory-mapped view)
-class MappedViewGuard {
+/**
+ * @brief RAII wrapper for MapViewOfFile memory-mapped views.
+ *
+ * Automatically unmaps the view on destruction using UnmapViewOfFile.
+ *
+ * Thread Safety: Not thread-safe. Each instance should be owned by one thread.
+ */
+class MappedViewGuard final {
 public:
-    explicit MappedViewGuard(void* addr = nullptr) noexcept : m_address(addr) {}
+    /**
+     * @brief Construct with optional address.
+     * @param addr Base address from MapViewOfFile (default: nullptr)
+     */
+    explicit MappedViewGuard(void* addr = nullptr) noexcept 
+        : m_address(addr) 
+    {}
     
+    /**
+     * @brief Destructor - unmaps view if valid.
+     */
     ~MappedViewGuard() noexcept { 
         Unmap(); 
     }
     
-    // Disable copy
+    // Disable copy - mapped views cannot be duplicated
     MappedViewGuard(const MappedViewGuard&) = delete;
     MappedViewGuard& operator=(const MappedViewGuard&) = delete;
     
-    // Enable move
-    MappedViewGuard(MappedViewGuard&& other) noexcept : m_address(other.m_address) {
+    /**
+     * @brief Move constructor - transfers ownership.
+     * @param other Source guard (will be invalidated)
+     */
+    MappedViewGuard(MappedViewGuard&& other) noexcept 
+        : m_address(other.m_address) 
+    {
         other.m_address = nullptr;
     }
     
+    /**
+     * @brief Move assignment - transfers ownership.
+     * @param other Source guard (will be invalidated)
+     * @return Reference to this
+     */
     MappedViewGuard& operator=(MappedViewGuard&& other) noexcept {
         if (this != &other) {
             Unmap();
@@ -117,139 +236,363 @@ public:
         return *this;
     }
     
+    /**
+     * @brief Explicitly unmap the view.
+     *
+     * Safe to call multiple times. Sets address to nullptr after unmapping.
+     */
     void Unmap() noexcept {
         if (m_address != nullptr) {
-            UnmapViewOfFile(m_address);
+            // UnmapViewOfFile can fail, but we can't recover in destructor
+            (void)::UnmapViewOfFile(m_address);
             m_address = nullptr;
         }
     }
     
-    [[nodiscard]] void* Get() noexcept { return m_address; }
-    [[nodiscard]] const void* Get() const noexcept { return m_address; }
-    [[nodiscard]] bool IsValid() const noexcept { return m_address != nullptr; }
+    /**
+     * @brief Get the base address (mutable).
+     * @return Base address of mapped view
+     */
+    [[nodiscard]] void* Get() noexcept { 
+        return m_address; 
+    }
     
+    /**
+     * @brief Get the base address (const).
+     * @return Base address of mapped view
+     */
+    [[nodiscard]] const void* Get() const noexcept { 
+        return m_address; 
+    }
+    
+    /**
+     * @brief Check if view is valid.
+     * @return true if address is not nullptr
+     */
+    [[nodiscard]] bool IsValid() const noexcept { 
+        return m_address != nullptr; 
+    }
+    
+    /**
+     * @brief Release ownership and return the address.
+     * @return Base address (caller takes ownership)
+     */
     [[nodiscard]] void* Release() noexcept {
         void* addr = m_address;
         m_address = nullptr;
         return addr;
     }
+    
+    /**
+     * @brief Implicit bool conversion for if-checks.
+     * @return true if view is valid
+     */
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return IsValid();
+    }
 
 private:
-    void* m_address;
+    void* m_address;  ///< Base address of the mapped view
 };
 
-/// @brief RAII wrapper for HCRYPTPROV crypto context
-class CryptoContextGuard {
+/**
+ * @brief RAII wrapper for HCRYPTPROV crypto context.
+ *
+ * Automatically releases the crypto context on destruction.
+ *
+ * Thread Safety: Not thread-safe. Each instance should be owned by one thread.
+ */
+class CryptoContextGuard final {
 public:
-    explicit CryptoContextGuard(HCRYPTPROV prov = 0) noexcept : m_provider(prov) {}
+    /**
+     * @brief Construct with optional provider handle.
+     * @param prov Crypto provider handle (default: 0)
+     */
+    explicit CryptoContextGuard(HCRYPTPROV prov = 0) noexcept 
+        : m_provider(prov) 
+    {}
     
+    /**
+     * @brief Destructor - releases context if valid.
+     */
     ~CryptoContextGuard() noexcept {
-        Release();
+        ReleaseContext();
     }
     
+    // Disable copy
     CryptoContextGuard(const CryptoContextGuard&) = delete;
     CryptoContextGuard& operator=(const CryptoContextGuard&) = delete;
     
-    void Release() noexcept {
+    // Disable move - crypto contexts should not be transferred
+    CryptoContextGuard(CryptoContextGuard&&) = delete;
+    CryptoContextGuard& operator=(CryptoContextGuard&&) = delete;
+    
+    /**
+     * @brief Explicitly release the crypto context.
+     *
+     * Safe to call multiple times. Sets provider to 0 after releasing.
+     */
+    void ReleaseContext() noexcept {
         if (m_provider != 0) {
-            CryptReleaseContext(m_provider, 0);
+            (void)::CryptReleaseContext(m_provider, 0);
             m_provider = 0;
         }
     }
     
-    [[nodiscard]] HCRYPTPROV Get() const noexcept { return m_provider; }
-    [[nodiscard]] HCRYPTPROV* Ptr() noexcept { return &m_provider; }
-    [[nodiscard]] bool IsValid() const noexcept { return m_provider != 0; }
+    /**
+     * @brief Get the provider handle.
+     * @return The underlying HCRYPTPROV
+     */
+    [[nodiscard]] HCRYPTPROV Get() const noexcept { 
+        return m_provider; 
+    }
+    
+    /**
+     * @brief Get pointer to provider handle (for CryptAcquireContext).
+     * @return Pointer to the underlying HCRYPTPROV
+     */
+    [[nodiscard]] HCRYPTPROV* Ptr() noexcept { 
+        return &m_provider; 
+    }
+    
+    /**
+     * @brief Check if context is valid.
+     * @return true if provider is not 0
+     */
+    [[nodiscard]] bool IsValid() const noexcept { 
+        return m_provider != 0; 
+    }
+    
+    /**
+     * @brief Implicit bool conversion for if-checks.
+     * @return true if context is valid
+     */
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return IsValid();
+    }
 
 private:
-    HCRYPTPROV m_provider;
+    HCRYPTPROV m_provider;  ///< The underlying crypto provider handle
 };
 
-/// @brief RAII wrapper for HCRYPTHASH crypto hash
-class CryptoHashGuard {
+/**
+ * @brief RAII wrapper for HCRYPTHASH crypto hash object.
+ *
+ * Automatically destroys the hash object on destruction.
+ *
+ * Thread Safety: Not thread-safe. Each instance should be owned by one thread.
+ */
+class CryptoHashGuard final {
 public:
-    explicit CryptoHashGuard(HCRYPTHASH hash = 0) noexcept : m_hash(hash) {}
+    /**
+     * @brief Construct with optional hash handle.
+     * @param hash Crypto hash handle (default: 0)
+     */
+    explicit CryptoHashGuard(HCRYPTHASH hash = 0) noexcept 
+        : m_hash(hash) 
+    {}
     
+    /**
+     * @brief Destructor - destroys hash if valid.
+     */
     ~CryptoHashGuard() noexcept {
         Destroy();
     }
     
+    // Disable copy
     CryptoHashGuard(const CryptoHashGuard&) = delete;
     CryptoHashGuard& operator=(const CryptoHashGuard&) = delete;
     
+    // Disable move - crypto hashes should not be transferred mid-computation
+    CryptoHashGuard(CryptoHashGuard&&) = delete;
+    CryptoHashGuard& operator=(CryptoHashGuard&&) = delete;
+    
+    /**
+     * @brief Explicitly destroy the hash object.
+     *
+     * Safe to call multiple times. Sets hash to 0 after destroying.
+     */
     void Destroy() noexcept {
         if (m_hash != 0) {
-            CryptDestroyHash(m_hash);
+            (void)::CryptDestroyHash(m_hash);
             m_hash = 0;
         }
     }
     
-    [[nodiscard]] HCRYPTHASH Get() const noexcept { return m_hash; }
-    [[nodiscard]] HCRYPTHASH* Ptr() noexcept { return &m_hash; }
-    [[nodiscard]] bool IsValid() const noexcept { return m_hash != 0; }
+    /**
+     * @brief Get the hash handle.
+     * @return The underlying HCRYPTHASH
+     */
+    [[nodiscard]] HCRYPTHASH Get() const noexcept { 
+        return m_hash; 
+    }
+    
+    /**
+     * @brief Get pointer to hash handle (for CryptCreateHash).
+     * @return Pointer to the underlying HCRYPTHASH
+     */
+    [[nodiscard]] HCRYPTHASH* Ptr() noexcept { 
+        return &m_hash; 
+    }
+    
+    /**
+     * @brief Check if hash is valid.
+     * @return true if hash is not 0
+     */
+    [[nodiscard]] bool IsValid() const noexcept { 
+        return m_hash != 0; 
+    }
+    
+    /**
+     * @brief Implicit bool conversion for if-checks.
+     * @return true if hash is valid
+     */
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return IsValid();
+    }
 
 private:
-    HCRYPTHASH m_hash;
+    HCRYPTHASH m_hash;  ///< The underlying crypto hash handle
 };
 
 // ============================================================================
-// CRC32 TABLE (Pre-computed for performance)
+// CRC32 TABLE (Pre-computed at compile-time for performance)
+// ============================================================================
+//
+// Uses IEEE 802.3 polynomial (0xEDB88320) which is the standard for
+// Ethernet, PKZIP, PNG, and many other formats.
+//
+// The table is generated at compile-time using constexpr, ensuring:
+// - Zero runtime initialization cost
+// - Placement in read-only memory section
+// - Perfect optimization by compiler
+//
 // ============================================================================
 
-/// @brief CRC32 lookup table (IEEE 802.3 polynomial)
+/**
+ * @brief Generate CRC32 lookup table at compile-time.
+ *
+ * Uses the IEEE 802.3 polynomial (reflected form): 0xEDB88320
+ * This is the standard polynomial used by:
+ * - Ethernet (IEEE 802.3)
+ * - PKZIP/GZIP
+ * - PNG
+ * - Many file formats
+ *
+ * @return 256-entry lookup table for CRC32 computation
+ */
 constexpr std::array<uint32_t, 256> GenerateCRC32Table() noexcept {
     std::array<uint32_t, 256> table{};
-    constexpr uint32_t polynomial = 0xEDB88320;
+    constexpr uint32_t kPolynomial = 0xEDB88320u;
     
-    for (uint32_t i = 0; i < 256; ++i) {
+    for (uint32_t i = 0; i < 256u; ++i) {
         uint32_t crc = i;
         for (int j = 0; j < 8; ++j) {
-            if (crc & 1) {
-                crc = (crc >> 1) ^ polynomial;
-            } else {
-                crc >>= 1;
-            }
+            // Use branchless XOR to avoid branch mispredictions
+            const uint32_t mask = static_cast<uint32_t>(-(static_cast<int32_t>(crc & 1u)));
+            crc = (crc >> 1u) ^ (kPolynomial & mask);
         }
         table[i] = crc;
     }
     return table;
 }
 
+/// @brief Pre-computed CRC32 lookup table (compile-time constant)
 static constexpr auto CRC32_TABLE = GenerateCRC32Table();
 
-/// @brief Compute CRC32 checksum
+// Verify table was generated correctly (spot check a few known values)
+static_assert(CRC32_TABLE[0] == 0x00000000u, "CRC32 table[0] invalid");
+static_assert(CRC32_TABLE[1] == 0x77073096u, "CRC32 table[1] invalid");
+static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
+
+/**
+ * @brief Compute CRC32 checksum of a memory region.
+ *
+ * Uses the pre-computed lookup table for high performance.
+ * This implementation matches the IEEE 802.3 CRC32.
+ *
+ * Performance: ~4-6 cycles per byte on modern CPUs (table lookup)
+ *
+ * @param data Pointer to data buffer (can be nullptr if length is 0)
+ * @param length Number of bytes to process
+ * @return CRC32 checksum (0 if data is nullptr or length is 0)
+ *
+ * @note Thread-safe (uses only read-only global table)
+ */
 [[nodiscard]] uint32_t ComputeCRC32(const void* data, size_t length) noexcept {
-    if (!data || length == 0) {
-        return 0;
+    // Handle null/empty cases
+    if (data == nullptr || length == 0) {
+        return 0u;
     }
     
     const auto* bytes = static_cast<const uint8_t*>(data);
-    uint32_t crc = 0xFFFFFFFF;
+    uint32_t crc = 0xFFFFFFFFu;
     
+    // Process each byte through the lookup table
+    // Using size_t for index to avoid signed/unsigned comparison
     for (size_t i = 0; i < length; ++i) {
-        crc = (crc >> 8) ^ CRC32_TABLE[(crc ^ bytes[i]) & 0xFF];
+        const uint8_t tableIndex = static_cast<uint8_t>((crc ^ bytes[i]) & 0xFFu);
+        crc = (crc >> 8u) ^ CRC32_TABLE[tableIndex];
     }
     
-    return crc ^ 0xFFFFFFFF;
+    // Final XOR to complete CRC32
+    return crc ^ 0xFFFFFFFFu;
 }
 
 // ============================================================================
 // HEX STRING HELPERS
 // ============================================================================
+//
+// These functions provide safe hex character conversion with full validation.
+// They are used for parsing and formatting hash strings.
+//
+// ============================================================================
 
-/// @brief Convert hex character to value
+/**
+ * @brief Convert a hex character to its 4-bit value.
+ *
+ * Supports uppercase and lowercase hex digits.
+ *
+ * @param c Character to convert ('0'-'9', 'a'-'f', 'A'-'F')
+ * @return 0-15 for valid hex chars, 0xFF for invalid
+ *
+ * @note Returns 0xFF (255) for invalid characters - caller must check!
+ */
 [[nodiscard]] inline uint8_t HexCharToValue(char c) noexcept {
-    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
-    return 0xFF; // Invalid
+    // Use a computed index rather than branches for better performance
+    if (c >= '0' && c <= '9') {
+        return static_cast<uint8_t>(c - '0');
+    }
+    if (c >= 'a' && c <= 'f') {
+        return static_cast<uint8_t>(c - 'a' + 10);
+    }
+    if (c >= 'A' && c <= 'F') {
+        return static_cast<uint8_t>(c - 'A' + 10);
+    }
+    return 0xFFu;  // Invalid sentinel value
 }
 
-/// @brief Check if character is valid hex
+/**
+ * @brief Check if a character is a valid hexadecimal digit.
+ *
+ * @param c Character to check
+ * @return true if '0'-'9', 'a'-'f', or 'A'-'F'
+ */
 [[nodiscard]] inline bool IsHexChar(char c) noexcept {
     return (c >= '0' && c <= '9') || 
            (c >= 'a' && c <= 'f') || 
            (c >= 'A' && c <= 'F');
+}
+
+/**
+ * @brief Convert a 4-bit value to lowercase hex character.
+ *
+ * @param nibble Value 0-15 (only lower 4 bits used)
+ * @return Hex character '0'-'9' or 'a'-'f'
+ */
+[[nodiscard]] inline char ValueToHexChar(uint8_t nibble) noexcept {
+    static constexpr char kHexChars[] = "0123456789abcdef";
+    return kHexChars[nibble & 0x0Fu];
 }
 
 } // anonymous namespace
@@ -260,30 +603,44 @@ static constexpr auto CRC32_TABLE = GenerateCRC32Table();
 
 namespace Format {
 
+/**
+ * @brief Validate whitelist database header structure.
+ *
+ * Performs comprehensive validation of all header fields:
+ * 1. Magic number and version compatibility
+ * 2. CRC32 integrity check
+ * 3. Page alignment of section offsets
+ * 4. Size limit enforcement
+ * 5. Overflow protection (offset + size)
+ * 6. Section overlap detection
+ * 7. Timestamp sanity checks
+ * 8. Statistics sanity checks
+ *
+ * SECURITY: This function is critical for preventing memory corruption
+ * attacks through malformed database files.
+ *
+ * @param header Pointer to database header (from memory-mapped file)
+ * @return true if header passes all validation checks
+ *
+ * @note All validation failures are logged with details
+ */
 bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
-    /*
-     * ========================================================================
-     * ENTERPRISE-GRADE HEADER VALIDATION
-     * ========================================================================
-     *
-     * Validates all aspects of the database header:
-     * 1. Magic number and version
-     * 2. Page alignment of all section offsets
-     * 3. Size limits and overflow protection
-     * 4. Section overlap detection
-     * 5. Timestamp sanity checks
-     * 6. CRC32 integrity verification
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // NULL POINTER CHECK
+    // ========================================================================
     
-    if (!header) {
+    if (header == nullptr) {
         SS_LOG_ERROR(L"Whitelist", L"ValidateHeader: null header pointer");
         return false;
     }
     
     // ========================================================================
     // STEP 1: MAGIC NUMBER & VERSION CHECK
+    // ========================================================================
+    //
+    // The magic number identifies this as a ShadowStrike whitelist database.
+    // Version checking ensures forward compatibility.
+    //
     // ========================================================================
     
     if (header->magic != WHITELIST_DB_MAGIC) {
@@ -293,27 +650,34 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
         return false;
     }
     
+    // Major version must match exactly (breaking changes)
     if (header->versionMajor != WHITELIST_DB_VERSION_MAJOR) {
         SS_LOG_ERROR(L"Whitelist",
             L"Version mismatch: expected %u.x, got %u.%u",
-            WHITELIST_DB_VERSION_MAJOR,
-            header->versionMajor,
-            header->versionMinor);
+            static_cast<unsigned>(WHITELIST_DB_VERSION_MAJOR),
+            static_cast<unsigned>(header->versionMajor),
+            static_cast<unsigned>(header->versionMinor));
         return false;
     }
     
+    // Minor version can be higher (backward compatible additions)
+    // No check needed - we handle all minor versions up to current
+    
     // ========================================================================
-    // STEP 2: CRC32 QUICK VALIDATION (Before extensive checks)
+    // STEP 2: CRC32 QUICK VALIDATION (Before expensive checks)
+    // ========================================================================
+    //
+    // If CRC32 is non-zero, validate it to catch corruption early.
+    // A zero CRC32 indicates a new/unfinalized database.
+    //
     // ========================================================================
     
-    // Compute CRC32 of header excluding the checksum fields
-    // CRC32 is stored at offset of sha256Checksum + 32 bytes
-    constexpr size_t crcOffset = offsetof(WhitelistDatabaseHeader, headerCrc32);
-    uint32_t computedCrc = ComputeCRC32(header, crcOffset);
+    constexpr size_t kCrcOffset = offsetof(WhitelistDatabaseHeader, headerCrc32);
+    const uint32_t computedCrc = ComputeCRC32(header, kCrcOffset);
     
-    if (header->headerCrc32 != 0 && header->headerCrc32 != computedCrc) {
+    if (header->headerCrc32 != 0u && header->headerCrc32 != computedCrc) {
         SS_LOG_ERROR(L"Whitelist",
-            L"Header CRC32 mismatch: expected 0x%08X, got 0x%08X",
+            L"Header CRC32 mismatch: expected 0x%08X, computed 0x%08X",
             header->headerCrc32, computedCrc);
         return false;
     }
@@ -321,17 +685,24 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
     // ========================================================================
     // STEP 3: PAGE ALIGNMENT VALIDATION
     // ========================================================================
+    //
+    // All section offsets must be page-aligned for efficient memory mapping.
+    // Non-aligned offsets indicate corruption or incompatible version.
+    //
+    // ========================================================================
     
-    auto checkPageAlignment = [](uint64_t offset, const wchar_t* name) -> bool {
-        if (offset != 0 && (offset % PAGE_SIZE != 0)) {
+    // Lambda for checking page alignment with logging
+    auto checkPageAlignment = [](uint64_t offset, const wchar_t* name) noexcept -> bool {
+        if (offset != 0u && (offset % PAGE_SIZE) != 0u) {
             SS_LOG_ERROR(L"Whitelist",
                 L"%s offset 0x%llX not page-aligned (PAGE_SIZE=%zu)",
-                name, offset, PAGE_SIZE);
+                name, static_cast<unsigned long long>(offset), PAGE_SIZE);
             return false;
         }
         return true;
     };
     
+    // Check all section offsets for alignment
     if (!checkPageAlignment(header->hashIndexOffset, L"Hash index")) return false;
     if (!checkPageAlignment(header->pathIndexOffset, L"Path index")) return false;
     if (!checkPageAlignment(header->certIndexOffset, L"Certificate index")) return false;
@@ -346,53 +717,83 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
     // ========================================================================
     // STEP 4: SIZE LIMITS VALIDATION
     // ========================================================================
+    //
+    // Individual sections cannot exceed the maximum database size.
+    // This prevents integer overflow in subsequent calculations.
+    //
+    // ========================================================================
     
-    auto checkSizeLimit = [](uint64_t size, const wchar_t* name) -> bool {
+    // Lambda for checking size limits with logging
+    auto checkSizeLimit = [](uint64_t size, const wchar_t* name) noexcept -> bool {
         if (size > MAX_DATABASE_SIZE) {
             SS_LOG_ERROR(L"Whitelist",
                 L"%s size %llu exceeds maximum %llu",
-                name, size, MAX_DATABASE_SIZE);
+                name, 
+                static_cast<unsigned long long>(size), 
+                static_cast<unsigned long long>(MAX_DATABASE_SIZE));
             return false;
         }
         return true;
     };
     
+    // Check all section sizes
     if (!checkSizeLimit(header->hashIndexSize, L"Hash index")) return false;
     if (!checkSizeLimit(header->pathIndexSize, L"Path index")) return false;
     if (!checkSizeLimit(header->certIndexSize, L"Certificate index")) return false;
     if (!checkSizeLimit(header->publisherIndexSize, L"Publisher index")) return false;
     if (!checkSizeLimit(header->entryDataSize, L"Entry data")) return false;
+    if (!checkSizeLimit(header->extendedHashSize, L"Extended hash")) return false;
     if (!checkSizeLimit(header->stringPoolSize, L"String pool")) return false;
     if (!checkSizeLimit(header->bloomFilterSize, L"Bloom filter")) return false;
     if (!checkSizeLimit(header->metadataSize, L"Metadata")) return false;
+    if (!checkSizeLimit(header->pathBloomSize, L"Path bloom")) return false;
     
     // ========================================================================
     // STEP 5: OVERFLOW PROTECTION (offset + size)
     // ========================================================================
+    //
+    // SECURITY: Ensure offset + size doesn't overflow uint64_t.
+    // This is critical for preventing memory access violations.
+    //
+    // ========================================================================
     
-    auto checkNoOverflow = [](uint64_t offset, uint64_t size, const wchar_t* name) -> bool {
-        if (offset > 0 && size > 0) {
-            if (offset > UINT64_MAX - size) {
+    // Lambda for checking overflow with logging
+    auto checkNoOverflow = [](uint64_t offset, uint64_t size, const wchar_t* name) noexcept -> bool {
+        if (offset > 0u && size > 0u) {
+            // Check if addition would overflow
+            if (offset > (std::numeric_limits<uint64_t>::max)() - size) {
                 SS_LOG_ERROR(L"Whitelist",
                     L"%s offset+size overflow: 0x%llX + 0x%llX",
-                    name, offset, size);
+                    name, 
+                    static_cast<unsigned long long>(offset), 
+                    static_cast<unsigned long long>(size));
                 return false;
             }
         }
         return true;
     };
     
+    // Check all offset+size combinations
     if (!checkNoOverflow(header->hashIndexOffset, header->hashIndexSize, L"Hash index")) return false;
     if (!checkNoOverflow(header->pathIndexOffset, header->pathIndexSize, L"Path index")) return false;
     if (!checkNoOverflow(header->certIndexOffset, header->certIndexSize, L"Cert index")) return false;
     if (!checkNoOverflow(header->publisherIndexOffset, header->publisherIndexSize, L"Publisher")) return false;
     if (!checkNoOverflow(header->entryDataOffset, header->entryDataSize, L"Entry data")) return false;
+    if (!checkNoOverflow(header->extendedHashOffset, header->extendedHashSize, L"Extended hash")) return false;
     if (!checkNoOverflow(header->stringPoolOffset, header->stringPoolSize, L"String pool")) return false;
     if (!checkNoOverflow(header->bloomFilterOffset, header->bloomFilterSize, L"Bloom filter")) return false;
     if (!checkNoOverflow(header->metadataOffset, header->metadataSize, L"Metadata")) return false;
+    if (!checkNoOverflow(header->pathBloomOffset, header->pathBloomSize, L"Path bloom")) return false;
     
     // ========================================================================
     // STEP 6: SECTION OVERLAP DETECTION
+    // ========================================================================
+    //
+    // SECURITY: Sections must not overlap as this could cause:
+    // - Data corruption during writes
+    // - Information disclosure between sections
+    // - Potential code execution if indices overlap with data
+    //
     // ========================================================================
     
     struct SectionInfo {
@@ -401,7 +802,8 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
         const wchar_t* name;
     };
     
-    std::array<SectionInfo, 10> sections = {{
+    // Build array of all sections for overlap checking
+    const std::array<SectionInfo, 10> sections = {{
         { header->hashIndexOffset, header->hashIndexSize, L"HashIndex" },
         { header->pathIndexOffset, header->pathIndexSize, L"PathIndex" },
         { header->certIndexOffset, header->certIndexSize, L"CertIndex" },
@@ -414,25 +816,36 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
         { header->pathBloomOffset, header->pathBloomSize, L"PathBloom" }
     }};
     
-    // Check each pair for overlap
+    // Check each pair of sections for overlap (O(n²) but n is small and constant)
     for (size_t i = 0; i < sections.size(); ++i) {
-        if (sections[i].offset == 0 || sections[i].size == 0) continue;
+        // Skip empty/unused sections
+        if (sections[i].offset == 0u || sections[i].size == 0u) {
+            continue;
+        }
         
-        uint64_t endI = sections[i].offset + sections[i].size;
+        const uint64_t endI = sections[i].offset + sections[i].size;
         
         for (size_t j = i + 1; j < sections.size(); ++j) {
-            if (sections[j].offset == 0 || sections[j].size == 0) continue;
+            // Skip empty/unused sections
+            if (sections[j].offset == 0u || sections[j].size == 0u) {
+                continue;
+            }
             
-            uint64_t endJ = sections[j].offset + sections[j].size;
+            const uint64_t endJ = sections[j].offset + sections[j].size;
             
-            // Check overlap: [start_i, end_i) overlaps [start_j, end_j)
-            bool overlaps = (sections[i].offset < endJ) && (sections[j].offset < endI);
+            // Check overlap: ranges [start_i, end_i) and [start_j, end_j) overlap
+            // if start_i < end_j AND start_j < end_i
+            const bool overlaps = (sections[i].offset < endJ) && (sections[j].offset < endI);
             
             if (overlaps) {
                 SS_LOG_ERROR(L"Whitelist",
-                    L"Section overlap: %s [0x%llX-0x%llX) overlaps %s [0x%llX-0x%llX)",
-                    sections[i].name, sections[i].offset, endI,
-                    sections[j].name, sections[j].offset, endJ);
+                    L"Section overlap detected: %s [0x%llX-0x%llX) overlaps %s [0x%llX-0x%llX)",
+                    sections[i].name, 
+                    static_cast<unsigned long long>(sections[i].offset), 
+                    static_cast<unsigned long long>(endI),
+                    sections[j].name, 
+                    static_cast<unsigned long long>(sections[j].offset), 
+                    static_cast<unsigned long long>(endJ));
                 return false;
             }
         }
@@ -441,153 +854,298 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
     // ========================================================================
     // STEP 7: TIMESTAMP SANITY CHECKS
     // ========================================================================
+    //
+    // Timestamps should be reasonable (between 2020 and 2100).
+    // Creation time should not be after last update time.
+    // These are warnings only - don't fail validation for timestamp issues.
+    //
+    // ========================================================================
     
-    if (header->creationTime > 0 && header->lastUpdateTime > 0) {
+    // Check creation vs update time consistency
+    if (header->creationTime > 0u && header->lastUpdateTime > 0u) {
         if (header->creationTime > header->lastUpdateTime) {
             SS_LOG_WARN(L"Whitelist",
-                L"Creation time (%llu) > last update time (%llu) - possible corruption",
-                header->creationTime, header->lastUpdateTime);
+                L"Creation time (%llu) > last update time (%llu) - possible clock issue",
+                static_cast<unsigned long long>(header->creationTime), 
+                static_cast<unsigned long long>(header->lastUpdateTime));
+            // Warning only - don't fail validation
         }
     }
     
-    // Reasonable timestamp range: 2020-2100
-    constexpr uint64_t MIN_TIMESTAMP = 1577836800ULL;  // 2020-01-01
-    constexpr uint64_t MAX_TIMESTAMP = 4102444800ULL;  // 2100-01-01
+    // Reasonable timestamp range: 2020-01-01 to 2100-01-01
+    constexpr uint64_t kMinTimestamp = 1577836800ULL;  // 2020-01-01 00:00:00 UTC
+    constexpr uint64_t kMaxTimestamp = 4102444800ULL;  // 2100-01-01 00:00:00 UTC
     
-    if (header->creationTime > 0 &&
-        (header->creationTime < MIN_TIMESTAMP || header->creationTime > MAX_TIMESTAMP)) {
-        SS_LOG_WARN(L"Whitelist",
-            L"Creation timestamp %llu outside expected range [2020-2100]",
-            header->creationTime);
+    if (header->creationTime > 0u) {
+        if (header->creationTime < kMinTimestamp || header->creationTime > kMaxTimestamp) {
+            SS_LOG_WARN(L"Whitelist",
+                L"Creation timestamp %llu outside expected range [2020-2100]",
+                static_cast<unsigned long long>(header->creationTime));
+            // Warning only - don't fail validation
+        }
     }
     
     // ========================================================================
     // STEP 8: STATISTICS SANITY CHECKS (Warnings only)
     // ========================================================================
+    //
+    // Check that entry counts are reasonable. Overflow during addition is
+    // possible if values are corrupted, so check carefully.
+    //
+    // ========================================================================
     
-    uint64_t totalEntries = header->totalHashEntries + header->totalPathEntries +
-                            header->totalCertEntries + header->totalPublisherEntries +
-                            header->totalOtherEntries;
+    // Safe addition with overflow check
+    uint64_t totalEntries = 0u;
+    
+    auto safeAdd = [&totalEntries](uint64_t value) noexcept -> bool {
+        if (value > (std::numeric_limits<uint64_t>::max)() - totalEntries) {
+            return false;  // Would overflow
+        }
+        totalEntries += value;
+        return true;
+    };
+    
+    if (!safeAdd(header->totalHashEntries) ||
+        !safeAdd(header->totalPathEntries) ||
+        !safeAdd(header->totalCertEntries) ||
+        !safeAdd(header->totalPublisherEntries) ||
+        !safeAdd(header->totalOtherEntries)) {
+        SS_LOG_WARN(L"Whitelist", L"Entry count overflow - statistics corrupted");
+        // Warning only - don't fail validation for statistics
+    }
     
     if (totalEntries > MAX_ENTRIES) {
         SS_LOG_WARN(L"Whitelist",
             L"Total entries (%llu) exceeds expected maximum (%llu)",
-            totalEntries, MAX_ENTRIES);
+            static_cast<unsigned long long>(totalEntries), 
+            static_cast<unsigned long long>(MAX_ENTRIES));
+        // Warning only - don't fail validation
     }
+    
+    // ========================================================================
+    // VALIDATION PASSED
+    // ========================================================================
     
     SS_LOG_DEBUG(L"Whitelist", L"Header validation passed");
     return true;
 }
 
+/**
+ * @brief Compute CRC32 checksum of database header.
+ *
+ * Computes CRC32 of the header up to (but not including) the headerCrc32 field.
+ * This allows the CRC32 to be stored within the header itself.
+ *
+ * @param header Pointer to database header
+ * @return CRC32 checksum, or 0 if header is nullptr
+ */
 uint32_t ComputeHeaderCRC32(const WhitelistDatabaseHeader* header) noexcept {
-    if (!header) {
-        return 0;
+    if (header == nullptr) {
+        return 0u;
     }
     
     // Compute CRC32 of header up to (but not including) headerCrc32 field
-    constexpr size_t crcOffset = offsetof(WhitelistDatabaseHeader, headerCrc32);
-    return ComputeCRC32(header, crcOffset);
+    // This allows the CRC32 to be stored in the header itself
+    constexpr size_t kCrcOffset = offsetof(WhitelistDatabaseHeader, headerCrc32);
+    return ComputeCRC32(header, kCrcOffset);
 }
 
+/**
+ * @brief Compute SHA-256 checksum of entire database.
+ *
+ * Computes SHA-256 hash of the database, excluding the sha256Checksum field
+ * in the header. This allows the checksum to be stored within the file.
+ *
+ * Uses Windows CryptoAPI for FIPS 140-2 compliant implementation.
+ * Processes large files in 1MB chunks to avoid memory pressure.
+ *
+ * @param view Memory-mapped view of the database
+ * @param[out] outChecksum 32-byte buffer to receive SHA-256 hash
+ * @return true if checksum computed successfully
+ *
+ * @note Thread-safe if view is not concurrently modified
+ */
 bool ComputeDatabaseChecksum(
     const MemoryMappedView& view,
     std::array<uint8_t, 32>& outChecksum
 ) noexcept {
-    /*
-     * ========================================================================
-     * SHA-256 DATABASE CHECKSUM COMPUTATION
-     * ========================================================================
-     *
-     * Computes SHA-256 of entire database excluding the checksum field.
-     * Uses Windows CryptoAPI for FIPS-compliant implementation.
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
     
     if (!view.IsValid()) {
         SS_LOG_ERROR(L"Whitelist", L"ComputeDatabaseChecksum: invalid view");
         return false;
     }
     
+    // Ensure view has at least header size
+    if (view.fileSize < sizeof(WhitelistDatabaseHeader)) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"ComputeDatabaseChecksum: file too small (%llu < %zu)",
+            static_cast<unsigned long long>(view.fileSize),
+            sizeof(WhitelistDatabaseHeader));
+        return false;
+    }
+    
+    // Initialize output to zero
     outChecksum.fill(0);
     
-    // Acquire crypto context
+    // ========================================================================
+    // ACQUIRE CRYPTO CONTEXT
+    // ========================================================================
+    //
+    // Use PROV_RSA_AES provider for SHA-256 support.
+    // CRYPT_VERIFYCONTEXT avoids key container creation.
+    //
+    // ========================================================================
+    
     CryptoContextGuard cryptProv;
-    if (!CryptAcquireContextW(cryptProv.Ptr(), nullptr, nullptr, 
-                               PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+    if (!::CryptAcquireContextW(
+            cryptProv.Ptr(), 
+            nullptr,           // No key container
+            nullptr,           // Default provider
+            PROV_RSA_AES,      // Provider with SHA-256
+            CRYPT_VERIFYCONTEXT)) {
         SS_LOG_LAST_ERROR(L"Whitelist", L"CryptAcquireContext failed");
         return false;
     }
     
-    // Create hash object
+    // ========================================================================
+    // CREATE HASH OBJECT
+    // ========================================================================
+    
     CryptoHashGuard cryptHash;
-    if (!CryptCreateHash(cryptProv.Get(), CALG_SHA_256, 0, 0, cryptHash.Ptr())) {
+    if (!::CryptCreateHash(
+            cryptProv.Get(), 
+            CALG_SHA_256, 
+            0,      // No key for hash
+            0,      // Reserved
+            cryptHash.Ptr())) {
         SS_LOG_LAST_ERROR(L"Whitelist", L"CryptCreateHash failed");
         return false;
     }
     
-    // Hash in chunks for large files
-    constexpr size_t CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+    // ========================================================================
+    // HASH DATABASE CONTENTS
+    // ========================================================================
+    //
+    // Hash in chunks for large files to avoid memory pressure.
+    // Skip the sha256Checksum field itself (self-referential checksum).
+    //
+    // ========================================================================
+    
+    constexpr size_t kChunkSize = 1024u * 1024u;  // 1MB chunks
     const auto* data = static_cast<const uint8_t*>(view.baseAddress);
     
-    // Hash everything before the checksum field
-    constexpr size_t checksumOffset = offsetof(WhitelistDatabaseHeader, sha256Checksum);
+    // Offset of the checksum field within the header
+    constexpr size_t kChecksumOffset = offsetof(WhitelistDatabaseHeader, sha256Checksum);
+    constexpr size_t kChecksumSize = 32u;  // SHA-256 is 32 bytes
+    constexpr size_t kPostChecksumOffset = kChecksumOffset + kChecksumSize;
     
-    // Hash header up to checksum
-    if (!CryptHashData(cryptHash.Get(), data, static_cast<DWORD>(checksumOffset), 0)) {
-        SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (header) failed");
-        return false;
+    // Hash header up to checksum field
+    if (kChecksumOffset > 0u) {
+        // Validate offset doesn't exceed file size
+        if (kChecksumOffset > view.fileSize) {
+            SS_LOG_ERROR(L"Whitelist", L"Checksum offset exceeds file size");
+            return false;
+        }
+        
+        if (!::CryptHashData(
+                cryptHash.Get(), 
+                data, 
+                static_cast<DWORD>(kChecksumOffset), 
+                0)) {
+            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (header prefix) failed");
+            return false;
+        }
     }
     
     // Skip the checksum field (32 bytes)
-    constexpr size_t postChecksumOffset = checksumOffset + 32;
+    // Hash remaining header (after checksum field)
+    constexpr size_t kRemainingHeader = sizeof(WhitelistDatabaseHeader) - kPostChecksumOffset;
+    static_assert(kRemainingHeader < sizeof(WhitelistDatabaseHeader), 
+                  "Invalid header layout calculation");
     
-    // Hash remaining header
-    constexpr size_t remainingHeader = sizeof(WhitelistDatabaseHeader) - postChecksumOffset;
-    if (!CryptHashData(cryptHash.Get(), data + postChecksumOffset, 
-                       static_cast<DWORD>(remainingHeader), 0)) {
-        SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (header remainder) failed");
-        return false;
+    if (kRemainingHeader > 0u) {
+        if (!::CryptHashData(
+                cryptHash.Get(), 
+                data + kPostChecksumOffset, 
+                static_cast<DWORD>(kRemainingHeader), 
+                0)) {
+            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (header suffix) failed");
+            return false;
+        }
     }
     
     // Hash rest of file in chunks
     size_t offset = sizeof(WhitelistDatabaseHeader);
     while (offset < view.fileSize) {
-        size_t remaining = view.fileSize - offset;
-        size_t chunkSize = (remaining < CHUNK_SIZE) ? remaining : CHUNK_SIZE;
+        // Calculate chunk size (don't exceed file bounds)
+        const size_t remaining = view.fileSize - offset;
+        const size_t chunkSize = (remaining < kChunkSize) ? remaining : kChunkSize;
         
-        if (!CryptHashData(cryptHash.Get(), data + offset, 
-                           static_cast<DWORD>(chunkSize), 0)) {
-            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (data chunk) failed");
+        // Validate chunk size fits in DWORD
+        if (chunkSize > static_cast<size_t>((std::numeric_limits<DWORD>::max)())) {
+            SS_LOG_ERROR(L"Whitelist", L"Chunk size exceeds DWORD maximum");
+            return false;
+        }
+        
+        if (!::CryptHashData(
+                cryptHash.Get(), 
+                data + offset, 
+                static_cast<DWORD>(chunkSize), 
+                0)) {
+            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (data chunk at 0x%zX) failed", offset);
             return false;
         }
         
         offset += chunkSize;
     }
     
-    // Get hash value
-    DWORD hashLen = 32;
-    if (!CryptGetHashParam(cryptHash.Get(), HP_HASHVAL, outChecksum.data(), &hashLen, 0)) {
+    // ========================================================================
+    // RETRIEVE HASH VALUE
+    // ========================================================================
+    
+    DWORD hashLen = static_cast<DWORD>(outChecksum.size());
+    if (!::CryptGetHashParam(
+            cryptHash.Get(), 
+            HP_HASHVAL, 
+            outChecksum.data(), 
+            &hashLen, 
+            0)) {
         SS_LOG_LAST_ERROR(L"Whitelist", L"CryptGetHashParam failed");
+        return false;
+    }
+    
+    // Verify we got the expected hash length
+    if (hashLen != 32u) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"Unexpected hash length: expected 32, got %lu", 
+            static_cast<unsigned long>(hashLen));
         return false;
     }
     
     return true;
 }
 
+/**
+ * @brief Verify complete database integrity.
+ *
+ * Performs comprehensive integrity verification:
+ * 1. Header structure validation
+ * 2. CRC32 quick check (if non-zero)
+ * 3. Full SHA-256 checksum verification (if non-zero)
+ *
+ * @param view Memory-mapped view of the database
+ * @param[out] error Detailed error information on failure
+ * @return true if database passes all integrity checks
+ *
+ * @note This can be slow for large databases due to SHA-256 computation
+ */
 bool VerifyIntegrity(const MemoryMappedView& view, StoreError& error) noexcept {
-    /*
-     * ========================================================================
-     * FULL DATABASE INTEGRITY VERIFICATION
-     * ========================================================================
-     *
-     * Performs complete integrity check:
-     * 1. Header validation
-     * 2. CRC32 quick check
-     * 3. SHA-256 full checksum verification
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
     
     if (!view.IsValid()) {
         error = StoreError::WithMessage(
@@ -597,9 +1155,21 @@ bool VerifyIntegrity(const MemoryMappedView& view, StoreError& error) noexcept {
         return false;
     }
     
-    // Get header
+    // Verify minimum file size
+    if (view.fileSize < sizeof(WhitelistDatabaseHeader)) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidHeader,
+            "File too small for valid header"
+        );
+        return false;
+    }
+    
+    // ========================================================================
+    // GET AND VALIDATE HEADER
+    // ========================================================================
+    
     const auto* header = view.GetAt<WhitelistDatabaseHeader>(0);
-    if (!header) {
+    if (header == nullptr) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidHeader,
             "Failed to read database header"
@@ -607,47 +1177,82 @@ bool VerifyIntegrity(const MemoryMappedView& view, StoreError& error) noexcept {
         return false;
     }
     
-    // Validate header structure
+    // Perform comprehensive header validation
     if (!ValidateHeader(header)) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidHeader,
-            "Header validation failed"
+            "Header validation failed - see log for details"
         );
         return false;
     }
     
-    // Verify SHA-256 checksum (skip if all zeros - new database)
+    // ========================================================================
+    // SHA-256 CHECKSUM VERIFICATION
+    // ========================================================================
+    //
+    // If the header has a non-zero SHA-256 checksum, verify it.
+    // A zero checksum indicates a new database that hasn't been finalized.
+    //
+    // ========================================================================
+    
+    // Check if checksum is present (non-zero)
     bool hasChecksum = false;
-    for (uint8_t b : header->sha256Checksum) {
-        if (b != 0) {
+    for (const uint8_t b : header->sha256Checksum) {
+        if (b != 0u) {
             hasChecksum = true;
             break;
         }
     }
     
     if (hasChecksum) {
-        std::array<uint8_t, 32> computedChecksum;
+        // Compute checksum of current database content
+        std::array<uint8_t, 32> computedChecksum{};
         if (!ComputeDatabaseChecksum(view, computedChecksum)) {
             error = StoreError::WithMessage(
                 WhitelistStoreError::InvalidChecksum,
-                "Failed to compute checksum"
+                "Failed to compute database checksum"
             );
             return false;
         }
         
+        // Compare computed checksum with stored checksum
         if (computedChecksum != header->sha256Checksum) {
+            // Log both checksums for debugging
+            SS_LOG_ERROR(L"Whitelist", 
+                L"Database checksum mismatch - possible corruption or tampering");
+            
             error = StoreError::WithMessage(
                 WhitelistStoreError::InvalidChecksum,
-                "Database checksum mismatch - possible corruption"
+                "Database checksum mismatch - file may be corrupted"
             );
             return false;
         }
+        
+        SS_LOG_DEBUG(L"Whitelist", L"SHA-256 checksum verified successfully");
+    } else {
+        SS_LOG_DEBUG(L"Whitelist", 
+            L"No SHA-256 checksum present (new or unfinalized database)");
     }
+    
+    // ========================================================================
+    // INTEGRITY VERIFIED
+    // ========================================================================
     
     error = StoreError::Success();
     return true;
 }
 
+/**
+ * @brief Convert HashAlgorithm enum to string representation.
+ *
+ * Returns a human-readable name for the hash algorithm.
+ * Used for logging, debugging, and display purposes.
+ *
+ * @param algo Hash algorithm enum value
+ * @return Null-terminated string (static lifetime)
+ *
+ * @note Thread-safe (returns pointer to static string literal)
+ */
 const char* HashAlgorithmToString(HashAlgorithm algo) noexcept {
     switch (algo) {
         case HashAlgorithm::MD5:          return "MD5";
@@ -660,6 +1265,17 @@ const char* HashAlgorithmToString(HashAlgorithm algo) noexcept {
     }
 }
 
+/**
+ * @brief Convert WhitelistEntryType enum to string representation.
+ *
+ * Returns a human-readable name for the entry type.
+ * Used for logging, debugging, and display purposes.
+ *
+ * @param type Entry type enum value
+ * @return Null-terminated string (static lifetime)
+ *
+ * @note Thread-safe (returns pointer to static string literal)
+ */
 const char* EntryTypeToString(WhitelistEntryType type) noexcept {
     switch (type) {
         case WhitelistEntryType::FileHash:     return "FileHash";
@@ -671,10 +1287,22 @@ const char* EntryTypeToString(WhitelistEntryType type) noexcept {
         case WhitelistEntryType::CommandLine:  return "CommandLine";
         case WhitelistEntryType::ImportHash:   return "ImportHash";
         case WhitelistEntryType::CombinedRule: return "CombinedRule";
+        case WhitelistEntryType::Reserved:     return "Reserved";
         default:                               return "Unknown";
     }
 }
 
+/**
+ * @brief Convert WhitelistReason enum to string representation.
+ *
+ * Returns a human-readable name for the whitelist reason.
+ * Used for audit logs, debugging, and display purposes.
+ *
+ * @param reason Reason enum value
+ * @return Null-terminated string (static lifetime)
+ *
+ * @note Thread-safe (returns pointer to static string literal)
+ */
 const char* ReasonToString(WhitelistReason reason) noexcept {
     switch (reason) {
         case WhitelistReason::SystemFile:      return "SystemFile";
@@ -691,168 +1319,255 @@ const char* ReasonToString(WhitelistReason reason) noexcept {
     }
 }
 
+/**
+ * @brief Parse a hex-encoded hash string into a HashValue.
+ *
+ * Converts a hexadecimal string representation of a hash into binary form.
+ * Handles both uppercase and lowercase hex characters.
+ * Automatically strips whitespace from the input.
+ *
+ * SECURITY: Uses stack-based processing to avoid heap allocation failures.
+ * All input is validated before use.
+ *
+ * @param hashStr Hex string to parse (e.g., "a1b2c3d4...")
+ * @param algo Expected hash algorithm (determines expected length)
+ * @return HashValue if parsing succeeds, std::nullopt on error
+ *
+ * @note Thread-safe (no global state modified)
+ *
+ * @example
+ * auto hash = ParseHashString("a1b2c3d4e5f6...", HashAlgorithm::SHA256);
+ * if (hash) {
+ *     // Use hash.value()
+ * }
+ */
 std::optional<HashValue> ParseHashString(
     const std::string& hashStr,
     HashAlgorithm algo
 ) noexcept {
-    /*
-     * ========================================================================
-     * EXCEPTION-SAFE HASH STRING PARSING
-     * ========================================================================
-     *
-     * Parses hex-encoded hash strings with full validation.
-     * Stack-based processing to avoid heap allocation failures.
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
     
     if (hashStr.empty()) {
-        SS_LOG_ERROR(L"Whitelist", L"ParseHashString: empty hash string");
+        SS_LOG_DEBUG(L"Whitelist", L"ParseHashString: empty hash string");
         return std::nullopt;
     }
     
-    // Maximum reasonable length
-    constexpr size_t MAX_HASH_STRING_LEN = 256;
-    if (hashStr.length() > MAX_HASH_STRING_LEN) {
-        SS_LOG_ERROR(L"Whitelist", L"ParseHashString: string too long (%zu)", 
-            hashStr.length());
+    // Maximum reasonable hash string length (SHA-512 * 2 + some whitespace)
+    constexpr size_t kMaxHashStringLen = 256u;
+    if (hashStr.length() > kMaxHashStringLen) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"ParseHashString: string too long (%zu > %zu)", 
+            hashStr.length(), 
+            kMaxHashStringLen);
         return std::nullopt;
     }
     
-    // Get expected length for algorithm
-    uint8_t expectedLen = HashValue::GetLengthForAlgorithm(algo);
-    if (expectedLen == 0) {
-        SS_LOG_ERROR(L"Whitelist", L"ParseHashString: invalid algorithm %u",
-            static_cast<uint8_t>(algo));
+    // Get expected binary length for the algorithm
+    const uint8_t expectedLen = HashValue::GetLengthForAlgorithm(algo);
+    if (expectedLen == 0u) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"ParseHashString: unsupported algorithm %u",
+            static_cast<unsigned>(algo));
         return std::nullopt;
     }
     
-    // Stack-based cleaning (remove whitespace)
-    char cleaned[MAX_HASH_STRING_LEN + 1];
-    size_t cleanedLen = 0;
+    // ========================================================================
+    // CLEAN INPUT (Remove whitespace)
+    // ========================================================================
+    //
+    // Use stack-based buffer to avoid heap allocation failures.
+    // This is critical for reliability in low-memory situations.
+    //
+    // ========================================================================
     
-    for (size_t i = 0; i < hashStr.length() && cleanedLen < MAX_HASH_STRING_LEN; ++i) {
-        char c = hashStr[i];
+    char cleaned[kMaxHashStringLen + 1];
+    size_t cleanedLen = 0u;
+    
+    for (size_t i = 0; i < hashStr.length() && cleanedLen < kMaxHashStringLen; ++i) {
+        const char c = hashStr[i];
+        // Skip whitespace (space, tab, newline, etc.)
         if (!std::isspace(static_cast<unsigned char>(c))) {
             cleaned[cleanedLen++] = c;
         }
     }
     cleaned[cleanedLen] = '\0';
     
-    // Validate hex string
-    if (cleanedLen != static_cast<size_t>(expectedLen) * 2) {
+    // ========================================================================
+    // LENGTH VALIDATION
+    // ========================================================================
+    //
+    // Hex string length must be exactly 2x the binary length.
+    //
+    // ========================================================================
+    
+    const size_t expectedHexLen = static_cast<size_t>(expectedLen) * 2u;
+    if (cleanedLen != expectedHexLen) {
         SS_LOG_ERROR(L"Whitelist",
-            L"ParseHashString: invalid length %zu for %S (expected %u hex chars)",
-            cleanedLen, HashAlgorithmToString(algo), expectedLen * 2);
+            L"ParseHashString: invalid length %zu for %S (expected %zu hex chars)",
+            cleanedLen, 
+            HashAlgorithmToString(algo), 
+            expectedHexLen);
         return std::nullopt;
     }
     
-    // Parse hex to bytes
+    // ========================================================================
+    // HEX PARSING
+    // ========================================================================
+    //
+    // Convert pairs of hex characters to bytes.
+    // Validate each character before conversion.
+    //
+    // ========================================================================
+    
     HashValue hash{};
     hash.algorithm = algo;
     hash.length = expectedLen;
     
     for (size_t i = 0; i < expectedLen; ++i) {
-        uint8_t high = HexCharToValue(cleaned[i * 2]);
-        uint8_t low = HexCharToValue(cleaned[i * 2 + 1]);
+        const char highChar = cleaned[i * 2u];
+        const char lowChar = cleaned[i * 2u + 1u];
         
-        if (high == 0xFF || low == 0xFF) {
+        const uint8_t highNibble = HexCharToValue(highChar);
+        const uint8_t lowNibble = HexCharToValue(lowChar);
+        
+        // Check for invalid hex characters (HexCharToValue returns 0xFF)
+        if (highNibble == 0xFFu || lowNibble == 0xFFu) {
             SS_LOG_ERROR(L"Whitelist",
-                L"ParseHashString: invalid hex character at position %zu", i * 2);
+                L"ParseHashString: invalid hex character at position %zu ('%c%c')", 
+                i * 2u,
+                highChar,
+                lowChar);
             return std::nullopt;
         }
         
-        hash.data[i] = static_cast<uint8_t>((high << 4) | low);
+        hash.data[i] = static_cast<uint8_t>((highNibble << 4u) | lowNibble);
     }
     
     return hash;
 }
 
+/**
+ * @brief Format a HashValue as a hex string.
+ *
+ * Converts binary hash data to lowercase hexadecimal representation.
+ * Uses lookup table for optimal performance.
+ *
+ * @param hash HashValue to format
+ * @return Lowercase hex string, empty string on error
+ *
+ * @note Thread-safe (no global state modified)
+ * @note May throw std::bad_alloc if string allocation fails
+ *
+ * @example
+ * HashValue hash = ...;
+ * std::string hexStr = FormatHashString(hash);
+ * // hexStr = "a1b2c3d4e5f6..."
+ */
 std::string FormatHashString(const HashValue& hash) {
-    /*
-     * ========================================================================
-     * HIGH-PERFORMANCE HASH FORMATTING
-     * ========================================================================
-     *
-     * Converts binary hash to lowercase hex string.
-     * Lookup table for optimal performance.
-     *
-     * ========================================================================
-     */
-    
-    if (hash.length == 0 || hash.length > hash.data.size()) {
+    // Validate hash length
+    if (hash.length == 0u || hash.length > hash.data.size()) {
         return {};
     }
     
-    static constexpr char hexChars[] = "0123456789abcdef";
+    // Lookup table for hex conversion (compile-time constant)
+    static constexpr char kHexChars[] = "0123456789abcdef";
     
+    // Pre-allocate result string to avoid reallocations
     std::string result;
-    result.reserve(static_cast<size_t>(hash.length) * 2);
+    result.reserve(static_cast<size_t>(hash.length) * 2u);
     
+    // Convert each byte to two hex characters
     for (size_t i = 0; i < hash.length; ++i) {
-        uint8_t byte = hash.data[i];
-        result.push_back(hexChars[(byte >> 4) & 0x0F]);
-        result.push_back(hexChars[byte & 0x0F]);
+        const uint8_t byte = hash.data[i];
+        result.push_back(kHexChars[(byte >> 4u) & 0x0Fu]);
+        result.push_back(kHexChars[byte & 0x0Fu]);
     }
     
     return result;
 }
 
+/**
+ * @brief Calculate optimal query cache size based on database size.
+ *
+ * Strategy: 5% of database size, clamped to [16MB, 512MB].
+ * This provides good cache hit rates while limiting memory usage.
+ *
+ * @param dbSizeBytes Database file size in bytes
+ * @return Recommended cache size in megabytes
+ *
+ * @note Thread-safe (pure function, no global state)
+ */
 uint32_t CalculateOptimalCacheSize(uint64_t dbSizeBytes) noexcept {
-    /*
-     * ========================================================================
-     * CACHE SIZE CALCULATION
-     * ========================================================================
-     *
-     * Strategy: 5% of database size, clamped to [16MB, 512MB]
-     * This provides good cache hit rates while limiting memory usage.
-     *
-     * ========================================================================
-     */
+    // Configuration constants
+    constexpr uint64_t kMinCacheMB = 16u;    // Minimum cache: 16MB
+    constexpr uint64_t kMaxCacheMB = 512u;   // Maximum cache: 512MB
+    constexpr double kCacheRatio = 0.05;     // 5% of database size
     
-    constexpr uint64_t MIN_CACHE_MB = 16;
-    constexpr uint64_t MAX_CACHE_MB = 512;
-    constexpr double CACHE_RATIO = 0.05;
+    // Convert database size to MB and calculate 5%
+    const double dbSizeMB = static_cast<double>(dbSizeBytes) / (1024.0 * 1024.0);
+    const double cacheDouble = dbSizeMB * kCacheRatio;
     
-    uint64_t cacheSizeMB = static_cast<uint64_t>(
-        (static_cast<double>(dbSizeBytes) / (1024.0 * 1024.0)) * CACHE_RATIO
-    );
+    // Clamp to valid range
+    uint64_t cacheSizeMB = static_cast<uint64_t>(cacheDouble);
     
-    if (cacheSizeMB < MIN_CACHE_MB) {
-        cacheSizeMB = MIN_CACHE_MB;
-    } else if (cacheSizeMB > MAX_CACHE_MB) {
-        cacheSizeMB = MAX_CACHE_MB;
+    if (cacheSizeMB < kMinCacheMB) {
+        cacheSizeMB = kMinCacheMB;
+    } else if (cacheSizeMB > kMaxCacheMB) {
+        cacheSizeMB = kMaxCacheMB;
     }
     
     return static_cast<uint32_t>(cacheSizeMB);
 }
 
+/**
+ * @brief Normalize a file path for consistent comparison.
+ *
+ * Performs the following transformations:
+ * - Converts to lowercase (Windows paths are case-insensitive)
+ * - Normalizes path separators (forward slash → backslash)
+ * - Removes trailing backslashes (except for root paths like "C:\")
+ *
+ * SECURITY: Does NOT expand environment variables or follow symbolic links.
+ * The caller is responsible for canonicalization if needed.
+ *
+ * @param path Path to normalize (may be empty)
+ * @return Normalized path string
+ *
+ * @note May throw std::bad_alloc if string allocation fails
+ * @note Thread-safe (no global state modified)
+ *
+ * @example
+ * NormalizePath(L"C:/Users/Test/") → L"c:\\users\\test"
+ * NormalizePath(L"C:\\") → L"c:\\" (root preserved)
+ */
 std::wstring NormalizePath(std::wstring_view path) {
-    /*
-     * ========================================================================
-     * PATH NORMALIZATION FOR CONSISTENT COMPARISON
-     * ========================================================================
-     *
-     * - Converts to lowercase (Windows is case-insensitive)
-     * - Converts backslashes to forward slashes
-     * - Removes trailing slashes
-     * - Expands environment variables (optional)
-     *
-     * ========================================================================
-     */
-    
+    // Handle empty path
     if (path.empty()) {
         return {};
     }
     
+    // Limit maximum path length to prevent DoS
+    constexpr size_t kMaxNormalizePath = 32768u;  // Extended MAX_PATH
+    if (path.length() > kMaxNormalizePath) {
+        SS_LOG_WARN(L"Whitelist", 
+            L"NormalizePath: path length %zu exceeds limit %zu",
+            path.length(), kMaxNormalizePath);
+        // Still process, but truncate to limit
+        path = path.substr(0, kMaxNormalizePath);
+    }
+    
+    // Pre-allocate result string
     std::wstring normalized;
     normalized.reserve(path.length());
     
-    for (wchar_t c : path) {
-        // Convert to lowercase
-        wchar_t lower = static_cast<wchar_t>(std::towlower(c));
+    // Process each character
+    for (const wchar_t c : path) {
+        // Convert to lowercase using towlower (locale-aware)
+        wchar_t lower = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
         
-        // Normalize path separators to backslash (Windows standard)
+        // Normalize forward slashes to backslashes (Windows standard)
         if (lower == L'/') {
             lower = L'\\';
         }
@@ -860,74 +1575,140 @@ std::wstring NormalizePath(std::wstring_view path) {
         normalized.push_back(lower);
     }
     
-    // Remove trailing backslashes (except for root paths like "C:\")
-    while (normalized.length() > 3 && normalized.back() == L'\\') {
+    // Remove trailing backslashes, but preserve root paths like "C:\"
+    // A root path has format: "X:\" (3 characters, drive letter + colon + backslash)
+    while (normalized.length() > 3u && normalized.back() == L'\\') {
         normalized.pop_back();
     }
     
     return normalized;
 }
 
+/**
+ * @brief Check if a path matches a pattern using the specified mode.
+ *
+ * Supports multiple matching modes:
+ * - Exact: Full string equality
+ * - Prefix: Path starts with pattern
+ * - Suffix: Path ends with pattern
+ * - Contains: Pattern appears anywhere in path
+ * - Glob: Wildcard matching with * and ?
+ * - Regex: Regular expression (not yet implemented)
+ *
+ * SECURITY: All inputs are normalized before comparison.
+ * Glob matching has O(n*m) worst case complexity with proper backtracking.
+ *
+ * @param path Path to check
+ * @param pattern Pattern to match against
+ * @param mode Matching mode (Exact, Prefix, Suffix, Contains, Glob, Regex)
+ * @param caseSensitive Ignored (always case-insensitive after normalization)
+ * @return true if path matches pattern
+ *
+ * @note Thread-safe (no global state modified)
+ * @note Regex mode is not implemented and returns false
+ */
 bool PathMatchesPattern(
     std::wstring_view path,
     std::wstring_view pattern,
     PathMatchMode mode,
-    bool caseSensitive
+    [[maybe_unused]] bool caseSensitive  // Ignored - always case-insensitive
 ) noexcept {
-    /*
-     * ========================================================================
-     * PATH PATTERN MATCHING
-     * ========================================================================
-     *
-     * Supports multiple matching modes:
-     * - Exact: Full string match
-     * - Prefix: Starts with pattern
-     * - Suffix: Ends with pattern
-     * - Contains: Pattern appears anywhere
-     * - Glob: Wildcard matching (*, ?)
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // EDGE CASE HANDLING
+    // ========================================================================
     
+    // Empty path only matches empty pattern
     if (path.empty()) {
         return pattern.empty();
     }
     
-    // Normalize for comparison
-    auto normPath = NormalizePath(path);
-    auto normPattern = NormalizePath(pattern);
+    // Empty pattern never matches non-empty path (except in Contains mode)
+    if (pattern.empty()) {
+        return (mode == PathMatchMode::Contains);
+    }
+    
+    // ========================================================================
+    // PATH NORMALIZATION
+    // ========================================================================
+    //
+    // Both path and pattern are normalized for consistent comparison.
+    // This handles case-insensitivity and path separator differences.
+    //
+    // ========================================================================
+    
+    std::wstring normPath;
+    std::wstring normPattern;
+    
+    try {
+        normPath = NormalizePath(path);
+        normPattern = NormalizePath(pattern);
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"PathMatchesPattern: normalization failed: %S", e.what());
+        return false;
+    } catch (...) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"PathMatchesPattern: unknown exception during normalization");
+        return false;
+    }
+    
+    // ========================================================================
+    // MODE-SPECIFIC MATCHING
+    // ========================================================================
     
     switch (mode) {
         case PathMatchMode::Exact:
+            // Full string equality
             return normPath == normPattern;
             
         case PathMatchMode::Prefix:
+            // Path starts with pattern
             return normPath.starts_with(normPattern);
             
         case PathMatchMode::Suffix:
+            // Path ends with pattern
             return normPath.ends_with(normPattern);
             
         case PathMatchMode::Contains:
+            // Pattern appears anywhere in path
             return normPath.find(normPattern) != std::wstring::npos;
             
         case PathMatchMode::Glob: {
-            // Simple glob matching with * and ?
+            // ================================================================
+            // GLOB PATTERN MATCHING
+            // ================================================================
+            //
+            // Implements glob matching with * and ? wildcards:
+            // - * matches zero or more characters
+            // - ? matches exactly one character
+            //
+            // Algorithm: Greedy matching with backtracking
+            // Time complexity: O(n * m) worst case
+            // Space complexity: O(1) (no recursion)
+            //
+            // ================================================================
+            
             size_t pathIdx = 0;
             size_t patIdx = 0;
-            size_t starPathIdx = std::wstring::npos;
-            size_t starPatIdx = std::wstring::npos;
+            size_t starPathIdx = std::wstring::npos;  // Position in path after last *
+            size_t starPatIdx = std::wstring::npos;   // Position of last * in pattern
             
-            while (pathIdx < normPath.length()) {
-                if (patIdx < normPattern.length()) {
-                    wchar_t patChar = normPattern[patIdx];
+            const size_t pathLen = normPath.length();
+            const size_t patLen = normPattern.length();
+            
+            while (pathIdx < pathLen) {
+                if (patIdx < patLen) {
+                    const wchar_t patChar = normPattern[patIdx];
                     
                     if (patChar == L'*') {
-                        // Star: remember position and try to match empty string
-                        starPatIdx = patIdx++;
+                        // Star: remember position for backtracking
+                        starPatIdx = patIdx;
                         starPathIdx = pathIdx;
+                        ++patIdx;  // Move past star, but don't consume path char yet
                         continue;
                     }
                     
+                    // Single character match (? matches any, or exact match)
                     if (patChar == L'?' || patChar == normPath[pathIdx]) {
                         ++pathIdx;
                         ++patIdx;
@@ -935,30 +1716,48 @@ bool PathMatchesPattern(
                     }
                 }
                 
-                // Mismatch - backtrack to last star if possible
+                // Mismatch - try backtracking to last star
                 if (starPatIdx != std::wstring::npos) {
+                    // Backtrack: star consumes one more character
                     patIdx = starPatIdx + 1;
-                    pathIdx = ++starPathIdx;
+                    ++starPathIdx;
+                    pathIdx = starPathIdx;
                     continue;
                 }
                 
+                // No star to backtrack to - match failed
                 return false;
             }
             
-            // Skip trailing stars
-            while (patIdx < normPattern.length() && normPattern[patIdx] == L'*') {
+            // Path exhausted - skip trailing stars in pattern
+            while (patIdx < patLen && normPattern[patIdx] == L'*') {
                 ++patIdx;
             }
             
-            return patIdx == normPattern.length();
+            // Match succeeds if pattern is also exhausted
+            return patIdx == patLen;
         }
             
         case PathMatchMode::Regex:
-            // TODO: Implement regex matching (expensive, use sparingly)
-            SS_LOG_WARN(L"Whitelist", L"Regex path matching not yet implemented");
+            // ================================================================
+            // REGEX MATCHING (NOT IMPLEMENTED)
+            // ================================================================
+            //
+            // Regular expression matching is expensive and potentially
+            // dangerous (ReDoS attacks). Use sparingly and with timeouts.
+            //
+            // TODO: Implement with std::wregex and execution time limit
+            //
+            // ================================================================
+            SS_LOG_WARN(L"Whitelist", 
+                L"Regex path matching not yet implemented - returning false");
             return false;
             
         default:
+            // Unknown mode - defensive return
+            SS_LOG_ERROR(L"Whitelist", 
+                L"PathMatchesPattern: unknown mode %u",
+                static_cast<unsigned>(mode));
             return false;
     }
 }
@@ -968,124 +1767,273 @@ bool PathMatchesPattern(
 // ============================================================================
 // MEMORY MAPPING IMPLEMENTATIONS
 // ============================================================================
+//
+// These functions provide safe, RAII-based memory-mapped file operations.
+// All resources are managed with guard classes for exception safety.
+//
+// Security considerations:
+// - File handles are opened with minimal required permissions
+// - Exclusive access during database creation prevents race conditions
+// - Read-only mapping for query operations
+// - All sizes validated against maximum limits
+//
+// ============================================================================
 
 namespace MemoryMapping {
 
 namespace {
 
-// Helper: Open file for memory mapping
-HANDLE OpenFileForMapping(const std::wstring& path, bool readOnly, DWORD& outError) noexcept {
-    DWORD desiredAccess = readOnly ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
-    DWORD shareMode = readOnly ? FILE_SHARE_READ : 0;
-    DWORD flagsAndAttributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS;
+/**
+ * @brief Open a file for memory mapping.
+ *
+ * Opens an existing file with appropriate access rights for memory mapping.
+ * Uses FILE_FLAG_RANDOM_ACCESS for optimal performance with mapped access.
+ *
+ * @param path File path (must not be empty)
+ * @param readOnly If true, open for read-only access
+ * @param[out] outError Win32 error code on failure
+ * @return File handle (INVALID_HANDLE_VALUE on failure)
+ *
+ * @note Caller is responsible for closing the handle
+ */
+HANDLE OpenFileForMapping(
+    const std::wstring& path, 
+    bool readOnly, 
+    DWORD& outError
+) noexcept {
+    outError = ERROR_SUCCESS;
     
-    HANDLE hFile = CreateFileW(
+    // Determine access mode
+    const DWORD desiredAccess = readOnly 
+        ? GENERIC_READ 
+        : (GENERIC_READ | GENERIC_WRITE);
+    
+    // Share mode: read-only files can be shared for reading
+    // Writable files need exclusive access to prevent corruption
+    const DWORD shareMode = readOnly ? FILE_SHARE_READ : 0u;
+    
+    // Flags: random access hint for memory-mapped usage
+    const DWORD flagsAndAttributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS;
+    
+    const HANDLE hFile = ::CreateFileW(
         path.c_str(),
         desiredAccess,
         shareMode,
-        nullptr,
-        OPEN_EXISTING,
+        nullptr,           // Default security
+        OPEN_EXISTING,     // Must exist
         flagsAndAttributes,
-        nullptr
+        nullptr            // No template
     );
     
     if (hFile == INVALID_HANDLE_VALUE) {
-        outError = GetLastError();
+        outError = ::GetLastError();
         SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to open file: %s", path.c_str());
     }
     
     return hFile;
 }
 
-// Helper: Create new file for database
-HANDLE CreateFileForDatabase(const std::wstring& path, DWORD& outError) noexcept {
-    HANDLE hFile = CreateFileW(
+/**
+ * @brief Create a new file for database storage.
+ *
+ * Creates a new file with exclusive access for database initialization.
+ * Overwrites any existing file at the path.
+ *
+ * @param path File path (must not be empty)
+ * @param[out] outError Win32 error code on failure
+ * @return File handle (INVALID_HANDLE_VALUE on failure)
+ *
+ * @note Caller is responsible for closing the handle
+ * @warning Overwrites existing files without warning
+ */
+HANDLE CreateFileForDatabase(
+    const std::wstring& path, 
+    DWORD& outError
+) noexcept {
+    outError = ERROR_SUCCESS;
+    
+    const HANDLE hFile = ::CreateFileW(
         path.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        0, // Exclusive access during creation
-        nullptr,
-        CREATE_ALWAYS,
+        GENERIC_READ | GENERIC_WRITE,  // Need both for initialization
+        0u,                            // Exclusive access during creation
+        nullptr,                       // Default security
+        CREATE_ALWAYS,                 // Create or overwrite
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
-        nullptr
+        nullptr                        // No template
     );
     
     if (hFile == INVALID_HANDLE_VALUE) {
-        outError = GetLastError();
+        outError = ::GetLastError();
         SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to create file: %s", path.c_str());
     }
     
     return hFile;
 }
 
-// Helper: Get file size
-bool GetFileSizeHelper(HANDLE hFile, uint64_t& outSize, DWORD& outError) noexcept {
+/**
+ * @brief Get the size of an open file.
+ *
+ * Retrieves the current file size using GetFileSizeEx.
+ *
+ * @param hFile Valid file handle
+ * @param[out] outSize File size in bytes
+ * @param[out] outError Win32 error code on failure
+ * @return true if size retrieved successfully
+ */
+bool GetFileSizeHelper(
+    HANDLE hFile, 
+    uint64_t& outSize, 
+    DWORD& outError
+) noexcept {
+    outSize = 0u;
+    outError = ERROR_SUCCESS;
+    
     LARGE_INTEGER size{};
     if (!::GetFileSizeEx(hFile, &size)) {
-        outError = GetLastError();
+        outError = ::GetLastError();
         SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to get file size");
         return false;
     }
+    
+    // Validate size is non-negative (should always be true for GetFileSizeEx)
+    if (size.QuadPart < 0) {
+        outError = ERROR_INVALID_DATA;
+        SS_LOG_ERROR(L"Whitelist", L"GetFileSizeEx returned negative size");
+        return false;
+    }
+    
     outSize = static_cast<uint64_t>(size.QuadPart);
     return true;
 }
 
-// Helper: Set file size
-bool SetFileSizeHelper(HANDLE hFile, uint64_t size, DWORD& outError) noexcept {
+/**
+ * @brief Set the size of an open file.
+ *
+ * Extends or truncates a file to the specified size.
+ * Used when creating or extending databases.
+ *
+ * @param hFile Valid file handle with write access
+ * @param size New file size in bytes
+ * @param[out] outError Win32 error code on failure
+ * @return true if size set successfully
+ */
+bool SetFileSizeHelper(
+    HANDLE hFile, 
+    uint64_t size, 
+    DWORD& outError
+) noexcept {
+    outError = ERROR_SUCCESS;
+    
+    // Set file pointer to desired position
     LARGE_INTEGER pos{};
     pos.QuadPart = static_cast<LONGLONG>(size);
     
-    if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) {
-        outError = GetLastError();
-        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to set file pointer");
+    if (!::SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) {
+        outError = ::GetLastError();
+        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to set file pointer to %llu", 
+            static_cast<unsigned long long>(size));
         return false;
     }
     
-    if (!SetEndOfFile(hFile)) {
-        outError = GetLastError();
-        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to set end of file");
+    // Set end of file at current position
+    if (!::SetEndOfFile(hFile)) {
+        outError = ::GetLastError();
+        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to set end of file at %llu", 
+            static_cast<unsigned long long>(size));
         return false;
     }
     
     return true;
 }
 
-// Helper: Create file mapping
-HANDLE CreateFileMappingHelper(HANDLE hFile, bool readOnly, uint64_t size, DWORD& outError) noexcept {
-    DWORD protect = readOnly ? PAGE_READONLY : PAGE_READWRITE;
-    DWORD maxSizeHigh = static_cast<DWORD>(size >> 32);
-    DWORD maxSizeLow = static_cast<DWORD>(size & 0xFFFFFFFF);
+/**
+ * @brief Create a file mapping object.
+ *
+ * Creates a Windows file mapping object for the specified file.
+ *
+ * @param hFile Valid file handle
+ * @param readOnly If true, create read-only mapping
+ * @param size Maximum size of the mapping
+ * @param[out] outError Win32 error code on failure
+ * @return File mapping handle (nullptr on failure)
+ *
+ * @note Caller is responsible for closing the handle
+ */
+HANDLE CreateFileMappingHelper(
+    HANDLE hFile, 
+    bool readOnly, 
+    uint64_t size, 
+    DWORD& outError
+) noexcept {
+    outError = ERROR_SUCCESS;
     
-    HANDLE hMapping = CreateFileMappingW(
+    // Page protection
+    const DWORD protect = readOnly ? PAGE_READONLY : PAGE_READWRITE;
+    
+    // Split size into high and low parts for 64-bit support
+    const DWORD maxSizeHigh = static_cast<DWORD>(size >> 32u);
+    const DWORD maxSizeLow = static_cast<DWORD>(size & 0xFFFFFFFFu);
+    
+    const HANDLE hMapping = ::CreateFileMappingW(
         hFile,
-        nullptr,
+        nullptr,        // Default security
         protect,
-        maxSizeHigh,
-        maxSizeLow,
-        nullptr
+        maxSizeHigh,    // High 32 bits of size
+        maxSizeLow,     // Low 32 bits of size
+        nullptr         // No name (private mapping)
     );
     
     if (hMapping == nullptr) {
-        outError = GetLastError();
+        outError = ::GetLastError();
         SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to create file mapping");
     }
     
     return hMapping;
 }
 
-// Helper: Map view of file
-void* MapViewHelper(HANDLE hMapping, bool readOnly, uint64_t size, DWORD& outError) noexcept {
-    DWORD desiredAccess = readOnly ? FILE_MAP_READ : FILE_MAP_WRITE;
+/**
+ * @brief Map a view of a file into memory.
+ *
+ * Maps the file mapping object into the process address space.
+ *
+ * @param hMapping Valid file mapping handle
+ * @param readOnly If true, map for read-only access
+ * @param size Size of the view to map (0 = entire file)
+ * @param[out] outError Win32 error code on failure
+ * @return Base address of mapped view (nullptr on failure)
+ *
+ * @note Caller is responsible for unmapping with UnmapViewOfFile
+ */
+void* MapViewHelper(
+    HANDLE hMapping, 
+    bool readOnly, 
+    uint64_t size, 
+    DWORD& outError
+) noexcept {
+    outError = ERROR_SUCCESS;
     
-    void* baseAddress = MapViewOfFile(
+    // Desired access
+    const DWORD desiredAccess = readOnly ? FILE_MAP_READ : FILE_MAP_WRITE;
+    
+    // Validate size fits in SIZE_T
+    if (size > static_cast<uint64_t>((std::numeric_limits<SIZE_T>::max)())) {
+        outError = ERROR_NOT_ENOUGH_MEMORY;
+        SS_LOG_ERROR(L"Whitelist", 
+            L"Mapping size %llu exceeds SIZE_T maximum",
+            static_cast<unsigned long long>(size));
+        return nullptr;
+    }
+    
+    void* baseAddress = ::MapViewOfFile(
         hMapping,
         desiredAccess,
-        0, // offset high
-        0, // offset low
+        0u,         // File offset high (map from start)
+        0u,         // File offset low
         static_cast<SIZE_T>(size)
     );
     
     if (baseAddress == nullptr) {
-        outError = GetLastError();
+        outError = ::GetLastError();
         SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to map view of file");
     }
     
@@ -1094,27 +2042,43 @@ void* MapViewHelper(HANDLE hMapping, bool readOnly, uint64_t size, DWORD& outErr
 
 } // anonymous namespace
 
+/**
+ * @brief Open an existing whitelist database file as a memory-mapped view.
+ *
+ * Opens the specified database file and validates its header before
+ * returning a usable memory-mapped view. Uses RAII guards to ensure
+ * proper cleanup on any failure path.
+ *
+ * SECURITY:
+ * - Validates file size against minimum and maximum limits
+ * - Performs full header validation before accepting database
+ * - Uses exclusive access for writable databases
+ *
+ * @param path Path to the database file
+ * @param readOnly If true, open for read-only access
+ * @param[out] view Memory-mapped view structure to populate
+ * @param[out] error Detailed error information on failure
+ * @return true if database opened and validated successfully
+ *
+ * @note Closes any existing view before opening
+ * @note Thread-safe for different view instances
+ */
 bool OpenView(
     const std::wstring& path,
     bool readOnly,
     MemoryMappedView& view,
     StoreError& error
 ) noexcept {
-    /*
-     * ========================================================================
-     * RAII-BASED MEMORY-MAPPED FILE OPENING
-     * ========================================================================
-     *
-     * Opens existing database file with full validation.
-     * Uses RAII guards for exception-safe resource management.
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // CLEANUP EXISTING VIEW
+    // ========================================================================
     
-    // Close any existing view
     CloseView(view);
     
-    // Input validation
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
+    
     if (path.empty()) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
@@ -1126,49 +2090,65 @@ bool OpenView(
     if (path.length() > MAX_PATH_LENGTH) {
         error = StoreError::WithMessage(
             WhitelistStoreError::PathTooLong,
-            "File path too long"
+            "File path exceeds maximum length"
         );
         return false;
     }
     
-    // Open file
-    DWORD win32Error = 0;
+    // ========================================================================
+    // OPEN FILE
+    // ========================================================================
+    
+    DWORD win32Error = ERROR_SUCCESS;
     HandleGuard fileGuard(OpenFileForMapping(path, readOnly, win32Error));
     
     if (!fileGuard.IsValid()) {
-        error = StoreError::FromWin32(WhitelistStoreError::FileNotFound, win32Error);
+        // Distinguish between file not found and access denied
+        const WhitelistStoreError errCode = 
+            (win32Error == ERROR_FILE_NOT_FOUND || win32Error == ERROR_PATH_NOT_FOUND)
+                ? WhitelistStoreError::FileNotFound
+                : WhitelistStoreError::FileAccessDenied;
+        
+        error = StoreError::FromWin32(errCode, win32Error);
         error.message = "Failed to open database file";
         return false;
     }
     
-    // Get file size
-    uint64_t fileSize = 0;
+    // ========================================================================
+    // GET AND VALIDATE FILE SIZE
+    // ========================================================================
+    
+    uint64_t fileSize = 0u;
     if (!GetFileSizeHelper(fileGuard.Get(), fileSize, win32Error)) {
         error = StoreError::FromWin32(WhitelistStoreError::InvalidSection, win32Error);
         error.message = "Failed to get file size";
         return false;
     }
     
-    // Validate minimum size
+    // Minimum size: must contain at least the header
     if (fileSize < sizeof(WhitelistDatabaseHeader)) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidHeader,
-            "File too small for valid header"
+            "File too small for valid database header"
         );
         return false;
     }
     
-    // Validate maximum size
+    // Maximum size: prevent memory exhaustion
     if (fileSize > MAX_DATABASE_SIZE) {
         error = StoreError::WithMessage(
             WhitelistStoreError::DatabaseTooLarge,
-            "Database exceeds maximum size"
+            "Database file exceeds maximum supported size"
         );
         return false;
     }
     
-    // Create file mapping
-    HandleGuard mappingGuard(CreateFileMappingHelper(fileGuard.Get(), readOnly, fileSize, win32Error));
+    // ========================================================================
+    // CREATE FILE MAPPING
+    // ========================================================================
+    
+    HandleGuard mappingGuard(CreateFileMappingHelper(
+        fileGuard.Get(), readOnly, fileSize, win32Error));
     
     if (!mappingGuard.IsValid()) {
         error = StoreError::FromWin32(WhitelistStoreError::MappingFailed, win32Error);
@@ -1176,8 +2156,12 @@ bool OpenView(
         return false;
     }
     
-    // Map view
-    MappedViewGuard viewGuard(MapViewHelper(mappingGuard.Get(), readOnly, fileSize, win32Error));
+    // ========================================================================
+    // MAP VIEW INTO MEMORY
+    // ========================================================================
+    
+    MappedViewGuard viewGuard(MapViewHelper(
+        mappingGuard.Get(), readOnly, fileSize, win32Error));
     
     if (!viewGuard.IsValid()) {
         error = StoreError::FromWin32(WhitelistStoreError::MappingFailed, win32Error);
@@ -1185,17 +2169,33 @@ bool OpenView(
         return false;
     }
     
-    // Validate header before committing
+    // ========================================================================
+    // VALIDATE HEADER
+    // ========================================================================
+    //
+    // SECURITY: Validate header BEFORE accepting the database.
+    // This prevents processing of malformed or malicious files.
+    //
+    // ========================================================================
+    
     const auto* header = reinterpret_cast<const WhitelistDatabaseHeader*>(viewGuard.Get());
     if (!Format::ValidateHeader(header)) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidHeader,
-            "Invalid database header"
+            "Database header validation failed - see log for details"
         );
         return false;
     }
     
-    // Success - transfer ownership
+    // ========================================================================
+    // SUCCESS - TRANSFER OWNERSHIP
+    // ========================================================================
+    //
+    // Release guards and transfer ownership to output structure.
+    // No cleanup needed on success path.
+    //
+    // ========================================================================
+    
     view.fileHandle = fileGuard.Release();
     view.mappingHandle = mappingGuard.Release();
     view.baseAddress = viewGuard.Release();
@@ -1204,33 +2204,51 @@ bool OpenView(
     
     SS_LOG_INFO(L"Whitelist",
         L"Opened whitelist database: %s (%llu bytes, %s)",
-        path.c_str(), fileSize, readOnly ? L"read-only" : L"read-write");
+        path.c_str(), 
+        static_cast<unsigned long long>(fileSize), 
+        readOnly ? L"read-only" : L"read-write");
     
     error = StoreError::Success();
     return true;
 }
 
+/**
+ * @brief Create a new whitelist database file.
+ *
+ * Creates a new database file with initialized header and section layout.
+ * The file is memory-mapped for immediate use after creation.
+ *
+ * SECURITY:
+ * - Uses exclusive file access during creation
+ * - Generates cryptographic UUID for database identification
+ * - Initializes all sections with proper alignment
+ * - Computes CRC32 for header integrity
+ *
+ * @param path Path for the new database file (will overwrite existing)
+ * @param initialSize Initial database size in bytes (minimum 64KB)
+ * @param[out] view Memory-mapped view structure to populate
+ * @param[out] error Detailed error information on failure
+ * @return true if database created and initialized successfully
+ *
+ * @note Closes any existing view before creating
+ * @warning Will overwrite existing files at the specified path
+ */
 bool CreateDatabase(
     const std::wstring& path,
     uint64_t initialSize,
     MemoryMappedView& view,
     StoreError& error
 ) noexcept {
-    /*
-     * ========================================================================
-     * CREATE NEW DATABASE FILE
-     * ========================================================================
-     *
-     * Creates a new whitelist database with initialized header.
-     * Allocates space for indices and data sections.
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // CLEANUP EXISTING VIEW
+    // ========================================================================
     
-    // Close any existing view
     CloseView(view);
     
-    // Validate parameters
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
+    
     if (path.empty()) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
@@ -1239,25 +2257,40 @@ bool CreateDatabase(
         return false;
     }
     
-    // Minimum size: header + at least one page for each section
-    constexpr uint64_t MIN_DB_SIZE = PAGE_SIZE * 16; // 64KB minimum
-    if (initialSize < MIN_DB_SIZE) {
-        initialSize = MIN_DB_SIZE;
+    if (path.length() > MAX_PATH_LENGTH) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::PathTooLong,
+            "File path exceeds maximum length"
+        );
+        return false;
+    }
+    
+    // Minimum size: header + at least one page for each major section
+    constexpr uint64_t kMinDbSize = PAGE_SIZE * 16u;  // 64KB minimum
+    if (initialSize < kMinDbSize) {
+        initialSize = kMinDbSize;
+        SS_LOG_DEBUG(L"Whitelist", 
+            L"Adjusted database size to minimum %llu bytes",
+            static_cast<unsigned long long>(kMinDbSize));
     }
     
     // Align to page size
     initialSize = Format::AlignToPage(initialSize);
     
+    // Maximum size check
     if (initialSize > MAX_DATABASE_SIZE) {
         error = StoreError::WithMessage(
             WhitelistStoreError::DatabaseTooLarge,
-            "Requested size exceeds maximum"
+            "Requested database size exceeds maximum"
         );
         return false;
     }
     
-    // Create file
-    DWORD win32Error = 0;
+    // ========================================================================
+    // CREATE FILE
+    // ========================================================================
+    
+    DWORD win32Error = ERROR_SUCCESS;
     HandleGuard fileGuard(CreateFileForDatabase(path, win32Error));
     
     if (!fileGuard.IsValid()) {
@@ -1266,15 +2299,22 @@ bool CreateDatabase(
         return false;
     }
     
-    // Set file size
+    // ========================================================================
+    // SET FILE SIZE
+    // ========================================================================
+    
     if (!SetFileSizeHelper(fileGuard.Get(), initialSize, win32Error)) {
         error = StoreError::FromWin32(WhitelistStoreError::InvalidSection, win32Error);
-        error.message = "Failed to set file size";
+        error.message = "Failed to set database file size";
         return false;
     }
     
-    // Create file mapping
-    HandleGuard mappingGuard(CreateFileMappingHelper(fileGuard.Get(), false, initialSize, win32Error));
+    // ========================================================================
+    // CREATE FILE MAPPING
+    // ========================================================================
+    
+    HandleGuard mappingGuard(CreateFileMappingHelper(
+        fileGuard.Get(), false /* read-write */, initialSize, win32Error));
     
     if (!mappingGuard.IsValid()) {
         error = StoreError::FromWin32(WhitelistStoreError::MappingFailed, win32Error);
@@ -1282,104 +2322,248 @@ bool CreateDatabase(
         return false;
     }
     
-    // Map view (read-write for initialization)
-    MappedViewGuard viewGuard(MapViewHelper(mappingGuard.Get(), false, initialSize, win32Error));
+    // ========================================================================
+    // MAP VIEW FOR INITIALIZATION
+    // ========================================================================
+    
+    MappedViewGuard viewGuard(MapViewHelper(
+        mappingGuard.Get(), false /* read-write */, initialSize, win32Error));
     
     if (!viewGuard.IsValid()) {
         error = StoreError::FromWin32(WhitelistStoreError::MappingFailed, win32Error);
-        error.message = "Failed to map view";
+        error.message = "Failed to map view for initialization";
         return false;
     }
     
-    // Initialize header
+    // ========================================================================
+    // INITIALIZE HEADER
+    // ========================================================================
+    
     auto* header = reinterpret_cast<WhitelistDatabaseHeader*>(viewGuard.Get());
+    
+    // Zero-initialize entire header for security
     std::memset(header, 0, sizeof(WhitelistDatabaseHeader));
     
-    // Set magic and version
+    // Set identification fields
     header->magic = WHITELIST_DB_MAGIC;
     header->versionMajor = WHITELIST_DB_VERSION_MAJOR;
     header->versionMinor = WHITELIST_DB_VERSION_MINOR;
     
-    // Generate UUID
-    if (FAILED(CoCreateGuid(reinterpret_cast<GUID*>(header->databaseUuid.data())))) {
-        // Fallback: use random bytes from crypto API
-        CryptoContextGuard cryptProv;
-        if (CryptAcquireContextW(cryptProv.Ptr(), nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-            CryptGenRandom(cryptProv.Get(), 16, header->databaseUuid.data());
+    // ========================================================================
+    // GENERATE DATABASE UUID
+    // ========================================================================
+    //
+    // Use CoCreateGuid for cryptographically random UUID.
+    // Fall back to CryptoAPI if COM is not available.
+    //
+    // ========================================================================
+    
+    // Initialize COM for CoCreateGuid (may already be initialized)
+    const HRESULT hrCom = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool comInitialized = SUCCEEDED(hrCom) || hrCom == RPC_E_CHANGED_MODE;
+    
+    GUID uuid{};
+    bool uuidGenerated = false;
+    
+    if (comInitialized || hrCom == RPC_E_CHANGED_MODE) {
+        if (SUCCEEDED(::CoCreateGuid(&uuid))) {
+            static_assert(sizeof(uuid) == 16, "GUID must be 16 bytes");
+            std::memcpy(header->databaseUuid.data(), &uuid, 16);
+            uuidGenerated = true;
         }
     }
     
-    // Set timestamps
-    auto now = std::chrono::system_clock::now();
-    auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+    // Uninitialize COM only if we initialized it
+    if (hrCom == S_OK || hrCom == S_FALSE) {
+        ::CoUninitialize();
+    }
+    
+    // Fallback: use CryptoAPI for random bytes
+    if (!uuidGenerated) {
+        CryptoContextGuard cryptProv;
+        if (::CryptAcquireContextW(
+                cryptProv.Ptr(), nullptr, nullptr, 
+                PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            (void)::CryptGenRandom(cryptProv.Get(), 16, header->databaseUuid.data());
+        } else {
+            // Last resort: use timestamp-based pseudo-random
+            const auto now = std::chrono::high_resolution_clock::now()
+                                .time_since_epoch().count();
+            std::memcpy(header->databaseUuid.data(), &now, 
+                        (std::min)(sizeof(now), header->databaseUuid.size()));
+        }
+    }
+    
+    // ========================================================================
+    // SET TIMESTAMPS
+    // ========================================================================
+    
+    const auto now = std::chrono::system_clock::now();
+    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
         now.time_since_epoch()
     ).count();
+    
     header->creationTime = static_cast<uint64_t>(epoch);
     header->lastUpdateTime = static_cast<uint64_t>(epoch);
-    header->buildNumber = 1;
+    header->buildNumber = 1u;
     
-    // Calculate section layout
-    uint64_t offset = PAGE_SIZE; // Start after header
+    // ========================================================================
+    // CALCULATE SECTION LAYOUT
+    // ========================================================================
+    //
+    // Layout sections with page alignment for optimal I/O.
+    // Proportional allocation based on expected usage patterns.
+    //
+    // ========================================================================
     
-    // Bloom filter section (1MB default)
-    header->bloomFilterOffset = offset;
-    header->bloomFilterSize = 1024 * 1024;
-    offset += Format::AlignToPage(header->bloomFilterSize);
+    uint64_t offset = PAGE_SIZE;  // Start after header (4KB)
+    
+    // Helper lambda for safe section allocation
+    auto allocateSection = [&](uint64_t* sectionOffset, uint64_t* sectionSize, 
+                               uint64_t requestedSize, const wchar_t* name) -> bool {
+        const uint64_t alignedSize = Format::AlignToPage(requestedSize);
+        
+        // Check for overflow
+        if (offset > initialSize || alignedSize > initialSize - offset) {
+            SS_LOG_ERROR(L"Whitelist", 
+                L"Insufficient space for %s section", name);
+            return false;
+        }
+        
+        *sectionOffset = offset;
+        *sectionSize = alignedSize;
+        offset += alignedSize;
+        return true;
+    };
+    
+    // Bloom filter section (1MB default for fast negative lookups)
+    constexpr uint64_t kBloomSize = 1024u * 1024u;
+    if (!allocateSection(&header->bloomFilterOffset, &header->bloomFilterSize, 
+                         kBloomSize, L"BloomFilter")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate bloom filter section"
+        );
+        return false;
+    }
     
     // Path bloom filter (512KB)
-    header->pathBloomOffset = offset;
-    header->pathBloomSize = 512 * 1024;
-    offset += Format::AlignToPage(header->pathBloomSize);
+    constexpr uint64_t kPathBloomSize = 512u * 1024u;
+    if (!allocateSection(&header->pathBloomOffset, &header->pathBloomSize, 
+                         kPathBloomSize, L"PathBloom")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate path bloom section"
+        );
+        return false;
+    }
     
-    // Hash index section (reserve 25% of remaining space)
-    uint64_t remaining = initialSize - offset;
-    header->hashIndexOffset = offset;
-    header->hashIndexSize = remaining / 4;
-    offset += Format::AlignToPage(header->hashIndexSize);
+    // Calculate remaining space for proportional allocation
+    const uint64_t remainingSpace = (initialSize > offset) ? (initialSize - offset) : 0u;
     
-    // Path index section (15% of remaining)
-    remaining = initialSize - offset;
-    header->pathIndexOffset = offset;
-    header->pathIndexSize = remaining / 4;
-    offset += Format::AlignToPage(header->pathIndexSize);
+    // Hash index section (25% of remaining)
+    const uint64_t hashIndexSize = remainingSpace / 4u;
+    if (!allocateSection(&header->hashIndexOffset, &header->hashIndexSize, 
+                         hashIndexSize, L"HashIndex")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate hash index section"
+        );
+        return false;
+    }
+    
+    // Path index section (15% of original remaining)
+    const uint64_t pathIndexSize = remainingSpace / 6u;
+    if (!allocateSection(&header->pathIndexOffset, &header->pathIndexSize, 
+                         pathIndexSize, L"PathIndex")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate path index section"
+        );
+        return false;
+    }
     
     // Certificate index (5%)
-    remaining = initialSize - offset;
-    header->certIndexOffset = offset;
-    header->certIndexSize = remaining / 8;
-    offset += Format::AlignToPage(header->certIndexSize);
+    const uint64_t certIndexSize = remainingSpace / 20u;
+    if (!allocateSection(&header->certIndexOffset, &header->certIndexSize, 
+                         certIndexSize, L"CertIndex")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate cert index section"
+        );
+        return false;
+    }
     
     // Publisher index (5%)
-    remaining = initialSize - offset;
-    header->publisherIndexOffset = offset;
-    header->publisherIndexSize = remaining / 8;
-    offset += Format::AlignToPage(header->publisherIndexSize);
+    const uint64_t publisherIndexSize = remainingSpace / 20u;
+    if (!allocateSection(&header->publisherIndexOffset, &header->publisherIndexSize, 
+                         publisherIndexSize, L"PublisherIndex")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate publisher index section"
+        );
+        return false;
+    }
     
-    // Entry data section (40% of remaining)
-    remaining = initialSize - offset;
-    header->entryDataOffset = offset;
-    header->entryDataSize = remaining / 2;
-    offset += Format::AlignToPage(header->entryDataSize);
+    // Extended hash section (5%)
+    const uint64_t extHashSize = remainingSpace / 20u;
+    if (!allocateSection(&header->extendedHashOffset, &header->extendedHashSize, 
+                         extHashSize, L"ExtendedHash")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate extended hash section"
+        );
+        return false;
+    }
     
-    // String pool (rest)
-    remaining = initialSize - offset;
-    header->stringPoolOffset = offset;
-    header->stringPoolSize = remaining - PAGE_SIZE; // Leave room for metadata
-    offset += Format::AlignToPage(header->stringPoolSize);
+    // Entry data section (25% of original remaining)
+    const uint64_t entryDataSize = remainingSpace / 4u;
+    if (!allocateSection(&header->entryDataOffset, &header->entryDataSize, 
+                         entryDataSize, L"EntryData")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate entry data section"
+        );
+        return false;
+    }
     
-    // Metadata section
+    // String pool - allocate most of what's left
+    uint64_t stringPoolSpace = (initialSize > offset + PAGE_SIZE) 
+                               ? (initialSize - offset - PAGE_SIZE) 
+                               : PAGE_SIZE;
+    if (!allocateSection(&header->stringPoolOffset, &header->stringPoolSize, 
+                         stringPoolSpace, L"StringPool")) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidSection,
+            "Failed to allocate string pool section"
+        );
+        return false;
+    }
+    
+    // Metadata section - whatever remains
+    const uint64_t metadataSpace = (initialSize > offset) ? (initialSize - offset) : 0u;
     header->metadataOffset = offset;
-    header->metadataSize = initialSize - offset;
+    header->metadataSize = metadataSpace;
     
-    // Performance hints
+    // ========================================================================
+    // SET PERFORMANCE HINTS
+    // ========================================================================
+    
     header->recommendedCacheSize = Format::CalculateOptimalCacheSize(initialSize);
-    header->bloomExpectedElements = 1000000; // 1M elements
-    header->bloomFalsePositiveRate = 100;    // 0.0001 (0.01%)
+    header->bloomExpectedElements = 1000000u;  // 1M elements
+    header->bloomFalsePositiveRate = 100u;     // 0.0001 (0.01%)
+    header->indexOptLevel = 1u;                // Default optimization
     
-    // Compute CRC32
+    // ========================================================================
+    // COMPUTE HEADER CRC32
+    // ========================================================================
+    
     header->headerCrc32 = Format::ComputeHeaderCRC32(header);
     
-    // Transfer ownership
+    // ========================================================================
+    // SUCCESS - TRANSFER OWNERSHIP
+    // ========================================================================
+    
     view.fileHandle = fileGuard.Release();
     view.mappingHandle = mappingGuard.Release();
     view.baseAddress = viewGuard.Release();
@@ -1388,33 +2572,72 @@ bool CreateDatabase(
     
     SS_LOG_INFO(L"Whitelist",
         L"Created new whitelist database: %s (%llu bytes)",
-        path.c_str(), initialSize);
+        path.c_str(), 
+        static_cast<unsigned long long>(initialSize));
     
     error = StoreError::Success();
     return true;
 }
 
+/**
+ * @brief Close a memory-mapped view and release all resources.
+ *
+ * Safely closes all handles and unmaps the view. Can be called on
+ * an already-closed or uninitialized view (no-op in that case).
+ *
+ * Order of cleanup:
+ * 1. Unmap view (UnmapViewOfFile)
+ * 2. Close mapping handle (CloseHandle)
+ * 3. Close file handle (CloseHandle)
+ * 4. Reset all fields to invalid state
+ *
+ * @param view Memory-mapped view to close
+ *
+ * @note Thread-safe for different view instances
+ * @note No error indication - cleanup always attempts all steps
+ */
 void CloseView(MemoryMappedView& view) noexcept {
+    // Unmap view first (must happen before closing mapping)
     if (view.baseAddress != nullptr) {
-        UnmapViewOfFile(view.baseAddress);
+        // UnmapViewOfFile can fail, but we can't do much about it
+        // in cleanup context. Ignore return value.
+        (void)::UnmapViewOfFile(view.baseAddress);
         view.baseAddress = nullptr;
     }
     
+    // Close mapping handle
     if (view.mappingHandle != nullptr && view.mappingHandle != INVALID_HANDLE_VALUE) {
-        CloseHandle(view.mappingHandle);
+        (void)::CloseHandle(view.mappingHandle);
         view.mappingHandle = nullptr;
     }
     
-    if (view.fileHandle != INVALID_HANDLE_VALUE) {
-        CloseHandle(view.fileHandle);
+    // Close file handle
+    if (view.fileHandle != INVALID_HANDLE_VALUE && view.fileHandle != nullptr) {
+        (void)::CloseHandle(view.fileHandle);
         view.fileHandle = INVALID_HANDLE_VALUE;
     }
     
-    view.fileSize = 0;
+    // Reset metadata
+    view.fileSize = 0u;
     view.readOnly = true;
 }
 
+/**
+ * @brief Flush memory-mapped view changes to disk.
+ *
+ * Ensures all modifications to the mapped view are written to disk.
+ * Performs both FlushViewOfFile (write to page cache) and
+ * FlushFileBuffers (sync to physical disk).
+ *
+ * @param view Memory-mapped view to flush (must be writable)
+ * @param[out] error Detailed error information on failure
+ * @return true if flush completed successfully
+ *
+ * @note May block for disk I/O - use judiciously
+ * @note Does nothing if view is read-only (returns error)
+ */
 bool FlushView(MemoryMappedView& view, StoreError& error) noexcept {
+    // Validate view
     if (!view.IsValid()) {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
@@ -1423,51 +2646,81 @@ bool FlushView(MemoryMappedView& view, StoreError& error) noexcept {
         return false;
     }
     
+    // Cannot flush read-only view
     if (view.readOnly) {
         error = StoreError::WithMessage(
             WhitelistStoreError::ReadOnlyDatabase,
-            "Cannot flush read-only view"
+            "Cannot flush read-only database view"
         );
         return false;
     }
     
-    // Flush memory-mapped region
-    if (!FlushViewOfFile(view.baseAddress, static_cast<SIZE_T>(view.fileSize))) {
-        DWORD win32Error = GetLastError();
+    // Validate size fits in SIZE_T
+    if (view.fileSize > static_cast<uint64_t>((std::numeric_limits<SIZE_T>::max)())) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::DatabaseTooLarge,
+            "View size exceeds SIZE_T maximum"
+        );
+        return false;
+    }
+    
+    // Flush memory-mapped region to page cache
+    if (!::FlushViewOfFile(view.baseAddress, static_cast<SIZE_T>(view.fileSize))) {
+        const DWORD win32Error = ::GetLastError();
         error = StoreError::FromWin32(WhitelistStoreError::Unknown, win32Error);
-        error.message = "Failed to flush view to disk";
+        error.message = "FlushViewOfFile failed";
         SS_LOG_LAST_ERROR(L"Whitelist", L"FlushViewOfFile failed");
         return false;
     }
     
-    // Flush file buffers
-    if (!FlushFileBuffers(view.fileHandle)) {
-        DWORD win32Error = GetLastError();
+    // Sync page cache to physical disk
+    if (!::FlushFileBuffers(view.fileHandle)) {
+        const DWORD win32Error = ::GetLastError();
         error = StoreError::FromWin32(WhitelistStoreError::Unknown, win32Error);
-        error.message = "Failed to flush file buffers";
+        error.message = "FlushFileBuffers failed";
         SS_LOG_LAST_ERROR(L"Whitelist", L"FlushFileBuffers failed");
         return false;
     }
+    
+    SS_LOG_DEBUG(L"Whitelist", L"Flushed %llu bytes to disk",
+        static_cast<unsigned long long>(view.fileSize));
     
     error = StoreError::Success();
     return true;
 }
 
+/**
+ * @brief Extend the database file size.
+ *
+ * Grows the database file and remaps it to the new size.
+ * This is an expensive operation that requires:
+ * 1. Flushing current changes
+ * 2. Unmapping current view
+ * 3. Extending file
+ * 4. Creating new mapping
+ * 5. Mapping new view
+ *
+ * SECURITY:
+ * - Validates new size against maximum limits
+ * - Ensures file handle remains valid throughout
+ * - Aligns size to page boundary
+ *
+ * @param view Memory-mapped view to extend (must be writable)
+ * @param newSize New database size in bytes (must be larger than current)
+ * @param[out] error Detailed error information on failure
+ * @return true if extension completed successfully
+ *
+ * @note Use sparingly - pre-allocate sufficient space when creating database
+ * @note View's baseAddress will change after successful extension
+ */
 bool ExtendDatabase(
     MemoryMappedView& view,
     uint64_t newSize,
     StoreError& error
 ) noexcept {
-    /*
-     * ========================================================================
-     * EXTEND DATABASE SIZE
-     * ========================================================================
-     *
-     * Grows the database file and remaps it.
-     * This is an expensive operation - use sparingly.
-     *
-     * ========================================================================
-     */
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
     
     if (!view.IsValid()) {
         error = StoreError::WithMessage(
@@ -1496,7 +2749,7 @@ bool ExtendDatabase(
     if (newSize > MAX_DATABASE_SIZE) {
         error = StoreError::WithMessage(
             WhitelistStoreError::DatabaseTooLarge,
-            "New size exceeds maximum"
+            "New size exceeds maximum database size"
         );
         return false;
     }
@@ -1504,56 +2757,101 @@ bool ExtendDatabase(
     // Align to page size
     newSize = Format::AlignToPage(newSize);
     
-    // Flush current view
+    // ========================================================================
+    // FLUSH CURRENT CHANGES
+    // ========================================================================
+    
     if (!FlushView(view, error)) {
+        // error already set by FlushView
         return false;
     }
     
-    // Save file handle, close mapping
-    HANDLE hFile = view.fileHandle;
+    // ========================================================================
+    // SAVE FILE HANDLE AND CLOSE MAPPING
+    // ========================================================================
+    //
+    // We need to keep the file handle open but close the mapping
+    // before we can extend the file.
+    //
+    // ========================================================================
     
-    if (view.baseAddress) {
-        UnmapViewOfFile(view.baseAddress);
+    const HANDLE hFile = view.fileHandle;
+    
+    // Unmap view
+    if (view.baseAddress != nullptr) {
+        (void)::UnmapViewOfFile(view.baseAddress);
         view.baseAddress = nullptr;
     }
     
-    if (view.mappingHandle) {
-        CloseHandle(view.mappingHandle);
+    // Close mapping (required before extending file)
+    if (view.mappingHandle != nullptr) {
+        (void)::CloseHandle(view.mappingHandle);
         view.mappingHandle = nullptr;
     }
     
-    // Extend file
-    DWORD win32Error = 0;
+    // ========================================================================
+    // EXTEND FILE
+    // ========================================================================
+    
+    DWORD win32Error = ERROR_SUCCESS;
     if (!SetFileSizeHelper(hFile, newSize, win32Error)) {
+        // Try to restore view to original state
+        HandleGuard mappingGuard(CreateFileMappingHelper(
+            hFile, false, view.fileSize, win32Error));
+        if (mappingGuard.IsValid()) {
+            MappedViewGuard viewGuard(MapViewHelper(
+                mappingGuard.Get(), false, view.fileSize, win32Error));
+            if (viewGuard.IsValid()) {
+                view.mappingHandle = mappingGuard.Release();
+                view.baseAddress = viewGuard.Release();
+            }
+        }
+        
         error = StoreError::FromWin32(WhitelistStoreError::Unknown, win32Error);
-        error.message = "Failed to extend file";
+        error.message = "Failed to extend database file";
         return false;
     }
     
-    // Recreate mapping
-    HandleGuard mappingGuard(CreateFileMappingHelper(hFile, false, newSize, win32Error));
+    // ========================================================================
+    // CREATE NEW MAPPING
+    // ========================================================================
+    
+    HandleGuard mappingGuard(CreateFileMappingHelper(
+        hFile, false /* read-write */, newSize, win32Error));
     
     if (!mappingGuard.IsValid()) {
+        // Cannot restore - file is extended but unmapped
+        // Keep file handle valid so caller can retry
         error = StoreError::FromWin32(WhitelistStoreError::MappingFailed, win32Error);
-        error.message = "Failed to recreate file mapping";
+        error.message = "Failed to create file mapping after extension";
         return false;
     }
     
-    // Remap view
-    MappedViewGuard viewGuard(MapViewHelper(mappingGuard.Get(), false, newSize, win32Error));
+    // ========================================================================
+    // MAP NEW VIEW
+    // ========================================================================
+    
+    MappedViewGuard viewGuard(MapViewHelper(
+        mappingGuard.Get(), false /* read-write */, newSize, win32Error));
     
     if (!viewGuard.IsValid()) {
         error = StoreError::FromWin32(WhitelistStoreError::MappingFailed, win32Error);
-        error.message = "Failed to remap view";
+        error.message = "Failed to remap view after extension";
         return false;
     }
     
-    // Update view structure
+    // ========================================================================
+    // SUCCESS - UPDATE VIEW
+    // ========================================================================
+    
     view.mappingHandle = mappingGuard.Release();
     view.baseAddress = viewGuard.Release();
     view.fileSize = newSize;
+    // view.fileHandle unchanged
+    // view.readOnly unchanged (still false)
     
-    SS_LOG_INFO(L"Whitelist", L"Extended database to %llu bytes", newSize);
+    SS_LOG_INFO(L"Whitelist", L"Extended database to %llu bytes",
+        static_cast<unsigned long long>(newSize));
     
     error = StoreError::Success();
     return true;
