@@ -1,11 +1,24 @@
-﻿
+﻿/**
+ * @file CryptoUtils.cpp
+ * @brief Enterprise-grade cryptographic utilities implementation
+ *
+ * Implements symmetric/asymmetric encryption, secure random generation,
+ * key derivation, and secure memory handling using Windows CNG APIs.
+ *
+ * @copyright Copyright (c) 2025 ShadowStrike Security Suite
+ * @license MIT License
+ */
+
 #include "CryptoUtils.hpp"
 #include "Base64Utils.hpp"
 #include "HashUtils.hpp"
 #include "FileUtils.hpp"
-#include"Logger.hpp"
+#include "Logger.hpp"
 
-#include <sstream> 
+// ============================================================================
+// Standard Library Headers
+// ============================================================================
+#include <sstream>
 #include <cmath>
 #include <limits>
 #include <cstring>
@@ -13,33 +26,35 @@
 #include <fstream>
 #include <vector>
 #include <memory>
+#include <type_traits>
 
+// ============================================================================
+// Windows Platform Headers
+// ============================================================================
 #ifdef _WIN32
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
-#ifndef CERT_KEY_CERT_SIGN_KEY_USAGE
-#define CERT_KEY_CERT_SIGN_KEY_USAGE 0x04  // Bit 5 (keyCertSign)
-#endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 
+#  ifndef CERT_KEY_CERT_SIGN_KEY_USAGE
+#    define CERT_KEY_CERT_SIGN_KEY_USAGE 0x04  // Bit 5 (keyCertSign)
+#  endif
 
-
-#ifndef _WIN32_WINNT
-#  define _WIN32_WINNT 0x0A00
-#endif
-
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0A00
+#  endif
 
 #  include <Windows.h>
-
-
-#  include <wincrypt.h>  
-#  include <wintrust.h>  
-#  include <softpub.h>    
-#  include <bcrypt.h>  
-#  include <ncrypt.h>    
-#  include <mscat.h>    
-#  include <ntstatus.h>   
-
+#  include <wincrypt.h>
+#  include <wintrust.h>
+#  include <softpub.h>
+#  include <bcrypt.h>
+#  include <ncrypt.h>
+#  include <mscat.h>
+#  include <ntstatus.h>
 
 #  pragma comment(lib, "crypt32.lib")
 #  pragma comment(lib, "wintrust.lib")
@@ -48,727 +63,1460 @@
 #endif
 
 namespace ShadowStrike {
-	namespace Utils {
-		namespace CryptoUtils {
+    namespace Utils {
+        namespace CryptoUtils {
 
-			// =============================================================================
-			// Helper Functions
-			// =============================================================================
+            // =============================================================================
+            // Internal Constants
+            // =============================================================================
 
-			static const wchar_t* AlgName(SymmetricAlgorithm alg) noexcept {
-				switch (alg) {
-				case SymmetricAlgorithm::AES_128_CBC:
-				case SymmetricAlgorithm::AES_192_CBC:
-				case SymmetricAlgorithm::AES_256_CBC: return BCRYPT_AES_ALGORITHM;
-				case SymmetricAlgorithm::AES_128_GCM:
-				case SymmetricAlgorithm::AES_192_GCM:
-				case SymmetricAlgorithm::AES_256_GCM: return BCRYPT_AES_ALGORITHM;
-				case SymmetricAlgorithm::AES_128_CFB:
-				case SymmetricAlgorithm::AES_192_CFB:
-				case SymmetricAlgorithm::AES_256_CFB: return BCRYPT_AES_ALGORITHM;
-				case SymmetricAlgorithm::ChaCha20_Poly1305: return L"ChaCha20-Poly1305";
-			 
-				default: return nullptr;
-				}
-			}
+            /// Maximum iterations for rejection sampling to prevent infinite loops
+            static constexpr uint32_t MAX_REJECTION_ITERATIONS = 1000UL;
 
-			static const wchar_t* ChainingMode(SymmetricAlgorithm alg) noexcept {
-				switch (alg) {
-				case SymmetricAlgorithm::AES_128_CBC:
-				case SymmetricAlgorithm::AES_192_CBC:
-				case SymmetricAlgorithm::AES_256_CBC: return BCRYPT_CHAIN_MODE_CBC;
-				case SymmetricAlgorithm::AES_128_GCM:
-				case SymmetricAlgorithm::AES_192_GCM:
-				case SymmetricAlgorithm::AES_256_GCM: return BCRYPT_CHAIN_MODE_GCM;
-				case SymmetricAlgorithm::AES_128_CFB:
-				case SymmetricAlgorithm::AES_192_CFB:
-				case SymmetricAlgorithm::AES_256_CFB: return BCRYPT_CHAIN_MODE_CFB;
-				default: return nullptr;
-				}
-			}
+            /// Log category for crypto operations
+            static constexpr const wchar_t* LOG_CATEGORY = L"CryptoUtils";
 
-			static size_t KeySizeForAlg(SymmetricAlgorithm alg) noexcept {
-				switch (alg) {
-				case SymmetricAlgorithm::AES_128_CBC:
-				case SymmetricAlgorithm::AES_128_GCM:
-				case SymmetricAlgorithm::AES_128_CFB: return 16;
-				case SymmetricAlgorithm::AES_192_CBC:
-				case SymmetricAlgorithm::AES_192_GCM:
-				case SymmetricAlgorithm::AES_192_CFB: return 24;
-				case SymmetricAlgorithm::AES_256_CBC:
-				case SymmetricAlgorithm::AES_256_GCM:
-				case SymmetricAlgorithm::AES_256_CFB:
-				case SymmetricAlgorithm::ChaCha20_Poly1305: return 32;
-				default: return 0;
-				}
-			}
+            // =============================================================================
+            // Helper Functions - Algorithm Mapping
+            // =============================================================================
 
-			static size_t IVSizeForAlg(SymmetricAlgorithm alg) noexcept {
-				switch (alg) {
-				case SymmetricAlgorithm::AES_128_GCM:
-				case SymmetricAlgorithm::AES_192_GCM:
-				case SymmetricAlgorithm::AES_256_GCM: return 12;
-				case SymmetricAlgorithm::ChaCha20_Poly1305: return 12;
-				case SymmetricAlgorithm::AES_128_CBC:
-				case SymmetricAlgorithm::AES_192_CBC:
-				case SymmetricAlgorithm::AES_256_CBC:
-				case SymmetricAlgorithm::AES_128_CFB:
-				case SymmetricAlgorithm::AES_192_CFB:
-				case SymmetricAlgorithm::AES_256_CFB: return 16;
+            /**
+             * @brief Get CNG algorithm identifier for symmetric algorithm
+             * @param alg Symmetric algorithm enum
+             * @return CNG algorithm name or nullptr if invalid
+             */
+            static const wchar_t* AlgName(SymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case SymmetricAlgorithm::AES_128_CBC:
+                case SymmetricAlgorithm::AES_192_CBC:
+                case SymmetricAlgorithm::AES_256_CBC:
+                case SymmetricAlgorithm::AES_128_GCM:
+                case SymmetricAlgorithm::AES_192_GCM:
+                case SymmetricAlgorithm::AES_256_GCM:
+                case SymmetricAlgorithm::AES_128_CFB:
+                case SymmetricAlgorithm::AES_192_CFB:
+                case SymmetricAlgorithm::AES_256_CFB:
+                    return BCRYPT_AES_ALGORITHM;
+                case SymmetricAlgorithm::ChaCha20_Poly1305:
+                    return L"ChaCha20-Poly1305";
+                default:
+                    return nullptr;
+                }
+            }
 
-					//Unknown Algorithm
-				default: return 0;
-				}
-			}
+            /**
+             * @brief Get CNG chaining mode for symmetric algorithm
+             * @param alg Symmetric algorithm enum
+             * @return CNG chaining mode or nullptr if not applicable
+             */
+            static const wchar_t* ChainingMode(SymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case SymmetricAlgorithm::AES_128_CBC:
+                case SymmetricAlgorithm::AES_192_CBC:
+                case SymmetricAlgorithm::AES_256_CBC:
+                    return BCRYPT_CHAIN_MODE_CBC;
+                case SymmetricAlgorithm::AES_128_GCM:
+                case SymmetricAlgorithm::AES_192_GCM:
+                case SymmetricAlgorithm::AES_256_GCM:
+                    return BCRYPT_CHAIN_MODE_GCM;
+                case SymmetricAlgorithm::AES_128_CFB:
+                case SymmetricAlgorithm::AES_192_CFB:
+                case SymmetricAlgorithm::AES_256_CFB:
+                    return BCRYPT_CHAIN_MODE_CFB;
+                default:
+                    return nullptr;
+                }
+            }
 
-			static bool IsAEADAlg(SymmetricAlgorithm alg) noexcept {
-				return alg == SymmetricAlgorithm::AES_128_GCM ||
-					alg == SymmetricAlgorithm::AES_192_GCM ||
-					alg == SymmetricAlgorithm::AES_256_GCM ||
-					alg == SymmetricAlgorithm::ChaCha20_Poly1305;
-			}
+            /**
+             * @brief Get key size in bytes for symmetric algorithm
+             * @param alg Symmetric algorithm enum
+             * @return Key size in bytes, 0 if invalid
+             */
+            static size_t KeySizeForAlg(SymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case SymmetricAlgorithm::AES_128_CBC:
+                case SymmetricAlgorithm::AES_128_GCM:
+                case SymmetricAlgorithm::AES_128_CFB:
+                    return 16ULL;  // 128 bits
+                case SymmetricAlgorithm::AES_192_CBC:
+                case SymmetricAlgorithm::AES_192_GCM:
+                case SymmetricAlgorithm::AES_192_CFB:
+                    return 24ULL;  // 192 bits
+                case SymmetricAlgorithm::AES_256_CBC:
+                case SymmetricAlgorithm::AES_256_GCM:
+                case SymmetricAlgorithm::AES_256_CFB:
+                case SymmetricAlgorithm::ChaCha20_Poly1305:
+                    return 32ULL;  // 256 bits
+                default:
+                    return 0ULL;
+                }
+            }
 
-			static const wchar_t* RSAAlgName(AsymmetricAlgorithm alg) noexcept {
-				switch (alg) {
-				case AsymmetricAlgorithm::RSA_2048:
-				case AsymmetricAlgorithm::RSA_3072:
-				case AsymmetricAlgorithm::RSA_4096: return BCRYPT_RSA_ALGORITHM;
+            /**
+             * @brief Get IV/nonce size in bytes for symmetric algorithm
+             * @param alg Symmetric algorithm enum
+             * @return IV size in bytes, 0 if invalid
+             */
+            static size_t IVSizeForAlg(SymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case SymmetricAlgorithm::AES_128_GCM:
+                case SymmetricAlgorithm::AES_192_GCM:
+                case SymmetricAlgorithm::AES_256_GCM:
+                case SymmetricAlgorithm::ChaCha20_Poly1305:
+                    return GCM_NONCE_SIZE_BYTES;  // 12 bytes (96-bit nonce)
+                case SymmetricAlgorithm::AES_128_CBC:
+                case SymmetricAlgorithm::AES_192_CBC:
+                case SymmetricAlgorithm::AES_256_CBC:
+                case SymmetricAlgorithm::AES_128_CFB:
+                case SymmetricAlgorithm::AES_192_CFB:
+                case SymmetricAlgorithm::AES_256_CFB:
+                    return AES_BLOCK_SIZE_BYTES;  // 16 bytes
+                default:
+                    return 0ULL;
+                }
+            }
 
-				case AsymmetricAlgorithm::ECC_P256:
-					return BCRYPT_ECDH_P256_ALGORITHM;
-				case AsymmetricAlgorithm::ECC_P384:
-					return BCRYPT_ECDH_P384_ALGORITHM;
-				case AsymmetricAlgorithm::ECC_P521:
-					return BCRYPT_ECDH_P521_ALGORITHM;
+            /**
+             * @brief Check if algorithm is an AEAD mode
+             * @param alg Symmetric algorithm enum
+             * @return true if AEAD (provides authenticated encryption)
+             */
+            static bool IsAEADAlg(SymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case SymmetricAlgorithm::AES_128_GCM:
+                case SymmetricAlgorithm::AES_192_GCM:
+                case SymmetricAlgorithm::AES_256_GCM:
+                case SymmetricAlgorithm::ChaCha20_Poly1305:
+                    return true;
+                default:
+                    return false;
+                }
+            }
 
-				default:
-					return nullptr;
-				}
-			}
+            /**
+             * @brief Get CNG algorithm identifier for asymmetric algorithm
+             * @param alg Asymmetric algorithm enum
+             * @return CNG algorithm name or nullptr if invalid
+             */
+            static const wchar_t* RSAAlgName(AsymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case AsymmetricAlgorithm::RSA_2048:
+                case AsymmetricAlgorithm::RSA_3072:
+                case AsymmetricAlgorithm::RSA_4096:
+                    return BCRYPT_RSA_ALGORITHM;
+                case AsymmetricAlgorithm::ECC_P256:
+                    return BCRYPT_ECDH_P256_ALGORITHM;
+                case AsymmetricAlgorithm::ECC_P384:
+                    return BCRYPT_ECDH_P384_ALGORITHM;
+                case AsymmetricAlgorithm::ECC_P521:
+                    return BCRYPT_ECDH_P521_ALGORITHM;
+                default:
+                    return nullptr;
+                }
+            }
 
-			static ULONG RSAKeySizeForAlg(AsymmetricAlgorithm alg) noexcept {
-				switch (alg) {
-				case AsymmetricAlgorithm::RSA_2048: return 2048;
-				case AsymmetricAlgorithm::RSA_3072: return 3072;
-				case AsymmetricAlgorithm::RSA_4096: return 4096;
-				case AsymmetricAlgorithm::ECC_P256: return 256;
-				case AsymmetricAlgorithm::ECC_P384: return 384;
-				case AsymmetricAlgorithm::ECC_P521: return 521;
-				default: return 0;
-				}
-			}
+            /**
+             * @brief Get key size in bits for asymmetric algorithm
+             * @param alg Asymmetric algorithm enum
+             * @return Key size in bits, 0 if invalid
+             */
+            static ULONG RSAKeySizeForAlg(AsymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case AsymmetricAlgorithm::RSA_2048: return 2048UL;
+                case AsymmetricAlgorithm::RSA_3072: return 3072UL;
+                case AsymmetricAlgorithm::RSA_4096: return 4096UL;
+                case AsymmetricAlgorithm::ECC_P256: return 256UL;
+                case AsymmetricAlgorithm::ECC_P384: return 384UL;
+                case AsymmetricAlgorithm::ECC_P521: return 521UL;
+                default: return 0UL;
+                }
+            }
 
-			// =============================================================================
-			// Base64 helpers
-			// =============================================================================
-			namespace Base64 {
-				std::string Encode(const uint8_t* data, size_t len) noexcept {
-					std::string out;
-					Utils::Base64EncodeOptions opt{};
-					bool ok = Utils::Base64Encode(data, len, out, opt);
-					if (!ok) out.clear();
-					return out;
-				}
+            /**
+             * @brief Check if algorithm is RSA-based
+             * @param alg Asymmetric algorithm enum
+             * @return true if RSA algorithm
+             */
+            [[maybe_unused]] static bool IsRSAAlgorithm(AsymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case AsymmetricAlgorithm::RSA_2048:
+                case AsymmetricAlgorithm::RSA_3072:
+                case AsymmetricAlgorithm::RSA_4096:
+                    return true;
+                default:
+                    return false;
+                }
+            }
 
-				std::string Encode(const std::vector<uint8_t>& data) noexcept {
-					return Encode(data.data(), data.size());
-				}
+            /**
+             * @brief Check if algorithm is ECC-based
+             * @param alg Asymmetric algorithm enum
+             * @return true if ECC algorithm
+             */
+            [[maybe_unused]] static bool IsECCAlgorithm(AsymmetricAlgorithm alg) noexcept {
+                switch (alg) {
+                case AsymmetricAlgorithm::ECC_P256:
+                case AsymmetricAlgorithm::ECC_P384:
+                case AsymmetricAlgorithm::ECC_P521:
+                    return true;
+                default:
+                    return false;
+                }
+            }
 
-				bool Decode(std::string_view base64, std::vector<uint8_t>& out) noexcept {
-					Utils::Base64DecodeError derr = Utils::Base64DecodeError::None;
-					Utils::Base64DecodeOptions opt{};
-					return Utils::Base64Decode(base64, out, derr, opt);
-				}
-			}
+            /**
+             * @brief Safe logging helper - logs to debug output if Logger not initialized
+             * @param msg Message to log
+             */
+            static void SafeLogError(const wchar_t* msg) noexcept {
+                if (msg == nullptr) return;
+                
+                try {
+                    if (Logger::Instance().IsInitialized()) {
+                        SS_LOG_ERROR(LOG_CATEGORY, L"%s", msg);
+                    }
+                    else {
+                        OutputDebugStringW(L"[CryptoUtils] ");
+                        OutputDebugStringW(msg);
+                        OutputDebugStringW(L"\n");
+                    }
+                }
+                catch (...) {
+                    // Logging should never throw - silently ignore
+                }
+            }
 
-			// =============================================================================
-			// Secure compare (timing resistant)
-			// =============================================================================
-			bool SecureCompare(const uint8_t* a, const uint8_t* b, size_t len) noexcept {
-				if (a == b) return true;
-				if (!a || !b) return false;
-				unsigned char acc = 0;
-				for (size_t i = 0; i < len; ++i) {
-					acc |= static_cast<unsigned char>(a[i] ^ b[i]);
-				}
-				return acc == 0;
-			}
+            /**
+             * @brief Safe logging helper for info messages
+             * @param msg Message to log
+             */
+            static void SafeLogInfo(const wchar_t* msg) noexcept {
+                if (msg == nullptr) return;
+                
+                try {
+                    if (Logger::Instance().IsInitialized()) {
+                        SS_LOG_INFO(LOG_CATEGORY, L"%s", msg);
+                    }
+                    else {
+                        OutputDebugStringW(L"[CryptoUtils] ");
+                        OutputDebugStringW(msg);
+                        OutputDebugStringW(L"\n");
+                    }
+                }
+                catch (...) {
+                    // Logging should never throw - silently ignore
+                }
+            }
 
-			bool SecureCompare(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) noexcept {
-				if (a.size() != b.size()) return false;
-				return SecureCompare(a.data(), b.data(), a.size());
-			}
+            // =============================================================================
+            // Base64 Helpers
+            // =============================================================================
 
-			// =============================================================================
-			// Secure memory wipe
-			// =============================================================================
-			void SecureZeroMemory(void* ptr, size_t size) noexcept {
+            namespace Base64 {
+
+                std::string Encode(const uint8_t* data, size_t len) noexcept {
+                    // Handle edge cases
+                    if (data == nullptr && len != 0) {
+                        return std::string();
+                    }
+                    if (len == 0) {
+                        return std::string();
+                    }
+
+                    try {
+                        std::string out;
+                        Utils::Base64EncodeOptions opt{};
+                        const bool ok = Utils::Base64Encode(data, len, out, opt);
+                        if (!ok) {
+                            out.clear();
+                        }
+                        return out;
+                    }
+                    catch (const std::exception&) {
+                        return std::string();
+                    }
+                }
+
+                std::string Encode(const std::vector<uint8_t>& data) noexcept {
+                    if (data.empty()) {
+                        return std::string();
+                    }
+                    return Encode(data.data(), data.size());
+                }
+
+                bool Decode(std::string_view base64, std::vector<uint8_t>& out) noexcept {
+                    out.clear();
+                    
+                    if (base64.empty()) {
+                        return true;  // Empty input is valid
+                    }
+
+                    try {
+                        Utils::Base64DecodeError derr = Utils::Base64DecodeError::None;
+                        Utils::Base64DecodeOptions opt{};
+                        return Utils::Base64Decode(base64, out, derr, opt);
+                    }
+                    catch (const std::exception&) {
+                        out.clear();
+                        return false;
+                    }
+                }
+
+            } // namespace Base64
+
+            // =============================================================================
+            // Secure Comparison (Constant-Time)
+            // =============================================================================
+
+            bool SecureCompare(const uint8_t* a, const uint8_t* b, size_t len) noexcept {
+                // Handle pointer equality (same buffer)
+                if (a == b) {
+                    return true;
+                }
+
+                // Null pointer check (both must be valid unless len is 0)
+                if (len == 0) {
+                    return true;
+                }
+                if (a == nullptr || b == nullptr) {
+                    return false;
+                }
+
+                // Constant-time comparison to prevent timing attacks
+                // Uses volatile to prevent compiler optimization
+                volatile unsigned char accumulator = 0;
+                
+                for (size_t i = 0; i < len; ++i) {
+                    accumulator |= static_cast<unsigned char>(a[i] ^ b[i]);
+                }
+
+                // Return true only if no differences found
+                return accumulator == 0;
+            }
+
+            bool SecureCompare(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) noexcept {
+                // Size comparison must be done in constant time to prevent length oracle
+                // However, if sizes differ, result is always false
+                if (a.size() != b.size()) {
+                    return false;
+                }
+
+                if (a.empty()) {
+                    return true;  // Both empty
+                }
+
+                return SecureCompare(a.data(), b.data(), a.size());
+            }
+
+            // =============================================================================
+            // Secure Memory Wipe
+            // =============================================================================
+
+            void SecureZeroMemory(void* ptr, size_t size) noexcept {
+                if (ptr == nullptr || size == 0) {
+                    return;
+                }
+
 #ifdef _WIN32
-				if (ptr && size) {
-					::RtlSecureZeroMemory(ptr, size);
-				}
+                // Windows: Use RtlSecureZeroMemory which is guaranteed not to be optimized away
+                ::RtlSecureZeroMemory(ptr, size);
 #else
-				if (!ptr || !size) return;
-				volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
-				for (size_t i = 0; i < size; ++i) p[i] = 0;
+                // Non-Windows: Use volatile pointer to prevent optimization
+                volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
+                while (size > 0) {
+                    *p++ = 0;
+                    --size;
+                }
+                // Memory barrier to ensure writes complete
+                std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
-			}
+            }
 
-			// =============================================================================
-			// SecureRandom Implementation
-			// =============================================================================
-			SecureRandom::SecureRandom() noexcept {
-#ifdef _WIN32
-				NTSTATUS st = BCryptOpenAlgorithmProvider(&m_algHandle, BCRYPT_RNG_ALGORITHM, nullptr, 0);
-				if (st >= 0 && m_algHandle) {
-					m_initialized = true;
-				}
-#endif
-			}
+            // =============================================================================
+            // SecureRandom Implementation
+            // =============================================================================
 
-			SecureRandom::~SecureRandom() {
+            SecureRandom::SecureRandom() noexcept {
 #ifdef _WIN32
-				if (m_algHandle) {
-					BCryptCloseAlgorithmProvider(m_algHandle, 0);
-					m_algHandle = nullptr;
-				}
-#endif
-				m_initialized = false;
-			}
+                // Open algorithm provider for random number generation
+                BCRYPT_ALG_HANDLE handle = nullptr;
+                const NTSTATUS st = BCryptOpenAlgorithmProvider(
+                    &handle,
+                    BCRYPT_RNG_ALGORITHM,
+                    nullptr,
+                    0
+                );
 
-			bool SecureRandom::Generate(uint8_t* buffer, size_t size, Error* err) noexcept {
-				if (!buffer || size == 0) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid buffer or size"; }
-					return false;
-				}
-#ifdef _WIN32
-				NTSTATUS st = 0;
-				if (m_initialized && m_algHandle) {
-					st = BCryptGenRandom(m_algHandle, buffer, static_cast<ULONG>(size), 0);
-				}
-				else {
-					st = BCryptGenRandom(nullptr, buffer, static_cast<ULONG>(size), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-				}
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptGenRandom failed"; }
-					return false;
-				}
-				return true;
+                if (BCRYPT_SUCCESS(st) && handle != nullptr) {
+                    m_algHandle = handle;
+                    m_initialized = true;
+                }
+                else {
+                    // Initialization failed - will fall back to system RNG
+                    m_algHandle = nullptr;
+                    m_initialized = false;
+                }
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
-				return false;
+                m_initialized = false;
 #endif
-			}
+            }
 
-			bool SecureRandom::Generate(std::vector<uint8_t>& out, size_t size, Error* err) noexcept {
-				out.resize(size);
-				if (size == 0) return true;
-				return Generate(out.data(), size, err);
-			}
-
-			std::vector<uint8_t> SecureRandom::Generate(size_t size, Error* err) noexcept {
-				std::vector<uint8_t> out;
-				Generate(out, size, err);
-				return out;
-			}
-
-			uint32_t SecureRandom::NextUInt32(Error* err) noexcept {
-				uint32_t val = 0;
-				if (!Generate(reinterpret_cast<uint8_t*>(&val), sizeof(val), err)) return 0;
-				return val;
-			}
-
-			uint64_t SecureRandom::NextUInt64(Error* err) noexcept {
-				uint64_t val = 0;
-				if (!Generate(reinterpret_cast<uint8_t*>(&val), sizeof(val), err)) return 0;
-				return val;
-			}
-
-			uint32_t SecureRandom::NextUInt32(uint32_t min, uint32_t max, Error* err) noexcept {
-				if (min >= max) return min;
-				const uint32_t range = max - min;
-				const uint32_t limit = (UINT32_MAX / range) * range;
-				uint32_t val = 0;
-				do {
-					val = NextUInt32(err);
-				} while (val >= limit);
-				return min + (val % range);
-			}
-
-			uint64_t SecureRandom::NextUInt64(uint64_t min, uint64_t max, Error* err) noexcept {
-				if (min >= max) return min;
-				const uint64_t range = max - min;
-				const uint64_t limit = (UINT64_MAX / range) * range;
-				uint64_t val = 0;
-				do {
-					val = NextUInt64(err);
-				} while (val >= limit);
-				return min + (val % range);
-			}
-
-			std::string SecureRandom::GenerateAlphanumeric(size_t length, Error* err) noexcept {
-				static const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-				static constexpr size_t alphaLen = sizeof(alphanum) - 1;
-				std::string out;
-				out.reserve(length);
-				for (size_t i = 0; i < length; ++i) {
-					uint32_t idx = NextUInt32(0, static_cast<uint32_t>(alphaLen), err);
-					out.push_back(alphanum[idx]);
-				}
-				return out;
-			}
-
-			std::string SecureRandom::GenerateHex(size_t byteCount, Error* err) noexcept {
-				std::vector<uint8_t> bytes;
-				if (!Generate(bytes, byteCount, err)) return std::string();
-				return HashUtils::ToHexLower(bytes.data(), bytes.size());
-			}
-
-			std::string SecureRandom::GenerateBase64(size_t byteCount, Error* err) noexcept {
-				std::vector<uint8_t> bytes;
-				if (!Generate(bytes, byteCount, err)) return std::string();
-				return Base64::Encode(bytes);
-			}
-
-			// =============================================================================
-			// SymmetricCipher Implementation
-			// =============================================================================
-			SymmetricCipher::SymmetricCipher(SymmetricAlgorithm algorithm) noexcept : m_algorithm(algorithm) {}
-
-			SymmetricCipher::~SymmetricCipher() {
-				cleanup();
-			}
-
-			SymmetricCipher::SymmetricCipher(SymmetricCipher&& other) noexcept
-				: m_algorithm(other.m_algorithm), m_paddingMode(other.m_paddingMode),
+            SecureRandom::~SecureRandom() {
 #ifdef _WIN32
-				m_algHandle(other.m_algHandle), m_keyHandle(other.m_keyHandle),
-				m_keyObject(std::move(other.m_keyObject)),
+                if (m_algHandle != nullptr) {
+                    BCryptCloseAlgorithmProvider(m_algHandle, 0);
+                    m_algHandle = nullptr;
+                }
 #endif
-				m_key(std::move(other.m_key)), m_iv(std::move(other.m_iv)),
-				m_keySet(other.m_keySet), m_ivSet(other.m_ivSet)
-			{
+                m_initialized = false;
+            }
+
+            bool SecureRandom::Generate(uint8_t* buffer, size_t size, Error* err) noexcept {
+                // Input validation
+                if (buffer == nullptr || size == 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid buffer or size for random generation");
+                    }
+                    return false;
+                }
+
+                // Size validation - prevent overflow when casting to ULONG
+                if (size > static_cast<size_t>(ULONG_MAX)) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_BUFFER_OVERFLOW,
+                            L"Random generation size exceeds ULONG_MAX");
+                    }
+                    return false;
+                }
+
 #ifdef _WIN32
-				other.m_algHandle = nullptr;
-				other.m_keyHandle = nullptr;
-#endif
-				other.m_keySet = false;
-				other.m_ivSet = false;
-			}
+                NTSTATUS st = STATUS_UNSUCCESSFUL;
 
-			SymmetricCipher& SymmetricCipher::operator=(SymmetricCipher&& other) noexcept {
-				if (this != &other) {
-					cleanup();
-					m_algorithm = other.m_algorithm;
-					m_paddingMode = other.m_paddingMode;
-#ifdef _WIN32
-					m_algHandle = other.m_algHandle;
-					m_keyHandle = other.m_keyHandle;
-					m_keyObject = std::move(other.m_keyObject);
-					other.m_algHandle = nullptr;
-					other.m_keyHandle = nullptr;
-#endif
-					m_key = std::move(other.m_key);
-					m_iv = std::move(other.m_iv);
-					m_keySet = other.m_keySet;
-					m_ivSet = other.m_ivSet;
-					other.m_keySet = false;
-					other.m_ivSet = false;
-				}
-				return *this;
-			}
+                if (m_initialized && m_algHandle != nullptr) {
+                    // Use our dedicated RNG handle
+                    st = BCryptGenRandom(
+                        m_algHandle,
+                        buffer,
+                        static_cast<ULONG>(size),
+                        0
+                    );
+                }
+                else {
+                    // Fallback to system preferred RNG (always available)
+                    st = BCryptGenRandom(
+                        nullptr,
+                        buffer,
+                        static_cast<ULONG>(size),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG
+                    );
+                }
 
-			void SymmetricCipher::cleanup() noexcept {
-#ifdef _WIN32
-				if (m_keyHandle) {
-					BCryptDestroyKey(m_keyHandle);
-					m_keyHandle = nullptr;
-				}
-				if (m_algHandle) {
-					BCryptCloseAlgorithmProvider(m_algHandle, 0);
-					m_algHandle = nullptr;
-				}
-#endif
-				SecureZeroMemory(m_key.data(), m_key.size());
-				SecureZeroMemory(m_iv.data(), m_iv.size());
-				m_key.clear();
-				m_iv.clear();
-				m_keyObject.clear();
-				m_keySet = false;
-				m_ivSet = false;
-			}
+                if (!BCRYPT_SUCCESS(st)) {
+                    // Secure wipe the buffer on failure
+                    SecureZeroMemory(buffer, size);
 
-			bool SymmetricCipher::ensureProvider(Error* err) noexcept {
-#ifdef _WIN32
-				//use if there is already a handle
-				if (m_algHandle) {
-					return true;
-				}
+                    if (err != nullptr) {
+                        err->SetNtStatus(st, L"BCryptGenRandom failed");
+                    }
+                    return false;
+                }
 
-				//Get Algorithm name
-				const wchar_t* algName = AlgName(m_algorithm);
-				if (!algName || !*algName) {
-					if (err) {
-						err->win32 = ERROR_INVALID_PARAMETER;
-						err->ntstatus = 0;
-						err->message = L"Invalid symmetric algorithm";
-						err->context.clear();
-					}
-					
-					
-					// Logger may not be initialized yet (prevents abort)
-					if (Logger::Instance().IsInitialized()) {
-						SS_LOG_ERROR(L"CryptoUtils", L"ensureProvider: invalid algorithm enum: %d", 
-							static_cast<int>(m_algorithm));
-					}
-					else
-					{
-						wchar_t debugMsg[256];
-						swprintf_s(debugMsg, L"[CryptoUtils] ensureProvider: invalid algorithm enum: %d\n", 
-							static_cast<int>(m_algorithm));
-						OutputDebugStringW(debugMsg);
-					}
-					return false;
-				}
-
-				//Try to open algorithm provider
-				BCRYPT_ALG_HANDLE h = nullptr;
-				NTSTATUS st = BCryptOpenAlgorithmProvider(&h, algName, nullptr, 0);
-				if (st < 0 || h == nullptr) {
-					if (err) {
-						err->ntstatus = st;
-						err->win32 = RtlNtStatusToDosError(st);
-						err->message = L"BCryptOpenAlgorithmProvider failed for asymmetric";
-						wchar_t tmp[256];
-						swprintf_s(tmp, L"Algorithm=%s NTSTATUS=0x%08X Win32=%u", algName, static_cast<unsigned>(st), err->win32);
-						err->context = tmp; // copies std::wstring, no dangling
-					}
-					
-				
-					// Prevents abort() if Logger is not initialized
-					if (Logger::Instance().IsInitialized()) {
-						SS_LOG_ERROR(L"CryptoUtils", L"BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X, Win32=%u",
-							algName, static_cast<unsigned>(st), RtlNtStatusToDosError(st));
-					}
-					else
-					{
-						wchar_t debugMsg[512];
-						swprintf_s(debugMsg, 
-							L"[CryptoUtils] BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X, Win32=%u\n",
-							algName, static_cast<unsigned>(st), RtlNtStatusToDosError(st));
-						OutputDebugStringW(debugMsg);
-					}
-					
-					//Guarantee no dangling
-					m_algHandle = nullptr;
-					return false;
-				}
-
-				m_algHandle = h;
-
-
-
-				const wchar_t* chainMode = ChainingMode(m_algorithm);
-				if (chainMode) {
-					st = BCryptSetProperty(
-						m_algHandle,
-						BCRYPT_CHAINING_MODE,
-						(PBYTE)chainMode,
-						(ULONG)((wcslen(chainMode) + 1) * sizeof(wchar_t)),
-						0
-					);
-
-					if (st < 0) {
-						if (err) {
-							err->ntstatus = st;
-							err->win32 = RtlNtStatusToDosError(st);
-							err->message = L"BCryptSetProperty for chaining mode failed";
-							wchar_t tmp[256];
-							swprintf_s(tmp, L"Mode=%s NTSTATUS=0x%08X", chainMode, static_cast<unsigned>(st));
-							err->context = tmp;
-						}
-
-						if (Logger::Instance().IsInitialized()) {
-							SS_LOG_ERROR(L"CryptoUtils", L"BCryptSetProperty failed for mode %s: 0x%08X", chainMode, st);
-						}
-
-						
-						BCryptCloseAlgorithmProvider(m_algHandle, 0);
-						m_algHandle = nullptr;
-						return false;
-					}
-				}
-
-				// Prevents abort() if Logger is not initialized
-				if (Logger::Instance().IsInitialized()) {
-					SS_LOG_INFO(L"CryptoUtils", L"Algorithm provider opened: %s (handle: %p)", algName, m_algHandle);
-				} else {
-					//Fallback to OutputDebugStringW if Logger not ready
-					wchar_t debugMsg[256];
-					swprintf_s(debugMsg, L"[CryptoUtils] Algorithm provider opened: %s (handle: %p)\n", 
-						algName, static_cast<void*>(m_algHandle));
-					OutputDebugStringW(debugMsg);
-				}
-				
-				return true;
+                return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->ntstatus = 0; err->message = L"Platform not supported"; }
-				return false;
+                // Non-Windows platforms not supported
+                SecureZeroMemory(buffer, size);
+                if (err != nullptr) {
+                    err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported");
+                }
+                return false;
 #endif
-			}
+            }
 
-			bool SymmetricCipher::SetKey(const uint8_t* key, size_t keyLen, Error* err) noexcept {
-				if (!key || keyLen == 0) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid key"; }
-					return false;
-				}
+            bool SecureRandom::Generate(std::vector<uint8_t>& out, size_t size, Error* err) noexcept {
+                // Handle zero-size request
+                if (size == 0) {
+                    out.clear();
+                    return true;
+                }
 
-				const size_t expectedSize = GetKeySize();
-				if (keyLen != expectedSize) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid key size"; }
-					return false;
-				}
+                try {
+                    out.resize(size);
+                }
+                catch (const std::exception&) {
+                    out.clear();
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate random buffer");
+                    }
+                    return false;
+                }
 
-				if (!ensureProvider(err)) return false;
+                if (!Generate(out.data(), size, err)) {
+                    SecureZeroMemory(out.data(), out.size());
+                    out.clear();
+                    return false;
+                }
+
+                return true;
+            }
+
+            std::vector<uint8_t> SecureRandom::Generate(size_t size, Error* err) noexcept {
+                std::vector<uint8_t> out;
+                if (!Generate(out, size, err)) {
+                    return std::vector<uint8_t>();
+                }
+                return out;
+            }
+
+            uint32_t SecureRandom::NextUInt32(Error* err) noexcept {
+                uint32_t val = 0;
+                if (!Generate(reinterpret_cast<uint8_t*>(&val), sizeof(val), err)) {
+                    return 0;
+                }
+                return val;
+            }
+
+            uint64_t SecureRandom::NextUInt64(Error* err) noexcept {
+                uint64_t val = 0;
+                if (!Generate(reinterpret_cast<uint8_t*>(&val), sizeof(val), err)) {
+                    return 0;
+                }
+                return val;
+            }
+
+            uint32_t SecureRandom::NextUInt32(uint32_t min, uint32_t max, Error* err) noexcept {
+                // Validate range
+                if (min >= max) {
+                    return min;
+                }
+
+                const uint32_t range = max - min;
+                
+                // Prevent division by zero (shouldn't happen given min < max check)
+                if (range == 0) {
+                    return min;
+                }
+
+                // Calculate rejection threshold to avoid modulo bias
+                // We reject values >= limit to ensure uniform distribution
+                const uint32_t limit = (UINT32_MAX / range) * range;
+
+                uint32_t val = 0;
+                uint32_t iterations = 0;
+
+                do {
+                    val = NextUInt32(err);
+                    ++iterations;
+
+                    // Safety limit to prevent infinite loop on RNG failure
+                    if (iterations > MAX_REJECTION_ITERATIONS) {
+                        if (err != nullptr) {
+                            err->SetWin32Error(ERROR_TIMEOUT,
+                                L"Random range generation exceeded iteration limit");
+                        }
+                        return min;
+                    }
+                } while (val >= limit);
+
+                return min + (val % range);
+            }
+
+            uint64_t SecureRandom::NextUInt64(uint64_t min, uint64_t max, Error* err) noexcept {
+                // Validate range
+                if (min >= max) {
+                    return min;
+                }
+
+                const uint64_t range = max - min;
+                
+                if (range == 0) {
+                    return min;
+                }
+
+                // Calculate rejection threshold
+                const uint64_t limit = (UINT64_MAX / range) * range;
+
+                uint64_t val = 0;
+                uint32_t iterations = 0;
+
+                do {
+                    val = NextUInt64(err);
+                    ++iterations;
+
+                    if (iterations > MAX_REJECTION_ITERATIONS) {
+                        if (err != nullptr) {
+                            err->SetWin32Error(ERROR_TIMEOUT,
+                                L"Random range generation exceeded iteration limit");
+                        }
+                        return min;
+                    }
+                } while (val >= limit);
+
+                return min + (val % range);
+            }
+
+            std::string SecureRandom::GenerateAlphanumeric(size_t length, Error* err) noexcept {
+                // Character set for alphanumeric strings
+                static constexpr char alphanum[] =
+                    "0123456789"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "abcdefghijklmnopqrstuvwxyz";
+                static constexpr size_t alphaLen = sizeof(alphanum) - 1;  // Exclude null terminator
+
+                if (length == 0) {
+                    return std::string();
+                }
+
+                try {
+                    std::string out;
+                    out.reserve(length);
+
+                    for (size_t i = 0; i < length; ++i) {
+                        const uint32_t idx = NextUInt32(0, static_cast<uint32_t>(alphaLen), err);
+                        out.push_back(alphanum[idx]);
+                    }
+
+                    return out;
+                }
+                catch (const std::exception&) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate alphanumeric string");
+                    }
+                    return std::string();
+                }
+            }
+
+            std::string SecureRandom::GenerateHex(size_t byteCount, Error* err) noexcept {
+                if (byteCount == 0) {
+                    return std::string();
+                }
+
+                std::vector<uint8_t> bytes;
+                if (!Generate(bytes, byteCount, err)) {
+                    return std::string();
+                }
+
+                try {
+                    return HashUtils::ToHexLower(bytes.data(), bytes.size());
+                }
+                catch (const std::exception&) {
+                    SecureZeroMemory(bytes.data(), bytes.size());
+                    return std::string();
+                }
+            }
+
+            std::string SecureRandom::GenerateBase64(size_t byteCount, Error* err) noexcept {
+                if (byteCount == 0) {
+                    return std::string();
+                }
+
+                std::vector<uint8_t> bytes;
+                if (!Generate(bytes, byteCount, err)) {
+                    return std::string();
+                }
+
+                std::string result = Base64::Encode(bytes);
+                
+                // Securely wipe the raw bytes
+                SecureZeroMemory(bytes.data(), bytes.size());
+                
+                return result;
+            }
+
+            // =============================================================================
+            // SymmetricCipher Implementation
+            // =============================================================================
+
+            SymmetricCipher::SymmetricCipher(SymmetricAlgorithm algorithm) noexcept
+                : m_streamBuffer()
+                , m_streamFinalized(false)
+                , m_algorithm(algorithm)
+                , m_paddingMode(PaddingMode::PKCS7)
+#ifdef _WIN32
+                , m_algHandle(nullptr)
+                , m_keyHandle(nullptr)
+                , m_keyObject()
+#endif
+                , m_key()
+                , m_iv()
+                , m_keySet(false)
+                , m_ivSet(false)
+            {
+            }
+
+            SymmetricCipher::~SymmetricCipher() {
+                cleanup();
+            }
+
+            SymmetricCipher::SymmetricCipher(SymmetricCipher&& other) noexcept
+                : m_streamBuffer(std::move(other.m_streamBuffer))
+                , m_streamFinalized(other.m_streamFinalized)
+                , m_algorithm(other.m_algorithm)
+                , m_paddingMode(other.m_paddingMode)
+#ifdef _WIN32
+                , m_algHandle(other.m_algHandle)
+                , m_keyHandle(other.m_keyHandle)
+                , m_keyObject(std::move(other.m_keyObject))
+#endif
+                , m_key(std::move(other.m_key))
+                , m_iv(std::move(other.m_iv))
+                , m_keySet(other.m_keySet)
+                , m_ivSet(other.m_ivSet)
+            {
+                // Clear source handles to prevent double-close
+#ifdef _WIN32
+                other.m_algHandle = nullptr;
+                other.m_keyHandle = nullptr;
+#endif
+                other.m_keySet = false;
+                other.m_ivSet = false;
+                other.m_streamFinalized = false;
+            }
+
+            SymmetricCipher& SymmetricCipher::operator=(SymmetricCipher&& other) noexcept {
+                if (this != &other) {
+                    // Clean up current resources first
+                    cleanup();
+
+                    // Move state from source
+                    m_streamBuffer = std::move(other.m_streamBuffer);
+                    m_streamFinalized = other.m_streamFinalized;
+                    m_algorithm = other.m_algorithm;
+                    m_paddingMode = other.m_paddingMode;
 
 #ifdef _WIN32
-				if (m_keyHandle) {
-					BCryptDestroyKey(m_keyHandle);
-					m_keyHandle = nullptr;
-				}
-
-				m_key.assign(key, key + keyLen);
-
-				DWORD objLen = 0, cbResult = 0;
-				NTSTATUS st = BCryptGetProperty(m_algHandle, BCRYPT_OBJECT_LENGTH,
-					reinterpret_cast<PUCHAR>(&objLen), sizeof(objLen), &cbResult, 0);
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptGetProperty OBJECT_LENGTH failed"; }
-					return false;
-				}
-
-				m_keyObject.resize(objLen);
-
-				st = BCryptGenerateSymmetricKey(m_algHandle, &m_keyHandle,
-					m_keyObject.data(), static_cast<ULONG>(m_keyObject.size()),
-					const_cast<uint8_t*>(m_key.data()), static_cast<ULONG>(m_key.size()), 0);
-				if (st < 0) {
-					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptGenerateSymmetricKey failed"; }
-					SS_LOG_ERROR(L"CryptoUtils", L"BCryptGenerateSymmetricKey failed: 0x%08X", st);
-					return false;
-				}
-
-				m_keySet = true;
-				return true;
-#else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
-				return false;
+                    m_algHandle = other.m_algHandle;
+                    m_keyHandle = other.m_keyHandle;
+                    m_keyObject = std::move(other.m_keyObject);
+                    other.m_algHandle = nullptr;
+                    other.m_keyHandle = nullptr;
 #endif
-			}
 
-			bool SymmetricCipher::SetKey(const std::vector<uint8_t>& key, Error* err) noexcept {
-				return SetKey(key.data(), key.size(), err);
-			}
+                    m_key = std::move(other.m_key);
+                    m_iv = std::move(other.m_iv);
+                    m_keySet = other.m_keySet;
+                    m_ivSet = other.m_ivSet;
 
-			bool SymmetricCipher::GenerateKey(std::vector<uint8_t>& outKey, Error* err) noexcept {
-				const size_t keySize = GetKeySize();
-				SecureRandom rng;
-				if (!rng.Generate(outKey, keySize, err)) return false;
-				return SetKey(outKey, err);
-			}
+                    // Clear source state
+                    other.m_keySet = false;
+                    other.m_ivSet = false;
+                    other.m_streamFinalized = false;
+                }
+                return *this;
+            }
+
+            void SymmetricCipher::cleanup() noexcept {
+#ifdef _WIN32
+                // Destroy key handle first (depends on algorithm handle)
+                if (m_keyHandle != nullptr) {
+                    BCryptDestroyKey(m_keyHandle);
+                    m_keyHandle = nullptr;
+                }
+
+                // Close algorithm provider
+                if (m_algHandle != nullptr) {
+                    BCryptCloseAlgorithmProvider(m_algHandle, 0);
+                    m_algHandle = nullptr;
+                }
+
+                // Secure wipe key object buffer
+                if (!m_keyObject.empty()) {
+                    SecureZeroMemory(m_keyObject.data(), m_keyObject.size());
+                    m_keyObject.clear();
+                }
+#endif
+
+                // Secure wipe key material
+                if (!m_key.empty()) {
+                    SecureZeroMemory(m_key.data(), m_key.size());
+                    m_key.clear();
+                }
+
+                // Secure wipe IV
+                if (!m_iv.empty()) {
+                    SecureZeroMemory(m_iv.data(), m_iv.size());
+                    m_iv.clear();
+                }
+
+                // Secure wipe stream buffer
+                if (!m_streamBuffer.empty()) {
+                    SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+                    m_streamBuffer.clear();
+                }
+
+                // Reset state flags
+                m_keySet = false;
+                m_ivSet = false;
+                m_streamFinalized = false;
+            }
+
+            bool SymmetricCipher::ensureProvider(Error* err) noexcept {
+#ifdef _WIN32
+                // Already initialized - return success
+                if (m_algHandle != nullptr) {
+                    return true;
+                }
+
+                // Get algorithm name for this cipher
+                const wchar_t* algName = AlgName(m_algorithm);
+                if (algName == nullptr || algName[0] == L'\0') {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid symmetric algorithm",
+                            L"ensureProvider");
+                    }
+
+                    wchar_t debugMsg[256];
+                    swprintf_s(debugMsg, _countof(debugMsg),
+                        L"ensureProvider: invalid algorithm enum: %d",
+                        static_cast<int>(m_algorithm));
+                    SafeLogError(debugMsg);
+
+                    return false;
+                }
+
+                // Open algorithm provider
+                BCRYPT_ALG_HANDLE handle = nullptr;
+                NTSTATUS st = BCryptOpenAlgorithmProvider(
+                    &handle,
+                    algName,
+                    nullptr,
+                    0
+                );
+
+                if (!BCRYPT_SUCCESS(st) || handle == nullptr) {
+                    if (err != nullptr) {
+                        err->SetNtStatus(st,
+                            L"BCryptOpenAlgorithmProvider failed",
+                            L"ensureProvider");
+                    }
+
+                    wchar_t debugMsg[512];
+                    swprintf_s(debugMsg, _countof(debugMsg),
+                        L"BCryptOpenAlgorithmProvider failed: Algorithm=%s, NTSTATUS=0x%08X",
+                        algName, static_cast<unsigned>(st));
+                    SafeLogError(debugMsg);
+
+                    // Ensure handle is null on failure
+                    m_algHandle = nullptr;
+                    return false;
+                }
+
+                m_algHandle = handle;
+
+                // Set chaining mode if applicable
+                const wchar_t* chainMode = ChainingMode(m_algorithm);
+                if (chainMode != nullptr) {
+                    const size_t chainModeLen = wcslen(chainMode);
+                    
+                    // Validate string length to prevent overflow
+                    if (chainModeLen > 0 && chainModeLen < 256) {
+                        st = BCryptSetProperty(
+                            m_algHandle,
+                            BCRYPT_CHAINING_MODE,
+                            reinterpret_cast<PBYTE>(const_cast<wchar_t*>(chainMode)),
+                            static_cast<ULONG>((chainModeLen + 1) * sizeof(wchar_t)),
+                            0
+                        );
+
+                        if (!BCRYPT_SUCCESS(st)) {
+                            if (err != nullptr) {
+                                err->SetNtStatus(st,
+                                    L"BCryptSetProperty for chaining mode failed",
+                                    L"ensureProvider");
+                            }
+
+                            wchar_t debugMsg[256];
+                            swprintf_s(debugMsg, _countof(debugMsg),
+                                L"BCryptSetProperty failed for mode %s: 0x%08X",
+                                chainMode, static_cast<unsigned>(st));
+                            SafeLogError(debugMsg);
+
+                            // Cleanup on failure
+                            BCryptCloseAlgorithmProvider(m_algHandle, 0);
+                            m_algHandle = nullptr;
+                            return false;
+                        }
+                    }
+                }
+
+                // Log successful initialization
+                wchar_t infoMsg[256];
+                swprintf_s(infoMsg, _countof(infoMsg),
+                    L"Algorithm provider opened: %s (handle: %p)",
+                    algName, static_cast<void*>(m_algHandle));
+                SafeLogInfo(infoMsg);
+
+                return true;
+#else
+                if (err != nullptr) {
+                    err->SetWin32Error(ERROR_NOT_SUPPORTED,
+                        L"Platform not supported",
+                        L"ensureProvider");
+                }
+                return false;
+#endif
+            }
+
+            bool SymmetricCipher::SetKey(const uint8_t* key, size_t keyLen, Error* err) noexcept {
+                // Input validation
+                if (key == nullptr || keyLen == 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid key pointer or length",
+                            L"SetKey");
+                    }
+                    return false;
+                }
+
+                // Validate key size matches algorithm requirements
+                const size_t expectedSize = GetKeySize();
+                if (expectedSize == 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Unknown algorithm - cannot determine key size",
+                            L"SetKey");
+                    }
+                    return false;
+                }
+
+                if (keyLen != expectedSize) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid key size for algorithm",
+                            L"SetKey");
+                    }
+                    return false;
+                }
+
+                // Ensure provider is initialized
+                if (!ensureProvider(err)) {
+                    return false;
+                }
+
+#ifdef _WIN32
+                // Destroy existing key if any
+                if (m_keyHandle != nullptr) {
+                    BCryptDestroyKey(m_keyHandle);
+                    m_keyHandle = nullptr;
+                }
+
+                // Securely store key copy
+                try {
+                    m_key.assign(key, key + keyLen);
+                }
+                catch (const std::exception&) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate key storage",
+                            L"SetKey");
+                    }
+                    return false;
+                }
+
+                // Get required key object size
+                DWORD objLen = 0;
+                DWORD cbResult = 0;
+                NTSTATUS st = BCryptGetProperty(
+                    m_algHandle,
+                    BCRYPT_OBJECT_LENGTH,
+                    reinterpret_cast<PUCHAR>(&objLen),
+                    sizeof(objLen),
+                    &cbResult,
+                    0
+                );
+
+                if (!BCRYPT_SUCCESS(st)) {
+                    if (err != nullptr) {
+                        err->SetNtStatus(st,
+                            L"BCryptGetProperty OBJECT_LENGTH failed",
+                            L"SetKey");
+                    }
+                    SecureZeroMemory(m_key.data(), m_key.size());
+                    m_key.clear();
+                    return false;
+                }
+
+                // Allocate key object buffer
+                try {
+                    m_keyObject.resize(objLen);
+                }
+                catch (const std::exception&) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate key object buffer",
+                            L"SetKey");
+                    }
+                    SecureZeroMemory(m_key.data(), m_key.size());
+                    m_key.clear();
+                    return false;
+                }
+
+                // Generate symmetric key from key material
+                st = BCryptGenerateSymmetricKey(
+                    m_algHandle,
+                    &m_keyHandle,
+                    m_keyObject.data(),
+                    static_cast<ULONG>(m_keyObject.size()),
+                    const_cast<uint8_t*>(m_key.data()),
+                    static_cast<ULONG>(m_key.size()),
+                    0
+                );
+
+                if (!BCRYPT_SUCCESS(st)) {
+                    if (err != nullptr) {
+                        err->SetNtStatus(st,
+                            L"BCryptGenerateSymmetricKey failed",
+                            L"SetKey");
+                    }
+
+                    wchar_t debugMsg[256];
+                    swprintf_s(debugMsg, _countof(debugMsg),
+                        L"BCryptGenerateSymmetricKey failed: 0x%08X",
+                        static_cast<unsigned>(st));
+                    SafeLogError(debugMsg);
+
+                    // Cleanup on failure
+                    SecureZeroMemory(m_key.data(), m_key.size());
+                    m_key.clear();
+                    SecureZeroMemory(m_keyObject.data(), m_keyObject.size());
+                    m_keyObject.clear();
+                    m_keyHandle = nullptr;
+                    return false;
+                }
+
+                m_keySet = true;
+                return true;
+#else
+                if (err != nullptr) {
+                    err->SetWin32Error(ERROR_NOT_SUPPORTED,
+                        L"Platform not supported",
+                        L"SetKey");
+                }
+                return false;
+#endif
+            }
+
+            bool SymmetricCipher::SetKey(const std::vector<uint8_t>& key, Error* err) noexcept {
+                if (key.empty()) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Empty key vector",
+                            L"SetKey");
+                    }
+                    return false;
+                }
+                return SetKey(key.data(), key.size(), err);
+            }
+
+            bool SymmetricCipher::GenerateKey(std::vector<uint8_t>& outKey, Error* err) noexcept {
+                const size_t keySize = GetKeySize();
+                if (keySize == 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Unknown algorithm - cannot determine key size",
+                            L"GenerateKey");
+                    }
+                    return false;
+                }
+
+                // Generate random key
+                SecureRandom rng;
+                if (!rng.Generate(outKey, keySize, err)) {
+                    return false;
+                }
+
+                // Set the generated key
+                if (!SetKey(outKey, err)) {
+                    SecureZeroMemory(outKey.data(), outKey.size());
+                    outKey.clear();
+                    return false;
+                }
+
+                return true;
+            }
 			
-			bool SymmetricCipher::SetIV(const uint8_t* iv, size_t ivLen, Error* err) noexcept {
-				const size_t expectedSize = GetIVSize();
-				if (expectedSize == 0) {
-					m_ivSet = true;
-					return true;
-				}
+            bool SymmetricCipher::SetIV(const uint8_t* iv, size_t ivLen, Error* err) noexcept {
+                const size_t expectedSize = GetIVSize();
 
-				if (!iv || ivLen != expectedSize) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid IV size"; }
-					return false;
-				}
+                // Some algorithms don't need an IV
+                if (expectedSize == 0) {
+                    m_iv.clear();
+                    m_ivSet = true;
+                    return true;
+                }
 
-				m_iv.assign(iv, iv + ivLen);
-				m_ivSet = true;
-				return true;
-			}
+                // Validate IV pointer
+                if (iv == nullptr) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"IV pointer is null",
+                            L"SetIV");
+                    }
+                    return false;
+                }
 
-			bool SymmetricCipher::SetIV(const std::vector<uint8_t>& iv, Error* err) noexcept {
-				return SetIV(iv.data(), iv.size(), err);
-			}
+                // Validate IV size
+                if (ivLen != expectedSize) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid IV size for algorithm",
+                            L"SetIV");
+                    }
+                    return false;
+                }
 
-			bool SymmetricCipher::GenerateIV(std::vector<uint8_t>& outIV, Error* err) noexcept {
-				const size_t ivSize = GetIVSize();
-				if (ivSize == 0) { outIV.clear(); m_ivSet = true; return true; }
+                try {
+                    m_iv.assign(iv, iv + ivLen);
+                }
+                catch (const std::exception&) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate IV storage",
+                            L"SetIV");
+                    }
+                    return false;
+                }
 
-				outIV.resize(ivSize);
-				SecureRandom rng;
-				if (!rng.Generate(outIV, ivSize, err)) return false;
-				return SetIV(outIV, err);
-			}
+                m_ivSet = true;
+                return true;
+            }
 
-			size_t SymmetricCipher::GetKeySize() const noexcept {
-				return KeySizeForAlg(m_algorithm);
-			}
+            bool SymmetricCipher::SetIV(const std::vector<uint8_t>& iv, Error* err) noexcept {
+                const size_t expectedSize = GetIVSize();
 
-			size_t SymmetricCipher::GetIVSize() const noexcept {
-				return IVSizeForAlg(m_algorithm);
-			}
+                // Some algorithms don't need an IV
+                if (expectedSize == 0) {
+                    m_iv.clear();
+                    m_ivSet = true;
+                    return true;
+                }
 
-			size_t SymmetricCipher::GetBlockSize() const noexcept {
-				return 16; // AES block size is always 16 bytes
-			}
+                if (iv.empty()) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Empty IV vector",
+                            L"SetIV");
+                    }
+                    return false;
+                }
 
-			size_t SymmetricCipher::GetTagSize() const noexcept {
-				return IsAEAD() ? 16 : 0;
-			}
+                return SetIV(iv.data(), iv.size(), err);
+            }
 
-			bool SymmetricCipher::IsAEAD() const noexcept {
-				return IsAEADAlg(m_algorithm);
-			}
+            bool SymmetricCipher::GenerateIV(std::vector<uint8_t>& outIV, Error* err) noexcept {
+                const size_t ivSize = GetIVSize();
 
-			bool SymmetricCipher::Encrypt(const uint8_t* plaintext, size_t plaintextLen,
-				std::vector<uint8_t>& ciphertext, Error* err) noexcept
-			{
-				// ═══════════════════════════════════════════════════════════════════
-				//  TIER-1 INPUT VALIDATION 
-				// ═══════════════════════════════════════════════════════════════════
-				if (!m_keySet) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"Key not set"; }
-					return false;
-				}
-				if (!m_ivSet && GetIVSize() > 0) {
-					if (err) { err->win32 = ERROR_INVALID_STATE; err->message = L"IV not set"; }
-					return false;
-				}
-				if (!plaintext && plaintextLen != 0) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Invalid plaintext pointer"; }
-					return false;
-				}
-				if (IsAEAD()) {
-					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Use EncryptAEAD for AEAD modes"; }
-					return false;
-				}
+                // Some algorithms don't need an IV
+                if (ivSize == 0) {
+                    outIV.clear();
+                    m_iv.clear();
+                    m_ivSet = true;
+                    return true;
+                }
+
+                // Generate random IV
+                SecureRandom rng;
+                if (!rng.Generate(outIV, ivSize, err)) {
+                    return false;
+                }
+
+                // Set the generated IV
+                if (!SetIV(outIV, err)) {
+                    SecureZeroMemory(outIV.data(), outIV.size());
+                    outIV.clear();
+                    return false;
+                }
+
+                return true;
+            }
+
+            // =============================================================================
+            // SymmetricCipher Property Accessors
+            // =============================================================================
+
+            size_t SymmetricCipher::GetKeySize() const noexcept {
+                return KeySizeForAlg(m_algorithm);
+            }
+
+            size_t SymmetricCipher::GetIVSize() const noexcept {
+                return IVSizeForAlg(m_algorithm);
+            }
+
+            size_t SymmetricCipher::GetBlockSize() const noexcept {
+                // All supported algorithms use 16-byte (128-bit) blocks
+                return AES_BLOCK_SIZE_BYTES;
+            }
+
+            size_t SymmetricCipher::GetTagSize() const noexcept {
+                // AEAD modes use 16-byte (128-bit) authentication tags
+                return IsAEAD() ? GCM_TAG_SIZE_BYTES : 0ULL;
+            }
+
+            bool SymmetricCipher::IsAEAD() const noexcept {
+                return IsAEADAlg(m_algorithm);
+            }
+
+            // =============================================================================
+            // SymmetricCipher Encrypt/Decrypt Implementation
+            // =============================================================================
+
+            bool SymmetricCipher::Encrypt(const uint8_t* plaintext, size_t plaintextLen,
+                std::vector<uint8_t>& ciphertext, Error* err) noexcept
+            {
+                // Clear output buffer first
+                ciphertext.clear();
+
+                // ═══════════════════════════════════════════════════════════════════
+                //  TIER-1 INPUT VALIDATION
+                // ═══════════════════════════════════════════════════════════════════
+                if (!m_keySet) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_STATE,
+                            L"Key not set",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
+
+                if (!m_ivSet && GetIVSize() > 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_STATE,
+                            L"IV not set",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
+
+                if (plaintext == nullptr && plaintextLen != 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid plaintext pointer",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
+
+                if (IsAEAD()) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Use EncryptAEAD for AEAD modes",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
+
+                // Size limit validation
+                if (plaintextLen > MAX_PLAINTEXT_SIZE) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_BUFFER_OVERFLOW,
+                            L"Plaintext exceeds maximum size limit",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
+
+                // Handle empty plaintext
+                if (plaintextLen == 0) {
+                    ciphertext.clear();
+                    return true;
+                }
 
 #ifdef _WIN32
-				// ═══════════════════════════════════════════════════════════════════
-				//  ALGORITHM CLASSIFICATION
-				// ═══════════════════════════════════════════════════════════════════
-				const bool isCBC = (m_algorithm == SymmetricAlgorithm::AES_128_CBC ||
-					m_algorithm == SymmetricAlgorithm::AES_192_CBC ||
-					m_algorithm == SymmetricAlgorithm::AES_256_CBC);
-			
-				const bool needsPadding = isCBC;
-				const size_t blockSize = GetBlockSize();
+                // ═══════════════════════════════════════════════════════════════════
+                //  ALGORITHM CLASSIFICATION
+                // ═══════════════════════════════════════════════════════════════════
+                const bool isCBC = (m_algorithm == SymmetricAlgorithm::AES_128_CBC ||
+                    m_algorithm == SymmetricAlgorithm::AES_192_CBC ||
+                    m_algorithm == SymmetricAlgorithm::AES_256_CBC);
 
+                const bool needsPadding = isCBC;
+                const size_t blockSize = GetBlockSize();
 
-				// ═══════════════════════════════════════════════════════════════════
-				//  PADDING STRATEGY (Manual PKCS7 - Industry Standard)
-				// ═══════════════════════════════════════════════════════════════════
+                // Validate block size
+                if (blockSize == 0) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_INVALID_PARAMETER,
+                            L"Invalid block size for algorithm",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
 
-				if (plaintextLen > std::numeric_limits<ULONG>::max()) {
-					if (err) {
-						err->win32 = ERROR_BUFFER_OVERFLOW;
-						err->message = L"Ciphertext too large for Windows CNG API";
-					}
-					return false;
-				}
-				std::vector<uint8_t> plaintextWithPadding;
-				const uint8_t* effectivePlaintext = plaintext;
-				size_t effectiveLen = plaintextLen;
+                // ═══════════════════════════════════════════════════════════════════
+                //  PADDING STRATEGY (Manual PKCS7 - Industry Standard)
+                // ═══════════════════════════════════════════════════════════════════
+                if (plaintextLen > static_cast<size_t>(ULONG_MAX)) {
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_BUFFER_OVERFLOW,
+                            L"Plaintext too large for Windows CNG API",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
 
-				if (needsPadding && m_paddingMode == PaddingMode::PKCS7) {
-					// Apply PKCS7 padding MANUALLY
-					plaintextWithPadding.assign(plaintext, plaintext + plaintextLen);
+                std::vector<uint8_t> plaintextWithPadding;
+                const uint8_t* effectivePlaintext = plaintext;
+                size_t effectiveLen = plaintextLen;
 
-					if (!applyPadding(plaintextWithPadding, blockSize)) {
-						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"PKCS7 padding failed"; }
-						return false;
-					}
+                if (needsPadding && m_paddingMode == PaddingMode::PKCS7) {
+                    // Apply PKCS7 padding manually
+                    try {
+                        plaintextWithPadding.assign(plaintext, plaintext + plaintextLen);
+                    }
+                    catch (const std::exception&) {
+                        if (err != nullptr) {
+                            err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                                L"Failed to allocate padding buffer",
+                                L"Encrypt");
+                        }
+                        return false;
+                    }
 
-					effectivePlaintext = plaintextWithPadding.data();
-					effectiveLen = plaintextWithPadding.size();
-				}
-				else if (needsPadding && m_paddingMode == PaddingMode::None) {
-					//  No padding - MUST be block-aligned
-					if (plaintextLen % blockSize != 0) {
-						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Plaintext must be block-aligned"; }
-						return false;
-					}
-				}
+                    if (!applyPadding(plaintextWithPadding, blockSize)) {
+                        if (err != nullptr) {
+                            err->SetWin32Error(ERROR_INVALID_DATA,
+                                L"PKCS7 padding failed",
+                                L"Encrypt");
+                        }
+                        SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+                        return false;
+                    }
 
-				// ═══════════════════════════════════════════════════════════════════
-				//  IV MUTATION PROTECTION (Prevent IV reuse attacks)
-				// ═══════════════════════════════════════════════════════════════════
-				std::vector<uint8_t> ivLocal = m_iv;
-				PUCHAR ivPtr = ivLocal.empty() ? nullptr : ivLocal.data();
-				ULONG ivLen = static_cast<ULONG>(ivLocal.size());
+                    effectivePlaintext = plaintextWithPadding.data();
+                    effectiveLen = plaintextWithPadding.size();
+                }
+                else if (needsPadding && m_paddingMode == PaddingMode::None) {
+                    // No padding - must be block-aligned
+                    if (plaintextLen % blockSize != 0) {
+                        if (err != nullptr) {
+                            err->SetWin32Error(ERROR_INVALID_DATA,
+                                L"Plaintext must be block-aligned when padding is disabled",
+                                L"Encrypt");
+                        }
+                        return false;
+                    }
+                }
 
-				// ═══════════════════════════════════════════════════════════════════
-				//  BCRYPT ENCRYPTION (NO PADDING FLAG)
-				// ═══════════════════════════════════════════════════════════════════
-				DWORD flags = 0; // ✅ CRITICAL: We handle padding ourselves
+                // ═══════════════════════════════════════════════════════════════════
+                //  IV LOCAL COPY (Prevent IV reuse attacks)
+                // ═══════════════════════════════════════════════════════════════════
+                std::vector<uint8_t> ivLocal;
+                try {
+                    ivLocal = m_iv;
+                }
+                catch (const std::exception&) {
+                    SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate IV buffer",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
 
-				// Query encrypted size
-				ULONG cbResult = 0;
-				NTSTATUS st = BCryptEncrypt(m_keyHandle,
-					const_cast<uint8_t*>(effectivePlaintext), static_cast<ULONG>(effectiveLen),
-					nullptr,
-					ivPtr, ivLen,
-					nullptr, 0, &cbResult, flags);
+                PUCHAR ivPtr = ivLocal.empty() ? nullptr : ivLocal.data();
+                ULONG ivLen = static_cast<ULONG>(ivLocal.size());
 
-				if (st < 0) {
-					if (err) {
-						err->ntstatus = st;
-						err->win32 = RtlNtStatusToDosError(st);
-						err->message = L"BCryptEncrypt size query failed";
-					}
-					SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
-					return false;
-				}
+                // ═══════════════════════════════════════════════════════════════════
+                //  BCRYPT ENCRYPTION (NO PADDING FLAG)
+                // ═══════════════════════════════════════════════════════════════════
+                constexpr DWORD flags = 0;  // We handle padding ourselves
 
-				// Allocate output buffer
-				ciphertext.resize(cbResult);
+                // Query encrypted size
+                ULONG cbResult = 0;
+                NTSTATUS st = BCryptEncrypt(
+                    m_keyHandle,
+                    const_cast<uint8_t*>(effectivePlaintext),
+                    static_cast<ULONG>(effectiveLen),
+                    nullptr,
+                    ivPtr,
+                    ivLen,
+                    nullptr,
+                    0,
+                    &cbResult,
+                    flags
+                );
 
-				// Perform encryption
-				st = BCryptEncrypt(m_keyHandle,
-					const_cast<uint8_t*>(effectivePlaintext), static_cast<ULONG>(effectiveLen),
-					nullptr,
-					ivPtr, ivLen,
-					ciphertext.data(), static_cast<ULONG>(ciphertext.size()), &cbResult, flags);
+                if (!BCRYPT_SUCCESS(st)) {
+                    if (err != nullptr) {
+                        err->SetNtStatus(st,
+                            L"BCryptEncrypt size query failed",
+                            L"Encrypt");
+                    }
+                    SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+                    return false;
+                }
 
-				//  SECURE CLEANUP
-				SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+                // Allocate output buffer
+                try {
+                    ciphertext.resize(cbResult);
+                }
+                catch (const std::exception&) {
+                    SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+                    if (err != nullptr) {
+                        err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
+                            L"Failed to allocate ciphertext buffer",
+                            L"Encrypt");
+                    }
+                    return false;
+                }
 
-				if (st < 0) {
-					if (err) {
-						err->ntstatus = st;
-						err->win32 = RtlNtStatusToDosError(st);
-						err->message = L"BCryptEncrypt failed";
-					}
-					SecureZeroMemory(ciphertext.data(), ciphertext.size());
-					return false;
-				}
+                // Perform encryption
+                st = BCryptEncrypt(
+                    m_keyHandle,
+                    const_cast<uint8_t*>(effectivePlaintext),
+                    static_cast<ULONG>(effectiveLen),
+                    nullptr,
+                    ivPtr,
+                    ivLen,
+                    ciphertext.data(),
+                    static_cast<ULONG>(ciphertext.size()),
+                    &cbResult,
+                    flags
+                );
 
-				ciphertext.resize(cbResult);
+                // Secure cleanup of padded plaintext
+                SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 
-				// ═══════════════════════════════════════════════════════════════════
-				//  IV CHAINING (CBC mode - prevent IV reuse)
-				// ═══════════════════════════════════════════════════════════════════
-				if (isCBC && ivPtr && ivLen > 0) {
-					if (ciphertext.size() >= ivLen) {
-						// Use last ciphertext block as next IV
-						std::memcpy(m_iv.data(), ciphertext.data() + ciphertext.size() - ivLen, ivLen);
-					}
-				}
+                if (!BCRYPT_SUCCESS(st)) {
+                    if (err != nullptr) {
+                        err->SetNtStatus(st,
+                            L"BCryptEncrypt failed",
+                            L"Encrypt");
+                    }
+                    SecureZeroMemory(ciphertext.data(), ciphertext.size());
+                    ciphertext.clear();
+                    return false;
+                }
 
-				return true;
+                ciphertext.resize(cbResult);
+
+                // ═══════════════════════════════════════════════════════════════════
+                //  IV CHAINING (CBC mode - for continuous streaming)
+                // ═══════════════════════════════════════════════════════════════════
+                if (isCBC && ivPtr != nullptr && ivLen > 0) {
+                    if (ciphertext.size() >= ivLen) {
+                        // Use last ciphertext block as next IV for chaining
+                        std::memcpy(m_iv.data(),
+                            ciphertext.data() + ciphertext.size() - ivLen,
+                            ivLen);
+                    }
+                }
+
+                return true;
 #else
-				if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Platform not supported"; }
-				return false;
+                if (err != nullptr) {
+                    err->SetWin32Error(ERROR_NOT_SUPPORTED,
+                        L"Platform not supported",
+                        L"Encrypt");
+                }
+                return false;
 #endif
-			}
+            }
 
 			bool SymmetricCipher::Decrypt(const uint8_t* ciphertext, size_t ciphertextLen,
 				std::vector<uint8_t>& plaintext, Error* err) noexcept
@@ -931,23 +1679,35 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
+				// ═══════════════════════════════════════════════════════════════════
+				//  IV MUTATION PROTECTION - Create local copy
+				// ═══════════════════════════════════════════════════════════════════
 				std::vector<uint8_t> ivLocal = m_iv;
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  BCRYPT AUTHENTICATED CIPHER MODE INFO SETUP
+				// ═══════════════════════════════════════════════════════════════════
 				BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
 				BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
 				authInfo.pbNonce = ivLocal.data();
-				authInfo.cbNonce = static_cast<ULONG>(m_iv.size());
+				authInfo.cbNonce = static_cast<ULONG>(ivLocal.size());
 				authInfo.pbAuthData = const_cast<uint8_t*>(aad);
 				authInfo.cbAuthData = static_cast<ULONG>(aadLen);
 
-				tag.resize(GetTagSize());
+				// Allocate tag buffer
+				const size_t tagSize = GetTagSize();
+				tag.resize(tagSize);
 				authInfo.pbTag = tag.data();
-				authInfo.cbTag = static_cast<ULONG>(tag.size());
+				authInfo.cbTag = static_cast<ULONG>(tagSize);
 				authInfo.pbMacContext = nullptr;
 				authInfo.cbMacContext = 0;
 				authInfo.cbAAD = static_cast<ULONG>(aadLen);
 				authInfo.cbData = static_cast<ULONG>(plaintextLen);
 				authInfo.dwFlags = 0;
 
+				// ═══════════════════════════════════════════════════════════════════
+				//  BCRYPT AEAD ENCRYPTION
+				// ═══════════════════════════════════════════════════════════════════
 				ULONG cbResult = 0;
 				
 				NTSTATUS st = BCryptEncrypt(m_keyHandle,
@@ -956,6 +1716,9 @@ namespace ShadowStrike {
 					nullptr, 0,
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
+					// SECURITY: Clear tag on failure
+					SecureZeroMemory(tag.data(), tag.size());
+					tag.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt AEAD size query failed"; }
 					return false;
 				}
@@ -967,6 +1730,11 @@ namespace ShadowStrike {
 					nullptr, 0,
 					ciphertext.data(), static_cast<ULONG>(ciphertext.size()), &cbResult, 0);
 				if (st < 0) {
+					// SECURITY: Clear both ciphertext and tag on failure
+					SecureZeroMemory(ciphertext.data(), ciphertext.size());
+					SecureZeroMemory(tag.data(), tag.size());
+					ciphertext.clear();
+					tag.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt AEAD failed"; }
 					return false;
 				}
@@ -1116,7 +1884,17 @@ namespace ShadowStrike {
 				}
 
 #ifdef _WIN32
+				// ═══════════════════════════════════════════════════════════════════
+				//  EXTRACT BLOCK-ALIGNED DATA FOR ENCRYPTION
+				// ═══════════════════════════════════════════════════════════════════
 				std::vector<uint8_t> toEncrypt(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
+
+				// Validate sizes for ULONG conversion
+				if (toEncrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Data too large for ULONG"; }
+					return false;
+				}
 
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptEncrypt(m_keyHandle,
@@ -1125,6 +1903,8 @@ namespace ShadowStrike {
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
+					// SECURITY: Clear temporary buffer on failure
+					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt size query failed"; }
 					return false;
 				}
@@ -1136,6 +1916,9 @@ namespace ShadowStrike {
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 				if (st < 0) {
+					// SECURITY: Clear both buffers on failure
+					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					SecureZeroMemory(out.data(), out.size());
 					out.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt failed"; }
 					return false;
@@ -1148,7 +1931,7 @@ namespace ShadowStrike {
 					std::memcpy(m_iv.data(), out.data() + out.size() - blockSize, blockSize);
 				}
 
-				//Remove the processed data from the buffer
+				// SECURITY: Securely clear temporary buffer after use
 				SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
 				m_streamBuffer.erase(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
 				return true;
@@ -1182,24 +1965,42 @@ namespace ShadowStrike {
 					return true;
 				}
 
-				// Apply manual padding ONLY if needed
+				// ═══════════════════════════════════════════════════════════════════
+				//  APPLY MANUAL PADDING (PKCS7)
+				// ═══════════════════════════════════════════════════════════════════
 				if (m_paddingMode == PaddingMode::PKCS7) {
 					if (!applyPadding(m_streamBuffer, GetBlockSize())) {
+						// SECURITY: Clear stream buffer on failure
+						SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+						m_streamBuffer.clear();
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Padding failed"; }
 						return false;
 					}
 				}
 
-				//Encrypt final block (flags=0, BCrypt won't add padding)
+				// Validate size for ULONG conversion
+				if (m_streamBuffer.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Data too large for ULONG"; }
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  ENCRYPT FINAL BLOCK (flags=0, BCrypt won't add padding)
+				// ═══════════════════════════════════════════════════════════════════
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptEncrypt(
 					m_keyHandle,
 					m_streamBuffer.data(), static_cast<ULONG>(m_streamBuffer.size()),
 					nullptr,
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
-					nullptr, 0, &cbResult, 0); //flags=0 (no BCrypt padding)
+					nullptr, 0, &cbResult, 0);
 
 				if (st < 0) {
+					// SECURITY: Clear stream buffer on failure
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"EncryptFinal failed"; }
 					return false;
 				}
@@ -1213,11 +2014,19 @@ namespace ShadowStrike {
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 
 				if (st < 0) {
+					// SECURITY: Clear both buffers on failure
+					SecureZeroMemory(out.data(), out.size());
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					out.clear();
+					m_streamBuffer.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"EncryptFinal failed"; }
 					return false;
 				}
 
 				out.resize(cbResult);
+
+				// SECURITY: Securely clear stream buffer before clearing
+				SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 				m_streamBuffer.clear();
 				m_streamFinalized = true;
 				return true;
@@ -1297,18 +2106,27 @@ namespace ShadowStrike {
 					return false;
 				}
 
+				// ═══════════════════════════════════════════════════════════════════
+				//  EXTRACT DATA FOR DECRYPTION
+				// ═══════════════════════════════════════════════════════════════════
 				std::vector<uint8_t> toDecrypt(m_streamBuffer.begin(), m_streamBuffer.begin() + processSize);
 
-				//overflow guard
+				// Validate sizes for ULONG conversion
 				if (toDecrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"toDecrypt size too large for ULONG"; }
 					return false;
 				}
 
 				if (m_iv.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"IV size too large for ULONG"; }
 					return false;
 				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  BCRYPT DECRYPTION
+				// ═══════════════════════════════════════════════════════════════════
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptDecrypt(m_keyHandle,
 					toDecrypt.data(), static_cast<ULONG>(toDecrypt.size()),
@@ -1316,6 +2134,8 @@ namespace ShadowStrike {
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
+					// SECURITY: Clear ciphertext copy on failure
+					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt size query failed"; }
 					return false;
 				}
@@ -1327,18 +2147,23 @@ namespace ShadowStrike {
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 				if (st < 0) {
+					// SECURITY: Clear both buffers on failure
+					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
 					SecureZeroMemory(out.data(), out.size());
+					out.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt failed"; }
 					return false;
 				}
 
 				out.resize(cbResult);
 
-				// update IV (for CBC mode)
+				// update IV (for CBC mode) - use ciphertext as next IV
 				if (!toDecrypt.empty() && m_iv.size() == blockSize) {
 					std::memcpy(m_iv.data(), toDecrypt.data() + toDecrypt.size() - blockSize, blockSize);
 				}
 
+				// SECURITY: Securely clear ciphertext copy
+				SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
 				m_streamBuffer.erase(m_streamBuffer.begin(), m_streamBuffer.begin() + processSize);
 
 				return true;
@@ -1372,16 +2197,29 @@ namespace ShadowStrike {
 					return true;
 				}
 
-				// Decrypt final block (flags=0, no BCrypt padding removal)
+				// Validate size for ULONG conversion
+				if (m_streamBuffer.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
+					if (err) { err->win32 = ERROR_ARITHMETIC_OVERFLOW; err->message = L"Data too large for ULONG"; }
+					return false;
+				}
+
+				// ═══════════════════════════════════════════════════════════════════
+				//  DECRYPT FINAL BLOCK (flags=0, no BCrypt padding removal)
+				// ═══════════════════════════════════════════════════════════════════
 				ULONG cbResult = 0;
 				NTSTATUS st = BCryptDecrypt(
 					m_keyHandle,
 					m_streamBuffer.data(), static_cast<ULONG>(m_streamBuffer.size()),
 					nullptr,
 					m_iv.empty() ? nullptr : m_iv.data(), static_cast<ULONG>(m_iv.size()),
-					nullptr, 0, &cbResult, 0); // flags=0
+					nullptr, 0, &cbResult, 0);
 
 				if (st < 0) {
+					// SECURITY: Clear stream buffer on failure
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					m_streamBuffer.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"DecryptFinal failed"; }
 					return false;
 				}
@@ -1395,22 +2233,34 @@ namespace ShadowStrike {
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 
 				if (st < 0) {
+					// SECURITY: Clear both buffers on failure
+					SecureZeroMemory(out.data(), out.size());
+					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					out.clear();
+					m_streamBuffer.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"DecryptFinal failed"; }
 					return false;
 				}
 
 				out.resize(cbResult);
 
-				// Manual padding removal (constant-time)
+				// ═══════════════════════════════════════════════════════════════════
+				//  MANUAL PADDING REMOVAL (Constant-time validation)
+				// ═══════════════════════════════════════════════════════════════════
 				if (m_paddingMode == PaddingMode::PKCS7) {
 					const size_t originalSize = out.size();
 					if (!removePadding(out, GetBlockSize())) {
+						// SECURITY: Clear sensitive data on padding failure
 						SecureZeroMemory(out.data(), originalSize);
+						SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 						out.clear();
+						m_streamBuffer.clear();
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid padding"; }
 						return false;
 					}
 				}
+
+				// SECURITY: Securely clear stream buffer
 				SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
 				m_streamBuffer.clear();
 				m_streamFinalized = true;
@@ -1645,6 +2495,8 @@ namespace ShadowStrike {
 				outKeyPair.publicKey.keyBlob.resize(cbBlob);
 				st = BCryptExportKey(hKey, nullptr, pubBlobType, outKeyPair.publicKey.keyBlob.data(), cbBlob, &cbBlob, 0);
 				if (st < 0) {
+					// SECURITY: Clear public key blob on failure
+					outKeyPair.publicKey.keyBlob.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptExportKey (public) failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptExportKey (public) failed: 0x%08X", st);
 					BCryptDestroyKey(hKey);
@@ -1655,6 +2507,8 @@ namespace ShadowStrike {
 				cbBlob = 0;
 				st = BCryptExportKey(hKey, nullptr, privBlobType, nullptr, 0, &cbBlob, 0);
 				if (st < 0 || cbBlob == 0) {
+					// SECURITY: Clear public key blob since we're failing
+					outKeyPair.publicKey.keyBlob.clear();
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptExportKey (private size) failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptExportKey (private size) failed: 0x%08X", st);
 					BCryptDestroyKey(hKey);
@@ -1664,6 +2518,8 @@ namespace ShadowStrike {
 				outKeyPair.privateKey.keyBlob.resize(cbBlob);
 				st = BCryptExportKey(hKey, nullptr, privBlobType, outKeyPair.privateKey.keyBlob.data(), cbBlob, &cbBlob, 0);
 				if (st < 0) {
+					// SECURITY: Clear both key blobs on failure
+					outKeyPair.publicKey.keyBlob.clear();
 					if (!outKeyPair.privateKey.keyBlob.empty()) {
 						SecureZeroMemory(outKeyPair.privateKey.keyBlob.data(), outKeyPair.privateKey.keyBlob.size());
 						outKeyPair.privateKey.keyBlob.clear();
@@ -2537,10 +3393,19 @@ namespace ShadowStrike {
 				// Use ComputeHmac helper (one-shot) instead of non-existent HashUtils::Hmac(...) function
 				if (!HashUtils::ComputeHmac(hashAlg, hmacKey.data(), hmacKey.size(),
 					inputKeyMaterial, ikmLen, prk, nullptr)) {
+					// SECURITY: Clear hmacKey on failure
+					SecureZeroMemory(hmacKey.data(), hmacKey.size());
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Extract failed"; }
 					return false;
 				}
+
+				// SECURITY: Clear hmacKey after use (it may contain salt or zeros)
+				SecureZeroMemory(hmacKey.data(), hmacKey.size());
+				hmacKey.clear();
+
 				if (keyLen > 255 * hashLen) {
+					// SECURITY: Clear prk before returning
+					SecureZeroMemory(prk.data(), prk.size());
 					if (err) {
 						err->win32 = ERROR_INVALID_PARAMETER;
 						err->message = L"HKDF keyLen too large";
@@ -2566,6 +3431,10 @@ namespace ShadowStrike {
 					//Use ComputeHmac here as well
 					if (!HashUtils::ComputeHmac(hashAlg, prk.data(), prk.size(),
 						msg.data(), msg.size(), t, nullptr)) {
+						// SECURITY: Clear all intermediate key material on failure
+						SecureZeroMemory(prk.data(), prk.size());
+						SecureZeroMemory(t.data(), t.size());
+						SecureZeroMemory(okm.data(), okm.size());
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Expand failed"; }
 						return false;
 					}
@@ -2574,7 +3443,10 @@ namespace ShadowStrike {
 				}
 
 				std::memcpy(outKey, okm.data(), keyLen);
+
+				// SECURITY: Clear all intermediate key material
 				SecureZeroMemory(prk.data(), prk.size());
+				SecureZeroMemory(t.data(), t.size());
 				SecureZeroMemory(okm.data(), okm.size());
 
 				return true;
@@ -2801,20 +3673,38 @@ namespace ShadowStrike {
 					kdfParams.salt = salt;
 
 					std::vector<uint8_t> key;
-					if (!KeyDerivation::DeriveKey(password, kdfParams, key, err)) return false;
+					if (!KeyDerivation::DeriveKey(password, kdfParams, key, err)) {
+						SecureZeroMemory(salt.data(), salt.size());
+						return false;
+					}
 
 					SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
-					if (!cipher.SetKey(key, err)) return false;
+					if (!cipher.SetKey(key, err)) {
+						SecureZeroMemory(key.data(), key.size());
+						SecureZeroMemory(salt.data(), salt.size());
+						return false;
+					}
+
+					// SECURITY: Clear key immediately after setting
+					SecureZeroMemory(key.data(), key.size());
+					key.clear();
 
 					std::vector<uint8_t> iv;
-					if (!cipher.GenerateIV(iv, err)) return false;
+					if (!cipher.GenerateIV(iv, err)) {
+						SecureZeroMemory(salt.data(), salt.size());
+						return false;
+					}
 
 					if(iv.size() != 16) {
+						SecureZeroMemory(salt.data(), salt.size());
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid IV size"; }
 						return false;
 					}
 					std::vector<uint8_t> encrypted;
-					if (!cipher.Encrypt(keyBlob.data(), keyBlob.size(), encrypted, err)) return false;
+					if (!cipher.Encrypt(keyBlob.data(), keyBlob.size(), encrypted, err)) {
+						SecureZeroMemory(salt.data(), salt.size());
+						return false;
+					}
 
 					// Format now includes iteration count for future-proofing
 					// Format: [VERSION(4)] + [ITERATIONS(4)] + [SALT(32)] + [IV(16)] + [ENCRYPTED_DATA]
@@ -2826,6 +3716,9 @@ namespace ShadowStrike {
 					dataToEncode.insert(dataToEncode.end(), salt.begin(), salt.end());
 					dataToEncode.insert(dataToEncode.end(), iv.begin(), iv.end());
 					dataToEncode.insert(dataToEncode.end(), encrypted.begin(), encrypted.end());
+
+					// SECURITY: Clear sensitive intermediate data
+					SecureZeroMemory(salt.data(), salt.size());
 				}
 
 				// Base64 encode
@@ -3256,7 +4149,11 @@ namespace ShadowStrike {
 				WideCharToMultiByte(CP_UTF8, 0, str.data(), static_cast<int>(str.size()),
 					&narrow[0], sizeNeeded, nullptr, nullptr);
 
+				// Copy to secure buffer
 				Assign(narrow);
+
+				// SECURITY: Securely clear the temporary string
+				SecureZeroMemory(narrow.data(), narrow.size());
 			}
 
 			void SecureString::Clear() {
@@ -3293,8 +4190,14 @@ namespace ShadowStrike {
 				if (!cipher.EncryptAEAD(reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
 					nullptr, 0, ciphertext, tag, err))
 				{
+					// SECURITY: Clear plaintext before returning on error
+					SecureZeroMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
+
+				// SECURITY: Clear plaintext immediately after encryption
+				SecureZeroMemory(plaintext.data(), plaintext.size());
+				plaintext.clear();
 
 				// Format: [IV_SIZE][IV][TAG_SIZE][TAG][CIPHERTEXT]
 				std::vector<std::byte> output;
@@ -3392,10 +4295,19 @@ namespace ShadowStrike {
 					[](uint8_t b) { return static_cast<std::byte>(b); }
 				);
 
+				// SECURITY: Clear plaintext after conversion
+				SecureZeroMemory(plaintext.data(), plaintext.size());
+				plaintext.clear();
+
 				if (!FileUtils::WriteAllBytesAtomic(outputPath, output, &fileErr)) {
+					// SECURITY: Clear output buffer on write failure
+					SecureZeroMemory(output.data(), output.size());
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to write output file"; }
 					return false;
 				}
+
+				// SECURITY: Clear output buffer after successful write
+				SecureZeroMemory(output.data(), output.size());
 				return true;
 			}
 
@@ -3427,23 +4339,42 @@ namespace ShadowStrike {
 				std::vector<std::byte> plaintext;
 				FileUtils::Error fileErr{};
 				if (!FileUtils::ReadAllBytes(inputPath, plaintext, &fileErr)) {
+					// SECURITY: Clear key on failure
+					SecureZeroMemory(key.data(), key.size());
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to read input file"; }
 					return false;
 				}
 
 				// Encrypt with AES-256-GCM
 				SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
-				if (!cipher.SetKey(key, err)) return false;
+				if (!cipher.SetKey(key, err)) {
+					SecureZeroMemory(key.data(), key.size());
+					SecureZeroMemory(plaintext.data(), plaintext.size());
+					return false;
+				}
+
+				// SECURITY: Clear key immediately after setting in cipher
+				SecureZeroMemory(key.data(), key.size());
+				key.clear();
 
 				std::vector<uint8_t> iv;
-				if (!cipher.GenerateIV(iv, err)) return false;
+				if (!cipher.GenerateIV(iv, err)) {
+					SecureZeroMemory(plaintext.data(), plaintext.size());
+					return false;
+				}
 
 				std::vector<uint8_t> ciphertext, tag;
 				if (!cipher.EncryptAEAD(reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(),
 					nullptr, 0, ciphertext, tag, err))
 				{
+					// SECURITY: Clear plaintext on encryption failure
+					SecureZeroMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
+
+				// SECURITY: Clear plaintext immediately after encryption
+				SecureZeroMemory(plaintext.data(), plaintext.size());
+				plaintext.clear();
 
 				// Format: [SALT_SIZE(4)][SALT][ITERATIONS(4)][IV_SIZE(4)][IV][TAG_SIZE(4)][TAG][CIPHERTEXT]
 				std::vector<std::byte> output;
@@ -3471,7 +4402,8 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				SecureZeroMemory(key.data(), key.size());
+				// SECURITY: Clear salt after use (key already cleared earlier)
+				SecureZeroMemory(salt.data(), salt.size());
 				return true;
 			}
 
@@ -3569,8 +4501,15 @@ namespace ShadowStrike {
 
 				// Decrypt
 				SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
-				// DÜZELTME: keyLen tanımsızdı — vector overloadunu kullanıyoruz
-				if (!cipher.SetKey(key, err)) return false;
+				if (!cipher.SetKey(key, err)) {
+					SecureZeroMemory(key.data(), key.size());
+					return false;
+				}
+
+				// SECURITY: Clear key immediately after setting in cipher
+				SecureZeroMemory(key.data(), key.size());
+				key.clear();
+
 				if (!cipher.SetIV(iv, err)) return false;
 
 				std::vector<uint8_t> plaintext;
@@ -3585,12 +4524,19 @@ namespace ShadowStrike {
 					[](uint8_t b) { return static_cast<std::byte>(b); }
 				);
 
+				// SECURITY: Clear plaintext after conversion
+				SecureZeroMemory(plaintext.data(), plaintext.size());
+				plaintext.clear();
+
 				if (!FileUtils::WriteAllBytesAtomic(outputPath, output, &fileErr)) {
+					// SECURITY: Clear output on write failure
+					SecureZeroMemory(output.data(), output.size());
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to write output file"; }
 					return false;
 				}
 
-				SecureZeroMemory(key.data(), key.size());
+				// SECURITY: Clear output buffer after successful write
+				SecureZeroMemory(output.data(), output.size());
 				return true;
 			}
 
@@ -3696,6 +4642,9 @@ namespace ShadowStrike {
 				}
 
 				outPlaintext.assign(reinterpret_cast<const char*>(plaintext.data()), plaintext.size());
+
+				// SECURITY: Clear plaintext vector after assignment
+				SecureZeroMemory(plaintext.data(), plaintext.size());
 				return true;
 			}
 

@@ -2512,7 +2512,7 @@ namespace ShadowStrike {
 					result = ::GetIpForwardTable2(AF_INET6, &pTable6);
 
 					if (result != NO_ERROR) {
-						// IPv4 routes varsa onlarý döndür, IPv6 hata veriyorsa sorun deðil
+						// IPv4 routes varsa onlarï¿½ dï¿½ndï¿½r, IPv6 hata veriyorsa sorun deï¿½il
 						return !routes.empty();
 					}
 
@@ -3033,7 +3033,7 @@ namespace ShadowStrike {
 					result = ::GetIpNetTable2(AF_INET6, &pTable6);
 
 					if (result != NO_ERROR) {
-						// IPv4 entries varsa onlarý döndür, IPv6 yoksa sorun deðil
+						// IPv4 entries varsa onlarï¿½ dï¿½ndï¿½r, IPv6 yoksa sorun deï¿½il
 						return !entries.empty();
 					}
 

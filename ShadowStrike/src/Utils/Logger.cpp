@@ -1,965 +1,1267 @@
-﻿#include"../Utils/Logger.hpp"
+﻿/**
+ * @file Logger.cpp
+ * @brief Implementation of the thread-safe asynchronous logging system.
+ *
+ * This file implements:
+ * - Singleton logger with lazy initialization
+ * - Async worker thread with queue-based message processing
+ * - Log file rotation with configurable limits
+ * - Multiple output targets (console, file, Windows Event Log)
+ * - Source location tracking and timing measurements
+ */
+
+#include "Logger.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
-#include <io.h>
 #include <chrono>
-#include<shared_mutex>
+#include <limits>
 
 #ifdef _WIN32
+#  include <io.h>
 #  include <Shlwapi.h>
 #  pragma comment(lib, "Shlwapi.lib")
 #endif
 
 namespace ShadowStrike {
-    namespace Utils {
+	namespace Utils {
 
-        static const wchar_t* LevelToW(LogLevel lv) {
-            switch (lv) {
-            case LogLevel::Trace: return L"TRACE";
-            case LogLevel::Debug: return L"DEBUG";
-            case LogLevel::Info:  return L"INFO";
-            case LogLevel::Warn:  return L"WARN";
-            case LogLevel::Error: return L"ERROR";
-            case LogLevel::Fatal: return L"FATAL";
-            default:              return L"UNKNOWN";
-            }
-        }
+		// ============================================================================
+		// Helper Functions
+		// ============================================================================
 
-        Logger& Logger::Instance() {
-            static Logger g_instance;
-            return g_instance;
-        }
+		/**
+		 * @brief Convert log level to wide string representation.
+		 * @param lv Log level
+		 * @return Wide string name of the log level
+		 */
+		[[nodiscard]] static const wchar_t* LevelToW(LogLevel lv) noexcept {
+			switch (lv) {
+			case LogLevel::Trace: return L"TRACE";
+			case LogLevel::Debug: return L"DEBUG";
+			case LogLevel::Info:  return L"INFO";
+			case LogLevel::Warn:  return L"WARN";
+			case LogLevel::Error: return L"ERROR";
+			case LogLevel::Fatal: return L"FATAL";
+			default:              return L"UNKNOWN";
+			}
+		}
 
-        Logger::Logger() {
+		// ============================================================================
+		// Singleton Instance
+		// ============================================================================
+
+		Logger& Logger::Instance() {
+			static Logger g_instance;
+			return g_instance;
+		}
+
+		// ============================================================================
+		// Constructor / Destructor
+		// ============================================================================
+
+		Logger::Logger() {
 #ifdef _WIN32
-            m_console = GetStdHandle(STD_OUTPUT_HANDLE);
+			m_console = GetStdHandle(STD_OUTPUT_HANDLE);
+			// Validate console handle
+			if (m_console == INVALID_HANDLE_VALUE) {
+				m_console = nullptr;
+			}
 #endif
-        }
+		}
 
-        Logger::~Logger() {
-            ShutDown();
-        }
+		Logger::~Logger() {
+			ShutDown();
+		}
 
-        bool Logger::IsEnabled(LogLevel level) const noexcept {
-            const LogLevel minLevel = m_minLevel.load(std::memory_order_acquire);
-            return static_cast<int>(level) >= static_cast<int>(minLevel);
-        }
+		// ============================================================================
+		// State Query Methods
+		// ============================================================================
 
-        bool Logger::IsInitialized() const noexcept {
-            return m_initialized.load(std::memory_order_acquire);
-        }
+		bool Logger::IsEnabled(LogLevel level) const noexcept {
+			const LogLevel minLevel = m_minLevel.load(std::memory_order_acquire);
+			return static_cast<uint8_t>(level) >= static_cast<uint8_t>(minLevel);
+		}
 
-        void Logger::EnsureInitialized() {
-            if (m_initialized.load(std::memory_order_acquire)) return;
+		bool Logger::IsInitialized() const noexcept {
+			return m_initialized.load(std::memory_order_acquire);
+		}
 
-            bool expected = false;
-            if (m_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                LoggerConfig def{};
-                def.async = false;
-                def.toFile = false;
-                def.toEventLog = false;
-                def.toConsole = true;
+		void Logger::setMinimalLevel(LogLevel level) noexcept {
+			m_minLevel.store(level, std::memory_order_release);
+		}
 
-                
-                {
-                    std::lock_guard<std::mutex> lk(m_cfgmutex);
-                    m_cfg = def;
-                }
-                m_minLevel.store(def.minimalLevel, std::memory_order_release);
-                m_accepting.store(true, std::memory_order_release);
-            }
-        }
+		// ============================================================================
+		// Initialization
+		// ============================================================================
 
-        void Logger::Initialize(const LoggerConfig& cfg) {
-            bool expected = false;
-            if (!m_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-              
-                return;
-            }
+		void Logger::EnsureInitialized() {
+			// Fast path - already initialized
+			if (m_initialized.load(std::memory_order_acquire)) {
+				return;
+			}
 
-      
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                m_cfg = cfg;
-            }
-            m_minLevel.store(cfg.minimalLevel, std::memory_order_release);
+			// Attempt to claim initialization
+			bool expected = false;
+			if (m_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				// We won the race - set up default console-only config
+				LoggerConfig defaultCfg{};
+				defaultCfg.async = false;
+				defaultCfg.toFile = false;
+				defaultCfg.toEventLog = false;
+				defaultCfg.toConsole = true;
 
-            try {
+				{
+					std::lock_guard<std::mutex> lk(m_cfgMutex);
+					m_cfg = defaultCfg;
+				}
+				m_minLevel.store(defaultCfg.minimalLevel, std::memory_order_release);
+				m_accepting.store(true, std::memory_order_release);
+			}
+		}
+
+		void Logger::Initialize(const LoggerConfig& cfg) {
+			// Only allow initialization once
+			bool expected = false;
+			if (!m_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				// Already initialized - ignore duplicate calls
+				return;
+			}
+
+			// Store configuration
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				m_cfg = cfg;
+			}
+			m_minLevel.store(cfg.minimalLevel, std::memory_order_release);
+
+			// Initialize output targets
+			try {
 #ifdef _WIN32
-                if (cfg.toFile) {
-                    EnsureLogDirectory();
-                    OpenLogFileIfNeeded();
-                }
-                if (cfg.toEventLog) {
-                    OpenEventLog();
-                }
+				if (cfg.toFile) {
+					EnsureLogDirectory();
+					OpenLogFileIfNeeded();
+				}
+				if (cfg.toEventLog) {
+					OpenEventLog();
+				}
 #endif
-            }
-            catch (...) {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                m_cfg.toFile = false;
-                m_cfg.toEventLog = false;
-                OutputDebugStringW(L"[Logger] File init failed\n");
-            }
+			}
+			catch (const std::exception& /*e*/) {
+				// Disable failed outputs but continue
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				m_cfg.toFile = false;
+				m_cfg.toEventLog = false;
+				OutputDebugStringW(L"[Logger] File/EventLog initialization failed\n");
+			}
+			catch (...) {
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				m_cfg.toFile = false;
+				m_cfg.toEventLog = false;
+				OutputDebugStringW(L"[Logger] Unknown initialization error\n");
+			}
 
-            m_stop.store(false, std::memory_order_release);
+			// Initialize async worker if enabled
+			m_stop.store(false, std::memory_order_release);
 
-            if (cfg.async) {
-                try {
-                    m_worker = std::thread([this]() { WorkerLoop(); });
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
-                catch (...) {
-                    std::lock_guard<std::mutex> lk(m_cfgmutex);
-                    m_cfg.async = false;
-                    OutputDebugStringW(L"[Logger] Async disabled\n");
-                }
-            }
+			if (cfg.async) {
+				try {
+					m_worker = std::thread([this]() { WorkerLoop(); });
+					// Brief wait to allow worker to start
+					std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				}
+				catch (const std::exception& /*e*/) {
+					std::lock_guard<std::mutex> lk(m_cfgMutex);
+					m_cfg.async = false;
+					OutputDebugStringW(L"[Logger] Async mode disabled - thread creation failed\n");
+				}
+				catch (...) {
+					std::lock_guard<std::mutex> lk(m_cfgMutex);
+					m_cfg.async = false;
+					OutputDebugStringW(L"[Logger] Async mode disabled - unknown error\n");
+				}
+			}
 
-            m_accepting.store(true, std::memory_order_release);
-        }
+			// Start accepting messages
+			m_accepting.store(true, std::memory_order_release);
+		}
 
-        void Logger::ShutDown() {
-            bool expected = true;
-            if (!m_initialized.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
-                return;
-            }
+		// ============================================================================
+		// Shutdown
+		// ============================================================================
 
-            m_accepting.store(false, std::memory_order_release);
-            m_stop.store(true, std::memory_order_release);
-            m_queueCv.notify_all();
+		void Logger::ShutDown() {
+			// Only allow shutdown once
+			bool expected = true;
+			if (!m_initialized.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
+				return;  // Not initialized or already shut down
+			}
 
-			//thread join with timeout
-            if (m_worker.joinable()) {
-                try {
-                    //5 seconds timeout
-                    auto start = std::chrono::steady_clock::now();
-                    while (m_worker.joinable()) {
-                        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
-                            // Timeout → force detach
-                            OutputDebugStringW(L"[Logger] Worker thread join timeout, forcing detach\n");
-                            m_worker.detach();
-                            break;
-                        }
-                        m_queueCv.notify_all();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			// Stop accepting new messages
+			m_accepting.store(false, std::memory_order_release);
 
-                        
-                        if (!m_worker.joinable()) break;
+			// Signal worker thread to stop
+			m_stop.store(true, std::memory_order_release);
+			m_queueCv.notify_all();
 
-                        
-                        try {
-                            m_worker.join();
-                            break;
-                        }
-                        catch (...) {
-                            // Join failed, retry
-                        }
-                    }
-                }
-                catch (...) {
-                    if (m_worker.joinable()) {
-                        m_worker.detach();
-                    }
-                }
-            }
+			// Join worker thread with timeout
+			if (m_worker.joinable()) {
+				constexpr auto SHUTDOWN_TIMEOUT = std::chrono::seconds(5);
+				const auto deadline = std::chrono::steady_clock::now() + SHUTDOWN_TIMEOUT;
 
-			//Lock Management 
-            LogItem item;
-            bool asyncCfg = false;
-            bool toConsoleCfg = false;
-            bool toFileCfg = false;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                asyncCfg = m_cfg.async;
-                toConsoleCfg = m_cfg.toConsole;
-                toFileCfg = m_cfg.toFile;
-            }
+				try {
+					while (m_worker.joinable()) {
+						if (std::chrono::steady_clock::now() > deadline) {
+							// Timeout exceeded - force detach
+							OutputDebugStringW(L"[Logger] Worker thread join timeout, forcing detach\n");
+							m_worker.detach();
+							break;
+						}
 
-            while (Dequeue(item)) {
-                try {
-                    if (toConsoleCfg) WriteConsole(item);
-                    if (toFileCfg) WriteFile(item);
-                }
-                catch (...) {}
-            }
+						// Signal and wait briefly
+						m_queueCv.notify_all();
+						std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+						// Attempt join
+						try {
+							m_worker.join();
+							break;  // Success
+						}
+						catch (const std::system_error& /*e*/) {
+							// Join failed, retry until timeout
+						}
+					}
+				}
+				catch (...) {
+					// Emergency detach on any exception
+					if (m_worker.joinable()) {
+						m_worker.detach();
+					}
+				}
+			}
+
+			// Drain remaining queue items
+			bool toConsoleCfg = false;
+			bool toFileCfg = false;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				toConsoleCfg = m_cfg.toConsole;
+				toFileCfg = m_cfg.toFile;
+			}
+
+			LogItem item;
+			while (Dequeue(item)) {
+				try {
+					if (toConsoleCfg) WriteConsole(item);
+					if (toFileCfg) WriteFile(item);
+				}
+				catch (...) {
+					// Ignore errors during shutdown drain
+				}
+			}
+
+			// Close file and event log handles
 #ifdef _WIN32
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                if (m_file && m_file != INVALID_HANDLE_VALUE) {
-                    FlushFileBuffers(m_file);
-                    CloseHandle(m_file);
-                    m_file = INVALID_HANDLE_VALUE;
-                }
-            }
-            CloseEventLog();
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				if (m_file != nullptr && m_file != INVALID_HANDLE_VALUE) {
+					FlushFileBuffers(m_file);
+					CloseHandle(m_file);
+					m_file = INVALID_HANDLE_VALUE;
+				}
+			}
+			CloseEventLog();
 #endif
-        }
+		}
 
-        void Logger::setMinimalLevel(LogLevel level) noexcept {
-            m_minLevel.store(level, std::memory_order_release);
-        }
+		// ============================================================================
+		// Queue Operations
+		// ============================================================================
 
-        void Logger::Enqueue(LogItem&& item) {
-            if (!m_accepting.load(std::memory_order_acquire)) return;
-            if (!IsInitialized()) return;
-            if (!IsEnabled(item.level)) return;
+		void Logger::Enqueue(LogItem&& item) {
+			// Early exit checks with proper memory ordering
+			if (!m_accepting.load(std::memory_order_acquire)) return;
+			if (!IsInitialized()) return;
+			if (!IsEnabled(item.level)) return;
 
-            bool asyncCfg = false;
-            bool toConsoleCfg = false;
-            bool toFileCfg = false;
-            bool toEventLogCfg = false;
-            size_t maxQueueSz = 0;
+			// Capture configuration atomically
+			bool asyncCfg = false;
+			bool toConsoleCfg = false;
+			bool toFileCfg = false;
+			bool toEventLogCfg = false;
+			size_t maxQueueSz = 0;
 
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                asyncCfg = m_cfg.async;
-                toConsoleCfg = m_cfg.toConsole;
-                toFileCfg = m_cfg.toFile;
-                toEventLogCfg = m_cfg.toEventLog;
-                maxQueueSz = m_cfg.maxQueueSize;
-            }
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				asyncCfg = m_cfg.async;
+				toConsoleCfg = m_cfg.toConsole;
+				toFileCfg = m_cfg.toFile;
+				toEventLogCfg = m_cfg.toEventLog;
+				maxQueueSz = m_cfg.maxQueueSize;
+			}
 
-            if (asyncCfg) {
-                std::lock_guard<std::mutex> lk(m_queueMutex);
-                if (m_queue.size() >= maxQueueSz) {
-                    m_queue.pop_front();
-                }
-                m_queue.emplace_back(std::move(item));
-                m_queueCv.notify_one();
-            }
-            else {
-                try {
-                    if (toConsoleCfg) WriteConsole(item);
-                    if (toFileCfg) WriteFile(item);
-                    if (toEventLogCfg && item.level >= LogLevel::Warn) WriteEventLog(item);
-                }
-                catch (...) {}
-            }
-        }
+			if (asyncCfg) {
+				// Async mode: queue the item for worker thread
+				std::lock_guard<std::mutex> lk(m_queueMutex);
 
-        bool Logger::Dequeue(LogItem& out) {
-            std::lock_guard<std::mutex> lk(m_queueMutex);
-            if (m_queue.empty()) return false;
-            out = std::move(m_queue.front());
-            m_queue.pop_front();
-            return true;
-        }
+				// Drop oldest if queue is full (bounded queue pattern)
+				if (maxQueueSz > 0 && m_queue.size() >= maxQueueSz) {
+					m_queue.pop_front();
+				}
 
-        void Logger::WorkerLoop() {
-            while (!m_stop.load(std::memory_order_acquire)) {
-                LogItem item;
-                bool hasItem = false;
-                {
-                    std::unique_lock<std::mutex> lk(m_queueMutex);
-                    m_queueCv.wait_for(lk, std::chrono::seconds(1), [this]() {
-                        return m_stop.load(std::memory_order_acquire) || !m_queue.empty();
-                        });
+				m_queue.emplace_back(std::move(item));
+				m_queueCv.notify_one();
+			}
+			else {
+				// Sync mode: write directly
+				try {
+					if (toConsoleCfg) WriteConsole(item);
+					if (toFileCfg) WriteFile(item);
+					if (toEventLogCfg && item.level >= LogLevel::Warn) WriteEventLog(item);
+				}
+				catch (const std::exception& e) {
+					// Use OutputDebugString to avoid recursive logging
+					OutputDebugStringA("[Logger] Enqueue sync write exception: ");
+					OutputDebugStringA(e.what());
+					OutputDebugStringA("\n");
+				}
+				catch (...) {
+					OutputDebugStringW(L"[Logger] Enqueue sync write unknown exception\n");
+				}
+			}
+		}
 
-                    if (m_stop.load(std::memory_order_acquire) && m_queue.empty()) break;
-                    if (m_queue.empty()) continue;
+		bool Logger::Dequeue(LogItem& out) {
+			std::lock_guard<std::mutex> lk(m_queueMutex);
+			if (m_queue.empty()) {
+				return false;
+			}
+			out = std::move(m_queue.front());
+			m_queue.pop_front();
+			return true;
+		}
 
-                    item = std::move(m_queue.front());
-                    m_queue.pop_front();
-                    hasItem = true;
-                }
+		// ============================================================================
+		// Worker Thread
+		// ============================================================================
 
-                if (!hasItem) continue;
+		void Logger::WorkerLoop() {
+			while (!m_stop.load(std::memory_order_acquire)) {
+				LogItem item;
+				bool hasItem = false;
 
-                 
-                bool toConsoleCfg = false;
-                bool toFileCfg = false;
-                bool toEventLogCfg = false;
-                {
-                    std::lock_guard<std::mutex> lk(m_cfgmutex);
-                    toConsoleCfg = m_cfg.toConsole;
-                    toFileCfg = m_cfg.toFile;
-                    toEventLogCfg = m_cfg.toEventLog;
-                }
+				// Wait for items or stop signal
+				{
+					std::unique_lock<std::mutex> lk(m_queueMutex);
+					
+					// Wait with timeout to allow periodic stop checks
+					constexpr auto kWorkerWaitTimeout = std::chrono::seconds(1);
+					m_queueCv.wait_for(lk, kWorkerWaitTimeout, [this]() {
+						return m_stop.load(std::memory_order_acquire) || !m_queue.empty();
+					});
 
-                try {
-                    if (toConsoleCfg) WriteConsole(item);
-                    if (toFileCfg) WriteFile(item);
-                    if (toEventLogCfg && item.level >= LogLevel::Warn) WriteEventLog(item);
-                }
-                catch (...) {}
-            }
-        }
+					// Check stop condition with empty queue
+					if (m_stop.load(std::memory_order_acquire) && m_queue.empty()) {
+						break;
+					}
 
-        void Logger::LogEx(LogLevel level, const wchar_t* category, const wchar_t* file,
-            int line, const wchar_t* function, const wchar_t* format, ...) {
-            if (!IsEnabled(level)) return;
+					// Continue if spurious wakeup
+					if (m_queue.empty()) {
+						continue;
+					}
 
-            va_list args;
-            va_start(args, format);
-            std::wstring msg = FormatMessageV(format, args);
-            va_end(args);
+					// Dequeue item
+					item = std::move(m_queue.front());
+					m_queue.pop_front();
+					hasItem = true;
+				}
 
-            LogMessage(level, category, msg, file, line, function, 0);
-        }
+				if (!hasItem) {
+					continue;
+				}
 
-        void Logger::LogWinErrorEx(LogLevel level, const wchar_t* category, const wchar_t* file,
-            int line, const wchar_t* function, DWORD errorCode,
-            const wchar_t* contextFormat, ...) {
-            if (!IsEnabled(level)) return;
+				// Get configuration for output targets
+				bool toConsoleCfg = false;
+				bool toFileCfg = false;
+				bool toEventLogCfg = false;
+				{
+					std::lock_guard<std::mutex> lk(m_cfgMutex);
+					toConsoleCfg = m_cfg.toConsole;
+					toFileCfg = m_cfg.toFile;
+					toEventLogCfg = m_cfg.toEventLog;
+				}
 
-            va_list args;
-            va_start(args, contextFormat);
-            std::wstring context = FormatMessageV(contextFormat, args);
-            va_end(args);
+				// Write to configured targets
+				try {
+					if (toConsoleCfg) WriteConsole(item);
+					if (toFileCfg) WriteFile(item);
+					if (toEventLogCfg && item.level >= LogLevel::Warn) WriteEventLog(item);
+				}
+				catch (const std::exception& e) {
+					OutputDebugStringA("[Logger] WorkerLoop exception: ");
+					OutputDebugStringA(e.what());
+					OutputDebugStringA("\n");
+				}
+				catch (...) {
+					OutputDebugStringW(L"[Logger] WorkerLoop unknown exception\n");
+				}
+			}
+		}
 
-            std::wstring winErr = FormatWinError(errorCode);
-            std::wstring combined = context + L": " + winErr;
+		// ============================================================================
+		// Logging Entry Points
+		// ============================================================================
 
-            LogMessage(level, category, combined, file, line, function, errorCode);
-        }
+		void Logger::LogEx(LogLevel level, const wchar_t* category, const wchar_t* file,
+			int line, const wchar_t* function, const wchar_t* format, ...) {
+			if (!IsEnabled(level)) return;
 
-        void Logger::LogMessage(LogLevel level, const wchar_t* category, const std::wstring& message,
-            const wchar_t* file, int line, const wchar_t* function, DWORD winError) {
-            LogItem item{};
-            item.level = level;
-            item.category = category ? category : L"";
-            item.message = message;
-            item.file = file ? file : L"";
-            item.function = function ? function : L"";
-            item.line = line;
+			va_list args;
+			va_start(args, format);
+			std::wstring msg = FormatMessageV(format, args);
+			va_end(args);
+
+			LogMessage(level, category, msg, file, line, function, 0);
+		}
+
+		void Logger::LogWinErrorEx(LogLevel level, const wchar_t* category, const wchar_t* file,
+			int line, const wchar_t* function, DWORD errorCode,
+			const wchar_t* contextFormat, ...) {
+			if (!IsEnabled(level)) return;
+
+			va_list args;
+			va_start(args, contextFormat);
+			std::wstring context = FormatMessageV(contextFormat, args);
+			va_end(args);
+
+			std::wstring winErr = FormatWinError(errorCode);
+			std::wstring combined = context + L": " + winErr;
+
+			LogMessage(level, category, combined, file, line, function, errorCode);
+		}
+
+		void Logger::LogMessage(LogLevel level, const wchar_t* category, const std::wstring& message,
+			const wchar_t* file, int line, const wchar_t* function, DWORD winError) {
+			// Build log item with all metadata
+			LogItem item{};
+			item.level = level;
+			item.category = (category != nullptr) ? category : L"";
+			item.message = message;
+			item.file = (file != nullptr) ? file : L"";
+			item.function = (function != nullptr) ? function : L"";
+			item.line = line;
 #ifdef _WIN32
-            item.pid = GetCurrentProcessId();
-            item.tid = GetCurrentThreadId();
+			item.pid = GetCurrentProcessId();
+			item.tid = GetCurrentThreadId();
 #endif
-            item.ts_100ns = NowAsFileTime100nsUTC();
-            item.winError = winError;
+			item.ts_100ns = NowAsFileTime100nsUTC();
+			item.winError = winError;
 
-            Enqueue(std::move(item));
+			Enqueue(std::move(item));
 
-            LogLevel flushLvl = LogLevel::Error;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                flushLvl = m_cfg.flushLevel;
-            }
+			// Auto-flush for high severity messages
+			LogLevel flushLvl = LogLevel::Error;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				flushLvl = m_cfg.flushLevel;
+			}
 
-            if (static_cast<int>(level) >= static_cast<int>(flushLvl))
-                Flush();
-        }
+			if (static_cast<int>(level) >= static_cast<int>(flushLvl)) {
+				Flush();
+			}
+		}
 
-        void Logger::Flush() {
+		// ============================================================================
+		// Flush
+		// ============================================================================
+
+		void Logger::Flush() {
 #ifdef _WIN32
-            bool asyncCfg = false;
-            bool toConsoleCfg = false;
-            bool toFileCfg = false;
-            bool toEventLogCfg = false;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                asyncCfg = m_cfg.async;
-                toConsoleCfg = m_cfg.toConsole;
-                toFileCfg = m_cfg.toFile;
-                toEventLogCfg = m_cfg.toEventLog;
-            }
+			// Get current configuration
+			bool asyncCfg = false;
+			bool toConsoleCfg = false;
+			bool toFileCfg = false;
+			bool toEventLogCfg = false;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				asyncCfg = m_cfg.async;
+				toConsoleCfg = m_cfg.toConsole;
+				toFileCfg = m_cfg.toFile;
+				toEventLogCfg = m_cfg.toEventLog;
+			}
 
-            if (asyncCfg) {
-                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                while (std::chrono::steady_clock::now() < deadline) {
-                    {
-                        std::lock_guard<std::mutex> lk(m_queueMutex);
-                        if (m_queue.empty()) break;
-                    }
-                    m_queueCv.notify_all();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
+			if (asyncCfg) {
+				// Wait for queue to drain with timeout
+				constexpr auto FLUSH_TIMEOUT = std::chrono::seconds(5);
+				const auto deadline = std::chrono::steady_clock::now() + FLUSH_TIMEOUT;
+				
+				while (std::chrono::steady_clock::now() < deadline) {
+					{
+						std::lock_guard<std::mutex> lk(m_queueMutex);
+						if (m_queue.empty()) break;
+					}
+					m_queueCv.notify_all();
+					std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				}
 
-                LogItem x{};
-                while (Dequeue(x)) {
-                    try {
-                        if (toConsoleCfg) WriteConsole(x);
-                        if (toFileCfg) WriteFile(x);
-                        if (toEventLogCfg && x.level >= LogLevel::Warn) WriteEventLog(x);
-                    }
-                    catch (...) {}
-                }
-            }
+				// Drain any remaining items directly
+				LogItem x{};
+				while (Dequeue(x)) {
+					try {
+						if (toConsoleCfg) WriteConsole(x);
+						if (toFileCfg) WriteFile(x);
+						if (toEventLogCfg && x.level >= LogLevel::Warn) WriteEventLog(x);
+					}
+					catch (const std::exception& e) {
+						OutputDebugStringA("[Logger] Flush drain exception: ");
+						OutputDebugStringA(e.what());
+						OutputDebugStringA("\n");
+					}
+					catch (...) {
+						OutputDebugStringW(L"[Logger] Flush drain unknown exception\n");
+					}
+				}
+			}
 
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                if (m_file && m_file != INVALID_HANDLE_VALUE) {
-                    FlushFileBuffers(m_file);
-                }
-            }
+			// Flush file buffers
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				if (m_file != nullptr && m_file != INVALID_HANDLE_VALUE) {
+					FlushFileBuffers(m_file);
+				}
+			}
 #endif
-        }
+		}
 
-        const wchar_t* Logger::NarrowToWideTLS(const char* s) {
+		// ============================================================================
+		// String Conversion Utilities
+		// ============================================================================
+
+		const wchar_t* Logger::NarrowToWideTLS(const char* s) {
 #ifdef _WIN32
-            thread_local std::wstring buff;
-            if (!s) { buff.clear(); return buff.c_str(); }
+			thread_local std::wstring buff;
+			
+			// Null/empty check
+			if (s == nullptr) {
+				buff.clear();
+				return buff.c_str();
+			}
 
-            int len = static_cast<int>(strlen(s));
-            if (len <= 0) { buff.clear(); return buff.c_str(); }
-            if (len > 100000) { buff = L"[Too long]"; return buff.c_str(); }
+			const int len = static_cast<int>(strlen(s));
+			if (len <= 0) {
+				buff.clear();
+				return buff.c_str();
+			}
 
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
-            if (wlen <= 0) { buff.clear(); return buff.c_str(); }
-            if (wlen > 100000) { buff = L"[Too long]"; return buff.c_str(); }
+			// Safety limit to prevent DoS
+			constexpr int MAX_INPUT_LEN = 100000;
+			if (len > MAX_INPUT_LEN) {
+				buff = L"[Too long]";
+				return buff.c_str();
+			}
 
-            buff.resize(wlen);
-            if (MultiByteToWideChar(CP_UTF8, 0, s, len, &buff[0], wlen) <= 0) {
-                buff.clear();
-            }
-            return buff.c_str();
+			// Get required buffer size
+			const int wlen = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
+			if (wlen <= 0) {
+				buff.clear();
+				return buff.c_str();
+			}
+			if (wlen > MAX_INPUT_LEN) {
+				buff = L"[Too long]";
+				return buff.c_str();
+			}
+
+			// Perform conversion
+			buff.resize(static_cast<size_t>(wlen));
+			if (MultiByteToWideChar(CP_UTF8, 0, s, len, buff.data(), wlen) <= 0) {
+				buff.clear();
+			}
+			return buff.c_str();
 #else
-            static thread_local std::wstring buff;
-            buff.clear();
-            return buff.c_str();
+			static thread_local std::wstring buff;
+			buff.clear();
+			return buff.c_str();
 #endif
-        }
+		}
 
-        std::wstring Logger::FormatMessageV(const wchar_t* fmt, va_list args) {
-            if (!fmt) return L"";
+		// ============================================================================
+		// Message Formatting
+		// ============================================================================
 
-            
-            std::wstring out;
-            out.resize(512);
+		std::wstring Logger::FormatMessageV(const wchar_t* fmt, va_list args) {
+			if (fmt == nullptr) {
+				return L"";
+			}
 
-            va_list args_copy;
-            va_copy(args_copy, args);
-            int needed = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
-            va_end(args_copy);
+			// Initial buffer size
+			std::wstring out;
+			out.resize(512);
 
-            if (needed >= 0 && static_cast<size_t>(needed) < out.size()) {
-                out.resize(static_cast<size_t>(needed));
-                return out;
-            }
+			// First attempt with small buffer
+			va_list args_copy;
+			va_copy(args_copy, args);
+			const int needed = _vsnwprintf_s(out.data(), out.size(), _TRUNCATE, fmt, args_copy);
+			va_end(args_copy);
 
-            //Try big buffer
-            size_t cap = 1024;
-            constexpr size_t MAX_CAP = 1u << 20; // 1MB limit
-            while (cap <= MAX_CAP) {
-                out.resize(cap);
+			if (needed >= 0 && static_cast<size_t>(needed) < out.size()) {
+				out.resize(static_cast<size_t>(needed));
+				return out;
+			}
 
-                va_copy(args_copy, args);
-                int n = _vsnwprintf_s(&out[0], out.size(), _TRUNCATE, fmt, args_copy);
-                va_end(args_copy);
+			// Exponential growth for larger messages
+			size_t cap = 1024;
+			constexpr size_t MAX_CAP = 1u << 20;  // 1MB safety limit
+			
+			while (cap <= MAX_CAP) {
+				out.resize(cap);
 
-                if (n >= 0 && static_cast<size_t>(n) < out.size()) {
-                    out.resize(static_cast<size_t>(n));
-                    return out;
-                }
-                cap *= 2;
-            }
-            return L"[Logger] Message too large";
-        }
+				va_copy(args_copy, args);
+				const int n = _vsnwprintf_s(out.data(), out.size(), _TRUNCATE, fmt, args_copy);
+				va_end(args_copy);
 
-        std::wstring Logger::FormatWinError(DWORD err) {
+				if (n >= 0 && static_cast<size_t>(n) < out.size()) {
+					out.resize(static_cast<size_t>(n));
+					return out;
+				}
+				cap *= 2;
+			}
+			
+			return L"[Logger] Message too large";
+		}
+
+		std::wstring Logger::FormatWinError(DWORD err) {
 #ifdef _WIN32
-            LPWSTR buf = nullptr;
-            DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                (LPWSTR)&buf, 0, nullptr);
+			LPWSTR buf = nullptr;
+			const DWORD n = FormatMessageW(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+				nullptr,
+				err,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				reinterpret_cast<LPWSTR>(&buf),
+				0,
+				nullptr);
 
-            std::wstring out = L"WinError " + std::to_wstring(err);
-            if (n && buf) {
-                while (n && (buf[n - 1] == L'\r' || buf[n - 1] == L'\n' || buf[n - 1] == L' ')) --n;
-                out.append(L": ");
-                out.append(buf, buf + n);
-                LocalFree(buf);
-            }
-            return out;
+			std::wstring out = L"WinError " + std::to_wstring(err);
+			
+			if (n > 0 && buf != nullptr) {
+				// Trim trailing whitespace
+				DWORD trimmed = n;
+				while (trimmed > 0 && (buf[trimmed - 1] == L'\r' || 
+									   buf[trimmed - 1] == L'\n' || 
+									   buf[trimmed - 1] == L' ')) {
+					--trimmed;
+				}
+				out.append(L": ");
+				out.append(buf, static_cast<size_t>(trimmed));
+				LocalFree(buf);
+			}
+			return out;
 #else
-            return L"";
+			return L"";
 #endif
-        }
+		}
 
-        uint64_t Logger::NowAsFileTime100nsUTC() {
+		// ============================================================================
+		// Timestamp Utilities
+		// ============================================================================
+
+		uint64_t Logger::NowAsFileTime100nsUTC() {
 #ifdef _WIN32
-            FILETIME ft{};
-            typedef VOID(WINAPI* GetPreciseFunc)(LPFILETIME);
-            static GetPreciseFunc pGetPrecise = (GetPreciseFunc)GetProcAddress(GetModuleHandle(L"kernel32.dll"), "GetSystemTimePreciseAsFileTime");
-            if (pGetPrecise)
-                pGetPrecise(&ft);
-            else
-                GetSystemTimeAsFileTime(&ft);
+			FILETIME ft{};
+			
+			// Try high-precision timer first (Windows 8+)
+			using GetPreciseFunc = VOID(WINAPI*)(LPFILETIME);
+			static const GetPreciseFunc pGetPrecise = 
+				reinterpret_cast<GetPreciseFunc>(
+					GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemTimePreciseAsFileTime"));
+			
+			if (pGetPrecise != nullptr) {
+				pGetPrecise(&ft);
+			}
+			else {
+				GetSystemTimeAsFileTime(&ft);
+			}
 
-            ULARGE_INTEGER uli{};
-            uli.LowPart = ft.dwLowDateTime;
-            uli.HighPart = ft.dwHighDateTime;
-            return uli.QuadPart;
+			ULARGE_INTEGER uli{};
+			uli.LowPart = ft.dwLowDateTime;
+			uli.HighPart = ft.dwHighDateTime;
+			return uli.QuadPart;
 #else 
-            return 0;
+			return 0;
 #endif
-        }
+		}
 
-        std::wstring Logger::FormatIso8601UTC(uint64_t filetime100ns) {
+		std::wstring Logger::FormatIso8601UTC(uint64_t filetime100ns) {
 #ifdef _WIN32
-            FILETIME ft{};
-            ft.dwLowDateTime = static_cast<DWORD>(filetime100ns & 0xFFFFFFFFull);
-            ft.dwHighDateTime = static_cast<DWORD>((filetime100ns >> 32) & 0xFFFFFFFFull);
+			FILETIME ft{};
+			ft.dwLowDateTime = static_cast<DWORD>(filetime100ns & 0xFFFFFFFFull);
+			ft.dwHighDateTime = static_cast<DWORD>((filetime100ns >> 32) & 0xFFFFFFFFull);
 
-            SYSTEMTIME st{};
-            if (!FileTimeToSystemTime(&ft, &st)) {
-                return L"[Invalid timestamp]";
-            }
+			SYSTEMTIME st{};
+			if (!FileTimeToSystemTime(&ft, &st)) {
+				return L"[Invalid timestamp]";
+			}
 
-            wchar_t buf[40] = { 0 };
-            _snwprintf_s(buf, _TRUNCATE, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
-                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-            return std::wstring(buf);
+			wchar_t buf[40] = { 0 };
+			_snwprintf_s(buf, _TRUNCATE, L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+				st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+			return std::wstring(buf);
 #else
-            return L"";
+			return L"";
 #endif
-        }
+		}
 
-        std::wstring Logger::EscapeJson(const std::wstring& s) {
-            std::wstring out;
-            out.reserve(s.size() + 16);
+		// ============================================================================
+		// JSON Utilities
+		// ============================================================================
 
-            for (wchar_t c : s) {
-                switch (c) {
-                case L'\\': out += L"\\\\"; break;
-                case L'"':  out += L"\\\""; break;
-                case L'\b': out += L"\\b";  break;
-                case L'\f': out += L"\\f";  break;
-                case L'\n': out += L"\\n";  break;
-                case L'\r': out += L"\\r";  break;
-                case L'\t': out += L"\\t";  break;
-                default:
-                    if (c < 0x20) {
-                        wchar_t buf[7];
-                        _snwprintf_s(buf, _TRUNCATE, L"\\u%04x", (unsigned)c);
-                        out += buf;
-                    }
-                    else {
-                        out += c;
-                    }
-                }
-            }
-            return out;
-        }
+		std::wstring Logger::EscapeJson(const std::wstring& s) {
+			std::wstring out;
+			out.reserve(s.size() + 16);
 
-        std::wstring Logger::FormatPrefix(const LogItem& item) const {
-            std::wstring ts = FormatIso8601UTC(item.ts_100ns);
-            std::wstring s;
-            s.reserve(128);
-            s += ts;
-            s += L" [";
-            s += LevelToW(item.level);
-            s += L"]";
+			for (const wchar_t c : s) {
+				switch (c) {
+				case L'\\': out += L"\\\\"; break;
+				case L'"':  out += L"\\\""; break;
+				case L'\b': out += L"\\b";  break;
+				case L'\f': out += L"\\f";  break;
+				case L'\n': out += L"\\n";  break;
+				case L'\r': out += L"\\r";  break;
+				case L'\t': out += L"\\t";  break;
+				default:
+					if (c < 0x20) {
+						// Escape control characters as Unicode
+						wchar_t buf[7];
+						_snwprintf_s(buf, _TRUNCATE, L"\\u%04x", static_cast<unsigned>(c));
+						out += buf;
+					}
+					else {
+						out += c;
+					}
+				}
+			}
+			return out;
+		}
 
-            if (!item.category.empty()) {
-                s += L" [";
-                s += item.category;
-                s += L"]";
-            }
+		// ============================================================================
+		// Output Formatting
+		// ============================================================================
 
-            bool includeProcThreadIdCfg = false;
-            bool includeSrcLocationCfg = false;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                includeProcThreadIdCfg = m_cfg.includeProcThreadId;
-                includeSrcLocationCfg = m_cfg.includeSrcLocation;
-            }
+		std::wstring Logger::FormatPrefix(const LogItem& item) const {
+			const std::wstring ts = FormatIso8601UTC(item.ts_100ns);
+			std::wstring s;
+			s.reserve(128);
+			s += ts;
+			s += L" [";
+			s += LevelToW(item.level);
+			s += L"]";
 
-            if (includeProcThreadIdCfg) {
-                s += L" (";
-                s += std::to_wstring(item.pid);
-                s += L":";
-                s += std::to_wstring(item.tid);
-                s += L")";
-            }
+			if (!item.category.empty()) {
+				s += L" [";
+				s += item.category;
+				s += L"]";
+			}
 
-            if (includeSrcLocationCfg && !item.file.empty()) {
-                s += L" ";
-                s += item.file;
-                s += L":";
-                s += std::to_wstring(item.line);
+			// Get configuration for optional fields
+			bool includeProcThreadIdCfg = false;
+			bool includeSrcLocationCfg = false;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				includeProcThreadIdCfg = m_cfg.includeProcThreadId;
+				includeSrcLocationCfg = m_cfg.includeSrcLocation;
+			}
 
-                if (!item.function.empty()) {
-                    s += L" ";
-                    s += item.function;
-                }
-            }
+			// Process/Thread ID
+			if (includeProcThreadIdCfg) {
+				s += L" (";
+				s += std::to_wstring(item.pid);
+				s += L":";
+				s += std::to_wstring(item.tid);
+				s += L")";
+			}
 
-            s += L" - ";
-            return s;
-        }
+			// Source location
+			if (includeSrcLocationCfg && !item.file.empty()) {
+				s += L" ";
+				s += item.file;
+				s += L":";
+				s += std::to_wstring(item.line);
 
-        std::wstring Logger::FormatAsJson(const LogItem& item) const {
-            std::wstring s;
-            s.reserve(128 + item.message.size());
-            s += L"{\"ts\":\"";
-            s += EscapeJson(FormatIso8601UTC(item.ts_100ns));
-            s += L"\",\"lvl\":\"";
-            s += LevelToW(item.level);
-            s += L"\"";
+				if (!item.function.empty()) {
+					s += L" ";
+					s += item.function;
+				}
+			}
 
-            if (!item.category.empty()) {
-                s += L",\"cat\":\"";
-                s += EscapeJson(item.category);
-                s += L"\"";
-            }
+			s += L" - ";
+			return s;
+		}
 
-            bool includeProcThreadIdCfg = false;
-            bool includeSrcLocationCfg = false;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                includeProcThreadIdCfg = m_cfg.includeProcThreadId;
-                includeSrcLocationCfg = m_cfg.includeSrcLocation;
-            }
+		std::wstring Logger::FormatAsJson(const LogItem& item) const {
+			std::wstring s;
+			s.reserve(128 + item.message.size());
+			s += L"{\"ts\":\"";
+			s += EscapeJson(FormatIso8601UTC(item.ts_100ns));
+			s += L"\",\"lvl\":\"";
+			s += LevelToW(item.level);
+			s += L"\"";
 
-            if (includeProcThreadIdCfg) {
-                s += L",\"pid\":";
-                s += std::to_wstring(item.pid);
-                s += L",\"tid\":";
-                s += std::to_wstring(item.tid);
-            }
+			if (!item.category.empty()) {
+				s += L",\"cat\":\"";
+				s += EscapeJson(item.category);
+				s += L"\"";
+			}
 
-            if (includeSrcLocationCfg && !item.file.empty()) {
-                s += L",\"file\":\"";
-                s += EscapeJson(item.file);
-                s += L"\",\"line\":";
-                s += std::to_wstring(item.line);
+			// Get configuration for optional fields
+			bool includeProcThreadIdCfg = false;
+			bool includeSrcLocationCfg = false;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				includeProcThreadIdCfg = m_cfg.includeProcThreadId;
+				includeSrcLocationCfg = m_cfg.includeSrcLocation;
+			}
 
-                if (!item.function.empty()) {
-                    s += L",\"func\":\"";
-                    s += EscapeJson(item.function);
-                    s += L"\"";
-                }
-            }
+			if (includeProcThreadIdCfg) {
+				s += L",\"pid\":";
+				s += std::to_wstring(item.pid);
+				s += L",\"tid\":";
+				s += std::to_wstring(item.tid);
+			}
 
-            if (item.winError) {
-                s += L",\"winerr\":";
-                s += std::to_wstring(item.winError);
-            }
+			if (includeSrcLocationCfg && !item.file.empty()) {
+				s += L",\"file\":\"";
+				s += EscapeJson(item.file);
+				s += L"\",\"line\":";
+				s += std::to_wstring(item.line);
 
-            s += L",\"msg\":\"";
-            s += EscapeJson(item.message);
-            s += L"\"}";
-            return s;
-        }
+				if (!item.function.empty()) {
+					s += L",\"func\":\"";
+					s += EscapeJson(item.function);
+					s += L"\"";
+				}
+			}
 
-        void Logger::WriteConsole(const LogItem& item) {
+			if (item.winError != 0) {
+				s += L",\"winerr\":";
+				s += std::to_wstring(item.winError);
+			}
+
+			s += L",\"msg\":\"";
+			s += EscapeJson(item.message);
+			s += L"\"}";
+			return s;
+		}
+
+		// ============================================================================
+		// Console Output
+		// ============================================================================
+
+		void Logger::WriteConsole(const LogItem& item) {
 #ifdef _WIN32
-            if (!m_console || m_console == INVALID_HANDLE_VALUE) return;
+			// Validate console handle
+			if (m_console == nullptr || m_console == INVALID_HANDLE_VALUE) {
+				return;
+			}
 
-            WORD color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
-            switch (item.level) {
-            case LogLevel::Trace: color = FOREGROUND_BLUE | FOREGROUND_GREEN; break;
-            case LogLevel::Debug: color = FOREGROUND_BLUE | FOREGROUND_INTENSITY; break;
-            case LogLevel::Info:  color = FOREGROUND_GREEN | FOREGROUND_INTENSITY; break;
-            case LogLevel::Warn:  color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY; break;
-            case LogLevel::Error: color = FOREGROUND_RED | FOREGROUND_INTENSITY; break;
-            case LogLevel::Fatal: color = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY; break;
-            }
+			// Determine color based on log level
+			WORD color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+			switch (item.level) {
+			case LogLevel::Trace: color = FOREGROUND_BLUE | FOREGROUND_GREEN; break;
+			case LogLevel::Debug: color = FOREGROUND_BLUE | FOREGROUND_INTENSITY; break;
+			case LogLevel::Info:  color = FOREGROUND_GREEN | FOREGROUND_INTENSITY; break;
+			case LogLevel::Warn:  color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY; break;
+			case LogLevel::Error: color = FOREGROUND_RED | FOREGROUND_INTENSITY; break;
+			case LogLevel::Fatal: color = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY; break;
+			}
 
-            
-            CONSOLE_SCREEN_BUFFER_INFO csbi{};
-            if (!GetConsoleScreenBufferInfo(m_console, &csbi)) {
-                
-                csbi.wAttributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
-            }
+			// Save current console attributes
+			CONSOLE_SCREEN_BUFFER_INFO csbi{};
+			if (!GetConsoleScreenBufferInfo(m_console, &csbi)) {
+				csbi.wAttributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+			}
 
-            SetConsoleTextAttribute(m_console, color);
+			SetConsoleTextAttribute(m_console, color);
 
-            bool jsonLinesCfg = false;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                jsonLinesCfg = m_cfg.jsonLines;
-            }
+			// Get JSON format preference
+			bool jsonLinesCfg = false;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				jsonLinesCfg = m_cfg.jsonLines;
+			}
 
-            std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
-            line += L"\r\n";
+			std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+			line += L"\r\n";
 
-            // ✅ FIX: Integer overflow check BEFORE cast
-            constexpr size_t MAX_CONSOLE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
-            if (line.size() > MAX_CONSOLE_WRITE) {
-                line = L"[Logger] Message too large\r\n";
-            }
+			// Integer overflow check BEFORE cast
+			constexpr size_t MAX_CONSOLE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
+			if (line.size() > MAX_CONSOLE_WRITE) {
+				line = L"[Logger] Message too large\r\n";
+			}
 
-            DWORD written = 0;
-            ::WriteConsoleW(m_console, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
-            SetConsoleTextAttribute(m_console, csbi.wAttributes);
+			DWORD written = 0;
+			::WriteConsoleW(m_console, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
+			
+			// Restore original console attributes
+			SetConsoleTextAttribute(m_console, csbi.wAttributes);
 #endif
-        }
+		}
 
-        void Logger::OpenLogFileIfNeeded() {
+		// ============================================================================
+		// File Output
+		// ============================================================================
+
+		void Logger::OpenLogFileIfNeeded() {
 #ifdef _WIN32
-            
-            if (m_file && m_file != INVALID_HANDLE_VALUE) return;
+			// Already have a valid handle
+			if (m_file != nullptr && m_file != INVALID_HANDLE_VALUE) {
+				return;
+			}
 
-            std::wstring path = BaseLogPath();
-            m_file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			const std::wstring path = BaseLogPath();
+			m_file = CreateFileW(
+				path.c_str(),
+				FILE_APPEND_DATA,
+				FILE_SHARE_READ | FILE_SHARE_WRITE,
+				nullptr,
+				OPEN_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL,
+				nullptr);
 
-            if (m_file == INVALID_HANDLE_VALUE) {
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                m_file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (m_file == INVALID_HANDLE_VALUE) return;
-            }
+			if (m_file == INVALID_HANDLE_VALUE) {
+				// Retry once after brief delay
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				m_file = CreateFileW(
+					path.c_str(),
+					FILE_APPEND_DATA,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					nullptr,
+					OPEN_ALWAYS,
+					FILE_ATTRIBUTE_NORMAL,
+					nullptr);
+				
+				if (m_file == INVALID_HANDLE_VALUE) {
+					return;
+				}
+			}
 
-            m_actualLogPath = path;
-            LARGE_INTEGER size{};
-            if (GetFileSizeEx(m_file, &size))
-                m_currentSize = static_cast<uint64_t>(size.QuadPart);
-            else
-                m_currentSize = 0;
+			m_actualLogPath = path;
+			
+			// Get current file size
+			LARGE_INTEGER size{};
+			if (GetFileSizeEx(m_file, &size)) {
+				m_currentSize = static_cast<uint64_t>(size.QuadPart);
+			}
+			else {
+				m_currentSize = 0;
+			}
 #endif
-        }
+		}
 
-        void Logger::RotateIfNeeded(size_t nextWriteBytes) {
+		void Logger::RotateIfNeeded(size_t nextWriteBytes) {
 #ifdef _WIN32
-            
-            bool toFileCfg = m_cfg.toFile;
-            uint64_t maxFileSizeBytesCfg = m_cfg.maxFileSizeBytes;
+			// Get configuration
+			const bool toFileCfg = m_cfg.toFile;
+			const uint64_t maxFileSizeBytesCfg = m_cfg.maxFileSizeBytes;
 
-            if (!toFileCfg) return;
-            if (!m_file || m_file == INVALID_HANDLE_VALUE) return;
-            if (m_currentSize + nextWriteBytes <= maxFileSizeBytesCfg) return;
+			if (!toFileCfg) return;
+			if (m_file == nullptr || m_file == INVALID_HANDLE_VALUE) return;
+			if (m_currentSize + nextWriteBytes <= maxFileSizeBytesCfg) return;
 
-            PerformRotation();
+			PerformRotation();
 
-            
-            if (m_file && m_file != INVALID_HANDLE_VALUE) {
-                CloseHandle(m_file);
-                m_file = INVALID_HANDLE_VALUE;
-            }
-            OpenLogFileIfNeeded();
+			// Close and reopen file after rotation
+			if (m_file != nullptr && m_file != INVALID_HANDLE_VALUE) {
+				CloseHandle(m_file);
+				m_file = INVALID_HANDLE_VALUE;
+			}
+			OpenLogFileIfNeeded();
 #endif
-        }
+		}
 
-        void Logger::PerformRotation() {
+		// ============================================================================
+		// File Rotation
+		// ============================================================================
+
+		void Logger::PerformRotation() {
 #ifdef _WIN32
-            bool expected = false;
-            if (!m_insideRotation.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                return;
-            }
+			// Prevent re-entry during rotation
+			bool expected = false;
+			if (!m_insideRotation.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				return;
+			}
 
-            struct RotationGuard {
-                std::atomic<bool>& flag;
-                ~RotationGuard() { flag.store(false, std::memory_order_release); }
-            } guard{ m_insideRotation };
+			// RAII guard to ensure flag is reset
+			struct RotationGuard {
+				std::atomic<bool>& flag;
+				~RotationGuard() { flag.store(false, std::memory_order_release); }
+			} guard{ m_insideRotation };
 
-            try {
-                if (m_file && m_file != INVALID_HANDLE_VALUE) {
-                    ::FlushFileBuffers(m_file);
-                    ::CloseHandle(m_file);
-                    m_file = INVALID_HANDLE_VALUE;
-                }
+			try {
+				// Flush and close current file
+				if (m_file != nullptr && m_file != INVALID_HANDLE_VALUE) {
+					::FlushFileBuffers(m_file);
+					::CloseHandle(m_file);
+					m_file = INVALID_HANDLE_VALUE;
+				}
 
-                const std::wstring base = BaseLogPath();
-                size_t maxFileCountCfg = m_cfg.maxFileCount;  // ✅ Use m_cfg!
+				const std::wstring base = BaseLogPath();
+				const size_t maxFileCountCfg = m_cfg.maxFileCount;
 
-                if (maxFileCountCfg > 1) {
-                    std::wstring oldestFile = base + L"." + std::to_wstring(maxFileCountCfg);
+				if (maxFileCountCfg > 1) {
+					// Delete oldest file
+					const std::wstring oldestFile = base + L"." + std::to_wstring(maxFileCountCfg);
 
-                    DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
-                    if (attrs != INVALID_FILE_ATTRIBUTES) {
-                        ::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL);
-                        ::DeleteFileW(oldestFile.c_str());
-                    }
+					DWORD attrs = ::GetFileAttributesW(oldestFile.c_str());
+					if (attrs != INVALID_FILE_ATTRIBUTES) {
+						::SetFileAttributesW(oldestFile.c_str(), FILE_ATTRIBUTE_NORMAL);
+						::DeleteFileW(oldestFile.c_str());
+					}
 
-                    for (size_t idx = maxFileCountCfg - 1; idx >= 1; --idx) {
-                        std::wstring srcFile = base + L"." + std::to_wstring(idx);
-                        std::wstring dstFile = base + L"." + std::to_wstring(idx + 1);
+					// Rotate files: .n-1 -> .n, .n-2 -> .n-1, etc.
+					for (size_t idx = maxFileCountCfg - 1; idx >= 1; --idx) {
+						const std::wstring srcFile = base + L"." + std::to_wstring(idx);
+						const std::wstring dstFile = base + L"." + std::to_wstring(idx + 1);
 
-                        attrs = ::GetFileAttributesW(srcFile.c_str());
-                        if (attrs == INVALID_FILE_ATTRIBUTES) {
-                            if (idx == 1) break;
-                            continue;
-                        }
+						attrs = ::GetFileAttributesW(srcFile.c_str());
+						if (attrs == INVALID_FILE_ATTRIBUTES) {
+							if (idx == 1) break;
+							continue;
+						}
 
-                        attrs = ::GetFileAttributesW(dstFile.c_str());
-                        if (attrs != INVALID_FILE_ATTRIBUTES) {
-                            ::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
-                            ::DeleteFileW(dstFile.c_str());
-                        }
+						attrs = ::GetFileAttributesW(dstFile.c_str());
+						if (attrs != INVALID_FILE_ATTRIBUTES) {
+							::SetFileAttributesW(dstFile.c_str(), FILE_ATTRIBUTE_NORMAL);
+							::DeleteFileW(dstFile.c_str());
+						}
 
-                        ::MoveFileExW(srcFile.c_str(), dstFile.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+						::MoveFileExW(srcFile.c_str(), dstFile.c_str(), 
+							MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 
-                        if (idx == 1) break;
-                    }
+						if (idx == 1) break;
+					}
 
-                    std::wstring firstRotated = base + L".1";
-                    attrs = ::GetFileAttributesW(base.c_str());
-                    if (attrs != INVALID_FILE_ATTRIBUTES) {
-                        attrs = ::GetFileAttributesW(firstRotated.c_str());
-                        if (attrs != INVALID_FILE_ATTRIBUTES) {
-                            ::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
-                            ::DeleteFileW(firstRotated.c_str());
-                        }
-                        ::MoveFileExW(base.c_str(), firstRotated.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-                    }
-                }
-                else {
-                    DWORD attrs = ::GetFileAttributesW(base.c_str());
-                    if (attrs != INVALID_FILE_ATTRIBUTES) {
-                        ::SetFileAttributesW(base.c_str(), FILE_ATTRIBUTE_NORMAL);
-                        ::DeleteFileW(base.c_str());
-                    }
-                }
+					const std::wstring firstRotated = base + L".1";
+					attrs = ::GetFileAttributesW(base.c_str());
+					if (attrs != INVALID_FILE_ATTRIBUTES) {
+						attrs = ::GetFileAttributesW(firstRotated.c_str());
+						if (attrs != INVALID_FILE_ATTRIBUTES) {
+							::SetFileAttributesW(firstRotated.c_str(), FILE_ATTRIBUTE_NORMAL);
+							::DeleteFileW(firstRotated.c_str());
+						}
+						::MoveFileExW(base.c_str(), firstRotated.c_str(), 
+							MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+					}
+				}
+				else {
+					// Only one file allowed - just truncate
+					const DWORD attrs = ::GetFileAttributesW(base.c_str());
+					if (attrs != INVALID_FILE_ATTRIBUTES) {
+						::SetFileAttributesW(base.c_str(), FILE_ATTRIBUTE_NORMAL);
+						::DeleteFileW(base.c_str());
+					}
+				}
 
-                m_currentSize = 0;
-                m_actualLogPath.clear();
-            }
-            catch (...) {
-                // Rotation failed, continue
-            }
+				m_currentSize = 0;
+				m_actualLogPath.clear();
+			}
+			catch (const std::exception& e) {
+				OutputDebugStringA("[Logger] Rotation failed: ");
+				OutputDebugStringA(e.what());
+				OutputDebugStringA("\n");
+			}
+			catch (...) {
+				OutputDebugStringW(L"[Logger] Rotation failed with unknown exception\n");
+			}
 #endif
-        }
+		}
 
-        void Logger::EnsureLogDirectory() {
+		void Logger::EnsureLogDirectory() {
 #ifdef _WIN32
-            std::wstring logDirCfg;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                logDirCfg = m_cfg.logDirectory;
-            }
-            if (logDirCfg.empty()) return;
+			std::wstring logDirCfg;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				logDirCfg = m_cfg.logDirectory;
+			}
+			
+			if (logDirCfg.empty()) {
+				return;
+			}
 
-            DWORD attrs = GetFileAttributesW(logDirCfg.c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                return;
-            }
-            CreateDirectoryW(logDirCfg.c_str(), nullptr);
+			const DWORD attrs = GetFileAttributesW(logDirCfg.c_str());
+			if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+				return;  // Directory exists
+			}
+			
+			CreateDirectoryW(logDirCfg.c_str(), nullptr);
 #endif
-        }
+		}
 
-        std::wstring Logger::BaseLogPath() const {
+		std::wstring Logger::BaseLogPath() const {
 #ifdef _WIN32
-            // ⚠️ NOTE: Caller should lock m_cfgmutex OR accept stale read
-            std::wstring path = m_cfg.logDirectory;
-            if (!path.empty()) {
-                if (path.back() != L'\\' && path.back() != L'/')
-                    path.push_back(L'\\');
-            }
-            path += m_cfg.baseFileName;
-            path += L".log";
-            return path;
+			// NOTE: Caller should lock m_cfgMutex OR accept potentially stale read
+			std::wstring path = m_cfg.logDirectory;
+			if (!path.empty()) {
+				if (path.back() != L'\\' && path.back() != L'/') {
+					path.push_back(L'\\');
+				}
+			}
+			path += m_cfg.baseFileName;
+			path += L".log";
+			return path;
 #else
-            return L"ShadowStrike.log";
+			return L"ShadowStrike.log";
 #endif
-        }
+		}
 
-        std::wstring Logger::CurrentLogPath() const {
-            std::lock_guard<std::mutex> lk(m_cfgmutex);
-            return m_actualLogPath.empty() ? BaseLogPath() : m_actualLogPath;
-        }
+		std::wstring Logger::CurrentLogPath() const {
+			std::lock_guard<std::mutex> lk(m_cfgMutex);
+			return m_actualLogPath.empty() ? BaseLogPath() : m_actualLogPath;
+		}
 
-        void Logger::WriteFile(const LogItem& item) {
+		void Logger::WriteFile(const LogItem& item) {
 #ifdef _WIN32
-            std::lock_guard<std::mutex> lk(m_cfgmutex);
-            OpenLogFileIfNeeded();
-            if (!m_file || m_file == INVALID_HANDLE_VALUE) return;
+			std::lock_guard<std::mutex> lk(m_cfgMutex);
+			
+			OpenLogFileIfNeeded();
+			if (m_file == nullptr || m_file == INVALID_HANDLE_VALUE) {
+				return;
+			}
 
-            bool jsonLinesCfg = m_cfg.jsonLines;
-            std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
-            line += L"\r\n";
+			const bool jsonLinesCfg = m_cfg.jsonLines;
+			std::wstring line = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+			line += L"\r\n";
 
-            // Integer overflow check BEFORE calculation
-            constexpr size_t MAX_FILE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
-            if (line.size() > MAX_FILE_WRITE) {
-                return;
-            }
+			// Integer overflow check BEFORE calculation
+			constexpr size_t MAX_FILE_WRITE = std::numeric_limits<DWORD>::max() / sizeof(wchar_t);
+			if (line.size() > MAX_FILE_WRITE) {
+				return;
+			}
 
-            const BYTE* data = reinterpret_cast<const BYTE*>(line.c_str());
-            const DWORD bytesToWrite = static_cast<DWORD>(line.size() * sizeof(wchar_t));
+			const BYTE* data = reinterpret_cast<const BYTE*>(line.c_str());
+			const DWORD bytesToWrite = static_cast<DWORD>(line.size() * sizeof(wchar_t));
 
-            RotateIfNeeded(bytesToWrite);
+			RotateIfNeeded(bytesToWrite);
 
-            DWORD written = 0;
-            if (!::WriteFile(m_file, data, bytesToWrite, &written, nullptr)) {
-                // Write failed,return
-                return;
-            }
-            m_currentSize += written;
+			DWORD written = 0;
+			if (!::WriteFile(m_file, data, bytesToWrite, &written, nullptr)) {
+				// Write failed
+				return;
+			}
+			m_currentSize += written;
 
-            LogLevel flushLevelCfg = m_cfg.flushLevel;
-            if (static_cast<int>(item.level) >= static_cast<int>(flushLevelCfg))
-                FlushFileBuffers(m_file);
+			// Flush for high severity messages
+			const LogLevel flushLevelCfg = m_cfg.flushLevel;
+			if (static_cast<int>(item.level) >= static_cast<int>(flushLevelCfg)) {
+				FlushFileBuffers(m_file);
+			}
 #endif
-        }
+		}
 
-        void Logger::OpenEventLog() {
+		// ============================================================================
+		// Windows Event Log
+		// ============================================================================
+
+		void Logger::OpenEventLog() {
 #ifdef _WIN32
-            if (m_eventSrc) return;
-            std::wstring eventLogSourceCfg;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                eventLogSourceCfg = m_cfg.eventLogSource;
-            }
-            m_eventSrc = RegisterEventSourceW(nullptr, eventLogSourceCfg.c_str());
+			if (m_eventSrc != nullptr) {
+				return;
+			}
+			
+			std::wstring eventLogSourceCfg;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				eventLogSourceCfg = m_cfg.eventLogSource;
+			}
+			m_eventSrc = RegisterEventSourceW(nullptr, eventLogSourceCfg.c_str());
 #endif
-        }
+		}
 
-        void Logger::CloseEventLog() {
+		void Logger::CloseEventLog() {
 #ifdef _WIN32
-            if (m_eventSrc) {
-                DeregisterEventSource(m_eventSrc);
-                m_eventSrc = nullptr;
-            }
+			if (m_eventSrc != nullptr) {
+				DeregisterEventSource(m_eventSrc);
+				m_eventSrc = nullptr;
+			}
 #endif
-        }
+		}
 
-        void Logger::WriteEventLog(const LogItem& item) {
+		void Logger::WriteEventLog(const LogItem& item) {
 #ifdef _WIN32
-            bool toEventLogCfg = false;
-            bool jsonLinesCfg = false;
-            {
-                std::lock_guard<std::mutex> lk(m_cfgmutex);
-                toEventLogCfg = m_cfg.toEventLog;
-                jsonLinesCfg = m_cfg.jsonLines;
-            }
+			// Get configuration
+			bool toEventLogCfg = false;
+			bool jsonLinesCfg = false;
+			{
+				std::lock_guard<std::mutex> lk(m_cfgMutex);
+				toEventLogCfg = m_cfg.toEventLog;
+				jsonLinesCfg = m_cfg.jsonLines;
+			}
 
-            if (!toEventLogCfg) return;
-            if (!m_eventSrc) OpenEventLog();
-            if (!m_eventSrc) return;
+			if (!toEventLogCfg) {
+				return;
+			}
+			
+			if (m_eventSrc == nullptr) {
+				OpenEventLog();
+			}
+			if (m_eventSrc == nullptr) {
+				return;
+			}
 
-            WORD type = EVENTLOG_SUCCESS;
-            switch (item.level) {
-            case LogLevel::Warn:  type = EVENTLOG_WARNING_TYPE; break;
-            case LogLevel::Error: type = EVENTLOG_ERROR_TYPE;   break;
-            case LogLevel::Fatal: type = EVENTLOG_ERROR_TYPE;   break;
-            default:              type = EVENTLOG_INFORMATION_TYPE; break;
-            }
+			// Map log level to Windows event type
+			WORD type = EVENTLOG_SUCCESS;
+			switch (item.level) {
+			case LogLevel::Warn:  type = EVENTLOG_WARNING_TYPE; break;
+			case LogLevel::Error: type = EVENTLOG_ERROR_TYPE;   break;
+			case LogLevel::Fatal: type = EVENTLOG_ERROR_TYPE;   break;
+			default:              type = EVENTLOG_INFORMATION_TYPE; break;
+			}
 
-            std::wstring payload = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
-            const wchar_t* strings[1] = { payload.c_str() };
-            ::ReportEventW(m_eventSrc, type, 0, 0, nullptr, 1, 0, strings, nullptr);
+			const std::wstring payload = jsonLinesCfg ? FormatAsJson(item) : (FormatPrefix(item) + item.message);
+			const wchar_t* strings[1] = { payload.c_str() };
+			::ReportEventW(m_eventSrc, type, 0, 0, nullptr, 1, 0, strings, nullptr);
 #endif
-        }
+		}
 
-        Logger::Scope::Scope(const wchar_t* category, const wchar_t* file, int line,
-            const wchar_t* function, const wchar_t* messageOnEnter, LogLevel level)
-            : m_category(category ? category : L"")
-            , m_file(file ? file : L"")
-            , m_line(line)
-            , m_function(function ? function : L"")
-            , m_level(level)
-        {
+		// ============================================================================
+		// Scope Timing (RAII)
+		// ============================================================================
+
+		Logger::Scope::Scope(const wchar_t* category, const wchar_t* file, int line,
+			const wchar_t* function, const wchar_t* messageOnEnter, LogLevel level)
+			: m_category((category != nullptr) ? category : L"")
+			, m_file((file != nullptr) ? file : L"")
+			, m_line(line)
+			, m_function((function != nullptr) ? function : L"")
+			, m_level(level)
+		{
 #ifdef _WIN32
-            QueryPerformanceFrequency(&m_freq);
-            QueryPerformanceCounter(&m_start);
+			QueryPerformanceFrequency(&m_freq);
+			QueryPerformanceCounter(&m_start);
 #endif
-            Logger::Instance().LogMessage(m_level, m_category, messageOnEnter, m_file, m_line, m_function, 0);
-        }
+			Logger::Instance().LogMessage(m_level, m_category, messageOnEnter, m_file, m_line, m_function, 0);
+		}
 
-        Logger::Scope::~Scope() {
+		Logger::Scope::~Scope() {
 #ifdef _WIN32
-            LARGE_INTEGER end{};
-            QueryPerformanceCounter(&end);
+			LARGE_INTEGER end{};
+			QueryPerformanceCounter(&end);
 
-            if (m_freq.QuadPart == 0) {
-                Logger::Instance().LogMessage(m_level, m_category, L"Leave", m_file, m_line, m_function, 0);
-                return;
-            }
+			// Guard against division by zero
+			if (m_freq.QuadPart == 0) {
+				Logger::Instance().LogMessage(m_level, m_category, L"Leave", m_file, m_line, m_function, 0);
+				return;
+			}
 
-            const double ms = (double)(end.QuadPart - m_start.QuadPart) * 1000.0 / (double)m_freq.QuadPart;
-            wchar_t buf[64];
-            _snwprintf_s(buf, _TRUNCATE, L"Leave (%.3f ms)", ms);
-            Logger::Instance().LogMessage(m_level, m_category, buf, m_file, m_line, m_function, 0);
+			// Calculate elapsed time in milliseconds
+			const double ms = static_cast<double>(end.QuadPart - m_start.QuadPart) * 1000.0 / 
+							  static_cast<double>(m_freq.QuadPart);
+			
+			wchar_t buf[64];
+			_snwprintf_s(buf, _TRUNCATE, L"Leave (%.3f ms)", ms);
+			Logger::Instance().LogMessage(m_level, m_category, buf, m_file, m_line, m_function, 0);
 #endif
-        }
+		}
 
-    } // namespace Utils
+	} // namespace Utils
 } // namespace ShadowStrike
