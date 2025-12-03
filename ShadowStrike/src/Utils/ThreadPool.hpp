@@ -1,8 +1,35 @@
+/**
+ * @file ThreadPool.hpp
+ * @brief Enterprise-grade thread pool implementation with ETW tracing support
+ *
+ * This file provides a comprehensive thread pool implementation designed for
+ * high-performance, mission-critical security applications. Features include:
+ * - Priority-based task scheduling
+ * - Work stealing for load balancing
+ * - ETW (Event Tracing for Windows) integration
+ * - Deadlock detection
+ * - Cancellation token support
+ * - Comprehensive statistics and metrics
+ *
+ * @note This implementation is Windows-specific and uses Windows APIs.
+ * @warning Thread pool operations are not signal-safe.
+ *
+ * @copyright ShadowStrike Security Suite
+ */
+
 #pragma once
 
+#ifndef SHADOWSTRIKE_THREADPOOL_HPP
+#define SHADOWSTRIKE_THREADPOOL_HPP
+
 #ifdef _WIN32
-#define NOMINMAX
-#endif// _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#endif // _WIN32
 
 #include <Windows.h>
 #include <evntprov.h>
@@ -27,207 +54,465 @@
 #include <latch>
 #include <barrier>
 #include <semaphore>
-#include<shared_mutex>
+#include <shared_mutex>
+#include <cstdint>
+#include <limits>
 
-// Forward declarations
 namespace ShadowStrike::Utils {
 
-// ============================================================================
+//=============================================================================
+// Constants
+//=============================================================================
+
+namespace ThreadPoolConstants {
+    /** Maximum allowed number of worker threads */
+    inline constexpr size_t kMaxThreads = 1024;
+
+    /** Maximum queue size to prevent memory exhaustion */
+    inline constexpr size_t kMaxQueueSize = 1000000;
+
+    /** Default idle timeout for worker threads (30 seconds) */
+    inline constexpr std::chrono::milliseconds kDefaultIdleTimeout{30000};
+
+    /** Default task timeout (5 minutes) */
+    inline constexpr std::chrono::milliseconds kDefaultTaskTimeout{300000};
+
+    /** Default stack size per thread (1 MB) */
+    inline constexpr size_t kDefaultStackSize = 1024 * 1024;
+
+    /** Default max memory per thread (100 MB) */
+    inline constexpr size_t kDefaultMaxMemoryPerThread = 100 * 1024 * 1024;
+
+    /** Default deadlock check interval (5 seconds) */
+    inline constexpr std::chrono::milliseconds kDefaultDeadlockCheckInterval{5000};
+
+    /** Suspicious thread inactivity threshold (30 seconds) */
+    inline constexpr std::chrono::seconds kInactivityThreshold{30};
+
+    /** Queue overflow threshold percentage */
+    inline constexpr double kQueueOverflowThreshold = 0.9;
+
+    /** Deadlock detection suspicious ratio */
+    inline constexpr double kDeadlockSuspiciousRatio = 0.5;
+
+    /** Health check success rate threshold */
+    inline constexpr double kHealthySuccessRate = 95.0;
+} // namespace ThreadPoolConstants
+
+//=============================================================================
 // ETW Provider GUID and Event Descriptors
-// ============================================================================
-// {A5F3D1E2-8B4C-4D5E-9F6A-1B2C3D4E5F6A}
-static constexpr GUID SHADOWSTRIKE_THREADPOOL_PROVIDER = 
+//=============================================================================
+
+/**
+ * ETW Provider GUID for ShadowStrike ThreadPool
+ * {A5F3D1E2-8B4C-4D5E-9F6A-1B2C3D4E5F6A}
+ */
+inline constexpr GUID SHADOWSTRIKE_THREADPOOL_PROVIDER = 
     { 0xa5f3d1e2, 0x8b4c, 0x4d5e, { 0x9f, 0x6a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a } };
 
-// ETW Event IDs
-enum class ETWEventId : UCHAR {
-    ThreadPoolCreated = 1,
-    ThreadPoolDestroyed = 2,
-    ThreadCreated = 3,
-    ThreadDestroyed = 4,
-    TaskEnqueued = 5,
-    TaskStarted = 6,
-    TaskCompleted = 7,
-    TaskFailed = 8,
-    ThreadException = 9,
-    PoolPaused = 10,
-    PoolResumed = 11,
-    PoolResized = 12,
-    ThreadStarved = 13,
-    QueueOverflow = 14,
-    PerformanceMetrics = 15,
-    ThreadPriorityChanged = 16,
-    ThreadAffinityChanged = 17,
-    TaskCancelled = 18,
-    DeadlockDetected = 19,
-    MemoryPressure = 20
+/**
+ * @enum ETWEventId
+ * @brief ETW Event identifiers for ThreadPool diagnostics
+ */
+enum class ETWEventId : uint8_t {
+    ThreadPoolCreated = 1,      ///< Thread pool instance created
+    ThreadPoolDestroyed = 2,    ///< Thread pool instance destroyed
+    ThreadCreated = 3,          ///< Worker thread created
+    ThreadDestroyed = 4,        ///< Worker thread destroyed
+    TaskEnqueued = 5,           ///< Task added to queue
+    TaskStarted = 6,            ///< Task execution started
+    TaskCompleted = 7,          ///< Task execution completed successfully
+    TaskFailed = 8,             ///< Task execution failed with exception
+    ThreadException = 9,        ///< Worker thread caught exception
+    PoolPaused = 10,            ///< Thread pool paused
+    PoolResumed = 11,           ///< Thread pool resumed
+    PoolResized = 12,           ///< Thread pool size changed
+    ThreadStarved = 13,         ///< Thread starvation detected
+    QueueOverflow = 14,         ///< Task queue near or at capacity
+    PerformanceMetrics = 15,    ///< Periodic performance metrics
+    ThreadPriorityChanged = 16, ///< Thread priority modified
+    ThreadAffinityChanged = 17, ///< Thread affinity mask changed
+    TaskCancelled = 18,         ///< Task was cancelled before completion
+    DeadlockDetected = 19,      ///< Potential deadlock detected
+    MemoryPressure = 20         ///< High memory usage warning
 };
 
-// ETW Event Levels
-enum class ETWLevel : UCHAR {
-    LogAlways = 0,
-    Critical = 1,
-    Error = 2,
-    Warning = 3,
-    Information = 4,
-    Verbose = 5
+/**
+ * @enum ETWLevel
+ * @brief ETW Event severity levels
+ */
+enum class ETWLevel : uint8_t {
+    LogAlways = 0,    ///< Always logged
+    Critical = 1,     ///< Critical errors
+    Error = 2,        ///< Errors
+    Warning = 3,      ///< Warnings
+    Information = 4,  ///< Informational
+    Verbose = 5       ///< Verbose/debug
 };
 
-// ============================================================================
+//=============================================================================
 // Task Priority System
-// ============================================================================
+//=============================================================================
+
+/**
+ * @enum TaskPriority
+ * @brief Task scheduling priority levels
+ *
+ * Lower values indicate higher priority. Tasks with higher priority
+ * are dequeued and executed before lower priority tasks.
+ */
 enum class TaskPriority : uint8_t {
-    Critical = 0,    // Real-time scanning threats
-    High = 1,        // User-initiated scans
-    Normal = 2,      // Background scans
-    Low = 3,         // Scheduled maintenance
-    Idle = 4         // Idle-time operations
+    Critical = 0,  ///< Highest priority - real-time threat scanning
+    High = 1,      ///< High priority - user-initiated operations
+    Normal = 2,    ///< Normal priority - background processing
+    Low = 3,       ///< Low priority - scheduled maintenance
+    Idle = 4       ///< Lowest priority - idle-time operations
 };
 
-// ============================================================================
+//=============================================================================
 // Thread Pool Configuration
-// ============================================================================
+//=============================================================================
+
+/**
+ * @struct ThreadPoolConfig
+ * @brief Configuration options for ThreadPool initialization
+ *
+ * This structure contains all configurable parameters for the thread pool.
+ * Use Validate() to check if the configuration is valid before use.
+ */
 struct ThreadPoolConfig {
-    // Core thread pool settings
+    //-------------------------------------------------------------------------
+    // Core Thread Pool Settings
+    //-------------------------------------------------------------------------
+    
+    /** Minimum number of worker threads (always maintained) */
     size_t minThreads = 4;
-    size_t maxThreads = std::thread::hardware_concurrency() * 2;
+    
+    /** Maximum number of worker threads (hard limit) */
+    size_t maxThreads = std::max(static_cast<size_t>(4), 
+                                  static_cast<size_t>(std::thread::hardware_concurrency() * 2));
+    
+    /** Maximum number of tasks in the queue */
     size_t maxQueueSize = 10000;
     
-    // Thread lifetime settings
-    std::chrono::milliseconds threadIdleTimeout{30000}; // 30 seconds
-    std::chrono::milliseconds taskTimeout{300000};      // 5 minutes
+    //-------------------------------------------------------------------------
+    // Thread Lifetime Settings
+    //-------------------------------------------------------------------------
     
-    // Performance tuning
+    /** Idle timeout before thread can be terminated */
+    std::chrono::milliseconds threadIdleTimeout{ThreadPoolConstants::kDefaultIdleTimeout};
+    
+    /** Maximum time a task can execute before timeout */
+    std::chrono::milliseconds taskTimeout{ThreadPoolConstants::kDefaultTaskTimeout};
+    
+    //-------------------------------------------------------------------------
+    // Performance Tuning
+    //-------------------------------------------------------------------------
+    
+    /** Enable thread affinity assignment */
     bool enableThreadAffinity = true;
+    
+    /** Enable priority boost for completing tasks */
     bool enablePriorityBoost = false;
+    
+    /** Enable ETW event tracing */
     bool enableETW = true;
+    
+    /** Enable performance counter collection */
     bool enablePerformanceCounters = true;
     
-    // Resource limits
-    size_t maxMemoryPerThread = 100 * 1024 * 1024; // 100 MB
-    size_t stackSizePerThread = 1024 * 1024;       // 1 MB
+    //-------------------------------------------------------------------------
+    // Resource Limits
+    //-------------------------------------------------------------------------
     
-    // Thread priority
+    /** Maximum memory allocation per thread */
+    size_t maxMemoryPerThread = ThreadPoolConstants::kDefaultMaxMemoryPerThread;
+    
+    /** Stack size for each worker thread */
+    size_t stackSizePerThread = ThreadPoolConstants::kDefaultStackSize;
+    
+    //-------------------------------------------------------------------------
+    // Thread Priority
+    //-------------------------------------------------------------------------
+    
+    /** Default thread priority for worker threads */
     int threadPriority = THREAD_PRIORITY_NORMAL;
     
-    // Debugging and diagnostics
-    bool enableDeadlockDetection = true;
-    bool enableTaskProfiling = true;
-    std::chrono::milliseconds deadlockCheckInterval{5000};
+    //-------------------------------------------------------------------------
+    // Debugging and Diagnostics
+    //-------------------------------------------------------------------------
     
-    // Thread naming
+    /** Enable deadlock detection monitoring */
+    bool enableDeadlockDetection = true;
+    
+    /** Enable task execution profiling */
+    bool enableTaskProfiling = true;
+    
+    /** Interval between deadlock detection checks */
+    std::chrono::milliseconds deadlockCheckInterval{ThreadPoolConstants::kDefaultDeadlockCheckInterval};
+    
+    //-------------------------------------------------------------------------
+    // Thread Naming
+    //-------------------------------------------------------------------------
+    
+    /** Prefix for worker thread names (visible in debugger) */
     std::wstring threadNamePrefix = L"ShadowStrike-Worker";
     
-    // Work stealing
+    //-------------------------------------------------------------------------
+    // Work Stealing
+    //-------------------------------------------------------------------------
+    
+    /** Enable work stealing between worker threads */
     bool enableWorkStealing = true;
+    
+    /** Minimum queue depth before work stealing activates */
     size_t workStealingThreshold = 3;
     
-    // Validation
+    //-------------------------------------------------------------------------
+    // Methods
+    //-------------------------------------------------------------------------
+    
+    /**
+     * @brief Validates the configuration parameters
+     * @return true if configuration is valid, false otherwise
+     */
     [[nodiscard]] bool Validate() const noexcept;
 };
 
-// ============================================================================
+//=============================================================================
 // Task Statistics
-// ============================================================================
+//=============================================================================
+
+/**
+ * @struct TaskStatistics
+ * @brief Tracks task execution statistics
+ *
+ * All counters are atomic for thread-safe access without external locking.
+ * Use relaxed memory ordering for statistics that don't need strict ordering.
+ */
 struct TaskStatistics {
+    /** Total number of tasks enqueued */
     std::atomic<uint64_t> enqueuedCount{0};
+    
+    /** Number of tasks completed successfully */
     std::atomic<uint64_t> completedCount{0};
+    
+    /** Number of tasks that failed with exceptions */
     std::atomic<uint64_t> failedCount{0};
+    
+    /** Number of tasks cancelled before execution */
     std::atomic<uint64_t> cancelledCount{0};
+    
+    /** Number of tasks that exceeded timeout */
     std::atomic<uint64_t> timedOutCount{0};
     
+    /** Cumulative execution time in milliseconds */
     std::atomic<uint64_t> totalExecutionTimeMs{0};
+    
+    /** Cumulative wait time in queue in milliseconds */
     std::atomic<uint64_t> totalWaitTimeMs{0};
     
-    std::atomic<uint64_t> minExecutionTimeMs{UINT64_MAX};
+    /** Minimum task execution time in milliseconds */
+    std::atomic<uint64_t> minExecutionTimeMs{std::numeric_limits<uint64_t>::max()};
+    
+    /** Maximum task execution time in milliseconds */
     std::atomic<uint64_t> maxExecutionTimeMs{0};
     
+    /** Resets all statistics to initial values */
     void Reset() noexcept;
+    
+    /** @return Average task execution time in milliseconds, or 0 if no tasks completed */
     [[nodiscard]] double GetAverageExecutionTimeMs() const noexcept;
+    
+    /** @return Average time tasks spend in queue in milliseconds */
     [[nodiscard]] double GetAverageWaitTimeMs() const noexcept;
+    
+    /** @return Percentage of tasks completed successfully (0-100) */
     [[nodiscard]] double GetSuccessRate() const noexcept;
 };
 
-// ============================================================================
+//=============================================================================
 // Thread Statistics
-// ============================================================================
+//=============================================================================
+
+/**
+ * @struct ThreadStatistics
+ * @brief Tracks worker thread statistics
+ */
 struct ThreadStatistics {
+    /** Current number of active worker threads */
     std::atomic<size_t> currentThreadCount{0};
+    
+    /** Peak number of concurrent threads */
     std::atomic<size_t> peakThreadCount{0};
+    
+    /** Number of threads currently executing tasks */
     std::atomic<size_t> activeThreadCount{0};
+    
+    /** Number of idle threads waiting for work */
     std::atomic<size_t> idleThreadCount{0};
     
+    /** Total threads created during pool lifetime */
     std::atomic<uint64_t> totalThreadsCreated{0};
+    
+    /** Total threads destroyed during pool lifetime */
     std::atomic<uint64_t> totalThreadsDestroyed{0};
     
+    /** Number of thread creation failures */
     std::atomic<uint64_t> threadCreationFailures{0};
+    
+    /** Number of exceptions caught by worker threads */
     std::atomic<uint64_t> threadExceptions{0};
     
+    /** Resets all statistics to initial values */
     void Reset() noexcept;
 };
 
-// ============================================================================
+//=============================================================================
 // Performance Metrics
-// ============================================================================
+//=============================================================================
+
+/**
+ * @struct PerformanceMetrics
+ * @brief Real-time performance monitoring data
+ */
 struct PerformanceMetrics {
-    // Queue metrics
+    /** Current number of tasks in queue */
     std::atomic<size_t> currentQueueSize{0};
+    
+    /** Peak queue size observed */
     std::atomic<size_t> peakQueueSize{0};
     
-    // Throughput metrics
+    /** Estimated tasks completed per second */
     std::atomic<uint64_t> tasksPerSecond{0};
+    
+    /** Total bytes processed by tasks */
     std::atomic<uint64_t> bytesProcessed{0};
     
-    // Resource utilization
+    /** Estimated CPU utilization (0-100) */
     std::atomic<double> cpuUtilization{0.0};
+    
+    /** Current memory usage in bytes */
     std::atomic<uint64_t> memoryUsage{0};
     
-    // Timing metrics
-    std::chrono::steady_clock::time_point startTime;
+    /** Time point when pool was started */
+    std::chrono::steady_clock::time_point startTime{std::chrono::steady_clock::now()};
+    
+    /** Total uptime in seconds */
     std::atomic<uint64_t> totalUptime{0};
     
+    /** Resets all metrics to initial values */
     void Reset() noexcept;
+    
+    /**
+     * @brief Updates throughput calculation
+     * @param completedTasks Number of tasks completed
+     * @param elapsed Time elapsed since last update
+     */
     void UpdateThroughput(uint64_t completedTasks, 
                          std::chrono::milliseconds elapsed) noexcept;
 };
 
-// ============================================================================
+//=============================================================================
 // Task Context
-// ============================================================================
+//=============================================================================
+
+/**
+ * @struct TaskContext
+ * @brief Context information passed to each task during execution
+ *
+ * TaskContext provides tasks with:
+ * - Unique task identifier
+ * - Priority information
+ * - Timing information (enqueue/start times)
+ * - Source location for debugging
+ * - Cancellation token for cooperative cancellation
+ * - Optional timeout
+ */
 struct TaskContext {
-    uint64_t taskId;
-    TaskPriority priority;
-    std::chrono::steady_clock::time_point enqueueTime;
-    std::chrono::steady_clock::time_point startTime;
-    std::source_location location;
+    /** Unique identifier for this task */
+    uint64_t taskId{0};
+    
+    /** Task priority level */
+    TaskPriority priority{TaskPriority::Normal};
+    
+    /** Time when task was added to queue */
+    std::chrono::steady_clock::time_point enqueueTime{std::chrono::steady_clock::now()};
+    
+    /** Time when task execution started */
+    std::chrono::steady_clock::time_point startTime{};
+    
+    /** Source location where task was submitted */
+    std::source_location location{std::source_location::current()};
+    
+    /** Human-readable task description */
     std::string description;
     
-    // Cancellation support
+    /** Shared cancellation token for cooperative cancellation */
     std::shared_ptr<std::atomic<bool>> cancellationToken;
     
-    // Timeout support
+    /** Optional timeout for task execution */
     std::optional<std::chrono::milliseconds> timeout;
     
+    /** Default constructor */
     TaskContext();
+    
+    /**
+     * @brief Construct with priority and description
+     * @param prio Task priority
+     * @param desc Task description
+     * @param loc Source location (auto-captured)
+     */
     explicit TaskContext(TaskPriority prio, 
                         std::string desc = "",
                         std::source_location loc = std::source_location::current());
     
+    /**
+     * @brief Check if task has been cancelled
+     * @return true if cancellation was requested
+     */
     [[nodiscard]] bool IsCancelled() const noexcept;
+    
+    /**
+     * @brief Request task cancellation
+     * @note This is cooperative - task must check IsCancelled()
+     */
     void Cancel() noexcept;
+    
+    /**
+     * @brief Get time spent waiting in queue
+     * @return Wait time as milliseconds
+     */
     [[nodiscard]] std::chrono::milliseconds GetWaitTime() const noexcept;
 };
 
-// ============================================================================
-// Task Wrapper
-// ============================================================================
+//=============================================================================
+// Task Wrapper Template
+//=============================================================================
+
+/**
+ * @class Task
+ * @brief Type-safe task wrapper with future support
+ *
+ * Task wraps a callable with its associated context and provides
+ * a shared_future for retrieving the result.
+ *
+ * @tparam ResultType The return type of the task function
+ */
 template<typename ResultType>
 class Task {
 public:
     using TaskFunction = std::function<ResultType(const TaskContext&)>;
     
+    /** Default constructor - creates invalid task */
     Task() = default;
     
+    /**
+     * @brief Construct task from callable
+     * @tparam Func Callable type
+     * @param func The callable to execute
+     * @param ctx Task context
+     */
     template<typename Func>
     Task(Func&& func, TaskContext ctx) 
         : function_(std::forward<Func>(func))
@@ -236,7 +521,15 @@ public:
         , future_(promise_->get_future().share())
     {}
     
+    /**
+     * @brief Execute the task
+     * @note Sets the promise with result or exception
+     */
     void Execute() {
+        if (!function_) {
+            return; // Invalid task
+        }
+        
         try {
             context_.startTime = std::chrono::steady_clock::now();
             
@@ -248,30 +541,40 @@ public:
                 promise_->set_value(std::move(result));
             }
         } catch (...) {
-            promise_->set_exception(std::current_exception());
+            try {
+                promise_->set_exception(std::current_exception());
+            } catch (...) {
+                // Promise already satisfied - ignore
+            }
         }
     }
     
+    /** @return Shared future for task result */
     [[nodiscard]] std::shared_future<ResultType> GetFuture() const noexcept {
         return future_;
     }
     
+    /** @return Const reference to task context */
     [[nodiscard]] const TaskContext& GetContext() const noexcept {
         return context_;
     }
     
+    /** @return Mutable reference to task context */
     [[nodiscard]] TaskContext& GetContext() noexcept {
         return context_;
     }
     
+    /** @return true if task has a valid callable */
     [[nodiscard]] bool IsValid() const noexcept {
         return function_ != nullptr;
     }
     
+    /** Request task cancellation */
     void Cancel() noexcept {
         context_.Cancel();
     }
     
+    /** @return true if task was cancelled */
     [[nodiscard]] bool IsCancelled() const noexcept {
         return context_.IsCancelled();
     }
@@ -283,33 +586,63 @@ private:
     std::shared_future<ResultType> future_;
 };
 
-// Type-erased task wrapper for queue storage
+//=============================================================================
+// Type-Erased Task Wrapper
+//=============================================================================
+
+/**
+ * @class TaskWrapper
+ * @brief Type-erased task wrapper for queue storage
+ *
+ * TaskWrapper allows storing tasks of any return type in the same queue
+ * by erasing the type information and storing only the executor.
+ */
 class TaskWrapper {
 public:
+    /** Default constructor - creates empty wrapper */
+    TaskWrapper() = default;
+    
+    /**
+     * @brief Construct from typed Task
+     * @tparam ResultType Task result type
+     * @param task The task to wrap
+     */
     template<typename ResultType>
     explicit TaskWrapper(Task<ResultType> task)
         : executor_([t = std::move(task)]() mutable { t.Execute(); })
         , context_(task.GetContext())
     {}
     
+    /** Execute the wrapped task */
     void Execute() {
-        executor_();
+        if (executor_) {
+            executor_();
+        }
     }
     
+    /** @return Const reference to task context */
     [[nodiscard]] const TaskContext& GetContext() const noexcept {
         return context_;
     }
     
+    /** @return Mutable reference to task context */
     [[nodiscard]] TaskContext& GetContext() noexcept {
         return context_;
     }
     
+    /** @return true if task was cancelled */
     [[nodiscard]] bool IsCancelled() const noexcept {
         return context_.IsCancelled();
     }
     
+    /** Request task cancellation */
     void Cancel() noexcept {
         context_.Cancel();
+    }
+    
+    /** @return true if wrapper contains a valid task */
+    [[nodiscard]] bool IsValid() const noexcept {
+        return executor_ != nullptr;
     }
     
 private:
@@ -794,7 +1127,7 @@ auto ThreadPool::Submit(
         throw std::runtime_error("ThreadPool is shut down");
     }
 
-    // Args'lý versiyonda default priority/description
+    // Args'lï¿½ versiyonda default priority/description
     TaskContext context(TaskPriority::Normal, "");
     context.taskId = nextTaskId_.fetch_add(1, std::memory_order_relaxed);
 
@@ -937,7 +1270,7 @@ auto ThreadPool::SubmitBatch(
 
     size_t index = 0;
     for (auto&& input : inputs) {
-        // Args'lý Submit çaðýr (func + input args olarak)
+        // Args'lï¿½ Submit ï¿½aï¿½ï¿½r (func + input args olarak)
         futures.push_back(Submit(func, std::forward<decltype(input)>(input)));
     }
 
@@ -1035,3 +1368,4 @@ bool ThreadPool::EnqueueTask(Task<ResultType> task) {
 
 } // namespace ShadowStrike::Utils
 
+#endif // SHADOWSTRIKE_THREADPOOL_HPP

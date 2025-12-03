@@ -51,113 +51,272 @@ namespace ShadowStrike {
 
             namespace {
 
+                // ============================================================================
+                // RAII Handle Wrapper for Windows HANDLE objects
+                // ============================================================================
+                
                 using unique_handle = std::unique_ptr<std::remove_pointer_t<HANDLE>, decltype(&::CloseHandle)>;
 
-                inline unique_handle make_unique_handle(HANDLE h) noexcept {
+                /**
+                 * @brief Creates a unique_ptr-based RAII wrapper for Windows HANDLE.
+                 * @param h The handle to wrap. May be nullptr or INVALID_HANDLE_VALUE.
+                 * @return A unique_handle that will automatically call CloseHandle on destruction.
+                 * @note If h is nullptr or INVALID_HANDLE_VALUE, the wrapper is still valid but empty.
+                 */
+                [[nodiscard]] inline unique_handle make_unique_handle(HANDLE h) noexcept {
+                    // Normalize invalid handles to nullptr for consistent behavior
+                    if (h == nullptr || h == INVALID_HANDLE_VALUE) {
+                        return unique_handle(nullptr, &::CloseHandle);
+                    }
                     return unique_handle(h, &::CloseHandle);
                 }
 
+                // Maximum buffer sizes to prevent DoS via oversized allocations
+                static constexpr DWORD kMaxTokenInfoSize = 64 * 1024;        // 64KB max for token info
+                static constexpr DWORD kMaxPathLength = 32768;               // MAX_PATH extended
+                static constexpr DWORD kMaxProcessCount = 65536;             // Max reasonable process count
+                static constexpr DWORD kMaxModuleCount = 16384;              // Max modules per process
+                static constexpr DWORD kMaxThreadCount = 65536;              // Max threads per process
+                static constexpr DWORD kMaxHandleCount = 16 * 1024 * 1024;   // 16M handles max
+
+                /**
+                 * @brief Sets Win32 error information in the Error struct.
+                 * @param err Pointer to Error struct (may be nullptr).
+                 * @param ctx Context string describing where the error occurred.
+                 * @param code Win32 error code (defaults to GetLastError()).
+                 * @param customMsg Optional custom message to override system message.
+                 */
                 void SetWin32Error(Error* err, std::wstring_view ctx, DWORD code = ::GetLastError(), std::wstring_view customMsg = L"") noexcept {
                     if (!err) return;
+                    
                     err->Clear();
                     err->win32 = code;
-                    err->context = ctx;
+                    
+                    // Safely copy context - truncate if necessary
+                    try {
+                        err->context.assign(ctx.data(), std::min(ctx.size(), static_cast<size_t>(1024)));
+                    } catch (...) {
+                        err->context.clear();
+                    }
+                    
                     if (!customMsg.empty()) {
-                        err->message.assign(customMsg);
+                        try {
+                            err->message.assign(customMsg.data(), std::min(customMsg.size(), static_cast<size_t>(2048)));
+                        } catch (...) {
+                            err->message.clear();
+                        }
                         return;
                     }
 
                     LPWSTR buf = nullptr;
-                    DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
-                    if (FormatMessageW(flags, nullptr, code, 0, (LPWSTR)&buf, 0, nullptr) && buf) {
-                        err->message.assign(buf);
+                    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+                    const DWORD result = FormatMessageW(flags, nullptr, code, 
+                                                        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
+                                                        reinterpret_cast<LPWSTR>(&buf), 0, nullptr);
+                    if (result > 0 && buf) {
+                        try {
+                            // Remove trailing newlines from system messages
+                            size_t len = result;
+                            while (len > 0 && (buf[len - 1] == L'\r' || buf[len - 1] == L'\n')) {
+                                --len;
+                            }
+                            err->message.assign(buf, len);
+                        } catch (...) {
+                            err->message.clear();
+                        }
                         LocalFree(buf);
                     }
                     else {
-                        std::wostringstream os;
-                        os << L"Win32 error " << code;
-                        err->message = os.str();
+                        try {
+                            std::wostringstream os;
+                            os << L"Win32 error 0x" << std::hex << std::uppercase << code;
+                            err->message = os.str();
+                        } catch (...) {
+                            err->message.clear();
+                        }
                     }
                 }
 
+                /**
+                 * @brief Sets NTSTATUS error information in the Error struct.
+                 * @param err Pointer to Error struct (may be nullptr).
+                 * @param ctx Context string describing where the error occurred.
+                 * @param status NTSTATUS code from NT API call.
+                 * @param customMsg Optional custom message.
+                 */
                 void SetNtError(Error* err, std::wstring_view ctx, LONG status, std::wstring_view customMsg = L"") noexcept {
                     if (!err) return;
+                    
                     err->Clear();
                     err->ntstatus = status;
-                    err->context = ctx;
+                    
+                    try {
+                        err->context.assign(ctx.data(), std::min(ctx.size(), static_cast<size_t>(1024)));
+                    } catch (...) {
+                        err->context.clear();
+                    }
+                    
                     if (!customMsg.empty()) {
-                        err->message.assign(customMsg);
+                        try {
+                            err->message.assign(customMsg.data(), std::min(customMsg.size(), static_cast<size_t>(2048)));
+                        } catch (...) {
+                            err->message.clear();
+                        }
                     }
                     else {
-                        std::wostringstream os;
-                        os << L"NTSTATUS 0x" << std::hex << std::uppercase << (unsigned long)status;
-                        err->message = os.str();
+                        try {
+                            std::wostringstream os;
+                            os << L"NTSTATUS 0x" << std::hex << std::uppercase << static_cast<unsigned long>(status);
+                            err->message = os.str();
+                        } catch (...) {
+                            err->message.clear();
+                        }
                     }
                 }
 
-                std::wstring ToLower(std::wstring s) {
-                    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return (wchar_t)::towlower(c); });
+                /**
+                 * @brief Converts a wide string to lowercase (locale-independent).
+                 * @param s Input string (by value for move semantics).
+                 * @return Lowercase version of the string.
+                 */
+                [[nodiscard]] std::wstring ToLower(std::wstring s) noexcept {
+                    try {
+                        std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) noexcept {
+                            // Use towlower for proper Unicode handling
+                            return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c)));
+                        });
+                    } catch (...) {
+                        // If transform fails, return original
+                    }
                     return s;
                 }
 
-                std::wstring BaseName(const std::wstring& p) {
-                    size_t pos = p.find_last_of(L"\\/");
+                /**
+                 * @brief Extracts the filename from a full path.
+                 * @param p Full path string.
+                 * @return The filename portion (after last \\ or /).
+                 */
+                [[nodiscard]] std::wstring BaseName(const std::wstring& p) noexcept {
+                    if (p.empty()) return std::wstring{};
+                    
+                    const size_t pos = p.find_last_of(L"\\/");
                     if (pos == std::wstring::npos) return p;
-                    return p.substr(pos + 1);
-                }
-
-                bool WildcardMatchInsensitive(std::wstring_view pattern, std::wstring_view text) {
-                    auto p = ToLower(std::wstring(pattern));
-                    auto t = ToLower(std::wstring(text));
-
-                    size_t pi = 0, ti = 0, star = std::wstring::npos, mark = 0;
-                    while (ti < t.size()) {
-                        if (pi < p.size() && (p[pi] == L'?' || p[pi] == t[ti])) {
-                            ++pi; ++ti;
-                        }
-                        else if (pi < p.size() && p[pi] == L'*') {
-                            star = pi++;
-                            mark = ti;
-                        }
-                        else if (star != std::wstring::npos) {
-                            pi = star + 1;
-                            ti = ++mark;
-                        }
-                        else {
-                            return false;
-                        }
+                    if (pos + 1 >= p.size()) return std::wstring{};
+                    
+                    try {
+                        return p.substr(pos + 1);
+                    } catch (...) {
+                        return std::wstring{};
                     }
-                    while (pi < p.size() && p[pi] == L'*') ++pi;
-                    return pi == p.size();
                 }
 
+                /**
+                 * @brief Performs case-insensitive wildcard matching.
+                 * @param pattern Pattern with * (any chars) and ? (single char) wildcards.
+                 * @param text Text to match against the pattern.
+                 * @return true if text matches pattern.
+                 * @note Uses standard wildcard semantics: * = zero or more, ? = exactly one.
+                 */
+                [[nodiscard]] bool WildcardMatchInsensitive(std::wstring_view pattern, std::wstring_view text) noexcept {
+                    if (pattern.empty()) return text.empty();
+                    
+                    try {
+                        const auto p = ToLower(std::wstring(pattern));
+                        const auto t = ToLower(std::wstring(text));
+
+                        size_t pi = 0, ti = 0;
+                        size_t star = std::wstring::npos;
+                        size_t mark = 0;
+                        
+                        while (ti < t.size()) {
+                            if (pi < p.size() && (p[pi] == L'?' || p[pi] == t[ti])) {
+                                ++pi; ++ti;
+                            }
+                            else if (pi < p.size() && p[pi] == L'*') {
+                                star = pi++;
+                                mark = ti;
+                            }
+                            else if (star != std::wstring::npos) {
+                                pi = star + 1;
+                                ti = ++mark;
+                            }
+                            else {
+                                return false;
+                            }
+                        }
+                        
+                        // Skip trailing wildcards
+                        while (pi < p.size() && p[pi] == L'*') ++pi;
+                        return pi == p.size();
+                    } catch (...) {
+                        return false;
+                    }
+                }
+
+                /**
+                 * @brief Enumerates top-level windows belonging to a specific process.
+                 * @tparam F Callable type accepting HWND parameter.
+                 * @param pid Process ID to filter by.
+                 * @param f Callback function invoked for each matching window.
+                 */
                 template <typename F>
-                void EnumerateTopLevelWindowsForPid(DWORD pid, F&& f) {
-                    struct Ctx { DWORD pid; F* func; };
-                    Ctx ctx{ pid, &f };
-                    auto cb = [](HWND h, LPARAM lparam)->BOOL {
+                void EnumerateTopLevelWindowsForPid(DWORD pid, F&& f) noexcept {
+                    struct Ctx { 
+                        DWORD pid; 
+                        F* func;
+                        bool hadError;
+                    };
+                    Ctx ctx{ pid, &f, false };
+                    
+                    auto cb = [](HWND h, LPARAM lparam) -> BOOL {
+                        if (!h) return TRUE; // Continue enumeration
+                        
                         auto* c = reinterpret_cast<Ctx*>(lparam);
+                        if (!c || !c->func) return TRUE;
+                        
                         DWORD wpid = 0;
                         GetWindowThreadProcessId(h, &wpid);
                         if (wpid == c->pid) {
-                            (*c->func)(h);
+                            try {
+                                (*c->func)(h);
+                            } catch (...) {
+                                c->hadError = true;
+                            }
                         }
-                        return TRUE;
-                        };
+                        return TRUE; // Continue enumeration
+                    };
+                    
                     EnumWindows(cb, reinterpret_cast<LPARAM>(&ctx));
                 }
 
-                bool GetMainWindowTitleForPid(DWORD pid, std::wstring& titleOut) {
+                /**
+                 * @brief Gets the main window title for a process.
+                 * @param pid Process ID.
+                 * @param titleOut Output string for the window title.
+                 * @return true if a window title was found.
+                 * @note Selects the longest visible window title as the "main" title.
+                 */
+                [[nodiscard]] bool GetMainWindowTitleForPid(DWORD pid, std::wstring& titleOut) noexcept {
+                    titleOut.clear();
                     std::wstring best;
-                    EnumerateTopLevelWindowsForPid(pid, [&](HWND h) {
-                        if (!IsWindowVisible(h)) return;
+                    
+                    EnumerateTopLevelWindowsForPid(pid, [&best](HWND h) noexcept {
+                        if (!h || !IsWindowVisible(h)) return;
+                        
                         wchar_t buf[1024] = {};
-                        int len = GetWindowTextW(h, buf, 1024);
-                        if (len > 0) {
-                            std::wstring t(buf, buf + len);
-                            if (t.size() > best.size()) best = std::move(t);
+                        const int len = GetWindowTextW(h, buf, static_cast<int>(std::size(buf)));
+                        if (len > 0 && len < static_cast<int>(std::size(buf))) {
+                            try {
+                                std::wstring t(buf, static_cast<size_t>(len));
+                                if (t.size() > best.size()) {
+                                    best = std::move(t);
+                                }
+                            } catch (...) {
+                                // Ignore allocation failures
+                            }
                         }
-                        });
+                    });
+                    
                     if (!best.empty()) {
                         titleOut = std::move(best);
                         return true;
@@ -165,42 +324,88 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                bool QueryFullImagePath(HANDLE hProcess, std::wstring& path) {
-                    DWORD len = MAX_PATH;
-                    std::wstring tmp(len, L'\0');
-                    if (!QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) {
-                        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-                            tmp.resize(len + 1);
-                            if (!QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) return false;
+                /**
+                 * @brief Queries the full image path for a process handle.
+                 * @param hProcess Process handle with PROCESS_QUERY_LIMITED_INFORMATION.
+                 * @param path Output string for the full path.
+                 * @return true if the path was retrieved successfully.
+                 */
+                [[nodiscard]] bool QueryFullImagePath(HANDLE hProcess, std::wstring& path) noexcept {
+                    path.clear();
+                    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return false;
+                    
+                    try {
+                        DWORD len = MAX_PATH;
+                        std::wstring tmp(len, L'\0');
+                        
+                        if (!QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) {
+                            const DWORD lastErr = GetLastError();
+                            if (lastErr == ERROR_INSUFFICIENT_BUFFER && len > 0 && len < kMaxPathLength) {
+                                tmp.resize(static_cast<size_t>(len) + 1);
+                                len = static_cast<DWORD>(tmp.size());
+                                if (!QueryFullProcessImageNameW(hProcess, 0, tmp.data(), &len)) {
+                                    return false;
+                                }
+                            }
+                            else {
+                                return false;
+                            }
                         }
-                        else {
+                        
+                        if (len > 0 && len < tmp.size()) {
+                            tmp.resize(len);
+                            path = std::move(tmp);
+                            return true;
+                        }
+                        return false;
+                    } catch (...) {
+                        return false;
+                    }
+                }
+
+                /**
+                 * @brief Checks if a process is running under WOW64 (32-bit on 64-bit OS).
+                 * @param hProcess Process handle.
+                 * @param isWow64 Output flag indicating WOW64 status.
+                 * @return true if the check succeeded.
+                 * @note Uses IsWow64Process2 if available (Windows 10+), falls back to IsWow64Process.
+                 */
+                [[nodiscard]] bool IsProcessWow64Cached(HANDLE hProcess, bool& isWow64) noexcept {
+                    isWow64 = false;
+                    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return false;
+                    
+                    // Try IsWow64Process2 first (Windows 10 1511+)
+                    typedef BOOL(WINAPI* IsWow64Process2_t)(HANDLE, USHORT*, USHORT*);
+                    static const IsWow64Process2_t pIsWow64Process2 = 
+                        reinterpret_cast<IsWow64Process2_t>(
+                            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2"));
+
+                    if (pIsWow64Process2) {
+                        USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+                        USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+                        if (!pIsWow64Process2(hProcess, &processMachine, &nativeMachine)) {
                             return false;
                         }
+                        // Process is WOW64 if it has a machine type and it differs from native
+                        isWow64 = (processMachine != IMAGE_FILE_MACHINE_UNKNOWN) && 
+                                  (processMachine != nativeMachine);
+                        return true;
                     }
-                    tmp.resize(len);
-                    path = std::move(tmp);
+                    
+                    // Fallback to IsWow64Process
+                    BOOL wow = FALSE;
+                    if (!IsWow64Process(hProcess, &wow)) {
+                        return false;
+                    }
+                    isWow64 = (wow == TRUE);
                     return true;
                 }
 
-                bool IsProcessWow64Cached(HANDLE hProcess, bool& isWow64) {
-                    typedef BOOL(WINAPI* IsWow64Process2_t)(HANDLE, USHORT*, USHORT*);
-                    static IsWow64Process2_t pIsWow64Process2 = (IsWow64Process2_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
-
-                    if (pIsWow64Process2) {
-                        USHORT p, n;
-                        if (!pIsWow64Process2(hProcess, &p, &n)) return false;
-                        isWow64 = (p != IMAGE_FILE_MACHINE_UNKNOWN) && (p != n);
-                        return true;
-                    }
-                    else {
-                        BOOL wow = FALSE;
-                        if (!IsWow64Process(hProcess, &wow)) return false;
-                        isWow64 = (wow == TRUE);
-                        return true;
-                    }
-                }
-
-                bool IsCurrentOS64Bit() {
+                /**
+                 * @brief Checks if the current OS is 64-bit.
+                 * @return true if running on 64-bit Windows.
+                 */
+                [[nodiscard]] bool IsCurrentOS64Bit() noexcept {
 #if defined(_WIN64)
                     return true;
 #else
@@ -212,20 +417,40 @@ namespace ShadowStrike {
 #endif
                 }
 
-                bool GetProcessTimesMs(HANDLE hProcess, uint64_t& kernelMs, uint64_t& userMs) {
+                /**
+                 * @brief Gets process CPU times in milliseconds.
+                 * @param hProcess Process handle.
+                 * @param kernelMs Output kernel mode time in milliseconds.
+                 * @param userMs Output user mode time in milliseconds.
+                 * @return true if times were retrieved successfully.
+                 */
+                [[nodiscard]] bool GetProcessTimesMs(HANDLE hProcess, uint64_t& kernelMs, uint64_t& userMs) noexcept {
+                    kernelMs = 0;
+                    userMs = 0;
+                    
+                    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return false;
+                    
                     FILETIME ct{}, et{}, kt{}, ut{};
-                    if (!GetProcessTimes(hProcess, &ct, &et, &kt, &ut)) return false;
-                    auto ftToMs = [](const FILETIME& ft) -> uint64_t {
+                    if (!GetProcessTimes(hProcess, &ct, &et, &kt, &ut)) {
+                        return false;
+                    }
+                    
+                    // Convert FILETIME to milliseconds (100ns units to ms)
+                    auto ftToMs = [](const FILETIME& ft) noexcept -> uint64_t {
                         ULARGE_INTEGER u{};
                         u.LowPart = ft.dwLowDateTime;
                         u.HighPart = ft.dwHighDateTime;
-                        return u.QuadPart / 10000ULL;
-                        };
+                        return u.QuadPart / 10000ULL; // 100ns to ms
+                    };
+                    
                     kernelMs = ftToMs(kt);
                     userMs = ftToMs(ut);
                     return true;
                 }
 
+                /**
+                 * @brief CPU usage sample for delta calculations.
+                 */
                 struct CpuSample {
                     uint64_t kernelMs = 0;
                     uint64_t userMs = 0;
@@ -233,28 +458,56 @@ namespace ShadowStrike {
                     DWORD affinity = 0;
                     int priority = NORMAL_PRIORITY_CLASS;
                 };
+                
+                // Global CPU sample cache (protected by mutex)
                 std::mutex g_cpuMutex;
                 std::unordered_map<DWORD, CpuSample> g_cpuPrev;
 
-                uint64_t GetTickCount64Ms() {
+                /**
+                 * @brief Gets current tick count in milliseconds.
+                 * @return Current tick count (wraps every ~49 days on 32-bit).
+                 */
+                [[nodiscard]] inline uint64_t GetTickCount64Ms() noexcept {
                     return GetTickCount64();
                 }
 
+                /**
+                 * @brief Safely retrieves module information.
+                 * @tparam T Module info structure type (MODULEINFO or compatible).
+                 * @param hProcess Process handle.
+                 * @param mod Module handle.
+                 * @param mi Output module info structure.
+                 * @return true if info was retrieved successfully.
+                 */
                 template<typename T>
-                bool SafeGetModuleInfo(HANDLE hProcess, HMODULE mod, T& mi) {
-                    memset(&mi, 0, sizeof(T));
-                    return GetModuleInformation(hProcess, mod, (MODULEINFO*)&mi, sizeof(T)) == TRUE;
+                [[nodiscard]] bool SafeGetModuleInfo(HANDLE hProcess, HMODULE mod, T& mi) noexcept {
+                    static_assert(sizeof(T) >= sizeof(MODULEINFO), "T must be at least MODULEINFO size");
+                    std::memset(&mi, 0, sizeof(T));
+                    if (!hProcess || hProcess == INVALID_HANDLE_VALUE || !mod) return false;
+                    return GetModuleInformation(hProcess, mod, reinterpret_cast<MODULEINFO*>(&mi), sizeof(T)) == TRUE;
                 }
 
+                // NT API function pointer types
                 using NtSuspendProcess_t = LONG(NTAPI*)(HANDLE);
                 using NtResumeProcess_t = LONG(NTAPI*)(HANDLE);
 
-                NtSuspendProcess_t GetNtSuspendProcess() {
-                    static auto fn = reinterpret_cast<NtSuspendProcess_t>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSuspendProcess"));
+                /**
+                 * @brief Gets pointer to NtSuspendProcess from ntdll.dll.
+                 * @return Function pointer or nullptr if not available.
+                 */
+                [[nodiscard]] NtSuspendProcess_t GetNtSuspendProcess() noexcept {
+                    static const auto fn = reinterpret_cast<NtSuspendProcess_t>(
+                        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSuspendProcess"));
                     return fn;
                 }
-                NtResumeProcess_t GetNtResumeProcess() {
-                    static auto fn = reinterpret_cast<NtResumeProcess_t>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtResumeProcess"));
+                
+                /**
+                 * @brief Gets pointer to NtResumeProcess from ntdll.dll.
+                 * @return Function pointer or nullptr if not available.
+                 */
+                [[nodiscard]] NtResumeProcess_t GetNtResumeProcess() noexcept {
+                    static const auto fn = reinterpret_cast<NtResumeProcess_t>(
+                        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtResumeProcess"));
                     return fn;
                 }
 
@@ -265,11 +518,19 @@ namespace ShadowStrike {
             // ==========================================================
 
             ProcessHandle::ProcessHandle(ProcessId pid, DWORD desiredAccess, Error* err) noexcept {
-                Open(pid, desiredAccess, err);
+                static_cast<void>(Open(pid, desiredAccess, err));
             }
 
             bool ProcessHandle::Open(ProcessId pid, DWORD desiredAccess, Error* err) noexcept {
                 Close();
+                
+                // Validate PID - 0 is System Idle Process, cannot be opened
+                if (pid == 0) {
+                    SetWin32Error(err, L"OpenProcess", ERROR_INVALID_PARAMETER, 
+                                  L"Cannot open System Idle Process (PID 0)");
+                    return false;
+                }
+                
                 m_handle = ::OpenProcess(desiredAccess, FALSE, pid);
                 if (!m_handle) {
                     SetWin32Error(err, L"OpenProcess");
@@ -299,22 +560,44 @@ namespace ShadowStrike {
 
             bool EnumerateProcesses(std::vector<ProcessId>& pids, Error* err) noexcept {
                 pids.clear();
-                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                
+                const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
                 if (hSnap == INVALID_HANDLE_VALUE) {
                     SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)");
                     return false;
                 }
+                
+                // RAII guard for snapshot handle
+                const auto snapGuard = make_unique_handle(hSnap);
+                
                 PROCESSENTRY32W pe{};
                 pe.dwSize = sizeof(pe);
+                
                 if (!Process32FirstW(hSnap, &pe)) {
-                    SetWin32Error(err, L"Process32FirstW");
-                    CloseHandle(hSnap);
+                    const DWORD lastErr = GetLastError();
+                    if (lastErr != ERROR_NO_MORE_FILES) {
+                        SetWin32Error(err, L"Process32FirstW", lastErr);
+                        return false;
+                    }
+                    return true; // Empty list is valid
+                }
+                
+                try {
+                    pids.reserve(256); // Pre-allocate for typical system
+                    do {
+                        if (pids.size() >= kMaxProcessCount) {
+                            // Safety limit reached
+                            break;
+                        }
+                        pids.push_back(pe.th32ProcessID);
+                    } while (Process32NextW(hSnap, &pe));
+                } catch (const std::bad_alloc&) {
+                    pids.clear();
+                    SetWin32Error(err, L"EnumerateProcesses", ERROR_OUTOFMEMORY, 
+                                  L"Memory allocation failed");
                     return false;
                 }
-                do {
-                    pids.push_back(pe.th32ProcessID);
-                } while (Process32NextW(hSnap, &pe));
-                CloseHandle(hSnap);
+                
                 return true;
             }
 
@@ -322,8 +605,11 @@ namespace ShadowStrike {
                 info = {};
                 info.pid = pid;
 
-                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                // Get process entry from snapshot
+                const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
                 if (hSnap != INVALID_HANDLE_VALUE) {
+                    const auto snapGuard = make_unique_handle(hSnap);
+                    
                     PROCESSENTRY32W pe{};
                     pe.dwSize = sizeof(pe);
                     if (Process32FirstW(hSnap, &pe)) {
@@ -332,25 +618,38 @@ namespace ShadowStrike {
                                 info.parentPid = pe.th32ParentProcessID;
                                 info.basePriority = pe.pcPriClassBase;
                                 info.threadCount = pe.cntThreads;
-                                info.name = pe.szExeFile;
+                                try {
+                                    // Ensure null-termination safety
+                                    pe.szExeFile[MAX_PATH - 1] = L'\0';
+                                    info.name = pe.szExeFile;
+                                } catch (...) {
+                                    info.name.clear();
+                                }
                                 break;
                             }
                         } while (Process32NextW(hSnap, &pe));
                     }
-                    CloseHandle(hSnap);
                 }
 
                 ProcessHandle ph;
                 if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, nullptr)) {
-                    if (err) SetWin32Error(err, L"OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)");
+                    if (err) {
+                        SetWin32Error(err, L"OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)");
+                    }
                     info.isSystemProcess = (pid == 4 || pid == 0);
                     return err == nullptr;
                 }
 
                 std::wstring fullPath;
                 if (QueryFullImagePath(ph.Get(), fullPath)) {
-                    info.executablePath = std::move(fullPath);
-                    if (info.name.empty()) info.name = BaseName(info.executablePath);
+                    try {
+                        info.executablePath = std::move(fullPath);
+                        if (info.name.empty()) {
+                            info.name = BaseName(info.executablePath);
+                        }
+                    } catch (...) {
+                        // Ignore allocation failures
+                    }
                 }
 
                 FILETIME ct{}, et{}, kt{}, ut{};
@@ -371,7 +670,8 @@ namespace ShadowStrike {
                     info.handleCount = handleCount;
                 }
 
-                info.priorityClass = static_cast<int64_t>(GetPriorityClass(ph.Get()));
+                const DWORD priorityClass = GetPriorityClass(ph.Get());
+                info.priorityClass = static_cast<int64_t>(priorityClass);
 
                 bool wow = false;
                 if (IsProcessWow64Cached(ph.Get(), wow)) {
@@ -381,8 +681,12 @@ namespace ShadowStrike {
 
                 std::wstring title;
                 if (GetMainWindowTitleForPid(pid, title)) {
-                    info.windowTitle = std::move(title);
-                    info.hasGUI = true;
+                    try {
+                        info.windowTitle = std::move(title);
+                        info.hasGUI = true;
+                    } catch (...) {
+                        info.hasGUI = false;
+                    }
                 }
 
                 info.isSystemProcess = (pid == 4 || pid == 0);
@@ -394,12 +698,22 @@ namespace ShadowStrike {
                 const EnumerationOptions& options,
                 Error* err) noexcept {
                 processes.clear();
+                
                 std::vector<ProcessId> pids;
                 if (!EnumerateProcesses(pids, err)) return false;
 
-                for (auto pid : pids) {
+                const ProcessId currentPid = ::GetCurrentProcessId();
+                
+                try {
+                    processes.reserve(std::min(pids.size(), static_cast<size_t>(1024)));
+                } catch (...) {
+                    // Continue without reservation
+                }
+
+                for (const auto pid : pids) {
+                    // Apply filters
                     if (!options.includeIdleProcess && pid == 0) continue;
-                    if (!options.includeCurrentProcess && pid == ::GetCurrentProcessId()) continue;
+                    if (!options.includeCurrentProcess && pid == currentPid) continue;
 
                     ProcessBasicInfo bi{};
                     if (!GetProcessBasicInfo(pid, bi, nullptr)) continue;
@@ -409,11 +723,13 @@ namespace ShadowStrike {
                     if (options.nameFilter && !options.nameFilter->empty()) {
                         if (!WildcardMatchInsensitive(*options.nameFilter, bi.name)) continue;
                     }
+                    
                     if (options.sessionFilter) {
                         DWORD sid = 0;
                         if (!ProcessIdToSessionId(pid, &sid) || sid != *options.sessionFilter) continue;
                     }
-                    if (options.userFilter) {
+                    
+                    if (options.userFilter && !options.userFilter->empty()) {
                         ProcessSecurityInfo sec{};
                         if (GetProcessSecurityInfo(pid, sec, nullptr)) {
                             if (ToLower(sec.userName) != ToLower(*options.userFilter)) continue;
@@ -423,39 +739,59 @@ namespace ShadowStrike {
                         }
                     }
 
-                    processes.push_back(std::move(bi));
+                    try {
+                        processes.push_back(std::move(bi));
+                    } catch (const std::bad_alloc&) {
+                        SetWin32Error(err, L"EnumerateProcesses", ERROR_OUTOFMEMORY,
+                                      L"Memory allocation failed");
+                        return false;
+                    }
                 }
 
-                if (options.sortByName) {
-                    std::sort(processes.begin(), processes.end(), [](const auto& a, const auto& b) {
-                        return ToLower(a.name) < ToLower(b.name);
-                        });
-                }
-                else if (options.sortByPid) {
-                    std::sort(processes.begin(), processes.end(), [](const auto& a, const auto& b) {
-                        return a.pid < b.pid;
-                        });
-                }
-                else if (options.sortByMemoryUsage) {
-                    for (auto& p : processes) {
-                        ProcessMemoryInfo mi{};
-                        if (GetProcessMemoryInfo(p.pid, mi, nullptr)) {
-                            p.handleCount = static_cast<DWORD>(mi.workingSetSize);
+                // Apply sorting (use stable_sort for deterministic ordering)
+                try {
+                    if (options.sortByName) {
+                        std::stable_sort(processes.begin(), processes.end(), 
+                            [](const ProcessBasicInfo& a, const ProcessBasicInfo& b) noexcept {
+                                return ToLower(a.name) < ToLower(b.name);
+                            });
+                    }
+                    else if (options.sortByPid) {
+                        std::stable_sort(processes.begin(), processes.end(), 
+                            [](const ProcessBasicInfo& a, const ProcessBasicInfo& b) noexcept {
+                                return a.pid < b.pid;
+                            });
+                    }
+                    else if (options.sortByMemoryUsage) {
+                        // Collect memory info for sorting
+                        for (auto& p : processes) {
+                            ProcessMemoryInfo mi{};
+                            if (GetProcessMemoryInfo(p.pid, mi, nullptr)) {
+                                // Store working set in handleCount temporarily (uint64_t truncated to DWORD)
+                                p.handleCount = static_cast<DWORD>(std::min(mi.workingSetSize, 
+                                                static_cast<SIZE_T>(MAXDWORD)));
+                            }
                         }
+                        std::stable_sort(processes.begin(), processes.end(), 
+                            [](const ProcessBasicInfo& a, const ProcessBasicInfo& b) noexcept {
+                                return a.handleCount > b.handleCount;
+                            });
                     }
-                    std::sort(processes.begin(), processes.end(), [](const auto& a, const auto& b) {
-                        return a.handleCount > b.handleCount;
-                        });
-                }
-                else if (options.sortByCpuUsage) {
-                    for (auto& p : processes) {
-                        ProcessCpuInfo ci{};
-                        GetProcessCpuInfo(p.pid, ci, nullptr);
-                        p.basePriority = static_cast<int64_t>(ci.cpuUsagePercent * 1000.0);
+                    else if (options.sortByCpuUsage) {
+                        // Collect CPU info for sorting
+                        for (auto& p : processes) {
+                            ProcessCpuInfo ci{};
+                            GetProcessCpuInfo(p.pid, ci, nullptr);
+                            // Store scaled CPU percentage in basePriority temporarily
+                            p.basePriority = static_cast<int64_t>(std::clamp(ci.cpuUsagePercent, 0.0, 100.0) * 1000.0);
+                        }
+                        std::stable_sort(processes.begin(), processes.end(), 
+                            [](const ProcessBasicInfo& a, const ProcessBasicInfo& b) noexcept {
+                                return a.basePriority > b.basePriority;
+                            });
                     }
-                    std::sort(processes.begin(), processes.end(), [](const auto& a, const auto& b) {
-                        return a.basePriority > b.basePriority;
-                        });
+                } catch (...) {
+                    // Sorting failed, return unsorted results
                 }
 
                 return true;
@@ -467,37 +803,51 @@ namespace ShadowStrike {
 
             bool GetProcessMemoryInfo(ProcessId pid, ProcessMemoryInfo& info, Error* err) noexcept {
                 info = {};
+                
                 ProcessHandle ph;
-                if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, err)) return false;
+                if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, err)) {
+                    return false;
+                }
 
                 PROCESS_MEMORY_COUNTERS_EX pmc{};
-                if (!::GetProcessMemoryInfo(ph.Get(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+                pmc.cb = sizeof(pmc);
+                
+                if (!::GetProcessMemoryInfo(ph.Get(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
                     SetWin32Error(err, L"GetProcessMemoryInfo");
                     return false;
                 }
+                
                 info.workingSetSize = pmc.WorkingSetSize;
                 info.peakWorkingSetSize = pmc.PeakWorkingSetSize;
                 info.privateMemorySize = pmc.PrivateUsage;
                 info.pageFaultCount = pmc.PageFaultCount;
+                info.pagedPoolUsage = pmc.QuotaPagedPoolUsage;
+                info.nonPagedPoolUsage = pmc.QuotaNonPagedPoolUsage;
+                
                 return true;
             }
 
             bool GetProcessIOCounters(ProcessId pid, ProcessIOCounters& io, Error* err) noexcept {
                 io = {};
+                
                 ProcessHandle ph;
-                if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+                if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+                    return false;
+                }
 
                 IO_COUNTERS ioc{};
                 if (!::GetProcessIoCounters(ph.Get(), &ioc)) {
                     SetWin32Error(err, L"GetProcessIoCounters");
                     return false;
                 }
+                
                 io.readOperationCount = ioc.ReadOperationCount;
                 io.writeOperationCount = ioc.WriteOperationCount;
                 io.otherOperationCount = ioc.OtherOperationCount;
                 io.readTransferCount = ioc.ReadTransferCount;
                 io.writeTransferCount = ioc.WriteTransferCount;
                 io.otherTransferCount = ioc.OtherTransferCount;
+                
                 return true;
             }
 
@@ -506,13 +856,17 @@ namespace ShadowStrike {
                 info.priorityClass = NORMAL_PRIORITY_CLASS;
 
                 ProcessHandle ph;
-                if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+                if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+                    return false;
+                }
 
                 DWORD_PTR affinity = 0, sysAffinity = 0;
                 if (GetProcessAffinityMask(ph.Get(), &affinity, &sysAffinity)) {
                     info.affinityMask = static_cast<DWORD>(affinity);
                 }
-                info.priorityClass = GetPriorityClass(ph.Get());
+                
+                const DWORD priorityClass = GetPriorityClass(ph.Get());
+                info.priorityClass = (priorityClass != 0) ? static_cast<int>(priorityClass) : NORMAL_PRIORITY_CLASS;
 
                 uint64_t kMs = 0, uMs = 0;
                 if (!GetProcessTimesMs(ph.Get(), kMs, uMs)) {
@@ -522,32 +876,58 @@ namespace ShadowStrike {
 
                 const uint64_t now = GetTickCount64Ms();
 
+                // Thread-safe access to CPU sample cache
                 std::lock_guard<std::mutex> lock(g_cpuMutex);
+                
                 auto it = g_cpuPrev.find(pid);
                 if (it != g_cpuPrev.end()) {
                     const auto& prev = it->second;
-                    uint64_t dt = now - prev.timestampMs;
-                    uint64_t dtotal = (kMs + uMs) - (prev.kernelMs + prev.userMs);
+                    
+                    // Calculate delta time (handle wrap-around)
+                    const uint64_t dt = (now >= prev.timestampMs) ? (now - prev.timestampMs) : 0;
+                    
+                    // Calculate delta CPU time (handle counter reset)
+                    const uint64_t currentTotal = kMs + uMs;
+                    const uint64_t prevTotal = prev.kernelMs + prev.userMs;
+                    const uint64_t dtotal = (currentTotal >= prevTotal) ? (currentTotal - prevTotal) : currentTotal;
 
                     if (dt > 0) {
+                        // Get processor count for CPU percentage calculation
                         SYSTEM_INFO si{};
                         GetSystemInfo(&si);
-                        uint64_t denom = dt * std::max<DWORD>(1, si.dwNumberOfProcessors);
-                        double usage = denom ? (static_cast<double>(dtotal) / static_cast<double>(denom)) * 100.0 : 0.0;
-                        info.totalCpuTimeMs = kMs + uMs;
+                        const DWORD numProcessors = std::max<DWORD>(1, si.dwNumberOfProcessors);
+                        
+                        // Avoid overflow: dt * numProcessors
+                        const uint64_t denom = dt * static_cast<uint64_t>(numProcessors);
+                        
+                        double usage = 0.0;
+                        if (denom > 0) {
+                            usage = (static_cast<double>(dtotal) / static_cast<double>(denom)) * 100.0;
+                        }
+                        
+                        info.totalCpuTimeMs = currentTotal;
                         info.kernelCpuTimeMs = kMs;
                         info.userCpuTimeMs = uMs;
                         info.cpuUsagePercent = std::clamp(usage, 0.0, 100.0);
-                        if (dtotal) {
-                            double kpart = static_cast<double>(kMs - prev.kernelMs) / static_cast<double>(dtotal);
+                        
+                        if (dtotal > 0) {
+                            const uint64_t dKernel = (kMs >= prev.kernelMs) ? (kMs - prev.kernelMs) : 0;
+                            const double kpart = static_cast<double>(dKernel) / static_cast<double>(dtotal);
                             info.kernelTimePercent = std::clamp(kpart * info.cpuUsagePercent, 0.0, 100.0);
                             info.userTimePercent = std::clamp(info.cpuUsagePercent - info.kernelTimePercent, 0.0, 100.0);
                         }
                     }
+                    
+                    // Update sample
                     it->second = CpuSample{ kMs, uMs, now, static_cast<DWORD>(affinity), info.priorityClass };
                 }
                 else {
-                    g_cpuPrev.emplace(pid, CpuSample{ kMs, uMs, now, static_cast<DWORD>(affinity), info.priorityClass });
+                    // First sample - can only report totals, not percentage
+                    try {
+                        g_cpuPrev.emplace(pid, CpuSample{ kMs, uMs, now, static_cast<DWORD>(affinity), info.priorityClass });
+                    } catch (...) {
+                        // Ignore allocation failure for cache
+                    }
                     info.totalCpuTimeMs = kMs + uMs;
                     info.kernelCpuTimeMs = kMs;
                     info.userCpuTimeMs = uMs;
@@ -576,8 +956,11 @@ namespace ShadowStrike {
 
 bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err) noexcept {
     sec = {};
+    
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
 
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(ph.Get(), TOKEN_QUERY, &hToken)) {
@@ -586,41 +969,88 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err)
     }
     auto token = make_unique_handle(hToken);
 
-    // User information
+    // User information with buffer size validation
     DWORD len = 0;
     GetTokenInformation(token.get(), TokenUser, nullptr, 0, &len);
-    std::vector<BYTE> buf(len);
+    
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0 || len > kMaxTokenInfoSize) {
+        SetWin32Error(err, L"GetTokenInformation(TokenUser) size query");
+        return false;
+    }
+    
+    std::vector<BYTE> buf;
+    try {
+        buf.resize(len);
+    } catch (const std::bad_alloc&) {
+        SetWin32Error(err, L"GetProcessSecurityInfo", ERROR_OUTOFMEMORY, L"Memory allocation failed");
+        return false;
+    }
+    
     if (!GetTokenInformation(token.get(), TokenUser, buf.data(), static_cast<DWORD>(buf.size()), &len)) {
         SetWin32Error(err, L"GetTokenInformation(TokenUser)");
         return false;
     }
+    
     auto tu = reinterpret_cast<TOKEN_USER*>(buf.data());
-    LPWSTR sidStr = nullptr;
-    if (ConvertSidToStringSidW(tu->User.Sid, &sidStr)) {
-        sec.userSid = sidStr;
-        LocalFree(sidStr);
+    if (tu && tu->User.Sid) {
+        LPWSTR sidStr = nullptr;
+        if (ConvertSidToStringSidW(tu->User.Sid, &sidStr) && sidStr) {
+            try {
+                sec.userSid = sidStr;
+            } catch (...) {
+                sec.userSid.clear();
+            }
+            LocalFree(sidStr);
+        }
+
+        WCHAR name[256] = {}, domain[256] = {};
+        DWORD cchName = static_cast<DWORD>(std::size(name));
+        DWORD cchDomain = static_cast<DWORD>(std::size(domain));
+        SID_NAME_USE use = SidTypeUnknown;
+        
+        if (LookupAccountSidW(nullptr, tu->User.Sid, name, &cchName, domain, &cchDomain, &use)) {
+            try {
+                sec.userName = std::wstring(domain) + L"\\" + std::wstring(name);
+            } catch (...) {
+                sec.userName.clear();
+            }
+        }
     }
 
-    WCHAR name[256], domain[256];
-    DWORD cchName = 256, cchDomain = 256;
-    SID_NAME_USE use;
-    if (LookupAccountSidW(nullptr, tu->User.Sid, name, &cchName, domain, &cchDomain, &use)) {
-        sec.userName = std::wstring(domain) + L"\\" + std::wstring(name);
-    }
-
-    // Integrity level
+    // Integrity level with proper validation
     len = 0;
     GetTokenInformation(token.get(), TokenIntegrityLevel, nullptr, 0, &len);
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-        std::vector<BYTE> il(len);
-        if (GetTokenInformation(token.get(), TokenIntegrityLevel, il.data(), static_cast<DWORD>(il.size()), &len)) {
+    
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0 && len <= kMaxTokenInfoSize) {
+        std::vector<BYTE> il;
+        try {
+            il.resize(len);
+        } catch (...) {
+            // Continue without integrity level
+            il.clear();
+        }
+        
+        if (!il.empty() && GetTokenInformation(token.get(), TokenIntegrityLevel, 
+                                               il.data(), static_cast<DWORD>(il.size()), &len)) {
             auto til = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(il.data());
-            DWORD subAuthCount = *GetSidSubAuthorityCount(til->Label.Sid);
-            DWORD rid = *GetSidSubAuthority(til->Label.Sid, subAuthCount - 1);
-            if (rid < SECURITY_MANDATORY_MEDIUM_RID) sec.integrityLevel = L"Low";
-            else if (rid < SECURITY_MANDATORY_HIGH_RID) sec.integrityLevel = L"Medium";
-            else if (rid < SECURITY_MANDATORY_SYSTEM_RID) sec.integrityLevel = L"High";
-            else sec.integrityLevel = L"System";
+            if (til && til->Label.Sid) {
+                PUCHAR subAuthCountPtr = GetSidSubAuthorityCount(til->Label.Sid);
+                if (subAuthCountPtr && *subAuthCountPtr > 0) {
+                    PDWORD ridPtr = GetSidSubAuthority(til->Label.Sid, *subAuthCountPtr - 1);
+                    if (ridPtr) {
+                        const DWORD rid = *ridPtr;
+                        if (rid < SECURITY_MANDATORY_MEDIUM_RID) {
+                            sec.integrityLevel = L"Low";
+                        } else if (rid < SECURITY_MANDATORY_HIGH_RID) {
+                            sec.integrityLevel = L"Medium";
+                        } else if (rid < SECURITY_MANDATORY_SYSTEM_RID) {
+                            sec.integrityLevel = L"High";
+                        } else {
+                            sec.integrityLevel = L"System";
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -628,44 +1058,94 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err)
     TOKEN_ELEVATION elev{};
     len = sizeof(elev);
     if (GetTokenInformation(token.get(), TokenElevation, &elev, sizeof(elev), &len)) {
-        sec.isElevated = elev.TokenIsElevated != 0;
+        sec.isElevated = (elev.TokenIsElevated != 0);
     }
 
-    // Group membership: SYSTEM / SERVICE
+    // Group membership: SYSTEM / SERVICE with RAII for SIDs
     len = 0;
     GetTokenInformation(token.get(), TokenGroups, nullptr, 0, &len);
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-        std::vector<BYTE> gr(len);
-        if (GetTokenInformation(token.get(), TokenGroups, gr.data(), static_cast<DWORD>(gr.size()), &len)) {
+    
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0 && len <= kMaxTokenInfoSize) {
+        std::vector<BYTE> gr;
+        try {
+            gr.resize(len);
+        } catch (...) {
+            gr.clear();
+        }
+        
+        if (!gr.empty() && GetTokenInformation(token.get(), TokenGroups, 
+                                               gr.data(), static_cast<DWORD>(gr.size()), &len)) {
             auto tg = reinterpret_cast<TOKEN_GROUPS*>(gr.data());
+            
+            // RAII wrapper for SIDs
+            struct SidGuard {
+                PSID sid = nullptr;
+                ~SidGuard() { if (sid) FreeSid(sid); }
+            };
+            
             SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
-            PSID sidSystem = nullptr, sidService = nullptr;
-            AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &sidSystem);
-            AllocateAndInitializeSid(&ntAuth, 1, SECURITY_SERVICE_RID, 0, 0, 0, 0, 0, 0, 0, &sidService);
-            for (DWORD i = 0; i < tg->GroupCount; i++) {
-                if (sidSystem && EqualSid(tg->Groups[i].Sid, sidSystem)) sec.isRunningAsSystem = true;
-                if (sidService && EqualSid(tg->Groups[i].Sid, sidService)) sec.isRunningAsService = true;
+            SidGuard sidSystemGuard, sidServiceGuard;
+            
+            AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID, 
+                                     0, 0, 0, 0, 0, 0, 0, &sidSystemGuard.sid);
+            AllocateAndInitializeSid(&ntAuth, 1, SECURITY_SERVICE_RID, 
+                                     0, 0, 0, 0, 0, 0, 0, &sidServiceGuard.sid);
+            
+            if (tg) {
+                for (DWORD i = 0; i < tg->GroupCount; i++) {
+                    if (tg->Groups[i].Sid) {
+                        if (sidSystemGuard.sid && EqualSid(tg->Groups[i].Sid, sidSystemGuard.sid)) {
+                            sec.isRunningAsSystem = true;
+                        }
+                        if (sidServiceGuard.sid && EqualSid(tg->Groups[i].Sid, sidServiceGuard.sid)) {
+                            sec.isRunningAsService = true;
+                        }
+                    }
+                }
             }
-            if (sidSystem) FreeSid(sidSystem);
-            if (sidService) FreeSid(sidService);
         }
     }
 
-    // Privileges
+    // Privileges with bounds checking
     len = 0;
     GetTokenInformation(token.get(), TokenPrivileges, nullptr, 0, &len);
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-        std::vector<BYTE> pv(len);
-        if (GetTokenInformation(token.get(), TokenPrivileges, pv.data(), static_cast<DWORD>(pv.size()), &len)) {
+    
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0 && len <= kMaxTokenInfoSize) {
+        std::vector<BYTE> pv;
+        try {
+            pv.resize(len);
+        } catch (...) {
+            pv.clear();
+        }
+        
+        if (!pv.empty() && GetTokenInformation(token.get(), TokenPrivileges, 
+                                               pv.data(), static_cast<DWORD>(pv.size()), &len)) {
             auto tp = reinterpret_cast<TOKEN_PRIVILEGES*>(pv.data());
-            for (DWORD i = 0; i < tp->PrivilegeCount; i++) {
-                WCHAR privName[256]; DWORD cch = 256;
-                if (LookupPrivilegeNameW(nullptr, &tp->Privileges[i].Luid, privName, &cch)) {
-                    sec.enabledPrivileges.emplace_back(privName);
-                    if (_wcsicmp(privName, L"SeDebugPrivilege") == 0) {
-                        sec.hasSeDebugPrivilege = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
-                        if (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED)
-                            sec.hasDebugPrivilege = true;
+            if (tp) {
+                try {
+                    sec.enabledPrivileges.reserve(std::min(static_cast<DWORD>(64), tp->PrivilegeCount));
+                } catch (...) {
+                    // Continue without reservation
+                }
+                
+                for (DWORD i = 0; i < tp->PrivilegeCount && i < 256; i++) {
+                    WCHAR privName[256] = {};
+                    DWORD cch = static_cast<DWORD>(std::size(privName));
+                    
+                    if (LookupPrivilegeNameW(nullptr, &tp->Privileges[i].Luid, privName, &cch)) {
+                        try {
+                            sec.enabledPrivileges.emplace_back(privName);
+                        } catch (...) {
+                            // Ignore allocation failure for individual privilege
+                        }
+                        
+                        if (_wcsicmp(privName, L"SeDebugPrivilege") == 0) {
+                            const bool enabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                            sec.hasSeDebugPrivilege = enabled;
+                            if (enabled) {
+                                sec.hasDebugPrivilege = true;
+                            }
+                        }
                     }
                 }
             }
@@ -710,7 +1190,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
 
     if (!NtQueryInformationProcess) {
         SetWin32Error(err, L"GetProcessCommandLine", ERROR_CALL_NOT_IMPLEMENTED,
-            L"NtQueryInformationProcess bulunamadı.");
+            L"Failed to resolve NtQueryInformationProcess from ntdll.dll.");
         return std::nullopt;
     }
 
@@ -733,7 +1213,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
 
     if (!pbi.PebBaseAddress) {
         SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
-            L"PEB adresi geçersiz.");
+            L"PEB base address is invalid.");
         return std::nullopt;
     }
 
@@ -741,7 +1221,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
     bool isTargetWow64 = false;
     if (!IsProcessWow64Cached(ph.Get(), isTargetWow64)) {
         SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_FUNCTION,
-            L"WOW64 durumu belirlenemedi.");
+            L"Failed to determine WOW64 status of target process.");
         return std::nullopt;
     }
 
@@ -782,7 +1262,7 @@ std::optional<std::wstring> GetProcessCommandLine(ProcessId pid, Error* err) noe
 
         if (!peb32.ProcessParameters) {
             SetWin32Error(err, L"GetProcessCommandLine", ERROR_INVALID_ADDRESS,
-                L"ProcessParameters adresi geçersiz.");
+                L"ProcessParameters address is invalid.");
             return std::nullopt;
         }
 
@@ -954,41 +1434,67 @@ std::optional<std::wstring> GetProcessWindowTitle(ProcessId pid, Error* /*err*/)
 // Process Tree & Relationships
 // ==========================================================
 
+/**
+ * @brief Gets the parent process ID for a given process.
+ * 
+ * @param pid Process ID to query.
+ * @param err Optional error output.
+ * @return Parent process ID if found, std::nullopt otherwise.
+ */
+[[nodiscard]]
 std::optional<ProcessId> GetParentProcessId(ProcessId pid, Error* err) noexcept {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)");
         return std::nullopt;
     }
+    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot
+    
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    if (Process32FirstW(hSnap, &pe)) {
+    if (Process32FirstW(snapGuard.get(), &pe)) {
         do {
             if (pe.th32ProcessID == pid) {
-                CloseHandle(hSnap);
                 return pe.th32ParentProcessID;
             }
-        } while (Process32NextW(hSnap, &pe));
+        } while (Process32NextW(snapGuard.get(), &pe));
     }
-    CloseHandle(hSnap);
     return std::nullopt;
 }
 
+/**
+ * @brief Gets all direct child processes of a parent process.
+ * 
+ * @param parentPid Parent process ID.
+ * @param children Output vector of child process IDs.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ */
 bool GetChildProcesses(ProcessId parentPid, std::vector<ProcessId>& children, Error* err) noexcept {
     children.clear();
+    
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)");
         return false;
     }
+    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot
+    
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    if (Process32FirstW(hSnap, &pe)) {
+    if (Process32FirstW(snapGuard.get(), &pe)) {
         do {
-            if (pe.th32ParentProcessID == parentPid) children.push_back(pe.th32ProcessID);
-        } while (Process32NextW(hSnap, &pe));
+            if (pe.th32ParentProcessID == parentPid) {
+                try {
+                    children.push_back(pe.th32ProcessID);
+                } catch (const std::bad_alloc&) {
+                    SetWin32Error(err, L"GetChildProcesses", ERROR_NOT_ENOUGH_MEMORY,
+                        L"Failed to allocate memory for child process list.");
+                    return false;
+                }
+            }
+        } while (Process32NextW(snapGuard.get(), &pe));
     }
-    CloseHandle(hSnap);
     return true;
 }
 
@@ -1022,16 +1528,25 @@ bool BuildProcessTree(ProcessDependencyGraph& graph, Error* err) noexcept {
 // Process Existence & State
 // ==========================================================
 
+/**
+ * @brief Checks if a process is currently running by PID.
+ * 
+ * @param pid Process ID to check.
+ * @return true if process exists and is running, false otherwise.
+ */
+[[nodiscard]]
 bool IsProcessRunning(ProcessId pid) noexcept {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-    if (!h) return false;
-    DWORD code = 0;
-    bool running = false;
-    if (GetExitCodeProcess(h, &code)) {
-        running = (code == STILL_ACTIVE);
+    if (!h) {
+        return false;
     }
-    CloseHandle(h);
-    return running;
+    auto guard = make_unique_handle(h);  // RAII for process handle
+    
+    DWORD code = 0;
+    if (!GetExitCodeProcess(guard.get(), &code)) {
+        return false;
+    }
+    return (code == STILL_ACTIVE);
 }
 
 bool IsProcessRunning(std::wstring_view processName) noexcept {
@@ -1068,7 +1583,8 @@ bool IsProcessCritical(ProcessId pid, Error* err) noexcept {
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
 
     if (!NtQueryInformationProcess) {
-        SetWin32Error(err, L"NtQueryInformationProcess", ERROR_CALL_NOT_IMPLEMENTED, L"NtQueryInformationProcess bulunamad�.");
+        SetWin32Error(err, L"NtQueryInformationProcess", ERROR_CALL_NOT_IMPLEMENTED, 
+            L"Failed to resolve NtQueryInformationProcess from ntdll.dll.");
         return false;
     }
 
@@ -1090,7 +1606,8 @@ bool IsProcessProtected(ProcessId pid, Error* err) noexcept {
     static auto GetProcessInformationDyn = reinterpret_cast<GetProcessInformation_t>(
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessInformation"));
     if (!GetProcessInformationDyn) {
-        SetWin32Error(err, L"GetProcessInformation", ERROR_CALL_NOT_IMPLEMENTED, L"ProcessProtectionLevel sorgusu desteklenmiyor.");
+        SetWin32Error(err, L"GetProcessInformation", ERROR_CALL_NOT_IMPLEMENTED, 
+            L"ProcessProtectionLevel query is not supported on this Windows version.");
         return false;
     }
     ProcessHandle ph;
@@ -1104,36 +1621,58 @@ bool IsProcessProtected(ProcessId pid, Error* err) noexcept {
     return ppl.ProtectionLevel != PROTECTION_LEVEL_NONE;
 }
 
+/**
+ * @brief Checks if a process is fully suspended (all threads suspended).
+ * 
+ * @param pid Process ID to check.
+ * @param err Unused but kept for API consistency.
+ * @return true if all threads are suspended, false otherwise.
+ * 
+ * @warning This function temporarily suspends threads to check their state.
+ */
+[[nodiscard]]
 bool IsProcessSuspended(ProcessId pid, Error* /*err*/) noexcept {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return false;
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot
+    
     THREADENTRY32 te{};
     te.dwSize = sizeof(te);
     bool anyThread = false;
     bool anyRunning = false;
-    if (Thread32First(hSnap, &te)) {
+    
+    if (Thread32First(snapGuard.get(), &te)) {
         do {
             if (te.th32OwnerProcessID == pid) {
                 anyThread = true;
                 HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
                 if (hThread) {
-                    DWORD prev = ::SuspendThread(hThread);
-                    if (prev == (DWORD)-1) {
+                    auto threadGuard = make_unique_handle(hThread);  // RAII for thread handle
+                    
+                    // Suspend to get previous suspend count
+                    DWORD prev = ::SuspendThread(threadGuard.get());
+                    if (prev == static_cast<DWORD>(-1)) {
                         anyRunning = true;
                     }
                     else {
-                        if (prev == 0) anyRunning = true;
-                        ::ResumeThread(hThread);
+                        // If previous count was 0, thread was running
+                        if (prev == 0) {
+                            anyRunning = true;
+                        }
+                        // Resume to restore original state
+                        ::ResumeThread(threadGuard.get());
                     }
-                    CloseHandle(hThread);
                 }
                 else {
+                    // Can't open thread - assume running
                     anyRunning = true;
                 }
             }
-        } while (Thread32Next(hSnap, &te));
+        } while (Thread32Next(snapGuard.get(), &te));
     }
-    CloseHandle(hSnap);
+    
     return anyThread && !anyRunning;
 }
 
@@ -1146,48 +1685,90 @@ bool SuspendProcess(ProcessId pid, Error* err) noexcept {
     if (!ph.Open(pid, PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION, nullptr)) {
         if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
     }
+    
+    // Try native API first (atomic operation)
     if (auto fn = GetNtSuspendProcess()) {
         LONG st = fn(ph.Get());
-        if (st != 0) { SetNtError(err, L"NtSuspendProcess", st); return false; }
+        if (st != 0) { 
+            SetNtError(err, L"NtSuspendProcess", st); 
+            return false; 
+        }
         return true;
     }
+    
+    // Fallback: suspend each thread individually
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) { SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)"); return false; }
-    THREADENTRY32 te{ sizeof(te) };
-    if (Thread32First(hSnap, &te)) {
+    if (hSnap == INVALID_HANDLE_VALUE) { 
+        SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)"); 
+        return false; 
+    }
+    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot
+    
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snapGuard.get(), &te)) {
         do {
             if (te.th32OwnerProcessID == pid) {
                 HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                if (hThread) { ::SuspendThread(hThread); CloseHandle(hThread); }
+                if (hThread) { 
+                    auto threadGuard = make_unique_handle(hThread);
+                    ::SuspendThread(threadGuard.get());
+                }
             }
-        } while (Thread32Next(hSnap, &te));
+        } while (Thread32Next(snapGuard.get(), &te));
     }
-    CloseHandle(hSnap);
     return true;
 }
 
+/**
+ * @brief Resumes a suspended process.
+ * 
+ * Uses NtResumeProcess if available, otherwise resumes all threads individually.
+ * 
+ * @param pid Process ID to resume.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ */
 bool ResumeProcess(ProcessId pid, Error* err) noexcept {
     ProcessHandle ph;
     if (!ph.Open(pid, PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION, nullptr)) {
         if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
     }
+    
+    // Try native API first (atomic operation)
     if (auto fn = GetNtResumeProcess()) {
         LONG st = fn(ph.Get());
-        if (st != 0) { SetNtError(err, L"NtResumeProcess", st); return false; }
+        if (st != 0) { 
+            SetNtError(err, L"NtResumeProcess", st); 
+            return false; 
+        }
         return true;
     }
+    
+    // Fallback: resume each thread individually
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) { SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)"); return false; }
-    THREADENTRY32 te{ sizeof(te) };
-    if (Thread32First(hSnap, &te)) {
+    if (hSnap == INVALID_HANDLE_VALUE) { 
+        SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)"); 
+        return false; 
+    }
+    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot
+    
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snapGuard.get(), &te)) {
         do {
             if (te.th32OwnerProcessID == pid) {
                 HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                if (hThread) { while (::ResumeThread(hThread) > 0) {} CloseHandle(hThread); }
+                if (hThread) { 
+                    auto threadGuard = make_unique_handle(hThread);
+                    // Resume until suspend count is 0
+                    while (::ResumeThread(threadGuard.get()) > 0) {
+                        // Continue resuming
+                    }
+                }
             }
-        } while (Thread32Next(hSnap, &te));
+        } while (Thread32Next(snapGuard.get(), &te));
     }
-    CloseHandle(hSnap);
     return true;
 }
 
@@ -1641,42 +2222,79 @@ bool EjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
 
 bool EnumerateProcessThreads(ProcessId pid, std::vector<ProcessThreadInfo>& threads, Error* err) noexcept {
     threads.clear();
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    
+    const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)");
         return false;
     }
+    
+    // RAII guard for snapshot handle
+    const auto snapGuard = make_unique_handle(hSnap);
+    
     THREADENTRY32 te{};
     te.dwSize = sizeof(te);
-    if (Thread32First(hSnap, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid) {
-                ProcessThreadInfo ti{};
-                ti.tid = te.th32ThreadID;
-                ti.ownerPid = te.th32OwnerProcessID;
-                ti.basePriority = te.tpBasePri;
+    
+    if (!Thread32First(hSnap, &te)) {
+        const DWORD lastErr = GetLastError();
+        if (lastErr != ERROR_NO_MORE_FILES) {
+            SetWin32Error(err, L"Thread32First", lastErr);
+            return false;
+        }
+        return true; // Empty is valid
+    }
+    
+    try {
+        threads.reserve(64); // Reasonable initial reservation
+    } catch (...) {
+        // Continue without reservation
+    }
+    
+    do {
+        if (te.th32OwnerProcessID == pid) {
+            if (threads.size() >= kMaxThreadCount) {
+                break; // Safety limit
+            }
+            
+            ProcessThreadInfo ti{};
+            ti.tid = te.th32ThreadID;
+            ti.ownerPid = te.th32OwnerProcessID;
+            ti.basePriority = te.tpBasePri;
 
-                HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
-                if (hThread) {
-                    FILETIME ct{}, et{}, kt{}, ut{};
-                    if (GetThreadTimes(hThread, &ct, &et, &kt, &ut)) {
-                        ti.creationTime = ct;
-                        ti.exitTime = et;
-                        ti.kernelTime = kt;
-                        ti.userTime = ut;
-                    }
-                    DWORD prev = ::SuspendThread(hThread);
-                    if (prev != (DWORD)-1) {
+            // Open thread for additional info
+            HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+            if (hThread) {
+                auto threadGuard = make_unique_handle(hThread);
+                
+                FILETIME ct{}, et{}, kt{}, ut{};
+                if (GetThreadTimes(hThread, &ct, &et, &kt, &ut)) {
+                    ti.creationTime = ct;
+                    ti.exitTime = et;
+                    ti.kernelTime = kt;
+                    ti.userTime = ut;
+                }
+                
+                // Check if suspended (only if not current thread)
+                const ThreadId currentTid = ::GetCurrentThreadId();
+                if (te.th32ThreadID != currentTid) {
+                    const DWORD prev = ::SuspendThread(hThread);
+                    if (prev != static_cast<DWORD>(-1)) {
                         ti.isSuspended = (prev > 0);
                         ::ResumeThread(hThread);
                     }
-                    CloseHandle(hThread);
                 }
-                threads.push_back(std::move(ti));
             }
-        } while (Thread32Next(hSnap, &te));
-    }
-    CloseHandle(hSnap);
+            
+            try {
+                threads.push_back(std::move(ti));
+            } catch (const std::bad_alloc&) {
+                SetWin32Error(err, L"EnumerateProcessThreads", ERROR_OUTOFMEMORY, 
+                              L"Memory allocation failed");
+                return false;
+            }
+        }
+    } while (Thread32Next(hSnap, &te));
+    
     return true;
 }
 
@@ -1689,6 +2307,9 @@ std::optional<ProcessThreadInfo> GetThreadInfo(ThreadId tid, Error* err) noexcep
         SetWin32Error(err, L"OpenThread");
         return std::nullopt;
     }
+    
+    auto threadGuard = make_unique_handle(hThread);
+    
     FILETIME ct{}, et{}, kt{}, ut{};
     if (GetThreadTimes(hThread, &ct, &et, &kt, &ut)) {
         ti.creationTime = ct;
@@ -1696,63 +2317,129 @@ std::optional<ProcessThreadInfo> GetThreadInfo(ThreadId tid, Error* err) noexcep
         ti.kernelTime = kt;
         ti.userTime = ut;
     }
-    ThreadId currentTid = ::GetCurrentThreadId();
-    if (tid != currentTid) { 
-        DWORD prev = ::SuspendThread(hThread);
-        if (prev != (DWORD)-1) {
+    
+    // Check suspended state (avoid suspending current thread)
+    const ThreadId currentTid = ::GetCurrentThreadId();
+    if (tid != currentTid) {
+        const DWORD prev = ::SuspendThread(hThread);
+        if (prev != static_cast<DWORD>(-1)) {
             ti.isSuspended = (prev > 0);
             ::ResumeThread(hThread);
         }
     }
     else {
-        ti.isSuspended = false; 
+        ti.isSuspended = false;
     }
-    CloseHandle(hThread);
+    
     return ti;
 }
 
 bool SuspendThread(ThreadId tid, Error* err) noexcept {
+    // Prevent suspending current thread
+    if (tid == ::GetCurrentThreadId()) {
+        SetWin32Error(err, L"SuspendThread", ERROR_INVALID_PARAMETER, 
+                      L"Cannot suspend current thread");
+        return false;
+    }
+    
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
-    if (!h) { SetWin32Error(err, L"OpenThread"); return false; }
-    DWORD r = ::SuspendThread(h);
-    CloseHandle(h);
-    if (r == (DWORD)-1) { SetWin32Error(err, L"SuspendThread"); return false; }
+    if (!h) {
+        SetWin32Error(err, L"OpenThread");
+        return false;
+    }
+    
+    auto threadGuard = make_unique_handle(h);
+    
+    const DWORD r = ::SuspendThread(h);
+    if (r == static_cast<DWORD>(-1)) {
+        SetWin32Error(err, L"SuspendThread");
+        return false;
+    }
+    
     return true;
 }
 
 bool ResumeThread(ThreadId tid, Error* err) noexcept {
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
-    if (!h) { SetWin32Error(err, L"OpenThread"); return false; }
-    DWORD r = ::ResumeThread(h);
-    CloseHandle(h);
-    if (r == (DWORD)-1) { SetWin32Error(err, L"ResumeThread"); return false; }
+    if (!h) {
+        SetWin32Error(err, L"OpenThread");
+        return false;
+    }
+    
+    auto threadGuard = make_unique_handle(h);
+    
+    const DWORD r = ::ResumeThread(h);
+    if (r == static_cast<DWORD>(-1)) {
+        SetWin32Error(err, L"ResumeThread");
+        return false;
+    }
+    
     return true;
 }
 
 bool TerminateThread(ThreadId tid, DWORD exitCode, Error* err) noexcept {
+    // Prevent terminating current thread
+    if (tid == ::GetCurrentThreadId()) {
+        SetWin32Error(err, L"TerminateThread", ERROR_INVALID_PARAMETER, 
+                      L"Cannot terminate current thread");
+        return false;
+    }
+    
     HANDLE h = OpenThread(THREAD_TERMINATE, FALSE, tid);
-    if (!h) { SetWin32Error(err, L"OpenThread"); return false; }
-    BOOL ok = ::TerminateThread(h, exitCode);
-    CloseHandle(h);
-    if (!ok) { SetWin32Error(err, L"TerminateThread"); return false; }
+    if (!h) {
+        SetWin32Error(err, L"OpenThread");
+        return false;
+    }
+    
+    auto threadGuard = make_unique_handle(h);
+    
+    if (!::TerminateThread(h, exitCode)) {
+        SetWin32Error(err, L"TerminateThread");
+        return false;
+    }
+    
     return true;
 }
 
 bool SetThreadPriority(ThreadId tid, int priority, Error* err) noexcept {
     HANDLE h = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
-    if (!h) { SetWin32Error(err, L"OpenThread"); return false; }
-    BOOL ok = ::SetThreadPriority(h, priority);
-    CloseHandle(h);
-    if (!ok) { SetWin32Error(err, L"SetThreadPriority"); return false; }
+    if (!h) {
+        SetWin32Error(err, L"OpenThread");
+        return false;
+    }
+    
+    auto threadGuard = make_unique_handle(h);
+    
+    if (!::SetThreadPriority(h, priority)) {
+        SetWin32Error(err, L"SetThreadPriority");
+        return false;
+    }
+    
     return true;
 }
 
 bool SetThreadAffinity(ThreadId tid, DWORD_PTR affinityMask, Error* err) noexcept {
+    // Validate affinity mask is not empty
+    if (affinityMask == 0) {
+        SetWin32Error(err, L"SetThreadAffinity", ERROR_INVALID_PARAMETER,
+                      L"Affinity mask cannot be zero");
+        return false;
+    }
+    
     HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!h) { SetWin32Error(err, L"OpenThread"); return false; }
-    auto prev = ::SetThreadAffinityMask(h, affinityMask);
-    CloseHandle(h);
-    if (!prev) { SetWin32Error(err, L"SetThreadAffinityMask"); return false; }
+    if (!h) {
+        SetWin32Error(err, L"OpenThread");
+        return false;
+    }
+    
+    auto threadGuard = make_unique_handle(h);
+    
+    const auto prev = ::SetThreadAffinityMask(h, affinityMask);
+    if (!prev) {
+        SetWin32Error(err, L"SetThreadAffinityMask");
+        return false;
+    }
+    
     return true;
 }
 
@@ -1763,55 +2450,133 @@ bool SetThreadAffinity(ThreadId tid, DWORD_PTR affinityMask, Error* err) noexcep
 
 bool ReadProcessMemory(ProcessId pid, void* address, void* buffer, SIZE_T size,
     SIZE_T* bytesRead, Error* err) noexcept {
+    
+    // Validate parameters
+    if (!address) {
+        SetWin32Error(err, L"ReadProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Source address is null");
+        return false;
+    }
+    if (!buffer) {
+        SetWin32Error(err, L"ReadProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Destination buffer is null");
+        return false;
+    }
+    if (size == 0) {
+        if (bytesRead) *bytesRead = 0;
+        return true; // Reading 0 bytes always succeeds
+    }
+    
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    if (!ph.Open(pid, PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+    
     SIZE_T br = 0;
     if (!::ReadProcessMemory(ph.Get(), address, buffer, size, &br)) {
         SetWin32Error(err, L"ReadProcessMemory");
         return false;
     }
+    
     if (bytesRead) *bytesRead = br;
     return true;
 }
 
 bool WriteProcessMemory(ProcessId pid, void* address, const void* buffer, SIZE_T size,
     SIZE_T* bytesWritten, Error* err) noexcept {
+    
+    // Validate parameters
+    if (!address) {
+        SetWin32Error(err, L"WriteProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Destination address is null");
+        return false;
+    }
+    if (!buffer) {
+        SetWin32Error(err, L"WriteProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Source buffer is null");
+        return false;
+    }
+    if (size == 0) {
+        if (bytesWritten) *bytesWritten = 0;
+        return true; // Writing 0 bytes always succeeds
+    }
+    
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    if (!ph.Open(pid, PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+    
     SIZE_T bw = 0;
     if (!::WriteProcessMemory(ph.Get(), address, buffer, size, &bw)) {
         SetWin32Error(err, L"WriteProcessMemory");
         return false;
     }
+    
     if (bytesWritten) *bytesWritten = bw;
     return true;
 }
 
 bool AllocateProcessMemory(ProcessId pid, SIZE_T size, void** outAddress,
     DWORD allocationType, DWORD protection, Error* err) noexcept {
+    
+    // Validate parameters
     if (!outAddress) {
-        SetWin32Error(err, L"AllocateProcessMemory", ERROR_INVALID_PARAMETER, L"outAddress null");
+        SetWin32Error(err, L"AllocateProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"outAddress is null");
         return false;
     }
+    *outAddress = nullptr;
+    
+    if (size == 0) {
+        SetWin32Error(err, L"AllocateProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Allocation size cannot be zero");
+        return false;
+    }
+    
+    // Sanity check on allocation size (prevent excessive allocations)
+    static constexpr SIZE_T kMaxAllocationSize = 1ULL * 1024 * 1024 * 1024; // 1GB
+    if (size > kMaxAllocationSize) {
+        SetWin32Error(err, L"AllocateProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Allocation size exceeds maximum allowed");
+        return false;
+    }
+    
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    if (!ph.Open(pid, PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+    
     void* p = ::VirtualAllocEx(ph.Get(), nullptr, size, allocationType, protection);
     if (!p) {
         SetWin32Error(err, L"VirtualAllocEx");
         return false;
     }
+    
     *outAddress = p;
     return true;
 }
 
 bool FreeProcessMemory(ProcessId pid, void* address, SIZE_T size, DWORD freeType, Error* err) noexcept {
+    // Validate address
+    if (!address) {
+        SetWin32Error(err, L"FreeProcessMemory", ERROR_INVALID_PARAMETER, 
+                      L"Address is null");
+        return false;
+    }
+    
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
-    BOOL ok = ::VirtualFreeEx(ph.Get(), address, (freeType == MEM_RELEASE) ? 0 : size, freeType);
-    if (!ok) {
+    if (!ph.Open(pid, PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+    
+    // For MEM_RELEASE, size must be 0 per Windows API spec
+    const SIZE_T effectiveSize = (freeType == MEM_RELEASE) ? 0 : size;
+    
+    if (!::VirtualFreeEx(ph.Get(), address, effectiveSize, freeType)) {
         SetWin32Error(err, L"VirtualFreeEx");
         return false;
     }
+    
     return true;
 }
 
@@ -1844,33 +2609,58 @@ bool QueryProcessMemoryRegion(ProcessId pid, void* address,
 // Handle Operations
 // ==========================================================
 
+/**
+ * @brief Enumerates all handles owned by a specific process.
+ * 
+ * Uses NtQuerySystemInformation to retrieve system-wide handle information,
+ * then filters handles belonging to the target process. Handle type names
+ * and object names are retrieved when possible via handle duplication.
+ * 
+ * @param pid Target process ID to enumerate handles for.
+ * @param handles Output vector of handle information structures.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ * 
+ * @note Requires SeDebugPrivilege for handles from protected processes.
+ * @warning Some handle types (File, Key) may hang during name query - they are skipped.
+ */
 bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& handles, Error* err) noexcept {
     handles.clear();
 
-    // NtQuerySystemInformation for handle enumeration
+    // NtQuerySystemInformation for handle enumeration - resolve once and cache
     typedef LONG(NTAPI* NtQuerySystemInformation_t)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
     static auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
 
     if (!NtQuerySystemInformation) {
         SetWin32Error(err, L"EnumerateProcessHandles", ERROR_CALL_NOT_IMPLEMENTED,
-            L"failed to find NtQuerySystemInformation.");
+            L"Failed to resolve NtQuerySystemInformation from ntdll.dll.");
         return false;
     }
 
-    // SystemHandleInformation (0x10) or SystemExtendedHandleInformation (0x40)
-    const SYSTEM_INFORMATION_CLASS SystemExtendedHandleInformation = static_cast<SYSTEM_INFORMATION_CLASS>(0x40);
+    // SystemExtendedHandleInformation (0x40) provides more info than SystemHandleInformation (0x10)
+    constexpr SYSTEM_INFORMATION_CLASS SystemExtendedHandleInformation = 
+        static_cast<SYSTEM_INFORMATION_CLASS>(0x40);
 
-    // Dynamically allocate buffer for handle information
-    ULONG bufferSize = 0x10000; // Start with 64KB
+    // Maximum buffer size to prevent runaway allocation (256MB limit)
+    constexpr ULONG kMaxHandleBufferSize = 256 * 1024 * 1024;
+    
+    // Dynamically allocate buffer for handle information, start with 64KB
+    ULONG bufferSize = 0x10000;
     std::vector<BYTE> buffer;
     LONG status = 0;
 
-    // Query with increasing buffer size
+    // Query with increasing buffer size, up to kMaxHandleBufferSize
     for (int attempts = 0; attempts < 10; ++attempts) {
-        buffer.resize(bufferSize);
-        ULONG returnLength = 0;
+        try {
+            buffer.resize(bufferSize);
+        } catch (const std::bad_alloc&) {
+            SetWin32Error(err, L"EnumerateProcessHandles", ERROR_NOT_ENOUGH_MEMORY,
+                L"Failed to allocate buffer for handle enumeration.");
+            return false;
+        }
 
+        ULONG returnLength = 0;
         status = NtQuerySystemInformation(
             SystemExtendedHandleInformation,
             buffer.data(),
@@ -1882,7 +2672,14 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
             break; // Success
         }
         else if (status == static_cast<LONG>(0xC0000004)) { // STATUS_INFO_LENGTH_MISMATCH
-            bufferSize = returnLength + 0x1000; // Add 4KB margin
+            // Calculate new buffer size with 4KB margin, check for overflow
+            const ULONG newSize = returnLength + 0x1000;
+            if (newSize < returnLength || newSize > kMaxHandleBufferSize) {
+                SetWin32Error(err, L"EnumerateProcessHandles", ERROR_NOT_ENOUGH_MEMORY,
+                    L"Handle information buffer size exceeded maximum limit.");
+                return false;
+            }
+            bufferSize = newSize;
             continue;
         }
         else {
@@ -1893,11 +2690,11 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
 
     if (status != 0) {
         SetNtError(err, L"EnumerateProcessHandles", status,
-            L"Handle information query is failed. (buffer is not enough).");
+            L"Handle information query failed after maximum retry attempts.");
         return false;
     }
 
-    // Parse SYSTEM_HANDLE_INFORMATION_EX structure
+    // Parse SYSTEM_HANDLE_INFORMATION_EX structure (Windows internal structure)
     struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
         PVOID Object;
         ULONG_PTR UniqueProcessId;
@@ -1915,7 +2712,30 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
         SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
     };
 
+    // Validate buffer size before accessing structure
+    if (buffer.size() < sizeof(SYSTEM_HANDLE_INFORMATION_EX)) {
+        SetWin32Error(err, L"EnumerateProcessHandles", ERROR_INVALID_DATA,
+            L"Returned buffer is too small for handle information.");
+        return false;
+    }
+
     auto* handleInfo = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(buffer.data());
+    
+    // Validate handle count against buffer capacity
+    const SIZE_T maxHandles = (buffer.size() - offsetof(SYSTEM_HANDLE_INFORMATION_EX, Handles)) / 
+                              sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX);
+    if (handleInfo->NumberOfHandles > maxHandles) {
+        SetWin32Error(err, L"EnumerateProcessHandles", ERROR_INVALID_DATA,
+            L"Handle count exceeds buffer capacity.");
+        return false;
+    }
+
+    // Pre-reserve space for efficiency (estimate 1% of handles belong to target process)
+    try {
+        handles.reserve(std::min<SIZE_T>(handleInfo->NumberOfHandles / 100 + 10, 10000));
+    } catch (...) {
+        // Non-fatal - continue without pre-allocation
+    }
 
     // Open target process for handle duplication (to get object names)
     ProcessHandle ph;
@@ -2066,15 +2886,35 @@ bool EnumerateProcessHandles(ProcessId pid, std::vector<ProcessHandleInfo>& hand
     return true;
 }
 
+/**
+ * @brief Closes a handle in a remote process.
+ * 
+ * Validates the handle exists and performs safety checks to prevent
+ * closing critical system handles that could destabilize the system.
+ * 
+ * @param pid Target process ID that owns the handle.
+ * @param handle The handle value to close in the target process.
+ * @param err Optional error output.
+ * @return true if handle was successfully closed, false on failure.
+ * 
+ * @warning Closing handles in another process is dangerous and can cause
+ *          crashes or undefined behavior in the target process.
+ * @note Protected handles (Process, Thread to system/current process) are blocked.
+ */
 bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
+    // Validate handle parameter
     if (!handle || handle == INVALID_HANDLE_VALUE) {
         SetWin32Error(err, L"CloseProcessHandle", ERROR_INVALID_HANDLE,
-            L"Geçersiz handle.");
+            L"Invalid handle specified.");
         return false;
     }
 
-    // Security check: Prevent closing critical system handles
-    // This is important to prevent system destabilization
+    // Security check: Prevent closing handles in the current process via this API
+    if (pid == ::GetCurrentProcessId()) {
+        SetWin32Error(err, L"CloseProcessHandle", ERROR_ACCESS_DENIED,
+            L"Cannot close handles in current process via remote API.");
+        return false;
+    }
 
     // Open target process with handle duplication rights
     ProcessHandle ph;
@@ -2082,8 +2922,7 @@ bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
         return false;
     }
 
-    // Verify the handle belongs to the target process
-    // by attempting to duplicate it first
+    // Duplicate the handle to our process for validation and type checking
     HANDLE testHandle = nullptr;
     if (!::DuplicateHandle(
         ph.Get(),
@@ -2095,20 +2934,19 @@ bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
         DUPLICATE_SAME_ACCESS))
     {
         SetWin32Error(err, L"CloseProcessHandle", GetLastError(),
-            L"Handle validation is failed.");
+            L"Failed to validate handle - handle may not exist or access denied.");
         return false;
     }
 
-    // Close the test handle
-    if (testHandle) {
-        ::CloseHandle(testHandle);
-    }
+    // RAII guard for the duplicated test handle
+    auto testGuard = make_unique_handle(testHandle);
 
-    // Get handle type for safety checks
+    // Resolve NtQueryObject for handle type checking
     typedef LONG(NTAPI* NtQueryObject_t)(HANDLE, DWORD, PVOID, ULONG, PULONG);
     static auto NtQueryObject = reinterpret_cast<NtQueryObject_t>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
 
+    // Get handle type for safety checks using the duplicated handle
     if (NtQueryObject) {
         BYTE typeBuffer[1024] = {};
         ULONG returnLength = 0;
@@ -2118,16 +2956,17 @@ bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
             ULONG Reserved[22];
         };
 
-        if (testHandle && NtQueryObject(testHandle, 2, typeBuffer, sizeof(typeBuffer), &returnLength) == 0) {
+        // Query object type information (ObjectTypeInformation = 2)
+        if (NtQueryObject(testGuard.get(), 2, typeBuffer, sizeof(typeBuffer), &returnLength) == 0) {
             auto* typeInfo = reinterpret_cast<PUBLIC_OBJECT_TYPE_INFORMATION*>(typeBuffer);
             if (typeInfo->TypeName.Buffer && typeInfo->TypeName.Length > 0) {
-                std::wstring typeName(typeInfo->TypeName.Buffer,
-                    typeInfo->TypeName.Length / sizeof(wchar_t));
+                // Safely construct string with bounds checking
+                const SIZE_T charCount = typeInfo->TypeName.Length / sizeof(wchar_t);
+                std::wstring typeName(typeInfo->TypeName.Buffer, charCount);
 
-                // Prevent closing critical handle types
+                // Prevent closing critical handle types (Process or Thread handles)
                 if (typeName == L"Process" || typeName == L"Thread") {
-                    // Additional check: Don't close current process/thread handles
-                    DWORD handlePid = 0;
+                    // Additional check: Don't close handles to system or current process
                     typedef LONG(NTAPI* NtQueryInformationProcess_t)(HANDLE, DWORD, PVOID, ULONG, PULONG);
                     static auto NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcess_t>(
                         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
@@ -2142,12 +2981,14 @@ bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
                         };
 
                         PROCESS_BASIC_INFORMATION pbi{};
-                        if (NtQueryInformationProcess(testHandle, 0, &pbi, sizeof(pbi), nullptr) == 0) {
-                            handlePid = static_cast<DWORD>(pbi.UniqueProcessId);
+                        // ProcessBasicInformation = 0
+                        if (NtQueryInformationProcess(testGuard.get(), 0, &pbi, sizeof(pbi), nullptr) == 0) {
+                            const DWORD handlePid = static_cast<DWORD>(pbi.UniqueProcessId);
 
-                            if (handlePid == ::GetCurrentProcessId() || handlePid == 4) { // System process
+                            // Block closing handles to System (PID 4) or current process
+                            if (handlePid == ::GetCurrentProcessId() || handlePid == 4) {
                                 SetWin32Error(err, L"CloseProcessHandle", ERROR_ACCESS_DENIED,
-                                    L"Tried to close a critical system Handle.");
+                                    L"Cannot close handle to System process or current process.");
                                 return false;
                             }
                         }
@@ -2158,14 +2999,15 @@ bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
     }
 
     // Close the handle in the remote process using DuplicateHandle with DUPLICATE_CLOSE_SOURCE
+    // This atomically closes the handle in the source process
     if (!::DuplicateHandle(
         ph.Get(),
         handle,
-        nullptr,  // No target process
-        nullptr,  // No target handle
+        nullptr,  // No target process - just close source
+        nullptr,  // No target handle needed
         0,
         FALSE,
-        DUPLICATE_CLOSE_SOURCE))  // This closes the source handle
+        DUPLICATE_CLOSE_SOURCE))  // This flag closes the source handle
     {
         SetWin32Error(err, L"DuplicateHandle(DUPLICATE_CLOSE_SOURCE)");
         return false;
@@ -2174,24 +3016,54 @@ bool CloseProcessHandle(ProcessId pid, HANDLE handle, Error* err) noexcept {
     return true;
 }
 
+/**
+ * @brief Duplicates a handle from one process to another.
+ * 
+ * @param sourcePid Process ID that owns the source handle.
+ * @param sourceHandle Handle value to duplicate from source process.
+ * @param targetPid Process ID to receive the duplicated handle.
+ * @param targetHandle Output: receives the new handle value in target process.
+ * @param desiredAccess Access rights for the duplicated handle.
+ * @param inheritHandle Whether the duplicated handle is inheritable.
+ * @param options Duplication options (DUPLICATE_SAME_ACCESS, etc.).
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ */
 bool DuplicateProcessHandle(ProcessId sourcePid, HANDLE sourceHandle,
     ProcessId targetPid, HANDLE* targetHandle,
     DWORD desiredAccess, bool inheritHandle,
     DWORD options, Error* err) noexcept {
+    // Validate output parameter
     if (!targetHandle) {
-        SetWin32Error(err, L"DuplicateProcessHandle", ERROR_INVALID_PARAMETER, L"targetHandle null");
+        SetWin32Error(err, L"DuplicateProcessHandle", ERROR_INVALID_PARAMETER, 
+            L"targetHandle output parameter is null.");
+        return false;
+    }
+    *targetHandle = nullptr;  // Initialize output
+
+    // Validate source handle
+    if (!sourceHandle || sourceHandle == INVALID_HANDLE_VALUE) {
+        SetWin32Error(err, L"DuplicateProcessHandle", ERROR_INVALID_HANDLE,
+            L"Invalid source handle specified.");
         return false;
     }
 
+    // Open source and target processes with duplication rights
     ProcessHandle src, dst;
-    if (!src.Open(sourcePid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
-    if (!dst.Open(targetPid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    if (!src.Open(sourcePid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+    if (!dst.Open(targetPid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
 
     HANDLE dup = nullptr;
-    if (!::DuplicateHandle(src.Get(), sourceHandle, dst.Get(), &dup, desiredAccess, inheritHandle, options)) {
+    if (!::DuplicateHandle(src.Get(), sourceHandle, dst.Get(), &dup, 
+                           desiredAccess, inheritHandle ? TRUE : FALSE, options)) {
         SetWin32Error(err, L"DuplicateHandle");
         return false;
     }
+    
     *targetHandle = dup;
     return true;
 }
@@ -2200,10 +3072,31 @@ bool DuplicateProcessHandle(ProcessId sourcePid, HANDLE sourceHandle,
 // Process Security & Privileges
 // ==========================================================
 
+/**
+ * @brief Enables or disables a privilege on a process token.
+ * 
+ * @param pid Target process ID.
+ * @param privilegeName Name of the privilege (e.g., SE_DEBUG_NAME, SE_BACKUP_NAME).
+ * @param enable true to enable, false to disable.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ * 
+ * @note The privilege must already exist in the token; this function cannot add new privileges.
+ */
 bool EnableProcessPrivilege(ProcessId pid, std::wstring_view privilegeName, bool enable, Error* err) noexcept {
-    ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    // Validate privilege name
+    if (privilegeName.empty()) {
+        SetWin32Error(err, L"EnableProcessPrivilege", ERROR_INVALID_PARAMETER,
+            L"Privilege name cannot be empty.");
+        return false;
+    }
 
+    ProcessHandle ph;
+    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+
+    // Open the process token with required access rights
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(ph.Get(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
         SetWin32Error(err, L"OpenProcessToken");
@@ -2211,48 +3104,117 @@ bool EnableProcessPrivilege(ProcessId pid, std::wstring_view privilegeName, bool
     }
     auto token = make_unique_handle(hToken);
 
+    // Look up the LUID for the privilege name
     LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, std::wstring(privilegeName).c_str(), &luid)) {
+    // Create null-terminated string for API call
+    std::wstring privNameStr(privilegeName);
+    if (!LookupPrivilegeValueW(nullptr, privNameStr.c_str(), &luid)) {
         SetWin32Error(err, L"LookupPrivilegeValueW");
         return false;
     }
 
+    // Set up the privilege structure
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = enable ? SE_PRIVILEGE_ENABLED : 0;
+
+    // Adjust the token privileges
     if (!AdjustTokenPrivileges(token.get(), FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
         SetWin32Error(err, L"AdjustTokenPrivileges");
         return false;
     }
+
+    // Check if the privilege was actually adjusted
+    // AdjustTokenPrivileges succeeds even if not all privileges were adjusted
     if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-        SetWin32Error(err, L"AdjustTokenPrivileges", ERROR_NOT_ALL_ASSIGNED, L"�stenen ayr�cal�k tokende bulunmuyor.");
+        SetWin32Error(err, L"AdjustTokenPrivileges", ERROR_NOT_ALL_ASSIGNED, 
+            L"Requested privilege does not exist in the process token.");
         return false;
     }
+
     return true;
 }
 
+/**
+ * @brief Checks if a process has a specific privilege enabled.
+ * 
+ * @param pid Target process ID.
+ * @param privilegeName Name of the privilege to check.
+ * @param err Optional error output.
+ * @return true if privilege is enabled, false otherwise (or on error).
+ */
+[[nodiscard]]
 bool HasProcessPrivilege(ProcessId pid, std::wstring_view privilegeName, Error* err) noexcept {
+    if (privilegeName.empty()) {
+        return false;
+    }
+
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) return false;
-    auto target = ToLower(std::wstring(privilegeName));
+    if (!GetProcessSecurityInfo(pid, sec, err)) {
+        return false;
+    }
+
+    const std::wstring target = ToLower(std::wstring(privilegeName));
     for (const auto& p : sec.enabledPrivileges) {
-        if (ToLower(p) == target) return true;
+        if (ToLower(p) == target) {
+            return true;
+        }
     }
     return false;
 }
 
+/**
+ * @brief Retrieves all enabled privileges for a process.
+ * 
+ * @param pid Target process ID.
+ * @param privileges Output vector of enabled privilege names.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ */
 bool GetProcessPrivileges(ProcessId pid, std::vector<std::wstring>& privileges, Error* err) noexcept {
     privileges.clear();
+
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) return false;
-    privileges = sec.enabledPrivileges;
+    if (!GetProcessSecurityInfo(pid, sec, err)) {
+        return false;
+    }
+
+    try {
+        privileges = sec.enabledPrivileges;
+    } catch (const std::bad_alloc&) {
+        SetWin32Error(err, L"GetProcessPrivileges", ERROR_NOT_ENOUGH_MEMORY,
+            L"Failed to allocate memory for privilege list.");
+        return false;
+    }
+
     return true;
 }
 
+/**
+ * @brief Impersonates the security context of another process.
+ * 
+ * The calling thread will assume the security context of the target process.
+ * Call RevertToSelf() when done to restore the original security context.
+ * 
+ * @param pid Target process ID to impersonate.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ * 
+ * @warning Impersonation affects the current thread only. Always call RevertToSelf().
+ */
 bool ImpersonateProcess(ProcessId pid, Error* err) noexcept {
+    // Prevent impersonating the current process (no-op but may indicate logic error)
+    if (pid == ::GetCurrentProcessId()) {
+        SetWin32Error(err, L"ImpersonateProcess", ERROR_INVALID_PARAMETER,
+            L"Cannot impersonate the current process.");
+        return false;
+    }
+
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
+    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
 
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(ph.Get(), TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
@@ -2428,9 +3390,34 @@ bool CreateProcessWithToken(std::wstring_view executablePath,
     return true;
 }
 
+/**
+ * @brief Terminates a process by PID.
+ * 
+ * @param pid Process ID to terminate.
+ * @param exitCode Exit code for the terminated process.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ * 
+ * @warning Process termination is abrupt and may cause data loss.
+ */
 bool TerminateProcess(ProcessId pid, DWORD exitCode, Error* err) noexcept {
+    // Prevent terminating System process or current process
+    if (pid == 0 || pid == 4) {
+        SetWin32Error(err, L"TerminateProcess", ERROR_ACCESS_DENIED,
+            L"Cannot terminate System process.");
+        return false;
+    }
+    if (pid == ::GetCurrentProcessId()) {
+        SetWin32Error(err, L"TerminateProcess", ERROR_ACCESS_DENIED,
+            L"Cannot terminate current process via this API.");
+        return false;
+    }
+
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_TERMINATE, err)) return false;
+    if (!ph.Open(pid, PROCESS_TERMINATE, err)) {
+        return false;
+    }
+    
     if (!::TerminateProcess(ph.Get(), exitCode)) {
         SetWin32Error(err, L"TerminateProcess");
         return false;
@@ -2438,7 +3425,23 @@ bool TerminateProcess(ProcessId pid, DWORD exitCode, Error* err) noexcept {
     return true;
 }
 
+/**
+ * @brief Terminates a process by handle.
+ * 
+ * @param hProcess Handle to the process to terminate.
+ * @param exitCode Exit code for the terminated process.
+ * @param err Optional error output.
+ * @return true on success, false on failure.
+ * 
+ * @note Caller is responsible for handle validity and access rights.
+ */
 bool TerminateProcess(HANDLE hProcess, DWORD exitCode, Error* err) noexcept {
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
+        SetWin32Error(err, L"TerminateProcess", ERROR_INVALID_HANDLE,
+            L"Invalid process handle.");
+        return false;
+    }
+
     if (!::TerminateProcess(hProcess, exitCode)) {
         SetWin32Error(err, L"TerminateProcess");
         return false;
@@ -2446,69 +3449,163 @@ bool TerminateProcess(HANDLE hProcess, DWORD exitCode, Error* err) noexcept {
     return true;
 }
 
+/**
+ * @brief Terminates a process and all of its descendant processes.
+ * 
+ * Builds a process tree and terminates processes in reverse order
+ * (children before parents) to avoid orphaned processes.
+ * 
+ * @param rootPid Root process ID of the tree to terminate.
+ * @param exitCode Exit code for all terminated processes.
+ * @param err Optional error output.
+ * @return true if all processes terminated successfully, false if any failed.
+ * 
+ * @note System processes (PID 0, 4) and current process are skipped.
+ */
 bool TerminateProcessTree(ProcessId rootPid, DWORD exitCode, Error* err) noexcept {
+    // Build parent-child relationship map
     std::unordered_multimap<ProcessId, ProcessId> tree;
+    
+    // Create process snapshot with RAII
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         SetWin32Error(err, L"CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)");
         return false;
     }
+    auto snapGuard = make_unique_handle(hSnap);  // RAII for snapshot handle
+
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    if (Process32FirstW(hSnap, &pe)) {
+    if (Process32FirstW(snapGuard.get(), &pe)) {
         do {
+            // Map parent PID -> child PID
             tree.emplace(pe.th32ParentProcessID, pe.th32ProcessID);
-        } while (Process32NextW(hSnap, &pe));
+        } while (Process32NextW(snapGuard.get(), &pe));
     }
-    CloseHandle(hSnap);
 
-    std::vector<ProcessId> stack{ rootPid };
+    // Build ordered list of processes to terminate using DFS
+    std::vector<ProcessId> stack;
     std::vector<ProcessId> order;
     std::unordered_set<ProcessId> visited;
+
+    try {
+        stack.reserve(64);
+        order.reserve(64);
+        stack.push_back(rootPid);
+    } catch (const std::bad_alloc&) {
+        SetWin32Error(err, L"TerminateProcessTree", ERROR_NOT_ENOUGH_MEMORY,
+            L"Failed to allocate memory for process tree traversal.");
+        return false;
+    }
+
     while (!stack.empty()) {
-        auto pid = stack.back(); stack.pop_back();
+        const ProcessId pid = stack.back();
+        stack.pop_back();
+
         if (visited.insert(pid).second) {
             order.push_back(pid);
+            
+            // Add all children to stack
             auto range = tree.equal_range(pid);
             for (auto it = range.first; it != range.second; ++it) {
                 stack.push_back(it->second);
             }
         }
     }
+
+    // Reverse order so we terminate children before parents
     std::reverse(order.begin(), order.end());
+
+    // Terminate all processes in order
     bool okAll = true;
-    for (auto pid : order) {
-        if (pid == 0 || pid == ::GetCurrentProcessId()) continue;
-        if (!IsProcessRunning(pid)) continue;
-        if (!TerminateProcess(pid, exitCode, nullptr)) okAll = false;
+    size_t failedCount = 0;
+
+    for (const ProcessId pid : order) {
+        // Skip system processes and current process
+        if (pid == 0 || pid == 4 || pid == ::GetCurrentProcessId()) {
+            continue;
+        }
+        
+        // Skip already terminated processes
+        if (!IsProcessRunning(pid)) {
+            continue;
+        }
+
+        if (!TerminateProcess(pid, exitCode, nullptr)) {
+            okAll = false;
+            ++failedCount;
+        }
     }
-    if (!okAll) SetWin32Error(err, L"TerminateProcessTree", ERROR_GEN_FAILURE, L"Baz� s�re�ler sonland�r�lamad�.");
+
+    if (!okAll) {
+        SetWin32Error(err, L"TerminateProcessTree", ERROR_GEN_FAILURE, 
+            L"Some processes in the tree could not be terminated.");
+    }
+
     return okAll;
 }
 
+/**
+ * @brief Waits for a process to exit.
+ * 
+ * @param pid Process ID to wait for.
+ * @param timeoutMs Timeout in milliseconds (INFINITE for no timeout).
+ * @param err Optional error output.
+ * @return true if wait succeeded (process exited or timeout), false on error.
+ */
 bool WaitForProcess(ProcessId pid, DWORD timeoutMs, Error* err) noexcept {
     ProcessHandle ph;
-    if (!ph.Open(pid, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, err)) return false;
-    DWORD w = WaitForSingleObject(ph.Get(), timeoutMs);
+    if (!ph.Open(pid, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return false;
+    }
+    
+    const DWORD w = WaitForSingleObject(ph.Get(), timeoutMs);
     if (w == WAIT_FAILED) {
         SetWin32Error(err, L"WaitForSingleObject");
         return false;
     }
-    return w == WAIT_OBJECT_0 || w == WAIT_TIMEOUT;
+    return (w == WAIT_OBJECT_0) || (w == WAIT_TIMEOUT);
 }
 
+/**
+ * @brief Waits for a process to exit using a handle.
+ * 
+ * @param hProcess Process handle with SYNCHRONIZE access.
+ * @param timeoutMs Timeout in milliseconds (INFINITE for no timeout).
+ * @param err Optional error output.
+ * @return true if wait succeeded, false on error.
+ */
 bool WaitForProcess(HANDLE hProcess, DWORD timeoutMs, Error* err) noexcept {
-    DWORD w = WaitForSingleObject(hProcess, timeoutMs);
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
+        SetWin32Error(err, L"WaitForProcess", ERROR_INVALID_HANDLE,
+            L"Invalid process handle.");
+        return false;
+    }
+
+    const DWORD w = WaitForSingleObject(hProcess, timeoutMs);
     if (w == WAIT_FAILED) {
         SetWin32Error(err, L"WaitForSingleObject");
         return false;
     }
-    return w == WAIT_OBJECT_0 || w == WAIT_TIMEOUT;
+    return (w == WAIT_OBJECT_0) || (w == WAIT_TIMEOUT);
 }
 
+/**
+ * @brief Retrieves the exit code of a process.
+ * 
+ * @param pid Process ID.
+ * @param err Optional error output.
+ * @return Exit code if available, std::nullopt on error.
+ * 
+ * @note Returns STILL_ACTIVE (259) if process is still running.
+ */
+[[nodiscard]]
 std::optional<DWORD> GetProcessExitCode(ProcessId pid, Error* err) noexcept {
     ProcessHandle ph;
-    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) return std::nullopt;
+    if (!ph.Open(pid, PROCESS_QUERY_LIMITED_INFORMATION, err)) {
+        return std::nullopt;
+    }
+    
     DWORD code = 0;
     if (!GetExitCodeProcess(ph.Get(), &code)) {
         SetWin32Error(err, L"GetExitCodeProcess");
@@ -2571,7 +3668,8 @@ bool ProcessMonitor::Start(Error* err) noexcept {
     }
     catch (...) {
         m_running.store(false);
-        SetWin32Error(err, L"ProcessMonitor::Start", ERROR_OUTOFMEMORY, L"�zleme thread'i ba�lat�lamad�.");
+        SetWin32Error(err, L"ProcessMonitor::Start", ERROR_OUTOFMEMORY, 
+            L"Failed to start monitoring thread.");
         return false;
     }
     return true;
@@ -2656,26 +3754,61 @@ std::vector<ProcessId> GetProcessIdsByName(std::wstring_view processName, Error*
     return result;
 }
 
+/**
+ * @brief Terminates the first process found with the specified name.
+ * 
+ * @param processName Process name to search for (case-insensitive).
+ * @param err Optional error output.
+ * @return true if a process was terminated, false if not found or on error.
+ */
 bool KillProcessByName(std::wstring_view processName, Error* err) noexcept {
+    if (processName.empty()) {
+        SetWin32Error(err, L"KillProcessByName", ERROR_INVALID_PARAMETER,
+            L"Process name cannot be empty.");
+        return false;
+    }
+
     auto pid = GetProcessIdByName(processName, err);
     if (pid == 0) {
-        SetWin32Error(err, L"KillProcessByName", ERROR_NOT_FOUND, L"�stenilen adla s�re� bulunamad�.");
+        SetWin32Error(err, L"KillProcessByName", ERROR_NOT_FOUND, 
+            L"No process found with the specified name.");
         return false;
     }
     return TerminateProcess(pid, 0, err);
 }
 
+/**
+ * @brief Terminates all processes with the specified name.
+ * 
+ * @param processName Process name to search for (case-insensitive).
+ * @param err Optional error output.
+ * @return true if all matching processes were terminated, false otherwise.
+ */
 bool KillAllProcessesByName(std::wstring_view processName, Error* err) noexcept {
+    if (processName.empty()) {
+        SetWin32Error(err, L"KillAllProcessesByName", ERROR_INVALID_PARAMETER,
+            L"Process name cannot be empty.");
+        return false;
+    }
+
     bool okAll = true;
     auto pids = GetProcessIdsByName(processName, nullptr);
     if (pids.empty()) {
-        SetWin32Error(err, L"KillAllProcessesByName", ERROR_NOT_FOUND, L"E�le�en s�re� bulunamad�.");
+        SetWin32Error(err, L"KillAllProcessesByName", ERROR_NOT_FOUND, 
+            L"No processes found matching the specified name.");
         return false;
     }
-    for (auto pid : pids) {
-        if (!TerminateProcess(pid, 0, nullptr)) okAll = false;
+
+    for (const ProcessId pid : pids) {
+        if (!TerminateProcess(pid, 0, nullptr)) {
+            okAll = false;
+        }
     }
-    if (!okAll) SetWin32Error(err, L"KillAllProcessesByName", ERROR_GEN_FAILURE, L"Baz� s�re�ler sonland�r�lamad�.");
+
+    if (!okAll) {
+        SetWin32Error(err, L"KillAllProcessesByName", ERROR_GEN_FAILURE, 
+            L"Some processes could not be terminated.");
+    }
     return okAll;
 }
 
