@@ -32,12 +32,59 @@
 #include <chrono>
 #include <mutex>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <immintrin.h> // AVX2/AVX-512 intrinsics
 
 namespace ShadowStrike {
 namespace SignatureStore {
 
+// ============================================================================
+// COMPILE-TIME CONSTANTS
+// ============================================================================
+
+namespace {
+
+    // Maximum pattern string length (DoS protection)
+    constexpr size_t MAX_PATTERN_STRING_LENGTH = 10'000;
     
+    // Maximum compiled pattern size
+    constexpr size_t MAX_COMPILED_PATTERN_SIZE = 256;
+    
+    // Minimum compiled pattern size
+    constexpr size_t MIN_COMPILED_PATTERN_SIZE = 1;
+    
+    // Maximum expansion size for variable gaps (DoS protection)
+    constexpr size_t MAX_EXPANDED_SIZE = 10'000;
+    
+    // Maximum variable gap range
+    constexpr size_t MAX_VAR_GAP_RANGE = 256;
+    
+    // Wildcard ratio warning threshold
+    constexpr double WILDCARD_RATIO_WARN_THRESHOLD = 0.5;
+    
+    // Scan threshold for incremental scanning
+    constexpr size_t SCAN_THRESHOLD = 1024 * 1024; // 1MB
+    
+    // Maximum pattern overlap for chunk boundary handling
+    constexpr size_t MAX_PATTERN_OVERLAP = 256;
+    
+    // Maximum description length
+    constexpr size_t MAX_DESCRIPTION_LENGTH = 10'000;
+    
+    // Maximum number of tags per pattern
+    constexpr size_t MAX_TAGS_PER_PATTERN = 100;
+    
+    // Maximum tag length
+    constexpr size_t MAX_TAG_LENGTH = 256;
+    
+    // Default performance frequency fallback
+    constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000;
+    
+    // Maximum buffer size for feed chunk (DoS protection)
+    constexpr size_t MAX_FEED_BUFFER_SIZE = 128ULL * 1024ULL * 1024ULL; // 128MB
+
+} // anonymous namespace
 
 // ============================================================================
 // PATTERN COMPILER IMPLEMENTATION
@@ -68,23 +115,42 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
 
     std::vector<uint8_t> pattern;
     outMask.clear();
+    outMode = PatternMode::Exact; // Safe default
+
+    // ========================================================================
+    // INPUT VALIDATION
+    // ========================================================================
 
     if (patternStr.empty()) {
         SS_LOG_ERROR(L"PatternCompiler", L"Empty pattern string");
         return std::nullopt;
     }
 
+    if (patternStr.length() > MAX_PATTERN_STRING_LENGTH) {
+        SS_LOG_ERROR(L"PatternCompiler", 
+            L"Pattern string too long: %zu (max %zu)", 
+            patternStr.length(), MAX_PATTERN_STRING_LENGTH);
+        return std::nullopt;
+    }
+
+    // Reserve reasonable initial capacity
+    try {
+        pattern.reserve(patternStr.length() / 2);
+        outMask.reserve(patternStr.length() / 2);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"PatternCompiler", L"Memory allocation failed");
+        return std::nullopt;
+    }
+
     // ========================================================================
     // STEP 1: DETECT PATTERN MODE
     // ========================================================================
-    outMode = PatternMode::Exact; // Default
 
-    bool hasWildcard = patternStr.find("??") != std::string::npos;
-    bool hasRegex = patternStr.find('[') != std::string::npos;
-    bool hasVarGap = patternStr.find('{') != std::string::npos;
+    const bool hasWildcard = patternStr.find("??") != std::string::npos;
+    const bool hasRegex = patternStr.find('[') != std::string::npos;
+    const bool hasVarGap = patternStr.find('{') != std::string::npos;
 
     if (hasVarGap) {
-        // Variable gaps are complex, mark as regex for now
         outMode = PatternMode::Regex;
     }
     else if (hasRegex) {
@@ -103,23 +169,23 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
     // ========================================================================
     // STEP 2: TOKENIZE PATTERN
     // ========================================================================
-    // Split by spaces and special delimiters
+
     std::vector<std::string> tokens;
 
-    {
+    try {
         std::string current;
+        current.reserve(16); // Typical token size
+
         for (size_t i = 0; i < patternStr.length(); ++i) {
-            char c = patternStr[i];
+            const char c = patternStr[i];
 
             if (std::isspace(static_cast<unsigned char>(c))) {
-                // Whitespace separates tokens
                 if (!current.empty()) {
                     tokens.push_back(current);
                     current.clear();
                 }
             }
             else if (c == '{' || c == '}') {
-                // Variable gap delimiters
                 if (!current.empty()) {
                     tokens.push_back(current);
                     current.clear();
@@ -127,7 +193,6 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
                 current += c;
             }
             else if (c == '[' || c == ']') {
-                // Byte range delimiters
                 if (!current.empty() && current.back() != '[') {
                     tokens.push_back(current);
                     current.clear();
@@ -142,15 +207,23 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
         if (!current.empty()) {
             tokens.push_back(current);
         }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"PatternCompiler", L"Tokenization failed: exception");
+        return std::nullopt;
     }
 
     // ========================================================================
     // STEP 3: PARSE EACH TOKEN
     // ========================================================================
-    size_t expandedSize = 0;  // Track expansion size for variable gaps
+
+    size_t expandedSize = 0;
 
     for (size_t tokenIdx = 0; tokenIdx < tokens.size(); ++tokenIdx) {
         const std::string& token = tokens[tokenIdx];
+
+        if (token.empty()) {
+            continue;
+        }
 
         // Variable gap: {min-max}
         if (token[0] == '{') {
@@ -159,30 +232,51 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
                 return std::nullopt;
             }
 
-            // Parse min-max
-            size_t dashPos = token.find('-');
+            const size_t dashPos = token.find('-');
             if (dashPos == std::string::npos || token.back() != '}') {
                 SS_LOG_ERROR(L"PatternCompiler", L"Invalid variable gap format: %S", token.c_str());
                 return std::nullopt;
             }
 
             try {
-                std::string minStr = token.substr(1, dashPos - 1);
-                std::string maxStr = token.substr(dashPos + 1, token.length() - dashPos - 2);
+                const std::string minStr = token.substr(1, dashPos - 1);
+                const std::string maxStr = token.substr(dashPos + 1, token.length() - dashPos - 2);
 
-                size_t minGap = std::stoul(minStr);
-                size_t maxGap = std::stoul(maxStr);
+                // Safe conversion with overflow protection
+                const unsigned long minGapUL = std::stoul(minStr);
+                const unsigned long maxGapUL = std::stoul(maxStr);
 
-                if (minGap > maxGap || maxGap > 256) {
+                if (minGapUL > MAX_VAR_GAP_RANGE || maxGapUL > MAX_VAR_GAP_RANGE) {
+                    SS_LOG_ERROR(L"PatternCompiler", 
+                        L"Gap values exceed maximum (%zu)", MAX_VAR_GAP_RANGE);
+                    return std::nullopt;
+                }
+
+                const size_t minGap = static_cast<size_t>(minGapUL);
+                const size_t maxGap = static_cast<size_t>(maxGapUL);
+
+                if (minGap > maxGap) {
                     SS_LOG_ERROR(L"PatternCompiler", L"Invalid gap range: [%zu, %zu]", minGap, maxGap);
                     return std::nullopt;
                 }
 
-                // For now, expand to minimum gap size (conservative approach)
-                // Full implementation would track variable positions
+                // Check for expansion overflow
+                if (expandedSize > MAX_EXPANDED_SIZE - minGap) {
+                    SS_LOG_ERROR(L"PatternCompiler", L"Pattern expansion too large");
+                    return std::nullopt;
+                }
+
                 expandedSize += minGap;
 
                 SS_LOG_DEBUG(L"PatternCompiler", L"Variable gap: [%zu, %zu]", minGap, maxGap);
+            }
+            catch (const std::out_of_range&) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Gap value out of range: %S", token.c_str());
+                return std::nullopt;
+            }
+            catch (const std::invalid_argument&) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Invalid gap format: %S", token.c_str());
+                return std::nullopt;
             }
             catch (...) {
                 SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse gap: %S", token.c_str());
@@ -194,35 +288,54 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
 
         // Byte range: [01-FF] or [8B-8D]
         if (token[0] == '[' && token.back() == ']') {
-            if (outMode != PatternMode::Regex) {
-                SS_LOG_WARN(L"PatternCompiler", L"Byte range in non-regex mode");
+            if (token.length() < 3) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Byte range too short: %S", token.c_str());
+                return std::nullopt;
             }
 
-            std::string rangeContent = token.substr(1, token.length() - 2);
-            size_t dashPos = rangeContent.find('-');
+            const std::string rangeContent = token.substr(1, token.length() - 2);
+            const size_t dashPos = rangeContent.find('-');
 
-            if (dashPos == std::string::npos) {
+            if (dashPos == std::string::npos || dashPos == 0 || dashPos >= rangeContent.length() - 1) {
                 SS_LOG_ERROR(L"PatternCompiler", L"Invalid byte range: %S", token.c_str());
                 return std::nullopt;
             }
 
             try {
-                std::string minStr = rangeContent.substr(0, dashPos);
-                std::string maxStr = rangeContent.substr(dashPos + 1);
+                const std::string minStr = rangeContent.substr(0, dashPos);
+                const std::string maxStr = rangeContent.substr(dashPos + 1);
 
-                uint8_t minByte = static_cast<uint8_t>(std::stoi(minStr, nullptr, 16));
-                uint8_t maxByte = static_cast<uint8_t>(std::stoi(maxStr, nullptr, 16));
+                const int minVal = std::stoi(minStr, nullptr, 16);
+                const int maxVal = std::stoi(maxStr, nullptr, 16);
 
-                if (minByte > maxByte) {
-                    SS_LOG_ERROR(L"PatternCompiler", L"Invalid byte range: [0x%02X, 0x%02X]", minByte, maxByte);
+                // Validate byte range
+                if (minVal < 0 || minVal > 255 || maxVal < 0 || maxVal > 255) {
+                    SS_LOG_ERROR(L"PatternCompiler", 
+                        L"Byte range out of bounds: [%d, %d]", minVal, maxVal);
                     return std::nullopt;
                 }
 
-                // Add first byte of range (conservative, full impl would track all)
+                const uint8_t minByte = static_cast<uint8_t>(minVal);
+                const uint8_t maxByte = static_cast<uint8_t>(maxVal);
+
+                if (minByte > maxByte) {
+                    SS_LOG_ERROR(L"PatternCompiler", 
+                        L"Invalid byte range: [0x%02X, 0x%02X]", minByte, maxByte);
+                    return std::nullopt;
+                }
+
                 pattern.push_back(minByte);
                 outMask.push_back(0xFF);
 
                 SS_LOG_DEBUG(L"PatternCompiler", L"Byte range: [0x%02X, 0x%02X]", minByte, maxByte);
+            }
+            catch (const std::out_of_range&) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Byte range value out of range: %S", token.c_str());
+                return std::nullopt;
+            }
+            catch (const std::invalid_argument&) {
+                SS_LOG_ERROR(L"PatternCompiler", L"Invalid byte range format: %S", token.c_str());
+                return std::nullopt;
             }
             catch (...) {
                 SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse byte range: %S", token.c_str());
@@ -238,21 +351,33 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
                 outMode = PatternMode::Wildcard;
             }
 
-            pattern.push_back(0x00);    // Placeholder value
-            outMask.push_back(0x00);    // Don't care mask
+            pattern.push_back(0x00);
+            outMask.push_back(0x00);
 
             SS_LOG_DEBUG(L"PatternCompiler", L"Wildcard byte");
             continue;
         }
 
         // Hex byte: 48, 8B, FF, etc.
-        if (token.length() == 2 || token.length() == 4) {
+        if (token.length() == 2) {
+            // Validate all characters are hex digits
+            if (!std::isxdigit(static_cast<unsigned char>(token[0])) ||
+                !std::isxdigit(static_cast<unsigned char>(token[1]))) {
+                SS_LOG_WARN(L"PatternCompiler", L"Invalid hex byte (non-hex chars): %S", token.c_str());
+                continue;
+            }
+
             try {
-                uint8_t byte = static_cast<uint8_t>(std::stoi(token, nullptr, 16));
-                pattern.push_back(byte);
+                const int val = std::stoi(token, nullptr, 16);
+                if (val < 0 || val > 255) {
+                    SS_LOG_ERROR(L"PatternCompiler", L"Hex byte out of range: %S", token.c_str());
+                    return std::nullopt;
+                }
+
+                pattern.push_back(static_cast<uint8_t>(val));
                 outMask.push_back(0xFF);
 
-                SS_LOG_DEBUG(L"PatternCompiler", L"Hex byte: 0x%02X", byte);
+                SS_LOG_DEBUG(L"PatternCompiler", L"Hex byte: 0x%02X", val);
             }
             catch (...) {
                 SS_LOG_ERROR(L"PatternCompiler", L"Invalid hex byte: %S", token.c_str());
@@ -262,7 +387,38 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
             continue;
         }
 
-        // Unknown token
+        // 4-character token (some patterns use XXXX format)
+        if (token.length() == 4) {
+            bool allHex = true;
+            for (char c : token) {
+                if (!std::isxdigit(static_cast<unsigned char>(c))) {
+                    allHex = false;
+                    break;
+                }
+            }
+
+            if (allHex) {
+                try {
+                    // Parse as two bytes
+                    const int val1 = std::stoi(token.substr(0, 2), nullptr, 16);
+                    const int val2 = std::stoi(token.substr(2, 2), nullptr, 16);
+
+                    if (val1 >= 0 && val1 <= 255 && val2 >= 0 && val2 <= 255) {
+                        pattern.push_back(static_cast<uint8_t>(val1));
+                        outMask.push_back(0xFF);
+                        pattern.push_back(static_cast<uint8_t>(val2));
+                        outMask.push_back(0xFF);
+
+                        SS_LOG_DEBUG(L"PatternCompiler", L"Hex bytes: 0x%02X 0x%02X", val1, val2);
+                        continue;
+                    }
+                }
+                catch (...) {
+                    // Fall through to unknown token handling
+                }
+            }
+        }
+
         SS_LOG_WARN(L"PatternCompiler", L"Unknown token (ignoring): %S", token.c_str());
     }
 
@@ -270,22 +426,24 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
     // STEP 4: VALIDATION & SECURITY CHECKS
     // ========================================================================
 
-    // Minimum pattern size
-    if (pattern.size() < 1 || pattern.size() > 256) {
-        SS_LOG_ERROR(L"PatternCompiler",
-            L"Pattern size out of bounds: %zu (min=1, max=256)", pattern.size());
+    if (pattern.empty()) {
+        SS_LOG_ERROR(L"PatternCompiler", L"Pattern compiled to empty sequence");
         return std::nullopt;
     }
 
-    // Maximum expansion check (prevent DoS)
-    const size_t MAX_EXPANDED_SIZE = 10000;  // 10KB max after expansion
+    if (pattern.size() < MIN_COMPILED_PATTERN_SIZE || pattern.size() > MAX_COMPILED_PATTERN_SIZE) {
+        SS_LOG_ERROR(L"PatternCompiler",
+            L"Pattern size out of bounds: %zu (min=%zu, max=%zu)", 
+            pattern.size(), MIN_COMPILED_PATTERN_SIZE, MAX_COMPILED_PATTERN_SIZE);
+        return std::nullopt;
+    }
+
     if (expandedSize > MAX_EXPANDED_SIZE) {
         SS_LOG_ERROR(L"PatternCompiler",
             L"Pattern expansion too large: %zu (max=%zu)", expandedSize, MAX_EXPANDED_SIZE);
         return std::nullopt;
     }
 
-    // Verify mask size matches pattern size
     if (outMask.size() != pattern.size()) {
         SS_LOG_ERROR(L"PatternCompiler",
             L"Mask/pattern size mismatch: %zu vs %zu", outMask.size(), pattern.size());
@@ -293,22 +451,20 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
     }
 
     // ========================================================================
-    // STEP 5: OPTIMIZATION
+    // STEP 5: OPTIMIZATION & METRICS
     // ========================================================================
 
-    // Check entropy for performance hints
-    float entropy = ComputeEntropy(pattern);
+    const float entropy = ComputeEntropy(pattern);
 
-    // Check for common patterns
-    size_t wildcardCount = std::count(outMask.begin(), outMask.end(), static_cast<uint8_t>(0));
-    double wildcardRatio = static_cast<double>(wildcardCount) / pattern.size();
+    const size_t wildcardCount = std::count(outMask.begin(), outMask.end(), static_cast<uint8_t>(0));
+    const double wildcardRatio = pattern.empty() ? 0.0 : 
+        static_cast<double>(wildcardCount) / static_cast<double>(pattern.size());
 
     SS_LOG_INFO(L"PatternCompiler",
         L"Pattern compiled: size=%zu, mode=%u, entropy=%.2f, wildcard_ratio=%.2f%%",
         pattern.size(), static_cast<uint8_t>(outMode), entropy, wildcardRatio * 100.0);
 
-    // Warn if pattern is mostly wildcards (poor selectivity)
-    if (wildcardRatio > 0.5) {
+    if (wildcardRatio > WILDCARD_RATIO_WARN_THRESHOLD) {
         SS_LOG_WARN(L"PatternCompiler",
             L"Pattern has low selectivity (%.2f%% wildcards)", wildcardRatio * 100.0);
     }
@@ -536,8 +692,11 @@ float PatternCompiler::ComputeEntropy(
 // ============================================================================
 
 PatternStore::PatternStore() {
-    if (!QueryPerformanceFrequency(&m_perfFrequency)) {
-        m_perfFrequency.QuadPart = 1000000;
+    // Initialize performance frequency with safe fallback
+    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+    if (!QueryPerformanceFrequency(&m_perfFrequency) || m_perfFrequency.QuadPart <= 0) {
+        SS_LOG_WARN(L"PatternStore", L"QueryPerformanceFrequency failed, using fallback");
+        m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
     }
 }
 
@@ -551,8 +710,16 @@ StoreError PatternStore::Initialize(
 ) noexcept {
     SS_LOG_INFO(L"PatternStore", L"Initialize: %s", databasePath.c_str());
 
+    // Prevent double initialization
     if (m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_DEBUG(L"PatternStore", L"Already initialized");
         return StoreError{SignatureStoreError::Success};
+    }
+
+    // Validate path is not empty
+    if (databasePath.empty()) {
+        SS_LOG_ERROR(L"PatternStore", L"Initialize: Empty database path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Empty database path"};
     }
 
     m_databasePath = databasePath;
@@ -561,29 +728,58 @@ StoreError PatternStore::Initialize(
     // Open memory mapping
     StoreError err = OpenMemoryMapping(databasePath, readOnly);
     if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"PatternStore", L"Initialize: Failed to open memory mapping");
         return err;
     }
 
     // Initialize pattern index
-    m_patternIndex = std::make_unique<PatternIndex>();
+    try {
+        m_patternIndex = std::make_unique<PatternIndex>();
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"PatternStore", L"Initialize: Failed to allocate PatternIndex");
+        CloseMemoryMapping();
+        return StoreError{SignatureStoreError::OutOfMemory, 0, "Failed to allocate PatternIndex"};
+    }
+
+    // Read and validate header
     const auto* header = m_mappedView.GetAt<SignatureDatabaseHeader>(0);
     if (header != nullptr) {
-        err = m_patternIndex->Initialize(
-            m_mappedView,
-            header->patternIndexOffset,
-            header->patternIndexSize
-        );
-        if (!err.IsSuccess()) {
+        // Validate header before using
+        if (header->magic != SIGNATURE_DB_MAGIC) {
+            SS_LOG_ERROR(L"PatternStore", L"Initialize: Invalid database magic");
             CloseMemoryMapping();
-            return err;
+            return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid database magic"};
+        }
+
+        // Check pattern index bounds
+        if (header->patternIndexOffset > 0 && header->patternIndexSize > 0) {
+            // Validate offset doesn't exceed file size
+            if (header->patternIndexOffset >= m_mappedView.fileSize ||
+                header->patternIndexOffset + header->patternIndexSize > m_mappedView.fileSize) {
+                SS_LOG_ERROR(L"PatternStore", 
+                    L"Initialize: Pattern index bounds exceed file size");
+                CloseMemoryMapping();
+                return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid pattern index bounds"};
+            }
+
+            err = m_patternIndex->Initialize(
+                m_mappedView,
+                header->patternIndexOffset,
+                header->patternIndexSize
+            );
+            if (!err.IsSuccess()) {
+                SS_LOG_ERROR(L"PatternStore", L"Initialize: Failed to initialize pattern index");
+                CloseMemoryMapping();
+                return err;
+            }
         }
     }
 
     // Build Aho-Corasick automaton
     err = BuildAutomaton();
     if (!err.IsSuccess()) {
-        CloseMemoryMapping();
-        return err;
+        SS_LOG_WARN(L"PatternStore", L"Initialize: Failed to build automaton (non-fatal)");
+        // Don't fail - automaton can be rebuilt later
     }
 
     m_initialized.store(true, std::memory_order_release);
@@ -651,54 +847,114 @@ std::vector<DetectionResult> PatternStore::Scan(
     std::span<const uint8_t> buffer,
     const QueryOptions& options
 ) const noexcept {
+    std::vector<DetectionResult> results;
+
+    // Early validation
     if (!m_initialized.load(std::memory_order_acquire)) {
-        return {};
+        SS_LOG_WARN(L"PatternStore", L"Scan: Not initialized");
+        return results;
     }
 
+    if (buffer.empty()) {
+        SS_LOG_DEBUG(L"PatternStore", L"Scan: Empty buffer");
+        return results;
+    }
+
+    // Update statistics (atomic, safe)
     m_totalScans.fetch_add(1, std::memory_order_relaxed);
     m_totalBytesScanned.fetch_add(buffer.size(), std::memory_order_relaxed);
 
-    LARGE_INTEGER startTime;
-    QueryPerformanceCounter(&startTime);
-
-    std::vector<DetectionResult> results;
-
-    // Use SIMD if enabled
-    if (m_simdEnabled.load(std::memory_order_acquire)) {
-        auto simdResults = ScanWithSIMD(buffer, options);
-        results.insert(results.end(), simdResults.begin(), simdResults.end());
-    } else {
-        // Use Aho-Corasick automaton
-        auto acResults = ScanWithAutomaton(buffer, options);
-        results.insert(results.end(), acResults.begin(), acResults.end());
+    // Get start time for performance measurement
+    LARGE_INTEGER startTime{};
+    if (!QueryPerformanceCounter(&startTime)) {
+        startTime.QuadPart = 0;
     }
 
-    LARGE_INTEGER endTime;
-    QueryPerformanceCounter(&endTime);
-    uint64_t scanTimeUs = 
-        ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+    // Reserve reasonable capacity for results
+    try {
+        const size_t reserveCapacity = (std::min)(
+            static_cast<size_t>(options.maxResults > 0 ? options.maxResults : 1000u),
+            static_cast<size_t>(256)
+        );
+        results.reserve(reserveCapacity);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"PatternStore", L"Scan: Failed to reserve results vector");
+        return results;
+    }
 
-    // Update statistics with safe integer arithmetic
-    for (auto& result : results) {
-        // Prevent integer overflow: check before multiplication
-        if (scanTimeUs <= UINT64_MAX / 1000ULL) {
-            result.matchTimeNanoseconds = scanTimeUs * 1000ULL;
-        } else {
-            result.matchTimeNanoseconds = UINT64_MAX; // Saturate on overflow
+    // Use SIMD if enabled and available
+    if (m_simdEnabled.load(std::memory_order_acquire) && SIMDMatcher::IsAVX2Available()) {
+        try {
+            auto simdResults = ScanWithSIMD(buffer, options);
+            results.insert(results.end(), 
+                std::make_move_iterator(simdResults.begin()),
+                std::make_move_iterator(simdResults.end()));
+        } catch (...) {
+            SS_LOG_WARN(L"PatternStore", L"Scan: SIMD scan failed, falling back to automaton");
+            results.clear();
         }
-        m_totalMatches.fetch_add(1, std::memory_order_relaxed);
-        
-        // Thread-safe hit count update using atomic
-        if (m_heatmapEnabled.load(std::memory_order_acquire)) {
-            if (result.signatureId < m_hitCounters.size()) {
-                // Use atomic_ref for safe concurrent access
-                std::atomic_ref<uint64_t> counter(
-                    const_cast<std::vector<uint64_t>&>(m_hitCounters)[result.signatureId]
-                );
-                counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    // Fall back to or supplement with automaton search
+    if (results.empty() || !m_simdEnabled.load(std::memory_order_acquire)) {
+        try {
+            auto acResults = ScanWithAutomaton(buffer, options);
+            results.insert(results.end(),
+                std::make_move_iterator(acResults.begin()),
+                std::make_move_iterator(acResults.end()));
+        } catch (...) {
+            SS_LOG_ERROR(L"PatternStore", L"Scan: Automaton scan failed");
+        }
+    }
+
+    // Calculate scan time safely
+    LARGE_INTEGER endTime{};
+    uint64_t scanTimeUs = 0;
+    
+    if (QueryPerformanceCounter(&endTime) && startTime.QuadPart > 0) {
+        const int64_t perfFreq = m_perfFrequency.QuadPart;
+        if (perfFreq > 0) {
+            const int64_t elapsed = endTime.QuadPart - startTime.QuadPart;
+            if (elapsed > 0) {
+                // Check for overflow before multiplication
+                if (elapsed <= (std::numeric_limits<int64_t>::max)() / 1'000'000LL) {
+                    scanTimeUs = static_cast<uint64_t>((elapsed * 1'000'000LL) / perfFreq);
+                } else {
+                    // Divide first to prevent overflow
+                    scanTimeUs = static_cast<uint64_t>((elapsed / perfFreq) * 1'000'000LL);
+                }
             }
         }
     }
+
+    // Update result metadata and statistics
+    for (auto& result : results) {
+        // Safe conversion to nanoseconds
+        if (scanTimeUs <= (std::numeric_limits<uint64_t>::max)() / 1'000ULL) {
+            result.matchTimeNanoseconds = scanTimeUs * 1'000ULL;
+        } else {
+            result.matchTimeNanoseconds = (std::numeric_limits<uint64_t>::max)();
+        }
+        
+        m_totalMatches.fetch_add(1, std::memory_order_relaxed);
+        
+        // Thread-safe hit count update
+        if (m_heatmapEnabled.load(std::memory_order_acquire)) {
+            if (result.signatureId < m_hitCounters.size()) {
+                try {
+                    std::atomic_ref<uint64_t> counter(
+                        const_cast<std::vector<uint64_t>&>(m_hitCounters)[result.signatureId]
+                    );
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                    // Ignore hit counter update failures
+                }
+            }
+        }
+    }
+
+    SS_LOG_DEBUG(L"PatternStore", L"Scan: Found %zu matches in %llu µs", 
+        results.size(), scanTimeUs);
 
     return results;
 }
@@ -709,24 +965,65 @@ std::vector<DetectionResult> PatternStore::ScanFile(
 ) const noexcept {
     SS_LOG_DEBUG(L"PatternStore", L"ScanFile: %s", filePath.c_str());
 
+    std::vector<DetectionResult> results;
+
+    // Validate initialization
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"PatternStore", L"ScanFile: Not initialized");
+        return results;
+    }
+
+    // Validate path
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"PatternStore", L"ScanFile: Empty file path");
+        return results;
+    }
+
     // Memory-map file for scanning
     StoreError err{};
     MemoryMappedView fileView{};
     
     if (!MemoryMapping::OpenView(filePath, true, fileView, err)) {
-        SS_LOG_ERROR(L"PatternStore", L"Failed to map file: %S", err.message.c_str());
-        return {};
+        SS_LOG_ERROR(L"PatternStore", L"ScanFile: Failed to map file: %S", err.message.c_str());
+        return results;
     }
 
-    // Scan mapped file
+    // Validate mapped view
+    if (!fileView.IsValid() || fileView.baseAddress == nullptr) {
+        SS_LOG_ERROR(L"PatternStore", L"ScanFile: Invalid memory map");
+        MemoryMapping::CloseView(fileView);
+        return results;
+    }
+
+    // Validate file size is within reasonable limits
+    if (fileView.fileSize == 0) {
+        SS_LOG_DEBUG(L"PatternStore", L"ScanFile: Empty file");
+        MemoryMapping::CloseView(fileView);
+        return results;
+    }
+
+    // Check for size overflow when casting to size_t
+    if (fileView.fileSize > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) {
+        SS_LOG_ERROR(L"PatternStore", 
+            L"ScanFile: File too large for memory-mapped scan: %llu bytes", fileView.fileSize);
+        MemoryMapping::CloseView(fileView);
+        return results;
+    }
+
+    // Create buffer span safely
     std::span<const uint8_t> buffer(
         static_cast<const uint8_t*>(fileView.baseAddress),
         static_cast<size_t>(fileView.fileSize)
     );
 
-    auto results = Scan(buffer, options);
+    // Scan the mapped file
+    results = Scan(buffer, options);
 
+    // Close memory mapping
     MemoryMapping::CloseView(fileView);
+
+    SS_LOG_DEBUG(L"PatternStore", L"ScanFile: Found %zu matches in %llu bytes", 
+        results.size(), fileView.fileSize);
 
     return results;
 }
@@ -737,53 +1034,101 @@ PatternStore::ScanContext PatternStore::CreateScanContext(
     ScanContext ctx;
     ctx.m_store = this;
     ctx.m_options = options;
+    ctx.m_buffer.clear();
+    ctx.m_totalBytesProcessed = 0;
     return ctx;
 }
 
 void PatternStore::ScanContext::Reset() noexcept {
     m_buffer.clear();
+    m_buffer.shrink_to_fit(); // Release memory
     m_totalBytesProcessed = 0;
 }
 
 std::vector<DetectionResult> PatternStore::ScanContext::FeedChunk(
     std::span<const uint8_t> chunk
 ) noexcept {
-    // Append to buffer
-    m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-    m_totalBytesProcessed += chunk.size();
+    std::vector<DetectionResult> results;
 
-    // Scan when buffer reaches threshold
-    constexpr size_t SCAN_THRESHOLD = 1024 * 1024; // 1MB
-    constexpr size_t MAX_PATTERN_LEN = 256;        // Keep overlap for pattern boundary
-    
-    if (m_buffer.size() >= SCAN_THRESHOLD) {
-        auto results = m_store->Scan(m_buffer, m_options);
-        
-        // Keep last MAX_PATTERN_LEN bytes to handle patterns crossing chunk boundaries
-        // This prevents missing patterns that span two chunks
-        if (m_buffer.size() > MAX_PATTERN_LEN) {
-            std::vector<uint8_t> overlap(
-                m_buffer.end() - MAX_PATTERN_LEN,
-                m_buffer.end()
-            );
-            m_buffer = std::move(overlap);
-        } else {
-            m_buffer.clear();
-        }
-        
+    // Validate store pointer
+    if (!m_store) {
+        SS_LOG_ERROR(L"PatternStore::ScanContext", L"FeedChunk: Store pointer is null");
         return results;
     }
 
-    return {};
+    // Validate chunk
+    if (chunk.empty()) {
+        return results;
+    }
+
+    // Check for buffer overflow protection
+    if (m_buffer.size() > MAX_FEED_BUFFER_SIZE - chunk.size()) {
+        SS_LOG_WARN(L"PatternStore::ScanContext", 
+            L"FeedChunk: Buffer would exceed maximum size, scanning now");
+        
+        // Force scan of current buffer
+        if (!m_buffer.empty()) {
+            results = m_store->Scan(m_buffer, m_options);
+            m_buffer.clear();
+        }
+    }
+
+    // Append chunk to buffer with exception handling
+    try {
+        m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"PatternStore::ScanContext", L"FeedChunk: Memory allocation failed");
+        return results;
+    }
+
+    // Update processed bytes counter with overflow protection
+    if (m_totalBytesProcessed <= (std::numeric_limits<size_t>::max)() - chunk.size()) {
+        m_totalBytesProcessed += chunk.size();
+    } else {
+        m_totalBytesProcessed = (std::numeric_limits<size_t>::max)();
+    }
+
+    // Scan when buffer reaches threshold
+    if (m_buffer.size() >= SCAN_THRESHOLD) {
+        results = m_store->Scan(m_buffer, m_options);
+        
+        // Keep last MAX_PATTERN_OVERLAP bytes for pattern boundary handling
+        if (m_buffer.size() > MAX_PATTERN_OVERLAP) {
+            try {
+                std::vector<uint8_t> overlap(
+                    m_buffer.end() - static_cast<ptrdiff_t>(MAX_PATTERN_OVERLAP),
+                    m_buffer.end()
+                );
+                m_buffer = std::move(overlap);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_WARN(L"PatternStore::ScanContext", 
+                    L"FeedChunk: Failed to preserve overlap, clearing buffer");
+                m_buffer.clear();
+            }
+        } else {
+            m_buffer.clear();
+        }
+    }
+
+    return results;
 }
 
 std::vector<DetectionResult> PatternStore::ScanContext::Finalize() noexcept {
-    if (m_buffer.empty()) {
-        return {};
+    std::vector<DetectionResult> results;
+
+    if (!m_store) {
+        SS_LOG_ERROR(L"PatternStore::ScanContext", L"Finalize: Store pointer is null");
+        return results;
     }
 
-    auto results = m_store->Scan(m_buffer, m_options);
+    if (m_buffer.empty()) {
+        return results;
+    }
+
+    results = m_store->Scan(m_buffer, m_options);
     m_buffer.clear();
+    m_buffer.shrink_to_fit(); // Release memory
+    
     return results;
 }
 
@@ -821,23 +1166,75 @@ StoreError PatternStore::AddCompiledPattern(
     const std::string& signatureName,
     ThreatLevel threatLevel
 ) noexcept {
+    // Validate inputs
+    if (pattern.empty()) {
+        SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Empty pattern");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Empty pattern"};
+    }
+
+    if (pattern.size() > MAX_COMPILED_PATTERN_SIZE) {
+        SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Pattern too large (%zu bytes)", pattern.size());
+        return StoreError{SignatureStoreError::TooLarge, 0, "Pattern too large"};
+    }
+
+    if (signatureName.empty()) {
+        SS_LOG_WARN(L"PatternStore", L"AddCompiledPattern: Empty signature name");
+    }
+
+    // Validate mask size if provided
+    if (!mask.empty() && mask.size() != pattern.size()) {
+        SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Mask size mismatch");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Mask size mismatch"};
+    }
+
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    // Create pattern metadata
-    PatternMetadata metadata{};
-    metadata.signatureId = m_patternCache.size();
-    metadata.name = signatureName;
-    metadata.threatLevel = threatLevel;
-    metadata.mode = mode;
-    metadata.pattern.assign(pattern.begin(), pattern.end());
-    metadata.mask.assign(mask.begin(), mask.end());
-    metadata.entropy = PatternCompiler::ComputeEntropy(pattern);
-    metadata.hitCount = 0;
+    // Check for duplicate signature names (optional, for uniqueness)
+    for (const auto& existing : m_patternCache) {
+        if (existing.name == signatureName && !signatureName.empty()) {
+            SS_LOG_WARN(L"PatternStore", 
+                L"AddCompiledPattern: Duplicate name '%S', assigning new ID", 
+                signatureName.c_str());
+            break;
+        }
+    }
 
-    m_patternCache.push_back(metadata);
+    // Create pattern metadata with exception handling
+    try {
+        PatternMetadata metadata{};
+        metadata.signatureId = m_patternCache.size();
+        metadata.name = signatureName;
+        metadata.threatLevel = threatLevel;
+        metadata.mode = mode;
+        metadata.pattern.assign(pattern.begin(), pattern.end());
+        
+        if (!mask.empty()) {
+            metadata.mask.assign(mask.begin(), mask.end());
+        } else {
+            // Default mask: all 0xFF (exact match)
+            metadata.mask.assign(pattern.size(), 0xFF);
+        }
+        
+        metadata.entropy = PatternCompiler::ComputeEntropy(pattern);
+        metadata.hitCount = 0;
+        metadata.created = std::chrono::system_clock::now();
+        metadata.lastModified = metadata.created;
+        metadata.modificationCount = 0;
+        metadata.isDeprecated = false;
 
-    SS_LOG_DEBUG(L"PatternStore", L"Added pattern: %S (mode=%u, entropy=%.2f)",
-        signatureName.c_str(), static_cast<uint8_t>(mode), metadata.entropy);
+        m_patternCache.push_back(std::move(metadata));
+
+        SS_LOG_DEBUG(L"PatternStore", L"AddCompiledPattern: Added '%S' (mode=%u, entropy=%.2f, id=%zu)",
+            signatureName.c_str(), static_cast<uint8_t>(mode), 
+            m_patternCache.back().entropy, m_patternCache.back().signatureId);
+
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Memory allocation failed");
+        return StoreError{SignatureStoreError::OutOfMemory, 0, "Memory allocation failed"};
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Exception occurred");
+        return StoreError{SignatureStoreError::Unknown, 0, "Exception during pattern addition"};
+    }
 
     return StoreError{SignatureStoreError::Success};
 }
@@ -851,13 +1248,21 @@ StoreError PatternStore::AddPatternBatch(
     SS_LOG_INFO(L"PatternStore", L"AddPatternBatch: Adding %zu patterns", patternStrs.size());
 
     if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Read-only mode");
         return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
     }
 
     // Validate input sizes
     if (patternStrs.size() != signatureNames.size() || patternStrs.size() != threatLevels.size()) {
-        SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Array size mismatch");
+        SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Array size mismatch (%zu, %zu, %zu)",
+            patternStrs.size(), signatureNames.size(), threatLevels.size());
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Array sizes must match" };
+    }
+
+    // Empty batch is not an error
+    if (patternStrs.empty()) {
+        SS_LOG_DEBUG(L"PatternStore", L"AddPatternBatch: Empty batch");
+        return StoreError{ SignatureStoreError::Success };
     }
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
@@ -865,10 +1270,19 @@ StoreError PatternStore::AddPatternBatch(
     size_t successCount = 0;
     size_t failCount = 0;
 
+    // Pre-reserve capacity for better performance
+    try {
+        m_patternCache.reserve(m_patternCache.size() + patternStrs.size());
+    } catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"PatternStore", L"AddPatternBatch: Failed to reserve capacity");
+        // Continue anyway - push_back will handle allocation
+    }
+
     for (size_t i = 0; i < patternStrs.size(); ++i) {
         // Compile pattern
-        PatternMode mode;
+        PatternMode mode = PatternMode::Exact;
         std::vector<uint8_t> mask;
+        
         auto pattern = PatternCompiler::CompilePattern(patternStrs[i], mode, mask);
 
         if (!pattern.has_value()) {
@@ -877,19 +1291,38 @@ StoreError PatternStore::AddPatternBatch(
             continue;
         }
 
-        // Create pattern metadata
-        PatternMetadata metadata{};
-        metadata.signatureId = m_patternCache.size();
-        metadata.name = signatureNames[i];
-        metadata.threatLevel = threatLevels[i];
-        metadata.mode = mode;
-        metadata.pattern.assign(pattern->begin(), pattern->end());
-        metadata.mask.assign(mask.begin(), mask.end());
-        metadata.entropy = PatternCompiler::ComputeEntropy(*pattern);
-        metadata.hitCount = 0;
+        // Validate compiled pattern
+        if (pattern->empty() || pattern->size() > MAX_COMPILED_PATTERN_SIZE) {
+            SS_LOG_WARN(L"PatternStore", 
+                L"AddPatternBatch: Invalid compiled pattern size at index %zu", i);
+            failCount++;
+            continue;
+        }
 
-        m_patternCache.push_back(metadata);
-        successCount++;
+        // Create pattern metadata
+        try {
+            PatternMetadata metadata{};
+            metadata.signatureId = m_patternCache.size();
+            metadata.name = signatureNames[i];
+            metadata.threatLevel = threatLevels[i];
+            metadata.mode = mode;
+            metadata.pattern = std::move(*pattern);
+            metadata.mask = std::move(mask);
+            metadata.entropy = PatternCompiler::ComputeEntropy(metadata.pattern);
+            metadata.hitCount = 0;
+            metadata.created = std::chrono::system_clock::now();
+            metadata.lastModified = metadata.created;
+
+            m_patternCache.push_back(std::move(metadata));
+            successCount++;
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Memory allocation failed at index %zu", i);
+            failCount++;
+            // Don't break - try to continue with remaining patterns
+        } catch (...) {
+            SS_LOG_ERROR(L"PatternStore", L"AddPatternBatch: Exception at index %zu", i);
+            failCount++;
+        }
     }
 
     SS_LOG_INFO(L"PatternStore", L"AddPatternBatch: Success=%zu, Failed=%zu", successCount, failCount);
@@ -898,7 +1331,7 @@ StoreError PatternStore::AddPatternBatch(
     if (successCount > 0) {
         StoreError rebuildErr = BuildAutomaton();
         if (!rebuildErr.IsSuccess()) {
-            SS_LOG_WARN(L"PatternStore", L"AddPatternBatch: Automaton rebuild failed");
+            SS_LOG_WARN(L"PatternStore", L"AddPatternBatch: Automaton rebuild failed (non-fatal)");
         }
     }
 
@@ -1555,7 +1988,14 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 ) const noexcept {
     std::vector<DetectionResult> results;
 
-    if (!m_automaton) return results;
+    if (!m_automaton) {
+        SS_LOG_DEBUG(L"PatternStore", L"ScanWithAutomaton: No automaton available");
+        return results;
+    }
+
+    if (buffer.empty()) {
+        return results;
+    }
 
     // Take reader lock for thread-safe access to pattern cache
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
@@ -1563,20 +2003,57 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
     // Capture cache size once under lock to avoid TOCTOU
     const size_t cacheSize = m_patternCache.size();
 
-    m_automaton->Search(buffer, [&](uint64_t patternId, size_t offset) {
-        if (patternId < cacheSize) {
+    // Reserve reasonable capacity
+    try {
+        const size_t reserveCapacity = (std::min)(
+            static_cast<size_t>(options.maxResults > 0 ? options.maxResults : 256u),
+            static_cast<size_t>(256)
+        );
+        results.reserve(reserveCapacity);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"PatternStore", L"ScanWithAutomaton: Failed to reserve results capacity");
+    }
+
+    // Track match count for maxResults limit
+    size_t matchCount = 0;
+    const size_t maxResults = options.maxResults > 0 ? options.maxResults : SIZE_MAX;
+
+    try {
+        m_automaton->Search(buffer, [&](uint64_t patternId, size_t offset) {
+            // Check max results limit
+            if (matchCount >= maxResults) {
+                return;
+            }
+
+            // Validate pattern ID bounds
+            if (patternId >= cacheSize) {
+                SS_LOG_WARN(L"PatternStore", 
+                    L"ScanWithAutomaton: Invalid pattern ID %llu (cache size %zu)", 
+                    patternId, cacheSize);
+                return;
+            }
+
             const auto& meta = m_patternCache[patternId];
 
-            DetectionResult result{};
-            result.signatureId = patternId;
-            result.signatureName = meta.name;
-            result.threatLevel = meta.threatLevel;
-            result.fileOffset = offset;
-            result.description = "Pattern match";
+            try {
+                DetectionResult result{};
+                result.signatureId = patternId;
+                result.signatureName = meta.name;
+                result.threatLevel = meta.threatLevel;
+                result.fileOffset = offset;
+                result.description = "Pattern match";
 
-            results.push_back(result);
-        }
-    });
+                results.push_back(std::move(result));
+                matchCount++;
+            } catch (const std::bad_alloc&) {
+                SS_LOG_WARN(L"PatternStore", L"ScanWithAutomaton: Memory allocation failed for result");
+            }
+        });
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"PatternStore", L"ScanWithAutomaton: Exception during search");
+    }
+
+    SS_LOG_DEBUG(L"PatternStore", L"ScanWithAutomaton: Found %zu matches", results.size());
 
     return results;
 }
@@ -1587,26 +2064,79 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
 ) const noexcept {
     std::vector<DetectionResult> results;
 
+    if (buffer.empty()) {
+        return results;
+    }
+
     // Take reader lock for thread-safe access to pattern cache
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
+    // Check if AVX2 is available
+    if (!SIMDMatcher::IsAVX2Available()) {
+        SS_LOG_DEBUG(L"PatternStore", L"ScanWithSIMD: AVX2 not available");
+        return results;
+    }
+
+    // Track match count for maxResults limit
+    size_t matchCount = 0;
+    const size_t maxResults = options.maxResults > 0 ? options.maxResults : SIZE_MAX;
+
+    // Reserve reasonable capacity
+    try {
+        const size_t reserveCapacity = (std::min)(static_cast<size_t>(256), 
+            static_cast<size_t>(maxResults));
+        results.reserve(reserveCapacity);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"PatternStore", L"ScanWithSIMD: Failed to reserve results capacity");
+    }
+
     // Use SIMD for exact patterns only
     for (const auto& meta : m_patternCache) {
-        if (meta.mode != PatternMode::Exact) continue;
+        // Check max results limit
+        if (matchCount >= maxResults) {
+            break;
+        }
 
-        auto matches = SIMDMatcher::SearchAVX2(buffer, meta.pattern);
+        // SIMD only works well with exact patterns
+        if (meta.mode != PatternMode::Exact) {
+            continue;
+        }
 
-        for (size_t offset : matches) {
-            DetectionResult result{};
-            result.signatureId = meta.signatureId;
-            result.signatureName = meta.name;
-            result.threatLevel = meta.threatLevel;
-            result.fileOffset = offset;
-            result.description = "SIMD pattern match";
+        // Skip empty patterns
+        if (meta.pattern.empty()) {
+            continue;
+        }
 
-            results.push_back(result);
+        // Skip patterns longer than buffer
+        if (meta.pattern.size() > buffer.size()) {
+            continue;
+        }
+
+        try {
+            auto matches = SIMDMatcher::SearchAVX2(buffer, meta.pattern);
+
+            for (size_t offset : matches) {
+                if (matchCount >= maxResults) {
+                    break;
+                }
+
+                DetectionResult result{};
+                result.signatureId = meta.signatureId;
+                result.signatureName = meta.name;
+                result.threatLevel = meta.threatLevel;
+                result.fileOffset = offset;
+                result.description = "SIMD pattern match";
+
+                results.push_back(std::move(result));
+                matchCount++;
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(L"PatternStore", 
+                L"ScanWithSIMD: Exception searching pattern %llu", meta.signatureId);
         }
     }
+
+    SS_LOG_DEBUG(L"PatternStore", L"ScanWithSIMD: Found %zu matches", results.size());
 
     return results;
 }
@@ -1624,28 +2154,50 @@ DetectionResult PatternStore::BuildDetectionResult(
     result.signatureId = patternId;
     result.fileOffset = offset;
     result.matchTimeNanoseconds = matchTimeNs;
+    result.threatLevel = ThreatLevel::Info; // Safe default (lowest severity)
+
+    // Thread-safe read with shared lock
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
     if (patternId < m_patternCache.size()) {
         const auto& meta = m_patternCache[patternId];
         result.signatureName = meta.name;
         result.threatLevel = meta.threatLevel;
+        result.description = meta.description;
+    } else {
+        result.signatureName = "Unknown_" + std::to_string(patternId);
+        SS_LOG_WARN(L"PatternStore", 
+            L"BuildDetectionResult: Pattern ID %llu out of range", patternId);
     }
 
     return result;
 }
 
 void PatternStore::UpdateHitCount(uint64_t patternId) noexcept {
+    // Validate pattern ID before atomic access
+    if (patternId >= m_hitCounters.size()) {
+        SS_LOG_WARN(L"PatternStore", 
+            L"UpdateHitCount: Pattern ID %llu out of range (%zu)", 
+            patternId, m_hitCounters.size());
+        return;
+    }
+
     // Thread-safe hit count update using atomic counters
-    // Note: m_hitCounters must be resized when patterns are added
-    if (patternId < m_hitCounters.size()) {
+    try {
         std::atomic_ref<uint64_t> counter(m_hitCounters[patternId]);
         counter.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        SS_LOG_WARN(L"PatternStore", L"UpdateHitCount: Atomic update failed");
+        return;
     }
     
     // Also update the cache copy under lock for persistence
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
     if (patternId < m_patternCache.size()) {
-        m_patternCache[patternId].hitCount = m_hitCounters[patternId];
+        // Safe increment with overflow protection
+        if (m_patternCache[patternId].hitCount < (std::numeric_limits<uint32_t>::max)()) {
+            m_patternCache[patternId].hitCount++;
+        }
     }
 }
 
@@ -1666,6 +2218,17 @@ const SignatureDatabaseHeader* PatternStore::GetHeader() const noexcept {
         return nullptr;
     }
 
+    if (m_mappedView.baseAddress == nullptr) {
+        SS_LOG_WARN(L"PatternStore", L"GetHeader: Base address is null");
+        return nullptr;
+    }
+
+    // Validate file size can accommodate header
+    if (m_mappedView.fileSize < sizeof(SignatureDatabaseHeader)) {
+        SS_LOG_ERROR(L"PatternStore", L"GetHeader: File too small for header");
+        return nullptr;
+    }
+
     // Get header from memory-mapped file at offset 0
     const SignatureDatabaseHeader* header = m_mappedView.GetAt<SignatureDatabaseHeader>(0);
 
@@ -1682,7 +2245,7 @@ const SignatureDatabaseHeader* PatternStore::GetHeader() const noexcept {
         return nullptr;
     }
 
-    // Validate version
+    // Validate version (warning only for minor version mismatch)
     if (header->versionMajor != SIGNATURE_DB_VERSION_MAJOR) {
         SS_LOG_WARN(L"PatternStore",
             L"GetHeader: Version mismatch - file: %u.%u, expected: %u.%u",
@@ -1701,12 +2264,27 @@ PatternStore::PatternStoreStatistics PatternStore::GetStatistics() const noexcep
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
     PatternStoreStatistics stats{};
+    
+    // Initialize all fields to safe defaults
+    stats.totalScans = 0;
+    stats.totalMatches = 0;
+    stats.totalBytesScanned = 0;
+    stats.totalPatterns = 0;
+    stats.exactPatterns = 0;
+    stats.wildcardPatterns = 0;
+    stats.regexPatterns = 0;
+    stats.averageScanTimeMicroseconds = 0;
+    stats.peakScanTimeMicroseconds = 0;
+    stats.averageThroughputMBps = 0.0;
+    stats.automatonNodeCount = 0;
+
+    // Read atomic statistics safely
     stats.totalScans = m_totalScans.load(std::memory_order_relaxed);
     stats.totalMatches = m_totalMatches.load(std::memory_order_relaxed);
     stats.totalBytesScanned = m_totalBytesScanned.load(std::memory_order_relaxed);
     stats.totalPatterns = m_patternCache.size();
 
-    // Count by mode
+    // Count patterns by mode
     for (const auto& meta : m_patternCache) {
         switch (meta.mode) {
             case PatternMode::Exact:    stats.exactPatterns++; break;
@@ -1716,6 +2294,7 @@ PatternStore::PatternStoreStatistics PatternStore::GetStatistics() const noexcep
         }
     }
 
+    // Get automaton statistics safely
     if (m_automaton) {
         stats.automatonNodeCount = m_automaton->GetNodeCount();
     }
@@ -1724,48 +2303,60 @@ PatternStore::PatternStoreStatistics PatternStore::GetStatistics() const noexcep
 }
 
 std::map<size_t, size_t> PatternStore::GetLengthHistogram() const noexcept {
-    
-
     SS_LOG_DEBUG(L"PatternStore", L"GetLengthHistogram: Building histogram");
+
+    std::map<size_t, size_t> histogram;
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-    std::map<size_t, size_t> histogram;
-    size_t totalPatterns = m_patternCache.size();
+    const size_t totalPatterns = m_patternCache.size();
+
+    if (totalPatterns == 0) {
+        SS_LOG_WARN(L"PatternStore", L"GetLengthHistogram: Empty pattern cache");
+        return histogram;
+    }
 
     // Build histogram
     for (const auto& meta : m_patternCache) {
-        histogram[meta.pattern.size()]++;
+        if (!meta.pattern.empty()) {
+            histogram[meta.pattern.size()]++;
+        }
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
-    // Extended logging
+    // Extended logging with statistics
     if (!histogram.empty()) {
-        size_t minLen = histogram.begin()->first;
-        size_t maxLen = histogram.rbegin()->first;
-        size_t rangeLen = maxLen - minLen + 1;
+        const size_t minLen = histogram.begin()->first;
+        const size_t maxLen = histogram.rbegin()->first;
 
-        // Calculate statistics
+        // Calculate statistics safely
         double avgLength = 0.0;
         double variance = 0.0;
 
         for (const auto& [length, count] : histogram) {
-            avgLength += length * count;
+            avgLength += static_cast<double>(length) * static_cast<double>(count);
         }
-        avgLength /= totalPatterns;
+        
+        if (totalPatterns > 0) {
+            avgLength /= static_cast<double>(totalPatterns);
+        }
 
         for (const auto& [length, count] : histogram) {
-            double diff = length - avgLength;
-            variance += diff * diff * count;
+            const double diff = static_cast<double>(length) - avgLength;
+            variance += diff * diff * static_cast<double>(count);
         }
-        variance /= totalPatterns;
-        double stdDev = std::sqrt(variance);
+        
+        if (totalPatterns > 0) {
+            variance /= static_cast<double>(totalPatterns);
+        }
+        
+        const double stdDev = std::sqrt(variance);
 
-        // Find most common length
+        // Find most common length (mode)
         size_t modeLen = histogram.begin()->first;
         size_t modeCount = histogram.begin()->second;
         for (const auto& [length, count] : histogram) {
@@ -1780,11 +2371,8 @@ std::map<size_t, size_t> PatternStore::GetLengthHistogram() const noexcept {
             totalPatterns, minLen, maxLen, avgLength, stdDev, modeLen);
 
         SS_LOG_INFO(L"PatternStore",
-            L"  Histogram buckets: %zu, Computation time: %lld �s",
-            histogram.size(), duration.count());
-    }
-    else {
-        SS_LOG_WARN(L"PatternStore", L"GetLengthHistogram: Empty pattern cache");
+            L"  Histogram buckets: %zu, Computation time: %lld us",
+            histogram.size(), static_cast<long long>(duration.count()));
     }
 
     return histogram;
@@ -1794,13 +2382,22 @@ void PatternStore::ResetStatistics() noexcept {
     m_totalScans.store(0, std::memory_order_release);
     m_totalMatches.store(0, std::memory_order_release);
     m_totalBytesScanned.store(0, std::memory_order_release);
+    
+    SS_LOG_DEBUG(L"PatternStore", L"ResetStatistics: Statistics cleared");
 }
 
 std::vector<std::pair<uint64_t, uint32_t>> PatternStore::GetHeatmap() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
     std::vector<std::pair<uint64_t, uint32_t>> heatmap;
-    heatmap.reserve(m_patternCache.size());
+    
+    // Reserve capacity
+    try {
+        heatmap.reserve(m_patternCache.size());
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"PatternStore", L"GetHeatmap: Failed to reserve capacity");
+        return heatmap;
+    }
 
     // Read hit counts safely
     for (size_t i = 0; i < m_patternCache.size(); ++i) {
@@ -1808,18 +2405,36 @@ std::vector<std::pair<uint64_t, uint32_t>> PatternStore::GetHeatmap() const noex
         uint32_t hitCount = 0;
 
         if (i < m_hitCounters.size()) {
-            // Use atomic_ref for safe read
-            std::atomic_ref<const uint64_t> counter(m_hitCounters[i]);
-            hitCount = static_cast<uint32_t>(
-                counter.load(std::memory_order_relaxed)
+            try {
+                // Use atomic_ref for safe read
+                std::atomic_ref<const uint64_t> counter(m_hitCounters[i]);
+                const uint64_t rawCount = counter.load(std::memory_order_relaxed);
+                
+                // Safe narrowing conversion
+                hitCount = static_cast<uint32_t>(
+                    (std::min)(rawCount, static_cast<uint64_t>((std::numeric_limits<uint32_t>::max)()))
                 );
+            } catch (...) {
+                // Fall back to cached value
+                hitCount = meta.hitCount;
+            }
+        } else {
+            hitCount = meta.hitCount;
         }
 
-        heatmap.emplace_back(meta.signatureId, hitCount);
+        try {
+            heatmap.emplace_back(meta.signatureId, hitCount);
+        } catch (const std::bad_alloc&) {
+            SS_LOG_WARN(L"PatternStore", L"GetHeatmap: Memory allocation failed at index %zu", i);
+            break;
+        }
     }
 
+    // Sort by hit count (descending)
     std::sort(heatmap.begin(), heatmap.end(),
         [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    SS_LOG_DEBUG(L"PatternStore", L"GetHeatmap: Returned %zu entries", heatmap.size());
 
     return heatmap;
 }
@@ -1842,13 +2457,46 @@ std::optional<std::vector<uint8_t>> HexStringToBytes(
 ) noexcept {
     std::vector<uint8_t> bytes;
     
-    for (size_t i = 0; i < hexStr.length(); i += 2) {
-        if (i + 1 >= hexStr.length()) break;
+    // Empty string returns empty vector
+    if (hexStr.empty()) {
+        return bytes;
+    }
+
+    // Reserve capacity for better performance
+    try {
+        bytes.reserve(hexStr.length() / 2);
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
+    
+    // Process pairs of hex characters
+    for (size_t i = 0; i + 1 < hexStr.length(); i += 2) {
+        // Skip whitespace
+        while (i < hexStr.length() && std::isspace(static_cast<unsigned char>(hexStr[i]))) {
+            i++;
+        }
         
-        std::string byteStr = hexStr.substr(i, 2);
+        if (i + 1 >= hexStr.length()) {
+            break;
+        }
+        
+        // Validate both characters are hex digits
+        if (!std::isxdigit(static_cast<unsigned char>(hexStr[i])) ||
+            !std::isxdigit(static_cast<unsigned char>(hexStr[i + 1]))) {
+            return std::nullopt;
+        }
+        
+        const std::string byteStr = hexStr.substr(i, 2);
         try {
-            uint8_t byte = static_cast<uint8_t>(std::stoi(byteStr, nullptr, 16));
-            bytes.push_back(byte);
+            const int val = std::stoi(byteStr, nullptr, 16);
+            if (val < 0 || val > 255) {
+                return std::nullopt;
+            }
+            bytes.push_back(static_cast<uint8_t>(val));
+        } catch (const std::out_of_range&) {
+            return std::nullopt;
+        } catch (const std::invalid_argument&) {
+            return std::nullopt;
         } catch (...) {
             return std::nullopt;
         }
@@ -1860,14 +2508,22 @@ std::optional<std::vector<uint8_t>> HexStringToBytes(
 std::string BytesToHexString(
     std::span<const uint8_t> bytes
 ) noexcept {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    
-    for (uint8_t byte : bytes) {
-        oss << std::setw(2) << static_cast<unsigned>(byte);
+    if (bytes.empty()) {
+        return std::string{};
     }
 
-    return oss.str();
+    try {
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0');
+        
+        for (uint8_t byte : bytes) {
+            oss << std::setw(2) << static_cast<unsigned>(byte);
+        }
+
+        return oss.str();
+    } catch (const std::exception&) {
+        return std::string{};
+    }
 }
 
 size_t HammingDistance(
@@ -1875,14 +2531,22 @@ size_t HammingDistance(
     std::span<const uint8_t> b
 ) noexcept {
     size_t distance = 0;
-    size_t minLen = std::min(a.size(), b.size());
+    const size_t minLen = (std::min)(a.size(), b.size());
 
+    // Count bit differences in overlapping region
     for (size_t i = 0; i < minLen; ++i) {
-        distance += std::popcount(static_cast<uint8_t>(a[i] ^ b[i]));
+        distance += static_cast<size_t>(std::popcount(static_cast<uint8_t>(a[i] ^ b[i])));
     }
 
-    // Add difference in lengths
-    distance += std::abs(static_cast<int>(a.size() - b.size())) * 8;
+    // Add difference in lengths (each byte difference = 8 bits)
+    const size_t lenDiff = (a.size() > b.size()) ? (a.size() - b.size()) : (b.size() - a.size());
+    
+    // Check for overflow before multiplication
+    if (lenDiff <= (std::numeric_limits<size_t>::max)() / 8) {
+        distance += lenDiff * 8;
+    } else {
+        distance = (std::numeric_limits<size_t>::max)();
+    }
 
     return distance;
 }

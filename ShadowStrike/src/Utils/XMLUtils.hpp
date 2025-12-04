@@ -39,7 +39,7 @@
 #include <optional>
 #include <cstdint>
 
-#include <../../external/pugixml/pugixml.hpp>
+#include"../../../../ShadowStrike/external/pugixml/pugixml.hpp"
 
 
 namespace ShadowStrike {

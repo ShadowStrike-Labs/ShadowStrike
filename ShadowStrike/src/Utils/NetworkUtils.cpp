@@ -548,13 +548,31 @@ namespace ShadowStrike {
 				try {
 					addresses.clear();
 
+					// Validate hostname length to prevent buffer overflow attacks
+					if (hostname.empty() || hostname.size() > 255) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid hostname length");
+						return false;
+					}
+
 					WsaInitializer wsa;
 					if (!wsa.IsInitialized()) {
 						Internal::SetWsaError(err, wsa.GetError(), L"WSA initialization failed");
 						return false;
 					}
 
-					std::string hostnameA(hostname.begin(), hostname.end());
+					// Properly convert wide string to narrow string using UTF-8
+					std::string hostnameA;
+					{
+						int narrowLen = WideCharToMultiByte(CP_UTF8, 0, hostname.data(),
+							static_cast<int>(hostname.size()), nullptr, 0, nullptr, nullptr);
+						if (narrowLen <= 0) {
+							Internal::SetError(err, ::GetLastError(), L"Failed to convert hostname");
+							return false;
+						}
+						hostnameA.resize(static_cast<size_t>(narrowLen));
+						WideCharToMultiByte(CP_UTF8, 0, hostname.data(),
+							static_cast<int>(hostname.size()), hostnameA.data(), narrowLen, nullptr, nullptr);
+					}
 
 					addrinfo hints{};
 					hints.ai_family = static_cast<int>(family);
@@ -628,11 +646,43 @@ namespace ShadowStrike {
 
 			bool ReverseLookup(const IpAddress& address, std::wstring& hostname, Error* err) noexcept {
 				try {
+					hostname.clear();
+					
 					WsaInitializer wsa;
 					if (!wsa.IsInitialized()) {
 						Internal::SetWsaError(err, wsa.GetError(), L"WSA initialization failed");
 						return false;
 					}
+
+					// Validate IP address
+					if (!address.IsValid()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address");
+						return false;
+					}
+
+					// Helper lambda for proper UTF-8 to wide string conversion
+					auto convertToWide = [](const char* narrowStr, std::wstring& wideStr) -> bool {
+						if (!narrowStr || narrowStr[0] == '\0') return false;
+						size_t narrowLen = std::strlen(narrowStr);
+						if (narrowLen == 0 || narrowLen > NI_MAXHOST) return false;
+						
+						int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+							narrowStr, static_cast<int>(narrowLen), nullptr, 0);
+						if (wideLen <= 0) {
+							// Fallback to ACP if UTF-8 fails
+							wideLen = MultiByteToWideChar(CP_ACP, 0, narrowStr,
+								static_cast<int>(narrowLen), nullptr, 0);
+							if (wideLen <= 0) return false;
+							wideStr.resize(static_cast<size_t>(wideLen));
+							MultiByteToWideChar(CP_ACP, 0, narrowStr,
+								static_cast<int>(narrowLen), wideStr.data(), wideLen);
+						} else {
+							wideStr.resize(static_cast<size_t>(wideLen));
+							MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+								narrowStr, static_cast<int>(narrowLen), wideStr.data(), wideLen);
+						}
+						return true;
+					};
 
 					if (address.version == IpVersion::IPv4) {
 						auto* ipv4 = address.AsIPv4();
@@ -645,12 +695,11 @@ namespace ShadowStrike {
 						sa.sin_family = AF_INET;
 						sa.sin_addr.s_addr = Internal::HostToNetwork32(ipv4->ToUInt32());
 
-						char hostBuffer[NI_MAXHOST];
+						char hostBuffer[NI_MAXHOST] = {};
 						int ret = ::getnameinfo(reinterpret_cast<sockaddr*>(&sa), sizeof(sa),
 							hostBuffer, sizeof(hostBuffer), nullptr, 0, NI_NAMEREQD);
 
-						if (ret == 0) {
-							hostname = std::wstring(hostBuffer, hostBuffer + std::strlen(hostBuffer));
+						if (ret == 0 && convertToWide(hostBuffer, hostname)) {
 							return true;
 						}
 
@@ -665,12 +714,11 @@ namespace ShadowStrike {
 						sa6.sin6_family = AF_INET6;
 						std::memcpy(&sa6.sin6_addr, ipv6->bytes.data(), 16);
 
-						char hostBuffer[NI_MAXHOST];
+						char hostBuffer[NI_MAXHOST] = {};
 						int ret = ::getnameinfo(reinterpret_cast<sockaddr*>(&sa6), sizeof(sa6),
 							hostBuffer, sizeof(hostBuffer), nullptr, 0, NI_NAMEREQD);
 
-						if (ret == 0) {
-							hostname = std::wstring(hostBuffer, hostBuffer + std::strlen(hostBuffer));
+						if (ret == 0 && convertToWide(hostBuffer, hostname)) {
 							return true;
 						}
 					}
@@ -692,8 +740,33 @@ namespace ShadowStrike {
 				try {
 					records.clear();
 
+					// Validate hostname
+					if (hostname.empty() || hostname.size() > 255) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid hostname length");
+						return false;
+					}
+
 					std::wstring hostStr(hostname);
-					PDNS_RECORD pDnsRecord = nullptr;
+					
+					// RAII wrapper for DNS records to prevent leaks
+					struct DnsRecordGuard {
+						PDNS_RECORD ptr = nullptr;
+						~DnsRecordGuard() {
+							if (ptr) {
+								::DnsRecordListFree(ptr, DnsFreeRecordList);
+							}
+						}
+					} dnsRecordGuard;
+
+					// RAII wrapper for custom DNS servers allocation
+					struct DnsServerArrayGuard {
+						PIP4_ARRAY ptr = nullptr;
+						~DnsServerArrayGuard() {
+							if (ptr) {
+								free(ptr);
+							}
+						}
+					} dnsServerGuard;
 
 					DWORD flags = DNS_QUERY_STANDARD;
 
@@ -708,10 +781,10 @@ namespace ShadowStrike {
 					}
 
 					// Prepare custom DNS servers if specified
-					PIP4_ARRAY pDnsServers = nullptr;
-					std::vector<IP4_ADDRESS> dnsServerAddresses;
-					
 					if (!options.customDnsServers.empty() && !options.useSystemDns) {
+						std::vector<IP4_ADDRESS> dnsServerAddresses;
+						dnsServerAddresses.reserve(options.customDnsServers.size());
+						
 						for (const auto& dnsServer : options.customDnsServers) {
 							if (dnsServer.IsIPv4()) {
 								auto* ipv4 = dnsServer.AsIPv4();
@@ -722,12 +795,18 @@ namespace ShadowStrike {
 						}
 
 						if (!dnsServerAddresses.empty()) {
+							// Validate size to prevent overflow
+							constexpr size_t maxDnsServers = 64;
+							if (dnsServerAddresses.size() > maxDnsServers) {
+								dnsServerAddresses.resize(maxDnsServers);
+							}
+							
 							size_t structSize = sizeof(IP4_ARRAY) + (dnsServerAddresses.size() - 1) * sizeof(IP4_ADDRESS);
-							pDnsServers = reinterpret_cast<PIP4_ARRAY>(malloc(structSize));
-							if (pDnsServers) {
-								pDnsServers->AddrCount = static_cast<DWORD>(dnsServerAddresses.size());
+							dnsServerGuard.ptr = static_cast<PIP4_ARRAY>(malloc(structSize));
+							if (dnsServerGuard.ptr) {
+								dnsServerGuard.ptr->AddrCount = static_cast<DWORD>(dnsServerAddresses.size());
 								for (size_t i = 0; i < dnsServerAddresses.size(); ++i) {
-									pDnsServers->AddrArray[i] = dnsServerAddresses[i];
+									dnsServerGuard.ptr->AddrArray[i] = dnsServerAddresses[i];
 								}
 							}
 						}
@@ -737,22 +816,18 @@ namespace ShadowStrike {
 						hostStr.c_str(),
 						static_cast<WORD>(type),
 						flags,
-						pDnsServers,
-						&pDnsRecord,
+						dnsServerGuard.ptr,
+						&dnsRecordGuard.ptr,
 						nullptr
 					);
-
-					// Cleanup custom DNS servers
-					if (pDnsServers) {
-						free(pDnsServers);
-					}
 
 					if (status != 0) {
 						Internal::SetError(err, status, L"DnsQuery_W failed");
 						return false;
 					}
 
-					for (PDNS_RECORD pRec = pDnsRecord; pRec != nullptr; pRec = pRec->pNext) {
+					// Iterate through DNS records using the RAII-guarded pointer
+					for (PDNS_RECORD pRec = dnsRecordGuard.ptr; pRec != nullptr; pRec = pRec->pNext) {
 						DnsRecord rec;
 						rec.name = pRec->pName ? pRec->pName : L"";
 						rec.type = static_cast<DnsRecordType>(pRec->wType);
@@ -785,10 +860,13 @@ namespace ShadowStrike {
 							break;
 
 						case DNS_TYPE_TEXT:
-							for (DWORD i = 0; i < pRec->Data.TXT.dwStringCount; ++i) {
-								if (pRec->Data.TXT.pStringArray[i]) {
-									if (!rec.data.empty()) rec.data += L" ";
-									rec.data += pRec->Data.TXT.pStringArray[i];
+							// Validate string count to prevent OOB access
+							if (pRec->Data.TXT.dwStringCount > 0 && pRec->Data.TXT.dwStringCount < 256) {
+								for (DWORD i = 0; i < pRec->Data.TXT.dwStringCount; ++i) {
+									if (pRec->Data.TXT.pStringArray[i]) {
+										if (!rec.data.empty()) rec.data += L" ";
+										rec.data += pRec->Data.TXT.pStringArray[i];
+									}
 								}
 							}
 							break;
@@ -807,14 +885,14 @@ namespace ShadowStrike {
 							break;
 
 						default:
-							rec.data = L"<unsupported record type>";
-							break;
+							// Skip unsupported record types instead of adding placeholder
+							continue;
 						}
 
 						records.push_back(std::move(rec));
 					}
 
-					::DnsRecordListFree(pDnsRecord, DnsFreeRecordList);
+					// DNS records are freed by RAII guard destructor
 					return true;
 
 				} catch (...) {
@@ -1044,10 +1122,26 @@ namespace ShadowStrike {
 				try {
 					response = HttpResponse{};
 
+					// Validate URL length to prevent buffer overflow
+					if (url.empty() || url.size() > 8192) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid URL length");
+						return false;
+					}
+
 					WinHttpSession session;
 					if (!session.Open(options.userAgent, err)) {
 						return false;
 					}
+
+					// RAII wrapper for WinHTTP handles
+					struct WinHttpHandleGuard {
+						HINTERNET handle = nullptr;
+						~WinHttpHandleGuard() {
+							if (handle) {
+								::WinHttpCloseHandle(handle);
+							}
+						}
+					};
 
 					URL_COMPONENTS urlComp{};
 					urlComp.dwStructSize = sizeof(urlComp);
@@ -1066,8 +1160,15 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					HINTERNET hConnect = ::WinHttpConnect(session.Handle(), hostName, urlComp.nPort, 0);
-					if (!hConnect) {
+					// Validate hostname was extracted
+					if (hostName[0] == L'\0') {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Empty hostname in URL");
+						return false;
+					}
+
+					WinHttpHandleGuard connectGuard;
+					connectGuard.handle = ::WinHttpConnect(session.Handle(), hostName, urlComp.nPort, 0);
+					if (!connectGuard.handle) {
 						Internal::SetError(err, ::GetLastError(), L"WinHttpConnect failed");
 						return false;
 					}
@@ -1087,43 +1188,62 @@ namespace ShadowStrike {
 					default: break;
 					}
 
-					DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-					HINTERNET hRequest = ::WinHttpOpenRequest(hConnect, method, urlPath, nullptr,
-						WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+					DWORD secureFlags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
 					
-					if (!hRequest) {
-						::WinHttpCloseHandle(hConnect);
+					WinHttpHandleGuard requestGuard;
+					requestGuard.handle = ::WinHttpOpenRequest(connectGuard.handle, method, urlPath, nullptr,
+						WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secureFlags);
+					
+					if (!requestGuard.handle) {
 						Internal::SetError(err, ::GetLastError(), L"WinHttpOpenRequest failed");
 						return false;
 					}
 
-					// Set timeout
-					::WinHttpSetTimeouts(hRequest, options.timeoutMs, options.timeoutMs, options.timeoutMs, options.timeoutMs);
+					// Configure SSL/TLS options if requested to skip verification
+					if (!options.verifySSL && (urlComp.nScheme == INTERNET_SCHEME_HTTPS)) {
+						DWORD sslFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+							SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+							SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+							SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+						::WinHttpSetOption(requestGuard.handle, WINHTTP_OPTION_SECURITY_FLAGS,
+							&sslFlags, sizeof(sslFlags));
+					}
 
-					// Add custom headers
+					// Set timeout with validation
+					DWORD timeoutMs = (options.timeoutMs > 0 && options.timeoutMs <= 300000) 
+						? options.timeoutMs : 30000;
+					::WinHttpSetTimeouts(requestGuard.handle, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
+
+					// Add custom headers with validation
 					for (const auto& header : options.headers) {
-						std::wstring headerStr = header.name + L": " + header.value;
-						::WinHttpAddRequestHeaders(hRequest, headerStr.c_str(), -1, WINHTTP_ADDREQ_FLAG_ADD);
+						if (!header.name.empty() && header.name.size() < 256 && header.value.size() < 8192) {
+							std::wstring headerStr = header.name + L": " + header.value;
+							::WinHttpAddRequestHeaders(requestGuard.handle, headerStr.c_str(), 
+								static_cast<DWORD>(headerStr.length()), WINHTTP_ADDREQ_FLAG_ADD);
+						}
+					}
+
+					// Validate body size
+					constexpr size_t MAX_BODY_SIZE = 100 * 1024 * 1024; // 100MB max
+					if (options.body.size() > MAX_BODY_SIZE) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Request body too large");
+						return false;
 					}
 
 					// Send request
-					BOOL result = ::WinHttpSendRequest(hRequest,
+					BOOL result = ::WinHttpSendRequest(requestGuard.handle,
 						WINHTTP_NO_ADDITIONAL_HEADERS, 0,
 						options.body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<void*>(static_cast<const void*>(options.body.data())),
 						static_cast<DWORD>(options.body.size()),
 						static_cast<DWORD>(options.body.size()), 0);
 
 					if (!result) {
-						::WinHttpCloseHandle(hRequest);
-						::WinHttpCloseHandle(hConnect);
 						Internal::SetError(err, ::GetLastError(), L"WinHttpSendRequest failed");
 						return false;
 					}
 
 					// Receive response
-					if (!::WinHttpReceiveResponse(hRequest, nullptr)) {
-						::WinHttpCloseHandle(hRequest);
-						::WinHttpCloseHandle(hConnect);
+					if (!::WinHttpReceiveResponse(requestGuard.handle, nullptr)) {
 						Internal::SetError(err, ::GetLastError(), L"WinHttpReceiveResponse failed");
 						return false;
 					}
@@ -1131,22 +1251,27 @@ namespace ShadowStrike {
 					// Get status code
 					DWORD statusCode = 0;
 					DWORD statusCodeSize = sizeof(statusCode);
-					::WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+					::WinHttpQueryHeaders(requestGuard.handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
 						nullptr, &statusCode, &statusCodeSize, nullptr);
 					response.statusCode = statusCode;
 
-					// Read response body
+					// Read response body with size limit
+					constexpr size_t MAX_RESPONSE_SIZE = 100 * 1024 * 1024; // 100MB max
 					std::vector<uint8_t> buffer(8192);
 					DWORD bytesRead = 0;
-					while (::WinHttpReadData(hRequest, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead) && bytesRead > 0) {
+					
+					while (::WinHttpReadData(requestGuard.handle, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead) && bytesRead > 0) {
+						// Check response size limit
+						if (response.body.size() + bytesRead > MAX_RESPONSE_SIZE) {
+							Internal::SetError(err, ERROR_BUFFER_OVERFLOW, L"Response body too large");
+							return false;
+						}
 						response.body.insert(response.body.end(), buffer.begin(), buffer.begin() + bytesRead);
 					}
 
 					response.contentLength = response.body.size();
 
-					::WinHttpCloseHandle(hRequest);
-					::WinHttpCloseHandle(hConnect);
-
+					// Handles are closed by RAII guards
 					return true;
 
 				} catch (...) {
@@ -1184,22 +1309,60 @@ namespace ShadowStrike {
 
 			bool HttpDownloadFile(std::wstring_view url, const std::filesystem::path& destPath, const HttpRequestOptions& options, ProgressCallback callback, Error* err) noexcept {
 				try {
+					// Validate destination path
+					if (destPath.empty()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Empty destination path");
+						return false;
+					}
+
 					HttpResponse response;
 					if (!HttpRequest(url, response, options, err)) {
 						return false;
 					}
 
-					std::ofstream outFile(destPath, std::ios::binary);
+					// Check HTTP status code
+					if (response.statusCode < 200 || response.statusCode >= 300) {
+						Internal::SetError(err, ERROR_INTERNET_OPERATION_CANCELLED, 
+							L"HTTP request failed with status " + std::to_wstring(response.statusCode));
+						return false;
+					}
+
+					// Create parent directory if it doesn't exist
+					std::error_code ec;
+					auto parentPath = destPath.parent_path();
+					if (!parentPath.empty() && !std::filesystem::exists(parentPath, ec)) {
+						std::filesystem::create_directories(parentPath, ec);
+						if (ec) {
+							Internal::SetError(err, ec.value(), L"Failed to create directory");
+							return false;
+						}
+					}
+
+					std::ofstream outFile(destPath, std::ios::binary | std::ios::trunc);
 					if (!outFile) {
 						Internal::SetError(err, ERROR_CANNOT_MAKE, L"Failed to create output file");
 						return false;
 					}
 
-					outFile.write(reinterpret_cast<const char*>(response.body.data()), response.body.size());
+					if (!response.body.empty()) {
+						outFile.write(reinterpret_cast<const char*>(response.body.data()), 
+							static_cast<std::streamsize>(response.body.size()));
+						
+						if (!outFile.good()) {
+							Internal::SetError(err, ERROR_WRITE_FAULT, L"Failed to write output file");
+							outFile.close();
+							// Attempt to delete partial file
+							std::filesystem::remove(destPath, ec);
+							return false;
+						}
+					}
+					
 					outFile.close();
-
 					return true;
 
+				} catch (const std::filesystem::filesystem_error& e) {
+					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Filesystem error in HttpDownloadFile");
+					return false;
 				} catch (...) {
 					Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Exception in HttpDownloadFile");
 					return false;
@@ -1208,17 +1371,43 @@ namespace ShadowStrike {
 
 			bool HttpUploadFile(std::wstring_view url, const std::filesystem::path& filePath, std::vector<uint8_t>& response, const HttpRequestOptions& options, ProgressCallback callback, Error* err) noexcept {
 				try {
-					std::ifstream inFile(filePath, std::ios::binary | std::ios::ate);
+					// Validate file path
+					if (filePath.empty()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Empty file path");
+						return false;
+					}
+
+					// Check file exists
+					std::error_code ec;
+					if (!std::filesystem::exists(filePath, ec) || ec) {
+						Internal::SetError(err, ERROR_FILE_NOT_FOUND, L"Input file does not exist");
+						return false;
+					}
+
+					// Get file size safely
+					auto fileSize = std::filesystem::file_size(filePath, ec);
+					if (ec) {
+						Internal::SetError(err, ec.value(), L"Failed to get file size");
+						return false;
+					}
+
+					// Validate file size limits
+					constexpr uintmax_t MAX_UPLOAD_SIZE = 1024ULL * 1024ULL * 1024ULL; // 1GB
+					if (fileSize > MAX_UPLOAD_SIZE) {
+						Internal::SetError(err, ERROR_FILE_TOO_LARGE, L"File too large to upload");
+						return false;
+					}
+
+					std::ifstream inFile(filePath, std::ios::binary);
 					if (!inFile) {
 						Internal::SetError(err, ERROR_FILE_NOT_FOUND, L"Failed to open input file");
 						return false;
 					}
 
-					std::streamsize fileSize = inFile.tellg();
-					inFile.seekg(0, std::ios::beg);
-
-					std::vector<uint8_t> fileData(fileSize);
-					if (!inFile.read(reinterpret_cast<char*>(fileData.data()), fileSize)) {
+					std::vector<uint8_t> fileData;
+					fileData.resize(static_cast<size_t>(fileSize));
+					
+					if (!inFile.read(reinterpret_cast<char*>(fileData.data()), static_cast<std::streamsize>(fileSize))) {
 						Internal::SetError(err, ERROR_READ_FAULT, L"Failed to read input file");
 						return false;
 					}
@@ -1400,6 +1589,26 @@ namespace ShadowStrike {
 					result = PingResult{};
 					result.address = address;
 
+					// Validate IP address
+					if (!address.IsValid()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address");
+						return false;
+					}
+
+					// RAII wrapper for ICMP handles
+					struct IcmpHandleGuard {
+						HANDLE handle = INVALID_HANDLE_VALUE;
+						~IcmpHandleGuard() {
+							if (handle != INVALID_HANDLE_VALUE) {
+								::IcmpCloseHandle(handle);
+							}
+						}
+					};
+
+					// Validate timeout
+					DWORD timeoutMs = (options.timeoutMs > 0 && options.timeoutMs <= 60000) 
+						? options.timeoutMs : 4000;
+
 					if (address.version == IpVersion::IPv4) {
 						auto* ipv4 = address.AsIPv4();
 						if (!ipv4) {
@@ -1407,29 +1616,36 @@ namespace ShadowStrike {
 							return false;
 						}
 
-						HANDLE hIcmp = ::IcmpCreateFile();
-						if (hIcmp == INVALID_HANDLE_VALUE) {
+						IcmpHandleGuard icmpGuard;
+						icmpGuard.handle = ::IcmpCreateFile();
+						if (icmpGuard.handle == INVALID_HANDLE_VALUE) {
 							Internal::SetError(err, ::GetLastError(), L"IcmpCreateFile failed");
 							return false;
 						}
 
+						// Prepare send data with size limit
 						std::vector<uint8_t> sendData = options.data;
 						if (sendData.empty()) {
 							sendData.resize(32, 0xAA);
+						} else if (sendData.size() > 65500) {
+							sendData.resize(65500); // Max ICMP payload size
 						}
 
-						std::vector<uint8_t> replyBuffer(sizeof(ICMP_ECHO_REPLY) + sendData.size() + 8);
+						// Calculate reply buffer size with overflow check
+						size_t replyBufferSize = sizeof(ICMP_ECHO_REPLY) + sendData.size() + 8;
+						if (replyBufferSize > 65535) {
+							replyBufferSize = 65535;
+						}
+						std::vector<uint8_t> replyBuffer(replyBufferSize);
 						
-						DWORD replySize = ::IcmpSendEcho(hIcmp,
+						DWORD replySize = ::IcmpSendEcho(icmpGuard.handle,
 							Internal::HostToNetwork32(ipv4->ToUInt32()),
 							sendData.data(), static_cast<WORD>(sendData.size()),
 							nullptr,
 							replyBuffer.data(), static_cast<DWORD>(replyBuffer.size()),
-							options.timeoutMs);
+							timeoutMs);
 
-						::IcmpCloseHandle(hIcmp);
-
-						if (replySize > 0) {
+						if (replySize > 0 && replySize >= sizeof(ICMP_ECHO_REPLY)) {
 							auto* pReply = reinterpret_cast<PICMP_ECHO_REPLY>(replyBuffer.data());
 							result.success = (pReply->Status == IP_SUCCESS);
 							result.roundTripTimeMs = pReply->RoundTripTime;
@@ -1437,7 +1653,8 @@ namespace ShadowStrike {
 							result.dataSize = pReply->DataSize;
 						} else {
 							result.success = false;
-							result.errorMessage = L"Ping timeout or failed";
+							DWORD lastErr = ::GetLastError();
+							result.errorMessage = L"Ping failed: " + FormatNetworkError(lastErr);
 						}
 
 						return true;
@@ -1449,8 +1666,9 @@ namespace ShadowStrike {
 							return false;
 						}
 
-						HANDLE hIcmp6 = ::Icmp6CreateFile();
-						if (hIcmp6 == INVALID_HANDLE_VALUE) {
+						IcmpHandleGuard icmpGuard;
+						icmpGuard.handle = ::Icmp6CreateFile();
+						if (icmpGuard.handle == INVALID_HANDLE_VALUE) {
 							Internal::SetError(err, ::GetLastError(), L"Icmp6CreateFile failed");
 							return false;
 						}
@@ -1462,29 +1680,36 @@ namespace ShadowStrike {
 						destAddr.sin6_family = AF_INET6;
 						std::memcpy(&destAddr.sin6_addr, ipv6->bytes.data(), 16);
 
+						// Prepare send data with size limit
 						std::vector<uint8_t> sendData = options.data;
 						if (sendData.empty()) {
 							sendData.resize(32, 0xAA);
+						} else if (sendData.size() > 65500) {
+							sendData.resize(65500);
 						}
 
-						std::vector<uint8_t> replyBuffer(sizeof(ICMPV6_ECHO_REPLY) + sendData.size() + 8);
+						// Calculate reply buffer size with overflow check
+						size_t replyBufferSize = sizeof(ICMPV6_ECHO_REPLY) + sendData.size() + 8;
+						if (replyBufferSize > 65535) {
+							replyBufferSize = 65535;
+						}
+						std::vector<uint8_t> replyBuffer(replyBufferSize);
 						
-						DWORD replySize = ::Icmp6SendEcho2(hIcmp6, nullptr, nullptr, nullptr,
+						DWORD replySize = ::Icmp6SendEcho2(icmpGuard.handle, nullptr, nullptr, nullptr,
 							&sourceAddr, &destAddr,
 							sendData.data(), static_cast<WORD>(sendData.size()),
 							nullptr,
 							replyBuffer.data(), static_cast<DWORD>(replyBuffer.size()),
-							options.timeoutMs);
+							timeoutMs);
 
-						::IcmpCloseHandle(hIcmp6);
-
-						if (replySize > 0) {
+						if (replySize > 0 && replySize >= sizeof(ICMPV6_ECHO_REPLY)) {
 							auto* pReply = reinterpret_cast<PICMPV6_ECHO_REPLY>(replyBuffer.data());
 							result.success = (pReply->Status == IP_SUCCESS);
 							result.roundTripTimeMs = pReply->RoundTripTime;
 						} else {
 							result.success = false;
-							result.errorMessage = L"Ping timeout or failed";
+							DWORD lastErr = ::GetLastError();
+							result.errorMessage = L"Ping failed: " + FormatNetworkError(lastErr);
 						}
 
 						return true;
@@ -1580,55 +1805,99 @@ namespace ShadowStrike {
 					result = PortScanResult{};
 					result.port = port;
 
+					// Validate address
+					if (!address.IsValid()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IP address");
+						return false;
+					}
+
+					// Validate timeout
+					if (timeoutMs == 0 || timeoutMs > 60000) {
+						timeoutMs = 1000;
+					}
+
 					WsaInitializer wsa;
 					if (!wsa.IsInitialized()) {
 						Internal::SetWsaError(err, wsa.GetError(), L"WSA initialization failed");
 						return false;
 					}
 
-					SOCKET sock = ::socket(address.IsIPv4() ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-					if (sock == INVALID_SOCKET) {
+					// RAII socket wrapper
+					struct SocketGuard {
+						SOCKET sock = INVALID_SOCKET;
+						~SocketGuard() {
+							if (sock != INVALID_SOCKET) {
+								::closesocket(sock);
+							}
+						}
+					} socketGuard;
+
+					socketGuard.sock = ::socket(address.IsIPv4() ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+					if (socketGuard.sock == INVALID_SOCKET) {
 						Internal::SetWsaError(err, ::WSAGetLastError(), L"socket creation failed");
 						return false;
 					}
 
 					// Set non-blocking mode
 					u_long mode = 1;
-					::ioctlsocket(sock, FIONBIO, &mode);
+					if (::ioctlsocket(socketGuard.sock, FIONBIO, &mode) == SOCKET_ERROR) {
+						Internal::SetWsaError(err, ::WSAGetLastError(), L"Failed to set non-blocking mode");
+						return false;
+					}
 
-					// Set timeout
-					struct timeval tv;
-					tv.tv_sec = timeoutMs / 1000;
-					tv.tv_usec = (timeoutMs % 1000) * 1000;
-					::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-					::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+					// Set timeout options
+					DWORD dwTimeout = timeoutMs;
+					::setsockopt(socketGuard.sock, SOL_SOCKET, SO_RCVTIMEO, 
+						reinterpret_cast<const char*>(&dwTimeout), sizeof(dwTimeout));
+					::setsockopt(socketGuard.sock, SOL_SOCKET, SO_SNDTIMEO, 
+						reinterpret_cast<const char*>(&dwTimeout), sizeof(dwTimeout));
 
 					auto startTime = std::chrono::steady_clock::now();
 
 					int connectResult = -1;
 					if (address.IsIPv4()) {
 						auto* ipv4 = address.AsIPv4();
+						if (!ipv4) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IPv4 address");
+							return false;
+						}
 						sockaddr_in sa{};
 						sa.sin_family = AF_INET;
 						sa.sin_port = Internal::HostToNetwork16(port);
 						sa.sin_addr.s_addr = Internal::HostToNetwork32(ipv4->ToUInt32());
-						connectResult = ::connect(sock, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+						connectResult = ::connect(socketGuard.sock, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
 					} else {
 						auto* ipv6 = address.AsIPv6();
+						if (!ipv6) {
+							Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid IPv6 address");
+							return false;
+						}
 						sockaddr_in6 sa6{};
 						sa6.sin6_family = AF_INET6;
 						sa6.sin6_port = Internal::HostToNetwork16(port);
 						std::memcpy(&sa6.sin6_addr, ipv6->bytes.data(), 16);
-						connectResult = ::connect(sock, reinterpret_cast<sockaddr*>(&sa6), sizeof(sa6));
+						connectResult = ::connect(socketGuard.sock, reinterpret_cast<sockaddr*>(&sa6), sizeof(sa6));
 					}
 
-					if (connectResult == 0 || ::WSAGetLastError() == WSAEWOULDBLOCK) {
+					int wsaErr = ::WSAGetLastError();
+					if (connectResult == 0 || wsaErr == WSAEWOULDBLOCK || wsaErr == WSAEINPROGRESS) {
 						fd_set writeSet;
 						FD_ZERO(&writeSet);
-						FD_SET(sock, &writeSet);
+						FD_SET(socketGuard.sock, &writeSet);
 
-						if (::select(0, nullptr, &writeSet, nullptr, &tv) > 0) {
-							result.isOpen = true;
+						struct timeval tv;
+						tv.tv_sec = static_cast<long>(timeoutMs / 1000);
+						tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+
+						int selectResult = ::select(0, nullptr, &writeSet, nullptr, &tv);
+						if (selectResult > 0 && FD_ISSET(socketGuard.sock, &writeSet)) {
+							// Check if connection succeeded
+							int optVal = 0;
+							int optLen = sizeof(optVal);
+							if (::getsockopt(socketGuard.sock, SOL_SOCKET, SO_ERROR, 
+									reinterpret_cast<char*>(&optVal), &optLen) == 0 && optVal == 0) {
+								result.isOpen = true;
+							}
 							
 							auto endTime = std::chrono::steady_clock::now();
 							result.responseTimeMs = static_cast<uint32_t>(
@@ -1637,7 +1906,7 @@ namespace ShadowStrike {
 						}
 					}
 
-					::closesocket(sock);
+					// Socket is closed by RAII guard
 					return true;
 
 				} catch (...) {
@@ -1866,39 +2135,125 @@ namespace ShadowStrike {
 			}
 
 			std::wstring UrlEncode(std::wstring_view str) noexcept {
-				std::wostringstream oss;
-				oss << std::hex << std::uppercase;
-
-				for (wchar_t c : str) {
-					if (std::isalnum(static_cast<unsigned char>(c)) || c == L'-' || c == L'_' || c == L'.' || c == L'~') {
-						oss << static_cast<char>(c);
-					} else if (c == L' ') {
-						oss << L'+';
-					} else {
-						oss << L'%' << std::setw(2) << std::setfill(L'0') << static_cast<int>(static_cast<unsigned char>(c));
+				try {
+					if (str.empty()) {
+						return std::wstring();
 					}
-				}
 
-				return oss.str();
+					// First convert to UTF-8 for proper encoding
+					std::string utf8;
+					{
+						int utf8Len = WideCharToMultiByte(CP_UTF8, 0, str.data(),
+							static_cast<int>(str.size()), nullptr, 0, nullptr, nullptr);
+						if (utf8Len <= 0) {
+							return std::wstring();
+						}
+						utf8.resize(static_cast<size_t>(utf8Len));
+						WideCharToMultiByte(CP_UTF8, 0, str.data(),
+							static_cast<int>(str.size()), utf8.data(), utf8Len, nullptr, nullptr);
+					}
+
+					std::wostringstream oss;
+					oss << std::hex << std::uppercase;
+
+					for (unsigned char c : utf8) {
+						if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+							oss << static_cast<wchar_t>(c);
+						} else if (c == ' ') {
+							oss << L'+';
+						} else {
+							oss << L'%' << std::setw(2) << std::setfill(L'0') << static_cast<int>(c);
+						}
+					}
+
+					return oss.str();
+				} catch (...) {
+					return std::wstring();
+				}
 			}
 
 			std::wstring UrlDecode(std::wstring_view str) noexcept {
-				std::wostringstream oss;
-
-				for (size_t i = 0; i < str.length(); ++i) {
-					if (str[i] == L'%' && i + 2 < str.length()) {
-						int value = 0;
-						std::wistringstream(std::wstring(str.substr(i + 1, 2))) >> std::hex >> value;
-						oss << static_cast<wchar_t>(value);
-						i += 2;
-					} else if (str[i] == L'+') {
-						oss << L' ';
-					} else {
-						oss << str[i];
+				try {
+					if (str.empty()) {
+						return std::wstring();
 					}
-				}
 
-				return oss.str();
+					// Decode to UTF-8 bytes first
+					std::vector<char> utf8;
+					utf8.reserve(str.length());
+
+					for (size_t i = 0; i < str.length(); ++i) {
+						wchar_t wc = str[i];
+						
+						if (wc == L'%' && i + 2 < str.length()) {
+							// Validate hex characters
+							wchar_t h1 = str[i + 1];
+							wchar_t h2 = str[i + 2];
+							
+							auto isHexChar = [](wchar_t c) -> bool {
+								return (c >= L'0' && c <= L'9') || 
+									   (c >= L'A' && c <= L'F') || 
+									   (c >= L'a' && c <= L'f');
+							};
+							
+							if (isHexChar(h1) && isHexChar(h2)) {
+								auto hexToInt = [](wchar_t c) -> int {
+									if (c >= L'0' && c <= L'9') return c - L'0';
+									if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+									if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+									return 0;
+								};
+								
+								int value = (hexToInt(h1) << 4) | hexToInt(h2);
+								utf8.push_back(static_cast<char>(value));
+								i += 2;
+							} else {
+								// Invalid percent encoding, keep literal
+								utf8.push_back('%');
+							}
+						} else if (wc == L'+') {
+							utf8.push_back(' ');
+						} else if (wc < 128) {
+							utf8.push_back(static_cast<char>(wc));
+						} else {
+							// Non-ASCII in URL - encode as UTF-8
+							wchar_t wcBuf[2] = { wc, L'\0' };
+							char utf8Buf[4] = {};
+							int len = WideCharToMultiByte(CP_UTF8, 0, wcBuf, 1, utf8Buf, 4, nullptr, nullptr);
+							for (int j = 0; j < len; ++j) {
+								utf8.push_back(utf8Buf[j]);
+							}
+						}
+					}
+
+					// Convert UTF-8 back to wide string
+					if (utf8.empty()) {
+						return std::wstring();
+					}
+					
+					int wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+						utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+					if (wideLen <= 0) {
+						// Fallback to ACP
+						wideLen = MultiByteToWideChar(CP_ACP, 0, utf8.data(),
+							static_cast<int>(utf8.size()), nullptr, 0);
+						if (wideLen <= 0) {
+							return std::wstring();
+						}
+						std::wstring result(static_cast<size_t>(wideLen), L'\0');
+						MultiByteToWideChar(CP_ACP, 0, utf8.data(),
+							static_cast<int>(utf8.size()), result.data(), wideLen);
+						return result;
+					}
+					
+					std::wstring result(static_cast<size_t>(wideLen), L'\0');
+					MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+						utf8.data(), static_cast<int>(utf8.size()), result.data(), wideLen);
+					return result;
+					
+				} catch (...) {
+					return std::wstring();
+				}
 			}
 
 			std::wstring ExtractDomain(std::wstring_view url) noexcept {
@@ -3648,7 +4003,11 @@ namespace ShadowStrike {
 					);
 
 					if (pExtension) {
+						// CRYPT_DECODE_ALLOC_FLAG causes CryptDecodeObjectEx to allocate memory
+						// The output is a pointer to the allocated buffer, which must be freed with LocalFree
+						PCERT_ALT_NAME_INFO pAltNameInfo = nullptr;
 						DWORD sanSize = 0;
+
 						if (::CryptDecodeObjectEx(
 							X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
 							X509_ALTERNATE_NAME,
@@ -3656,43 +4015,37 @@ namespace ShadowStrike {
 							pExtension->Value.cbData,
 							CRYPT_DECODE_ALLOC_FLAG,
 							nullptr,
-							nullptr,
+							&pAltNameInfo,  // Output: pointer to allocated CERT_ALT_NAME_INFO
 							&sanSize)) {
 
-							std::vector<uint8_t> sanBuf(sanSize);
-							if (::CryptDecodeObjectEx(
-								X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-								X509_ALTERNATE_NAME,
-								pExtension->Value.pbData,
-								pExtension->Value.cbData,
-								CRYPT_DECODE_ALLOC_FLAG,
-								nullptr,
-								sanBuf.data(),
-								&sanSize)) {
+							// RAII guard for the allocated memory
+							struct SanDeleter {
+								void operator()(PCERT_ALT_NAME_INFO p) const {
+									if (p) ::LocalFree(p);
+								}
+							};
+							std::unique_ptr<CERT_ALT_NAME_INFO, SanDeleter> sanGuard(pAltNameInfo);
 
-								auto* pAltNameInfo = reinterpret_cast<PCERT_ALT_NAME_INFO>(sanBuf.data());
+							for (DWORD i = 0; i < pAltNameInfo->cAltEntry; ++i) {
+								const auto& entry = pAltNameInfo->rgAltEntry[i];
 
-								for (DWORD i = 0; i < pAltNameInfo->cAltEntry; ++i) {
-									const auto& entry = pAltNameInfo->rgAltEntry[i];
-
-									if (entry.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME && entry.pwszDNSName) {
-										certInfo.subjectAltNames.emplace_back(entry.pwszDNSName);
+								if (entry.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME && entry.pwszDNSName) {
+									certInfo.subjectAltNames.emplace_back(entry.pwszDNSName);
+								}
+								else if (entry.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS) {
+									// Handle IP address SANs if needed
+									if (entry.IPAddress.cbData == 4) {
+										// IPv4
+										IPv4Address ipv4;
+										std::memcpy(ipv4.octets.data(), entry.IPAddress.pbData, 4);
+										certInfo.subjectAltNames.emplace_back(ipv4.ToString());
 									}
-									else if (entry.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS) {
-										// Handle IP address SANs if needed
-										if (entry.IPAddress.cbData == 4) {
-											// IPv4
-											IPv4Address ipv4;
-											std::memcpy(ipv4.octets.data(), entry.IPAddress.pbData, 4);
-											certInfo.subjectAltNames.emplace_back(ipv4.ToString());
-										}
-										else if (entry.IPAddress.cbData == 16) {
-											// IPv6
-											std::array<uint8_t, 16> bytes;
-											std::memcpy(bytes.data(), entry.IPAddress.pbData, 16);
-											IPv6Address ipv6(bytes);
-											certInfo.subjectAltNames.emplace_back(ipv6.ToStringCompressed());
-										}
+									else if (entry.IPAddress.cbData == 16) {
+										// IPv6
+										std::array<uint8_t, 16> bytes;
+										std::memcpy(bytes.data(), entry.IPAddress.pbData, 16);
+										IPv6Address ipv6(bytes);
+										certInfo.subjectAltNames.emplace_back(ipv6.ToStringCompressed());
 									}
 								}
 							}
@@ -3753,9 +4106,16 @@ namespace ShadowStrike {
 						err->win32 = ERROR_INVALID_PARAMETER;
 						err->message = L"Exception in GetSslCertificate: ";
 
-						// Convert exception message to wstring
-						std::string exMsg = ex.what();
-						err->message += std::wstring(exMsg.begin(), exMsg.end());
+						// Convert UTF-8 exception message to wstring using proper Windows API
+						const char* exMsg = ex.what();
+						if (exMsg && *exMsg) {
+							int requiredSize = ::MultiByteToWideChar(CP_UTF8, 0, exMsg, -1, nullptr, 0);
+							if (requiredSize > 0) {
+								std::wstring wideMsg(static_cast<size_t>(requiredSize - 1), L'\0');
+								::MultiByteToWideChar(CP_UTF8, 0, exMsg, -1, wideMsg.data(), requiredSize);
+								err->message += wideMsg;
+							}
+						}
 					}
 					return false;
 				}
@@ -4551,12 +4911,12 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					struct SessionDeleter {
+					struct HandleDeleter {
 						void operator()(HINTERNET h) const {
 							if (h) ::WinHttpCloseHandle(h);
 						}
 					};
-					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> sessionGuard(hSession);
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, HandleDeleter> sessionGuard(hSession);
 
 					// Get autoproxy options
 					WINHTTP_AUTOPROXY_OPTIONS autoProxyOptions = {};
@@ -4564,8 +4924,20 @@ namespace ShadowStrike {
 					autoProxyOptions.dwAutoDetectFlags = WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
 					autoProxyOptions.fAutoLogonIfChallenged = TRUE;
 
-					// Check for PAC file
+					// Check for PAC file - RAII guard for IE proxy config
 					WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieProxyConfig{};
+					struct IeProxyConfigCleanup {
+						WINHTTP_CURRENT_USER_IE_PROXY_CONFIG* config;
+						~IeProxyConfigCleanup() {
+							if (config) {
+								if (config->lpszProxy) ::GlobalFree(config->lpszProxy);
+								if (config->lpszProxyBypass) ::GlobalFree(config->lpszProxyBypass);
+								if (config->lpszAutoConfigUrl) ::GlobalFree(config->lpszAutoConfigUrl);
+							}
+						}
+					};
+					IeProxyConfigCleanup ieConfigGuard{ &ieProxyConfig };
+
 					if (::WinHttpGetIEProxyConfigForCurrentUser(&ieProxyConfig)) {
 						if (ieProxyConfig.lpszAutoConfigUrl) {
 							autoProxyOptions.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
@@ -4578,26 +4950,31 @@ namespace ShadowStrike {
 					std::wstring urlStr(url);
 					BOOL result = ::WinHttpGetProxyForUrl(hSession, urlStr.c_str(), &autoProxyOptions, &proxyInfo);
 
-					// Cleanup IE proxy config
-					if (ieProxyConfig.lpszProxy) ::GlobalFree(ieProxyConfig.lpszProxy);
-					if (ieProxyConfig.lpszProxyBypass) ::GlobalFree(ieProxyConfig.lpszProxyBypass);
-					if (ieProxyConfig.lpszAutoConfigUrl) ::GlobalFree(ieProxyConfig.lpszAutoConfigUrl);
+					// RAII guard for proxyInfo strings (only set if WinHttpGetProxyForUrl succeeds)
+					struct ProxyInfoCleanup {
+						WINHTTP_PROXY_INFO* info;
+						~ProxyInfoCleanup() {
+							if (info) {
+								if (info->lpszProxy) ::GlobalFree(info->lpszProxy);
+								if (info->lpszProxyBypass) ::GlobalFree(info->lpszProxyBypass);
+							}
+						}
+					};
+					ProxyInfoCleanup proxyInfoGuard{ result ? &proxyInfo : nullptr };
 
 					if (!result) {
 						// Fall back to system proxy settings
 						return GetSystemProxySettings(proxy, err);
 					}
 
-					// Process proxy info
+					// Process proxy info - strings are managed by proxyInfoGuard
 					if (proxyInfo.lpszProxy) {
 						proxy.enabled = true;
 						proxy.server = proxyInfo.lpszProxy;
-						::GlobalFree(proxyInfo.lpszProxy);
 					}
 
 					if (proxyInfo.lpszProxyBypass) {
 						proxy.bypass = proxyInfo.lpszProxyBypass;
-						::GlobalFree(proxyInfo.lpszProxyBypass);
 					}
 
 					return true;
@@ -4692,12 +5069,12 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					struct SessionDeleter {
+					struct HandleDeleter {
 						void operator()(HINTERNET h) const {
 							if (h) ::WinHttpCloseHandle(h);
 						}
 					};
-					std::unique_ptr<std::remove_pointer_t<HINTERNET>, SessionDeleter> sessionGuard(hSession);
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, HandleDeleter> sessionGuard(hSession);
 
 					// Try to connect to a known endpoint
 					HINTERNET hConnect = ::WinHttpConnect(hSession, L"www.microsoft.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -4707,7 +5084,9 @@ namespace ShadowStrike {
 						return false;
 					}
 
-					::WinHttpCloseHandle(hConnect);
+					// Use RAII to ensure hConnect is always closed
+					std::unique_ptr<std::remove_pointer_t<HINTERNET>, HandleDeleter> connectGuard(hConnect);
+
 					return true;
 
 				}

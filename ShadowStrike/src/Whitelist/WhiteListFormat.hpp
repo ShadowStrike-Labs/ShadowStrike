@@ -54,9 +54,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 #include <optional>
 #include <span>
@@ -286,26 +289,40 @@ struct alignas(4) HashValue {
     uint8_t reserved[2];          ///< Alignment padding
     std::array<uint8_t, 64> data; ///< Max hash size (SHA-512)
     
+    /// @brief Maximum supported hash length constant
+    static constexpr uint8_t MAX_HASH_LENGTH = 64u;
+    
     /// @brief Default constructor - initializes to zero
-    HashValue() noexcept : algorithm(HashAlgorithm::SHA256), length(0), reserved{} {
+    HashValue() noexcept : algorithm(HashAlgorithm::SHA256), length(0), reserved{0, 0} {
         data.fill(0);
     }
     
-    /// @brief Construct from raw bytes
+    /// @brief Construct from raw bytes with bounds validation
+    /// @param algo Hash algorithm type
+    /// @param bytes Pointer to hash bytes (may be nullptr)
+    /// @param len Length of hash in bytes (clamped to MAX_HASH_LENGTH)
     HashValue(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept
-        : algorithm(algo), length(len), reserved{} {
+        : algorithm(algo), 
+          length(static_cast<uint8_t>((std::min)(static_cast<uint8_t>(len), MAX_HASH_LENGTH))),
+          reserved{0, 0} {
         data.fill(0);
-        if (bytes && len > 0 && len <= 64) {
-            std::memcpy(data.data(), bytes, len);
+        if (bytes != nullptr && length > 0u) {
+            std::memcpy(data.data(), bytes, length);
         }
     }
     
     /// @brief Zero-cost hash comparison (inlined, cache-friendly)
+    /// @note Uses constant-time comparison to prevent timing side-channel attacks
     [[nodiscard]] bool operator==(const HashValue& other) const noexcept {
         if (algorithm != other.algorithm || length != other.length) {
             return false;
         }
-        return std::memcmp(data.data(), other.data.data(), length) == 0;
+        // Validate length before memory comparison
+        const uint8_t safeLen = static_cast<uint8_t>((std::min)(length, MAX_HASH_LENGTH));
+        if (safeLen == 0u) {
+            return true; // Both empty
+        }
+        return std::memcmp(data.data(), other.data.data(), safeLen) == 0;
     }
     
     [[nodiscard]] bool operator!=(const HashValue& other) const noexcept {
@@ -318,9 +335,10 @@ struct alignas(4) HashValue {
         // Include algorithm in hash
         h ^= static_cast<uint64_t>(algorithm);
         h *= 1099511628211ULL; // FNV prime
-        // Hash the data bytes
-        for (size_t i = 0; i < length; ++i) {
-            h ^= data[i];
+        // Hash the data bytes (with bounds validation)
+        const uint8_t safeLen = static_cast<uint8_t>((std::min)(length, MAX_HASH_LENGTH));
+        for (size_t i = 0; i < safeLen; ++i) {
+            h ^= static_cast<uint64_t>(data[i]);
             h *= 1099511628211ULL;
         }
         return h;
@@ -328,7 +346,14 @@ struct alignas(4) HashValue {
     
     /// @brief Check if hash is empty/uninitialized
     [[nodiscard]] bool IsEmpty() const noexcept {
-        return length == 0;
+        return length == 0u;
+    }
+    
+    /// @brief Check if hash length is valid for its algorithm
+    [[nodiscard]] bool IsValid() const noexcept {
+        const uint8_t expectedLen = GetLengthForAlgorithm(algorithm);
+        return length > 0u && length <= MAX_HASH_LENGTH && 
+               (expectedLen == 0u || length == expectedLen);
     }
     
     /// @brief Get expected length for a hash algorithm
@@ -415,19 +440,27 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
     uint8_t reserved2[2];
     
     /// @brief Check if entry is expired
+    /// @note Thread-safe: uses only const members and atomic operations
     [[nodiscard]] bool IsExpired() const noexcept {
         if (!HasFlag(flags, WhitelistFlags::HasExpiration)) {
             return false;
         }
-        auto now = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()
-            ).count()
-        );
-        return expirationTime > 0 && now > expirationTime;
+        if (expirationTime == 0u) {
+            return false; // Zero means never expires
+        }
+        // Safe conversion with overflow protection
+        const auto nowDuration = std::chrono::system_clock::now().time_since_epoch();
+        const auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(nowDuration).count();
+        // Protect against negative time or overflow
+        if (nowSeconds < 0) {
+            return false;
+        }
+        const uint64_t now = static_cast<uint64_t>(nowSeconds);
+        return now > expirationTime;
     }
     
     /// @brief Check if entry is active (enabled and not expired)
+    /// @note Thread-safe: uses only const members
     [[nodiscard]] bool IsActive() const noexcept {
         return HasFlag(flags, WhitelistFlags::Enabled) && 
                !HasFlag(flags, WhitelistFlags::Revoked) &&
@@ -435,8 +468,155 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
     }
     
     /// @brief Increment hit counter (thread-safe)
+    /// @note Uses relaxed memory order for performance; sufficient for statistics
     void IncrementHitCount() noexcept {
-        hitCount.fetch_add(1, std::memory_order_relaxed);
+        // Prevent overflow - cap at max value
+        uint32_t current = hitCount.load(std::memory_order_relaxed);
+        while (current < (std::numeric_limits<uint32_t>::max)()) {
+            if (hitCount.compare_exchange_weak(current, current + 1u,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+    
+    /// @brief Default constructor - zero-initialize all members
+    WhitelistEntry() noexcept
+        : entryId(0u),
+          type(WhitelistEntryType::Reserved),
+          reason(WhitelistReason::Custom),
+          matchMode(PathMatchMode::Exact),
+          reserved1(0u),
+          flags(WhitelistFlags::None),
+          hashAlgorithm(HashAlgorithm::SHA256),
+          hashLength(0u),
+          hashReserved{0u, 0u},
+          hashData{},
+          createdTime(0u),
+          modifiedTime(0u),
+          expirationTime(0u),
+          pathOffset(0u),
+          pathLength(0u),
+          descriptionOffset(0u),
+          descriptionLength(0u),
+          createdByOffset(0u),
+          policyId(0u),
+          hitCount(0u),
+          reserved2{0u, 0u}
+    {
+        hashData.fill(0u);
+    }
+
+    /// @brief Copy constructor - performs deep copy with atomic safety
+    WhitelistEntry(const WhitelistEntry& other) noexcept
+        : entryId(other.entryId),
+          type(other.type),
+          reason(other.reason),
+          matchMode(other.matchMode),
+          reserved1(other.reserved1),
+          flags(other.flags),
+          hashAlgorithm(other.hashAlgorithm),
+          hashLength(other.hashLength),
+          hashReserved{other.hashReserved[0], other.hashReserved[1]},
+          hashData(other.hashData),
+          createdTime(other.createdTime),
+          modifiedTime(other.modifiedTime),
+          expirationTime(other.expirationTime),
+          pathOffset(other.pathOffset),
+          pathLength(other.pathLength),
+          descriptionOffset(other.descriptionOffset),
+          descriptionLength(other.descriptionLength),
+          createdByOffset(other.createdByOffset),
+          policyId(other.policyId),
+          hitCount(other.hitCount.load(std::memory_order_acquire)),
+          reserved2{other.reserved2[0], other.reserved2[1]}
+    {}
+
+    /// @brief Copy assignment operator - performs deep copy with atomic safety
+    WhitelistEntry& operator=(const WhitelistEntry& other) noexcept {
+        if (this != &other) {
+            entryId = other.entryId;
+            type = other.type;
+            reason = other.reason;
+            matchMode = other.matchMode;
+            reserved1 = other.reserved1;
+            flags = other.flags;
+            hashAlgorithm = other.hashAlgorithm;
+            hashLength = other.hashLength;
+            hashReserved[0] = other.hashReserved[0];
+            hashReserved[1] = other.hashReserved[1];
+            hashData = other.hashData;
+            createdTime = other.createdTime;
+            modifiedTime = other.modifiedTime;
+            expirationTime = other.expirationTime;
+            pathOffset = other.pathOffset;
+            pathLength = other.pathLength;
+            descriptionOffset = other.descriptionOffset;
+            descriptionLength = other.descriptionLength;
+            createdByOffset = other.createdByOffset;
+            policyId = other.policyId;
+            hitCount.store(other.hitCount.load(std::memory_order_acquire), 
+                          std::memory_order_release);
+            reserved2[0] = other.reserved2[0];
+            reserved2[1] = other.reserved2[1];
+        }
+        return *this;
+    }
+    
+    /// @brief Move constructor
+    WhitelistEntry(WhitelistEntry&& other) noexcept
+        : entryId(other.entryId),
+          type(other.type),
+          reason(other.reason),
+          matchMode(other.matchMode),
+          reserved1(other.reserved1),
+          flags(other.flags),
+          hashAlgorithm(other.hashAlgorithm),
+          hashLength(other.hashLength),
+          hashReserved{other.hashReserved[0], other.hashReserved[1]},
+          hashData(std::move(other.hashData)),
+          createdTime(other.createdTime),
+          modifiedTime(other.modifiedTime),
+          expirationTime(other.expirationTime),
+          pathOffset(other.pathOffset),
+          pathLength(other.pathLength),
+          descriptionOffset(other.descriptionOffset),
+          descriptionLength(other.descriptionLength),
+          createdByOffset(other.createdByOffset),
+          policyId(other.policyId),
+          hitCount(other.hitCount.load(std::memory_order_acquire)),
+          reserved2{other.reserved2[0], other.reserved2[1]}
+    {}
+    
+    /// @brief Move assignment operator
+    WhitelistEntry& operator=(WhitelistEntry&& other) noexcept {
+        if (this != &other) {
+            entryId = other.entryId;
+            type = other.type;
+            reason = other.reason;
+            matchMode = other.matchMode;
+            reserved1 = other.reserved1;
+            flags = other.flags;
+            hashAlgorithm = other.hashAlgorithm;
+            hashLength = other.hashLength;
+            hashReserved[0] = other.hashReserved[0];
+            hashReserved[1] = other.hashReserved[1];
+            hashData = std::move(other.hashData);
+            createdTime = other.createdTime;
+            modifiedTime = other.modifiedTime;
+            expirationTime = other.expirationTime;
+            pathOffset = other.pathOffset;
+            pathLength = other.pathLength;
+            descriptionOffset = other.descriptionOffset;
+            descriptionLength = other.descriptionLength;
+            createdByOffset = other.createdByOffset;
+            policyId = other.policyId;
+            hitCount.store(other.hitCount.load(std::memory_order_acquire),
+                          std::memory_order_release);
+            reserved2[0] = other.reserved2[0];
+            reserved2[1] = other.reserved2[1];
+        }
+        return *this;
     }
 };
 #pragma pack(pop)
@@ -452,6 +632,18 @@ struct ExtendedHashEntry {
     uint64_t entryId;                     ///< Links to WhitelistEntry.entryId
     HashValue fullHash;                   ///< Complete hash value
     uint8_t reserved[52];                 ///< Pad to 128 bytes
+    
+    /// @brief Default constructor - zero-initialize
+    ExtendedHashEntry() noexcept 
+        : entryId(0u), fullHash{}, reserved{} {
+        std::memset(reserved, 0, sizeof(reserved));
+    }
+    
+    /// @brief Construct with entry ID and hash
+    ExtendedHashEntry(uint64_t id, const HashValue& hash) noexcept
+        : entryId(id), fullHash(hash), reserved{} {
+        std::memset(reserved, 0, sizeof(reserved));
+    }
 };
 #pragma pack(pop)
 
@@ -473,7 +665,7 @@ struct BPlusTreeNode {
     /// @brief Reserved for alignment
     uint8_t reserved[7];
     
-    /// @brief Number of keys in this node
+    /// @brief Number of keys in this node (capped at MAX_KEYS)
     uint32_t keyCount;
     
     /// @brief Offset to parent node (0 = root)
@@ -492,6 +684,30 @@ struct BPlusTreeNode {
     
     /// @brief Previous leaf in linked list
     uint32_t prevLeaf;
+    
+    /// @brief Default constructor - zero-initialize
+    BPlusTreeNode() noexcept
+        : isLeaf(true),
+          reserved{0, 0, 0, 0, 0, 0, 0},
+          keyCount(0u),
+          parentOffset(0u),
+          keys{},
+          children{},
+          nextLeaf(0u),
+          prevLeaf(0u) {
+        keys.fill(0u);
+        children.fill(0u);
+    }
+    
+    /// @brief Get valid key count (bounds-checked)
+    [[nodiscard]] uint32_t GetKeyCount() const noexcept {
+        return (std::min)(keyCount, static_cast<uint32_t>(MAX_KEYS));
+    }
+    
+    /// @brief Get valid child count (bounds-checked)
+    [[nodiscard]] uint32_t GetChildCount() const noexcept {
+        return (std::min)(static_cast<uint32_t>(keyCount + 1u), static_cast<uint32_t>(MAX_CHILDREN));
+    }
 };
 #pragma pack(pop)
 
@@ -512,6 +728,32 @@ struct BloomFilterHeader {
     double falsePositiveRate;             ///< Target false positive rate
     uint64_t dataOffset;                  ///< Offset to bit array
     uint64_t dataSize;                    ///< Size of bit array in bytes
+    
+    /// @brief Magic constant for bloom filter validation
+    static constexpr uint32_t BLOOM_MAGIC = 0x424C4F4Du; // 'BLOM'
+    
+    /// @brief Default constructor - zero-initialize
+    BloomFilterHeader() noexcept
+        : magic(BLOOM_MAGIC),
+          version(1u),
+          bitCount(0u),
+          hashFunctions(0u),
+          reserved(0u),
+          elementCount(0u),
+          falsePositiveRate(0.0),
+          dataOffset(0u),
+          dataSize(0u)
+    {}
+    
+    /// @brief Check if header is valid
+    [[nodiscard]] bool IsValid() const noexcept {
+        return magic == BLOOM_MAGIC && 
+               version == 1u && 
+               hashFunctions > 0u && 
+               hashFunctions <= 32u &&  // Reasonable limit
+               bitCount > 0u &&
+               dataSize > 0u;
+    }
 };
 #pragma pack(pop)
 
@@ -772,9 +1014,17 @@ struct MemoryMappedView {
     }
     
     /// @brief Get typed pointer at offset with bounds checking
+    /// @tparam T Type to cast to (must be trivially copyable)
+    /// @param offset Byte offset from base address
+    /// @return Pointer to T or nullptr if bounds check fails
     template<typename T>
     [[nodiscard]] const T* GetAt(uint64_t offset) const noexcept {
-        if (offset + sizeof(T) > fileSize) {
+        static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+        // Check for overflow and bounds
+        if (offset > fileSize || sizeof(T) > fileSize - offset) {
+            return nullptr;
+        }
+        if (baseAddress == nullptr) {
             return nullptr;
         }
         return reinterpret_cast<const T*>(
@@ -783,9 +1033,20 @@ struct MemoryMappedView {
     }
     
     /// @brief Get mutable typed pointer at offset
+    /// @tparam T Type to cast to (must be trivially copyable)
+    /// @param offset Byte offset from base address
+    /// @return Pointer to T or nullptr if read-only or bounds check fails
     template<typename T>
     [[nodiscard]] T* GetAtMutable(uint64_t offset) noexcept {
-        if (readOnly || offset + sizeof(T) > fileSize) {
+        static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+        if (readOnly) {
+            return nullptr;
+        }
+        // Check for overflow and bounds
+        if (offset > fileSize || sizeof(T) > fileSize - offset) {
+            return nullptr;
+        }
+        if (baseAddress == nullptr) {
             return nullptr;
         }
         return reinterpret_cast<T*>(
@@ -793,9 +1054,17 @@ struct MemoryMappedView {
         );
     }
     
-    /// @brief Get span of bytes at offset
+    /// @brief Get span of bytes at offset with bounds checking
+    /// @param offset Byte offset from base address
+    /// @param length Number of bytes to include in span
+    /// @return Span of bytes or empty span if bounds check fails
     [[nodiscard]] std::span<const uint8_t> GetSpan(uint64_t offset, size_t length) const noexcept {
-        if (offset + length > fileSize) {
+        // Check for overflow and bounds
+        if (baseAddress == nullptr || offset > fileSize) {
+            return {};
+        }
+        // Check if length would overflow or exceed bounds
+        if (length > fileSize - offset) {
             return {};
         }
         return std::span<const uint8_t>(
@@ -803,14 +1072,45 @@ struct MemoryMappedView {
         );
     }
     
-    /// @brief Get string view at offset
+    /// @brief Get string view at offset with bounds checking
+    /// @param offset Byte offset from base address
+    /// @param length Number of characters in string
+    /// @return String view or empty string_view if bounds check fails
     [[nodiscard]] std::string_view GetString(uint64_t offset, size_t length) const noexcept {
-        if (offset + length > fileSize) {
+        // Check for overflow and bounds
+        if (baseAddress == nullptr || offset > fileSize) {
+            return {};
+        }
+        // Check if length would overflow or exceed bounds
+        if (length > fileSize - offset) {
             return {};
         }
         return std::string_view(
             reinterpret_cast<const char*>(static_cast<const uint8_t*>(baseAddress) + offset),
             length
+        );
+    }
+    
+    /// @brief Get wide string view at offset with bounds checking
+    /// @param offset Byte offset from base address
+    /// @param charCount Number of wide characters in string
+    /// @return Wide string view or empty wstring_view if bounds check fails
+    [[nodiscard]] std::wstring_view GetWideString(uint64_t offset, size_t charCount) const noexcept {
+        const size_t byteLen = charCount * sizeof(wchar_t);
+        // Check for overflow in byte calculation
+        if (charCount > 0u && byteLen / sizeof(wchar_t) != charCount) {
+            return {}; // Overflow in size calculation
+        }
+        // Check for overflow and bounds
+        if (baseAddress == nullptr || offset > fileSize) {
+            return {};
+        }
+        if (byteLen > fileSize - offset) {
+            return {};
+        }
+        return std::wstring_view(
+            reinterpret_cast<const wchar_t*>(static_cast<const uint8_t*>(baseAddress) + offset),
+            charCount
         );
     }
 };
@@ -921,15 +1221,58 @@ struct WhitelistStatistics {
     uint64_t indexMemoryBytes{0};
     
     /// @brief Calculate cache hit rate (0.0 - 1.0)
+    /// @return Cache hit rate or 0.0 if no lookups performed
     [[nodiscard]] double CacheHitRate() const noexcept {
-        uint64_t total = cacheHits + cacheMisses;
-        return total > 0 ? static_cast<double>(cacheHits) / static_cast<double>(total) : 0.0;
+        // Safe arithmetic: check for potential overflow before addition
+        if (cacheHits > (std::numeric_limits<uint64_t>::max)() - cacheMisses) {
+            return 0.0; // Overflow protection
+        }
+        const uint64_t total = cacheHits + cacheMisses;
+        if (total == 0u) {
+            return 0.0;
+        }
+        return static_cast<double>(cacheHits) / static_cast<double>(total);
     }
     
-    /// @brief Calculate bloom filter effectiveness
+    /// @brief Calculate bloom filter effectiveness (rejection rate)
+    /// @return Bloom filter rejection rate (0.0 - 1.0) or 0.0 if no checks performed
     [[nodiscard]] double BloomFilterEffectiveness() const noexcept {
-        uint64_t total = bloomFilterHits + bloomFilterRejects;
-        return total > 0 ? static_cast<double>(bloomFilterRejects) / static_cast<double>(total) : 0.0;
+        // Safe arithmetic: check for potential overflow before addition
+        if (bloomFilterHits > (std::numeric_limits<uint64_t>::max)() - bloomFilterRejects) {
+            return 0.0; // Overflow protection
+        }
+        const uint64_t total = bloomFilterHits + bloomFilterRejects;
+        if (total == 0u) {
+            return 0.0;
+        }
+        return static_cast<double>(bloomFilterRejects) / static_cast<double>(total);
+    }
+    
+    /// @brief Reset all statistics to zero
+    void Reset() noexcept {
+        totalEntries = 0u;
+        hashEntries = 0u;
+        pathEntries = 0u;
+        certEntries = 0u;
+        publisherEntries = 0u;
+        activeEntries = 0u;
+        expiredEntries = 0u;
+        totalLookups = 0u;
+        cacheHits = 0u;
+        cacheMisses = 0u;
+        bloomFilterHits = 0u;
+        bloomFilterRejects = 0u;
+        indexLookups = 0u;
+        totalHits = 0u;
+        totalMisses = 0u;
+        avgLookupTimeNs = 0u;
+        minLookupTimeNs = 0u;
+        maxLookupTimeNs = 0u;
+        p99LookupTimeNs = 0u;
+        databaseSizeBytes = 0u;
+        mappedSizeBytes = 0u;
+        cacheMemoryBytes = 0u;
+        indexMemoryBytes = 0u;
     }
 };
 

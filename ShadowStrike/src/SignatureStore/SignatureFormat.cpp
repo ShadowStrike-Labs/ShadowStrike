@@ -24,6 +24,8 @@
 #include <cstring>
 #include <cwchar>
 #include <charconv>
+#include <cstdint>   // For SIZE_MAX and standard integer limits
+#include <climits>   // For additional platform limits
 
 // Windows crypto API for SHA-256 validation
 #include <windows.h>
@@ -248,11 +250,21 @@ namespace Format {
         for (size_t i = 0; i < sections.size(); ++i) {
             if (sections[i].offset == 0 || sections[i].size == 0) continue;
 
+            // SECURITY: Overflow-safe end calculation for section i
+            // Already validated above in section offset validation loop
             uint64_t end_i = sections[i].offset + sections[i].size;
 
             for (size_t j = i + 1; j < sections.size(); ++j) {
                 if (sections[j].offset == 0 || sections[j].size == 0) continue;
 
+                // SECURITY: Overflow protection for section j end calculation
+                // Check that offset + size doesn't overflow (should be caught earlier, but defense-in-depth)
+                if (sections[j].size > UINT64_MAX - sections[j].offset) {
+                    SS_LOG_ERROR(L"SignatureStore",
+                        L"Section %s: offset + size would overflow",
+                        sections[j].name);
+                    return false;
+                }
                 uint64_t end_j = sections[j].offset + sections[j].size;
 
                 // Check for overlap: [start_i, end_i) overlaps [start_j, end_j)
@@ -377,7 +389,17 @@ inline uint8_t HexCharToValue(char c) noexcept {
 }
 
 // Helper: Convert hex string to bytes
+// SECURITY: All bounds are validated before any memory access
 bool HexStringToBytes(const std::string& hexStr, uint8_t* output, size_t maxLen) noexcept {
+    // SECURITY: Validate output pointer
+    if (output == nullptr || maxLen == 0) {
+        return false;
+    }
+
+    if (hexStr.empty()) {
+        return false; // Empty string - no bytes to parse
+    }
+
     if (hexStr.length() % 2 != 0) {
         return false; // Must be even number of characters
     }
@@ -388,14 +410,25 @@ bool HexStringToBytes(const std::string& hexStr, uint8_t* output, size_t maxLen)
     }
 
     for (size_t i = 0; i < byteCount; ++i) {
-        uint8_t high = HexCharToValue(hexStr[i * 2]);
-        uint8_t low = HexCharToValue(hexStr[i * 2 + 1]);
+        // SECURITY: Bounds check - verify index is valid
+        // i * 2 < hexStr.length() is guaranteed since byteCount = length/2
+        // and i < byteCount
+        size_t highIdx = i * 2;
+        size_t lowIdx = highIdx + 1;
+        
+        // Defense-in-depth: explicit bounds check
+        if (lowIdx >= hexStr.length()) {
+            return false;
+        }
+
+        uint8_t high = HexCharToValue(hexStr[highIdx]);
+        uint8_t low = HexCharToValue(hexStr[lowIdx]);
 
         if (high == 0xFF || low == 0xFF) {
             return false; // Invalid hex character
         }
 
-        output[i] = (high << 4) | low;
+        output[i] = static_cast<uint8_t>((high << 4) | low);
     }
 
     return true;
@@ -530,8 +563,18 @@ std::string FormatHashString(const HashValue& hash) {
      * ========================================================================
      */
 
-    // Validate input
-    if (hash.length == 0 || hash.length > hash.data.size()) {
+    // SECURITY: Validate input with explicit bounds check
+    // Check for zero length first, then validate against container size
+    if (hash.length == 0) {
+        return {};
+    }
+    
+    // SECURITY: Explicit bounds check to prevent buffer over-read
+    // hash.length is uint8_t so max is 255, but validate against actual container
+    if (static_cast<size_t>(hash.length) > hash.data.size()) {
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"FormatHashString: hash.length (%u) exceeds data buffer size (%zu)",
+            static_cast<unsigned>(hash.length), hash.data.size());
         return {};
     }
 
@@ -622,7 +665,17 @@ HANDLE CreateFileMappingForView(HANDLE hFile, bool readOnly, uint64_t size, DWOR
 }
 
 // Helper: Map view of file
+// SECURITY: Validates size fits in SIZE_T before casting
 void* MapViewOfFileForAccess(HANDLE hMapping, bool readOnly, uint64_t size, DWORD& outError) noexcept {
+    // SECURITY: Validate size fits in SIZE_T (critical for 32-bit compatibility)
+    // SIZE_T is size_t which is 32-bit on 32-bit Windows
+    if (size > static_cast<uint64_t>(SIZE_MAX)) {
+        outError = ERROR_ARITHMETIC_OVERFLOW;
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"MapViewOfFileForAccess: size %llu exceeds SIZE_MAX", size);
+        return nullptr;
+    }
+
     DWORD desiredAccess = readOnly ? FILE_MAP_READ : FILE_MAP_WRITE;
 
     void* baseAddress = MapViewOfFile(
@@ -685,6 +738,17 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
         return false;
     }
 
+    // SECURITY: Check for embedded NUL characters (path truncation attack prevention)
+    // A NUL character in the path could cause the string to be truncated
+    // when passed to Windows API, potentially accessing unintended files
+    if (path.find(L'\0') != std::wstring::npos) {
+        error.code = SignatureStoreError::InvalidFormat;
+        error.win32Error = 0;
+        error.message = "Path contains embedded NUL character";
+        SS_LOG_ERROR(L"SignatureStore", L"Security: Path contains embedded NUL character");
+        return false;
+    }
+
     // ========================================================================
     // STEP 2: OPEN FILE WITH RAII
     // ========================================================================
@@ -724,6 +788,17 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
         error.code = SignatureStoreError::TooLarge;
         error.win32Error = 0;
         error.message = "Database file exceeds maximum size";
+        return false;
+    }
+
+    // SECURITY: Validate fileSize fits in SIZE_T before memory mapping
+    // This is critical on 32-bit systems where SIZE_T is 32-bit
+    if (fileSize > static_cast<uint64_t>(SIZE_MAX)) {
+        error.code = SignatureStoreError::TooLarge;
+        error.win32Error = 0;
+        error.message = "File size exceeds addressable memory range";
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"OpenView: fileSize %llu exceeds SIZE_MAX for memory mapping", fileSize);
         return false;
     }
 
@@ -817,6 +892,16 @@ bool FlushView(MemoryMappedView& view, StoreError& error) noexcept {
     if (view.readOnly) {
         error.code = SignatureStoreError::AccessDenied;
         error.message = "Cannot flush read-only view";
+        return false;
+    }
+
+    // SECURITY: Validate fileSize fits in SIZE_T before casting
+    // On 32-bit systems, SIZE_T is 32-bit, so large files would overflow
+    if (view.fileSize > static_cast<uint64_t>(SIZE_MAX)) {
+        error.code = SignatureStoreError::TooLarge;
+        error.message = "File size exceeds addressable range for flush";
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"FlushView: fileSize %llu exceeds SIZE_MAX", view.fileSize);
         return false;
     }
 

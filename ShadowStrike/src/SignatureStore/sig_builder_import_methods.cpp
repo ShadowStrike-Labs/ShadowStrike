@@ -1,4 +1,20 @@
-﻿
+﻿/*
+ * ============================================================================
+ * ShadowStrike SignatureBuilder - IMPORT METHODS IMPLEMENTATION
+ * ============================================================================
+ *
+ * Copyright (c) 2026 ShadowStrike Security Suite
+ * All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL
+ *
+ * High-performance import methods for signature database building.
+ * Supports: Hash files, CSV, JSON, YARA rules, ClamAV, Database merge
+ *
+ * SECURITY: All inputs validated, DoS-protected, bounds-checked
+ *
+ * ============================================================================
+ */
 
 #include "SignatureBuilder.hpp"
 
@@ -7,44 +23,108 @@
 #include <fstream>
 #include <sstream>
 #include <charconv>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 
 namespace ShadowStrike {
 
 namespace SignatureStore {
 
 // ============================================================================
+// COMPILE-TIME CONSTANTS FOR SECURITY & DoS PROTECTION
+// ============================================================================
+namespace {
+
+    // Maximum file sizes for various import formats (DoS protection)
+    constexpr uint64_t MAX_HASH_FILE_SIZE = 500ULL * 1024 * 1024;      // 500MB
+    constexpr uint64_t MAX_CSV_FILE_SIZE = 500ULL * 1024 * 1024;       // 500MB
+    constexpr uint64_t MAX_PATTERN_FILE_SIZE = 500ULL * 1024 * 1024;   // 500MB
+    constexpr uint64_t MAX_YARA_FILE_SIZE = 100ULL * 1024 * 1024;      // 100MB
+    constexpr uint64_t MAX_CLAMAV_FILE_SIZE = 500ULL * 1024 * 1024;    // 500MB
+    constexpr uint64_t MAX_JSON_SIZE = 100ULL * 1024 * 1024;           // 100MB
+    constexpr uint64_t MAX_IMPORT_DB_SIZE = 10ULL * 1024 * 1024 * 1024; // 10GB
+
+    // Line length limits
+    constexpr size_t MAX_LINE_LENGTH = 10000;
+    constexpr size_t MAX_CSV_LINE_LENGTH = 50000;
+    constexpr size_t MAX_PATTERN_LINE_LENGTH = 100000;
+    constexpr size_t MAX_CLAMAV_LINE_LENGTH = 50000;
+
+    // Field length limits
+    constexpr size_t MAX_NAME_LENGTH = 256;
+    constexpr size_t MAX_DESCRIPTION_LENGTH = 4096;
+    constexpr size_t MAX_FIELD_LENGTH = 10000;
+    constexpr size_t MAX_NAMESPACE_LENGTH = 128;
+
+    // Batch processing sizes
+    constexpr size_t HASH_BATCH_SIZE = 1000;
+    constexpr size_t CSV_BATCH_SIZE = 500;
+    constexpr size_t PATTERN_BATCH_SIZE = 500;
+    constexpr size_t CLAMAV_BATCH_SIZE = 500;
+
+    // Timeout limits (milliseconds)
+    constexpr uint64_t IMPORT_TIMEOUT_MS = 300000;        // 5 minutes
+    constexpr uint64_t DIRECTORY_IMPORT_TIMEOUT_MS = 600000; // 10 minutes
+    constexpr uint64_t DATABASE_IMPORT_TIMEOUT_MS = 600000;  // 10 minutes
+
+    // Other limits
+    constexpr size_t MAX_COLUMN_COUNT = 10;
+    constexpr size_t MAX_TAGS_COUNT = 32;
+    constexpr size_t MAX_TAG_LENGTH = 64;
+
+    // Default performance frequency fallback (prevents division by zero)
+    constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000;
+
+} // anonymous namespace
+
+// ============================================================================
 // RAII HANDLE WRAPPER FOR EXCEPTION SAFETY
 // ============================================================================
 namespace {
-    // RAII wrapper for Windows HANDLE - prevents resource leaks on exceptions
+
+    /**
+     * RAII wrapper for Windows HANDLE - prevents resource leaks on exceptions.
+     * Thread-safe, exception-safe, move-only semantics.
+     */
     class FileHandleGuard {
     public:
         explicit FileHandleGuard(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+        
         ~FileHandleGuard() noexcept {
-            if (m_handle != INVALID_HANDLE_VALUE) {
-                CloseHandle(m_handle);
-            }
+            reset();
         }
         
         // Non-copyable
         FileHandleGuard(const FileHandleGuard&) = delete;
         FileHandleGuard& operator=(const FileHandleGuard&) = delete;
         
-        // Movable
+        // Movable with proper null-safety
         FileHandleGuard(FileHandleGuard&& other) noexcept : m_handle(other.m_handle) {
             other.m_handle = INVALID_HANDLE_VALUE;
         }
+        
         FileHandleGuard& operator=(FileHandleGuard&& other) noexcept {
             if (this != &other) {
-                if (m_handle != INVALID_HANDLE_VALUE) CloseHandle(m_handle);
+                reset();
                 m_handle = other.m_handle;
                 other.m_handle = INVALID_HANDLE_VALUE;
             }
             return *this;
         }
         
+        void reset() noexcept {
+            if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
+                CloseHandle(m_handle);
+                m_handle = INVALID_HANDLE_VALUE;
+            }
+        }
+        
         [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
-        [[nodiscard]] bool isValid() const noexcept { return m_handle != INVALID_HANDLE_VALUE; }
+        [[nodiscard]] bool isValid() const noexcept { 
+            return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr; 
+        }
+        
         HANDLE release() noexcept {
             HANDLE h = m_handle;
             m_handle = INVALID_HANDLE_VALUE;
@@ -55,19 +135,29 @@ namespace {
         HANDLE m_handle;
     };
     
-    // RAII wrapper for MemoryMappedView
+    /**
+     * RAII wrapper for MemoryMappedView - automatic cleanup on scope exit.
+     * Non-copyable, non-movable (view addresses shouldn't change).
+     */
     class MappedViewGuard {
     public:
         MappedViewGuard() noexcept = default;
+        
         ~MappedViewGuard() noexcept {
-            if (m_view.IsValid()) {
-                MemoryMapping::CloseView(m_view);
+            try {
+                if (m_view.IsValid()) {
+                    MemoryMapping::CloseView(m_view);
+                }
+            } catch (...) {
+                // Suppress exceptions in destructor - log silently
             }
         }
         
         // Non-copyable, non-movable (view addresses shouldn't change)
         MappedViewGuard(const MappedViewGuard&) = delete;
         MappedViewGuard& operator=(const MappedViewGuard&) = delete;
+        MappedViewGuard(MappedViewGuard&&) = delete;
+        MappedViewGuard& operator=(MappedViewGuard&&) = delete;
         
         [[nodiscard]] MemoryMappedView& get() noexcept { return m_view; }
         [[nodiscard]] const MemoryMappedView& get() const noexcept { return m_view; }
@@ -77,25 +167,108 @@ namespace {
         MemoryMappedView m_view{};
     };
     
-    // Safe string trim that handles empty strings correctly
+    /**
+     * Safe string trim that handles empty strings and edge cases correctly.
+     * Never throws, always leaves string in valid state.
+     */
     inline void safeTrim(std::string& s) noexcept {
         if (s.empty()) return;
         
-        const auto start = s.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) {
+        try {
+            const auto start = s.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) {
+                s.clear();
+                return;
+            }
+            
+            const auto end = s.find_last_not_of(" \t\r\n");
+            
+            // Safety check: ensure end >= start (always true for valid inputs)
+            if (end < start) {
+                s.clear();
+                return;
+            }
+            
+            // Calculate length safely
+            const size_t len = end - start + 1;
+            if (len > s.length()) {
+                // Should never happen, but protect against it
+                s.clear();
+                return;
+            }
+            
+            s = s.substr(start, len);
+        } catch (...) {
+            // If any exception occurs, clear the string as safe fallback
             s.clear();
-            return;
+        }
+    }
+
+    /**
+     * Safe elapsed time calculation with division-by-zero protection.
+     * Returns elapsed milliseconds.
+     */
+    [[nodiscard]] inline uint64_t safeElapsedMs(
+        const LARGE_INTEGER& start,
+        const LARGE_INTEGER& current,
+        const LARGE_INTEGER& frequency
+    ) noexcept {
+        if (frequency.QuadPart <= 0) {
+            return 0;
         }
         
-        const auto end = s.find_last_not_of(" \t\r\n");
-        s = s.substr(start, end - start + 1);
+        // Check for negative elapsed time (clock skew protection)
+        if (current.QuadPart < start.QuadPart) {
+            return 0;
+        }
+        
+        // Overflow-safe calculation
+        const uint64_t elapsed = static_cast<uint64_t>(current.QuadPart - start.QuadPart);
+        const uint64_t freq = static_cast<uint64_t>(frequency.QuadPart);
+        
+        // Check for potential overflow before multiplication
+        if (elapsed > (std::numeric_limits<uint64_t>::max() / 1000ULL)) {
+            // Would overflow - return max reasonable value
+            return std::numeric_limits<uint64_t>::max() / freq;
+        }
+        
+        return (elapsed * 1000ULL) / freq;
     }
+
+    /**
+     * Safe elapsed time calculation in microseconds.
+     */
+    [[nodiscard]] inline uint64_t safeElapsedUs(
+        const LARGE_INTEGER& start,
+        const LARGE_INTEGER& current,
+        const LARGE_INTEGER& frequency
+    ) noexcept {
+        if (frequency.QuadPart <= 0) {
+            return 0;
+        }
+        
+        if (current.QuadPart < start.QuadPart) {
+            return 0;
+        }
+        
+        const uint64_t elapsed = static_cast<uint64_t>(current.QuadPart - start.QuadPart);
+        const uint64_t freq = static_cast<uint64_t>(frequency.QuadPart);
+        
+        // Check for potential overflow
+        if (elapsed > (std::numeric_limits<uint64_t>::max() / 1000000ULL)) {
+            return std::numeric_limits<uint64_t>::max() / freq;
+        }
+        
+        return (elapsed * 1000000ULL) / freq;
+    }
+
 } // anonymous namespace
 
 
  // ============================================================================
 // IMPORT METHODS
 // ============================================================================
+
         StoreError SignatureBuilder::ImportHashesFromFile(const std::wstring& filePath) noexcept {
             SS_LOG_INFO(L"SignatureBuilder", L"ImportHashesFromFile: %s", filePath.c_str());
 
@@ -123,8 +296,7 @@ namespace {
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "File not found or is directory" };
             }
 
-            // Check file size (security limit: 500MB)
-            constexpr uint64_t MAX_FILE_SIZE = 500ULL * 1024 * 1024;
+            // Check file size (security limit)
             FileHandleGuard hFileGuard(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
 
@@ -146,10 +318,10 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty" };
             }
 
-            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_FILE_SIZE) {
+            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_HASH_FILE_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ImportHashesFromFile: File too large (%llu > %llu bytes)",
-                    fileSize.QuadPart, MAX_FILE_SIZE);
+                    static_cast<uint64_t>(fileSize.QuadPart), MAX_HASH_FILE_SIZE);
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File too large (max 500MB)" };
             }
             
@@ -172,27 +344,43 @@ namespace {
             size_t validCount = 0;
             size_t invalidCount = 0;
             std::vector<HashSignatureInput> batchEntries;
-            batchEntries.reserve(10000);
+            
+            try {
+                batchEntries.reserve(10000);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromFile: Memory allocation failed");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+            }
 
-            constexpr size_t MAX_LINE_LENGTH = 10000;     // Prevent extremely long lines
-            constexpr size_t BATCH_SIZE = 1000;           // Process in batches
-
-            LARGE_INTEGER startTime, currentTime;
+            LARGE_INTEGER startTime{}, currentTime{};
             QueryPerformanceCounter(&startTime);
-            constexpr uint64_t TIMEOUT_MS = 300000;       // 5 minute timeout
+
+            // Ensure m_perfFrequency is valid (division-by-zero protection)
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             while (std::getline(file, line)) {
                 lineNum++;
+
+                // Overflow protection for line counter
+                if (lineNum == std::numeric_limits<size_t>::max()) {
+                    SS_LOG_ERROR(L"SignatureBuilder", 
+                        L"ImportHashesFromFile: Line counter overflow");
+                    break;
+                }
 
                 // ====================================================================
                 // TIMEOUT CHECK (Performance monitor)
                 // ====================================================================
                 if (lineNum % 1000 == 0) {
                     QueryPerformanceCounter(&currentTime);
-                    uint64_t elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                        m_perfFrequency.QuadPart;
+                    uint64_t elapsedMs = safeElapsedMs(startTime, currentTime, m_perfFrequency);
 
-                    if (elapsedMs > TIMEOUT_MS) {
+                    if (elapsedMs > IMPORT_TIMEOUT_MS) {
                         SS_LOG_ERROR(L"SignatureBuilder",
                             L"ImportHashesFromFile: Import timeout after %zu lines", lineNum);
                         file.close();
@@ -263,18 +451,29 @@ namespace {
                     continue;
                 }
 
-                batchEntries.push_back(std::move(*hashInput));
-                validCount++;
+                try {
+                    batchEntries.push_back(std::move(*hashInput));
+                    validCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder", 
+                        L"ImportHashesFromFile: Memory allocation failed at line %zu", lineNum);
+                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+                }
 
                 // ====================================================================
                 // BATCH PROCESSING (Performance optimization)
                 // ====================================================================
-                if (batchEntries.size() >= BATCH_SIZE) {
+                if (batchEntries.size() >= HASH_BATCH_SIZE) {
                     for (auto& entry : batchEntries) {
-                        StoreError err = AddHash(entry);
-                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                        try {
+                            StoreError err = AddHash(entry);
+                            if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                                SS_LOG_WARN(L"SignatureBuilder",
+                                    L"ImportHashesFromFile: Failed to add hash: %S", err.message.c_str());
+                            }
+                        } catch (const std::exception& ex) {
                             SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportHashesFromFile: Failed to add hash: %S", err.message.c_str());
+                                L"ImportHashesFromFile: Exception adding hash: %S", ex.what());
                         }
                     }
                     batchEntries.clear();
@@ -286,10 +485,15 @@ namespace {
             // ========================================================================
             if (!batchEntries.empty()) {
                 for (auto& entry : batchEntries) {
-                    StoreError err = AddHash(entry);
-                    if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                    try {
+                        StoreError err = AddHash(entry);
+                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                            SS_LOG_WARN(L"SignatureBuilder",
+                                L"ImportHashesFromFile: Failed to add hash: %S", err.message.c_str());
+                        }
+                    } catch (const std::exception& ex) {
                         SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromFile: Failed to add hash: %S", err.message.c_str());
+                            L"ImportHashesFromFile: Exception adding hash: %S", ex.what());
                     }
                 }
                 batchEntries.clear();
@@ -317,8 +521,7 @@ namespace {
             }
 
             QueryPerformanceCounter(&currentTime);
-            uint64_t elapsedUs = ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            uint64_t elapsedUs = safeElapsedUs(startTime, currentTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportHashesFromFile: Complete - %zu valid, %zu invalid from %zu lines in %llu µs",
@@ -355,11 +558,18 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path too long" };
             }
 
-            // Validate delimiter
+            // Validate delimiter (must be printable ASCII, not alphanumeric)
             if (delimiter < 32 || delimiter > 126) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ImportHashesFromCsv: Invalid delimiter character (%d)", static_cast<int>(delimiter));
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid delimiter" };
+            }
+
+            // Prevent dangerous delimiters that could cause parsing issues
+            if (delimiter == '"' || delimiter == '\'' || delimiter == '\\') {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ImportHashesFromCsv: Unsafe delimiter character (%c)", delimiter);
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Unsafe delimiter character" };
             }
 
             // ========================================================================
@@ -386,11 +596,16 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, err, "Cannot get file size" };
             }
 
-            constexpr uint64_t MAX_CSV_SIZE = 500ULL * 1024 * 1024;
-            if (fileSize.QuadPart == 0 || static_cast<uint64_t>(fileSize.QuadPart) > MAX_CSV_SIZE) {
+            if (fileSize.QuadPart == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromCsv: File is empty");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty" };
+            }
+
+            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_CSV_FILE_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromCsv: Invalid file size (%llu)", fileSize.QuadPart);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty or too large" };
+                    L"ImportHashesFromCsv: File too large (%llu bytes)", 
+                    static_cast<uint64_t>(fileSize.QuadPart));
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File too large" };
             }
             // FileHandleGuard auto-closes handle on scope exit
 
@@ -411,28 +626,42 @@ namespace {
             size_t validCount = 0;
             size_t invalidCount = 0;
             std::vector<HashSignatureInput> batchEntries;
-            batchEntries.reserve(5000);
+            
+            try {
+                batchEntries.reserve(5000);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromCsv: Memory allocation failed");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+            }
 
-            constexpr size_t MAX_COLUMN_COUNT = 10;        // CSV should have reasonable # columns
-            constexpr size_t MAX_FIELD_LENGTH = 10000;
-            constexpr size_t BATCH_SIZE = 500;
-
-            LARGE_INTEGER startTime, currentTime;
+            LARGE_INTEGER startTime{}, currentTime{};
             QueryPerformanceCounter(&startTime);
-            constexpr uint64_t TIMEOUT_MS = 300000;
+
+            // Ensure m_perfFrequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             while (std::getline(file, line)) {
                 lineNum++;
+
+                // Overflow protection
+                if (lineNum == std::numeric_limits<size_t>::max()) {
+                    SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromCsv: Line counter overflow");
+                    break;
+                }
 
                 // ====================================================================
                 // TIMEOUT CHECK
                 // ====================================================================
                 if (lineNum % 500 == 0) {
                     QueryPerformanceCounter(&currentTime);
-                    uint64_t elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                        m_perfFrequency.QuadPart;
+                    uint64_t elapsedMs = safeElapsedMs(startTime, currentTime, m_perfFrequency);
 
-                    if (elapsedMs > TIMEOUT_MS) {
+                    if (elapsedMs > IMPORT_TIMEOUT_MS) {
                         SS_LOG_ERROR(L"SignatureBuilder",
                             L"ImportHashesFromCsv: Import timeout after %zu lines", lineNum);
                         file.close();
@@ -452,7 +681,7 @@ namespace {
                     continue;
                 }
 
-                if (line.length() > 50000) {  // CSV lines should be reasonable length
+                if (line.length() > MAX_CSV_LINE_LENGTH) {
                     SS_LOG_WARN(L"SignatureBuilder",
                         L"ImportHashesFromCsv: Line %zu too long (%zu bytes)",
                         lineNum, line.length());
@@ -567,20 +796,28 @@ namespace {
                 }
 
                 // ====================================================================
-                // PARSE THREAT LEVEL
+                // PARSE THREAT LEVEL (safer parsing)
                 // ====================================================================
-                char* endptr = nullptr;
-                long levelLong = std::strtol(levelStr.c_str(), &endptr, 10);
+                int threatLevelInt = 50;  // Default to medium
+                
+                if (!levelStr.empty()) {
+                    char* endptr = nullptr;
+                    errno = 0;  // Reset errno before strtol
+                    long levelLong = std::strtol(levelStr.c_str(), &endptr, 10);
 
-                if (endptr == levelStr.c_str() || levelLong < 0 || levelLong > 100) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportHashesFromCsv: Line %zu invalid threat level: %S",
-                        lineNum, levelStr.c_str());
-                    invalidCount++;
-                    continue;
+                    // Validate parsing result
+                    if (endptr == levelStr.c_str() || errno == ERANGE || 
+                        levelLong < 0 || levelLong > 100) {
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"ImportHashesFromCsv: Line %zu invalid threat level: %S",
+                            lineNum, levelStr.c_str());
+                        invalidCount++;
+                        continue;
+                    }
+                    threatLevelInt = static_cast<int>(levelLong);
                 }
 
-                ThreatLevel level = static_cast<ThreatLevel>(levelLong);
+                ThreatLevel level = static_cast<ThreatLevel>(std::clamp(threatLevelInt, 0, 100));
 
                 // ====================================================================
                 // CREATE SIGNATURE INPUT
@@ -589,20 +826,36 @@ namespace {
                 input.hash = *hash;
                 input.name = nameStr;
                 input.threatLevel = level;
-                input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+                
+                try {
+                    input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+                } catch (...) {
+                    input.source = "csv_import";
+                }
 
-                batchEntries.push_back(std::move(input));
-                validCount++;
+                try {
+                    batchEntries.push_back(std::move(input));
+                    validCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder", 
+                        L"ImportHashesFromCsv: Memory allocation failed at line %zu", lineNum);
+                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+                }
 
                 // ====================================================================
                 // BATCH PROCESSING
                 // ====================================================================
-                if (batchEntries.size() >= BATCH_SIZE) {
+                if (batchEntries.size() >= CSV_BATCH_SIZE) {
                     for (auto& entry : batchEntries) {
-                        StoreError err = AddHash(entry);
-                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                        try {
+                            StoreError err = AddHash(entry);
+                            if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                                SS_LOG_WARN(L"SignatureBuilder",
+                                    L"ImportHashesFromCsv: Failed to add hash: %S", err.message.c_str());
+                            }
+                        } catch (const std::exception& ex) {
                             SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportHashesFromCsv: Failed to add hash: %S", err.message.c_str());
+                                L"ImportHashesFromCsv: Exception adding hash: %S", ex.what());
                         }
                     }
                     batchEntries.clear();
@@ -614,12 +867,18 @@ namespace {
             // ========================================================================
             if (!batchEntries.empty()) {
                 for (auto& entry : batchEntries) {
-                    StoreError err = AddHash(entry);
-                    if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                    try {
+                        StoreError err = AddHash(entry);
+                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                            SS_LOG_WARN(L"SignatureBuilder",
+                                L"ImportHashesFromCsv: Failed to add hash: %S", err.message.c_str());
+                        }
+                    } catch (const std::exception& ex) {
                         SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromCsv: Failed to add hash: %S", err.message.c_str());
+                            L"ImportHashesFromCsv: Exception adding hash: %S", ex.what());
                     }
                 }
+                batchEntries.clear();
             }
 
             // ========================================================================
@@ -644,8 +903,7 @@ namespace {
             }
 
             QueryPerformanceCounter(&currentTime);
-            uint64_t elapsedUs = ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            uint64_t elapsedUs = safeElapsedUs(startTime, currentTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportHashesFromCsv: Complete - %zu valid, %zu invalid from %zu lines in %llu µs",
@@ -701,11 +959,16 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, err, "Cannot get file size" };
             }
 
-            constexpr uint64_t MAX_PATTERN_FILE_SIZE = 500ULL * 1024 * 1024;
-            if (fileSize.QuadPart == 0 || static_cast<uint64_t>(fileSize.QuadPart) > MAX_PATTERN_FILE_SIZE) {
+            if (fileSize.QuadPart == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromFile: File is empty");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty" };
+            }
+
+            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_PATTERN_FILE_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromFile: Invalid file size (%llu)", fileSize.QuadPart);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty or too large" };
+                    L"ImportPatternsFromFile: File too large (%llu bytes)", 
+                    static_cast<uint64_t>(fileSize.QuadPart));
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File too large" };
             }
             // FileHandleGuard auto-closes handle on scope exit
 
@@ -726,27 +989,42 @@ namespace {
             size_t validCount = 0;
             size_t invalidCount = 0;
             std::vector<PatternSignatureInput> batchEntries;
-            batchEntries.reserve(5000);
+            
+            try {
+                batchEntries.reserve(5000);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromFile: Memory allocation failed");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+            }
 
-            constexpr size_t MAX_PATTERN_LINE_LENGTH = 100000;
-            constexpr size_t BATCH_SIZE = 500;
-
-            LARGE_INTEGER startTime, currentTime;
+            LARGE_INTEGER startTime{}, currentTime{};
             QueryPerformanceCounter(&startTime);
-            constexpr uint64_t TIMEOUT_MS = 300000;
+
+            // Ensure m_perfFrequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             while (std::getline(file, line)) {
                 lineNum++;
+
+                // Overflow protection
+                if (lineNum == std::numeric_limits<size_t>::max()) {
+                    SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromFile: Line counter overflow");
+                    break;
+                }
 
                 // ====================================================================
                 // TIMEOUT CHECK
                 // ====================================================================
                 if (lineNum % 500 == 0) {
                     QueryPerformanceCounter(&currentTime);
-                    uint64_t elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                        m_perfFrequency.QuadPart;
+                    uint64_t elapsedMs = safeElapsedMs(startTime, currentTime, m_perfFrequency);
 
-                    if (elapsedMs > TIMEOUT_MS) {
+                    if (elapsedMs > IMPORT_TIMEOUT_MS) {
                         SS_LOG_ERROR(L"SignatureBuilder",
                             L"ImportPatternsFromFile: Import timeout after %zu lines", lineNum);
                         file.close();
@@ -824,19 +1102,35 @@ namespace {
                     continue;
                 }
 
-                patternInput->source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
-                batchEntries.push_back(std::move(*patternInput));
-                validCount++;
+                try {
+                    patternInput->source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+                } catch (...) {
+                    patternInput->source = "pattern_file_import";
+                }
+
+                try {
+                    batchEntries.push_back(std::move(*patternInput));
+                    validCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder", 
+                        L"ImportPatternsFromFile: Memory allocation failed at line %zu", lineNum);
+                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+                }
 
                 // ====================================================================
                 // BATCH PROCESSING
                 // ====================================================================
-                if (batchEntries.size() >= BATCH_SIZE) {
+                if (batchEntries.size() >= PATTERN_BATCH_SIZE) {
                     for (auto& entry : batchEntries) {
-                        StoreError err = AddPattern(entry);
-                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                        try {
+                            StoreError err = AddPattern(entry);
+                            if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                                SS_LOG_WARN(L"SignatureBuilder",
+                                    L"ImportPatternsFromFile: Failed to add pattern: %S", err.message.c_str());
+                            }
+                        } catch (const std::exception& ex) {
                             SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportPatternsFromFile: Failed to add pattern: %S", err.message.c_str());
+                                L"ImportPatternsFromFile: Exception adding pattern: %S", ex.what());
                         }
                     }
                     batchEntries.clear();
@@ -848,12 +1142,18 @@ namespace {
             // ========================================================================
             if (!batchEntries.empty()) {
                 for (auto& entry : batchEntries) {
-                    StoreError err = AddPattern(entry);
-                    if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                    try {
+                        StoreError err = AddPattern(entry);
+                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                            SS_LOG_WARN(L"SignatureBuilder",
+                                L"ImportPatternsFromFile: Failed to add pattern: %S", err.message.c_str());
+                        }
+                    } catch (const std::exception& ex) {
                         SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportPatternsFromFile: Failed to add pattern: %S", err.message.c_str());
+                            L"ImportPatternsFromFile: Exception adding pattern: %S", ex.what());
                     }
                 }
+                batchEntries.clear();
             }
 
             // ========================================================================
@@ -878,8 +1178,7 @@ namespace {
             }
 
             QueryPerformanceCounter(&currentTime);
-            uint64_t elapsedUs = ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            uint64_t elapsedUs = safeElapsedUs(startTime, currentTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportPatternsFromFile: Complete - %zu valid, %zu invalid from %zu lines in %llu µs",
@@ -917,12 +1216,20 @@ namespace {
             }
 
             // Validate namespace
-            constexpr size_t MAX_NAMESPACE_LEN = 128;
-            if (namespace_.empty() || namespace_.length() > MAX_NAMESPACE_LEN) {
+            if (namespace_.empty() || namespace_.length() > MAX_NAMESPACE_LENGTH) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ImportYaraRulesFromFile: Invalid namespace length (%zu)",
                     namespace_.length());
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid namespace" };
+            }
+
+            // Validate namespace contains only safe characters
+            for (char c : namespace_) {
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"ImportYaraRulesFromFile: Namespace contains invalid character: %c", c);
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0, "Namespace contains invalid characters" };
+                }
             }
 
             // ========================================================================
@@ -951,12 +1258,16 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, err, "Cannot get file size" };
             }
 
-            constexpr uint64_t MAX_YARA_FILE_SIZE = 100ULL * 1024 * 1024;  // 100MB
-            if (fileSize.QuadPart == 0 || static_cast<uint64_t>(fileSize.QuadPart) > MAX_YARA_FILE_SIZE) {
+            if (fileSize.QuadPart == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportYaraRulesFromFile: File is empty");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty" };
+            }
+
+            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_YARA_FILE_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportYaraRulesFromFile: Invalid file size (%llu)",
-                    fileSize.QuadPart);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty or too large (max 100MB)" };
+                    L"ImportYaraRulesFromFile: File too large (%llu bytes)",
+                    static_cast<uint64_t>(fileSize.QuadPart));
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File too large (max 100MB)" };
             }
             // FileHandleGuard auto-closes handle on scope exit
 
@@ -970,11 +1281,16 @@ namespace {
             }
 
             std::string ruleSource;
-            ruleSource.reserve(static_cast<size_t>(fileSize.QuadPart));
-
+            
             try {
+                ruleSource.reserve(static_cast<size_t>(fileSize.QuadPart));
                 ruleSource.assign((std::istreambuf_iterator<char>(file)),
                     std::istreambuf_iterator<char>());
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ImportYaraRulesFromFile: Memory allocation failed");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
             }
             catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"SignatureBuilder",
@@ -987,7 +1303,7 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, 0, "File stream error" };
             }
 
-            file.close();
+            file.close();;
 
             // ========================================================================
             // STEP 4: VALIDATE CONTENT
@@ -1031,13 +1347,28 @@ namespace {
             // STEP 6: EXTRACT RULE COUNT (FOR STATISTICS)
             // ========================================================================
             size_t ruleCount = 0;
-            size_t pos = 0;
-            while ((pos = ruleSource.find("rule ", pos)) != std::string::npos) {
+            size_t searchPos = 0;
+            
+            // Safe rule counting with bounds protection
+            while (searchPos < ruleSource.length() && 
+                   (searchPos = ruleSource.find("rule ", searchPos)) != std::string::npos) {
                 // Verify this is actually a rule declaration (preceded by whitespace or start of string)
-                if (pos == 0 || std::isspace(ruleSource[pos - 1])) {
+                if (searchPos == 0 || std::isspace(static_cast<unsigned char>(ruleSource[searchPos - 1]))) {
                     ruleCount++;
+                    
+                    // Prevent overflow
+                    if (ruleCount == std::numeric_limits<size_t>::max()) {
+                        SS_LOG_WARN(L"SignatureBuilder", 
+                            L"ImportYaraRulesFromFile: Rule count overflow protection");
+                        break;
+                    }
                 }
-                pos += 5;
+                
+                // Safe advancement with overflow protection
+                if (searchPos > ruleSource.length() - 5) {
+                    break;
+                }
+                searchPos += 5;
             }
 
             if (ruleCount == 0) {
@@ -1050,19 +1381,31 @@ namespace {
             // ========================================================================
             // STEP 7: CREATE INPUT & ADD RULE
             // ========================================================================
-            LARGE_INTEGER startTime, endTime;
+            LARGE_INTEGER startTime{}, endTime{};
             QueryPerformanceCounter(&startTime);
 
+            // Ensure m_perfFrequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
+
             YaraRuleInput input{};
-            input.ruleSource = ruleSource;
+            input.ruleSource = std::move(ruleSource);
             input.namespace_ = namespace_;
-            input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+            
+            try {
+                input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+            } catch (...) {
+                input.source = "yara_file_import";
+            }
 
             StoreError addErr = AddYaraRule(input);
 
             QueryPerformanceCounter(&endTime);
-            uint64_t importTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            uint64_t importTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             // ========================================================================
             // STEP 8: LOGGING & REPORTING
@@ -1076,7 +1419,7 @@ namespace {
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportYaraRulesFromFile: Complete - %zu rules imported from %zu bytes in %llu µs",
-                ruleCount, ruleSource.size(), importTimeUs);
+                ruleCount, input.ruleSource.size(), importTimeUs);
 
             return StoreError{ SignatureStoreError::Success };
         }
@@ -1104,10 +1447,18 @@ namespace {
             }
 
             // Validate namespace
-            constexpr size_t MAX_NAMESPACE_LEN = 128;
-            if (namespace_.empty() || namespace_.length() > MAX_NAMESPACE_LEN) {
+            if (namespace_.empty() || namespace_.length() > MAX_NAMESPACE_LENGTH) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportYaraRulesFromDirectory: Invalid namespace");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid namespace" };
+            }
+
+            // Validate namespace contains only safe characters
+            for (char c : namespace_) {
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"ImportYaraRulesFromDirectory: Namespace contains invalid character");
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0, "Namespace contains invalid characters" };
+                }
             }
 
             // ========================================================================
@@ -1124,7 +1475,15 @@ namespace {
             // ========================================================================
             // STEP 3: FIND ALL YARA FILES
             // ========================================================================
-            auto yaraFiles = YaraUtils::FindYaraFiles(directoryPath, true);
+            std::vector<std::wstring> yaraFiles;
+            
+            try {
+                yaraFiles = YaraUtils::FindYaraFiles(directoryPath, true);
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ImportYaraRulesFromDirectory: Exception finding YARA files: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0, "Failed to enumerate directory" };
+            }
 
             if (yaraFiles.empty()) {
                 SS_LOG_WARN(L"SignatureBuilder",
@@ -1140,15 +1499,26 @@ namespace {
             // ========================================================================
             // STEP 4: IMPORT EACH FILE
             // ========================================================================
-            LARGE_INTEGER startTime, currentTime;
+            LARGE_INTEGER startTime{}, currentTime{};
             QueryPerformanceCounter(&startTime);
+
+            // Ensure m_perfFrequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             size_t successCount = 0;
             size_t failureCount = 0;
             std::vector<std::wstring> failedFiles;
-            failedFiles.reserve(10);
-
-            constexpr uint64_t TIMEOUT_MS = 600000;  // 10 minute timeout for directory import
+            
+            try {
+                failedFiles.reserve(std::min(yaraFiles.size(), size_t{100}));
+            } catch (...) {
+                // Non-critical, continue without reservation
+            }
 
             for (size_t i = 0; i < yaraFiles.size(); ++i) {
                 const auto& filePath = yaraFiles[i];
@@ -1158,10 +1528,9 @@ namespace {
                 // ====================================================================
                 if (i % 10 == 0) {
                     QueryPerformanceCounter(&currentTime);
-                    uint64_t elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                        m_perfFrequency.QuadPart;
+                    uint64_t elapsedMs = safeElapsedMs(startTime, currentTime, m_perfFrequency);
 
-                    if (elapsedMs > TIMEOUT_MS) {
+                    if (elapsedMs > DIRECTORY_IMPORT_TIMEOUT_MS) {
                         SS_LOG_ERROR(L"SignatureBuilder",
                             L"ImportYaraRulesFromDirectory: Import timeout after %zu files",
                             i);
@@ -1179,7 +1548,13 @@ namespace {
                         L"ImportYaraRulesFromDirectory: Invalid file path (%zu/%zu)",
                         i + 1, yaraFiles.size());
                     failureCount++;
-                    failedFiles.push_back(L"<invalid path>");
+                    
+                    try {
+                        if (failedFiles.size() < 100) {
+                            failedFiles.push_back(L"<invalid path>");
+                        }
+                    } catch (...) {}
+                    
                     continue;
                 }
 
@@ -1190,19 +1565,30 @@ namespace {
                     L"ImportYaraRulesFromDirectory: Importing file %zu/%zu: %s",
                     i + 1, yaraFiles.size(), filePath.c_str());
 
-                StoreError err = ImportYaraRulesFromFile(filePath, namespace_);
+                try {
+                    StoreError err = ImportYaraRulesFromFile(filePath, namespace_);
 
-                if (err.IsSuccess()) {
-                    successCount++;
-                    SS_LOG_DEBUG(L"SignatureBuilder", L"  -> Success");
-                }
-                else {
+                    if (err.IsSuccess()) {
+                        successCount++;
+                        SS_LOG_DEBUG(L"SignatureBuilder", L"  -> Success");
+                    }
+                    else {
+                        failureCount++;
+                        
+                        try {
+                            if (failedFiles.size() < 100) {
+                                failedFiles.push_back(filePath);
+                            }
+                        } catch (...) {}
+
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"ImportYaraRulesFromDirectory: Failed to import file: %S",
+                            err.message.c_str());
+                    }
+                } catch (const std::exception& ex) {
                     failureCount++;
-                    failedFiles.push_back(filePath);
-
                     SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportYaraRulesFromDirectory: Failed to import file: %S",
-                        err.message.c_str());
+                        L"ImportYaraRulesFromDirectory: Exception importing file: %S", ex.what());
                 }
             }
 
@@ -1210,8 +1596,7 @@ namespace {
             // STEP 5: FINAL REPORTING
             // ========================================================================
             QueryPerformanceCounter(&currentTime);
-            uint64_t totalTimeUs = ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            uint64_t totalTimeUs = safeElapsedUs(startTime, currentTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportYaraRulesFromDirectory: Complete - %zu succeeded, %zu failed from %zu files in %llu µs",
@@ -1238,7 +1623,11 @@ namespace {
             }
 
             if (failureCount > 0) {
-                double successRate = (static_cast<double>(successCount) / yaraFiles.size()) * 100.0;
+                // Safe percentage calculation with overflow protection
+                double successRate = 0.0;
+                if (yaraFiles.size() > 0) {
+                    successRate = (static_cast<double>(successCount) / static_cast<double>(yaraFiles.size())) * 100.0;
+                }
                 return StoreError{ SignatureStoreError::InvalidFormat, 0,
                     "Directory import partial success: " + std::to_string(successCount) + "/" +
                     std::to_string(yaraFiles.size()) + " (" + std::to_string(static_cast<int>(successRate)) + "%)" };
@@ -1262,11 +1651,10 @@ namespace {
             }
 
             // Check size against security limit
-            constexpr size_t MAX_IMPORT_JSON_SIZE = 100ULL * 1024 * 1024; // 100MB
-            if (jsonData.size() > MAX_IMPORT_JSON_SIZE) {
+            if (jsonData.size() > MAX_JSON_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromJson: JSON data too large (%zu > %zu bytes)",
-                    jsonData.size(), MAX_IMPORT_JSON_SIZE);
+                    L"ImportHashesFromJson: JSON data too large (%zu > %llu bytes)",
+                    jsonData.size(), MAX_JSON_SIZE);
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON data exceeds maximum size (100MB)" };
             }
 
@@ -1282,12 +1670,18 @@ namespace {
             parseOpts.allowComments = true;
             parseOpts.maxDepth = 100;  // Hashes don't need deep nesting
 
-            if (!Parse(jsonData, jsonRoot, &jsonErr, parseOpts)) {
+            try {
+                if (!Parse(jsonData, jsonRoot, &jsonErr, parseOpts)) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"ImportHashesFromJson: Parse error at line %zu, column %zu: %S",
+                        jsonErr.line, jsonErr.column, jsonErr.message.c_str());
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                        "JSON parse error: " + jsonErr.message };
+                }
+            } catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromJson: Parse error at line %zu, column %zu: %S",
-                    jsonErr.line, jsonErr.column, jsonErr.message.c_str());
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "JSON parse error: " + jsonErr.message };
+                    L"ImportHashesFromJson: Exception during JSON parsing: %S", ex.what());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON parsing exception" };
             }
 
             // ========================================================================
@@ -1318,7 +1712,13 @@ namespace {
             // ========================================================================
 
             std::vector<HashSignatureInput> validEntries;
-            validEntries.reserve(hashesArray.size());
+            
+            try {
+                validEntries.reserve(std::min(hashesArray.size(), size_t{100000}));
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Memory allocation failed");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+            }
 
             size_t entryIndex = 0;
             size_t validCount = 0;
@@ -1545,22 +1945,34 @@ namespace {
                 L"ImportHashesFromJson: Adding %zu valid entries (invalid: %zu)",
                 validCount, invalidCount);
 
-            LARGE_INTEGER startTime, endTime;
-            QueryPerformanceFrequency(&m_perfFrequency);  // Ensure frequency is available
+            LARGE_INTEGER startTime{}, endTime{};
+            
+            // Ensure frequency is available (safe initialization)
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
+            
             QueryPerformanceCounter(&startTime);
 
             for (const auto& input : validEntries) {
-                StoreError err = AddHash(input);
-                if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                try {
+                    StoreError err = AddHash(input);
+                    if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"ImportHashesFromJson: Failed to add hash %S: %S",
+                            input.name.c_str(), err.message.c_str());
+                    }
+                } catch (const std::exception& ex) {
                     SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportHashesFromJson: Failed to add hash %S: %S",
-                        input.name.c_str(), err.message.c_str());
+                        L"ImportHashesFromJson: Exception adding hash: %S", ex.what());
                 }
             }
 
             QueryPerformanceCounter(&endTime);
-            uint64_t importTimeUs =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+            uint64_t importTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             // ========================================================================
             // STEP 7: FINAL LOGGING AND STATISTICS
@@ -1569,7 +1981,7 @@ namespace {
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportHashesFromJson: Complete - %zu valid entries added in %llu µs (%.2f ms), "
                 L"%zu invalid entries skipped",
-                validCount, importTimeUs, importTimeUs / 1000.0, invalidCount);
+                validCount, importTimeUs, static_cast<double>(importTimeUs) / 1000.0, invalidCount);
 
             // ========================================================================
             // STEP 8: RETURN APPROPRIATE STATUS
@@ -1627,12 +2039,16 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, err, "Cannot get file size" };
             }
 
-            constexpr uint64_t MAX_CLAMAV_FILE_SIZE = 500ULL * 1024 * 1024;
-            if (fileSize.QuadPart == 0 || static_cast<uint64_t>(fileSize.QuadPart) > MAX_CLAMAV_FILE_SIZE) {
+            if (fileSize.QuadPart == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: File is empty");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty" };
+            }
+
+            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_CLAMAV_FILE_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromClamAV: Invalid file size (%llu)",
-                    fileSize.QuadPart);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty or too large" };
+                    L"ImportPatternsFromClamAV: File too large (%llu bytes)",
+                    static_cast<uint64_t>(fileSize.QuadPart));
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File too large" };
             }
             // FileHandleGuard auto-closes handle on scope exit
 
@@ -1654,27 +2070,42 @@ namespace {
             size_t validCount = 0;
             size_t invalidCount = 0;
             std::vector<PatternSignatureInput> batchEntries;
-            batchEntries.reserve(5000);
+            
+            try {
+                batchEntries.reserve(5000);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Memory allocation failed");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+            }
 
-            constexpr size_t MAX_CLAMAV_LINE_LENGTH = 50000;
-            constexpr size_t BATCH_SIZE = 500;
-
-            LARGE_INTEGER startTime, currentTime;
+            LARGE_INTEGER startTime{}, currentTime{};
             QueryPerformanceCounter(&startTime);
-            constexpr uint64_t TIMEOUT_MS = 300000;
+
+            // Ensure m_perfFrequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             while (std::getline(file, line)) {
                 lineNum++;
+
+                // Overflow protection
+                if (lineNum == std::numeric_limits<size_t>::max()) {
+                    SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Line counter overflow");
+                    break;
+                }
 
                 // ====================================================================
                 // TIMEOUT CHECK
                 // ====================================================================
                 if (lineNum % 500 == 0) {
                     QueryPerformanceCounter(&currentTime);
-                    uint64_t elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                        m_perfFrequency.QuadPart;
+                    uint64_t elapsedMs = safeElapsedMs(startTime, currentTime, m_perfFrequency);
 
-                    if (elapsedMs > TIMEOUT_MS) {
+                    if (elapsedMs > IMPORT_TIMEOUT_MS) {
                         SS_LOG_ERROR(L"SignatureBuilder",
                             L"ImportPatternsFromClamAV: Import timeout after %zu lines", lineNum);
                         file.close();
@@ -1790,21 +2221,37 @@ namespace {
                 input.patternString = hexSignature;
                 input.threatLevel = ThreatLevel::High;
                 input.description = "ClamAV signature (target: " + targetType + ", offset: " + offsetStr + ")";
-                input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+                
+                try {
+                    input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+                } catch (...) {
+                    input.source = "clamav_import";
+                }
 
-                batchEntries.push_back(std::move(input));
-                validCount++;
+                try {
+                    batchEntries.push_back(std::move(input));
+                    validCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder", 
+                        L"ImportPatternsFromClamAV: Memory allocation failed at line %zu", lineNum);
+                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+                }
 
                 // ====================================================================
                 // BATCH PROCESSING
                 // ====================================================================
-                if (batchEntries.size() >= BATCH_SIZE) {
+                if (batchEntries.size() >= CLAMAV_BATCH_SIZE) {
                     for (auto& entry : batchEntries) {
-                        StoreError err = AddPattern(entry);
-                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                        try {
+                            StoreError err = AddPattern(entry);
+                            if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                                SS_LOG_WARN(L"SignatureBuilder",
+                                    L"ImportPatternsFromClamAV: Failed to add pattern: %S",
+                                    err.message.c_str());
+                            }
+                        } catch (const std::exception& ex) {
                             SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportPatternsFromClamAV: Failed to add pattern: %S",
-                                err.message.c_str());
+                                L"ImportPatternsFromClamAV: Exception adding pattern: %S", ex.what());
                         }
                     }
                     batchEntries.clear();
@@ -1816,13 +2263,19 @@ namespace {
             // ========================================================================
             if (!batchEntries.empty()) {
                 for (auto& entry : batchEntries) {
-                    StoreError err = AddPattern(entry);
-                    if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                    try {
+                        StoreError err = AddPattern(entry);
+                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                            SS_LOG_WARN(L"SignatureBuilder",
+                                L"ImportPatternsFromClamAV: Failed to add pattern: %S",
+                                err.message.c_str());
+                        }
+                    } catch (const std::exception& ex) {
                         SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportPatternsFromClamAV: Failed to add pattern: %S",
-                            err.message.c_str());
+                            L"ImportPatternsFromClamAV: Exception adding pattern: %S", ex.what());
                     }
                 }
+                batchEntries.clear();
             }
 
             // ========================================================================
@@ -1847,8 +2300,7 @@ namespace {
             }
 
             QueryPerformanceCounter(&currentTime);
-            uint64_t elapsedUs = ((currentTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            uint64_t elapsedUs = safeElapsedUs(startTime, currentTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ImportPatternsFromClamAV: Complete - %zu valid, %zu invalid from %zu lines in %llu µs",
@@ -1863,7 +2315,7 @@ namespace {
             return StoreError{ SignatureStoreError::Success };
         }
         // ============================================================================
-        // PRODUCTION-GRADE YARA RULES IMPORT FROM SOURCE DATABASE - COMPLETE IMPLEMENTATION
+        // PRODUCTION-GRADE DATABASE IMPORT - COMPLETE IMPLEMENTATION
         // ============================================================================
 
         StoreError SignatureBuilder::ImportFromDatabase(
@@ -1914,7 +2366,6 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, lastError, "Cannot determine file size" };
             }
 
-            constexpr uint64_t MAX_IMPORT_DB_SIZE = 10ULL * 1024 * 1024 * 1024;
             if (fileSize.QuadPart == 0) {
                 SS_LOG_WARN(L"SignatureBuilder", L"ImportFromDatabase: Source database is empty");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Source database is empty" };
@@ -1940,14 +2391,26 @@ namespace {
             StoreError openErr{};
             MappedViewGuard viewGuard{};  // RAII wrapper for auto-cleanup
 
-            if (!MemoryMapping::OpenView(databasePath, true, viewGuard.get(), openErr)) {
+            try {
+                if (!MemoryMapping::OpenView(databasePath, true, viewGuard.get(), openErr)) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"ImportFromDatabase: Failed to open database: %S", openErr.message.c_str());
+                    return openErr;
+                }
+            } catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportFromDatabase: Failed to open database: %S", openErr.message.c_str());
-                return openErr;
+                    L"ImportFromDatabase: Exception opening database: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0, "Exception opening database" };
             }
             
             // Alias for cleaner code - viewGuard handles cleanup
             auto& sourceView = viewGuard.get();
+
+            if (!sourceView.IsValid() || sourceView.baseAddress == nullptr) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ImportFromDatabase: Invalid memory mapped view");
+                return StoreError{ SignatureStoreError::Unknown, 0, "Invalid memory mapped view" };
+            }
 
             // ========================================================================
             // STEP 3: VALIDATE DATABASE HEADER
@@ -2564,11 +3027,14 @@ namespace {
             // ========================================================================
             // MappedViewGuard automatically closes sourceView when function returns
 
-            LARGE_INTEGER importEndTime;
+            LARGE_INTEGER importEndTime{};
             QueryPerformanceCounter(&importEndTime);
 
-            uint64_t totalImportTimeUs = ((importEndTime.QuadPart - importStartTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            // Safe elapsed time calculation with division-by-zero protection
+            uint64_t totalImportTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0) {
+                totalImportTimeUs = safeElapsedUs(importStartTime, importEndTime, m_perfFrequency);
+            }
 
             // ========================================================================
             // STEP 9: COMPREHENSIVE FINAL LOGGING & REPORTING
@@ -2583,7 +3049,7 @@ namespace {
             SS_LOG_INFO(L"SignatureBuilder",
                 L"Source Database Size: %llu bytes (%.2f MB)",
                 static_cast<uint64_t>(fileSize.QuadPart),
-                static_cast<double>(fileSize.QuadPart) / (1024 * 1024));
+                static_cast<double>(fileSize.QuadPart) / (1024.0 * 1024.0));
             SS_LOG_INFO(L"SignatureBuilder",
                 L"════════════════════════════════════════════════════════════════");
             SS_LOG_INFO(L"SignatureBuilder",
@@ -2641,8 +3107,19 @@ namespace {
             // ========================================================================
 
             size_t totalImported = hashesImported + patternsImported + yaraImported;
-            size_t totalExpected = sourceHeader->totalHashes + sourceHeader->totalPatterns +
-                sourceHeader->totalYaraRules;
+            
+            // Safe calculation of expected totals with overflow protection
+            size_t totalExpected = 0;
+            {
+                uint64_t expectedSum = static_cast<uint64_t>(sourceHeader->totalHashes) +
+                                      static_cast<uint64_t>(sourceHeader->totalPatterns) +
+                                      static_cast<uint64_t>(sourceHeader->totalYaraRules);
+                
+                // Clamp to SIZE_MAX to prevent overflow
+                totalExpected = (expectedSum > std::numeric_limits<size_t>::max()) 
+                    ? std::numeric_limits<size_t>::max() 
+                    : static_cast<size_t>(expectedSum);
+            }
 
             if (totalImported == 0) {
                 SS_LOG_ERROR(L"SignatureBuilder",
@@ -2651,19 +3128,20 @@ namespace {
                                   "No valid signatures found in source database" };
             }
 
-            if (totalImported < totalExpected / 2) {
+            // Safe division with zero check
+            if (totalExpected > 0 && totalImported < totalExpected / 2) {
+                double pct = (100.0 * static_cast<double>(totalImported) / static_cast<double>(totalExpected));
                 SS_LOG_WARN(L"SignatureBuilder",
-                    L"ImportFromDatabase: PARTIAL SUCCESS - Only %.1f%% of signatures imported",
-                    (100.0 * totalImported / totalExpected));
+                    L"ImportFromDatabase: PARTIAL SUCCESS - Only %.1f%% of signatures imported", pct);
                 return StoreError{ SignatureStoreError::InvalidFormat, 0,
                                   "Database import partially successful: " + std::to_string(totalImported) +
                                   "/" + std::to_string(totalExpected) + " signatures imported" };
             }
 
-            if (totalImported < totalExpected) {
+            if (totalExpected > 0 && totalImported < totalExpected) {
+                double pct = (100.0 * static_cast<double>(totalImported) / static_cast<double>(totalExpected));
                 SS_LOG_WARN(L"SignatureBuilder",
-                    L"ImportFromDatabase: SUCCESS WITH WARNINGS - %.1f%% of signatures imported",
-                    (100.0 * totalImported / totalExpected));
+                    L"ImportFromDatabase: SUCCESS WITH WARNINGS - %.1f%% of signatures imported", pct);
                 return StoreError{ SignatureStoreError::Success,
                                   0,
                                   "Database import completed: " + std::to_string(totalImported) +

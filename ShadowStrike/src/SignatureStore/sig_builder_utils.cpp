@@ -192,7 +192,19 @@ namespace {
             // Alignment must be power of 2
             if ((alignment & (alignment - 1)) != 0) return false;
 
-            m_buffer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
+            // HARDENED: Prevent excessive allocation that could cause memory exhaustion
+            constexpr size_t MAX_ALIGNED_BUFFER_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1GB max
+            if (size > MAX_ALIGNED_BUFFER_SIZE) {
+                return false;
+            }
+
+            // HARDENED: Try-catch around allocation to handle bad_alloc gracefully
+            try {
+                m_buffer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
+            } catch (...) {
+                m_buffer = nullptr;
+            }
+            
             if (m_buffer) {
                 m_size = size;
                 m_alignment = alignment;
@@ -223,30 +235,53 @@ namespace {
 
     // Get disk sector size for aligned I/O
     [[nodiscard]] DWORD GetSectorSize(const std::wstring& filePath) noexcept {
+        // HARDENED: Input validation - empty path should return default
+        if (filePath.empty()) {
+            return 4096;  // Default to 4KB
+        }
+
         // Extract volume root from file path
         std::wstring volumePath;
-        if (filePath.length() >= 2 && filePath[1] == L':') {
-            volumePath = filePath.substr(0, 3);  // "C:\"
-        } else if (filePath.length() >= 2 && filePath[0] == L'\\' && filePath[1] == L'\\') {
-            // UNC path - find server\share
-            size_t thirdSlash = filePath.find(L'\\', 2);
-            if (thirdSlash != std::wstring::npos) {
-                size_t fourthSlash = filePath.find(L'\\', thirdSlash + 1);
-                if (fourthSlash != std::wstring::npos) {
-                    volumePath = filePath.substr(0, fourthSlash + 1);
+        
+        // HARDENED: Use try-catch to handle any std::wstring exceptions
+        try {
+            if (filePath.length() >= 2 && filePath[1] == L':') {
+                // HARDENED: Bounds check before substr
+                if (filePath.length() >= 3) {
+                    volumePath = filePath.substr(0, 3);  // "C:\"
+                } else {
+                    volumePath = filePath.substr(0, 2) + L"\\";  // "C:" -> "C:\"
+                }
+            } else if (filePath.length() >= 2 && filePath[0] == L'\\' && filePath[1] == L'\\') {
+                // UNC path - find server\share
+                size_t thirdSlash = filePath.find(L'\\', 2);
+                if (thirdSlash != std::wstring::npos && thirdSlash + 1 < filePath.length()) {
+                    size_t fourthSlash = filePath.find(L'\\', thirdSlash + 1);
+                    if (fourthSlash != std::wstring::npos) {
+                        volumePath = filePath.substr(0, fourthSlash + 1);
+                    }
                 }
             }
+        } catch (...) {
+            // Any string operation exception - return default
+            return 4096;
         }
 
         if (volumePath.empty()) {
             return 4096;  // Default to 4KB
         }
 
-        DWORD sectorsPerCluster, bytesPerSector, freeClusters, totalClusters;
+        DWORD sectorsPerCluster = 0, bytesPerSector = 0, freeClusters = 0, totalClusters = 0;
         if (GetDiskFreeSpaceW(volumePath.c_str(), &sectorsPerCluster, 
                               &bytesPerSector, &freeClusters, &totalClusters)) {
-            // Return sector size, but ensure minimum 512 bytes
-            return (bytesPerSector >= 512) ? bytesPerSector : 512;
+            // Return sector size, but ensure minimum 512 bytes and maximum 64KB
+            // HARDENED: Cap maximum sector size to prevent unreasonable values
+            constexpr DWORD MAX_SECTOR_SIZE = 64 * 1024;  // 64KB max reasonable sector
+            if (bytesPerSector >= 512 && bytesPerSector <= MAX_SECTOR_SIZE) {
+                return bytesPerSector;
+            }
+            // Fallback for out-of-range values
+            return 4096;
         }
 
         return 4096;  // Default to 4KB on failure
@@ -433,7 +468,10 @@ namespace {
             // ========================================================================
 
             // Use aligned buffer for better I/O performance
+            // HARDENED: Ensure BUFFER_SIZE fits in DWORD for ReadFile
             constexpr size_t BUFFER_SIZE = 4 * 1024 * 1024;  // 4MB chunks
+            static_assert(BUFFER_SIZE <= static_cast<size_t>(MAXDWORD), 
+                "BUFFER_SIZE must fit in DWORD for ReadFile");
             AlignedBuffer buffer;
             
             if (!buffer.Allocate(BUFFER_SIZE, sectorSize)) {
@@ -479,8 +517,17 @@ namespace {
                     LARGE_INTEGER currentTime{};
                     QueryPerformanceCounter(&currentTime);
 
-                    uint64_t elapsedMs = static_cast<uint64_t>(
-                        (currentTime.QuadPart - startTime.QuadPart) * 1000 / perfFreq.QuadPart);
+                    // HARDENED: Division-by-zero protection for performance counter
+                    // HARDENED: Use 64-bit intermediate to prevent overflow on multiplication
+                    uint64_t elapsedMs = 0;
+                    if (perfFreq.QuadPart > 0) {
+                        const int64_t elapsed = currentTime.QuadPart - startTime.QuadPart;
+                        // Divide first to prevent overflow: (elapsed / freq) * 1000
+                        // But we need precision, so use double for intermediate calculation
+                        const double elapsedSec = static_cast<double>(elapsed) / 
+                                                   static_cast<double>(perfFreq.QuadPart);
+                        elapsedMs = static_cast<uint64_t>(elapsedSec * 1000.0);
+                    }
 
                     if (elapsedMs > HASH_TIMEOUT_MS) {
                         SS_LOG_ERROR(L"SignatureBuilder",
@@ -519,6 +566,14 @@ namespace {
             hash.type = type;
             hash.length = expectedLen;
 
+            // HARDENED: Bounds check to prevent buffer overflow
+            if (expectedLen > hash.data.size()) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ComputeFileHash: Expected hash length exceeds buffer capacity (%lu > %zu)",
+                    expectedLen, hash.data.size());
+                return std::nullopt;
+            }
+
             DWORD hashLen = expectedLen;
             if (!CryptGetHashParam(hashGuard.Get(), HP_HASHVAL, hash.data.data(), &hashLen, 0)) {
                 DWORD lastError = GetLastError();
@@ -540,12 +595,23 @@ namespace {
 
             LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
-            uint64_t totalTimeMs = static_cast<uint64_t>(
-                (endTime.QuadPart - startTime.QuadPart) * 1000 / perfFreq.QuadPart);
+            
+            // HARDENED: Division-by-zero protection and overflow-safe calculation
+            uint64_t totalTimeMs = 0;
+            if (perfFreq.QuadPart > 0) {
+                const int64_t elapsed = endTime.QuadPart - startTime.QuadPart;
+                // Use double for intermediate to prevent overflow
+                const double elapsedSec = static_cast<double>(elapsed) / 
+                                           static_cast<double>(perfFreq.QuadPart);
+                totalTimeMs = static_cast<uint64_t>(elapsedSec * 1000.0);
+            }
 
-            double throughputMBps = (totalTimeMs > 0) ?
-                (static_cast<double>(bytesProcessed) / (1024.0 * 1024.0)) / 
-                (static_cast<double>(totalTimeMs) / 1000.0) : 0.0;
+            // HARDENED: Division-by-zero protection for throughput calculation
+            double throughputMBps = 0.0;
+            if (totalTimeMs > 0) {
+                throughputMBps = (static_cast<double>(bytesProcessed) / (1024.0 * 1024.0)) / 
+                                 (static_cast<double>(totalTimeMs) / 1000.0);
+            }
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ComputeFileHash: Complete - file: %s, hash: %S, size: %llu MB, "
@@ -690,11 +756,21 @@ namespace {
 
             if (!buffer.empty()) {
                 // Process in chunks to avoid DWORD overflow for large buffers
+                // HARDENED: Use DWORD-safe chunk size to prevent overflow in CryptHashData
                 constexpr size_t CHUNK_SIZE = 256 * 1024 * 1024;  // 256MB chunks
+                static_assert(CHUNK_SIZE <= static_cast<size_t>(MAXDWORD), 
+                    "CHUNK_SIZE must fit in DWORD for CryptHashData");
                 size_t offset = 0;
 
                 while (offset < buffer.size()) {
                     size_t chunkSize = (std::min)(CHUNK_SIZE, buffer.size() - offset);
+                    
+                    // HARDENED: Double-check chunk size fits in DWORD before cast
+                    if (chunkSize > static_cast<size_t>(MAXDWORD)) {
+                        SS_LOG_ERROR(L"SignatureBuilder",
+                            L"ComputeBufferHash: Chunk size exceeds DWORD max (%zu)", chunkSize);
+                        return std::nullopt;
+                    }
                     
                     if (!CryptHashData(hashGuard.Get(), buffer.data() + offset, 
                                        static_cast<DWORD>(chunkSize), 0)) {
@@ -715,6 +791,14 @@ namespace {
             HashValue hash{};
             hash.type = type;
             hash.length = expectedLen;
+
+            // HARDENED: Bounds check to prevent buffer overflow
+            if (expectedLen > hash.data.size()) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ComputeBufferHash: Expected hash length exceeds buffer capacity (%lu > %zu)",
+                    expectedLen, hash.data.size());
+                return std::nullopt;
+            }
 
             DWORD hashLen = expectedLen;
             if (!CryptGetHashParam(hashGuard.Get(), HP_HASHVAL, hash.data.data(), &hashLen, 0)) {
@@ -796,6 +880,14 @@ namespace {
             // ========================================================================
             // STEP 2: CONSTANT-TIME COMPARISON
             // ========================================================================
+
+            // HARDENED: Bounds check to prevent out-of-bounds array access
+            if (a.length > a.data.size() || b.length > b.data.size()) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"CompareHashes: Hash length exceeds data capacity (a.length: %u, a.capacity: %zu, b.length: %u, b.capacity: %zu)",
+                    a.length, a.data.size(), b.length, b.data.size());
+                return false;
+            }
 
             // Use constant-time comparison to prevent timing attacks
             // This ensures comparison time is independent of where mismatch occurs

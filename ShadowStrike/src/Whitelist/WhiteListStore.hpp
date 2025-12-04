@@ -1202,7 +1202,7 @@ public:
     [[nodiscard]] WhitelistStatistics GetStatistics() const noexcept;
     
     /// @brief Get entry by ID
-    [[nodiscard]] std::optional<WhitelistEntry> GetEntry(uint64_t entryId) const noexcept;
+    [[nodiscard]] std::optional<Whitelist::WhitelistEntry> GetEntry(uint64_t entryId) const noexcept;
     
     /// @brief Get all entries (paginated)
     [[nodiscard]] std::vector<WhitelistEntry> GetEntries(

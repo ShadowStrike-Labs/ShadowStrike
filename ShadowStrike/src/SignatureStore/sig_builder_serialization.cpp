@@ -1,6 +1,8 @@
 #include "SignatureBuilder.hpp"
 
 #include <array>
+#include <ctime>
+#include <limits>
 #include <map>
 #include <memory>
 #include <queue>
@@ -11,6 +13,43 @@ namespace ShadowStrike {
 namespace SignatureStore {
 
     namespace {
+        // ============================================================================
+        // SAFETY CONSTANTS
+        // ============================================================================
+        constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000LL;  // 1MHz fallback
+        
+        // Safe elapsed time calculation helper with division-by-zero protection
+        [[nodiscard]] inline uint64_t safeElapsedUs(
+            const LARGE_INTEGER& start,
+            const LARGE_INTEGER& end,
+            const LARGE_INTEGER& freq) noexcept
+        {
+            if (freq.QuadPart <= 0) {
+                return 0;
+            }
+            int64_t diff = end.QuadPart - start.QuadPart;
+            if (diff < 0) {
+                return 0;  // Timer wrapped or invalid
+            }
+            // Use safe multiplication order to prevent overflow
+            return static_cast<uint64_t>((diff * 1'000'000LL) / freq.QuadPart);
+        }
+
+        [[nodiscard]] inline uint64_t safeElapsedMs(
+            const LARGE_INTEGER& start,
+            const LARGE_INTEGER& end,
+            const LARGE_INTEGER& freq) noexcept
+        {
+            if (freq.QuadPart <= 0) {
+                return 0;
+            }
+            int64_t diff = end.QuadPart - start.QuadPart;
+            if (diff < 0) {
+                return 0;
+            }
+            return static_cast<uint64_t>((diff * 1'000LL) / freq.QuadPart);
+        }
+
         // ============================================================================
         // RAII GUARD FOR SERIALIZATION CLEANUP
         // ============================================================================
@@ -24,6 +63,12 @@ namespace SignatureStore {
                     Cleanup();
                 }
             }
+            
+            // Non-copyable, non-movable for safety
+            SerializationGuard(const SerializationGuard&) = delete;
+            SerializationGuard& operator=(const SerializationGuard&) = delete;
+            SerializationGuard(SerializationGuard&&) = delete;
+            SerializationGuard& operator=(SerializationGuard&&) = delete;
             
             void Commit() noexcept { m_committed = true; }
             
@@ -74,6 +119,11 @@ namespace SignatureStore {
         
         // Fast CRC64 using lookup table - O(n) single pass
         [[nodiscard]] uint64_t FastCRC64(const uint8_t* data, size_t length) noexcept {
+            // Null pointer protection
+            if (!data || length == 0) {
+                return 0xFFFFFFFFFFFFFFFFULL;
+            }
+            
             uint64_t crc = 0xFFFFFFFFFFFFFFFFULL;
             for (size_t i = 0; i < length; ++i) {
                 const uint8_t tableIndex = static_cast<uint8_t>(crc ^ data[i]);
@@ -88,27 +138,41 @@ namespace SignatureStore {
         StoreError SignatureBuilder::Serialize() noexcept {
             m_currentStage = "Serialization";
 
-            LARGE_INTEGER startTime;
+            LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
 
             // Validate performance frequency to prevent division by zero
-            if (m_perfFrequency.QuadPart == 0) {
+            if (m_perfFrequency.QuadPart <= 0) {
                 QueryPerformanceFrequency(&m_perfFrequency);
-                if (m_perfFrequency.QuadPart == 0) {
-                    m_perfFrequency.QuadPart = 1; // Fallback
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY; // Fallback
                 }
             }
 
-            // Calculate required size
-            uint64_t requiredSize = CalculateRequiredSize();
+            // Calculate required size with overflow protection
+            uint64_t requiredSize = 0;
+            try {
+                requiredSize = CalculateRequiredSize();
+            } catch (...) {
+                return StoreError{ SignatureStoreError::Unknown, 0, "Failed to calculate required size" };
+            }
 
-            if (requiredSize == 0 || requiredSize > MAX_DATABASE_SIZE) {
+            if (requiredSize == 0) {
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Database size is zero" };
+            }
+            
+            if (requiredSize > MAX_DATABASE_SIZE) {
                 return StoreError{ SignatureStoreError::TooLarge, 0, "Database too large" };
             }
 
-            // Create output file
+            // Create output file with path validation
             if (m_config.outputPath.empty()) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "No output path" };
+            }
+            
+            // Validate path length (Windows MAX_PATH limit)
+            if (m_config.outputPath.length() > 32767) {
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output path too long" };
             }
 
             m_outputFile = CreateFileW(
@@ -207,10 +271,11 @@ namespace SignatureStore {
             CloseHandle(m_outputFile);
             m_outputFile = INVALID_HANDLE_VALUE;
 
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
-            m_statistics.serializationTimeMilliseconds =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+            
+            // Safe time calculation with division-by-zero protection
+            m_statistics.serializationTimeMilliseconds = safeElapsedMs(startTime, endTime, m_perfFrequency);
 
             m_statistics.finalDatabaseSize = requiredSize;
 
@@ -252,8 +317,16 @@ namespace SignatureStore {
         StoreError SignatureBuilder::SerializeHashes() noexcept {
             SS_LOG_INFO(L"SignatureBuilder", L"SerializeHashes: Starting hash serialization");
 
-            LARGE_INTEGER startTime;
+            LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
+
+            // Ensure performance frequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             // ========================================================================
             // VALIDATION
@@ -261,6 +334,12 @@ namespace SignatureStore {
             if (m_pendingHashes.empty()) {
                 SS_LOG_WARN(L"SignatureBuilder", L"SerializeHashes: No hashes to serialize");
                 return StoreError{ SignatureStoreError::Success };
+            }
+            
+            // Validate output buffer
+            if (!m_outputBase || m_outputSize == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"SerializeHashes: Invalid output buffer");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
             }
 
             // ========================================================================
@@ -358,11 +437,11 @@ namespace SignatureStore {
             // ========================================================================
             // PERFORMANCE METRICS
             // ========================================================================
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
 
-            uint64_t serializeTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            // Safe time calculation with division-by-zero protection
+            uint64_t serializeTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             m_statistics.serializationTimeMilliseconds += serializeTimeUs / 1000;
 
@@ -384,8 +463,16 @@ namespace SignatureStore {
         StoreError SignatureBuilder::SerializePatterns() noexcept {
             SS_LOG_INFO(L"SignatureBuilder", L"SerializePatterns: Starting pattern serialization with Aho-Corasick optimization");
 
-            LARGE_INTEGER startTime;
+            LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
+
+            // Ensure performance frequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             // ========================================================================
             // STEP 1: VALIDATION
@@ -394,6 +481,12 @@ namespace SignatureStore {
                 SS_LOG_WARN(L"SignatureBuilder", L"SerializePatterns: No patterns to serialize");
                 m_statistics.patternIndexSize = 0;
                 return StoreError{ SignatureStoreError::Success };
+            }
+            
+            // Validate output buffer
+            if (!m_outputBase || m_outputSize == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"SerializePatterns: Invalid output buffer");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
             }
 
             SS_LOG_INFO(L"SignatureBuilder",
@@ -646,18 +739,24 @@ namespace SignatureStore {
             uint32_t minLen = UINT32_MAX;
             uint32_t maxLen = 0;
 
-            // FIX: Use cached compiled pattern sizes instead of re-compiling (yet again!)
+            // Use cached compiled pattern sizes instead of re-compiling
             for (const auto& [origIdx, entropy] : patternsByEntropy) {
-                const auto& cache = compiledCache[origIdx];
-                if (cache.valid) {
-                    entropySum += entropy;
-                    minLen = std::min(minLen, static_cast<uint32_t>(cache.bytes.size()));
-                    maxLen = std::max(maxLen, static_cast<uint32_t>(cache.bytes.size()));
+                // Bounds check before accessing cache
+                if (origIdx < compiledCache.size()) {
+                    const auto& cache = compiledCache[origIdx];
+                    if (cache.valid && !cache.bytes.empty()) {
+                        entropySum += entropy;
+                        uint32_t patternSize = static_cast<uint32_t>(cache.bytes.size());
+                        minLen = std::min(minLen, patternSize);
+                        maxLen = std::max(maxLen, patternSize);
+                    }
                 }
             }
 
-            metadata.averageEntropy = processedPatterns > 0 ? entropySum / static_cast<float>(processedPatterns) : 0.0f;
-            metadata.patternLengthMin = minLen == UINT32_MAX ? 0 : minLen;
+            // Safe division with zero check
+            metadata.averageEntropy = (processedPatterns > 0) ? 
+                (entropySum / static_cast<float>(processedPatterns)) : 0.0f;
+            metadata.patternLengthMin = (minLen == UINT32_MAX) ? 0 : minLen;
             metadata.patternLengthMax = maxLen;
             metadata.flags = 0x01;
 
@@ -671,11 +770,11 @@ namespace SignatureStore {
             // ========================================================================
             // STEP 7: PERFORMANCE METRICS & LOGGING
             // ========================================================================
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
 
-            uint64_t serializeTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            // Safe time calculation with division-by-zero protection
+            uint64_t serializeTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             m_statistics.serializationTimeMilliseconds += serializeTimeUs / 1000;
             m_currentOffset = currentOffset;
@@ -717,8 +816,16 @@ namespace SignatureStore {
                 L"SerializeAhoCorasickToDisk: Starting trie serialization at offset 0x%llX",
                 currentOffset);
 
-            LARGE_INTEGER startTime;
+            LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
+
+            // Ensure performance frequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             // ========================================================================
             // STEP 1: VALIDATION
@@ -727,6 +834,13 @@ namespace SignatureStore {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"SerializeAhoCorasickToDisk: Invalid output buffer");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
+            }
+            
+            // Validate offset doesn't exceed output size
+            if (currentOffset >= m_outputSize) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"SerializeAhoCorasickToDisk: Offset exceeds output size");
+                return StoreError{ SignatureStoreError::TooLarge, 0, "Offset out of bounds" };
             }
 
             // ========================================================================
@@ -970,26 +1084,37 @@ namespace SignatureStore {
          // STEP 8: COMPUTE CHECKSUM
          // ========================================================================
 
-         //calculate the triedatasize
+         // Calculate the trie data size with overflow protection
             uint64_t trieDataSize = currentOffset - headerOffset;
 
+            // Bounds validation before computing checksum
+            if (headerOffset + sizeof(TrieIndexHeader) > m_outputSize ||
+                trieDataSize < sizeof(TrieIndexHeader)) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"SerializeAhoCorasickToDisk: Invalid trie data size for checksum");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid trie data size" };
+            }
 
             const uint8_t* trieDataPtr = static_cast<const uint8_t*>(m_outputBase)
                 + headerOffset + sizeof(TrieIndexHeader);
             size_t trieDataLen = static_cast<size_t>(trieDataSize - sizeof(TrieIndexHeader));
 
-
-            std::span<const uint8_t> trieData(trieDataPtr, trieDataLen);
-            header->checksumCRC64 = ComputeCRC64(trieData.data(), trieData.size());
+            // Additional bounds validation
+            if (trieDataLen > 0 && trieDataPtr) {
+                std::span<const uint8_t> trieData(trieDataPtr, trieDataLen);
+                header->checksumCRC64 = ComputeCRC64(trieData.data(), trieData.size());
+            } else {
+                header->checksumCRC64 = 0;
+            }
 
             // ========================================================================
             // STEP 9: PERFORMANCE LOGGING
             // ========================================================================
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
 
-            uint64_t serializeTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            // Safe time calculation with division-by-zero protection
+            uint64_t serializeTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"SerializeAhoCorasickToDisk: Complete");
@@ -1310,8 +1435,16 @@ namespace SignatureStore {
         StoreError SignatureBuilder::SerializeYaraRules() noexcept {
             SS_LOG_INFO(L"SignatureBuilder", L"SerializeYaraIndex: Starting YARA rule serialization");
 
-            LARGE_INTEGER startTime;
+            LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
+
+            // Ensure performance frequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
 
             // ========================================================================
             // VALIDATION
@@ -1319,6 +1452,12 @@ namespace SignatureStore {
             if (m_pendingYaraRules.empty()) {
                 SS_LOG_WARN(L"SignatureBuilder", L"SerializeYaraIndex: No YARA rules to serialize");
                 return StoreError{ SignatureStoreError::Success };
+            }
+            
+            // Validate output buffer
+            if (!m_outputBase || m_outputSize == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"SerializeYaraIndex: Invalid output buffer");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
             }
 
             // ========================================================================
@@ -1417,11 +1556,11 @@ namespace SignatureStore {
             // ========================================================================
             // PERFORMANCE METRICS
             // ========================================================================
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
 
-            uint64_t serializeTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            // Safe time calculation with division-by-zero protection
+            uint64_t serializeTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             m_statistics.serializationTimeMilliseconds += serializeTimeUs / 1000;
             m_currentOffset = currentOffset;
@@ -1443,19 +1582,37 @@ namespace SignatureStore {
         StoreError SignatureBuilder::SerializeMetadata() noexcept {
             SS_LOG_INFO(L"SignatureBuilder", L"SerializeMetadata: Starting metadata serialization");
 
-            LARGE_INTEGER startTime;
+            LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
+
+            // Ensure performance frequency is valid
+            if (m_perfFrequency.QuadPart <= 0) {
+                QueryPerformanceFrequency(&m_perfFrequency);
+                if (m_perfFrequency.QuadPart <= 0) {
+                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
+                }
+            }
+            
+            // Validate output buffer
+            if (!m_outputBase || m_outputSize == 0) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"SerializeMetadata: Invalid output buffer");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
+            }
 
             // ========================================================================
             // BUILD METADATA JSON - WITH PROPER TIMESTAMP FORMATTING
             // ========================================================================
 
             time_t now = time(nullptr);
-            char buf[26]; // typical buffer size for ctime_s
-            ctime_s(buf, sizeof(buf), &now);
-
-            // FIX: Remove trailing newline from ctime_s output (JSON injection prevention)
-            std::string createdAt(buf);
+            char buf[32] = {0}; // Safely oversized buffer for ctime_s
+            errno_t timeErr = ctime_s(buf, sizeof(buf), &now);
+            
+            std::string createdAt;
+            if (timeErr == 0) {
+                createdAt = buf;
+            } else {
+                createdAt = "unknown";
+            }
             while (!createdAt.empty() && (createdAt.back() == '\n' || createdAt.back() == '\r')) {
                 createdAt.pop_back();
             }
@@ -1517,11 +1674,11 @@ namespace SignatureStore {
             // ========================================================================
             // PERFORMANCE METRICS
             // ========================================================================
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
 
-            uint64_t serializeTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            // Safe time calculation with division-by-zero protection
+            uint64_t serializeTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             m_statistics.serializationTimeMilliseconds += serializeTimeUs / 1000;
             m_currentOffset = currentOffset;
@@ -1534,17 +1691,32 @@ namespace SignatureStore {
         }
 
         StoreError SignatureBuilder::ComputeChecksum() noexcept {
-            if (!m_outputBase) {
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "No output" };
+            if (!m_outputBase || m_outputSize == 0) {
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "No output buffer" };
+            }
+            
+            // Validate minimum size for header
+            if (m_outputSize < sizeof(SignatureDatabaseHeader)) {
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output too small for header" };
             }
 
             // Compute SHA-256 of entire database (excluding checksum field)
             auto checksum = ComputeDatabaseChecksum();
+            
+            // Validate checksum was computed
+            if (checksum.empty()) {
+                return StoreError{ SignatureStoreError::Unknown, 0, "Checksum computation failed" };
+            }
 
             auto* header = static_cast<SignatureDatabaseHeader*>(m_outputBase);
-            std::memcpy(header->sha256Checksum.data(), checksum.data(), 32);
+            
+            // Copy checksum with bounds check
+            size_t copySize = std::min(checksum.size(), header->sha256Checksum.size());
+            std::memcpy(header->sha256Checksum.data(), checksum.data(), copySize);
 
-            FlushViewOfFile(m_outputBase, sizeof(SignatureDatabaseHeader));
+            if (!FlushViewOfFile(m_outputBase, sizeof(SignatureDatabaseHeader))) {
+                SS_LOG_WARN(L"SignatureBuilder", L"ComputeChecksum: FlushViewOfFile failed");
+            }
 
             Log("Checksum computed");
             return StoreError{ SignatureStoreError::Success };

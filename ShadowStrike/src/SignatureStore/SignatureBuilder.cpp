@@ -456,11 +456,16 @@ StoreError SignatureBuilder::Build() noexcept {
 
     ReportProgress("Complete", 7, 7);
 
-    // Calculate build time
+    // Calculate build time - HARDENED: Division-by-zero protection
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
-    m_statistics.totalBuildTimeMilliseconds = 
-        ((endTime.QuadPart - m_buildStartTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+    
+    if (m_perfFrequency.QuadPart > 0) {
+        m_statistics.totalBuildTimeMilliseconds = 
+            ((endTime.QuadPart - m_buildStartTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+    } else {
+        m_statistics.totalBuildTimeMilliseconds = 0;
+    }
 
     m_buildInProgress.store(false);
 
@@ -623,8 +628,14 @@ StoreError SignatureBuilder::Optimize() noexcept {
     }
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
-    m_statistics.optimizationTimeMilliseconds = 
-        ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+    
+    // HARDENED: Division-by-zero protection
+    if (m_perfFrequency.QuadPart > 0) {
+        m_statistics.optimizationTimeMilliseconds = 
+            ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+    } else {
+        m_statistics.optimizationTimeMilliseconds = 0;
+    }
 
     Log("Optimization complete");
     return StoreError{SignatureStoreError::Success};
@@ -680,8 +691,14 @@ StoreError SignatureBuilder::BuildIndices() noexcept {
 
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
-    m_statistics.indexBuildTimeMilliseconds = 
-        ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+    
+    // HARDENED: Division-by-zero protection
+    if (m_perfFrequency.QuadPart > 0) {
+        m_statistics.indexBuildTimeMilliseconds = 
+            ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
+    } else {
+        m_statistics.indexBuildTimeMilliseconds = 0;
+    }
 
     Log("Index construction complete");
     return StoreError{SignatureStoreError::Success};
@@ -770,8 +787,12 @@ StoreError SignatureBuilder::BuildHashIndex() noexcept {
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
 
-    uint64_t buildTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    // HARDENED: Division-by-zero protection
+    uint64_t buildTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        buildTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
+            m_perfFrequency.QuadPart;
+    }
 
     m_statistics.indexBuildTimeMilliseconds += buildTimeUs / 1000;
 
@@ -886,10 +907,16 @@ StoreError SignatureBuilder::BuildPatternIndex() noexcept {
 
             double entropy = 0.0;
             double n = static_cast<double>(pattern.patternString.length());
-            for (int count : byteCounts) {
-                if (count > 0) {
-                    double p = static_cast<double>(count) / n;
-                    entropy -= p * std::log2(p);
+            // HARDENED: Division-by-zero protection in entropy calculation
+            if (n > 0.0) {
+                for (int count : byteCounts) {
+                    if (count > 0) {
+                        double p = static_cast<double>(count) / n;
+                        // HARDENED: log2 only for positive values
+                        if (p > 0.0) {
+                            entropy -= p * std::log2(p);
+                        }
+                    }
                 }
             }
 
@@ -916,8 +943,12 @@ StoreError SignatureBuilder::BuildPatternIndex() noexcept {
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
 
-    uint64_t buildTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    // HARDENED: Division-by-zero protection
+    uint64_t buildTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        buildTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
+            m_perfFrequency.QuadPart;
+    }
 
     m_statistics.indexBuildTimeMilliseconds += buildTimeUs / 1000;
 
@@ -1079,8 +1110,12 @@ StoreError SignatureBuilder::BuildYaraIndex() noexcept {
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
 
-    uint64_t buildTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-        m_perfFrequency.QuadPart;
+    // HARDENED: Division-by-zero protection
+    uint64_t buildTimeUs = 0;
+    if (m_perfFrequency.QuadPart > 0) {
+        buildTimeUs = ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
+            m_perfFrequency.QuadPart;
+    }
 
     m_statistics.indexBuildTimeMilliseconds += buildTimeUs / 1000;
 
@@ -1719,8 +1754,12 @@ StoreError SignatureBuilder::ValidateOutput(
             LARGE_INTEGER currentTime{};
             QueryPerformanceCounter(&currentTime);
 
-            uint64_t elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
-                perfFreq.QuadPart;
+            // HARDENED: Division-by-zero protection
+            uint64_t elapsedMs = 0;
+            if (perfFreq.QuadPart > 0) {
+                elapsedMs = ((currentTime.QuadPart - startTime.QuadPart) * 1000ULL) /
+                    perfFreq.QuadPart;
+            }
 
             constexpr uint64_t HASH_TIMEOUT_MS = 300000; // 5 minute timeout
             if (elapsedMs > HASH_TIMEOUT_MS) {
@@ -1885,10 +1924,10 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
         L"BenchmarkDatabase: Database validation passed, proceeding with benchmarks");
 
     // ========================================================================
-    // STEP 3: SETUP MEMORY MAPPING
+    // STEP 3: SETUP MEMORY MAPPING (WITH RAII)
     // ========================================================================
 
-    HANDLE hFile = CreateFileW(
+    HandleGuard hFileGuard(CreateFileW(
         databasePath.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
@@ -1896,9 +1935,9 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
         OPEN_EXISTING,
         FILE_FLAG_SEQUENTIAL_SCAN,
         nullptr
-    );
+    ));
 
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (!hFileGuard.IsValid()) {
         DWORD err = GetLastError();
         SS_LOG_ERROR(L"SignatureBuilder",
             L"BenchmarkDatabase: Cannot open database (error: %lu)", err);
@@ -1906,25 +1945,21 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
     }
 
     LARGE_INTEGER fileSize{};
-    if (!GetFileSizeEx(hFile, &fileSize)) {
-        CloseHandle(hFile);
+    if (!GetFileSizeEx(hFileGuard.Get(), &fileSize)) {
         return metrics;
     }
 
-    HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (hMapping == nullptr) {
-        CloseHandle(hFile);
+    HandleGuard hMappingGuard(CreateFileMappingW(hFileGuard.Get(), nullptr, PAGE_READONLY, 0, 0, nullptr));
+    if (!hMappingGuard.IsValid()) {
         return metrics;
     }
 
-    void* baseAddress = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-    if (baseAddress == nullptr) {
-        CloseHandle(hMapping);
-        CloseHandle(hFile);
+    MappedViewGuard viewGuard(MapViewOfFile(hMappingGuard.Get(), FILE_MAP_READ, 0, 0, 0));
+    if (!viewGuard.IsValid()) {
         return metrics;
     }
 
-    const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(baseAddress);
+    const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(viewGuard.Get());
 
     SS_LOG_DEBUG(L"SignatureBuilder", L"BenchmarkDatabase: Database mapped successfully");
 
@@ -1936,9 +1971,7 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
     if (!QueryPerformanceFrequency(&perfFreq) || perfFreq.QuadPart == 0) {
         SS_LOG_ERROR(L"SignatureBuilder",
             L"BenchmarkDatabase: Cannot initialize performance counter");
-        UnmapViewOfFile(baseAddress);
-        CloseHandle(hMapping);
-        CloseHandle(hFile);
+        // HARDENED: RAII handles cleanup automatically
         return metrics;
     }
 
@@ -1947,15 +1980,14 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
     // ========================================================================
 
     DWORD processCount = 0;
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot != INVALID_HANDLE_VALUE) {
+    HandleGuard hSnapshotGuard(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (hSnapshotGuard.IsValid()) {
         PROCESSENTRY32W pe{ sizeof(pe) };
-        if (Process32FirstW(hSnapshot, &pe)) {
+        if (Process32FirstW(hSnapshotGuard.Get(), &pe)) {
             do {
                 processCount++;
-            } while (Process32NextW(hSnapshot, &pe));
+            } while (Process32NextW(hSnapshotGuard.Get(), &pe));
         }
-        CloseHandle(hSnapshot);
     }
 
     if (processCount > 100) {
@@ -1995,43 +2027,53 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
 
         QueryPerformanceCounter(&end);
 
-        uint64_t timeNs = ((end.QuadPart - start.QuadPart) * 1000000000ULL) / perfFreq.QuadPart;
+        // HARDENED: Division-by-zero protection
+        uint64_t timeNs = 0;
+        if (perfFreq.QuadPart > 0) {
+            timeNs = ((end.QuadPart - start.QuadPart) * 1000000000ULL) / perfFreq.QuadPart;
+        }
         hashLookupTimes.push_back(timeNs);
     }
 
     // Calculate statistics (exclude min/max outliers for accuracy)
     std::sort(hashLookupTimes.begin(), hashLookupTimes.end());
 
+    // HARDENED: Bounds validation before accessing array elements
     size_t validCount = hashLookupTimes.size();
-    if (validCount > 2) {
-        validCount -= 2; // Remove min/max
-    }
-
-    uint64_t sumHashLookup = 0;
-    for (size_t i = 1; i < hashLookupTimes.size() - 1; ++i) {
-        sumHashLookup += hashLookupTimes[i];
-    }
-
-    metrics.averageHashLookupNanoseconds = validCount > 0 ? (sumHashLookup / validCount) : 0;
-
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"BenchmarkDatabase:   Hash Lookup Results:");
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Average: %llu ns", metrics.averageHashLookupNanoseconds);
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Min:     %llu ns", hashLookupTimes[1]);
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Max:     %llu ns", hashLookupTimes[hashLookupTimes.size() - 2]);
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Target:  < 1000 ns");
-
-    if (metrics.averageHashLookupNanoseconds > 1000) {
+    if (validCount < 3) {
         SS_LOG_WARN(L"SignatureBuilder",
-            L"    ⚠ BELOW TARGET: Hash lookups slower than 1µs target");
-    }
-    else {
+            L"BenchmarkDatabase: Not enough hash lookup samples for accurate statistics");
+        metrics.averageHashLookupNanoseconds = validCount > 0 ? hashLookupTimes[0] : 0;
+    } else {
+        // Remove min/max outliers
+        validCount -= 2;
+
+        uint64_t sumHashLookup = 0;
+        for (size_t i = 1; i < hashLookupTimes.size() - 1; ++i) {
+            sumHashLookup += hashLookupTimes[i];
+        }
+
+        metrics.averageHashLookupNanoseconds = validCount > 0 ? (sumHashLookup / validCount) : 0;
+
         SS_LOG_INFO(L"SignatureBuilder",
-            L"    ✓ MEETS TARGET: Hash lookups < 1µs");
+            L"BenchmarkDatabase:   Hash Lookup Results:");
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Average: %llu ns", metrics.averageHashLookupNanoseconds);
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Min:     %llu ns", hashLookupTimes[1]);
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Max:     %llu ns", hashLookupTimes[hashLookupTimes.size() - 2]);
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Target:  < 1000 ns");
+
+        if (metrics.averageHashLookupNanoseconds > 1000) {
+            SS_LOG_WARN(L"SignatureBuilder",
+                L"    ⚠ BELOW TARGET: Hash lookups slower than 1µs target");
+        }
+        else {
+            SS_LOG_INFO(L"SignatureBuilder",
+                L"    ✓ MEETS TARGET: Hash lookups < 1µs");
+        }
     }
 
     // ========================================================================
@@ -2044,7 +2086,20 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
     constexpr size_t TEST_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB test buffer
     constexpr size_t PATTERN_SCAN_ITERATIONS = 10;
 
-    std::vector<uint8_t> testBuffer(TEST_BUFFER_SIZE);
+    // HARDENED: Exception-safe buffer allocation
+    std::vector<uint8_t> testBuffer;
+    try {
+        testBuffer.resize(TEST_BUFFER_SIZE);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"SignatureBuilder",
+            L"BenchmarkDatabase: Failed to allocate test buffer (%zu bytes)",
+            TEST_BUFFER_SIZE);
+        return metrics;
+    } catch (...) {
+        SS_LOG_ERROR(L"SignatureBuilder",
+            L"BenchmarkDatabase: Unknown exception during buffer allocation");
+        return metrics;
+    }
 
     // Fill with random-ish data (simulate file contents)
     for (size_t i = 0; i < TEST_BUFFER_SIZE; ++i) {
@@ -2077,38 +2132,48 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
 
         QueryPerformanceCounter(&end);
 
-        uint64_t timeUs = ((end.QuadPart - start.QuadPart) * 1000000ULL) / perfFreq.QuadPart;
+        // HARDENED: Division-by-zero protection
+        uint64_t timeUs = 0;
+        if (perfFreq.QuadPart > 0) {
+            timeUs = ((end.QuadPart - start.QuadPart) * 1000000ULL) / perfFreq.QuadPart;
+        }
         patternScanTimes.push_back(timeUs);
     }
 
     std::sort(patternScanTimes.begin(), patternScanTimes.end());
 
-    uint64_t sumPatternScan = 0;
-    for (size_t i = 1; i < patternScanTimes.size() - 1; ++i) {
-        sumPatternScan += patternScanTimes[i];
-    }
-
-    metrics.averagePatternScanMicroseconds = (patternScanTimes.size() > 2) ?
-        (sumPatternScan / (patternScanTimes.size() - 2)) : 0;
-
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"BenchmarkDatabase:   Pattern Scan Results (10MB buffer):");
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Average: %llu µs", metrics.averagePatternScanMicroseconds);
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Min:     %llu µs", patternScanTimes[1]);
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Max:     %llu µs", patternScanTimes[patternScanTimes.size() - 2]);
-    SS_LOG_INFO(L"SignatureBuilder",
-        L"    Target:  < 10000 µs (10ms)");
-
-    if (metrics.averagePatternScanMicroseconds > 10000) {
+    // HARDENED: Bounds validation before accessing array elements
+    if (patternScanTimes.size() < 3) {
         SS_LOG_WARN(L"SignatureBuilder",
-            L"    ⚠ BELOW TARGET: Pattern scanning slower than 10ms target");
-    }
-    else {
+            L"BenchmarkDatabase: Not enough pattern scan samples for accurate statistics");
+        metrics.averagePatternScanMicroseconds = patternScanTimes.empty() ? 0 : patternScanTimes[0];
+    } else {
+        uint64_t sumPatternScan = 0;
+        for (size_t i = 1; i < patternScanTimes.size() - 1; ++i) {
+            sumPatternScan += patternScanTimes[i];
+        }
+
+        metrics.averagePatternScanMicroseconds = sumPatternScan / (patternScanTimes.size() - 2);
+
         SS_LOG_INFO(L"SignatureBuilder",
-            L"    ✓ MEETS TARGET: Pattern scanning < 10ms");
+            L"BenchmarkDatabase:   Pattern Scan Results (10MB buffer):");
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Average: %llu µs", metrics.averagePatternScanMicroseconds);
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Min:     %llu µs", patternScanTimes[1]);
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Max:     %llu µs", patternScanTimes[patternScanTimes.size() - 2]);
+        SS_LOG_INFO(L"SignatureBuilder",
+            L"    Target:  < 10000 µs (10ms)");
+
+        if (metrics.averagePatternScanMicroseconds > 10000) {
+            SS_LOG_WARN(L"SignatureBuilder",
+                L"    ⚠ BELOW TARGET: Pattern scanning slower than 10ms target");
+        }
+        else {
+            SS_LOG_INFO(L"SignatureBuilder",
+                L"    ✓ MEETS TARGET: Pattern scanning < 10ms");
+        }
     }
 
     // ========================================================================
@@ -2149,12 +2214,11 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
         static_cast<uint64_t>(fileSize.QuadPart));
 
     // ========================================================================
-    // STEP 10: CLEANUP
+    // STEP 10: CLEANUP (RAII handles this automatically)
     // ========================================================================
 
-    UnmapViewOfFile(baseAddress);
-    CloseHandle(hMapping);
-    CloseHandle(hFile);
+    // HARDENED: RAII guards (hFileGuard, hMappingGuard, viewGuard) automatically
+    // clean up resources when they go out of scope - no manual cleanup needed
 
     return metrics;
 }

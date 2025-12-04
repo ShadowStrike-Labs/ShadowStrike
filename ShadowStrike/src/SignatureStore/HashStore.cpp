@@ -19,11 +19,15 @@
 #include "HashStore.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
-#include"../Utils/JSONUtils.hpp"
-#include"../Utils/StringUtils.hpp"
-#include<fuzzy.h>
-#include<tlsh.h>
-#include<format>
+#include "../Utils/JSONUtils.hpp"
+#include "../Utils/StringUtils.hpp"
+#include <fuzzy.h>
+#include <tlsh.h>
+#include <format>
+#include <chrono>
+#include <limits>
+#include <ctime>
+#include <cctype>
 #include <algorithm>
 #include <cmath>
 #include<atomic>
@@ -47,25 +51,113 @@ namespace ShadowStrike {
 // ====================================================
 
         BloomFilter::BloomFilter(size_t expectedElements, double falsePositiveRate) {
+            // Input validation - prevent DoS and division by zero
+            constexpr size_t MIN_EXPECTED_ELEMENTS = 1;
+            constexpr size_t MAX_EXPECTED_ELEMENTS = 100'000'000;  // 100M max
+            constexpr double MIN_FPR = 0.0001;   // 0.01%
+            constexpr double MAX_FPR = 0.5;      // 50%
+
+            if (expectedElements < MIN_EXPECTED_ELEMENTS) {
+                expectedElements = MIN_EXPECTED_ELEMENTS;
+                SS_LOG_WARN(L"BloomFilter", 
+                    L"Expected elements too low, clamped to %zu", MIN_EXPECTED_ELEMENTS);
+            }
+            if (expectedElements > MAX_EXPECTED_ELEMENTS) {
+                expectedElements = MAX_EXPECTED_ELEMENTS;
+                SS_LOG_WARN(L"BloomFilter", 
+                    L"Expected elements too high, clamped to %zu", MAX_EXPECTED_ELEMENTS);
+            }
+
+            if (falsePositiveRate < MIN_FPR) {
+                falsePositiveRate = MIN_FPR;
+                SS_LOG_WARN(L"BloomFilter", 
+                    L"FPR too low, clamped to %.4f", MIN_FPR);
+            }
+            if (falsePositiveRate > MAX_FPR) {
+                falsePositiveRate = MAX_FPR;
+                SS_LOG_WARN(L"BloomFilter", 
+                    L"FPR too high, clamped to %.2f", MAX_FPR);
+            }
+
             const double ln2 = std::log(2.0);
+            const double ln2Squared = ln2 * ln2;
 
-            m_size = static_cast<size_t>(
-                -static_cast<double>(expectedElements) * std::log(falsePositiveRate) / (ln2 * ln2)
-                );
+            // Calculate optimal bit array size: m = -n * ln(p) / (ln2)^2
+            // Guard against overflow with saturation
+            const double rawSize = -static_cast<double>(expectedElements) * 
+                                    std::log(falsePositiveRate) / ln2Squared;
+            
+            constexpr size_t MAX_BIT_SIZE = 1'000'000'000;  // 1 billion bits max (~125MB)
+            if (rawSize <= 0.0 || std::isnan(rawSize) || std::isinf(rawSize)) {
+                m_size = MIN_EXPECTED_ELEMENTS * 10;  // Fallback
+                SS_LOG_WARN(L"BloomFilter", 
+                    L"Invalid size calculation, using fallback: %zu", m_size);
+            } else if (rawSize > static_cast<double>(MAX_BIT_SIZE)) {
+                m_size = MAX_BIT_SIZE;
+                SS_LOG_WARN(L"BloomFilter", 
+                    L"Size clamped to maximum: %zu bits", MAX_BIT_SIZE);
+            } else {
+                m_size = static_cast<size_t>(rawSize);
+            }
 
-            m_numHashes = static_cast<size_t>(
-                (static_cast<double>(m_size) / expectedElements) * ln2
-                );
+            // Ensure minimum size
+            if (m_size == 0) {
+                m_size = 64;  // Minimum 64 bits (1 uint64_t)
+            }
 
-            if (m_numHashes < 1) m_numHashes = 1;
-            if (m_numHashes > 10) m_numHashes = 10;
+            // Calculate optimal number of hash functions: k = (m/n) * ln2
+            const double rawHashes = (static_cast<double>(m_size) / 
+                                      static_cast<double>(expectedElements)) * ln2;
+            
+            if (rawHashes <= 0.0 || std::isnan(rawHashes) || std::isinf(rawHashes)) {
+                m_numHashes = 3;  // Fallback to reasonable default
+            } else {
+                m_numHashes = static_cast<size_t>(std::round(rawHashes));
+            }
 
-            // 64-bit slot count
-            const size_t uint64Count = (m_size + 63) / 64;
+            // Clamp hash functions to reasonable range
+            constexpr size_t MIN_HASHES = 1;
+            constexpr size_t MAX_HASHES = 16;
+            if (m_numHashes < MIN_HASHES) {
+                m_numHashes = MIN_HASHES;
+            } else if (m_numHashes > MAX_HASHES) {
+                m_numHashes = MAX_HASHES;
+            }
 
-            // create fresh vector of atomics and swap (no reallocation/move/copy)
-            std::vector<std::atomic<uint64_t>> fresh(uint64Count);
-            m_bits.swap(fresh);
+            // Calculate 64-bit slot count with overflow protection
+            // Avoid overflow: (m_size + 63) / 64 could overflow if m_size is near SIZE_MAX
+            constexpr size_t MAX_UINT64_COUNT = MAX_BIT_SIZE / 64 + 1;
+            size_t uint64Count = 0;
+            if (m_size <= SIZE_MAX - 63) {
+                uint64Count = (m_size + 63) / 64;
+            } else {
+                // Overflow would occur, use max safe value
+                uint64Count = MAX_UINT64_COUNT;
+            }
+            
+            // Prevent huge allocations
+            if (uint64Count > MAX_UINT64_COUNT || uint64Count == 0) {
+                SS_LOG_ERROR(L"BloomFilter", 
+                    L"Bit array size invalid: %zu slots (max: %zu)", 
+                    uint64Count, MAX_UINT64_COUNT);
+                m_size = 64;
+                m_numHashes = 3;
+                return;
+            }
+
+            // Allocate with exception handling
+            try {
+                std::vector<std::atomic<uint64_t>> fresh(uint64Count);
+                m_bits.swap(fresh);
+            }
+            catch (const std::bad_alloc& ex) {
+                SS_LOG_ERROR(L"BloomFilter", 
+                    L"Memory allocation failed for %zu slots: %S", 
+                    uint64Count, ex.what());
+                m_size = 0;
+                m_numHashes = 0;
+                return;
+            }
 
             // Atomically zero each element
             for (auto& w : m_bits) {
@@ -73,47 +165,69 @@ namespace ShadowStrike {
             }
 
             SS_LOG_INFO(L"BloomFilter",
-                L"Initialized: size=%zu bits, hashes=%zu, expectedElements=%zu, FPR=%.4f",
-                m_size, m_numHashes, expectedElements, falsePositiveRate);
+                L"Initialized: size=%zu bits (%zu slots), hashes=%zu, expectedElements=%zu, FPR=%.4f",
+                m_size, m_bits.size(), m_numHashes, expectedElements, falsePositiveRate);
         }
 
 
         void BloomFilter::Add(uint64_t hash) noexcept {
-            for (size_t i = 0; i < m_numHashes; ++i) {
-                uint64_t bitIndex = Hash(hash, i) % m_size;
-                size_t arrayIndex = bitIndex / 64;
-                size_t bitOffset = bitIndex % 64;
+            // Early exit if not properly initialized
+            if (m_bits.empty() || m_size == 0 || m_numHashes == 0) {
+                return;
+            }
 
-                // Bounds check for safety
-                if (arrayIndex >= m_bits.size()) {
-                    continue;  // Should never happen, but be safe
+            const size_t bitsSize = m_bits.size();
+            for (size_t i = 0; i < m_numHashes; ++i) {
+                const uint64_t hashedValue = Hash(hash, i);
+                // Guard against division by zero (m_size validated above, but defense in depth)
+                const uint64_t bitIndex = (m_size > 0) ? (hashedValue % m_size) : 0;
+                const size_t arrayIndex = static_cast<size_t>(bitIndex / 64);
+                const size_t bitOffset = static_cast<size_t>(bitIndex % 64);
+
+                // Bounds check for safety (defense in depth)
+                if (arrayIndex >= bitsSize) {
+                    SS_LOG_ERROR(L"BloomFilter", 
+                        L"Add: Array index out of bounds: %zu >= %zu", 
+                        arrayIndex, bitsSize);
+                    return;  // Stop processing on invalid state
                 }
 
-                uint64_t mask = 1ULL << bitOffset;
+                const uint64_t mask = 1ULL << bitOffset;
 
-                // Thread-safe atomic set
+                // Thread-safe atomic set using fetch_or
                 m_bits[arrayIndex].fetch_or(mask, std::memory_order_relaxed);
             }
         }
 
         bool BloomFilter::MightContain(uint64_t hash) const noexcept {
+            // Return false if not properly initialized (safe default)
+            if (m_bits.empty() || m_size == 0 || m_numHashes == 0) {
+                return false;
+            }
+
+            const size_t bitsSize = m_bits.size();
             for (size_t i = 0; i < m_numHashes; ++i) {
-                uint64_t bitIndex = Hash(hash, i) % m_size;
-                size_t arrayIndex = bitIndex / 64;
-                size_t bitOffset = bitIndex % 64;
+                const uint64_t hashedValue = Hash(hash, i);
+                // Guard against division by zero
+                const uint64_t bitIndex = (m_size > 0) ? (hashedValue % m_size) : 0;
+                const size_t arrayIndex = static_cast<size_t>(bitIndex / 64);
+                const size_t bitOffset = static_cast<size_t>(bitIndex % 64);
 
                 // Bounds check for safety
-                if (arrayIndex >= m_bits.size()) {
+                if (arrayIndex >= bitsSize) {
+                    SS_LOG_ERROR(L"BloomFilter", 
+                        L"MightContain: Array index out of bounds: %zu >= %zu", 
+                        arrayIndex, bitsSize);
                     return false;  // Invalid state, return false to be safe
                 }
 
-                // m_bits is already std::atomic<uint64_t>, load directly
-                uint64_t word = m_bits[arrayIndex].load(std::memory_order_relaxed);
+                // Atomic read with relaxed ordering (sufficient for bloom filter)
+                const uint64_t word = m_bits[arrayIndex].load(std::memory_order_relaxed);
                 if ((word & (1ULL << bitOffset)) == 0) {
-                    return false;
+                    return false;  // Definitely not present
                 }
             }
-            return true;
+            return true;  // Might be present (could be false positive)
         }
 
         void BloomFilter::Clear() noexcept {
@@ -123,19 +237,37 @@ namespace ShadowStrike {
         }
 
         double BloomFilter::EstimatedFillRate() const noexcept {
-            size_t setBits = 0;
-            for (size_t i = 0; i < m_bits.size(); ++i) {
-                // m_bits is already std::atomic<uint64_t>, load directly
-                uint64_t word = m_bits[i].load(std::memory_order_relaxed);
-                setBits += std::popcount(word);
+            if (m_bits.empty() || m_size == 0) {
+                return 0.0;
             }
-            return (m_size == 0) ? 0.0 : static_cast<double>(setBits) / static_cast<double>(m_size);
-        }
-        uint64_t BloomFilter::Hash(uint64_t value, size_t seed) const noexcept {
-            // FNV-1a hash with seed
-            uint64_t hash = 14695981039346656037ULL + seed;
-            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
 
+            size_t setBits = 0;
+            const size_t bitsSize = m_bits.size();
+            for (size_t i = 0; i < bitsSize; ++i) {
+                const uint64_t word = m_bits[i].load(std::memory_order_relaxed);
+                // popcount returns int, safely convert to size_t
+                const int popCount = std::popcount(word);
+                if (popCount > 0) {
+                    // Guard against overflow (extremely unlikely but defensive)
+                    if (setBits <= SIZE_MAX - static_cast<size_t>(popCount)) {
+                        setBits += static_cast<size_t>(popCount);
+                    }
+                }
+            }
+            // Division by zero already guarded above
+            return static_cast<double>(setBits) / static_cast<double>(m_size);
+        }
+
+        uint64_t BloomFilter::Hash(uint64_t value, size_t seed) const noexcept {
+            // FNV-1a hash with seed - deterministic and fast
+            uint64_t hash = 14695981039346656037ULL;
+            
+            // Mix in seed first
+            hash ^= static_cast<uint64_t>(seed);
+            hash *= 1099511628211ULL;
+            
+            // Process value bytes
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
             for (size_t i = 0; i < sizeof(uint64_t); ++i) {
                 hash ^= bytes[i];
                 hash *= 1099511628211ULL;
@@ -152,13 +284,30 @@ namespace ShadowStrike {
 
         HashBucket::HashBucket(HashType type)
             : m_type(type)
-            , m_index(std::make_unique<SignatureIndex>())
+            , m_index(nullptr)
             , m_bloomFilter(nullptr)
+            , m_view(nullptr)
+            , m_bucketOffset(0)
+            , m_bucketSize(0)
+            , m_lookupCount(0)
+            , m_bloomHits(0)
+            , m_bloomMisses(0)
         {
+            try {
+                m_index = std::make_unique<SignatureIndex>();
+            }
+            catch (const std::bad_alloc& ex) {
+                SS_LOG_ERROR(L"HashBucket", 
+                    L"Failed to allocate SignatureIndex: %S", ex.what());
+                m_index = nullptr;
+            }
         }
 
         HashBucket::~HashBucket() {
-            // Smart pointers handle cleanup
+            // Smart pointers handle cleanup automatically
+            // Explicit reset for deterministic destruction order
+            m_bloomFilter.reset();
+            m_index.reset();
         }
 
         StoreError HashBucket::Initialize(
@@ -170,19 +319,56 @@ namespace ShadowStrike {
                 L"Initialize bucket for %S: offset=0x%llX, size=0x%llX",
                 Format::HashTypeToString(m_type), bucketOffset, bucketSize);
 
+            // Validate inputs
+            if (!view.IsValid()) {
+                SS_LOG_ERROR(L"HashBucket", L"Initialize: Invalid memory mapped view");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid memory mapped view" };
+            }
+
+            if (bucketSize == 0) {
+                SS_LOG_ERROR(L"HashBucket", L"Initialize: Bucket size is zero");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Bucket size cannot be zero" };
+            }
+
+            // Bounds validation
+            if (bucketOffset > view.fileSize || 
+                bucketSize > view.fileSize - bucketOffset) {
+                SS_LOG_ERROR(L"HashBucket", 
+                    L"Initialize: Bucket bounds exceed file size (offset=%llu, size=%llu, fileSize=%llu)",
+                    bucketOffset, bucketSize, view.fileSize);
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Bucket exceeds file bounds" };
+            }
+
             m_view = &view;
             m_bucketOffset = bucketOffset;
             m_bucketSize = bucketSize;
 
             // Initialize B+Tree index
+            if (!m_index) {
+                try {
+                    m_index = std::make_unique<SignatureIndex>();
+                }
+                catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"HashBucket", L"Initialize: Failed to allocate index");
+                    return StoreError{ SignatureStoreError::Unknown, 0, "Index allocation failed" };
+                }
+            }
+
             StoreError err = m_index->Initialize(view, bucketOffset, bucketSize);
             if (!err.IsSuccess()) {
                 SS_LOG_ERROR(L"HashBucket", L"Failed to initialize index: %S", err.message.c_str());
                 return err;
             }
 
-            // Create Bloom filter
-            m_bloomFilter = std::make_unique<BloomFilter>(100000, 0.01); // 100K hashes, 1% FPR
+            // Create Bloom filter with proper exception handling
+            try {
+                m_bloomFilter = std::make_unique<BloomFilter>(100000, 0.01); // 100K hashes, 1% FPR
+            }
+            catch (const std::bad_alloc& ex) {
+                SS_LOG_ERROR(L"HashBucket", 
+                    L"Failed to allocate bloom filter: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0, "Bloom filter allocation failed" };
+            }
 
             SS_LOG_INFO(L"HashBucket", L"Initialized bucket for %S",
                 Format::HashTypeToString(m_type));
@@ -198,26 +384,65 @@ namespace ShadowStrike {
             SS_LOG_DEBUG(L"HashBucket", L"CreateNew bucket for %S",
                 Format::HashTypeToString(m_type));
 
+            // Validate inputs
+            if (baseAddress == nullptr) {
+                SS_LOG_ERROR(L"HashBucket", L"CreateNew: Null base address");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Null base address" };
+            }
+
+            if (availableSize == 0) {
+                SS_LOG_ERROR(L"HashBucket", L"CreateNew: Zero available size");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Zero available size" };
+            }
+
             m_bucketOffset = 0;
             m_bucketSize = availableSize;
+            usedSize = 0;  // Initialize output parameter
 
             // Create B+Tree index
+            if (!m_index) {
+                try {
+                    m_index = std::make_unique<SignatureIndex>();
+                }
+                catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"HashBucket", L"CreateNew: Failed to allocate index");
+                    return StoreError{ SignatureStoreError::Unknown, 0, "Index allocation failed" };
+                }
+            }
+
             StoreError err = m_index->CreateNew(baseAddress, availableSize, usedSize);
             if (!err.IsSuccess()) {
+                SS_LOG_ERROR(L"HashBucket", L"CreateNew: Index creation failed: %S", err.message.c_str());
                 return err;
             }
 
             // Create Bloom filter
-            m_bloomFilter = std::make_unique<BloomFilter>(100000, 0.01);
+            try {
+                m_bloomFilter = std::make_unique<BloomFilter>(100000, 0.01);
+            }
+            catch (const std::bad_alloc& ex) {
+                SS_LOG_ERROR(L"HashBucket", 
+                    L"CreateNew: Bloom filter allocation failed: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0, "Bloom filter allocation failed" };
+            }
+
+            SS_LOG_INFO(L"HashBucket", L"Created new bucket for %S, used %llu bytes",
+                Format::HashTypeToString(m_type), usedSize);
 
             return StoreError{ SignatureStoreError::Success };
         }
 
         std::optional<uint64_t> HashBucket::Lookup(const HashValue& hash) const noexcept {
+            // Validate state
+            if (!m_index) {
+                SS_LOG_ERROR(L"HashBucket", L"Lookup: Index not initialized");
+                return std::nullopt;
+            }
+
             m_lookupCount.fetch_add(1, std::memory_order_relaxed);
 
             // Fast path: Bloom filter check
-            uint64_t fastHash = hash.FastHash();
+            const uint64_t fastHash = hash.FastHash();
             if (m_bloomFilter && !m_bloomFilter->MightContain(fastHash)) {
                 m_bloomHits.fetch_add(1, std::memory_order_relaxed);
                 return std::nullopt; // Definitely not present
@@ -225,7 +450,7 @@ namespace ShadowStrike {
 
             m_bloomMisses.fetch_add(1, std::memory_order_relaxed);
 
-            // Slow path: B+Tree lookup
+            // Slow path: B+Tree lookup with read lock
             std::shared_lock<std::shared_mutex> lock(m_rwLock);
             return m_index->LookupByFastHash(fastHash);
         }
@@ -235,12 +460,30 @@ namespace ShadowStrike {
             std::vector<std::optional<uint64_t>>& results
         ) const noexcept {
             results.clear();
-            results.reserve(hashes.size());
+            
+            if (hashes.empty()) {
+                return;
+            }
+
+            // Validate state
+            if (!m_index) {
+                SS_LOG_ERROR(L"HashBucket", L"BatchLookup: Index not initialized");
+                results.resize(hashes.size(), std::nullopt);
+                return;
+            }
+
+            try {
+                results.reserve(hashes.size());
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"HashBucket", L"BatchLookup: Memory allocation failed");
+                return;
+            }
 
             std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
             for (const auto& hash : hashes) {
-                uint64_t fastHash = hash.FastHash();
+                const uint64_t fastHash = hash.FastHash();
 
                 // Bloom filter check
                 if (m_bloomFilter && !m_bloomFilter->MightContain(fastHash)) {
@@ -262,9 +505,15 @@ namespace ShadowStrike {
             const HashValue& hash,
             uint64_t signatureOffset
         ) noexcept {
+            // Validate state
+            if (!m_index) {
+                SS_LOG_ERROR(L"HashBucket", L"Insert: Index not initialized");
+                return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
+            }
+
             std::unique_lock<std::shared_mutex> lock(m_rwLock);
 
-            // Add to Bloom filter
+            // Add to Bloom filter first (cannot fail)
             if (m_bloomFilter) {
                 m_bloomFilter->Add(hash.FastHash());
             }
@@ -274,16 +523,33 @@ namespace ShadowStrike {
         }
 
         StoreError HashBucket::Remove(const HashValue& hash) noexcept {
+            // Validate state
+            if (!m_index) {
+                SS_LOG_ERROR(L"HashBucket", L"Remove: Index not initialized");
+                return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
+            }
+
             std::unique_lock<std::shared_mutex> lock(m_rwLock);
 
-            // Note: Cannot remove from Bloom filter (it's append-only)
-            // Just remove from B+Tree
+            // Note: Cannot remove from Bloom filter (it's append-only by design)
+            // This may cause false positives, but bloom filter is just an optimization
+            // The B+Tree is the authoritative source
             return m_index->Remove(hash);
         }
 
         StoreError HashBucket::BatchInsert(
             std::span<const std::pair<HashValue, uint64_t>> entries
         ) noexcept {
+            if (entries.empty()) {
+                return StoreError{ SignatureStoreError::Success };
+            }
+
+            // Validate state
+            if (!m_index) {
+                SS_LOG_ERROR(L"HashBucket", L"BatchInsert: Index not initialized");
+                return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
+            }
+
             std::unique_lock<std::shared_mutex> lock(m_rwLock);
 
             // Add all to Bloom filter first
@@ -301,7 +567,11 @@ namespace ShadowStrike {
             std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
             BucketStatistics stats{};
-            stats.totalHashes = m_index->GetStatistics().totalEntries;
+            
+            if (m_index) {
+                stats.totalHashes = m_index->GetStatistics().totalEntries;
+            }
+            
             stats.bloomFilterHits = m_bloomHits.load(std::memory_order_relaxed);
             stats.bloomFilterMisses = m_bloomMisses.load(std::memory_order_relaxed);
             stats.indexLookups = m_lookupCount.load(std::memory_order_relaxed);
@@ -319,11 +589,41 @@ namespace ShadowStrike {
         // HASH STORE IMPLEMENTATION
         // ============================================================================
 
-        HashStore::HashStore() {
-            // Initialize performance counter
+        HashStore::HashStore() 
+            : m_databasePath()
+            , m_mappedView{}
+            , m_initialized(false)
+            , m_readOnly(true)
+            , m_buckets()
+            , m_queryCache{}
+            , m_cacheAccessCounter(0)
+            , m_cachingEnabled(true)
+            , m_totalLookups(0)
+            , m_cacheHits(0)
+            , m_cacheMisses(0)
+            , m_totalMatches(0)
+            , m_bloomExpectedElements(1'000'000)
+            , m_bloomFalsePositiveRate(0.01)
+            , m_perfFrequency{}
+        {
+            // Initialize performance counter with fallback
             if (!QueryPerformanceFrequency(&m_perfFrequency)) {
-                SS_LOG_WARN(L"HashStore", L"QueryPerformanceFrequency failed");
-                m_perfFrequency.QuadPart = 1000000; // Fallback
+                SS_LOG_WARN(L"HashStore", L"QueryPerformanceFrequency failed, using fallback");
+                m_perfFrequency.QuadPart = 1000000; // 1MHz fallback
+            }
+            
+            // Validate frequency is reasonable
+            if (m_perfFrequency.QuadPart <= 0) {
+                SS_LOG_ERROR(L"HashStore", L"Invalid performance frequency, using fallback");
+                m_perfFrequency.QuadPart = 1000000;
+            }
+
+            // Initialize cache entries to safe defaults
+            for (auto& entry : m_queryCache) {
+                entry.seqlock.store(0, std::memory_order_relaxed);
+                entry.hash = HashValue{};
+                entry.result = std::nullopt;
+                entry.timestamp = 0;
             }
         }
 
@@ -338,8 +638,24 @@ namespace ShadowStrike {
             SS_LOG_INFO(L"HashStore", L"Initialize: %s (%s)",
                 databasePath.c_str(), readOnly ? L"read-only" : L"read-write");
 
+            // Validate input
+            if (databasePath.empty()) {
+                SS_LOG_ERROR(L"HashStore", L"Initialize: Empty database path");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty database path" };
+            }
+
+            // Check for double initialization
             if (m_initialized.load(std::memory_order_acquire)) {
-                SS_LOG_WARN(L"HashStore", L"Already initialized");
+                SS_LOG_WARN(L"HashStore", L"Already initialized, call Close() first");
+                return StoreError{ SignatureStoreError::Success };
+            }
+
+            // Acquire exclusive lock for initialization
+            std::unique_lock<std::shared_mutex> lock(m_globalLock);
+
+            // Double-check after acquiring lock
+            if (m_initialized.load(std::memory_order_relaxed)) {
+                SS_LOG_WARN(L"HashStore", L"Already initialized (race condition avoided)");
                 return StoreError{ SignatureStoreError::Success };
             }
 
@@ -372,11 +688,35 @@ namespace ShadowStrike {
             SS_LOG_INFO(L"HashStore", L"CreateNew: %s (size=%llu)",
                 databasePath.c_str(), initialSizeBytes);
 
-            // Create file
+            // Input validation
+            if (databasePath.empty()) {
+                SS_LOG_ERROR(L"HashStore", L"CreateNew: Empty database path");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty database path" };
+            }
+
+            // Size validation - enforce reasonable bounds
+            constexpr uint64_t MIN_DB_SIZE = 1024 * 1024;           // 1MB minimum
+            constexpr uint64_t MAX_DB_SIZE = 100ULL * 1024 * 1024 * 1024;  // 100GB maximum
+
+            if (initialSizeBytes < MIN_DB_SIZE) {
+                SS_LOG_WARN(L"HashStore", 
+                    L"CreateNew: Size %llu too small, using minimum %llu", 
+                    initialSizeBytes, MIN_DB_SIZE);
+                initialSizeBytes = MIN_DB_SIZE;
+            }
+
+            if (initialSizeBytes > MAX_DB_SIZE) {
+                SS_LOG_ERROR(L"HashStore", 
+                    L"CreateNew: Size %llu exceeds maximum %llu", 
+                    initialSizeBytes, MAX_DB_SIZE);
+                return StoreError{ SignatureStoreError::TooLarge, 0, "Database size exceeds maximum" };
+            }
+
+            // Create file with proper error handling
             HANDLE hFile = CreateFileW(
                 databasePath.c_str(),
                 GENERIC_READ | GENERIC_WRITE,
-                0,
+                0,  // No sharing during creation
                 nullptr,
                 CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
@@ -389,36 +729,70 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::FileNotFound, err, "Failed to create file" };
             }
 
-            // Set file size
+            // Set file size - use RAII wrapper for handle cleanup
+            struct HandleGuard {
+                HANDLE h;
+                ~HandleGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+            } guard{hFile};
+
             LARGE_INTEGER size{};
-            size.QuadPart = initialSizeBytes;
-            if (!SetFilePointerEx(hFile, size, nullptr, FILE_BEGIN) ||
-                !SetEndOfFile(hFile)) {
+            size.QuadPart = static_cast<LONGLONG>(initialSizeBytes);
+            
+            if (!SetFilePointerEx(hFile, size, nullptr, FILE_BEGIN)) {
                 DWORD err = GetLastError();
-                CloseHandle(hFile);
+                SS_LOG_LAST_ERROR(L"HashStore", L"Failed to set file pointer");
+                return StoreError{ SignatureStoreError::Unknown, err, "Failed to set file pointer" };
+            }
+
+            if (!SetEndOfFile(hFile)) {
+                DWORD err = GetLastError();
                 SS_LOG_LAST_ERROR(L"HashStore", L"Failed to set file size");
                 return StoreError{ SignatureStoreError::Unknown, err, "Failed to set file size" };
             }
 
+            // Close handle before Initialize opens it again
             CloseHandle(hFile);
+            guard.h = INVALID_HANDLE_VALUE;  // Prevent double-close
 
             // Initialize with memory mapping
             return Initialize(databasePath, false);
         }
 
         void HashStore::Close() noexcept {
+            // Fast check without lock
             if (!m_initialized.load(std::memory_order_acquire)) {
                 return;
             }
 
             SS_LOG_INFO(L"HashStore", L"Closing hash store");
 
+            // Acquire exclusive lock for safe shutdown
             std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
+            // Double-check after acquiring lock
+            if (!m_initialized.load(std::memory_order_relaxed)) {
+                return;
+            }
+
+            // Clear buckets first (releases index resources)
             m_buckets.clear();
+
+            // Close memory mapping
             CloseMemoryMapping();
 
+            // Clear cache
+            for (auto& entry : m_queryCache) {
+                entry.seqlock.store(0, std::memory_order_relaxed);
+                entry.hash = HashValue{};
+                entry.result = std::nullopt;
+                entry.timestamp = 0;
+            }
+
+            // Reset state
+            m_databasePath.clear();
             m_initialized.store(false, std::memory_order_release);
+
+            SS_LOG_INFO(L"HashStore", L"Hash store closed");
         }
 
         // ============================================================================
@@ -426,16 +800,25 @@ namespace ShadowStrike {
         // ============================================================================
 
         std::optional<DetectionResult> HashStore::LookupHash(const HashValue& hash) const noexcept {
+            // Validate initialization state
             if (!m_initialized.load(std::memory_order_acquire)) {
+                return std::nullopt;
+            }
+
+            // Validate hash input
+            if (hash.length == 0 || hash.length > 64) {
+                SS_LOG_DEBUG(L"HashStore", L"LookupHash: Invalid hash length %u", hash.length);
                 return std::nullopt;
             }
 
             m_totalLookups.fetch_add(1, std::memory_order_relaxed);
 
-            LARGE_INTEGER startTime;
-            QueryPerformanceCounter(&startTime);
+            LARGE_INTEGER startTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
 
-            // Check cache first
+            // Check cache first (lock-free using SeqLock)
             if (m_cachingEnabled.load(std::memory_order_acquire)) {
                 auto cached = GetFromCache(hash);
                 if (cached.has_value()) {
@@ -445,15 +828,20 @@ namespace ShadowStrike {
                 m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
             }
 
+            // Acquire read lock for bucket access
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
             // Lookup in appropriate bucket
             const HashBucket* bucket = GetBucket(hash.type);
             if (!bucket) {
+                SS_LOG_DEBUG(L"HashStore", L"LookupHash: No bucket for hash type %u", 
+                    static_cast<uint8_t>(hash.type));
                 return std::nullopt;
             }
 
             auto signatureOffset = bucket->Lookup(hash);
             if (!signatureOffset.has_value()) {
-                // Cache negative result
+                // Cache negative result to avoid repeated lookups
                 if (m_cachingEnabled.load(std::memory_order_acquire)) {
                     AddToCache(hash, std::nullopt);
                 }
@@ -464,10 +852,12 @@ namespace ShadowStrike {
             DetectionResult result = BuildDetectionResult(hash, *signatureOffset);
 
             // Performance tracking
-            LARGE_INTEGER endTime;
-            QueryPerformanceCounter(&endTime);
-            result.matchTimeNanoseconds =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000000ULL) / m_perfFrequency.QuadPart;
+            LARGE_INTEGER endTime{};
+            if (QueryPerformanceCounter(&endTime) && m_perfFrequency.QuadPart > 0) {
+                result.matchTimeNanoseconds =
+                    ((endTime.QuadPart - startTime.QuadPart) * 1000000000ULL) / 
+                    static_cast<uint64_t>(m_perfFrequency.QuadPart);
+            }
 
             // Cache result
             if (m_cachingEnabled.load(std::memory_order_acquire)) {
@@ -481,6 +871,21 @@ namespace ShadowStrike {
             const std::string& hashStr,
             HashType type
         ) const noexcept {
+            // Validate input string
+            if (hashStr.empty()) {
+                SS_LOG_ERROR(L"HashStore", L"LookupHashString: Empty hash string");
+                return std::nullopt;
+            }
+
+            // Limit string length to prevent DoS
+            constexpr size_t MAX_HASH_STRING_LEN = 256;
+            if (hashStr.length() > MAX_HASH_STRING_LEN) {
+                SS_LOG_ERROR(L"HashStore", 
+                    L"LookupHashString: Hash string too long (%zu > %zu)", 
+                    hashStr.length(), MAX_HASH_STRING_LEN);
+                return std::nullopt;
+            }
+
             auto hash = Format::ParseHashString(hashStr, type);
             if (!hash.has_value()) {
                 SS_LOG_ERROR(L"HashStore", L"Failed to parse hash string: %S", hashStr.c_str());
@@ -495,16 +900,51 @@ namespace ShadowStrike {
             const QueryOptions& options
         ) const noexcept {
             std::vector<DetectionResult> results;
-            results.reserve(hashes.size());
+            
+            // Early exit for empty input
+            if (hashes.empty()) {
+                return results;
+            }
+
+            // DoS protection - limit batch size
+            constexpr size_t MAX_BATCH_LOOKUP_SIZE = 100000;
+            const size_t limitedSize = std::min(hashes.size(), MAX_BATCH_LOOKUP_SIZE);
+            
+            if (hashes.size() > MAX_BATCH_LOOKUP_SIZE) {
+                SS_LOG_WARN(L"HashStore", 
+                    L"BatchLookup: Batch size %zu exceeds limit, processing first %zu",
+                    hashes.size(), MAX_BATCH_LOOKUP_SIZE);
+            }
+
+            try {
+                results.reserve(std::min(limitedSize, static_cast<size_t>(options.maxResults)));
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"HashStore", L"BatchLookup: Memory allocation failed");
+                return results;
+            }
 
             std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
-            for (const auto& hash : hashes) {
+            for (size_t i = 0; i < limitedSize; ++i) {
+                const auto& hash = hashes[i];
+                
+                // Validate each hash
+                if (hash.length == 0 || hash.length > 64) {
+                    continue;
+                }
+
                 auto result = LookupHash(hash);
                 if (result.has_value()) {
                     // Apply filters
                     if (result->threatLevel >= options.minThreatLevel) {
-                        results.push_back(*result);
+                        try {
+                            results.push_back(*result);
+                        }
+                        catch (const std::bad_alloc&) {
+                            SS_LOG_ERROR(L"HashStore", L"BatchLookup: Memory allocation failed");
+                            break;
+                        }
 
                         if (results.size() >= options.maxResults) {
                             break; // Hit limit
@@ -537,6 +977,7 @@ namespace ShadowStrike {
                 return results;
             }
 
+            // Clamp threshold to valid range
             if (similarityThreshold > 100) {
                 SS_LOG_WARN(L"HashStore",
                     L"FuzzyMatch: Invalid threshold %u, clamping to 100",
@@ -552,10 +993,19 @@ namespace ShadowStrike {
                 similarityThreshold = MIN_THRESHOLD;
             }
 
-            if (hash.length == 0 || hash.length > 64) {
+            // Validate hash length for fuzzy types
+            if (hash.length == 0) {
                 SS_LOG_ERROR(L"HashStore",
-                    L"FuzzyMatch: Invalid hash length %u",
-                    hash.length);
+                    L"FuzzyMatch: Empty hash");
+                return results;
+            }
+
+            // SSDEEP/TLSH can have longer variable-length hashes
+            constexpr uint8_t MAX_FUZZY_HASH_LEN = 128;  // Increased for fuzzy hashes
+            if (hash.length > MAX_FUZZY_HASH_LEN) {
+                SS_LOG_ERROR(L"HashStore",
+                    L"FuzzyMatch: Hash length %u exceeds maximum %u",
+                    hash.length, MAX_FUZZY_HASH_LEN);
                 return results;
             }
 
@@ -582,12 +1032,20 @@ namespace ShadowStrike {
                 return results;
             }
 
+            // Validate bucket has a valid index
+            if (!bucket->m_index) {
+                SS_LOG_ERROR(L"HashStore", L"FuzzyMatch: Bucket index not initialized");
+                return results;
+            }
+
             // ========================================================================
             // STEP 3: PERFORMANCE MONITORING INITIALIZATION
             // ========================================================================
 
-            LARGE_INTEGER startTime;
-            QueryPerformanceCounter(&startTime);
+            LARGE_INTEGER startTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
 
             m_totalLookups.fetch_add(1, std::memory_order_relaxed);
 
@@ -601,24 +1059,35 @@ namespace ShadowStrike {
             // STEP 4: PREPARE HASH FOR COMPARISON (Native Library Format)
             // ========================================================================
 
-            std::array<char, 65> hashBuffer{};
-            std::memcpy(hashBuffer.data(), hash.data.data(), hash.length);
-            hashBuffer[hash.length] = '\0';
+            // Use larger buffer for fuzzy hashes (SSDEEP/TLSH can be longer)
+            std::array<char, 256> hashBuffer{};
+            // Ensure we don't copy more than buffer can hold minus null terminator
+            const size_t maxCopyLen = hashBuffer.size() - 1;
+            const size_t copyLen = std::min(static_cast<size_t>(hash.length), maxCopyLen);
+            if (copyLen > 0 && copyLen <= hash.data.size()) {
+                std::memcpy(hashBuffer.data(), hash.data.data(), copyLen);
+            }
+            hashBuffer[copyLen] = '\0';
 
             const char* hashString = hashBuffer.data();
 
+            // Validate SSDEEP format
             if (hash.type == HashType::SSDEEP) {
-                if (std::count(hashString, hashString + hash.length, ':') != 2) {
+                const size_t colonCount = static_cast<size_t>(
+                    std::count(hashString, hashString + copyLen, ':'));
+                if (colonCount != 2) {
                     SS_LOG_ERROR(L"HashStore",
-                        L"FuzzyMatch: Invalid SSDEEP format (expected 2 colons)");
+                        L"FuzzyMatch: Invalid SSDEEP format (expected 2 colons, found %zu)", 
+                        colonCount);
                     return results;
                 }
             }
             else if (hash.type == HashType::TLSH) {
-                if (hash.length < 70) {
+                // TLSH hashes are typically 70+ characters
+                if (copyLen < 70) {
                     SS_LOG_ERROR(L"HashStore",
-                        L"FuzzyMatch: Invalid TLSH length %u (min 70 chars)",
-                        hash.length);
+                        L"FuzzyMatch: Invalid TLSH length %zu (min 70 chars)",
+                        copyLen);
                     return results;
                 }
             }
@@ -676,6 +1145,9 @@ namespace ShadowStrike {
 
                     // Calculate address: base + offset
                     const uint8_t* dataBase = static_cast<const uint8_t*>(m_mappedView.baseAddress);
+                    if (dataBase == nullptr) {
+                        return true; // Continue with next - invalid state
+                    }
 
                     // Bounds check: offset must be within file
                     if (signatureOffset >= m_mappedView.fileSize) {
@@ -748,12 +1220,21 @@ namespace ShadowStrike {
                 if (hash.type == HashType::SSDEEP) {
                     // Extract blocksize from query hash with exception safety
                     const char* colonPtr = std::strchr(hashString, ':');
-                    if (colonPtr && colonPtr > hashString) {
-                        try {
-                            std::string blockSizeStr(hashString, colonPtr);
-                            // Validate it's a number before parsing
-                            if (!blockSizeStr.empty() && std::all_of(blockSizeStr.begin(), blockSizeStr.end(), ::isdigit)) {
-                                uint32_t queryBlockSize = static_cast<uint32_t>(std::stoul(blockSizeStr));
+                    // Safely compute distance to avoid pointer arithmetic issues
+                    if (colonPtr != nullptr && colonPtr > hashString) {
+                        const size_t blockSizeStrLen = static_cast<size_t>(colonPtr - hashString);
+                        // Limit blocksize string length to prevent allocation DoS
+                        if (blockSizeStrLen > 0 && blockSizeStrLen <= 16) {
+                            try {
+                                std::string blockSizeStr(hashString, blockSizeStrLen);
+                                // Validate it's a number before parsing
+                                if (!blockSizeStr.empty() && 
+                                    std::all_of(blockSizeStr.begin(), blockSizeStr.end(), 
+                                        [](unsigned char c) { return std::isdigit(c); })) {
+                                    unsigned long parsedBlockSize = std::stoul(blockSizeStr);
+                                    // Clamp to uint32_t range
+                                    uint32_t queryBlockSize = (parsedBlockSize <= UINT32_MAX) 
+                                        ? static_cast<uint32_t>(parsedBlockSize) : UINT32_MAX;
 
                                 SS_LOG_DEBUG(L"HashStore",
                                     L"FuzzyMatch: SSDEEP blocksize filter (query=%u)",
@@ -766,35 +1247,48 @@ namespace ShadowStrike {
                                         continue;
                                     }
 
-                                    const char* candidateStr =
-                                        reinterpret_cast<const char*>(candidateHash.data.data());
-                                    const char* candidateColon = static_cast<const char*>(
-                                        std::memchr(candidateStr, ':', candidateHash.length));
+                                        const char* candidateStr =
+                                            reinterpret_cast<const char*>(candidateHash.data.data());
+                                        // Use safe memchr instead of strchr on non-null-terminated data
+                                        const void* colonVoid = std::memchr(candidateStr, ':', candidateHash.length);
+                                        const char* candidateColon = static_cast<const char*>(colonVoid);
 
-                                    if (candidateColon && candidateColon > candidateStr) {
-                                        try {
-                                            std::string candBlockSizeStr(candidateStr, candidateColon);
-                                            if (!candBlockSizeStr.empty() && std::all_of(candBlockSizeStr.begin(), candBlockSizeStr.end(), ::isdigit)) {
-                                                uint32_t candBlockSize = static_cast<uint32_t>(std::stoul(candBlockSizeStr));
+                                        if (candidateColon != nullptr && candidateColon > candidateStr) {
+                                            const size_t candBlockSizeStrLen = static_cast<size_t>(candidateColon - candidateStr);
+                                            // Limit parsed string length
+                                            if (candBlockSizeStrLen > 0 && candBlockSizeStrLen <= 16) {
+                                                try {
+                                                    std::string candBlockSizeStr(candidateStr, candBlockSizeStrLen);
+                                                    if (!candBlockSizeStr.empty() && 
+                                                        std::all_of(candBlockSizeStr.begin(), candBlockSizeStr.end(),
+                                                            [](unsigned char c) { return std::isdigit(c); })) {
+                                                        unsigned long parsedCandBlockSize = std::stoul(candBlockSizeStr);
+                                                        uint32_t candBlockSize = (parsedCandBlockSize <= UINT32_MAX)
+                                                            ? static_cast<uint32_t>(parsedCandBlockSize) : UINT32_MAX;
 
-                                                if (candBlockSize >= queryBlockSize / 2 &&
-                                                    candBlockSize <= queryBlockSize * 2) {
-                                                    filteredCandidates.emplace_back(offset, candidateHash);
+                                                        // Safe comparison avoiding overflow
+                                                        const uint32_t halfQuery = queryBlockSize / 2;
+                                                        const uint32_t doubleQuery = (queryBlockSize <= UINT32_MAX / 2)
+                                                            ? queryBlockSize * 2 : UINT32_MAX;
+                                                        if (candBlockSize >= halfQuery &&
+                                                            candBlockSize <= doubleQuery) {
+                                                            filteredCandidates.emplace_back(offset, candidateHash);
+                                                        }
+                                                    }
+                                                }
+                                                catch (...) {
+                                                    // Skip invalid candidate, continue with others
                                                 }
                                             }
-                                        }
-                                        catch (...) {
-                                            // Skip invalid candidate, continue with others
-                                            continue;
                                         }
                                     }
                                 }
                             }
-                        }
-                        catch (const std::exception& ex) {
-                            SS_LOG_WARN(L"HashStore",
-                                L"FuzzyMatch: Failed to parse SSDEEP blocksize: %S", ex.what());
-                            // Fall through without filtering
+                            catch (const std::exception& ex) {
+                                SS_LOG_WARN(L"HashStore",
+                                    L"FuzzyMatch: Failed to parse SSDEEP blocksize: %S", ex.what());
+                                // Fall through without filtering
+                            }
                         }
                     }
                 }
@@ -872,10 +1366,16 @@ namespace ShadowStrike {
                 // PREPARE CANDIDATE HASH FOR COMPARISON
                 // ====================================================================
 
-                std::array<char, 65> candidateBuffer{};
-                std::memcpy(candidateBuffer.data(), candidateHash.data.data(),
-                    candidateHash.length);
-                candidateBuffer[candidateHash.length] = '\0';
+                // Use larger buffer for fuzzy hashes
+                std::array<char, 256> candidateBuffer{};
+                const size_t candCopyLen = std::min(
+                    static_cast<size_t>(candidateHash.length), 
+                    candidateBuffer.size() - 1);
+                if (candCopyLen > 0 && candCopyLen <= candidateHash.data.size()) {
+                    std::memcpy(candidateBuffer.data(), candidateHash.data.data(),
+                        candCopyLen);
+                }
+                candidateBuffer[candCopyLen] = '\0';
 
                 const char* candidateString = candidateBuffer.data();
 
@@ -1025,20 +1525,40 @@ namespace ShadowStrike {
             // STEP 8: PERFORMANCE METRICS & LOGGING
             // ========================================================================
 
-            LARGE_INTEGER endTime;
+            LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
-            uint64_t totalTimeUs =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            
+            uint64_t totalTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                // Guard against overflow: elapsed * 1000000 could overflow
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    totalTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    // Large elapsed time - use different calculation order
+                    totalTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
-            double avgComputeTimeUs = (candidatesScanned > 0) ?
-                (static_cast<double>(totalComputeTimeUs) / candidatesScanned) : 0.0;
+            // Calculate metrics with division-by-zero protection
+            double avgComputeTimeUs = 0.0;
+            if (candidatesScanned > 0) {
+                avgComputeTimeUs = static_cast<double>(totalComputeTimeUs) / 
+                                   static_cast<double>(candidatesScanned);
+            }
 
-            double throughputPerSec = (totalTimeUs > 0) ?
-                (static_cast<double>(candidatesScanned) / (totalTimeUs / 1'000'000.0)) : 0.0;
+            double throughputPerSec = 0.0;
+            if (totalTimeUs > 0) {
+                throughputPerSec = static_cast<double>(candidatesScanned) / 
+                                   (static_cast<double>(totalTimeUs) / 1'000'000.0);
+            }
 
-            double bloomEfficiency = (candidatesScanned > 0) ?
-                (static_cast<double>(bloomFilterRejections) / candidatesScanned * 100.0) : 0.0;
+            double bloomEfficiency = 0.0;
+            if (candidatesScanned > 0) {
+                bloomEfficiency = (static_cast<double>(bloomFilterRejections) / 
+                                   static_cast<double>(candidatesScanned)) * 100.0;
+            }
 
             SS_LOG_INFO(L"HashStore",
                 L"FuzzyMatch: COMPLETE - %zu matches from %zu candidates in %llu µs "
@@ -1254,8 +1774,10 @@ namespace ShadowStrike {
             // STEP 4: INSERTION - Atomic Operation
             // ====================================================================
 
-            LARGE_INTEGER startTime;
-            QueryPerformanceCounter(&startTime);
+            LARGE_INTEGER startTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
 
             // Insert into B+Tree index
             // Note: In production, this would allocate storage for the full entry
@@ -1273,10 +1795,21 @@ namespace ShadowStrike {
             // STEP 5: STATISTICS UPDATE
             // ====================================================================
 
-            LARGE_INTEGER endTime;
-            QueryPerformanceCounter(&endTime);
-            uint64_t insertTimeUs =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+            LARGE_INTEGER endTime{};
+            if (!QueryPerformanceCounter(&endTime)) {
+                endTime.QuadPart = startTime.QuadPart;
+            }
+            
+            uint64_t insertTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    insertTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    insertTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
             // Update statistics (thread-safe atomic operations)
             m_totalLookups.fetch_add(1, std::memory_order_relaxed);
@@ -1416,8 +1949,10 @@ namespace ShadowStrike {
             // STEP 4: BATCH INSERT BY TYPE
             // ====================================================================
 
-            LARGE_INTEGER batchStartTime;
-            QueryPerformanceCounter(&batchStartTime);
+            LARGE_INTEGER batchStartTime{};
+            if (!QueryPerformanceCounter(&batchStartTime)) {
+                batchStartTime.QuadPart = 0;
+            }
 
             size_t successCount = 0;
             size_t failureCount = 0;
@@ -1494,14 +2029,29 @@ namespace ShadowStrike {
             // STEP 5: PERFORMANCE LOGGING & STATISTICS
             // ====================================================================
 
-            LARGE_INTEGER batchEndTime;
-            QueryPerformanceCounter(&batchEndTime);
-            uint64_t batchTimeUs =
-                ((batchEndTime.QuadPart - batchStartTime.QuadPart) * 1000000ULL)
-                / m_perfFrequency.QuadPart;
+            LARGE_INTEGER batchEndTime{};
+            if (!QueryPerformanceCounter(&batchEndTime)) {
+                batchEndTime.QuadPart = batchStartTime.QuadPart;
+            }
+            
+            uint64_t batchTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && batchEndTime.QuadPart >= batchStartTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(batchEndTime.QuadPart - batchStartTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    batchTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    batchTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
-            double throughput = (successCount > 0) ?
-                (static_cast<double>(successCount) / (batchTimeUs / 1000000.0)) : 0.0;
+            double throughput = 0.0;
+            if (successCount > 0 && batchTimeUs > 0) {
+                const double seconds = static_cast<double>(batchTimeUs) / 1000000.0;
+                if (seconds > 0.0) {
+                    throughput = static_cast<double>(successCount) / seconds;
+                }
+            }
 
             SS_LOG_INFO(L"HashStore",
                 L"AddHashBatch: Completed - Success: %zu, Failed: %zu, "
@@ -1791,8 +2341,10 @@ namespace ShadowStrike {
             // STEP 4: LOOKUP HASH IN INDEX
             // ========================================================================
 
-            LARGE_INTEGER startTime;
-            QueryPerformanceCounter(&startTime);
+            LARGE_INTEGER startTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
 
             auto signatureOffset = bucket->Lookup(hash);
             if (!signatureOffset.has_value()) {
@@ -1812,10 +2364,21 @@ namespace ShadowStrike {
 
             // Calculate tags serialization size (JSON array format)
             for (const auto& tag : newTags) {
-                tagsSize += tag.length() + 4;  // tag + quotes + comma/bracket
+                // Protect against overflow when summing tag sizes
+                const size_t tagContribution = tag.length() + 4;  // tag + quotes + comma/bracket
+                if (tagsSize <= SIZE_MAX - tagContribution) {
+                    tagsSize += tagContribution;
+                }
             }
 
-            size_t totalMetadataSize = descriptionSize + tagsSize + 50;  // 50 for overhead
+            // Protect against overflow when calculating total size
+            size_t totalMetadataSize = 0;
+            if (descriptionSize <= SIZE_MAX - tagsSize &&
+                descriptionSize + tagsSize <= SIZE_MAX - 50) {
+                totalMetadataSize = descriptionSize + tagsSize + 50;  // 50 for overhead
+            } else {
+                totalMetadataSize = SIZE_MAX;  // Will trigger the size check below
+            }
 
             // Validate total size
             constexpr size_t MAX_TOTAL_METADATA_SIZE = 20000;
@@ -1831,8 +2394,15 @@ namespace ShadowStrike {
             // STEP 6: SERIALIZE METADATA
             // ========================================================================
 
-            // Create metadata JSON
-            std::string metadataJson = "{";
+            // Pre-allocate with reasonable estimate to avoid reallocations
+            std::string metadataJson;
+            try {
+                metadataJson.reserve(totalMetadataSize + 100);
+            } catch (const std::exception&) {
+                return StoreError{ SignatureStoreError::Unknown, 0, "Memory allocation failed" };
+            }
+            
+            metadataJson = "{";
 
             // Add description
             metadataJson += "\"description\":\"";
@@ -1846,7 +2416,7 @@ namespace ShadowStrike {
                 case '\t': metadataJson += "\\t";  break;
                 default:
                     if (ch >= 0x20) {
-                        metadataJson += ch;
+                        metadataJson += static_cast<char>(ch);
                     }
                 }
             }
@@ -1863,7 +2433,7 @@ namespace ShadowStrike {
             metadataJson += "],";
 
             // Add timestamp
-            auto now = std::time(nullptr);
+            const auto now = std::time(nullptr);
             metadataJson += "\"updated_at\":" + std::to_string(now);
 
             metadataJson += "}";
@@ -1872,10 +2442,21 @@ namespace ShadowStrike {
             // STEP 7: UPDATE STATISTICS & AUDIT LOG
             // ========================================================================
 
-            LARGE_INTEGER endTime;
-            QueryPerformanceCounter(&endTime);
-            uint64_t updateTimeUs =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+            LARGE_INTEGER endTime{};
+            if (!QueryPerformanceCounter(&endTime)) {
+                endTime.QuadPart = startTime.QuadPart;
+            }
+            
+            uint64_t updateTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    updateTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    updateTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
             // Log audit trail
             SS_LOG_INFO(L"HashStore",
@@ -2042,8 +2623,10 @@ namespace ShadowStrike {
                 file << "# Filter: " << Format::HashTypeToString(typeFilter) << "\n\n";
 
                 size_t exportedCount = 0;
-                LARGE_INTEGER startTime, endTime;
-                QueryPerformanceCounter(&startTime);
+                LARGE_INTEGER startTime{}, endTime{};
+                if (!QueryPerformanceCounter(&startTime)) {
+                    startTime.QuadPart = 0;
+                }
 
                 for (const auto& [bucketType, bucket] : m_buckets) {
                     if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
@@ -2054,17 +2637,23 @@ namespace ShadowStrike {
                         [&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
                             const uint8_t* dataBase =
                                 static_cast<const uint8_t*>(m_mappedView.baseAddress);
+                            
+                            // Null pointer check
+                            if (dataBase == nullptr) {
+                                return true; // Continue to next
+                            }
 
                             if (signatureOffset >= m_mappedView.fileSize) {
                                 return true;
                             }
 
-                            const HashValue* hashPtr =
-                                reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
-
-                            if (signatureOffset + sizeof(HashValue) > m_mappedView.fileSize) {
+                            // Bounds check before dereferencing
+                            if (signatureOffset > m_mappedView.fileSize - sizeof(HashValue)) {
                                 return true;
                             }
+
+                            const HashValue* hashPtr =
+                                reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
 
                             if (hashPtr->length == 0 || hashPtr->length > 64) {
                                 return true;
@@ -2083,9 +2672,20 @@ namespace ShadowStrike {
                         });
                 }
 
-                QueryPerformanceCounter(&endTime);
-                uint64_t exportTimeUs =
-                    ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+                if (!QueryPerformanceCounter(&endTime)) {
+                    endTime.QuadPart = startTime.QuadPart;
+                }
+                
+                uint64_t exportTimeUs = 0;
+                if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                    const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                    const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                    if (elapsed <= UINT64_MAX / 1000000ULL) {
+                        exportTimeUs = (elapsed * 1000000ULL) / freq;
+                    } else {
+                        exportTimeUs = (elapsed / freq) * 1000000ULL;
+                    }
+                }
 
                 file << "\n# Total exported: " << exportedCount << " hashes\n";
                 file << "# Export time: " << exportTimeUs << " microseconds\n";
@@ -2154,11 +2754,24 @@ namespace ShadowStrike {
             std::vector<std::string> names;
             std::vector<ThreatLevel> levels;
 
-            LARGE_INTEGER startTime, endTime;
-            QueryPerformanceCounter(&startTime);
+            LARGE_INTEGER startTime{}, endTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
 
             size_t validCount = 0;
             size_t invalidCount = 0;
+
+            // Pre-allocate vectors to reduce reallocations
+            const size_t expectedSize = hashesArray.size();
+            try {
+                hashes.reserve(expectedSize);
+                names.reserve(expectedSize);
+                levels.reserve(expectedSize);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromJson: Memory allocation failed");
+                return StoreError{ SignatureStoreError::Unknown, 0, "Memory allocation failed" };
+            }
 
             for (size_t i = 0; i < hashesArray.size(); ++i) {
                 const Json& entry = hashesArray[i];
@@ -2217,7 +2830,7 @@ namespace ShadowStrike {
                     }
 
                     hashes.push_back(*parsedHash);
-                    names.push_back(name);
+                    names.push_back(std::move(name));
                     levels.push_back(static_cast<ThreatLevel>(threatLevelInt));
                     validCount++;
                 }
@@ -2230,9 +2843,20 @@ namespace ShadowStrike {
                 }
             }
 
-            QueryPerformanceCounter(&endTime);
-            uint64_t parseTimeUs =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+            if (!QueryPerformanceCounter(&endTime)) {
+                endTime.QuadPart = startTime.QuadPart;
+            }
+            
+            uint64_t parseTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    parseTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    parseTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
             if (validCount == 0) {
                 SS_LOG_ERROR(L"HashStore",
@@ -2286,11 +2910,19 @@ namespace ShadowStrike {
 
             Json hashesArray = Json::array();
 
-            LARGE_INTEGER startTime, endTime;
-            QueryPerformanceCounter(&startTime);
+            LARGE_INTEGER startTime{}, endTime{};
+            if (!QueryPerformanceCounter(&startTime)) {
+                startTime.QuadPart = 0;
+            }
 
             size_t exportCount = 0;
             const uint8_t* dataBase = static_cast<const uint8_t*>(m_mappedView.baseAddress);
+            
+            // Early exit if base address is null
+            if (dataBase == nullptr) {
+                SS_LOG_ERROR(L"HashStore", L"ExportToJson: Memory-mapped base address is null");
+                return "{}";
+            }
 
             for (const auto& [bucketType, bucket] : m_buckets) {
                 if (typeFilter != HashType::MD5 && bucketType != typeFilter) {
@@ -2307,12 +2939,13 @@ namespace ShadowStrike {
                             return true;
                         }
 
-                        const HashValue* hashPtr =
-                            reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
-
-                        if (signatureOffset + sizeof(HashValue) > m_mappedView.fileSize) {
+                        // Bounds check before dereferencing
+                        if (signatureOffset > m_mappedView.fileSize - sizeof(HashValue)) {
                             return true;
                         }
+
+                        const HashValue* hashPtr =
+                            reinterpret_cast<const HashValue*>(dataBase + signatureOffset);
 
                         if (hashPtr->length == 0 || hashPtr->length > 64) {
                             return true;
@@ -2338,9 +2971,20 @@ namespace ShadowStrike {
                 }
             }
 
-            QueryPerformanceCounter(&endTime);
-            uint64_t exportTimeUs =
-                ((endTime.QuadPart - startTime.QuadPart) * 1000000ULL) / m_perfFrequency.QuadPart;
+            if (!QueryPerformanceCounter(&endTime)) {
+                endTime.QuadPart = startTime.QuadPart;
+            }
+            
+            uint64_t exportTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && endTime.QuadPart >= startTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(endTime.QuadPart - startTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    exportTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    exportTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
             exportRoot["hashes"] = hashesArray;
             exportRoot["count"] = exportCount;
@@ -2384,21 +3028,51 @@ namespace ShadowStrike {
             stats.cacheHits = m_cacheHits.load(std::memory_order_relaxed);
             stats.cacheMisses = m_cacheMisses.load(std::memory_order_relaxed);
 
-            uint64_t total = stats.cacheHits + stats.cacheMisses;
-            if (total > 0) {
-                stats.cacheHitRate = static_cast<double>(stats.cacheHits) / total;
+            // Calculate cache hit rate with division-by-zero protection
+            const uint64_t totalCacheAccesses = stats.cacheHits + stats.cacheMisses;
+            if (totalCacheAccesses > 0) {
+                stats.cacheHitRate = static_cast<double>(stats.cacheHits) / 
+                                     static_cast<double>(totalCacheAccesses);
+            } else {
+                stats.cacheHitRate = 0.0;
             }
 
             // Count hashes by type
+            stats.totalHashes = 0;
+            stats.bloomFilterSaves = 0;
+            
             for (const auto& [type, bucket] : m_buckets) {
-                auto bucketStats = bucket->GetStatistics();
-                stats.countsByType[type] = bucketStats.totalHashes;
-                stats.totalHashes += bucketStats.totalHashes;
-                stats.bloomFilterSaves += bucketStats.bloomFilterHits;
+                if (!bucket) {
+                    continue;
+                }
+                
+                try {
+                    auto bucketStats = bucket->GetStatistics();
+                    stats.countsByType[type] = bucketStats.totalHashes;
+                    stats.totalHashes += bucketStats.totalHashes;
+                    stats.bloomFilterSaves += bucketStats.bloomFilterHits;
+                }
+                catch (const std::exception& ex) {
+                    SS_LOG_ERROR(L"HashStore", 
+                        L"GetStatistics: Error getting bucket stats for type %u: %S",
+                        static_cast<uint8_t>(type), ex.what());
+                }
+            }
+
+            // Calculate bloom filter efficiency with division-by-zero protection
+            const uint64_t totalBloomChecks = stats.bloomFilterSaves + 
+                                              (stats.totalLookups - stats.bloomFilterSaves);
+            if (totalBloomChecks > 0) {
+                stats.bloomFilterEfficiency = static_cast<double>(stats.bloomFilterSaves) /
+                                              static_cast<double>(totalBloomChecks);
+            } else {
+                stats.bloomFilterEfficiency = 0.0;
             }
 
             if (m_mappedView.IsValid()) {
                 stats.databaseSizeBytes = m_mappedView.fileSize;
+            } else {
+                stats.databaseSizeBytes = 0;
             }
 
             return stats;
@@ -2408,9 +3082,13 @@ namespace ShadowStrike {
             m_totalLookups.store(0, std::memory_order_release);
             m_cacheHits.store(0, std::memory_order_release);
             m_cacheMisses.store(0, std::memory_order_release);
+            m_totalMatches.store(0, std::memory_order_release);
 
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
             for (auto& [type, bucket] : m_buckets) {
-                bucket->ResetStatistics();
+                if (bucket) {
+                    bucket->ResetStatistics();
+                }
             }
         }
 
@@ -2419,6 +3097,9 @@ namespace ShadowStrike {
 
             const HashBucket* bucket = GetBucket(type);
             if (!bucket) {
+                SS_LOG_DEBUG(L"HashStore", 
+                    L"GetBucketStatistics: No bucket for type %u", 
+                    static_cast<uint8_t>(type));
                 return HashBucket::BucketStatistics{};
             }
 
@@ -2454,8 +3135,10 @@ namespace ShadowStrike {
             // STEP 3: PERFORMANCE MONITORING SETUP
             // ========================================================================
 
-            LARGE_INTEGER rebuildStartTime, rebuildEndTime;
-            QueryPerformanceCounter(&rebuildStartTime);
+            LARGE_INTEGER rebuildStartTime{}, rebuildEndTime{};
+            if (!QueryPerformanceCounter(&rebuildStartTime)) {
+                rebuildStartTime.QuadPart = 0;
+            }
 
             size_t totalHashesProcessed = 0;
             size_t totalBucketsRebuilt = 0;
@@ -2694,10 +3377,20 @@ namespace ShadowStrike {
             // STEP 10: PERFORMANCE ANALYSIS & VALIDATION
             // ========================================================================
 
-            QueryPerformanceCounter(&rebuildEndTime);
-            uint64_t rebuildTimeUs =
-                ((rebuildEndTime.QuadPart - rebuildStartTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            if (!QueryPerformanceCounter(&rebuildEndTime)) {
+                rebuildEndTime.QuadPart = rebuildStartTime.QuadPart;
+            }
+            
+            uint64_t rebuildTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && rebuildEndTime.QuadPart >= rebuildStartTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(rebuildEndTime.QuadPart - rebuildStartTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    rebuildTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    rebuildTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
             auto statsAfterRebuild = GetStatistics();
 
@@ -2761,8 +3454,10 @@ namespace ShadowStrike {
             // STEP 3: PERFORMANCE MONITORING
             // ========================================================================
 
-            LARGE_INTEGER compactStartTime, compactEndTime;
-            QueryPerformanceCounter(&compactStartTime);
+            LARGE_INTEGER compactStartTime{}, compactEndTime{};
+            if (!QueryPerformanceCounter(&compactStartTime)) {
+                compactStartTime.QuadPart = 0;
+            }
 
             auto statsBefore = GetStatistics();
 
@@ -2966,11 +3661,12 @@ namespace ShadowStrike {
             }
 
             if (m_mappedView.IsValid()) {
-                StoreError mmapFlush{};
-                if (m_mappedView.IsValid()) {
-                    StoreError mmapFlush{};
-                    auto ret = MemoryMapping::FlushView(m_mappedView, mmapFlush);
-                    (void)ret; 
+                StoreError mmapFlushErr{};
+                auto ret = MemoryMapping::FlushView(m_mappedView, mmapFlushErr);
+                if (!ret) {
+                    SS_LOG_WARN(L"HashStore", 
+                        L"Compact: Failed to flush memory-mapped view: %S",
+                        mmapFlushErr.message.c_str());
                 }
             }
 
@@ -2985,10 +3681,20 @@ namespace ShadowStrike {
             // STEP 10: FINAL STATISTICS & PERFORMANCE REPORTING
             // ========================================================================
 
-            QueryPerformanceCounter(&compactEndTime);
-            uint64_t compactTimeUs =
-                ((compactEndTime.QuadPart - compactStartTime.QuadPart) * 1000000ULL) /
-                m_perfFrequency.QuadPart;
+            if (!QueryPerformanceCounter(&compactEndTime)) {
+                compactEndTime.QuadPart = compactStartTime.QuadPart;
+            }
+            
+            uint64_t compactTimeUs = 0;
+            if (m_perfFrequency.QuadPart > 0 && compactEndTime.QuadPart >= compactStartTime.QuadPart) {
+                const uint64_t elapsed = static_cast<uint64_t>(compactEndTime.QuadPart - compactStartTime.QuadPart);
+                const uint64_t freq = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                if (elapsed <= UINT64_MAX / 1000000ULL) {
+                    compactTimeUs = (elapsed * 1000000ULL) / freq;
+                } else {
+                    compactTimeUs = (elapsed / freq) * 1000000ULL;
+                }
+            }
 
             auto statsAfter = GetStatistics();
 
@@ -3112,15 +3818,35 @@ namespace ShadowStrike {
 
         void HashStore::ClearCache() noexcept {
             // Clear cache using SeqLock protocol to prevent torn reads
+            constexpr int MAX_SPIN_PER_ENTRY = 100;
+            
             for (auto& entry : m_queryCache) {
                 // Acquire write lock (set to odd)
                 uint64_t oldSeq = entry.seqlock.load(std::memory_order_relaxed);
-                while (oldSeq & 1 || !entry.seqlock.compare_exchange_weak(
-                        oldSeq, oldSeq + 1, 
-                        std::memory_order_acquire, 
-                        std::memory_order_relaxed)) {
-                    std::this_thread::yield();
-                    oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+                int spinCount = 0;
+                
+                while (spinCount < MAX_SPIN_PER_ENTRY) {
+                    // Wait if another write is in progress
+                    if (oldSeq & 1) {
+                        std::this_thread::yield();
+                        oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+                        ++spinCount;
+                        continue;
+                    }
+                    
+                    if (entry.seqlock.compare_exchange_weak(
+                            oldSeq, oldSeq + 1, 
+                            std::memory_order_acquire, 
+                            std::memory_order_relaxed)) {
+                        break;
+                    }
+                    ++spinCount;
+                }
+                
+                if (spinCount >= MAX_SPIN_PER_ENTRY) {
+                    // Skip this entry if we can't acquire lock
+                    SS_LOG_DEBUG(L"HashStore", L"ClearCache: Skipped entry due to contention");
+                    continue;
                 }
                 
                 // Clear the entry
@@ -3162,29 +3888,90 @@ void HashStore::CloseMemoryMapping() noexcept {
 StoreError HashStore::InitializeBuckets() noexcept {
     const auto* header = GetHeader();
     if (!header) {
+        SS_LOG_ERROR(L"HashStore", L"InitializeBuckets: Missing or invalid header");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "Missing header"};
     }
 
-    uint64_t bucketOffset = header->hashIndexOffset;
-    uint64_t bucketSize = header->hashIndexSize / 7;
+    // Validate header offsets
+    if (header->hashIndexOffset >= m_mappedView.fileSize) {
+        SS_LOG_ERROR(L"HashStore", 
+            L"InitializeBuckets: Hash index offset %llu exceeds file size %llu",
+            header->hashIndexOffset, m_mappedView.fileSize);
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid hash index offset"};
+    }
 
-    for (uint8_t i = 0; i <= static_cast<uint8_t>(HashType::TLSH); ++i) {
+    if (header->hashIndexSize == 0) {
+        SS_LOG_ERROR(L"HashStore", L"InitializeBuckets: Zero hash index size");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Zero hash index size"};
+    }
+
+    // Calculate number of hash types (TLSH is currently highest enum value)
+    constexpr uint8_t NUM_HASH_TYPES = static_cast<uint8_t>(HashType::TLSH) + 1;
+    
+    // Prevent division by zero
+    if (NUM_HASH_TYPES == 0) {
+        SS_LOG_ERROR(L"HashStore", L"InitializeBuckets: No hash types defined");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "No hash types"};
+    }
+
+    const uint64_t bucketSize = header->hashIndexSize / NUM_HASH_TYPES;
+    
+    if (bucketSize == 0) {
+        SS_LOG_ERROR(L"HashStore", 
+            L"InitializeBuckets: Bucket size too small (indexSize=%llu, types=%u)",
+            header->hashIndexSize, NUM_HASH_TYPES);
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Bucket size too small"};
+    }
+
+    uint64_t bucketOffset = header->hashIndexOffset;
+    size_t bucketsInitialized = 0;
+
+    for (uint8_t i = 0; i < NUM_HASH_TYPES; ++i) {
         HashType type = static_cast<HashType>(i);
         
-        auto bucket = std::make_unique<HashBucket>(type);
-        StoreError err = bucket->Initialize(m_mappedView, bucketOffset, bucketSize);
-        
-        if (!err.IsSuccess()) {
-            SS_LOG_WARN(L"HashStore", L"Failed to initialize bucket for %S",
+        // Bounds check for this bucket
+        if (bucketOffset > m_mappedView.fileSize ||
+            bucketSize > m_mappedView.fileSize - bucketOffset) {
+            SS_LOG_WARN(L"HashStore", 
+                L"InitializeBuckets: Bucket %S exceeds file bounds, skipping",
                 Format::HashTypeToString(type));
             continue;
         }
-
-        m_buckets[type] = std::move(bucket);
+        
+        try {
+            auto bucket = std::make_unique<HashBucket>(type);
+            StoreError err = bucket->Initialize(m_mappedView, bucketOffset, bucketSize);
+            
+            if (!err.IsSuccess()) {
+                SS_LOG_WARN(L"HashStore", L"Failed to initialize bucket for %S: %S",
+                    Format::HashTypeToString(type), err.message.c_str());
+                // Continue with other buckets
+            }
+            else {
+                m_buckets[type] = std::move(bucket);
+                bucketsInitialized++;
+            }
+        }
+        catch (const std::bad_alloc& ex) {
+            SS_LOG_ERROR(L"HashStore", 
+                L"InitializeBuckets: Memory allocation failed for %S: %S",
+                Format::HashTypeToString(type), ex.what());
+        }
+        
+        // Safe offset advancement with overflow check
+        if (bucketOffset > UINT64_MAX - bucketSize) {
+            SS_LOG_ERROR(L"HashStore", L"InitializeBuckets: Offset overflow");
+            break;
+        }
         bucketOffset += bucketSize;
     }
 
-    SS_LOG_INFO(L"HashStore", L"Initialized %zu hash buckets", m_buckets.size());
+    if (bucketsInitialized == 0) {
+        SS_LOG_ERROR(L"HashStore", L"InitializeBuckets: No buckets initialized");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "No buckets initialized"};
+    }
+
+    SS_LOG_INFO(L"HashStore", L"Initialized %zu hash buckets", bucketsInitialized);
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -3203,9 +3990,40 @@ uint64_t HashStore::AllocateSignatureEntry(size_t size) noexcept {
     // Initial offset starts after header pages (100 pages reserved)
     static std::atomic<uint64_t> currentOffset{ PAGE_SIZE * 100 };
     
+    // Validate size
+    if (size == 0) {
+        SS_LOG_ERROR(L"HashStore", L"AllocateSignatureEntry: Zero size requested");
+        return UINT64_MAX;  // Invalid offset
+    }
+    
+    constexpr size_t MAX_ENTRY_SIZE = 1024 * 1024;  // 1MB max per entry
+    if (size > MAX_ENTRY_SIZE) {
+        SS_LOG_ERROR(L"HashStore", 
+            L"AllocateSignatureEntry: Size %zu exceeds maximum %zu", 
+            size, MAX_ENTRY_SIZE);
+        return UINT64_MAX;
+    }
+
     const size_t alignedSize = Format::AlignToPage(size);
+    
+    // Check for overflow before allocation
+    uint64_t current = currentOffset.load(std::memory_order_relaxed);
+    if (current > UINT64_MAX - alignedSize) {
+        SS_LOG_ERROR(L"HashStore", L"AllocateSignatureEntry: Offset overflow");
+        return UINT64_MAX;
+    }
+
     // Atomically reserve space and return the starting offset
     uint64_t offset = currentOffset.fetch_add(alignedSize, std::memory_order_acq_rel);
+    
+    // Verify the allocation is within bounds (if we have a valid file size)
+    if (m_mappedView.IsValid() && offset + alignedSize > m_mappedView.fileSize) {
+        SS_LOG_ERROR(L"HashStore", 
+            L"AllocateSignatureEntry: Allocation exceeds file size (offset=%llu, size=%zu, fileSize=%llu)",
+            offset, alignedSize, m_mappedView.fileSize);
+        return UINT64_MAX;
+    }
+
     return offset;
 }
 
@@ -3215,30 +4033,47 @@ DetectionResult HashStore::BuildDetectionResult(
 ) const noexcept {
     DetectionResult result{};
     result.signatureId = signatureOffset;
-    result.signatureName = "Hash_" + Format::FormatHashString(hash);
     result.threatLevel = ThreatLevel::Medium;
     result.fileOffset = 0;
+    result.matchTimestamp = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    result.matchTimeNanoseconds = 0;
+    
+    // Safely build signature name
+    try {
+        result.signatureName = "Hash_" + Format::FormatHashString(hash);
+    }
+    catch (const std::exception&) {
+        result.signatureName = "Hash_Unknown";
+    }
+    
     result.description = "Known malicious hash";
-    result.matchTimestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    
     return result;
 }
 
 std::optional<DetectionResult> HashStore::GetFromCache(const HashValue& hash) const noexcept {
-    size_t cacheIdx = (hash.FastHash() % CACHE_SIZE);
+    // Validate hash before using it for indexing
+    if (hash.length == 0 || hash.length > 64) {
+        return std::nullopt;
+    }
+
+    const uint64_t fastHash = hash.FastHash();
+    const size_t cacheIdx = static_cast<size_t>(fastHash % CACHE_SIZE);
     const auto& entry = m_queryCache[cacheIdx];
     
     // SeqLock read: retry if writer is active or sequence changed
-    constexpr int MAX_RETRIES = 3;
+    constexpr int MAX_RETRIES = 5;
     for (int retry = 0; retry < MAX_RETRIES; ++retry) {
         uint64_t seq1 = entry.seqlock.load(std::memory_order_acquire);
         
-        // Odd sequence means write in progress - spin briefly
+        // Odd sequence means write in progress - yield and retry
         if (seq1 & 1) {
             std::this_thread::yield();
             continue;
         }
         
-        // Read the data
+        // Read the data (these are copies, not references)
         HashValue readHash = entry.hash;
         std::optional<DetectionResult> readResult = entry.result;
         
@@ -3262,7 +4097,13 @@ void HashStore::AddToCache(
     const HashValue& hash,
     const std::optional<DetectionResult>& result
 ) const noexcept {
-    size_t cacheIdx = (hash.FastHash() % CACHE_SIZE);
+    // Validate hash before using it for indexing
+    if (hash.length == 0 || hash.length > 64) {
+        return;
+    }
+
+    const uint64_t fastHash = hash.FastHash();
+    const size_t cacheIdx = static_cast<size_t>(fastHash % CACHE_SIZE);
     auto& entry = m_queryCache[cacheIdx];
     
     // SeqLock write: increment to odd (writing), write data, increment to even (done)
@@ -3270,12 +4111,34 @@ void HashStore::AddToCache(
     
     // Try to acquire write lock (set to odd)
     // Simple spin if another writer is active
-    while (oldSeq & 1 || !entry.seqlock.compare_exchange_weak(
-            oldSeq, oldSeq + 1, 
-            std::memory_order_acquire, 
-            std::memory_order_relaxed)) {
-        std::this_thread::yield();
-        oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+    constexpr int MAX_SPIN_COUNT = 1000;
+    int spinCount = 0;
+    
+    while (spinCount < MAX_SPIN_COUNT) {
+        // Wait if another write is in progress (odd sequence)
+        if (oldSeq & 1) {
+            std::this_thread::yield();
+            oldSeq = entry.seqlock.load(std::memory_order_relaxed);
+            ++spinCount;
+            continue;
+        }
+        
+        // Try to acquire write lock by setting to odd
+        if (entry.seqlock.compare_exchange_weak(
+                oldSeq, oldSeq + 1, 
+                std::memory_order_acquire, 
+                std::memory_order_relaxed)) {
+            break;  // Successfully acquired lock
+        }
+        
+        // CAS failed, another thread got there first
+        ++spinCount;
+    }
+    
+    if (spinCount >= MAX_SPIN_COUNT) {
+        // Gave up trying to acquire lock - skip caching this entry
+        SS_LOG_DEBUG(L"HashStore", L"AddToCache: Gave up acquiring write lock");
+        return;
     }
     
     // Now we hold the write lock (sequence is odd)

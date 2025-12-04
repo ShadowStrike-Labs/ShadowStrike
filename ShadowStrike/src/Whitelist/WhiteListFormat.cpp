@@ -41,6 +41,7 @@
 // Standard library headers
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cwctype>
 #include <cwchar>
@@ -520,8 +521,14 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
  * @note Thread-safe (uses only read-only global table)
  */
 [[nodiscard]] uint32_t ComputeCRC32(const void* data, size_t length) noexcept {
-    // Handle null/empty cases
-    if (data == nullptr || length == 0) {
+    // Handle null/empty cases - return valid CRC for empty input
+    if (data == nullptr || length == 0u) {
+        return 0u;
+    }
+    
+    // Validate pointer alignment is reasonable (defensive check)
+    // Note: This is not strictly required but helps catch corruption
+    if (reinterpret_cast<uintptr_t>(data) == 0u) {
         return 0u;
     }
     
@@ -557,17 +564,19 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
  * @return 0-15 for valid hex chars, 0xFF for invalid
  *
  * @note Returns 0xFF (255) for invalid characters - caller must check!
+ * @note This function is deliberately branchless-friendly for optimizer
  */
 [[nodiscard]] inline uint8_t HexCharToValue(char c) noexcept {
     // Use a computed index rather than branches for better performance
+    // Each branch returns early to allow optimizer to generate cmov
     if (c >= '0' && c <= '9') {
-        return static_cast<uint8_t>(c - '0');
+        return static_cast<uint8_t>(static_cast<unsigned char>(c) - static_cast<unsigned char>('0'));
     }
     if (c >= 'a' && c <= 'f') {
-        return static_cast<uint8_t>(c - 'a' + 10);
+        return static_cast<uint8_t>(static_cast<unsigned char>(c) - static_cast<unsigned char>('a') + 10u);
     }
     if (c >= 'A' && c <= 'F') {
-        return static_cast<uint8_t>(c - 'A' + 10);
+        return static_cast<uint8_t>(static_cast<unsigned char>(c) - static_cast<unsigned char>('A') + 10u);
     }
     return 0xFFu;  // Invalid sentinel value
 }
@@ -591,7 +600,7 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
  * @return Hex character '0'-'9' or 'a'-'f'
  */
 [[nodiscard]] inline char ValueToHexChar(uint8_t nibble) noexcept {
-    static constexpr char kHexChars[] = "0123456789abcdef";
+    static constexpr char kHexChars[17] = "0123456789abcdef";
     return kHexChars[nibble & 0x0Fu];
 }
 
@@ -600,6 +609,14 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
 // ============================================================================
 // FORMAT UTILITY IMPLEMENTATIONS
 // ============================================================================
+
+// Compile-time verification of critical structure sizes
+static_assert(sizeof(WhitelistDatabaseHeader) == PAGE_SIZE,
+    "WhitelistDatabaseHeader must be exactly one page (4KB)");
+static_assert(sizeof(WhitelistEntry) == 128,
+    "WhitelistEntry must be exactly 128 bytes");
+static_assert(sizeof(HashValue) == 68,
+    "HashValue must be exactly 68 bytes");
 
 namespace Format {
 
@@ -938,6 +955,8 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
  *
  * @param header Pointer to database header
  * @return CRC32 checksum, or 0 if header is nullptr
+ *
+ * @note Thread-safe (pure function on const input)
  */
 uint32_t ComputeHeaderCRC32(const WhitelistDatabaseHeader* header) noexcept {
     if (header == nullptr) {
@@ -947,6 +966,11 @@ uint32_t ComputeHeaderCRC32(const WhitelistDatabaseHeader* header) noexcept {
     // Compute CRC32 of header up to (but not including) headerCrc32 field
     // This allows the CRC32 to be stored in the header itself
     constexpr size_t kCrcOffset = offsetof(WhitelistDatabaseHeader, headerCrc32);
+    
+    // Sanity check: offset should be reasonable
+    static_assert(kCrcOffset > 0u && kCrcOffset < sizeof(WhitelistDatabaseHeader),
+        "Invalid CRC offset calculation");
+    
     return ComputeCRC32(header, kCrcOffset);
 }
 
@@ -1373,6 +1397,16 @@ std::optional<HashValue> ParseHashString(
         return std::nullopt;
     }
     
+    // Additional safety: ensure expected length doesn't exceed HashValue::MAX_HASH_LENGTH
+    if (expectedLen > HashValue::MAX_HASH_LENGTH) {
+        SS_LOG_ERROR(L"Whitelist",
+            L"ParseHashString: algorithm %u has length %u exceeding max %u",
+            static_cast<unsigned>(algo),
+            static_cast<unsigned>(expectedLen),
+            static_cast<unsigned>(HashValue::MAX_HASH_LENGTH));
+        return std::nullopt;
+    }
+    
     // ========================================================================
     // CLEAN INPUT (Remove whitespace)
     // ========================================================================
@@ -1388,6 +1422,7 @@ std::optional<HashValue> ParseHashString(
     for (size_t i = 0; i < hashStr.length() && cleanedLen < kMaxHashStringLen; ++i) {
         const char c = hashStr[i];
         // Skip whitespace (space, tab, newline, etc.)
+        // Cast to unsigned char to avoid UB with negative char values
         if (!std::isspace(static_cast<unsigned char>(c))) {
             cleaned[cleanedLen++] = c;
         }
@@ -1425,9 +1460,18 @@ std::optional<HashValue> ParseHashString(
     hash.algorithm = algo;
     hash.length = expectedLen;
     
-    for (size_t i = 0; i < expectedLen; ++i) {
-        const char highChar = cleaned[i * 2u];
-        const char lowChar = cleaned[i * 2u + 1u];
+    for (size_t i = 0; i < static_cast<size_t>(expectedLen); ++i) {
+        // Bounds check (should be guaranteed by length validation above, but defensive)
+        const size_t hiIdx = i * 2u;
+        const size_t loIdx = i * 2u + 1u;
+        if (hiIdx >= cleanedLen || loIdx >= cleanedLen) {
+            SS_LOG_ERROR(L"Whitelist",
+                L"ParseHashString: index out of bounds at position %zu", i);
+            return std::nullopt;
+        }
+        
+        const char highChar = cleaned[hiIdx];
+        const char lowChar = cleaned[loIdx];
         
         const uint8_t highNibble = HexCharToValue(highChar);
         const uint8_t lowNibble = HexCharToValue(lowChar);
@@ -1455,7 +1499,7 @@ std::optional<HashValue> ParseHashString(
  * Uses lookup table for optimal performance.
  *
  * @param hash HashValue to format
- * @return Lowercase hex string, empty string on error
+ * @return Lowercase hex string, empty string on error or invalid hash
  *
  * @note Thread-safe (no global state modified)
  * @note May throw std::bad_alloc if string allocation fails
@@ -1466,20 +1510,35 @@ std::optional<HashValue> ParseHashString(
  * // hexStr = "a1b2c3d4e5f6..."
  */
 std::string FormatHashString(const HashValue& hash) {
-    // Validate hash length
-    if (hash.length == 0u || hash.length > hash.data.size()) {
+    // Validate hash length - protect against buffer overread
+    if (hash.length == 0u) {
+        return {};
+    }
+    
+    // Clamp length to maximum data array size
+    const size_t safeLen = static_cast<size_t>((std::min)(
+        hash.length, 
+        static_cast<uint8_t>(hash.data.size())
+    ));
+    
+    if (safeLen == 0u) {
         return {};
     }
     
     // Lookup table for hex conversion (compile-time constant)
-    static constexpr char kHexChars[] = "0123456789abcdef";
+    static constexpr char kHexChars[17] = "0123456789abcdef";
     
     // Pre-allocate result string to avoid reallocations
     std::string result;
-    result.reserve(static_cast<size_t>(hash.length) * 2u);
+    try {
+        result.reserve(safeLen * 2u);
+    } catch (const std::bad_alloc&) {
+        // Return empty string on allocation failure
+        return {};
+    }
     
     // Convert each byte to two hex characters
-    for (size_t i = 0; i < hash.length; ++i) {
+    for (size_t i = 0; i < safeLen; ++i) {
         const uint8_t byte = hash.data[i];
         result.push_back(kHexChars[(byte >> 4u) & 0x0Fu]);
         result.push_back(kHexChars[byte & 0x0Fu]);
@@ -1504,18 +1563,36 @@ uint32_t CalculateOptimalCacheSize(uint64_t dbSizeBytes) noexcept {
     constexpr uint64_t kMinCacheMB = 16u;    // Minimum cache: 16MB
     constexpr uint64_t kMaxCacheMB = 512u;   // Maximum cache: 512MB
     constexpr double kCacheRatio = 0.05;     // 5% of database size
+    constexpr double kBytesPerMB = 1024.0 * 1024.0;
+    
+    // Protect against zero or excessively large database sizes
+    if (dbSizeBytes == 0u) {
+        return static_cast<uint32_t>(kMinCacheMB);
+    }
     
     // Convert database size to MB and calculate 5%
-    const double dbSizeMB = static_cast<double>(dbSizeBytes) / (1024.0 * 1024.0);
+    // Using double for precision, but validate range
+    const double dbSizeMB = static_cast<double>(dbSizeBytes) / kBytesPerMB;
+    
+    // Protect against NaN or infinity (shouldn't happen but defensive)
+    if (!std::isfinite(dbSizeMB) || dbSizeMB < 0.0) {
+        return static_cast<uint32_t>(kMinCacheMB);
+    }
+    
     const double cacheDouble = dbSizeMB * kCacheRatio;
     
-    // Clamp to valid range
-    uint64_t cacheSizeMB = static_cast<uint64_t>(cacheDouble);
-    
-    if (cacheSizeMB < kMinCacheMB) {
+    // Clamp to valid range with proper rounding
+    uint64_t cacheSizeMB;
+    if (cacheDouble < static_cast<double>(kMinCacheMB)) {
         cacheSizeMB = kMinCacheMB;
-    } else if (cacheSizeMB > kMaxCacheMB) {
+    } else if (cacheDouble > static_cast<double>(kMaxCacheMB)) {
         cacheSizeMB = kMaxCacheMB;
+    } else {
+        cacheSizeMB = static_cast<uint64_t>(cacheDouble);
+        // Ensure we're at least at minimum after truncation
+        if (cacheSizeMB < kMinCacheMB) {
+            cacheSizeMB = kMinCacheMB;
+        }
     }
     
     return static_cast<uint32_t>(cacheSizeMB);
@@ -1550,22 +1627,31 @@ std::wstring NormalizePath(std::wstring_view path) {
     
     // Limit maximum path length to prevent DoS
     constexpr size_t kMaxNormalizePath = 32768u;  // Extended MAX_PATH
-    if (path.length() > kMaxNormalizePath) {
+    size_t effectiveLength = path.length();
+    if (effectiveLength > kMaxNormalizePath) {
         SS_LOG_WARN(L"Whitelist", 
-            L"NormalizePath: path length %zu exceeds limit %zu",
+            L"NormalizePath: path length %zu exceeds limit %zu, truncating",
             path.length(), kMaxNormalizePath);
-        // Still process, but truncate to limit
-        path = path.substr(0, kMaxNormalizePath);
+        effectiveLength = kMaxNormalizePath;
     }
     
     // Pre-allocate result string
     std::wstring normalized;
-    normalized.reserve(path.length());
+    try {
+        normalized.reserve(effectiveLength);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"Whitelist", L"NormalizePath: allocation failed for path normalization");
+        return {};
+    }
     
     // Process each character
-    for (const wchar_t c : path) {
+    for (size_t i = 0; i < effectiveLength; ++i) {
+        wchar_t c = path[i];
+        
         // Convert to lowercase using towlower (locale-aware)
-        wchar_t lower = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
+        // Cast to wint_t for proper handling
+        const wint_t wc = static_cast<wint_t>(c);
+        wchar_t lower = static_cast<wchar_t>(std::towlower(wc));
         
         // Normalize forward slashes to backslashes (Windows standard)
         if (lower == L'/') {
@@ -1577,7 +1663,12 @@ std::wstring NormalizePath(std::wstring_view path) {
     
     // Remove trailing backslashes, but preserve root paths like "C:\"
     // A root path has format: "X:\" (3 characters, drive letter + colon + backslash)
+    // Also preserve UNC paths like "\\"
     while (normalized.length() > 3u && normalized.back() == L'\\') {
+        // Don't remove if this would leave us with just "\\" (UNC prefix)
+        if (normalized.length() == 3u && normalized[0] == L'\\' && normalized[1] == L'\\') {
+            break;
+        }
         normalized.pop_back();
     }
     
@@ -1617,14 +1708,37 @@ bool PathMatchesPattern(
     // EDGE CASE HANDLING
     // ========================================================================
     
-    // Empty path only matches empty pattern
+    // Empty path only matches empty pattern (except in Glob mode where * matches empty)
     if (path.empty()) {
-        return pattern.empty();
+        if (pattern.empty()) {
+            return true;
+        }
+        // Check if pattern is just wildcards that can match empty string
+        if (mode == PathMatchMode::Glob) {
+            for (const wchar_t c : pattern) {
+                if (c != L'*') {
+                    return false;
+                }
+            }
+            return true; // Pattern is all stars, matches empty
+        }
+        return false;
     }
     
-    // Empty pattern never matches non-empty path (except in Contains mode)
+    // Empty pattern behavior varies by mode
     if (pattern.empty()) {
-        return (mode == PathMatchMode::Contains);
+        return (mode == PathMatchMode::Contains); // Contains empty = always true
+    }
+    
+    // Validate path and pattern lengths to prevent DoS
+    constexpr size_t kMaxPathLen = 32768u;
+    constexpr size_t kMaxPatternLen = 4096u;
+    
+    if (path.length() > kMaxPathLen || pattern.length() > kMaxPatternLen) {
+        SS_LOG_WARN(L"Whitelist",
+            L"PathMatchesPattern: path/pattern too long (path=%zu, pattern=%zu)",
+            path.length(), pattern.length());
+        return false;
     }
     
     // ========================================================================
@@ -1642,6 +1756,10 @@ bool PathMatchesPattern(
     try {
         normPath = NormalizePath(path);
         normPattern = NormalizePath(pattern);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"PathMatchesPattern: memory allocation failed during normalization");
+        return false;
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Whitelist", 
             L"PathMatchesPattern: normalization failed: %S", e.what());
@@ -1686,6 +1804,8 @@ bool PathMatchesPattern(
             // Time complexity: O(n * m) worst case
             // Space complexity: O(1) (no recursion)
             //
+            // Security: Added iteration limit to prevent pathological cases
+            //
             // ================================================================
             
             size_t pathIdx = 0;
@@ -1696,7 +1816,19 @@ bool PathMatchesPattern(
             const size_t pathLen = normPath.length();
             const size_t patLen = normPattern.length();
             
+            // Iteration limit to prevent DoS on pathological patterns
+            // Maximum iterations = path_len * pattern_len (bounded by validation above)
+            constexpr size_t kMaxIterations = 100'000'000u; // 100M iterations max
+            size_t iterations = 0u;
+            
             while (pathIdx < pathLen) {
+                // Check iteration limit
+                if (++iterations > kMaxIterations) {
+                    SS_LOG_WARN(L"Whitelist",
+                        L"Glob matching exceeded iteration limit - possible DoS pattern");
+                    return false;
+                }
+                
                 if (patIdx < patLen) {
                     const wchar_t patChar = normPattern[patIdx];
                     
@@ -1740,23 +1872,30 @@ bool PathMatchesPattern(
             
         case PathMatchMode::Regex:
             // ================================================================
-            // REGEX MATCHING (NOT IMPLEMENTED)
+            // REGEX MATCHING (NOT IMPLEMENTED - SECURITY RISK)
             // ================================================================
             //
             // Regular expression matching is expensive and potentially
             // dangerous (ReDoS attacks). Use sparingly and with timeouts.
             //
-            // TODO: Implement with std::wregex and execution time limit
+            // SECURITY NOTE: Regex is intentionally not implemented as it
+            // can be exploited for denial-of-service attacks through
+            // catastrophic backtracking. If regex support is needed,
+            // implement with:
+            // 1. Input validation (limit pattern length and complexity)
+            // 2. Execution time limit (timeout mechanism)
+            // 3. Pre-compiled pattern cache with size limits
+            // 4. Possibly use RE2 library instead of std::regex
             //
             // ================================================================
             SS_LOG_WARN(L"Whitelist", 
-                L"Regex path matching not yet implemented - returning false");
+                L"Regex path matching not implemented for security reasons - returning false");
             return false;
             
         default:
-            // Unknown mode - defensive return
+            // Unknown mode - defensive return with logging
             SS_LOG_ERROR(L"Whitelist", 
-                L"PathMatchesPattern: unknown mode %u",
+                L"PathMatchesPattern: unknown matching mode %u - returning false",
                 static_cast<unsigned>(mode));
             return false;
     }
@@ -1803,6 +1942,13 @@ HANDLE OpenFileForMapping(
 ) noexcept {
     outError = ERROR_SUCCESS;
     
+    // Validate path is not empty
+    if (path.empty()) {
+        outError = ERROR_INVALID_PARAMETER;
+        SS_LOG_ERROR(L"Whitelist", L"OpenFileForMapping: empty path provided");
+        return INVALID_HANDLE_VALUE;
+    }
+    
     // Determine access mode
     const DWORD desiredAccess = readOnly 
         ? GENERIC_READ 
@@ -1813,6 +1959,7 @@ HANDLE OpenFileForMapping(
     const DWORD shareMode = readOnly ? FILE_SHARE_READ : 0u;
     
     // Flags: random access hint for memory-mapped usage
+    // Use FILE_FLAG_NO_BUFFERING for large files if needed
     const DWORD flagsAndAttributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS;
     
     const HANDLE hFile = ::CreateFileW(
@@ -1852,6 +1999,13 @@ HANDLE CreateFileForDatabase(
 ) noexcept {
     outError = ERROR_SUCCESS;
     
+    // Validate path is not empty
+    if (path.empty()) {
+        outError = ERROR_INVALID_PARAMETER;
+        SS_LOG_ERROR(L"Whitelist", L"CreateFileForDatabase: empty path provided");
+        return INVALID_HANDLE_VALUE;
+    }
+    
     const HANDLE hFile = ::CreateFileW(
         path.c_str(),
         GENERIC_READ | GENERIC_WRITE,  // Need both for initialization
@@ -1888,6 +2042,13 @@ bool GetFileSizeHelper(
     outSize = 0u;
     outError = ERROR_SUCCESS;
     
+    // Validate handle
+    if (hFile == INVALID_HANDLE_VALUE || hFile == nullptr) {
+        outError = ERROR_INVALID_HANDLE;
+        SS_LOG_ERROR(L"Whitelist", L"GetFileSizeHelper: invalid handle");
+        return false;
+    }
+    
     LARGE_INTEGER size{};
     if (!::GetFileSizeEx(hFile, &size)) {
         outError = ::GetLastError();
@@ -1898,7 +2059,8 @@ bool GetFileSizeHelper(
     // Validate size is non-negative (should always be true for GetFileSizeEx)
     if (size.QuadPart < 0) {
         outError = ERROR_INVALID_DATA;
-        SS_LOG_ERROR(L"Whitelist", L"GetFileSizeEx returned negative size");
+        SS_LOG_ERROR(L"Whitelist", L"GetFileSizeEx returned negative size: %lld",
+            static_cast<long long>(size.QuadPart));
         return false;
     }
     
@@ -1923,6 +2085,22 @@ bool SetFileSizeHelper(
     DWORD& outError
 ) noexcept {
     outError = ERROR_SUCCESS;
+    
+    // Validate handle
+    if (hFile == INVALID_HANDLE_VALUE || hFile == nullptr) {
+        outError = ERROR_INVALID_HANDLE;
+        SS_LOG_ERROR(L"Whitelist", L"SetFileSizeHelper: invalid handle");
+        return false;
+    }
+    
+    // Validate size is within reasonable bounds
+    // LONGLONG max is used for file operations
+    if (size > static_cast<uint64_t>((std::numeric_limits<LONGLONG>::max)())) {
+        outError = ERROR_INVALID_PARAMETER;
+        SS_LOG_ERROR(L"Whitelist", L"SetFileSizeHelper: size %llu exceeds LONGLONG max",
+            static_cast<unsigned long long>(size));
+        return false;
+    }
     
     // Set file pointer to desired position
     LARGE_INTEGER pos{};
@@ -1967,6 +2145,20 @@ HANDLE CreateFileMappingHelper(
 ) noexcept {
     outError = ERROR_SUCCESS;
     
+    // Validate handle
+    if (hFile == INVALID_HANDLE_VALUE || hFile == nullptr) {
+        outError = ERROR_INVALID_HANDLE;
+        SS_LOG_ERROR(L"Whitelist", L"CreateFileMappingHelper: invalid file handle");
+        return nullptr;
+    }
+    
+    // Validate size is non-zero
+    if (size == 0u) {
+        outError = ERROR_INVALID_PARAMETER;
+        SS_LOG_ERROR(L"Whitelist", L"CreateFileMappingHelper: zero size not allowed");
+        return nullptr;
+    }
+    
     // Page protection
     const DWORD protect = readOnly ? PAGE_READONLY : PAGE_READWRITE;
     
@@ -1985,7 +2177,8 @@ HANDLE CreateFileMappingHelper(
     
     if (hMapping == nullptr) {
         outError = ::GetLastError();
-        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to create file mapping");
+        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to create file mapping for size %llu",
+            static_cast<unsigned long long>(size));
     }
     
     return hMapping;
@@ -2012,15 +2205,30 @@ void* MapViewHelper(
 ) noexcept {
     outError = ERROR_SUCCESS;
     
+    // Validate mapping handle
+    if (hMapping == nullptr || hMapping == INVALID_HANDLE_VALUE) {
+        outError = ERROR_INVALID_HANDLE;
+        SS_LOG_ERROR(L"Whitelist", L"MapViewHelper: invalid mapping handle");
+        return nullptr;
+    }
+    
+    // Validate size is non-zero
+    if (size == 0u) {
+        outError = ERROR_INVALID_PARAMETER;
+        SS_LOG_ERROR(L"Whitelist", L"MapViewHelper: zero size not allowed");
+        return nullptr;
+    }
+    
     // Desired access
     const DWORD desiredAccess = readOnly ? FILE_MAP_READ : FILE_MAP_WRITE;
     
-    // Validate size fits in SIZE_T
+    // Validate size fits in SIZE_T (platform-dependent)
     if (size > static_cast<uint64_t>((std::numeric_limits<SIZE_T>::max)())) {
         outError = ERROR_NOT_ENOUGH_MEMORY;
         SS_LOG_ERROR(L"Whitelist", 
-            L"Mapping size %llu exceeds SIZE_T maximum",
-            static_cast<unsigned long long>(size));
+            L"Mapping size %llu exceeds SIZE_T maximum (%llu)",
+            static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>((std::numeric_limits<SIZE_T>::max)()));
         return nullptr;
     }
     
@@ -2034,7 +2242,8 @@ void* MapViewHelper(
     
     if (baseAddress == nullptr) {
         outError = ::GetLastError();
-        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to map view of file");
+        SS_LOG_LAST_ERROR(L"Whitelist", L"Failed to map view of file (size=%llu)",
+            static_cast<unsigned long long>(size));
     }
     
     return baseAddress;
@@ -2597,27 +2806,46 @@ bool CreateDatabase(
  * @note No error indication - cleanup always attempts all steps
  */
 void CloseView(MemoryMappedView& view) noexcept {
-    // Unmap view first (must happen before closing mapping)
+    // ========================================================================
+    // CLEANUP ORDER IS CRITICAL
+    // ========================================================================
+    //
+    // Must unmap view before closing mapping handle, and close mapping
+    // handle before closing file handle. Failure to follow this order
+    // can lead to resource leaks or access violations.
+    //
+    // ========================================================================
+    
+    // Step 1: Unmap view first (must happen before closing mapping)
     if (view.baseAddress != nullptr) {
         // UnmapViewOfFile can fail, but we can't do much about it
-        // in cleanup context. Ignore return value.
-        (void)::UnmapViewOfFile(view.baseAddress);
+        // in cleanup context. Log failure for diagnostics.
+        if (!::UnmapViewOfFile(view.baseAddress)) {
+            SS_LOG_DEBUG(L"Whitelist", L"CloseView: UnmapViewOfFile failed (error %lu)",
+                static_cast<unsigned long>(::GetLastError()));
+        }
         view.baseAddress = nullptr;
     }
     
-    // Close mapping handle
+    // Step 2: Close mapping handle
     if (view.mappingHandle != nullptr && view.mappingHandle != INVALID_HANDLE_VALUE) {
-        (void)::CloseHandle(view.mappingHandle);
+        if (!::CloseHandle(view.mappingHandle)) {
+            SS_LOG_DEBUG(L"Whitelist", L"CloseView: CloseHandle(mapping) failed (error %lu)",
+                static_cast<unsigned long>(::GetLastError()));
+        }
         view.mappingHandle = nullptr;
     }
     
-    // Close file handle
+    // Step 3: Close file handle
     if (view.fileHandle != INVALID_HANDLE_VALUE && view.fileHandle != nullptr) {
-        (void)::CloseHandle(view.fileHandle);
+        if (!::CloseHandle(view.fileHandle)) {
+            SS_LOG_DEBUG(L"Whitelist", L"CloseView: CloseHandle(file) failed (error %lu)",
+                static_cast<unsigned long>(::GetLastError()));
+        }
         view.fileHandle = INVALID_HANDLE_VALUE;
     }
     
-    // Reset metadata
+    // Step 4: Reset metadata to known safe state
     view.fileSize = 0u;
     view.readOnly = true;
 }

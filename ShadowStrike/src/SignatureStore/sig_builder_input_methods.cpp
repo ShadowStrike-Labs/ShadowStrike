@@ -4,12 +4,57 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <set>
 #include <thread>
 #include <unordered_set>
 
 namespace ShadowStrike {
 namespace SignatureStore {
+
+        // ============================================================================
+        // SAFETY CONSTANTS FOR INPUT VALIDATION
+        // ============================================================================
+        namespace {
+            // Default performance frequency fallback (1MHz) for division-by-zero protection
+            constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000LL;
+            
+            // Lock acquisition timeout constants
+            constexpr int LOCK_MAX_ATTEMPTS = 50;
+            constexpr std::chrono::milliseconds LOCK_SLEEP_DURATION{100};
+            
+            // Safe elapsed time calculation helper with division-by-zero protection
+            [[nodiscard]] inline uint64_t safeElapsedUs(
+                const LARGE_INTEGER& start,
+                const LARGE_INTEGER& end,
+                const LARGE_INTEGER& freq) noexcept
+            {
+                if (freq.QuadPart <= 0) {
+                    return 0;
+                }
+                int64_t diff = end.QuadPart - start.QuadPart;
+                if (diff < 0) {
+                    return 0;  // Timer wrapped or invalid
+                }
+                // Use safe multiplication order to prevent overflow
+                return static_cast<uint64_t>((diff * 1'000'000LL) / freq.QuadPart);
+            }
+
+            [[nodiscard]] inline uint64_t safeElapsedMs(
+                const LARGE_INTEGER& start,
+                const LARGE_INTEGER& end,
+                const LARGE_INTEGER& freq) noexcept
+            {
+                if (freq.QuadPart <= 0) {
+                    return 0;
+                }
+                int64_t diff = end.QuadPart - start.QuadPart;
+                if (diff < 0) {
+                    return 0;
+                }
+                return static_cast<uint64_t>((diff * 1'000LL) / freq.QuadPart);
+            }
+        } // anonymous namespace
 
 
         StoreError SignatureBuilder::AddHash(const HashSignatureInput& input) noexcept {
@@ -264,26 +309,38 @@ namespace SignatureStore {
 
             // Skip entropy check for variable-length hashes (SSDEEP, TLSH)
             if (input.hash.type != HashType::SSDEEP && input.hash.type != HashType::TLSH) {
-                // Calculate Shannon entropy
-                std::array<int, 256> byteFreq{};
-                for (size_t i = 0; i < input.hash.length; ++i) {
-                    byteFreq[input.hash.data[i]]++;
-                }
-
-                double entropy = 0.0;
-                for (int freq : byteFreq) {
-                    if (freq > 0) {
-                        double p = static_cast<double>(freq) / input.hash.length;
-                        entropy -= p * std::log2(p);
+                // Bounds-check hash length before accessing data
+                if (input.hash.length > 0 && input.hash.length <= 64) {
+                    // Calculate Shannon entropy
+                    std::array<int, 256> byteFreq{};
+                    for (size_t i = 0; i < input.hash.length; ++i) {
+                        byteFreq[input.hash.data[i]]++;
                     }
-                }
 
-                // Entropy should be between 0.5 and 8.0 for valid hashes
-                if (entropy < 0.1 || entropy > 8.1) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"AddHash: Suspicious entropy %.2f for hash (name: %S)",
-                        entropy, input.name.c_str());
-                    // Log warning but don't fail - might be intentional
+                    double entropy = 0.0;
+                    const double hashLen = static_cast<double>(input.hash.length);
+                    
+                    // Division-by-zero protection
+                    if (hashLen > 0.0) {
+                        for (int freq : byteFreq) {
+                            if (freq > 0) {
+                                double p = static_cast<double>(freq) / hashLen;
+                                // Protect against log2(0) - though p > 0 here, be safe
+                                if (p > 0.0) {
+                                    entropy -= p * std::log2(p);
+                                }
+                            }
+                        }
+                    }
+
+                    // Entropy should be between 0.5 and 8.0 for valid hashes
+                    // Values outside this range are suspicious but not necessarily invalid
+                    if (entropy < 0.1 || entropy > 8.1) {
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"AddHash: Suspicious entropy %.2f for hash (name: %S)",
+                            entropy, input.name.c_str());
+                        // Log warning but don't fail - might be intentional
+                    }
                 }
             }
 
@@ -292,6 +349,16 @@ namespace SignatureStore {
             // ========================================================================
 
             try {
+                // Reserve space to reduce reallocation risk
+                if (m_pendingHashes.size() == m_pendingHashes.capacity()) {
+                    // Pre-allocate additional space
+                    size_t newCap = m_pendingHashes.capacity() + 1000;
+                    if (newCap > MAX_PENDING_HASHES) {
+                        newCap = MAX_PENDING_HASHES;
+                    }
+                    m_pendingHashes.reserve(newCap);
+                }
+
                 m_pendingHashes.push_back(input);
                 m_hashFingerprints.insert(hashFingerprint);
                 m_statistics.totalHashesAdded++;
@@ -307,6 +374,12 @@ namespace SignatureStore {
                     L"AddHash: Out of memory (bad_alloc)");
                 return StoreError{ SignatureStoreError::OutOfMemory, 0,
                                   "Insufficient memory to add hash" };
+            }
+            catch (const std::length_error&) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddHash: Container size limit reached (length_error)");
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Maximum container size exceeded" };
             }
             catch (const std::exception& ex) {
                 SS_LOG_ERROR(L"SignatureBuilder",
@@ -489,6 +562,15 @@ namespace SignatureStore {
             // ========================================================================
 
             try {
+                // Reserve space to reduce reallocation risk
+                if (m_pendingPatterns.size() == m_pendingPatterns.capacity()) {
+                    size_t newCap = m_pendingPatterns.capacity() + 1000;
+                    if (newCap > MAX_PENDING_PATTERNS) {
+                        newCap = MAX_PENDING_PATTERNS;
+                    }
+                    m_pendingPatterns.reserve(newCap);
+                }
+
                 m_pendingPatterns.push_back(input);
                 m_patternFingerprints.insert(input.patternString);
                 m_statistics.totalPatternsAdded++;
@@ -503,6 +585,16 @@ namespace SignatureStore {
                 SS_LOG_ERROR(L"SignatureBuilder", L"AddPattern: Out of memory");
                 return StoreError{ SignatureStoreError::OutOfMemory, 0,
                                   "Insufficient memory" };
+            }
+            catch (const std::length_error&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddPattern: Container size limit reached");
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Maximum container size exceeded" };
+            }
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddPattern: Unexpected exception: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                                  "Internal error adding pattern" };
             }
         }
 
@@ -607,12 +699,19 @@ namespace SignatureStore {
                                   "Missing 'rule' keyword" };
             }
 
+            // Bounds check before extracting rule name
+            if (rulePos > input.ruleSource.length() - 5) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRule: Invalid rule position");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                  "Invalid rule declaration position" };
+            }
+
             // Extract rule name safely
             size_t nameStart = rulePos + 5;
 
-            // Skip whitespace
+            // Skip whitespace with bounds checking
             while (nameStart < input.ruleSource.length() &&
-                std::isspace(input.ruleSource[nameStart])) {
+                std::isspace(static_cast<unsigned char>(input.ruleSource[nameStart]))) {
                 nameStart++;
             }
 
@@ -622,14 +721,24 @@ namespace SignatureStore {
                                   "Rule name missing" };
             }
 
-            // Find rule name end
+            // Find rule name end with bounds checking
             size_t nameEnd = nameStart;
             while (nameEnd < input.ruleSource.length() &&
-                (std::isalnum(input.ruleSource[nameEnd]) || input.ruleSource[nameEnd] == '_')) {
+                (std::isalnum(static_cast<unsigned char>(input.ruleSource[nameEnd])) || 
+                 input.ruleSource[nameEnd] == '_')) {
                 nameEnd++;
+                // Prevent infinite loop - name can't exceed reasonable length
+                if (nameEnd - nameStart > 512) {
+                    SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRule: Rule name too long");
+                    return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                      "Rule name exceeds maximum length" };
+                }
             }
 
-            ruleName = input.ruleSource.substr(nameStart, nameEnd - nameStart);
+            // Safe substring extraction
+            if (nameEnd > nameStart) {
+                ruleName = input.ruleSource.substr(nameStart, nameEnd - nameStart);
+            }
 
             // Validate rule name
             constexpr size_t MAX_RULE_NAME_LEN = 256;
@@ -709,6 +818,15 @@ namespace SignatureStore {
             // ========================================================================
 
             try {
+                // Reserve space to reduce reallocation risk
+                if (m_pendingYaraRules.size() == m_pendingYaraRules.capacity()) {
+                    size_t newCap = m_pendingYaraRules.capacity() + 100;
+                    if (newCap > MAX_PENDING_RULES) {
+                        newCap = MAX_PENDING_RULES;
+                    }
+                    m_pendingYaraRules.reserve(newCap);
+                }
+
                 m_pendingYaraRules.push_back(input);
                 m_yaraRuleNames.insert(fullName);
                 m_statistics.totalYaraRulesAdded++;
@@ -723,6 +841,16 @@ namespace SignatureStore {
                 SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRule: Out of memory");
                 return StoreError{ SignatureStoreError::OutOfMemory, 0,
                                   "Insufficient memory" };
+            }
+            catch (const std::length_error&) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRule: Container size limit reached");
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Maximum container size exceeded" };
+            }
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRule: Unexpected exception: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                                  "Internal error adding YARA rule" };
             }
         }
         // ============================================================================
@@ -1452,8 +1580,15 @@ namespace SignatureStore {
             size_t addedCount = 0;
             size_t skippedCount = 0;
 
-            // Reserve space to avoid reallocations
-            m_pendingHashes.reserve(m_pendingHashes.size() + uniqueCount);
+            // Reserve space to avoid reallocations - with exception safety
+            try {
+                m_pendingHashes.reserve(m_pendingHashes.size() + uniqueCount);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder", 
+                    L"AddHashBatch: Failed to reserve memory for %zu entries", uniqueCount);
+                return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                                  "Failed to allocate memory for batch" };
+            }
 
             for (size_t i = 0; i < inputs.size(); ++i) {
                 // Skip invalid/duplicate entries - O(1) lookups
@@ -1464,14 +1599,25 @@ namespace SignatureStore {
                     continue;
                 }
 
-                // Add to pending hashes
-                m_pendingHashes.push_back(inputs[i]);
+                // Add to pending hashes with exception safety
+                try {
+                    m_pendingHashes.push_back(inputs[i]);
 
-                // Add fingerprint to deduplication set
-                uint64_t fingerprint = inputs[i].hash.FastHash();
-                m_hashFingerprints.insert(fingerprint);
+                    // Add fingerprint to deduplication set
+                    uint64_t fingerprint = inputs[i].hash.FastHash();
+                    m_hashFingerprints.insert(fingerprint);
 
-                addedCount++;
+                    addedCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"AddHashBatch: Memory allocation failed at index %zu", i);
+                    break;  // Stop processing on memory error
+                } catch (const std::exception& ex) {
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"AddHashBatch: Exception at index %zu: %S", i, ex.what());
+                    skippedCount++;
+                    continue;
+                }
 
                 // Progress callback every 10000 entries
                 if (addedCount % 10000 == 0) {
@@ -1480,7 +1626,11 @@ namespace SignatureStore {
                         addedCount, uniqueCount);
 
                     if (m_config.progressCallback) {
-                        m_config.progressCallback("hash_batch_add", addedCount, uniqueCount);
+                        try {
+                            m_config.progressCallback("hash_batch_add", addedCount, uniqueCount);
+                        } catch (...) {
+                            // Ignore callback exceptions
+                        }
                     }
                 }
             }
@@ -1497,18 +1647,27 @@ namespace SignatureStore {
             // STEP 8: PERFORMANCE METRICS
             // ========================================================================
 
-            LARGE_INTEGER batchEndTime;
+            LARGE_INTEGER batchEndTime{};
             QueryPerformanceCounter(&batchEndTime);
 
-            LARGE_INTEGER perfFreq;
+            LARGE_INTEGER perfFreq{};
             QueryPerformanceFrequency(&perfFreq);
+            
+            // Safe division with zero protection
+            if (perfFreq.QuadPart <= 0) {
+                perfFreq.QuadPart = DEFAULT_PERF_FREQUENCY;
+            }
 
-            uint64_t batchTimeUs =
-                ((batchEndTime.QuadPart - batchStartTime.QuadPart) * 1000000ULL) /
-                perfFreq.QuadPart;
+            uint64_t batchTimeUs = safeElapsedUs(batchStartTime, batchEndTime, perfFreq);
 
-            double throughput = (batchTimeUs > 0) ?
-                (static_cast<double>(addedCount) / (batchTimeUs / 1'000'000.0)) : 0.0;
+            // Safe throughput calculation with division-by-zero protection
+            double throughput = 0.0;
+            if (batchTimeUs > 0) {
+                double timeSeconds = static_cast<double>(batchTimeUs) / 1'000'000.0;
+                if (timeSeconds > 0.0) {
+                    throughput = static_cast<double>(addedCount) / timeSeconds;
+                }
+            }
 
             // ========================================================================
             // STEP 9: COMPREHENSIVE LOGGING
@@ -1527,7 +1686,8 @@ namespace SignatureStore {
                 L"  Invalid entries: %zu", invalidIndices.size());
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Processing time: %llu µs (%.2f ms)",
-                batchTimeUs, batchTimeUs / 1000.0);
+                static_cast<unsigned long long>(batchTimeUs), 
+                static_cast<double>(batchTimeUs) / 1000.0);
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Throughput: %.0f hashes/sec", throughput);
             SS_LOG_INFO(L"SignatureBuilder",
@@ -1702,15 +1862,22 @@ namespace SignatureStore {
             // STEP 4: ACQUIRE LOCK & ADD TO PENDING
             // ========================================================================
 
-            LARGE_INTEGER batchStartTime;
+            LARGE_INTEGER batchStartTime{};
             QueryPerformanceCounter(&batchStartTime);
 
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
 
             size_t addedCount = 0;
             
-            // Reserve space to avoid reallocations
-            m_pendingPatterns.reserve(m_pendingPatterns.size() + validCount);
+            // Reserve space to avoid reallocations - with exception safety
+            try {
+                m_pendingPatterns.reserve(m_pendingPatterns.size() + validCount);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddPatternBatch: Failed to reserve memory for %zu entries", validCount);
+                return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                                  "Failed to allocate memory for batch" };
+            }
 
             for (size_t i = 0; i < inputs.size(); ++i) {
                 // Skip invalid/duplicate - O(1) lookups
@@ -1726,9 +1893,20 @@ namespace SignatureStore {
                     continue;
                 }
 
-                m_pendingPatterns.push_back(inputs[i]);
-                m_patternFingerprints.insert(inputs[i].patternString);
-                addedCount++;
+                // Exception-safe push
+                try {
+                    m_pendingPatterns.push_back(inputs[i]);
+                    m_patternFingerprints.insert(inputs[i].patternString);
+                    addedCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"AddPatternBatch: Memory allocation failed at index %zu", i);
+                    break;  // Stop processing on memory error
+                } catch (const std::exception& ex) {
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"AddPatternBatch: Exception at index %zu: %S", i, ex.what());
+                    continue;
+                }
             }
 
             // ========================================================================
@@ -1739,23 +1917,32 @@ namespace SignatureStore {
             m_statistics.duplicatesRemoved += (inputs.size() - addedCount);
             m_statistics.invalidSignaturesSkipped += invalidIndices.size();
 
-            LARGE_INTEGER batchEndTime;
+            LARGE_INTEGER batchEndTime{};
             QueryPerformanceCounter(&batchEndTime);
 
-            LARGE_INTEGER perfFreq;
+            LARGE_INTEGER perfFreq{};
             QueryPerformanceFrequency(&perfFreq);
+            
+            // Safe division with zero protection
+            if (perfFreq.QuadPart <= 0) {
+                perfFreq.QuadPart = DEFAULT_PERF_FREQUENCY;
+            }
 
-            uint64_t batchTimeUs =
-                ((batchEndTime.QuadPart - batchStartTime.QuadPart) * 1000000ULL) /
-                perfFreq.QuadPart;
+            uint64_t batchTimeUs = safeElapsedUs(batchStartTime, batchEndTime, perfFreq);
 
-            double throughput = (batchTimeUs > 0) ?
-                (static_cast<double>(addedCount) / (batchTimeUs / 1'000'000.0)) : 0.0;
+            // Safe throughput calculation with division-by-zero protection
+            double throughput = 0.0;
+            if (batchTimeUs > 0) {
+                double timeSeconds = static_cast<double>(batchTimeUs) / 1'000'000.0;
+                if (timeSeconds > 0.0) {
+                    throughput = static_cast<double>(addedCount) / timeSeconds;
+                }
+            }
 
             SS_LOG_INFO(L"SignatureBuilder", L"AddPatternBatch: COMPLETE");
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Added: %zu, Time: %llu µs, Throughput: %.0f patterns/sec",
-                addedCount, batchTimeUs, throughput);
+                addedCount, static_cast<unsigned long long>(batchTimeUs), throughput);
 
             // ========================================================================
             // STEP 6: RETURN STATUS
@@ -1914,19 +2101,33 @@ namespace SignatureStore {
                     continue;
                 }
 
-                // Extract rule name from source (simplified)
+                // Extract rule name from source with bounds checking
                 size_t rulePos = inputs[i].ruleSource.find("rule ");
-                if (rulePos != std::string::npos) {
+                if (rulePos != std::string::npos && 
+                    rulePos < inputs[i].ruleSource.length() - 5) {
                     size_t nameStart = rulePos + 5;
-                    // Skip whitespace
+                    
+                    // Skip whitespace with bounds checking
                     while (nameStart < inputs[i].ruleSource.length() && 
                            std::isspace(static_cast<unsigned char>(inputs[i].ruleSource[nameStart]))) {
                         nameStart++;
                     }
+                    
+                    // Find name end with bounds checking
                     size_t nameEnd = inputs[i].ruleSource.find_first_of(" :\t{", nameStart);
-                    if (nameEnd != std::string::npos && nameEnd > nameStart) {
-                        std::string ruleName = inputs[i].ruleSource.substr(
-                            nameStart, nameEnd - nameStart);
+                    if (nameEnd == std::string::npos) {
+                        nameEnd = inputs[i].ruleSource.length();
+                    }
+                    
+                    // Validate bounds before substring extraction
+                    if (nameEnd > nameStart && nameStart < inputs[i].ruleSource.length()) {
+                        size_t nameLen = nameEnd - nameStart;
+                        // Limit name length for safety
+                        if (nameLen > 256) {
+                            nameLen = 256;
+                        }
+                        
+                        std::string ruleName = inputs[i].ruleSource.substr(nameStart, nameLen);
 
                         if (!seenRuleNames.insert(ruleName).second) {
                             SS_LOG_WARN(L"SignatureBuilder",
@@ -1942,15 +2143,22 @@ namespace SignatureStore {
             // STEP 4: ACQUIRE LOCK & ADD TO PENDING
             // ========================================================================
 
-            LARGE_INTEGER batchStartTime;
+            LARGE_INTEGER batchStartTime{};
             QueryPerformanceCounter(&batchStartTime);
 
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
 
             size_t addedCount = 0;
             
-            // Reserve space to avoid reallocations
-            m_pendingYaraRules.reserve(m_pendingYaraRules.size() + validCount);
+            // Reserve space to avoid reallocations - with exception safety
+            try {
+                m_pendingYaraRules.reserve(m_pendingYaraRules.size() + validCount);
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddYaraRuleBatch: Failed to reserve memory for %zu entries", validCount);
+                return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                                  "Failed to allocate memory for batch" };
+            }
 
             for (size_t i = 0; i < inputs.size(); ++i) {
                 // Skip invalid/duplicate - O(1) lookups
@@ -1958,20 +2166,36 @@ namespace SignatureStore {
                     continue;
                 }
 
-                // Extract rule name for existing check
+                // Extract rule name for existing check with bounds safety
                 std::string fullName = inputs[i].namespace_.empty() ? "default" : inputs[i].namespace_;
                 
-                // Check rule name extraction
+                // Check rule name extraction with bounds validation
                 size_t rulePos = inputs[i].ruleSource.find("rule ");
-                if (rulePos != std::string::npos) {
+                if (rulePos != std::string::npos &&
+                    rulePos < inputs[i].ruleSource.length() - 5) {
                     size_t nameStart = rulePos + 5;
+                    
+                    // Skip whitespace with bounds checking
                     while (nameStart < inputs[i].ruleSource.length() && 
                            std::isspace(static_cast<unsigned char>(inputs[i].ruleSource[nameStart]))) {
                         nameStart++;
                     }
+                    
+                    // Find name end with bounds checking
                     size_t nameEnd = inputs[i].ruleSource.find_first_of(" :\t{", nameStart);
-                    if (nameEnd != std::string::npos && nameEnd > nameStart) {
-                        std::string ruleName = inputs[i].ruleSource.substr(nameStart, nameEnd - nameStart);
+                    if (nameEnd == std::string::npos) {
+                        nameEnd = inputs[i].ruleSource.length();
+                    }
+                    
+                    // Validate bounds before substring extraction
+                    if (nameEnd > nameStart && nameStart < inputs[i].ruleSource.length()) {
+                        size_t nameLen = nameEnd - nameStart;
+                        // Limit name length for safety
+                        if (nameLen > 256) {
+                            nameLen = 256;
+                        }
+                        
+                        std::string ruleName = inputs[i].ruleSource.substr(nameStart, nameLen);
                         fullName = inputs[i].namespace_.empty() ? 
                             "default::" + ruleName : inputs[i].namespace_ + "::" + ruleName;
                     }
@@ -1985,9 +2209,20 @@ namespace SignatureStore {
                     continue;
                 }
 
-                m_pendingYaraRules.push_back(inputs[i]);
-                m_yaraRuleNames.insert(fullName);
-                addedCount++;
+                // Exception-safe push
+                try {
+                    m_pendingYaraRules.push_back(inputs[i]);
+                    m_yaraRuleNames.insert(fullName);
+                    addedCount++;
+                } catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureBuilder", 
+                        L"AddYaraRuleBatch: Memory allocation failed at index %zu", i);
+                    break;  // Stop processing on memory error
+                } catch (const std::exception& ex) {
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"AddYaraRuleBatch: Exception at index %zu: %S", i, ex.what());
+                    continue;
+                }
             }
 
             // ========================================================================
@@ -1998,23 +2233,32 @@ namespace SignatureStore {
             m_statistics.duplicatesRemoved += (inputs.size() - addedCount);
             m_statistics.invalidSignaturesSkipped += invalidIndices.size();
 
-            LARGE_INTEGER batchEndTime;
+            LARGE_INTEGER batchEndTime{};
             QueryPerformanceCounter(&batchEndTime);
 
-            LARGE_INTEGER perfFreq;
+            LARGE_INTEGER perfFreq{};
             QueryPerformanceFrequency(&perfFreq);
+            
+            // Safe division with zero protection
+            if (perfFreq.QuadPart <= 0) {
+                perfFreq.QuadPart = DEFAULT_PERF_FREQUENCY;
+            }
 
-            uint64_t batchTimeUs =
-                ((batchEndTime.QuadPart - batchStartTime.QuadPart) * 1000000ULL) /
-                perfFreq.QuadPart;
+            uint64_t batchTimeUs = safeElapsedUs(batchStartTime, batchEndTime, perfFreq);
 
-            double throughput = (batchTimeUs > 0) ?
-                (static_cast<double>(addedCount) / (batchTimeUs / 1'000'000.0)) : 0.0;
+            // Safe throughput calculation with division-by-zero protection
+            double throughput = 0.0;
+            if (batchTimeUs > 0) {
+                double timeSeconds = static_cast<double>(batchTimeUs) / 1'000'000.0;
+                if (timeSeconds > 0.0) {
+                    throughput = static_cast<double>(addedCount) / timeSeconds;
+                }
+            }
 
             SS_LOG_INFO(L"SignatureBuilder", L"AddYaraRuleBatch: COMPLETE");
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Added: %zu, Time: %llu µs, Throughput: %.0f rules/sec",
-                addedCount, batchTimeUs, throughput);
+                addedCount, static_cast<unsigned long long>(batchTimeUs), throughput);
 
             // ========================================================================
             // STEP 6: RETURN STATUS

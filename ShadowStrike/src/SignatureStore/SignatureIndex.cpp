@@ -23,8 +23,12 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
-#include<map>
-#include<unordered_set>
+#include <map>
+#include <unordered_set>
+#include <unordered_map>
+#include <cstdint>   // For SIZE_MAX, UINT64_MAX
+#include <cmath>     // For std::log2
+#include <functional>
 
 namespace ShadowStrike {
 namespace SignatureStore {
@@ -99,6 +103,14 @@ StoreError SignatureIndex::Initialize(
         SS_LOG_ERROR(L"SignatureIndex", 
             L"Index offset 0x%llX not page-aligned", indexOffset);
         return StoreError{SignatureStoreError::InvalidFormat, 0, "Misaligned offset"};
+    }
+
+    // SECURITY: Overflow-safe check for indexOffset + indexSize
+    if (indexSize > UINT64_MAX - indexOffset) {
+        SS_LOG_ERROR(L"SignatureIndex", 
+            L"Index offset + size would overflow: offset=0x%llX, size=0x%llX",
+            indexOffset, indexSize);
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Offset + size overflow"};
     }
 
     if (indexOffset + indexSize > view.fileSize) {
@@ -256,7 +268,24 @@ std::vector<uint64_t> SignatureIndex::RangeQuery(
     uint32_t maxResults
 ) const noexcept {
     std::vector<uint64_t> results;
-    results.reserve(std::min(maxResults, 1000u));
+    
+    // SECURITY: Validate range
+    if (minFastHash > maxFastHash) {
+        SS_LOG_WARN(L"SignatureIndex", 
+            L"RangeQuery: Invalid range (min > max)");
+        return results;
+    }
+    
+    // SECURITY: Limit max results to prevent DoS
+    constexpr uint32_t ABSOLUTE_MAX_RESULTS = 100000;
+    uint32_t effectiveMaxResults = std::min(maxResults, ABSOLUTE_MAX_RESULTS);
+    
+    try {
+        results.reserve(std::min(effectiveMaxResults, 1000u));
+    } catch (...) {
+        SS_LOG_ERROR(L"SignatureIndex", L"RangeQuery: Failed to reserve result space");
+        return results;
+    }
 
     std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
@@ -266,11 +295,27 @@ std::vector<uint64_t> SignatureIndex::RangeQuery(
         return results;
     }
 
+    // SECURITY: Track iterations to prevent infinite loop
+    constexpr size_t MAX_ITERATIONS = 1000000;
+    size_t iterations = 0;
+
     // Traverse leaf nodes via linked list
-    while (leaf && results.size() < maxResults) {
-        for (uint32_t i = 0; i < leaf->keyCount && results.size() < maxResults; ++i) {
+    while (leaf && results.size() < effectiveMaxResults && iterations < MAX_ITERATIONS) {
+        // SECURITY: Validate keyCount
+        if (leaf->keyCount > BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"RangeQuery: Invalid keyCount %u", leaf->keyCount);
+            break;
+        }
+        
+        for (uint32_t i = 0; i < leaf->keyCount && results.size() < effectiveMaxResults; ++i) {
             if (leaf->keys[i] >= minFastHash && leaf->keys[i] <= maxFastHash) {
-                results.push_back(leaf->children[i]);
+                try {
+                    results.push_back(leaf->children[i]);
+                } catch (...) {
+                    SS_LOG_ERROR(L"SignatureIndex", L"RangeQuery: push_back failed");
+                    return results;
+                }
             } else if (leaf->keys[i] > maxFastHash) {
                 return results; // Past range
             }
@@ -280,7 +325,20 @@ std::vector<uint64_t> SignatureIndex::RangeQuery(
         if (leaf->nextLeaf == 0) {
             break;
         }
+        
+        // SECURITY: Validate nextLeaf offset before use
+        if (leaf->nextLeaf >= m_indexSize) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"RangeQuery: Invalid nextLeaf offset 0x%X", leaf->nextLeaf);
+            break;
+        }
+        
         leaf = GetNode(leaf->nextLeaf);
+        iterations++;
+    }
+
+    if (iterations >= MAX_ITERATIONS) {
+        SS_LOG_WARN(L"SignatureIndex", L"RangeQuery: Iteration limit reached");
     }
 
     return results;
@@ -325,6 +383,13 @@ StoreError SignatureIndex::InsertInternal(
         return StoreError{SignatureStoreError::IndexCorrupted, 0, "Leaf not found"};
     }
 
+    // SECURITY: Validate leaf node
+    if (leafConst->keyCount > BPlusTreeNode::MAX_KEYS) {
+        SS_LOG_ERROR(L"SignatureIndex", 
+            L"InsertInternal: Invalid leaf keyCount %u", leafConst->keyCount);
+        return StoreError{SignatureStoreError::IndexCorrupted, 0, "Invalid leaf keyCount"};
+    }
+
     // Check for duplicate
     uint32_t pos = BinarySearch(leafConst->keys, leafConst->keyCount, fastHash);
     if (pos < leafConst->keyCount && leafConst->keys[pos] == fastHash) {
@@ -340,10 +405,25 @@ StoreError SignatureIndex::InsertInternal(
     // Check if node has space
     if (leaf->keyCount < BPlusTreeNode::MAX_KEYS) {
         // Simple insertion
-        // Shift elements to make space
+        // SECURITY: Validate pos is within bounds before shift
+        if (pos > leaf->keyCount) {
+            pos = leaf->keyCount;
+        }
+        
+        // Shift elements to make space (bounds-safe)
         for (uint32_t i = leaf->keyCount; i > pos; --i) {
-            leaf->keys[i] = leaf->keys[i - 1];
-            leaf->children[i] = leaf->children[i - 1];
+            // SECURITY: Ensure we don't underflow or overflow
+            if (i > 0 && i <= BPlusTreeNode::MAX_KEYS && (i - 1) < BPlusTreeNode::MAX_KEYS) {
+                leaf->keys[i] = leaf->keys[i - 1];
+                leaf->children[i] = leaf->children[i - 1];
+            }
+        }
+
+        // SECURITY: Final bounds check before insert
+        if (pos >= BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"InsertInternal: pos %u out of bounds", pos);
+            return StoreError{SignatureStoreError::IndexCorrupted, 0, "Insert position out of bounds"};
         }
 
         leaf->keys[pos] = fastHash;
@@ -364,11 +444,34 @@ StoreError SignatureIndex::InsertInternal(
 
         // Insert into appropriate leaf
         BPlusTreeNode* targetLeaf = (fastHash < splitKey) ? leaf : newLeaf;
+        
+        // SECURITY: Validate target leaf
+        if (!targetLeaf || targetLeaf->keyCount >= BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"InsertInternal: Target leaf invalid after split");
+            return StoreError{SignatureStoreError::IndexCorrupted, 0, "Invalid state after split"};
+        }
+        
         uint32_t insertPos = BinarySearch(targetLeaf->keys, targetLeaf->keyCount, fastHash);
+        
+        // SECURITY: Clamp insertPos
+        if (insertPos > targetLeaf->keyCount) {
+            insertPos = targetLeaf->keyCount;
+        }
 
+        // Shift elements (bounds-safe)
         for (uint32_t i = targetLeaf->keyCount; i > insertPos; --i) {
-            targetLeaf->keys[i] = targetLeaf->keys[i - 1];
-            targetLeaf->children[i] = targetLeaf->children[i - 1];
+            if (i > 0 && i <= BPlusTreeNode::MAX_KEYS && (i - 1) < BPlusTreeNode::MAX_KEYS) {
+                targetLeaf->keys[i] = targetLeaf->keys[i - 1];
+                targetLeaf->children[i] = targetLeaf->children[i - 1];
+            }
+        }
+
+        // SECURITY: Final bounds check
+        if (insertPos >= BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"InsertInternal: insertPos %u out of bounds after split", insertPos);
+            return StoreError{SignatureStoreError::IndexCorrupted, 0, "Insert position out of bounds"};
         }
 
         targetLeaf->keys[insertPos] = fastHash;
@@ -542,15 +645,29 @@ StoreError SignatureIndex::Remove(const HashValue& hash) noexcept {
     // Store removed offset for logging
     uint64_t removedOffset = leaf->children[keyPosition];
 
-    // Shift keys and children to fill gap
-    for (uint32_t i = keyPosition; i < leaf->keyCount - 1; ++i) {
-        leaf->keys[i] = leaf->keys[i + 1];
-        leaf->children[i] = leaf->children[i + 1];
+    // SECURITY: Validate we can perform the shift
+    if (leaf->keyCount == 0) {
+        m_inCOWTransaction = false;
+        SS_LOG_ERROR(L"SignatureIndex", L"Remove: Leaf keyCount is 0, cannot remove");
+        return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Invalid keyCount" };
+    }
+
+    // Shift keys and children to fill gap (bounds-safe)
+    // Only shift if there are entries after keyPosition
+    if (keyPosition < leaf->keyCount - 1) {
+        for (uint32_t i = keyPosition; i < leaf->keyCount - 1; ++i) {
+            // SECURITY: Bounds check
+            if (i + 1 >= BPlusTreeNode::MAX_KEYS) break;
+            leaf->keys[i] = leaf->keys[i + 1];
+            leaf->children[i] = leaf->children[i + 1];
+        }
     }
 
     // Clear last entry (good practice)
-    leaf->keys[leaf->keyCount - 1] = 0;
-    leaf->children[leaf->keyCount - 1] = 0;
+    if (leaf->keyCount > 0 && leaf->keyCount <= BPlusTreeNode::MAX_KEYS) {
+        leaf->keys[leaf->keyCount - 1] = 0;
+        leaf->children[leaf->keyCount - 1] = 0;
+    }
 
     leaf->keyCount--;
 
@@ -1109,15 +1226,44 @@ void SignatureIndex::ForEach(
     const BPlusTreeNode* node = GetNode(rootOffset);
     if (!node) return;
 
+    // SECURITY: Track depth to prevent infinite loop during navigation
+    constexpr uint32_t MAX_DEPTH = 64;
+    uint32_t depth = 0;
+
     // Navigate to leftmost leaf
-    while (!node->isLeaf) {
+    while (!node->isLeaf && depth < MAX_DEPTH) {
         if (node->keyCount == 0) break;
+        
+        // SECURITY: Validate child offset
+        if (node->children[0] == 0 || node->children[0] >= m_indexSize) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEach: Invalid child[0] offset 0x%X", node->children[0]);
+            return;
+        }
+        
         node = GetNode(node->children[0]);
         if (!node) return;
+        depth++;
     }
 
+    if (depth >= MAX_DEPTH) {
+        SS_LOG_ERROR(L"SignatureIndex", L"ForEach: Max depth exceeded during navigation");
+        return;
+    }
+
+    // SECURITY: Track iterations to prevent infinite loop in linked list
+    constexpr size_t MAX_ITERATIONS = 10000000; // 10M leaves max
+    size_t iterations = 0;
+
     // Traverse linked list of leaves
-    while (node) {
+    while (node && iterations < MAX_ITERATIONS) {
+        // SECURITY: Validate keyCount
+        if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEach: Invalid keyCount %u", node->keyCount);
+            return;
+        }
+        
         for (uint32_t i = 0; i < node->keyCount; ++i) {
             if (!callback(node->keys[i], node->children[i])) {
                 return; // Early exit requested
@@ -1125,7 +1271,20 @@ void SignatureIndex::ForEach(
         }
 
         if (node->nextLeaf == 0) break;
+        
+        // SECURITY: Validate nextLeaf offset
+        if (node->nextLeaf >= m_indexSize) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEach: Invalid nextLeaf offset 0x%X", node->nextLeaf);
+            return;
+        }
+        
         node = GetNode(node->nextLeaf);
+        iterations++;
+    }
+
+    if (iterations >= MAX_ITERATIONS) {
+        SS_LOG_WARN(L"SignatureIndex", L"ForEach: Iteration limit reached");
     }
 }
 
@@ -1826,18 +1985,29 @@ StoreError SignatureIndex::Compact() noexcept {
                     
                     // Remove entry from parent
                     uint32_t removePos = 0;
+                    bool foundPos = false;
                     for (uint32_t j = 0; j < clonedParent->keyCount; ++j) {
-                        if (clonedParent->children[j + 1] ==
-                            allNodes[childIndices[i + 1]].offset) {
+                        // SECURITY: Bounds check on children access
+                        if (j + 1 <= clonedParent->keyCount &&
+                            clonedParent->children[j + 1] == allNodes[childIndices[i + 1]].offset) {
                             removePos = j;
+                            foundPos = true;
                             break;
                         }
                     }
 
-                    // Shift entries
+                    if (!foundPos) {
+                        SS_LOG_WARN(L"SignatureIndex",
+                            L"Compact: Could not find child position to remove");
+                        continue;
+                    }
+
+                    // Shift entries (bounds-safe)
                     // FIX: Check keyCount > 1 to prevent underflow in loop condition
                     if (clonedParent->keyCount > 1) {
                         for (uint32_t j = removePos; j < clonedParent->keyCount - 1; ++j) {
+                            // SECURITY: Additional bounds check
+                            if (j + 1 >= BPlusTreeNode::MAX_KEYS || j + 2 > BPlusTreeNode::MAX_KEYS) break;
                             clonedParent->keys[j] = clonedParent->keys[j + 1];
                             clonedParent->children[j + 1] = clonedParent->children[j + 2];
                         }
@@ -2800,6 +2970,395 @@ bool SignatureIndex::ValidateInvariants(std::string& errorMessage) const noexcep
     // More validation would go here in full implementation
 
     return true;
+}
+
+// ============================================================================
+// MISSING CORE FUNCTIONS - IMPLEMENTATION
+// ============================================================================
+
+const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept {
+    /*
+     * ========================================================================
+     * FIND LEAF NODE CONTAINING TARGET HASH
+     * ========================================================================
+     *
+     * Traverses from root to leaf, following child pointers.
+     * Uses binary search at each internal node level.
+     * Returns null if tree is empty or corrupted.
+     *
+     * ========================================================================
+     */
+
+    uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+    const BPlusTreeNode* node = GetNode(rootOffset);
+    
+    if (!node) {
+        SS_LOG_WARN(L"SignatureIndex", L"FindLeaf: Root node not found");
+        return nullptr;
+    }
+
+    // Track depth to prevent infinite loops (max depth ~ log(N))
+    constexpr uint32_t MAX_DEPTH = 64;
+    uint32_t depth = 0;
+
+    while (!node->isLeaf && depth < MAX_DEPTH) {
+        // Binary search to find correct child
+        uint32_t childIndex = 0;
+        for (uint32_t i = 0; i < node->keyCount; ++i) {
+            if (fastHash >= node->keys[i]) {
+                childIndex = i + 1;
+            } else {
+                break;
+            }
+        }
+
+        // SECURITY: Bounds check on childIndex
+        if (childIndex > node->keyCount) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"FindLeaf: Invalid child index %u (keyCount=%u)",
+                childIndex, node->keyCount);
+            return nullptr;
+        }
+
+        uint32_t childOffset = node->children[childIndex];
+        if (childOffset == 0 || childOffset >= m_indexSize) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"FindLeaf: Invalid child offset 0x%X at depth %u",
+                childOffset, depth);
+            return nullptr;
+        }
+
+        node = GetNode(childOffset);
+        if (!node) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"FindLeaf: Failed to load child node at offset 0x%X",
+                childOffset);
+            return nullptr;
+        }
+
+        depth++;
+    }
+
+    if (depth >= MAX_DEPTH) {
+        SS_LOG_ERROR(L"SignatureIndex", L"FindLeaf: Max depth exceeded - possible cycle");
+        return nullptr;
+    }
+
+    return node;
+}
+
+uint32_t SignatureIndex::FindInsertionPoint(
+    const BPlusTreeNode* node,
+    uint64_t fastHash
+) const noexcept {
+    if (!node) return 0;
+    return BinarySearch(node->keys, node->keyCount, fastHash);
+}
+
+const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept {
+    /*
+     * ========================================================================
+     * GET NODE FROM CACHE OR MEMORY-MAPPED FILE
+     * ========================================================================
+     *
+     * First checks node cache, then falls back to memory-mapped file.
+     * Updates cache statistics.
+     *
+     * ========================================================================
+     */
+
+    if (!m_baseAddress) {
+        return nullptr;
+    }
+
+    // SECURITY: Bounds check
+    if (nodeOffset >= m_indexSize) {
+        SS_LOG_ERROR(L"SignatureIndex", 
+            L"GetNode: Offset 0x%X exceeds index size 0x%llX",
+            nodeOffset, m_indexSize);
+        return nullptr;
+    }
+
+    // Check node cache first (with shared lock for cache read)
+    {
+        std::shared_lock<std::shared_mutex> cacheLock(m_cacheLock);
+        
+        size_t cacheIndex = HashNodeOffset(nodeOffset) % CACHE_SIZE;
+        constexpr size_t MAX_PROBE = 8;
+        
+        for (size_t probe = 0; probe < MAX_PROBE; ++probe) {
+            size_t idx = (cacheIndex + probe) % CACHE_SIZE;
+            const auto& entry = m_nodeCache[idx];
+            
+            if (entry.node != nullptr) {
+                // Verify this is the correct node
+                const uint8_t* cachedPtr = reinterpret_cast<const uint8_t*>(entry.node);
+                const uint8_t* basePtr = static_cast<const uint8_t*>(m_baseAddress);
+                
+                if (cachedPtr >= basePtr && cachedPtr < basePtr + m_indexSize) {
+                    uint32_t cachedOffset = static_cast<uint32_t>(cachedPtr - basePtr);
+                    if (cachedOffset == nodeOffset) {
+                        m_cacheHits.fetch_add(1, std::memory_order_relaxed);
+                        return entry.node;
+                    }
+                }
+            }
+        }
+    }
+
+    // Cache miss - load from memory-mapped file
+    m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
+
+    const uint8_t* basePtr = static_cast<const uint8_t*>(m_baseAddress);
+    const BPlusTreeNode* node = reinterpret_cast<const BPlusTreeNode*>(basePtr + nodeOffset);
+
+    // SECURITY: Validate node appears sane
+    if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
+        SS_LOG_ERROR(L"SignatureIndex", 
+            L"GetNode: Invalid keyCount %u at offset 0x%X",
+            node->keyCount, nodeOffset);
+        return nullptr;
+    }
+
+    // Add to cache (with exclusive lock)
+    {
+        std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock);
+        
+        size_t cacheIndex = HashNodeOffset(nodeOffset) % CACHE_SIZE;
+        auto& entry = m_nodeCache[cacheIndex];
+        
+        entry.node = node;
+        entry.accessCount = 1;
+        entry.lastAccessTime = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return node;
+}
+
+BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
+    /*
+     * ========================================================================
+     * ALLOCATE NEW B+TREE NODE
+     * ========================================================================
+     *
+     * Allocates from COW pool for later commit.
+     * Node is initialized to empty state.
+     *
+     * ========================================================================
+     */
+
+    try {
+        auto node = std::make_unique<BPlusTreeNode>();
+        std::memset(node.get(), 0, sizeof(BPlusTreeNode));
+        node->isLeaf = isLeaf;
+        node->keyCount = 0;
+        
+        BPlusTreeNode* rawPtr = node.get();
+        m_cowNodes.push_back(std::move(node));
+        
+        SS_LOG_TRACE(L"SignatureIndex", 
+            L"AllocateNode: Allocated %s node (COW pool size=%zu)",
+            isLeaf ? L"leaf" : L"internal", m_cowNodes.size());
+        
+        return rawPtr;
+    }
+    catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"SignatureIndex", L"AllocateNode: Memory allocation failed");
+        return nullptr;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureIndex", L"AllocateNode: Unknown exception");
+        return nullptr;
+    }
+}
+
+void SignatureIndex::FreeNode(BPlusTreeNode* node) noexcept {
+    /*
+     * Free node - for COW nodes, they are managed by unique_ptr in m_cowNodes
+     * This function is a no-op since cleanup happens in RollbackCOW/CommitCOW
+     */
+    (void)node; // Unused - COW nodes are auto-managed
+    SS_LOG_TRACE(L"SignatureIndex", L"FreeNode: Node marked for cleanup");
+}
+
+BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept {
+    /*
+     * ========================================================================
+     * CLONE NODE FOR COPY-ON-WRITE MODIFICATION
+     * ========================================================================
+     *
+     * Creates a deep copy of the node for modification.
+     * Original remains unchanged (readers continue using it).
+     *
+     * ========================================================================
+     */
+
+    if (!original) {
+        SS_LOG_ERROR(L"SignatureIndex", L"CloneNode: Null original node");
+        return nullptr;
+    }
+
+    try {
+        auto cloned = std::make_unique<BPlusTreeNode>();
+        std::memcpy(cloned.get(), original, sizeof(BPlusTreeNode));
+        
+        BPlusTreeNode* rawPtr = cloned.get();
+        m_cowNodes.push_back(std::move(cloned));
+        
+        SS_LOG_TRACE(L"SignatureIndex", 
+            L"CloneNode: Cloned node (keyCount=%u, isLeaf=%u)",
+            original->keyCount, original->isLeaf ? 1 : 0);
+        
+        return rawPtr;
+    }
+    catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"SignatureIndex", L"CloneNode: Memory allocation failed");
+        return nullptr;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureIndex", L"CloneNode: Unknown exception");
+        return nullptr;
+    }
+}
+
+StoreError SignatureIndex::SplitNode(
+    BPlusTreeNode* node,
+    uint64_t& splitKey,
+    BPlusTreeNode** newNode
+) noexcept {
+    /*
+     * ========================================================================
+     * SPLIT FULL NODE DURING INSERTION
+     * ========================================================================
+     *
+     * Splits a full node into two nodes.
+     * Returns the split key (median) and new node pointer.
+     *
+     * ========================================================================
+     */
+
+    if (!node || !newNode) {
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Null parameters"};
+    }
+
+    if (node->keyCount < BPlusTreeNode::MAX_KEYS) {
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Node not full"};
+    }
+
+    // Allocate new node
+    BPlusTreeNode* right = AllocateNode(node->isLeaf);
+    if (!right) {
+        return StoreError{SignatureStoreError::OutOfMemory, 0, "Failed to allocate split node"};
+    }
+
+    // Calculate split point (middle)
+    uint32_t midPoint = node->keyCount / 2;
+    
+    // For leaf nodes: split keys evenly
+    // For internal nodes: promote middle key to parent
+    
+    if (node->isLeaf) {
+        // Copy right half to new node
+        uint32_t rightCount = node->keyCount - midPoint;
+        for (uint32_t i = 0; i < rightCount; ++i) {
+            right->keys[i] = node->keys[midPoint + i];
+            right->children[i] = node->children[midPoint + i];
+        }
+        right->keyCount = rightCount;
+        
+        // Update left node
+        node->keyCount = midPoint;
+        
+        // Split key is first key of right node
+        splitKey = right->keys[0];
+        
+        // Update leaf linked list
+        right->nextLeaf = node->nextLeaf;
+        right->prevLeaf = 0; // Will be set by caller
+        node->nextLeaf = 0;  // Will be updated when committing to file
+    }
+    else {
+        // Internal node: promote middle key
+        splitKey = node->keys[midPoint];
+        
+        // Copy keys and children after midpoint to right node
+        uint32_t rightCount = node->keyCount - midPoint - 1;
+        for (uint32_t i = 0; i < rightCount; ++i) {
+            right->keys[i] = node->keys[midPoint + 1 + i];
+        }
+        for (uint32_t i = 0; i <= rightCount; ++i) {
+            right->children[i] = node->children[midPoint + 1 + i];
+        }
+        right->keyCount = rightCount;
+        
+        // Update left node
+        node->keyCount = midPoint;
+    }
+
+    *newNode = right;
+    
+    SS_LOG_DEBUG(L"SignatureIndex", 
+        L"SplitNode: Split at key 0x%llX (left=%u keys, right=%u keys)",
+        splitKey, node->keyCount, right->keyCount);
+
+    return StoreError{SignatureStoreError::Success};
+}
+
+StoreError SignatureIndex::MergeNodes(
+    BPlusTreeNode* left,
+    BPlusTreeNode* right
+) noexcept {
+    /*
+     * ========================================================================
+     * MERGE TWO SIBLING NODES
+     * ========================================================================
+     *
+     * Merges right node into left node.
+     * Used during deletion when nodes become underfull.
+     *
+     * ========================================================================
+     */
+
+    if (!left || !right) {
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Null parameters"};
+    }
+
+    if (left->isLeaf != right->isLeaf) {
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Cannot merge leaf with internal"};
+    }
+
+    uint32_t totalKeys = left->keyCount + right->keyCount;
+    if (totalKeys > BPlusTreeNode::MAX_KEYS) {
+        return StoreError{SignatureStoreError::TooLarge, 0, "Merged node would exceed max keys"};
+    }
+
+    if (left->isLeaf) {
+        // Merge leaf nodes
+        for (uint32_t i = 0; i < right->keyCount; ++i) {
+            left->keys[left->keyCount + i] = right->keys[i];
+            left->children[left->keyCount + i] = right->children[i];
+        }
+        left->keyCount = totalKeys;
+        
+        // Update leaf linked list
+        left->nextLeaf = right->nextLeaf;
+    }
+    else {
+        // Merge internal nodes - need separator key from parent
+        // This is a simplified implementation
+        for (uint32_t i = 0; i < right->keyCount; ++i) {
+            left->keys[left->keyCount + i] = right->keys[i];
+        }
+        for (uint32_t i = 0; i <= right->keyCount; ++i) {
+            left->children[left->keyCount + i] = right->children[i];
+        }
+        left->keyCount = totalKeys;
+    }
+
+    SS_LOG_DEBUG(L"SignatureIndex", 
+        L"MergeNodes: Merged to %u keys", left->keyCount);
+
+    return StoreError{SignatureStoreError::Success};
 }
 
 } // namespace SignatureStore

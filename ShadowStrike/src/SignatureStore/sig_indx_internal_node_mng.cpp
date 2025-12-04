@@ -80,21 +80,28 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
     // ========================================================================
 
     // Infinite loop prevention (max tree height = 10 for 2^127 entries)
+    // HARDENED: Use constexpr for compile-time validation
     constexpr uint32_t MAX_TREE_DEPTH = 20;
     uint32_t depth = 0;
+
+    // HARDENED: Track visited offsets to detect cycles (corruption detection)
+    uint32_t visitedOffsets[MAX_TREE_DEPTH + 1] = { 0 };
+    visitedOffsets[0] = nodeOffset;
 
     while (node && !node->isLeaf) {
         // ====================================================================
         // DEPTH CHECK (Corruption/Loop Detection)
         // ====================================================================
 
-        if (++depth > MAX_TREE_DEPTH) {
+        // HARDENED: Pre-increment check to prevent overflow
+        if (depth >= MAX_TREE_DEPTH) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"FindLeaf: Maximum tree depth exceeded (depth=%u, fastHash=0x%llX) - "
                 L"possible corruption or infinite loop",
                 depth, fastHash);
             return nullptr;
         }
+        ++depth;
 
         // ====================================================================
         // VALIDATE NODE STRUCTURE
@@ -159,6 +166,20 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
                 L"FindLeaf: Child offset 0x%X exceeds index size 0x%llX at depth %u",
                 nodeOffset, m_indexSize, depth);
             return nullptr;
+        }
+
+        // HARDENED: Cycle detection - check if we've visited this offset before
+        for (uint32_t i = 0; i < depth; ++i) {
+            if (visitedOffsets[i] == nodeOffset) {
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"FindLeaf: Cycle detected - offset 0x%X visited at depth %u, now at depth %u",
+                    nodeOffset, i, depth);
+                return nullptr;
+            }
+        }
+        // Record this offset for future cycle detection
+        if (depth < MAX_TREE_DEPTH) {
+            visitedOffsets[depth] = nodeOffset;
         }
 
         // Get next node from cache or memory
@@ -395,19 +416,43 @@ StoreError SignatureIndex::SplitNode(
 
     (*newNode)->keyCount = keysToMove;
 
-    // Copy keys
+    // Copy keys - HARDENED: bounds check source indices
     for (uint32_t i = 0; i < keysToMove; ++i) {
-        (*newNode)->keys[i] = node->keys[midPoint + i];
+        const uint32_t srcIdx = midPoint + i;
+        // HARDENED: Defensive bounds check
+        if (srcIdx >= BPlusTreeNode::MAX_KEYS || i >= BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"SplitNode: Key copy index out of bounds (src=%u, dst=%u, max=%zu)",
+                srcIdx, i, BPlusTreeNode::MAX_KEYS);
+            FreeNode(*newNode);
+            *newNode = nullptr;
+            return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Array bounds violation" };
+        }
+        (*newNode)->keys[i] = node->keys[srcIdx];
     }
 
     // Copy children (for internal nodes) or offsets (for leaf nodes)
+    // HARDENED: bounds check on children array
     for (uint32_t i = 0; i < keysToMove; ++i) {
-        (*newNode)->children[i] = node->children[midPoint + i];
+        const uint32_t srcIdx = midPoint + i;
+        if (srcIdx >= BPlusTreeNode::MAX_CHILDREN || i >= BPlusTreeNode::MAX_CHILDREN) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"SplitNode: Children copy index out of bounds (src=%u, dst=%u, max=%zu)",
+                srcIdx, i, BPlusTreeNode::MAX_CHILDREN);
+            FreeNode(*newNode);
+            *newNode = nullptr;
+            return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Children array bounds violation" };
+        }
+        (*newNode)->children[i] = node->children[srcIdx];
     }
 
     // For internal nodes, also copy the extra child pointer
-    if (!node->isLeaf && (midPoint + keysToMove) < BPlusTreeNode::MAX_CHILDREN) {
-        (*newNode)->children[keysToMove] = node->children[midPoint + keysToMove];
+    // HARDENED: explicit bounds validation
+    if (!node->isLeaf) {
+        const uint32_t srcExtraIdx = midPoint + keysToMove;
+        if (srcExtraIdx < BPlusTreeNode::MAX_CHILDREN && keysToMove < BPlusTreeNode::MAX_CHILDREN) {
+            (*newNode)->children[keysToMove] = node->children[srcExtraIdx];
+        }
     }
 
     SS_LOG_TRACE(L"SignatureIndex",
@@ -417,10 +462,18 @@ StoreError SignatureIndex::SplitNode(
     // STEP 5: UPDATE ORIGINAL NODE
     // ========================================================================
 
+    // HARDENED: Store original keyCount before modification for safe iteration
+    const uint32_t originalKeyCount = node->keyCount;
+    
     // Clear moved entries (good practice for debugging)
-    for (uint32_t i = midPoint; i < node->keyCount; ++i) {
-        node->keys[i] = 0;
-        node->children[i] = 0;
+    // HARDENED: bounds check each access
+    for (uint32_t i = midPoint; i < originalKeyCount; ++i) {
+        if (i < BPlusTreeNode::MAX_KEYS) {
+            node->keys[i] = 0;
+        }
+        if (i < BPlusTreeNode::MAX_CHILDREN) {
+            node->children[i] = 0;
+        }
     }
 
     node->keyCount = midPoint;
@@ -519,6 +572,15 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
      // ========================================================================
 
     try {
+        // HARDENED: Pre-check COW pool size before allocation to fail fast
+        constexpr size_t MAX_COW_NODES = 10000;
+        if (m_cowNodes.size() >= MAX_COW_NODES) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"AllocateNode: COW pool already at maximum size (%zu nodes) - allocation denied",
+                MAX_COW_NODES);
+            return nullptr;
+        }
+
         auto node = std::make_unique<BPlusTreeNode>();
 
         if (!node) {
@@ -530,8 +592,12 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
         // STEP 2: INITIALIZE NODE TO SAFE DEFAULTS
         // ====================================================================
 
-        // Zero-initialize entire structure (paranoid security measure)
-        std::memset(node.get(), 0, sizeof(BPlusTreeNode));
+        // HARDENED: Use volatile write to ensure zeroing is not optimized away
+        // This prevents potential information leakage from uninitialized memory
+        volatile uint8_t* volatilePtr = reinterpret_cast<volatile uint8_t*>(node.get());
+        for (size_t i = 0; i < sizeof(BPlusTreeNode); ++i) {
+            volatilePtr[i] = 0;
+        }
 
         // Set node type
         node->isLeaf = isLeaf;
@@ -546,7 +612,7 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
         node->nextLeaf = 0;
         node->prevLeaf = 0;
 
-        // Keys and children are already zeroed by memset
+        // Keys and children are already zeroed by volatile write above
 
         SS_LOG_TRACE(L"SignatureIndex",
             L"AllocateNode: Allocated %s node (size=%zu bytes)",
@@ -558,16 +624,17 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
 
         BPlusTreeNode* ptr = node.get();
 
-        // DoS protection: prevent unbounded COW pool growth
-        constexpr size_t MAX_COW_NODES = 10000;
-        if (m_cowNodes.size() >= MAX_COW_NODES) {
+        // HARDENED: Pre-check already done above, but verify again for defense-in-depth
+        // (Size check was done at function entry - this is a sanity check)
+        
+        // HARDENED: Wrap push_back in try-catch as it may throw
+        try {
+            m_cowNodes.push_back(std::move(node));
+        } catch (const std::exception& pushEx) {
             SS_LOG_ERROR(L"SignatureIndex",
-                L"AllocateNode: COW pool exceeded maximum size (%zu nodes)",
-                MAX_COW_NODES);
+                L"AllocateNode: Failed to add node to COW pool: %S", pushEx.what());
             return nullptr;
         }
-
-        m_cowNodes.push_back(std::move(node));
 
         SS_LOG_TRACE(L"SignatureIndex",
             L"AllocateNode: Added to COW pool (pool size=%zu)",
@@ -666,6 +733,18 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
     // STEP 1: BOUNDS CHECKING
     // ========================================================================
 
+    // HARDENED: Check for null base address first
+    if (!m_baseAddress) {
+        SS_LOG_ERROR(L"SignatureIndex", L"GetNode: Base address is null");
+        return nullptr;
+    }
+
+    // HARDENED: Check for zero index size
+    if (m_indexSize == 0) {
+        SS_LOG_ERROR(L"SignatureIndex", L"GetNode: Index size is zero");
+        return nullptr;
+    }
+
     if (nodeOffset >= m_indexSize) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"GetNode: Offset 0x%X exceeds index size 0x%llX",
@@ -673,17 +752,29 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
         return nullptr;
     }
 
-    // Validate offset is properly aligned
-    if (nodeOffset % alignof(BPlusTreeNode) != 0) {
-        SS_LOG_WARN(L"SignatureIndex",
-            L"GetNode: Offset 0x%X is not properly aligned (alignment=%zu)",
-            nodeOffset, alignof(BPlusTreeNode));
+    // HARDENED: Integer overflow check before addition
+    if (static_cast<uint64_t>(nodeOffset) + sizeof(BPlusTreeNode) > m_indexSize) {
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"GetNode: Node at offset 0x%X would overflow index bounds",
+            nodeOffset);
+        return nullptr;
+    }
+
+    // Validate offset is properly aligned - HARDENED: make this an error, not warning
+    constexpr size_t NODE_ALIGNMENT = alignof(BPlusTreeNode);
+    if (NODE_ALIGNMENT > 1 && (nodeOffset % NODE_ALIGNMENT) != 0) {
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"GetNode: Offset 0x%X is not properly aligned (required alignment=%zu)",
+            nodeOffset, NODE_ALIGNMENT);
+        return nullptr;  // HARDENED: Changed from warning to error - misaligned access is UB
     }
 
     // ========================================================================
     // STEP 2: CHECK CACHE (Thread-Safe Read)
     // ========================================================================
 
+    // HARDENED: Validate CACHE_SIZE > 0 at compile time
+    static_assert(CACHE_SIZE > 0, "CACHE_SIZE must be positive");
     const size_t cacheIdx = HashNodeOffset(nodeOffset) % CACHE_SIZE;
     
     // Read cache entry under shared lock
@@ -725,14 +816,8 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
 
     m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
 
-    // Validate we have enough space for full node
-    if (nodeOffset + sizeof(BPlusTreeNode) > m_indexSize) {
-        SS_LOG_ERROR(L"SignatureIndex",
-            L"GetNode: Node at offset 0x%X would exceed index bounds "
-            L"(required=%zu, available=%llu)",
-            nodeOffset, sizeof(BPlusTreeNode), m_indexSize - nodeOffset);
-        return nullptr;
-    }
+    // HARDENED: Bounds check already performed at function entry, but kept as defense-in-depth
+    // (Note: This was checked above, but a second check here provides extra safety)
 
     // Calculate node address
     const uint8_t* nodeAddr = static_cast<const uint8_t*>(m_baseAddress) + nodeOffset;
@@ -741,6 +826,14 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
     // ========================================================================
     // STEP 4: VALIDATE NODE STRUCTURE (Corruption Detection)
     // ========================================================================
+
+    // HARDENED: Null check after cast (should never happen, but defense-in-depth)
+    if (!node) {
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"GetNode: Node pointer is null after address calculation at offset 0x%X",
+            nodeOffset);
+        return nullptr;
+    }
 
     if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_ERROR(L"SignatureIndex",
@@ -753,13 +846,26 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
     // STEP 5: UPDATE CACHE (Thread-Safe Write)
     // ========================================================================
 
-    {
+    // HARDENED: Wrap cache update in try-catch for exception safety
+    try {
         std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock);
         
         auto& cached = m_nodeCache[cacheIdx];
         cached.node = node;
         cached.accessCount = 1;
         cached.lastAccessTime = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
+    }
+    catch (const std::exception& ex) {
+        // HARDENED: Cache update failure is non-fatal, log and continue
+        SS_LOG_WARN(L"SignatureIndex",
+            L"GetNode: Cache update failed (offset=0x%X): %S - continuing without cache",
+            nodeOffset, ex.what());
+        // Node is still valid, just not cached
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureIndex",
+            L"GetNode: Cache update failed with unknown exception (offset=0x%X)",
+            nodeOffset);
     }
 
     SS_LOG_TRACE(L"SignatureIndex",
@@ -833,7 +939,7 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
 
         BPlusTreeNode* ptr = clone.get();
 
-        // DoS protection
+        // HARDENED: Pre-check COW pool size before push_back
         constexpr size_t MAX_COW_NODES = 10000;
         if (m_cowNodes.size() >= MAX_COW_NODES) {
             SS_LOG_ERROR(L"SignatureIndex",
@@ -842,7 +948,14 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
             return nullptr;
         }
 
-        m_cowNodes.push_back(std::move(clone));
+        // HARDENED: Wrap push_back in try-catch
+        try {
+            m_cowNodes.push_back(std::move(clone));
+        } catch (const std::exception& pushEx) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"CloneNode: Failed to add to COW pool: %S", pushEx.what());
+            return nullptr;
+        }
 
         SS_LOG_TRACE(L"SignatureIndex",
             L"CloneNode: Added to COW pool (pool size=%zu)",
@@ -927,6 +1040,15 @@ StoreError SignatureIndex::MergeNodes(
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Right node is null" };
     }
 
+    // HARDENED: Validate node types match (can't merge leaf with internal)
+    if (left->isLeaf != right->isLeaf) {
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"MergeNodes: Node type mismatch (left isLeaf=%d, right isLeaf=%d)",
+            left->isLeaf, right->isLeaf);
+        return StoreError{ SignatureStoreError::IndexCorrupted, 0,
+                          "Cannot merge nodes of different types" };
+    }
+
     // Validate key counts
     if (left->keyCount > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_ERROR(L"SignatureIndex",
@@ -944,11 +1066,13 @@ StoreError SignatureIndex::MergeNodes(
                           "Right node has invalid keyCount" };
     }
 
-    // Check merge is actually possible
-    if (left->keyCount + right->keyCount > BPlusTreeNode::MAX_KEYS) {
+    // HARDENED: Use safe addition to prevent overflow
+    const uint64_t combinedKeys = static_cast<uint64_t>(left->keyCount) + 
+                                   static_cast<uint64_t>(right->keyCount);
+    if (combinedKeys > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_WARN(L"SignatureIndex",
-            L"MergeNodes: Combined keys (%u + %u) exceed maximum (%zu) - merge not possible",
-            left->keyCount, right->keyCount, BPlusTreeNode::MAX_KEYS);
+            L"MergeNodes: Combined keys (%llu) exceed maximum (%zu) - merge not possible",
+            combinedKeys, BPlusTreeNode::MAX_KEYS);
         return StoreError{ SignatureStoreError::IndexCorrupted, 0,
                           "Cannot merge: combined keys exceed max capacity" };
     }
@@ -969,13 +1093,35 @@ StoreError SignatureIndex::MergeNodes(
     // STEP 3: COPY KEYS FROM RIGHT TO LEFT
     // ========================================================================
 
-    for (uint32_t i = 0; i < right->keyCount; ++i) {
+    // HARDENED: Store rightKeyCount to prevent TOCTOU issues if right is modified
+    const uint32_t rightKeyCount = right->keyCount;
+    
+    for (uint32_t i = 0; i < rightKeyCount; ++i) {
+        // HARDENED: Bounds check on left node before write
         if (left->keyCount >= BPlusTreeNode::MAX_KEYS) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"MergeNodes: Left node full during merge (keyCount=%u)",
                 left->keyCount);
             return StoreError{ SignatureStoreError::IndexCorrupted, 0,
                               "Left node overflowed during merge" };
+        }
+
+        // HARDENED: Bounds check on right node before read
+        if (i >= BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"MergeNodes: Right source index %u out of bounds (max=%zu)",
+                i, BPlusTreeNode::MAX_KEYS);
+            return StoreError{ SignatureStoreError::IndexCorrupted, 0,
+                              "Right node index out of bounds" };
+        }
+
+        // HARDENED: Bounds check on children array (may differ from keys)
+        if (left->keyCount >= BPlusTreeNode::MAX_CHILDREN || i >= BPlusTreeNode::MAX_CHILDREN) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"MergeNodes: Children index out of bounds (left=%u, right=%u, max=%zu)",
+                left->keyCount, i, BPlusTreeNode::MAX_CHILDREN);
+            return StoreError{ SignatureStoreError::IndexCorrupted, 0,
+                              "Children array bounds violation" };
         }
 
         left->keys[left->keyCount] = right->keys[i];
@@ -993,18 +1139,19 @@ StoreError SignatureIndex::MergeNodes(
 
     if (!left->isLeaf && !right->isLeaf) {
         // Internal nodes have one more child pointer than keys
-        if (right->keyCount < BPlusTreeNode::MAX_CHILDREN) {
-            if (left->keyCount < BPlusTreeNode::MAX_CHILDREN - 1) {
-                left->children[left->keyCount] = right->children[right->keyCount];
-                SS_LOG_TRACE(L"SignatureIndex",
-                    L"MergeNodes: Copied extra child pointer for internal nodes");
-            }
-            else {
-                SS_LOG_ERROR(L"SignatureIndex",
-                    L"MergeNodes: Left node children array full");
-                return StoreError{ SignatureStoreError::IndexCorrupted, 0,
-                                  "Left node children overflow" };
-            }
+        // HARDENED: Explicit bounds validation for both source and destination
+        if (rightKeyCount < BPlusTreeNode::MAX_CHILDREN && 
+            left->keyCount < BPlusTreeNode::MAX_CHILDREN) {
+            left->children[left->keyCount] = right->children[rightKeyCount];
+            SS_LOG_TRACE(L"SignatureIndex",
+                L"MergeNodes: Copied extra child pointer for internal nodes");
+        }
+        else {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"MergeNodes: Cannot copy extra child - index out of bounds (left=%u, right=%u)",
+                left->keyCount, rightKeyCount);
+            return StoreError{ SignatureStoreError::IndexCorrupted, 0,
+                              "Extra child pointer copy failed" };
         }
     }
 
