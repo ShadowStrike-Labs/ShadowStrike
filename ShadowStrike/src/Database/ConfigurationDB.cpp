@@ -1,4 +1,7 @@
-﻿#include "ConfigurationDB.hpp"
+﻿
+
+
+#include "ConfigurationDB.hpp"
 #include"DatabaseManager.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/XMLUtils.hpp"
@@ -1922,21 +1925,21 @@ namespace ShadowStrike {
                         continue;
                     }
 
-                    // Convert key to narrow string for JSON
-                    std::string keyNarrow(key.begin(), key.end());
+                    // Convert key to narrow string for JSON using proper UTF-8
+                    std::string keyNarrow = wstringToUtf8(key);
                     entry["key"] = keyNarrow;
                     entry["type"] = static_cast<int>(type);
                     entry["scope"] = static_cast<int>(entryScope);
                     entry["isEncrypted"] = isEncrypted;
                     entry["isReadOnly"] = isReadOnly;
 
-                    std::string descNarrow(description.begin(), description.end());
+                    std::string descNarrow = wstringToUtf8(description);
                     entry["description"] = descNarrow;
 
                     entry["createdAt"] = createdMs;
                     entry["modifiedAt"] = modifiedMs;
 
-                    std::string modifiedByNarrow(modifiedBy.begin(), modifiedBy.end());
+                    std::string modifiedByNarrow = wstringToUtf8(modifiedBy);
                     entry["modifiedBy"] = modifiedByNarrow;
                     entry["version"] = version;
 
@@ -2150,8 +2153,7 @@ namespace ShadowStrike {
                     // If read-only flag was set, update it separately
                     if (isReadOnly) {
                         std::string updateSql = "UPDATE configurations SET is_readonly = 1 WHERE key = ?";
-                        std::wstring keyWide(key);
-                        std::string keyUtf8(keyWide.begin(), keyWide.end());
+                        std::string keyUtf8 = wstringToUtf8(key);
                         if (!dbMgr.ExecuteWithParams(updateSql, err, keyUtf8)) {
                             SS_LOG_WARN(LOG_CATEGORY, L"ImportFromJson: Failed to set read-only flag for: %ls", key.c_str());
                         }
@@ -2257,8 +2259,8 @@ namespace ShadowStrike {
 
                     auto entry = configs.append_child("Configuration");
 
-                    // Convert to UTF-8 for XML
-                    std::string keyUtf8(key.begin(), key.end());
+                    // Convert to UTF-8 for XML using proper conversion
+                    std::string keyUtf8 = wstringToUtf8(key);
                     entry.append_attribute("key").set_value(keyUtf8.c_str());
                     entry.append_attribute("type").set_value(static_cast<int>(type));
                     entry.append_attribute("scope").set_value(static_cast<int>(entryScope));
@@ -2268,7 +2270,7 @@ namespace ShadowStrike {
 
                     // Description
                     if (!description.empty()) {
-                        std::string descUtf8(description.begin(), description.end());
+                        std::string descUtf8 = wstringToUtf8(description);
                         auto descNode = entry.append_child("Description");
                         descNode.text().set(descUtf8.c_str());
                     }
@@ -2284,7 +2286,7 @@ namespace ShadowStrike {
                     snprintf(modifiedBuf, sizeof(modifiedBuf), "%lld", modifiedMs);
                     meta.append_child("ModifiedAt").text().set(modifiedBuf);
 
-                    std::string modifiedByUtf8(modifiedBy.begin(), modifiedBy.end());
+                    std::string modifiedByUtf8 = wstringToUtf8(modifiedBy);
                     meta.append_child("ModifiedBy").text().set(modifiedByUtf8.c_str());
 
                     // Value
@@ -2300,7 +2302,7 @@ namespace ShadowStrike {
 
                         if (std::holds_alternative<std::wstring>(val)) {
                             auto& wstr = std::get<std::wstring>(val);
-                            std::string strUtf8(wstr.begin(), wstr.end());
+                            std::string strUtf8 = wstringToUtf8(wstr);
                             valueNode.text().set(strUtf8.c_str());
                         }
                         else if (std::holds_alternative<int64_t>(val)) {
@@ -2525,7 +2527,7 @@ namespace ShadowStrike {
                     // Set read-only if needed
                     if (isReadOnly) {
                         std::string updateSql = "UPDATE configurations SET is_readonly = 1 WHERE key = ?";
-                        std::string keyNarrow(key.begin(), key.end());
+                        std::string keyNarrow = wstringToUtf8(key);
                         if (!dbMgr.ExecuteWithParams(updateSql, err, keyNarrow)) {
                             SS_LOG_WARN(LOG_CATEGORY, L"ImportFromXml: Failed to set read-only for: %ls", key.c_str());
                         }
@@ -2587,8 +2589,7 @@ namespace ShadowStrike {
                 sql += " LIMIT ?";
             }
 
-            std::wstring keyWide(key);
-            std::string keyUtf8(keyWide.begin(), keyWide.end());
+            std::string keyUtf8 = wstringToUtf8(key);
 
             QueryResult result;
             if (maxVersions > 0) {
@@ -2648,8 +2649,7 @@ namespace ShadowStrike {
             std::string sql = "SELECT value, type, scope FROM configuration_history "
                 "WHERE key = ? AND version = ?";
 
-            std::wstring keyWide(key);
-            std::string keyUtf8(keyWide.begin(), keyWide.end());
+            std::string keyUtf8 = wstringToUtf8(key);
 
             auto result = dbMgr.QueryWithParams(sql, err, keyUtf8, version);
 

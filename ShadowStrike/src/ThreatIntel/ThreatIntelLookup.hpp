@@ -201,9 +201,12 @@ struct LookupConfig {
 // ============================================================================
 
 /**
- * @brief Options for individual lookup operations
+ * @brief Options for individual lookup operations via ThreatIntelLookup
+ * 
+ * @note This is the options struct for the unified lookup interface.
+ * Distinguished from StoreLookupOptions in ThreatIntelStore.hpp.
  */
-struct LookupOptions {
+struct UnifiedLookupOptions {
     /// @brief Maximum lookup tiers to try (1=cache only, 5=all including external)
     uint8_t maxLookupTiers{4};
     
@@ -246,8 +249,8 @@ struct LookupOptions {
     /**
      * @brief Create options for fastest lookup
      */
-    [[nodiscard]] static LookupOptions FastestLookup() noexcept {
-        LookupOptions opts;
+    [[nodiscard]] static UnifiedLookupOptions FastestLookup() noexcept {
+        UnifiedLookupOptions opts;
         opts.maxLookupTiers = 2;  // Cache + Index only
         opts.cacheResult = true;
         opts.includeMetadata = false;
@@ -263,8 +266,8 @@ struct LookupOptions {
     /**
      * @brief Create options for detailed lookup
      */
-    [[nodiscard]] static LookupOptions DetailedLookup() noexcept {
-        LookupOptions opts;
+    [[nodiscard]] static UnifiedLookupOptions DetailedLookup() noexcept {
+        UnifiedLookupOptions opts;
         opts.maxLookupTiers = 5;  // All tiers including external
         opts.includeMetadata = true;
         opts.includeSourceAttribution = true;
@@ -279,8 +282,8 @@ struct LookupOptions {
     /**
      * @brief Create options for malware analysis
      */
-    [[nodiscard]] static LookupOptions MalwareAnalysis() noexcept {
-        LookupOptions opts;
+    [[nodiscard]] static UnifiedLookupOptions MalwareAnalysis() noexcept {
+        UnifiedLookupOptions opts;
         opts.maxLookupTiers = 5;
         opts.includeMetadata = true;
         opts.includeSourceAttribution = true;
@@ -541,6 +544,12 @@ struct LookupStatistics {
     std::atomic<uint64_t> externalAPIErrors{0};
     std::atomic<uint64_t> externalAPITimeouts{0};
     
+    /// @brief Cache management statistics
+    std::atomic<uint64_t> bloomFilterRejects{0};    ///< Bloom filter definite negatives
+    std::atomic<uint64_t> cacheInsertions{0};       ///< Cache entry insertions
+    std::atomic<uint64_t> cacheEvictions{0};        ///< Cache entry evictions
+    std::atomic<uint64_t> cacheExpirations{0};      ///< Expired entry evictions
+    
     /// @brief Last reset timestamp
     std::atomic<uint64_t> lastResetTime{0};
     
@@ -568,6 +577,10 @@ struct LookupStatistics {
         , externalAPIRequests(other.externalAPIRequests.load(std::memory_order_relaxed))
         , externalAPIErrors(other.externalAPIErrors.load(std::memory_order_relaxed))
         , externalAPITimeouts(other.externalAPITimeouts.load(std::memory_order_relaxed))
+        , bloomFilterRejects(other.bloomFilterRejects.load(std::memory_order_relaxed))
+        , cacheInsertions(other.cacheInsertions.load(std::memory_order_relaxed))
+        , cacheEvictions(other.cacheEvictions.load(std::memory_order_relaxed))
+        , cacheExpirations(other.cacheExpirations.load(std::memory_order_relaxed))
         , lastResetTime(other.lastResetTime.load(std::memory_order_relaxed))
     {
         for (size_t i = 0; i < lookupsByType.size(); ++i) {
@@ -629,6 +642,10 @@ struct LookupStatistics {
         externalAPIRequests.store(0, std::memory_order_relaxed);
         externalAPIErrors.store(0, std::memory_order_relaxed);
         externalAPITimeouts.store(0, std::memory_order_relaxed);
+        bloomFilterRejects.store(0, std::memory_order_relaxed);
+        cacheInsertions.store(0, std::memory_order_relaxed);
+        cacheEvictions.store(0, std::memory_order_relaxed);
+        cacheExpirations.store(0, std::memory_order_relaxed);
         
         for (auto& counter : lookupsByType) {
             counter.store(0, std::memory_order_relaxed);
@@ -723,7 +740,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupIPv4(
         std::string_view ipv4,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -731,7 +748,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupIPv4(
         const IPv4Address& addr,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -739,7 +756,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupIPv4(
         uint32_t ipv4,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -754,7 +771,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupIPv6(
         std::string_view ipv6,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -762,7 +779,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupIPv6(
         const IPv6Address& addr,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -777,7 +794,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupDomain(
         std::string_view domain,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -792,7 +809,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupURL(
         std::string_view url,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -807,7 +824,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupHash(
         std::string_view hash,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -815,7 +832,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupMD5(
         std::string_view md5,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -823,7 +840,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupSHA1(
         std::string_view sha1,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -831,7 +848,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupSHA256(
         std::string_view sha256,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -839,7 +856,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupHash(
         const HashValue& hashValue,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -854,7 +871,7 @@ public:
      */
     [[nodiscard]] ThreatLookupResult LookupEmail(
         std::string_view email,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -871,7 +888,7 @@ public:
     [[nodiscard]] ThreatLookupResult Lookup(
         IOCType type,
         std::string_view value,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================
@@ -886,7 +903,7 @@ public:
      */
     [[nodiscard]] BatchLookupResult BatchLookupIPv4(
         std::span<const std::string_view> addresses,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -894,7 +911,7 @@ public:
      */
     [[nodiscard]] BatchLookupResult BatchLookupDomains(
         std::span<const std::string_view> domains,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -902,7 +919,7 @@ public:
      */
     [[nodiscard]] BatchLookupResult BatchLookupHashes(
         std::span<const std::string_view> hashes,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -910,7 +927,7 @@ public:
      */
     [[nodiscard]] BatchLookupResult BatchLookupURLs(
         std::span<const std::string_view> urls,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     /**
@@ -919,7 +936,7 @@ public:
     [[nodiscard]] BatchLookupResult BatchLookup(
         IOCType type,
         std::span<const std::string_view> values,
-        const LookupOptions& options = LookupOptions::FastestLookup()
+        const UnifiedLookupOptions& options = UnifiedLookupOptions::FastestLookup()
     ) noexcept;
     
     // ========================================================================

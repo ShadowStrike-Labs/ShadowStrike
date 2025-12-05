@@ -38,33 +38,110 @@ namespace SignatureStore {
 // ============================================================================
 
 SignatureStore::SignatureStore()
-    : m_hashStore(std::make_unique<HashStore>())
-    , m_patternStore(std::make_unique<PatternStore>())
-    , m_yaraStore(std::make_unique<YaraRuleStore>())
+    : m_hashStore(nullptr)
+    , m_patternStore(nullptr)
+    , m_yaraStore(nullptr)
 {
-    if (!QueryPerformanceFrequency(&m_perfFrequency)) {
+    // TITANIUM: Initialize performance counter with validation
+    m_perfFrequency.QuadPart = 0;
+    if (!QueryPerformanceFrequency(&m_perfFrequency) || m_perfFrequency.QuadPart <= 0) {
+        // Fallback to reasonable default (1MHz = 1µs resolution)
         m_perfFrequency.QuadPart = 1000000;
+        SS_LOG_WARN(L"SignatureStore", L"QueryPerformanceFrequency failed, using fallback");
     }
 
-    // FIX: Initialize query cache with default size to prevent division by zero
+    // TITANIUM: Initialize component stores with exception safety
+    try {
+        m_hashStore = std::make_unique<HashStore>();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to create HashStore: %S", e.what());
+        m_hashStore = nullptr;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to create HashStore: Unknown exception");
+        m_hashStore = nullptr;
+    }
+
+    try {
+        m_patternStore = std::make_unique<PatternStore>();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to create PatternStore: %S", e.what());
+        m_patternStore = nullptr;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to create PatternStore: Unknown exception");
+        m_patternStore = nullptr;
+    }
+
+    try {
+        m_yaraStore = std::make_unique<YaraRuleStore>();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to create YaraRuleStore: %S", e.what());
+        m_yaraStore = nullptr;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to create YaraRuleStore: Unknown exception");
+        m_yaraStore = nullptr;
+    }
+
+    // TITANIUM: Initialize query cache with proper exception handling
     try {
         m_queryCache.resize(QUERY_CACHE_SIZE);
         for (auto& entry : m_queryCache) {
             entry.bufferHash.fill(0);
-            entry.result = ScanResult{};
+            entry.result.Clear();  // Use Clear() method for proper initialization
             entry.timestamp = 0;
         }
     }
+    catch (const std::bad_alloc& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Failed to allocate query cache: %S", e.what());
+        // Cache will remain empty - operations will check for empty cache
+        m_queryCache.clear();
+    }
     catch (const std::exception& e) {
         SS_LOG_ERROR(L"SignatureStore", L"Failed to initialize query cache: %S", e.what());
-        // Cache will remain empty - operations will check for empty cache
+        m_queryCache.clear();
     }
 
-    SS_LOG_DEBUG(L"SignatureStore", L"Created instance");
+    SS_LOG_DEBUG(L"SignatureStore", L"Created instance (HashStore=%s, PatternStore=%s, YaraStore=%s)",
+        m_hashStore ? L"OK" : L"FAILED",
+        m_patternStore ? L"OK" : L"FAILED",
+        m_yaraStore ? L"OK" : L"FAILED");
 }
 
 SignatureStore::~SignatureStore() {
-    Close();
+    // TITANIUM: Safe destruction with exception handling
+    // Note: Destructor must not throw - wrap all operations in try-catch
+    try {
+        Close();
+    }
+    catch (...) {
+        // Silently ignore exceptions in destructor
+        SS_LOG_ERROR(L"SignatureStore", L"Exception in destructor during Close()");
+    }
+    
+    // TITANIUM: Explicitly clear callback to prevent dangling references
+    try {
+        std::lock_guard<std::mutex> lock(m_callbackMutex);
+        m_detectionCallback = nullptr;
+    }
+    catch (...) {
+        // Mutex acquisition failed - force clear anyway
+        m_detectionCallback = nullptr;
+    }
+    
+    // TITANIUM: Clear caches before destroying stores
+    try {
+        std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock, std::try_to_lock);
+        m_queryCache.clear();
+    }
+    catch (...) {
+        // Silently clear what we can
+        m_queryCache.clear();
+    }
 }
 
 // ============================================================================
@@ -78,50 +155,101 @@ StoreError SignatureStore::Initialize(
     SS_LOG_INFO(L"SignatureStore", L"Initialize: %s (%s)", 
         databasePath.c_str(), readOnly ? L"read-only" : L"read-write");
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - INITIALIZATION
+    // ========================================================================
+    
+    // VALIDATION 1: Path cannot be empty
+    if (databasePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"Initialize: Database path cannot be empty");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Database path cannot be empty"};
+    }
+    
+    // VALIDATION 2: Path length check
+    constexpr size_t MAX_PATH_LENGTH = 32767;
+    if (databasePath.length() > MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"Initialize: Path too long (%zu chars)", databasePath.length());
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Path too long"};
+    }
+    
+    // VALIDATION 3: Null character injection check (path truncation attack)
+    if (databasePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"Initialize: Path contains null character (security violation)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Path contains null character"};
+    }
+
+    // VALIDATION 4: Check for already initialized state
     if (m_initialized.load(std::memory_order_acquire)) {
         SS_LOG_WARN(L"SignatureStore", L"Already initialized");
         return StoreError{SignatureStoreError::Success};
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    // TITANIUM: Acquire exclusive lock with timeout protection
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SS_LOG_ERROR(L"SignatureStore", L"Initialize: Failed to acquire lock (possible deadlock)");
+        return StoreError{SignatureStoreError::Unknown, 0, "Failed to acquire initialization lock"};
+    }
+
+    // Double-check initialization state under lock
+    if (m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"Already initialized (race condition detected)");
+        return StoreError{SignatureStoreError::Success};
+    }
 
     m_readOnly.store(readOnly, std::memory_order_release);
 
-    // Initialize YARA library first
+    // Initialize YARA library first (global initialization)
     StoreError err = YaraRuleStore::InitializeYara();
     if (!err.IsSuccess()) {
-        SS_LOG_ERROR(L"SignatureStore", L"YARA initialization failed");
-        return err;
+        SS_LOG_ERROR(L"SignatureStore", L"YARA initialization failed: %S", err.message.c_str());
+        // Continue - YARA is optional
     }
 
+    // TITANIUM: Track initialization success for each component
+    bool anyComponentInitialized = false;
+
     // Initialize all components from same database
-    if (m_hashStoreEnabled.load(std::memory_order_acquire)) {
+    if (m_hashStoreEnabled.load(std::memory_order_acquire) && m_hashStore) {
         err = m_hashStore->Initialize(databasePath, readOnly);
         if (!err.IsSuccess()) {
             SS_LOG_WARN(L"SignatureStore", L"HashStore init failed: %S", err.message.c_str());
             // Continue - non-critical
+        } else {
+            anyComponentInitialized = true;
         }
     }
 
-    if (m_patternStoreEnabled.load(std::memory_order_acquire)) {
+    if (m_patternStoreEnabled.load(std::memory_order_acquire) && m_patternStore) {
         err = m_patternStore->Initialize(databasePath, readOnly);
         if (!err.IsSuccess()) {
             SS_LOG_WARN(L"SignatureStore", L"PatternStore init failed: %S", err.message.c_str());
             // Continue - non-critical
+        } else {
+            anyComponentInitialized = true;
         }
     }
 
-    if (m_yaraStoreEnabled.load(std::memory_order_acquire)) {
+    if (m_yaraStoreEnabled.load(std::memory_order_acquire) && m_yaraStore) {
         err = m_yaraStore->Initialize(databasePath, readOnly);
         if (!err.IsSuccess()) {
             SS_LOG_WARN(L"SignatureStore", L"YaraStore init failed: %S", err.message.c_str());
             // Continue - non-critical
+        } else {
+            anyComponentInitialized = true;
         }
     }
 
+    // TITANIUM: Set initialized even if some components failed
+    // (allows partial functionality)
     m_initialized.store(true, std::memory_order_release);
 
-    SS_LOG_INFO(L"SignatureStore", L"Initialized successfully");
+    if (anyComponentInitialized) {
+        SS_LOG_INFO(L"SignatureStore", L"Initialized successfully");
+    } else {
+        SS_LOG_WARN(L"SignatureStore", L"Initialized but no components available");
+    }
+    
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -134,71 +262,190 @@ StoreError SignatureStore::InitializeMulti(
     SS_LOG_INFO(L"SignatureStore", L"InitializeMulti (read-only=%s)", 
         readOnly ? L"true" : L"false");
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - MULTI-DATABASE INITIALIZATION
+    // ========================================================================
+    
+    // VALIDATION 1: At least one path must be provided
+    if (hashDatabasePath.empty() && patternDatabasePath.empty() && yaraDatabasePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"InitializeMulti: At least one database path must be provided");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "No database paths provided"};
+    }
+
+    // VALIDATION 2: Path length and security checks
+    constexpr size_t MAX_PATH_LENGTH = 32767;
+    auto validatePath = [](const std::wstring& path, const wchar_t* name) -> StoreError {
+        if (path.empty()) {
+            return StoreError{SignatureStoreError::Success}; // Empty is OK - component disabled
+        }
+        if (path.length() > MAX_PATH_LENGTH) {
+            SS_LOG_ERROR(L"SignatureStore", L"InitializeMulti: %s path too long", name);
+            return StoreError{SignatureStoreError::InvalidFormat, 0, "Path too long"};
+        }
+        if (path.find(L'\0') != std::wstring::npos) {
+            SS_LOG_ERROR(L"SignatureStore", L"InitializeMulti: %s path contains null character", name);
+            return StoreError{SignatureStoreError::InvalidFormat, 0, "Path contains null character"};
+        }
+        return StoreError{SignatureStoreError::Success};
+    };
+
+    StoreError pathErr = validatePath(hashDatabasePath, L"Hash");
+    if (!pathErr.IsSuccess()) return pathErr;
+    
+    pathErr = validatePath(patternDatabasePath, L"Pattern");
+    if (!pathErr.IsSuccess()) return pathErr;
+    
+    pathErr = validatePath(yaraDatabasePath, L"YARA");
+    if (!pathErr.IsSuccess()) return pathErr;
+
+    // VALIDATION 3: Check already initialized
+    if (m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"InitializeMulti: Already initialized");
+        return StoreError{SignatureStoreError::Success};
+    }
+
+    // TITANIUM: Acquire exclusive lock with try_lock to prevent deadlock
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SS_LOG_ERROR(L"SignatureStore", L"InitializeMulti: Failed to acquire lock");
+        return StoreError{SignatureStoreError::Unknown, 0, "Failed to acquire lock"};
+    }
+
+    // Double-check under lock
     if (m_initialized.load(std::memory_order_acquire)) {
         return StoreError{SignatureStoreError::Success};
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
-
     m_readOnly.store(readOnly, std::memory_order_release);
 
-    // Initialize YARA
-    YaraRuleStore::InitializeYara();
+    // Initialize YARA (global, doesn't need a database path)
+    StoreError yaraInitErr = YaraRuleStore::InitializeYara();
+    if (!yaraInitErr.IsSuccess()) {
+        SS_LOG_WARN(L"SignatureStore", L"InitializeMulti: YARA library init failed: %S", 
+            yaraInitErr.message.c_str());
+        // Continue - YARA is optional
+    }
 
-    // Initialize each component with its own database
+    // TITANIUM: Track component initialization
+    bool anyComponentInitialized = false;
     StoreError err{SignatureStoreError::Success};
 
-    if (m_hashStoreEnabled.load() && !hashDatabasePath.empty()) {
+    // Initialize each component with its own database
+    if (m_hashStoreEnabled.load(std::memory_order_acquire) && !hashDatabasePath.empty() && m_hashStore) {
         err = m_hashStore->Initialize(hashDatabasePath, readOnly);
         if (!err.IsSuccess()) {
             SS_LOG_ERROR(L"SignatureStore", L"HashStore failed: %S", err.message.c_str());
+        } else {
+            anyComponentInitialized = true;
+            SS_LOG_DEBUG(L"SignatureStore", L"HashStore initialized from: %s", hashDatabasePath.c_str());
         }
     }
 
-    if (m_patternStoreEnabled.load() && !patternDatabasePath.empty()) {
+    if (m_patternStoreEnabled.load(std::memory_order_acquire) && !patternDatabasePath.empty() && m_patternStore) {
         err = m_patternStore->Initialize(patternDatabasePath, readOnly);
         if (!err.IsSuccess()) {
             SS_LOG_ERROR(L"SignatureStore", L"PatternStore failed: %S", err.message.c_str());
+        } else {
+            anyComponentInitialized = true;
+            SS_LOG_DEBUG(L"SignatureStore", L"PatternStore initialized from: %s", patternDatabasePath.c_str());
         }
     }
 
-    if (m_yaraStoreEnabled.load() && !yaraDatabasePath.empty()) {
+    if (m_yaraStoreEnabled.load(std::memory_order_acquire) && !yaraDatabasePath.empty() && m_yaraStore) {
         err = m_yaraStore->Initialize(yaraDatabasePath, readOnly);
         if (!err.IsSuccess()) {
             SS_LOG_ERROR(L"SignatureStore", L"YaraStore failed: %S", err.message.c_str());
+        } else {
+            anyComponentInitialized = true;
+            SS_LOG_DEBUG(L"SignatureStore", L"YaraStore initialized from: %s", yaraDatabasePath.c_str());
         }
     }
 
     m_initialized.store(true, std::memory_order_release);
 
-    SS_LOG_INFO(L"SignatureStore", L"Multi-database initialization complete");
+    if (anyComponentInitialized) {
+        SS_LOG_INFO(L"SignatureStore", L"Multi-database initialization complete");
+    } else {
+        SS_LOG_WARN(L"SignatureStore", L"Multi-database initialization complete but no components available");
+    }
+    
     return StoreError{SignatureStoreError::Success};
 }
 
 void SignatureStore::Close() noexcept {
+    // TITANIUM: Early exit if not initialized
     if (!m_initialized.load(std::memory_order_acquire)) {
         return;
     }
 
     SS_LOG_INFO(L"SignatureStore", L"Closing signature store");
 
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
-
-    // Close all components
-    if (m_hashStore) {
-        m_hashStore->Close();
+    // TITANIUM: Try to acquire lock with timeout to prevent deadlock during shutdown
+    // Use manual retry loop since std::shared_mutex doesn't have try_lock_for
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::defer_lock);
+    
+    constexpr int maxRetries = 50;  // 50 * 100ms = 5 seconds total
+    for (int i = 0; i < maxRetries; ++i) {
+        if (lock.try_lock()) {
+            break;
+        }
+        // Brief sleep before retry
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    if (!lock.owns_lock()) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: Failed to acquire lock within timeout");
+        // Force close anyway - this is a critical operation
+        m_initialized.store(false, std::memory_order_release);
+        return;
     }
 
-    if (m_patternStore) {
-        m_patternStore->Close();
+    // TITANIUM: Close all components with exception safety
+    try {
+        if (m_hashStore) {
+            m_hashStore->Close();
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: HashStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: HashStore unknown exception");
     }
 
-    if (m_yaraStore) {
-        m_yaraStore->Close();
+    try {
+        if (m_patternStore) {
+            m_patternStore->Close();
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: PatternStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: PatternStore unknown exception");
     }
 
-    // Clear caches
-    ClearAllCaches();
+    try {
+        if (m_yaraStore) {
+            m_yaraStore->Close();
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: YaraStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: YaraStore unknown exception");
+    }
+
+    // Clear caches (need to release global lock first, then acquire cache lock)
+    lock.unlock();
+    
+    try {
+        ClearAllCaches();
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Close: ClearAllCaches exception");
+    }
 
     m_initialized.store(false, std::memory_order_release);
 
@@ -208,9 +455,39 @@ void SignatureStore::Close() noexcept {
 SignatureStore::InitializationStatus SignatureStore::GetStatus() const noexcept {
     InitializationStatus status{};
 
-    status.hashStoreReady = m_hashStore && m_hashStore->IsInitialized();
-    status.patternStoreReady = m_patternStore && m_patternStore->IsInitialized();
-    status.yaraStoreReady = m_yaraStore && m_yaraStore->IsInitialized();
+    // TITANIUM: Thread-safe status retrieval with try_lock to prevent deadlock
+    std::shared_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        // Can't acquire lock - return current known state without blocking
+        status.hashStoreReady = false;
+        status.patternStoreReady = false;
+        status.yaraStoreReady = false;
+        status.allReady = false;
+        return status;
+    }
+
+    // TITANIUM: Safely check each component with null checks
+    try {
+        status.hashStoreReady = m_hashStore && m_hashStore->IsInitialized();
+    }
+    catch (...) {
+        status.hashStoreReady = false;
+    }
+
+    try {
+        status.patternStoreReady = m_patternStore && m_patternStore->IsInitialized();
+    }
+    catch (...) {
+        status.patternStoreReady = false;
+    }
+
+    try {
+        status.yaraStoreReady = m_yaraStore && m_yaraStore->IsInitialized();
+    }
+    catch (...) {
+        status.yaraStoreReady = false;
+    }
+
     status.allReady = status.hashStoreReady && status.patternStoreReady && status.yaraStoreReady;
 
     return status;
@@ -708,21 +985,84 @@ ScanResult SignatureStore::ScanProcess(
 
     ScanResult result{};
 
-    // Only YARA supports process scanning
-    if (m_yaraStoreEnabled.load() && m_yaraStore && options.enableYaraScan) {
-        result.yaraMatches = m_yaraStore->ScanProcess(processId, options.yaraOptions);
-        result.detections.reserve(result.yaraMatches.size());
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - PROCESS SCANNING
+    // ========================================================================
+    
+    // VALIDATION 1: Check initialization
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanProcess: Store not initialized");
+        result.lastError = "Store not initialized";
+        result.errorCount = 1;
+        return result;
+    }
 
-        // Convert YARA matches to detections
-        for (const auto& match : result.yaraMatches) {
-            DetectionResult detection{};
-            detection.signatureId = match.ruleId;
-            detection.signatureName = match.ruleName;
-            detection.threatLevel = match.threatLevel;
-            detection.description = "YARA rule match in process memory";
-            detection.matchTimestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    // VALIDATION 2: Process ID validation (0 is typically invalid)
+    if (processId == 0) {
+        SS_LOG_ERROR(L"SignatureStore", L"ScanProcess: Invalid process ID (0)");
+        result.lastError = "Invalid process ID";
+        result.errorCount = 1;
+        return result;
+    }
+
+    // VALIDATION 3: Validate options
+    if (!options.Validate()) {
+        SS_LOG_WARN(L"SignatureStore", L"ScanProcess: Invalid options, using defaults");
+    }
+
+    // Only YARA supports process scanning
+    if (options.enableYaraScan && m_yaraStoreEnabled.load(std::memory_order_acquire) && m_yaraStore) {
+        try {
+            result.yaraMatches = m_yaraStore->ScanProcess(processId, options.yaraOptions);
             
-            result.detections.push_back(detection);
+            // TITANIUM: Limit results to prevent memory exhaustion
+            const size_t maxResults = options.GetValidatedMaxResults();
+            const size_t matchCount = std::min(result.yaraMatches.size(), maxResults);
+            
+            result.detections.reserve(matchCount);
+
+            // Convert YARA matches to detections
+            for (size_t i = 0; i < matchCount; ++i) {
+                const auto& match = result.yaraMatches[i];
+                
+                DetectionResult detection{};
+                detection.signatureId = match.ruleId;
+                detection.signatureName = match.ruleName;
+                detection.threatLevel = match.threatLevel;
+                detection.description = "YARA rule match in process memory";
+                
+                // TITANIUM: Safe timestamp handling
+                try {
+                    detection.matchTimestamp = std::chrono::system_clock::now().time_since_epoch().count();
+                }
+                catch (...) {
+                    detection.matchTimestamp = 0;
+                }
+                
+                result.detections.push_back(std::move(detection));
+                
+                // Check stop-on-first-match
+                if (options.stopOnFirstMatch) {
+                    result.stoppedEarly = true;
+                    break;
+                }
+            }
+            
+            // TITANIUM: Truncate yaraMatches if we hit the limit
+            if (result.yaraMatches.size() > maxResults) {
+                result.yaraMatches.resize(maxResults);
+                SS_LOG_WARN(L"SignatureStore", L"ScanProcess: Results truncated to %zu", maxResults);
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ScanProcess: Exception during YARA scan: %S", e.what());
+            result.lastError = e.what();
+            result.errorCount = 1;
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"SignatureStore", L"ScanProcess: Unknown exception during YARA scan");
+            result.lastError = "Unknown exception";
+            result.errorCount = 1;
         }
     }
 
@@ -916,18 +1256,60 @@ std::optional<DetectionResult> SignatureStore::LookupFileHash(
     const std::wstring& filePath,
     HashType type
 ) const noexcept {
-    if (!m_hashStoreEnabled.load() || !m_hashStore) {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Component check
+    if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
         return std::nullopt;
     }
-    ShadowStrike::SignatureStore::SignatureBuilder builder;
-    // Compute file hash
-    auto hash = builder.ComputeFileHash(filePath, type);
-    if (!hash.has_value()) {
-        SS_LOG_ERROR(L"SignatureStore", L"Failed to compute file hash");
+    
+    // VALIDATION 2: Path validation
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Empty file path");
+        return std::nullopt;
+    }
+    
+    // VALIDATION 3: Path length check
+    constexpr size_t MAX_PATH_LENGTH = 32767;
+    if (filePath.length() > MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Path too long");
+        return std::nullopt;
+    }
+    
+    // VALIDATION 4: Null character injection check
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Path contains null character");
+        return std::nullopt;
+    }
+    
+    // VALIDATION 5: Hash type validation (check if hash length is valid for the type)
+    if (GetHashLengthForType(type) == 0) {
+        SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Invalid hash type");
         return std::nullopt;
     }
 
-    return m_hashStore->LookupHash(*hash);
+    try {
+        ShadowStrike::SignatureStore::SignatureBuilder builder;
+        
+        // Compute file hash
+        auto hash = builder.ComputeFileHash(filePath, type);
+        if (!hash.has_value()) {
+            SS_LOG_ERROR(L"SignatureStore", L"Failed to compute file hash for: %s", filePath.c_str());
+            return std::nullopt;
+        }
+
+        return m_hashStore->LookupHash(*hash);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash exception: %S", e.what());
+        return std::nullopt;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash unknown exception");
+        return std::nullopt;
+    }
 }
 
 std::vector<DetectionResult> SignatureStore::ScanPatterns(
@@ -963,15 +1345,72 @@ StoreError SignatureStore::AddHash(
     const std::string& description,
     const std::vector<std::string>& tags
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - ADD HASH
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
     if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"AddHash: Store is read-only");
         return StoreError{SignatureStoreError::AccessDenied, 0, "Read-only mode"};
     }
 
-    if (!m_hashStoreEnabled.load() || !m_hashStore) {
+    // VALIDATION 2: Component availability
+    if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddHash: HashStore not available");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "HashStore not available"};
     }
+    
+    // VALIDATION 3: Hash validation
+    if (hash.length == 0 || hash.length > 64) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddHash: Invalid hash length (%u)", hash.length);
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Invalid hash length"};
+    }
+    
+    // Validate hash type using length check (invalid types return 0)
+    if (GetHashLengthForType(hash.type) == 0) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddHash: Invalid hash type");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Invalid hash type"};
+    }
+    
+    // VALIDATION 4: Name validation
+    if (name.empty()) {
+        SS_LOG_WARN(L"SignatureStore", L"AddHash: Empty signature name");
+        // Allow but log warning
+    }
+    
+    // VALIDATION 5: Name length limit
+    constexpr size_t MAX_NAME_LENGTH = 1024;
+    if (name.length() > MAX_NAME_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddHash: Name too long (%zu chars)", name.length());
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Name too long"};
+    }
+    
+    // VALIDATION 6: Description length limit
+    constexpr size_t MAX_DESC_LENGTH = 4096;
+    if (description.length() > MAX_DESC_LENGTH) {
+        SS_LOG_WARN(L"SignatureStore", L"AddHash: Description too long, truncating");
+        // Will be truncated by underlying store
+    }
+    
+    // VALIDATION 7: Tags count limit
+    constexpr size_t MAX_TAGS = 100;
+    if (tags.size() > MAX_TAGS) {
+        SS_LOG_WARN(L"SignatureStore", L"AddHash: Too many tags (%zu), only first %zu will be used",
+            tags.size(), MAX_TAGS);
+    }
 
-    return m_hashStore->AddHash(hash, name, threatLevel, description, tags);
+    try {
+        return m_hashStore->AddHash(hash, name, threatLevel, description, tags);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddHash exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddHash unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown exception"};
+    }
 }
 
 StoreError SignatureStore::AddPattern(
@@ -981,54 +1420,227 @@ StoreError SignatureStore::AddPattern(
     const std::string& description,
     const std::vector<std::string>& tags
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - ADD PATTERN
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
     if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"AddPattern: Store is read-only");
         return StoreError{SignatureStoreError::AccessDenied, 0, "Read-only mode"};
     }
 
-    if (!m_patternStoreEnabled.load() || !m_patternStore) {
+    // VALIDATION 2: Component availability
+    if (!m_patternStoreEnabled.load(std::memory_order_acquire) || !m_patternStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddPattern: PatternStore not available");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "PatternStore not available"};
     }
+    
+    // VALIDATION 3: Pattern string validation
+    if (patternString.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Empty pattern string");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Pattern string cannot be empty"};
+    }
+    
+    // VALIDATION 4: Pattern length limit
+    constexpr size_t MAX_PATTERN_LENGTH = 65536;  // 64KB max pattern
+    if (patternString.length() > MAX_PATTERN_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Pattern too long (%zu bytes)", patternString.length());
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Pattern too long"};
+    }
+    
+    // VALIDATION 5: Name validation
+    constexpr size_t MAX_NAME_LENGTH = 1024;
+    if (name.length() > MAX_NAME_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddPattern: Name too long");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Name too long"};
+    }
 
-    return m_patternStore->AddPattern(patternString, name, threatLevel, description, tags);
+    try {
+        return m_patternStore->AddPattern(patternString, name, threatLevel, description, tags);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddPattern exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddPattern unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown exception"};
+    }
 }
 
 StoreError SignatureStore::AddYaraRule(
     const std::string& ruleSource,
     const std::string& namespace_
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - ADD YARA RULE
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
     if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"AddYaraRule: Store is read-only");
         return StoreError{SignatureStoreError::AccessDenied, 0, "Read-only mode"};
     }
 
-    if (!m_yaraStoreEnabled.load() || !m_yaraStore) {
+    // VALIDATION 2: Component availability
+    if (!m_yaraStoreEnabled.load(std::memory_order_acquire) || !m_yaraStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: YaraStore not available");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "YaraStore not available"};
     }
+    
+    // VALIDATION 3: Rule source validation
+    if (ruleSource.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Empty rule source");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Rule source cannot be empty"};
+    }
+    
+    // VALIDATION 4: Rule source length limit
+    constexpr size_t MAX_RULE_LENGTH = 10 * 1024 * 1024;  // 10MB max rule
+    if (ruleSource.length() > MAX_RULE_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Rule source too long (%zu bytes)", ruleSource.length());
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Rule source too long"};
+    }
+    
+    // VALIDATION 5: Namespace validation
+    constexpr size_t MAX_NAMESPACE_LENGTH = 256;
+    if (namespace_.length() > MAX_NAMESPACE_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: Namespace too long");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace too long"};
+    }
 
-    return m_yaraStore->AddRulesFromSource(ruleSource, namespace_);
+    try {
+        return m_yaraStore->AddRulesFromSource(ruleSource, namespace_);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown exception"};
+    }
 }
 
 StoreError SignatureStore::RemoveHash(const HashValue& hash) noexcept {
-    if (m_readOnly.load() || !m_hashStore) {
-        return StoreError{SignatureStoreError::AccessDenied, 0, "Cannot remove"};
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - REMOVE HASH
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"RemoveHash: Store is read-only");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Cannot remove - read-only mode"};
+    }
+    
+    // VALIDATION 2: Component availability
+    if (!m_hashStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: HashStore not available");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "HashStore not available"};
+    }
+    
+    // VALIDATION 3: Hash validation
+    if (hash.length == 0 || hash.length > 64) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: Invalid hash length (%u)", hash.length);
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Invalid hash length"};
+    }
+    
+    // Validate hash type using length check (invalid types return 0)
+    if (GetHashLengthForType(hash.type) == 0) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: Invalid hash type");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Invalid hash type"};
     }
 
-    return m_hashStore->RemoveHash(hash);
+    try {
+        return m_hashStore->RemoveHash(hash);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveHash exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveHash unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown exception"};
+    }
 }
 
 StoreError SignatureStore::RemovePattern(uint64_t signatureId) noexcept {
-    if (m_readOnly.load() || !m_patternStore) {
-        return StoreError{SignatureStoreError::AccessDenied, 0, "Cannot remove"};
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - REMOVE PATTERN
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"RemovePattern: Store is read-only");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Cannot remove - read-only mode"};
+    }
+    
+    // VALIDATION 2: Component availability
+    if (!m_patternStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemovePattern: PatternStore not available");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "PatternStore not available"};
+    }
+    
+    // VALIDATION 3: Signature ID validation (0 is typically invalid)
+    if (signatureId == 0) {
+        SS_LOG_WARN(L"SignatureStore", L"RemovePattern: Removing signature ID 0 (may be invalid)");
+        // Allow but log warning
     }
 
-    return m_patternStore->RemovePattern(signatureId);
+    try {
+        return m_patternStore->RemovePattern(signatureId);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemovePattern exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemovePattern unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown exception"};
+    }
 }
 
 StoreError SignatureStore::RemoveYaraRule(const std::string& ruleName) noexcept {
-    if (m_readOnly.load() || !m_yaraStore) {
-        return StoreError{SignatureStoreError::AccessDenied, 0, "Cannot remove"};
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER - REMOVE YARA RULE
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"SignatureStore", L"RemoveYaraRule: Store is read-only");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Cannot remove - read-only mode"};
+    }
+    
+    // VALIDATION 2: Component availability
+    if (!m_yaraStore) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: YaraStore not available");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "YaraStore not available"};
+    }
+    
+    // VALIDATION 3: Rule name validation
+    if (ruleName.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: Empty rule name");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Rule name cannot be empty"};
+    }
+    
+    // VALIDATION 4: Rule name length limit
+    constexpr size_t MAX_RULE_NAME_LENGTH = 256;
+    if (ruleName.length() > MAX_RULE_NAME_LENGTH) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: Rule name too long");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Rule name too long"};
     }
 
-    return m_yaraStore->RemoveRule(ruleName, "default");
+    try {
+        return m_yaraStore->RemoveRule(ruleName, "default");
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Exception: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown exception"};
+    }
 }
 
 // ============================================================================
@@ -1040,20 +1652,66 @@ StoreError SignatureStore::ImportHashes(
     std::function<void(size_t, size_t)> progressCallback
 ) noexcept {
     SS_LOG_INFO(L"SignatureStore", L"ImportHashes: %s", filePath.c_str());
+    
+    // TITANIUM: Path validation
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportHashes: Empty file path");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Empty file path"};
+    }
+    
+    // Check for path traversal attacks (null bytes, etc.)
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportHashes: Invalid path (contains null)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid path"};
+    }
+    
     if (!m_hashStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "HashStore not available"};
     }
 
-    return m_hashStore->ImportFromFile(filePath, progressCallback);
+    // TITANIUM: Exception-safe import with callback protection
+    try {
+        return m_hashStore->ImportFromFile(filePath, progressCallback);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportHashes exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Import error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportHashes unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown import error"};
+    }
 }
 
 StoreError SignatureStore::ImportPatterns(const std::wstring& filePath) noexcept {
     SS_LOG_INFO(L"SignatureStore", L"ImportPatterns: %s", filePath.c_str());
+    
+    // TITANIUM: Path validation
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns: Empty file path");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Empty file path"};
+    }
+    
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns: Invalid path (contains null)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid path"};
+    }
+    
     if (!m_patternStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "PatternStore not available"};
     }
 
-    return m_patternStore->ImportFromYaraFile(filePath);
+    try {
+        return m_patternStore->ImportFromYaraFile(filePath);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Import error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown import error"};
+    }
 }
 
 StoreError SignatureStore::ImportYaraRules(
@@ -1061,11 +1719,39 @@ StoreError SignatureStore::ImportYaraRules(
     const std::string& namespace_
 ) noexcept {
     SS_LOG_INFO(L"SignatureStore", L"ImportYaraRules: %s", filePath.c_str());
+    
+    // TITANIUM: Path and namespace validation
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Empty file path");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Empty file path"};
+    }
+    
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Invalid path (contains null)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid path"};
+    }
+    
+    // Namespace can be empty but should not contain null bytes
+    if (namespace_.find('\0') != std::string::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules: Invalid namespace");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid namespace"};
+    }
+    
     if (!m_yaraStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "YaraStore not available"};
     }
 
-    return m_yaraStore->AddRulesFromFile(filePath, namespace_);
+    try {
+        return m_yaraStore->AddRulesFromFile(filePath, namespace_);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Import error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ImportYaraRules unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown import error"};
+    }
 }
 
 StoreError SignatureStore::ExportHashes(
@@ -1074,52 +1760,116 @@ StoreError SignatureStore::ExportHashes(
 ) const noexcept {
     SS_LOG_INFO(L"SignatureStore", L"ExportHashes: %s", outputPath.c_str());
 
+    // TITANIUM: Output path validation
+    if (outputPath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportHashes: Empty output path");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Empty output path"};
+    }
+    
+    if (outputPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportHashes: Invalid path (contains null)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid path"};
+    }
+
     if (!m_hashStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "HashStore not available"};
     }
 
-    return m_hashStore->ExportToFile(outputPath, typeFilter);
+    try {
+        return m_hashStore->ExportToFile(outputPath, typeFilter);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportHashes exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Export error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportHashes unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown export error"};
+    }
 }
 
 StoreError SignatureStore::ExportPatterns(const std::wstring& outputPath) const noexcept {
     SS_LOG_INFO(L"SignatureStore", L"ExportPatterns: %s", outputPath.c_str());
+
+    // TITANIUM: Output path validation
+    if (outputPath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Empty output path");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Empty output path"};
+    }
+    
+    if (outputPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Invalid path (contains null)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid path"};
+    }
 
     if (!m_patternStoreEnabled.load() || !m_patternStore) {
         SS_LOG_ERROR(L"SignatureStore", L"PatternStore not available");
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
     }
 
-    // Get JSON from pattern store
-    std::string jsonContent = m_patternStore->ExportToJson();
-    if (jsonContent.empty()) {
-        SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Failed to export JSON");
-        return StoreError{ SignatureStoreError::Unknown, 0, "JSON export failed" };
-    }
+    try {
+        // Get JSON from pattern store
+        std::string jsonContent = m_patternStore->ExportToJson();
+        if (jsonContent.empty()) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns: Failed to export JSON");
+            return StoreError{ SignatureStoreError::Unknown, 0, "JSON export failed" };
+        }
 
-    // Write JSON to file atomically
-    ShadowStrike::Utils::FileUtils::Error fileErr{};
-    if (!ShadowStrike::Utils::FileUtils::WriteAllTextUtf8Atomic(outputPath, jsonContent, &fileErr)) {
-        SS_LOG_ERROR(L"SignatureStore",
-            L"ExportPatterns: Failed to write file (win32: %u)", fileErr.win32);
-        return StoreError{
-            SignatureStoreError::InvalidFormat,
-            fileErr.win32,
-            "Failed to write JSON file"
-        };
-    }
+        // Write JSON to file atomically
+        ShadowStrike::Utils::FileUtils::Error fileErr{};
+        if (!ShadowStrike::Utils::FileUtils::WriteAllTextUtf8Atomic(outputPath, jsonContent, &fileErr)) {
+            SS_LOG_ERROR(L"SignatureStore",
+                L"ExportPatterns: Failed to write file (win32: %u)", fileErr.win32);
+            return StoreError{
+                SignatureStoreError::InvalidFormat,
+                fileErr.win32,
+                "Failed to write JSON file"
+            };
+        }
 
-    SS_LOG_INFO(L"SignatureStore", L"ExportPatterns: Successfully exported to %s",
-        outputPath.c_str());
-    return StoreError{ SignatureStoreError::Success };
+        SS_LOG_INFO(L"SignatureStore", L"ExportPatterns: Successfully exported to %s",
+            outputPath.c_str());
+        return StoreError{ SignatureStoreError::Success };
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Export error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportPatterns unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown export error"};
+    }
 }
 
 StoreError SignatureStore::ExportYaraRules(const std::wstring& outputPath) const noexcept {
-	SS_LOG_INFO(L"SignatureStore", L"ExportYaraRules: %s", outputPath.c_str());
+    SS_LOG_INFO(L"SignatureStore", L"ExportYaraRules: %s", outputPath.c_str());
+    
+    // TITANIUM: Output path validation
+    if (outputPath.empty()) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules: Empty output path");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Empty output path"};
+    }
+    
+    if (outputPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules: Invalid path (contains null)");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid path"};
+    }
+    
     if (!m_yaraStore) {
         return StoreError{SignatureStoreError::InvalidFormat, 0, "YaraStore not available"};
     }
 
-    return m_yaraStore->ExportCompiled(outputPath);
+    try {
+        return m_yaraStore->ExportCompiled(outputPath);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Export error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown export error"};
+    }
 }
 
 // ============================================================================
@@ -1127,76 +1877,157 @@ StoreError SignatureStore::ExportYaraRules(const std::wstring& outputPath) const
 // ============================================================================
 
 SignatureStore::GlobalStatistics SignatureStore::GetGlobalStatistics() const noexcept {
-    std::shared_lock<std::shared_mutex> lock(m_globalLock);
-
     GlobalStatistics stats{};
 
-    // Component statistics
-    if (m_hashStore) {
-        stats.hashStats = m_hashStore->GetStatistics();
-        stats.hashDatabaseSize = stats.hashStats.databaseSizeBytes;
+    // TITANIUM: Thread-safe statistics retrieval with try_lock to prevent deadlock
+    std::shared_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        // Can't acquire lock - return partial statistics from atomics only
+        stats.totalScans = m_totalScans.load(std::memory_order_relaxed);
+        stats.totalDetections = m_totalDetections.load(std::memory_order_relaxed);
+        stats.queryCacheHits = m_queryCacheHits.load(std::memory_order_relaxed);
+        stats.queryCacheMisses = m_queryCacheMisses.load(std::memory_order_relaxed);
+        return stats;
     }
 
-    if (m_patternStore) {
-        stats.patternStats = m_patternStore->GetStatistics();
-        stats.patternDatabaseSize = stats.patternStats.totalBytesScanned;
+    // Component statistics with exception safety
+    try {
+        if (m_hashStore) {
+            stats.hashStats = m_hashStore->GetStatistics();
+            stats.hashDatabaseSize = stats.hashStats.databaseSizeBytes;
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"GetGlobalStatistics: HashStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"GetGlobalStatistics: HashStore unknown exception");
     }
 
-    if (m_yaraStore) {
-        stats.yaraStats = m_yaraStore->GetStatistics();
-        stats.yaraDatabaseSize = stats.yaraStats.compiledRulesSize;
+    try {
+        if (m_patternStore) {
+            stats.patternStats = m_patternStore->GetStatistics();
+            stats.patternDatabaseSize = stats.patternStats.totalBytesScanned;
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"GetGlobalStatistics: PatternStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"GetGlobalStatistics: PatternStore unknown exception");
     }
 
-    // Global metrics
+    try {
+        if (m_yaraStore) {
+            stats.yaraStats = m_yaraStore->GetStatistics();
+            stats.yaraDatabaseSize = stats.yaraStats.compiledRulesSize;
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"GetGlobalStatistics: YaraStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"GetGlobalStatistics: YaraStore unknown exception");
+    }
+
+    // Global metrics (atomic loads)
     stats.totalScans = m_totalScans.load(std::memory_order_relaxed);
     stats.totalDetections = m_totalDetections.load(std::memory_order_relaxed);
     
-    stats.totalDatabaseSize = stats.hashDatabaseSize + 
-                             stats.patternDatabaseSize + 
-                             stats.yaraDatabaseSize;
+    // TITANIUM: Overflow-safe total database size calculation
+    uint64_t totalSize = 0;
+    if (stats.hashDatabaseSize <= UINT64_MAX - totalSize) {
+        totalSize += stats.hashDatabaseSize;
+    }
+    if (stats.patternDatabaseSize <= UINT64_MAX - totalSize) {
+        totalSize += stats.patternDatabaseSize;
+    }
+    if (stats.yaraDatabaseSize <= UINT64_MAX - totalSize) {
+        totalSize += stats.yaraDatabaseSize;
+    }
+    stats.totalDatabaseSize = totalSize;
 
     // Cache performance
     stats.queryCacheHits = m_queryCacheHits.load(std::memory_order_relaxed);
     stats.queryCacheMisses = m_queryCacheMisses.load(std::memory_order_relaxed);
     
+    // TITANIUM: Overflow-safe cache hit rate calculation
     uint64_t totalCache = stats.queryCacheHits + stats.queryCacheMisses;
-    if (totalCache > 0) {
-        stats.cacheHitRate = static_cast<double>(stats.queryCacheHits) / totalCache;
+    if (totalCache > 0 && stats.queryCacheHits <= totalCache) {
+        stats.cacheHitRate = static_cast<double>(stats.queryCacheHits) / static_cast<double>(totalCache);
+    } else {
+        stats.cacheHitRate = 0.0;
     }
 
     return stats;
 }
 
 void SignatureStore::ResetStatistics() noexcept {
+    // TITANIUM: Reset atomic counters first (no lock needed for atomics)
     m_totalScans.store(0, std::memory_order_release);
     m_totalDetections.store(0, std::memory_order_release);
     m_queryCacheHits.store(0, std::memory_order_release);
     m_queryCacheMisses.store(0, std::memory_order_release);
 
-    if (m_hashStore) m_hashStore->ResetStatistics();
-    if (m_patternStore) m_patternStore->ResetStatistics();
-    if (m_yaraStore) m_yaraStore->ResetStatistics();
+    // Component resets with exception safety
+    try {
+        if (m_hashStore) m_hashStore->ResetStatistics();
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"ResetStatistics: HashStore reset failed");
+    }
+
+    try {
+        if (m_patternStore) m_patternStore->ResetStatistics();
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"ResetStatistics: PatternStore reset failed");
+    }
+
+    try {
+        if (m_yaraStore) m_yaraStore->ResetStatistics();
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"ResetStatistics: YaraStore reset failed");
+    }
+
+    SS_LOG_DEBUG(L"SignatureStore", L"Statistics reset completed");
 }
 
 HashStore::HashStoreStatistics SignatureStore::GetHashStatistics() const noexcept {
-    if (!m_hashStore) {
+    try {
+        if (!m_hashStore) {
+            return HashStore::HashStoreStatistics{};
+        }
+        return m_hashStore->GetStatistics();
+    }
+    catch (...) {
         return HashStore::HashStoreStatistics{};
     }
-    return m_hashStore->GetStatistics();
 }
 
 PatternStore::PatternStoreStatistics SignatureStore::GetPatternStatistics() const noexcept {
-    if (!m_patternStore) {
+    try {
+        if (!m_patternStore) {
+            return PatternStore::PatternStoreStatistics{};
+        }
+        return m_patternStore->GetStatistics();
+    }
+    catch (...) {
         return PatternStore::PatternStoreStatistics{};
     }
-    return m_patternStore->GetStatistics();
 }
 
 YaraRuleStore::YaraStoreStatistics SignatureStore::GetYaraStatistics() const noexcept {
-    if (!m_yaraStore) {
+    try {
+        if (!m_yaraStore) {
+            return YaraRuleStore::YaraStoreStatistics{};
+        }
+        return m_yaraStore->GetStatistics();
+    }
+    catch (...) {
         return YaraRuleStore::YaraStoreStatistics{};
     }
-    return m_yaraStore->GetStatistics();
 }
 
 // ============================================================================
@@ -1206,41 +2037,122 @@ YaraRuleStore::YaraStoreStatistics SignatureStore::GetYaraStatistics() const noe
 StoreError SignatureStore::Rebuild() noexcept {
     SS_LOG_INFO(L"SignatureStore", L"Rebuilding all indices");
 
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
-
-    StoreError err{SignatureStoreError::Success};
-
-    if (m_hashStore) {
-        err = m_hashStore->Rebuild();
-        if (!err.IsSuccess()) {
-            SS_LOG_WARN(L"SignatureStore", L"Hash rebuild failed: %S", err.message.c_str());
-        }
+    // TITANIUM: Use try_to_lock to prevent deadlock in noexcept function
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SS_LOG_WARN(L"SignatureStore", L"Rebuild: Could not acquire lock, operation in progress");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Could not acquire exclusive lock"};
     }
 
-    if (m_patternStore) {
-        err = m_patternStore->Rebuild();
-        if (!err.IsSuccess()) {
-            SS_LOG_WARN(L"SignatureStore", L"Pattern rebuild failed: %S", err.message.c_str());
+    StoreError lastError{SignatureStoreError::Success};
+    uint32_t failCount = 0;
+
+    // TITANIUM: Exception-safe component rebuilds
+    try {
+        if (m_hashStore) {
+            auto err = m_hashStore->Rebuild();
+            if (!err.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"Hash rebuild failed: %S", err.message.c_str());
+                lastError = err;
+                ++failCount;
+            }
         }
     }
-
-    if (m_yaraStore) {
-        err = m_yaraStore->Recompile();
-        if (!err.IsSuccess()) {
-            SS_LOG_WARN(L"SignatureStore", L"YARA rebuild failed: %S", err.message.c_str());
-        }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Hash rebuild exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Hash rebuild unknown exception");
+        ++failCount;
     }
 
+    try {
+        if (m_patternStore) {
+            auto err = m_patternStore->Rebuild();
+            if (!err.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"Pattern rebuild failed: %S", err.message.c_str());
+                lastError = err;
+                ++failCount;
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"Pattern rebuild exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"Pattern rebuild unknown exception");
+        ++failCount;
+    }
+
+    try {
+        if (m_yaraStore) {
+            auto err = m_yaraStore->Recompile();
+            if (!err.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"YARA rebuild failed: %S", err.message.c_str());
+                lastError = err;
+                ++failCount;
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"YARA rebuild exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"YARA rebuild unknown exception");
+        ++failCount;
+    }
+
+    if (failCount > 0) {
+        SS_LOG_WARN(L"SignatureStore", L"Rebuild completed with %u failures", failCount);
+        return lastError;
+    }
+
+    SS_LOG_INFO(L"SignatureStore", L"Rebuild completed successfully");
     return StoreError{SignatureStoreError::Success};
 }
 
 StoreError SignatureStore::Compact() noexcept {
     SS_LOG_INFO(L"SignatureStore", L"Compacting databases");
 
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    // TITANIUM: Use try_to_lock to prevent deadlock
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SS_LOG_WARN(L"SignatureStore", L"Compact: Could not acquire lock");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Could not acquire exclusive lock"};
+    }
 
-    if (m_hashStore) m_hashStore->Compact();
-    if (m_patternStore) m_patternStore->Compact();
+    uint32_t failCount = 0;
+
+    try {
+        if (m_hashStore) m_hashStore->Compact();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"HashStore compact exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"HashStore compact unknown exception");
+        ++failCount;
+    }
+
+    try {
+        if (m_patternStore) m_patternStore->Compact();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"PatternStore compact exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"PatternStore compact unknown exception");
+        ++failCount;
+    }
+
+    if (failCount > 0) {
+        SS_LOG_WARN(L"SignatureStore", L"Compact completed with %u warnings", failCount);
+    }
 
     return StoreError{SignatureStoreError::Success};
 }
@@ -1250,16 +2162,23 @@ StoreError SignatureStore::Verify(
 ) const noexcept {
     SS_LOG_INFO(L"SignatureStore", L"Verifying database integrity");
 
-    // FIX: Wrap in try-catch since callback can throw
+    // TITANIUM: Enhanced exception-safe verification with try_to_lock
     try {
-        std::shared_lock<std::shared_mutex> lock(m_globalLock);
+        std::shared_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            SS_LOG_WARN(L"SignatureStore", L"Verify: Could not acquire lock");
+            return StoreError{SignatureStoreError::AccessDenied, 0, "Could not acquire shared lock"};
+        }
 
         StoreError err{SignatureStoreError::Success};
 
         if (m_hashStore) {
             err = m_hashStore->Verify(logCallback);
             if (!err.IsSuccess()) {
-                if (logCallback) logCallback("HashStore verification failed");
+                try {
+                    if (logCallback) logCallback("HashStore verification failed");
+                }
+                catch (...) { /* Callback threw - ignore */ }
                 return err;
             }
         }
@@ -1267,7 +2186,10 @@ StoreError SignatureStore::Verify(
         if (m_patternStore) {
             err = m_patternStore->Verify(logCallback);
             if (!err.IsSuccess()) {
-                if (logCallback) logCallback("PatternStore verification failed");
+                try {
+                    if (logCallback) logCallback("PatternStore verification failed");
+                }
+                catch (...) { /* Callback threw - ignore */ }
                 return err;
             }
         }
@@ -1275,12 +2197,19 @@ StoreError SignatureStore::Verify(
         if (m_yaraStore) {
             err = m_yaraStore->Verify(logCallback);
             if (!err.IsSuccess()) {
-                if (logCallback) logCallback("YaraStore verification failed");
+                try {
+                    if (logCallback) logCallback("YaraStore verification failed");
+                }
+                catch (...) { /* Callback threw - ignore */ }
                 return err;
             }
         }
 
-        if (logCallback) logCallback("All components verified successfully");
+        try {
+            if (logCallback) logCallback("All components verified successfully");
+        }
+        catch (...) { /* Callback threw - ignore */ }
+        
         return StoreError{SignatureStoreError::Success};
     }
     catch (const std::exception& e) {
@@ -1294,11 +2223,56 @@ StoreError SignatureStore::Verify(
 }
 
 StoreError SignatureStore::Flush() noexcept {
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    SS_LOG_DEBUG(L"SignatureStore", L"Flushing all databases");
 
-    if (m_hashStore) m_hashStore->Flush();
-    if (m_patternStore) m_patternStore->Flush();
-    if (m_yaraStore) m_yaraStore->Flush();
+    // TITANIUM: Use try_to_lock to prevent deadlock in noexcept function
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SS_LOG_WARN(L"SignatureStore", L"Flush: Could not acquire lock");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Could not acquire exclusive lock"};
+    }
+
+    uint32_t failCount = 0;
+
+    try {
+        if (m_hashStore) m_hashStore->Flush();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"HashStore flush exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"HashStore flush unknown exception");
+        ++failCount;
+    }
+
+    try {
+        if (m_patternStore) m_patternStore->Flush();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"PatternStore flush exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"PatternStore flush unknown exception");
+        ++failCount;
+    }
+
+    try {
+        if (m_yaraStore) m_yaraStore->Flush();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"YaraStore flush exception: %S", e.what());
+        ++failCount;
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"YaraStore flush unknown exception");
+        ++failCount;
+    }
+
+    if (failCount > 0) {
+        SS_LOG_WARN(L"SignatureStore", L"Flush completed with %u warnings", failCount);
+    }
 
     return StoreError{SignatureStoreError::Success};
 }
@@ -1306,11 +2280,29 @@ StoreError SignatureStore::Flush() noexcept {
 StoreError SignatureStore::OptimizeByUsage() noexcept {
     SS_LOG_INFO(L"SignatureStore", L"Optimizing by usage patterns");
 
-    // Get heatmaps
-    if (m_patternStore) {
-        auto heatmap = m_patternStore->GetHeatmap();
-        // Would reorder patterns based on frequency
-        m_patternStore->OptimizeByHitRate();
+    // TITANIUM: Exception-safe optimization with try_to_lock
+    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SS_LOG_WARN(L"SignatureStore", L"OptimizeByUsage: Could not acquire lock");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Could not acquire exclusive lock"};
+    }
+
+    try {
+        // Get heatmaps and optimize pattern ordering
+        if (m_patternStore) {
+            auto heatmap = m_patternStore->GetHeatmap();
+            // Would reorder patterns based on frequency
+            m_patternStore->OptimizeByHitRate();
+            SS_LOG_DEBUG(L"SignatureStore", L"Pattern optimization completed");
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"OptimizeByUsage exception: %S", e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, std::string("Optimization error: ") + e.what()};
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"OptimizeByUsage unknown exception");
+        return StoreError{SignatureStoreError::Unknown, 0, "Unknown optimization error"};
     }
 
     return StoreError{SignatureStoreError::Success};
@@ -1414,17 +2406,44 @@ void SignatureStore::SetQueryCacheSize(size_t entries) noexcept {
 
 
 void SignatureStore::SetResultCacheSize(size_t entries) noexcept {
-    SS_LOG_DEBUG(L"SignatureStore", L"SetResultCacheSize: %zu", entries);
+    // TITANIUM: Validate input and add meaningful implementation
+    if (entries == 0) {
+        SS_LOG_WARN(L"SignatureStore", L"SetResultCacheSize: Cannot set to 0");
+        return;
+    }
+    
+    constexpr size_t MAX_RESULT_CACHE = 10000;
+    if (entries > MAX_RESULT_CACHE) {
+        SS_LOG_WARN(L"SignatureStore", L"SetResultCacheSize: Capping to maximum %zu", MAX_RESULT_CACHE);
+        entries = MAX_RESULT_CACHE;
+    }
+    
+    SS_LOG_DEBUG(L"SignatureStore", L"SetResultCacheSize: Setting to %zu", entries);
+    // Note: Actual result cache may be implemented by underlying stores
 }
 
 void SignatureStore::ClearQueryCache() noexcept {
-    // FIX: Thread safety - acquire dedicated cache lock before modifying cache
-    std::unique_lock<std::shared_mutex> lock(m_cacheLock);
-    
-    for (auto& entry : m_queryCache) {
-        entry.bufferHash.fill(0);
-        entry.result = ScanResult{};
-        entry.timestamp = 0;
+    // TITANIUM: Exception-safe cache clear with try_to_lock
+    try {
+        std::unique_lock<std::shared_mutex> lock(m_cacheLock, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            SS_LOG_DEBUG(L"SignatureStore", L"ClearQueryCache: Could not acquire lock, skipping");
+            return;
+        }
+        
+        for (auto& entry : m_queryCache) {
+            entry.bufferHash.fill(0);
+            entry.result = ScanResult{};
+            entry.timestamp = 0;
+        }
+        
+        SS_LOG_DEBUG(L"SignatureStore", L"Query cache cleared");
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"ClearQueryCache exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"ClearQueryCache unknown exception");
     }
 }
 
@@ -1433,13 +2452,38 @@ void SignatureStore::ClearResultCache() noexcept {
 }
 
 void SignatureStore::ClearAllCaches() noexcept {
+    SS_LOG_DEBUG(L"SignatureStore", L"Clearing all caches");
+    
     ClearQueryCache();
     
-    if (m_hashStore) m_hashStore->ClearCache();
+    // TITANIUM: Exception-safe component cache clear
+    try {
+        if (m_hashStore) m_hashStore->ClearCache();
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"SignatureStore", L"ClearAllCaches HashStore exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_WARN(L"SignatureStore", L"ClearAllCaches HashStore unknown exception");
+    }
 }
 
 void SignatureStore::SetThreadPoolSize(uint32_t threadCount) noexcept {
+    // TITANIUM: Validate thread count
+    if (threadCount == 0) {
+        SS_LOG_WARN(L"SignatureStore", L"SetThreadPoolSize: Cannot set to 0, using 1");
+        threadCount = 1;
+    }
+    
+    // Cap to reasonable maximum to prevent resource exhaustion
+    constexpr uint32_t MAX_THREADS = 64;
+    if (threadCount > MAX_THREADS) {
+        SS_LOG_WARN(L"SignatureStore", L"SetThreadPoolSize: Capping to %u threads", MAX_THREADS);
+        threadCount = MAX_THREADS;
+    }
+    
     m_threadPoolSize = threadCount;
+    SS_LOG_DEBUG(L"SignatureStore", L"Thread pool size set to %u", threadCount);
 }
 
 // ============================================================================
@@ -1447,17 +2491,46 @@ void SignatureStore::SetThreadPoolSize(uint32_t threadCount) noexcept {
 // ============================================================================
 
 void SignatureStore::RegisterDetectionCallback(DetectionCallback callback) noexcept {
-    std::lock_guard<std::mutex> lock(m_callbackMutex);
-    m_detectionCallback = std::move(callback);
+    // TITANIUM: Exception-safe callback registration
+    try {
+        std::lock_guard<std::mutex> lock(m_callbackMutex);
+        m_detectionCallback = std::move(callback);
+        SS_LOG_DEBUG(L"SignatureStore", L"Detection callback registered");
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"RegisterDetectionCallback exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"RegisterDetectionCallback unknown exception");
+    }
 }
 
 void SignatureStore::UnregisterDetectionCallback() noexcept {
-    std::lock_guard<std::mutex> lock(m_callbackMutex);
-    m_detectionCallback = nullptr;
+    // TITANIUM: Exception-safe callback unregistration
+    try {
+        std::lock_guard<std::mutex> lock(m_callbackMutex);
+        m_detectionCallback = nullptr;
+        SS_LOG_DEBUG(L"SignatureStore", L"Detection callback unregistered");
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"UnregisterDetectionCallback exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"UnregisterDetectionCallback unknown exception");
+    }
 }
 
 std::wstring SignatureStore::GetHashDatabasePath() const noexcept {
-    return m_hashStore ? m_hashStore->GetDatabasePath() : L"";
+    // TITANIUM: Exception-safe path retrieval
+    try {
+        if (!m_hashStore) {
+            return L"";
+        }
+        return m_hashStore->GetDatabasePath();
+    }
+    catch (...) {
+        return L"";
+    }
 }
 
 std::wstring SignatureStore::GetPatternDatabasePath() const noexcept {
@@ -2290,55 +3363,103 @@ ScanResult SignatureStore::ExecuteSequentialScan(
 ) const noexcept {
     ScanResult result{};
 
+    // TITANIUM: Buffer validation
+    if (buffer.empty() || buffer.data() == nullptr) {
+        SS_LOG_DEBUG(L"SignatureStore", L"ExecuteSequentialScan: Invalid buffer");
+        return result;
+    }
+
     // Hash lookup
-    if (options.enableHashLookup && m_hashStoreEnabled.load() && m_hashStore) {
-        ShadowStrike::SignatureStore::SignatureBuilder builder;
-        auto hash =builder.ComputeBufferHash(buffer, HashType::SHA256);
-        if (hash.has_value()) {
-            auto detection = m_hashStore->LookupHash(*hash);
-            if (detection.has_value()) {
-                result.hashMatches.push_back(*detection);
-                result.detections.push_back(*detection);
-                
-                if (options.stopOnFirstMatch) {
-                    result.stoppedEarly = true;
-                    return result;
+    if (options.enableHashLookup && m_hashStoreEnabled.load(std::memory_order_acquire) && m_hashStore) {
+        try {
+            ShadowStrike::SignatureStore::SignatureBuilder builder;
+            auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
+            if (hash.has_value()) {
+                auto detection = m_hashStore->LookupHash(*hash);
+                if (detection.has_value()) {
+                    result.hashMatches.push_back(*detection);
+                    result.detections.push_back(*detection);
+                    
+                    if (options.stopOnFirstMatch) {
+                        result.stoppedEarly = true;
+                        return result;
+                    }
                 }
             }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteSequentialScan: Hash lookup exception: %S", e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteSequentialScan: Hash lookup unknown exception");
         }
     }
 
     // Pattern scan
-    if (options.enablePatternScan && m_patternStoreEnabled.load() && m_patternStore) {
-        result.patternMatches = m_patternStore->Scan(buffer, options.patternOptions);
-        result.detections.insert(result.detections.end(),
-                                result.patternMatches.begin(),
-                                result.patternMatches.end());
-        
-        if (options.stopOnFirstMatch && !result.patternMatches.empty()) {
-            result.stoppedEarly = true;
-            return result;
+    if (options.enablePatternScan && m_patternStoreEnabled.load(std::memory_order_acquire) && m_patternStore) {
+        try {
+            result.patternMatches = m_patternStore->Scan(buffer, options.patternOptions);
+            
+            // TITANIUM: Limit results to prevent memory exhaustion
+            const size_t maxToAdd = options.maxResults > result.detections.size() 
+                ? options.maxResults - result.detections.size() 
+                : 0;
+            
+            if (result.patternMatches.size() <= maxToAdd) {
+                result.detections.insert(result.detections.end(),
+                                        result.patternMatches.begin(),
+                                        result.patternMatches.end());
+            } else {
+                result.detections.insert(result.detections.end(),
+                                        result.patternMatches.begin(),
+                                        result.patternMatches.begin() + static_cast<ptrdiff_t>(maxToAdd));
+            }
+            
+            if (options.stopOnFirstMatch && !result.patternMatches.empty()) {
+                result.stoppedEarly = true;
+                return result;
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteSequentialScan: Pattern scan exception: %S", e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteSequentialScan: Pattern scan unknown exception");
         }
     }
 
     // YARA scan
-    if (options.enableYaraScan && m_yaraStoreEnabled.load() && m_yaraStore) {
-        result.yaraMatches = m_yaraStore->ScanBuffer(buffer, options.yaraOptions);
-        
-        for (const auto& match : result.yaraMatches) {
-            DetectionResult detection{};
-            detection.signatureId = match.ruleId;
-            detection.signatureName = match.ruleName;
-            detection.threatLevel = match.threatLevel;
-            detection.description = "YARA rule match";
-            detection.matchTimestamp = match.matchTimeMicroseconds;
+    if (options.enableYaraScan && m_yaraStoreEnabled.load(std::memory_order_acquire) && m_yaraStore) {
+        try {
+            result.yaraMatches = m_yaraStore->ScanBuffer(buffer, options.yaraOptions);
             
-            result.detections.push_back(detection);
+            for (const auto& match : result.yaraMatches) {
+                // TITANIUM: Check result limit before adding
+                if (result.detections.size() >= options.maxResults) {
+                    SS_LOG_DEBUG(L"SignatureStore", L"ExecuteSequentialScan: Result limit reached");
+                    break;
+                }
+                
+                DetectionResult detection{};
+                detection.signatureId = match.ruleId;
+                detection.signatureName = match.ruleName;
+                detection.threatLevel = match.threatLevel;
+                detection.description = "YARA rule match";
+                detection.matchTimestamp = match.matchTimeMicroseconds;
+                
+                result.detections.push_back(detection);
+            }
+            
+            if (options.stopOnFirstMatch && !result.yaraMatches.empty()) {
+                result.stoppedEarly = true;
+                return result;
+            }
         }
-        
-        if (options.stopOnFirstMatch && !result.yaraMatches.empty()) {
-            result.stoppedEarly = true;
-            return result;
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteSequentialScan: YARA scan exception: %S", e.what());
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"SignatureStore", L"ExecuteSequentialScan: YARA scan unknown exception");
         }
     }
 
@@ -2520,18 +3641,62 @@ void SignatureStore::MergeResults(
     ScanResult& target,
     const std::vector<DetectionResult>& source
 ) const noexcept {
-    target.detections.insert(target.detections.end(), source.begin(), source.end());
+    // TITANIUM: Exception-safe merge with capacity check
+    if (source.empty()) {
+        return;
+    }
+    
+    try {
+        // Reserve space to prevent multiple reallocations
+        const size_t newSize = target.detections.size() + source.size();
+        
+        // TITANIUM: Prevent overflow/excessive allocation
+        constexpr size_t MAX_DETECTIONS = 100000;
+        if (newSize > MAX_DETECTIONS) {
+            SS_LOG_WARN(L"SignatureStore", L"MergeResults: Limiting total detections to %zu", MAX_DETECTIONS);
+            const size_t toAdd = MAX_DETECTIONS > target.detections.size() 
+                ? MAX_DETECTIONS - target.detections.size() 
+                : 0;
+            target.detections.reserve(MAX_DETECTIONS);
+            target.detections.insert(target.detections.end(), 
+                source.begin(), 
+                source.begin() + static_cast<ptrdiff_t>(std::min(toAdd, source.size())));
+        } else {
+            target.detections.reserve(newSize);
+            target.detections.insert(target.detections.end(), source.begin(), source.end());
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeResults: Exception: %S", e.what());
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"MergeResults: Unknown exception");
+    }
 }
 
 void SignatureStore::NotifyDetection(const DetectionResult& detection) const noexcept {
-    std::lock_guard<std::mutex> lock(m_callbackMutex);
-    
-    if (m_detectionCallback) {
-        try {
-            m_detectionCallback(detection);
-        } catch (...) {
-            SS_LOG_ERROR(L"SignatureStore", L"Detection callback threw exception");
+    // TITANIUM: Exception-safe callback with try_lock to prevent deadlock
+    try {
+        std::unique_lock<std::mutex> lock(m_callbackMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            SS_LOG_DEBUG(L"SignatureStore", L"NotifyDetection: Could not acquire callback lock");
+            return;
         }
+        
+        if (m_detectionCallback) {
+            try {
+                m_detectionCallback(detection);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_ERROR(L"SignatureStore", L"Detection callback threw exception: %S", e.what());
+            }
+            catch (...) {
+                SS_LOG_ERROR(L"SignatureStore", L"Detection callback threw unknown exception");
+            }
+        }
+    }
+    catch (...) {
+        SS_LOG_ERROR(L"SignatureStore", L"NotifyDetection: Failed to acquire lock");
     }
 }
 

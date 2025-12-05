@@ -290,10 +290,10 @@ struct alignas(8) CacheValue {
                 : reputation(result.reputation),
                     confidence(result.confidence),
                     category(result.category),
-                    shouldBlock(result.IsMalicious()),
-                    shouldAlert(result.IsSuspicious()),
+                    shouldBlock(result.shouldBlock),//Ismalicious olayı
+                    shouldAlert(result.shouldAlert),
                     isPositive(result.found),
-                    source(result.primarySource) {
+                    source(result.source) {
                 entryId = 0;
         auto now = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::seconds>(

@@ -140,13 +140,101 @@ namespace {
 }
 
 /**
+ * @brief Thread-safe regex holder with exception-safe initialization
+ * @details Uses std::call_once for guaranteed single initialization across threads
+ */
+struct RegexHolder {
+    std::once_flag initFlag;
+    std::unique_ptr<std::regex> regex;
+    bool valid{false};
+    
+    /**
+     * @brief Initialize regex with exception handling
+     * @param pattern The regex pattern to compile
+     * @return true if initialization succeeded
+     */
+    [[nodiscard]] bool Initialize(const char* pattern) noexcept {
+        std::call_once(initFlag, [this, pattern]() {
+            try {
+                regex = std::make_unique<std::regex>(pattern);
+                valid = true;
+            } catch (const std::regex_error&) {
+                valid = false;
+            } catch (...) {
+                valid = false;
+            }
+        });
+        return valid;
+    }
+    
+    /**
+     * @brief Check if regex is valid and initialized
+     */
+    [[nodiscard]] bool IsValid() const noexcept {
+        return valid && regex != nullptr;
+    }
+    
+    /**
+     * @brief Get the underlying regex (must check IsValid first)
+     */
+    [[nodiscard]] const std::regex& Get() const noexcept {
+        return *regex;
+    }
+};
+
+// Global thread-safe regex holders for validation patterns
+static RegexHolder g_ipv4Regex;
+static RegexHolder g_domainRegex;
+static RegexHolder g_emailRegex;
+
+/**
  * @brief Validate IPv4 address string
+ * @details Thread-safe validation using lazily-initialized regex
  */
 [[nodiscard]] bool IsValidIPv4(std::string_view addr) noexcept {
-    static const std::regex ipv4Regex(
+    // Initialize regex on first use (thread-safe via std::call_once)
+    if (!g_ipv4Regex.Initialize(
         R"(^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(/([0-9]|[1-2][0-9]|3[0-2]))?$)"
-    );
-    return std::regex_match(std::string(addr), ipv4Regex);
+    )) {
+        // Regex compilation failed - fall back to manual validation
+        // Count octets separated by dots
+        int octets = 0;
+        size_t pos = 0;
+        while (pos < addr.size() && octets < 4) {
+            // Parse numeric value
+            size_t num = 0;
+            size_t digits = 0;
+            while (pos < addr.size() && addr[pos] >= '0' && addr[pos] <= '9') {
+                num = num * 10 + static_cast<size_t>(addr[pos] - '0');
+                if (num > 255) return false;
+                ++pos;
+                ++digits;
+            }
+            if (digits == 0 || digits > 3) return false;
+            ++octets;
+            if (octets < 4 && (pos >= addr.size() || addr[pos] != '.')) return false;
+            if (octets < 4) ++pos; // Skip dot
+        }
+        // Handle optional CIDR notation
+        if (pos < addr.size() && addr[pos] == '/') {
+            ++pos;
+            size_t cidr = 0;
+            size_t cidrDigits = 0;
+            while (pos < addr.size() && addr[pos] >= '0' && addr[pos] <= '9') {
+                cidr = cidr * 10 + static_cast<size_t>(addr[pos] - '0');
+                ++pos;
+                ++cidrDigits;
+            }
+            if (cidrDigits == 0 || cidr > 32) return false;
+        }
+        return octets == 4 && pos == addr.size();
+    }
+    
+    try {
+        return std::regex_match(std::string(addr), g_ipv4Regex.Get());
+    } catch (...) {
+        return false;
+    }
 }
 
 /**
@@ -160,17 +248,58 @@ namespace {
 
 /**
  * @brief Validate domain name
+ * @details Thread-safe validation using lazily-initialized regex
  */
 [[nodiscard]] bool IsValidDomain(std::string_view domain) noexcept {
     if (domain.empty() || domain.length() > MAX_DOMAIN_LENGTH) {
         return false;
     }
     
-    // Basic domain validation
-    static const std::regex domainRegex(
+    // Initialize regex on first use (thread-safe via std::call_once)
+    if (!g_domainRegex.Initialize(
         R"(^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$)"
-    );
-    return std::regex_match(std::string(domain), domainRegex);
+    )) {
+        // Regex compilation failed - fall back to manual validation
+        // Check for valid domain structure: labels separated by dots
+        bool lastWasDot = true; // Track start of label
+        size_t labelLen = 0;
+        bool hasValidTLD = false;
+        size_t dotCount = 0;
+        
+        for (size_t i = 0; i < domain.size(); ++i) {
+            const char c = domain[i];
+            
+            if (c == '.') {
+                if (lastWasDot || labelLen == 0) return false; // Empty label
+                if (labelLen > 63) return false; // Label too long
+                lastWasDot = true;
+                labelLen = 0;
+                ++dotCount;
+            } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                lastWasDot = false;
+                ++labelLen;
+                hasValidTLD = true; // Track TLD contains letters
+            } else if (c >= '0' && c <= '9') {
+                lastWasDot = false;
+                ++labelLen;
+            } else if (c == '-') {
+                if (lastWasDot) return false; // Label can't start with hyphen
+                ++labelLen;
+            } else {
+                return false; // Invalid character
+            }
+        }
+        
+        // Last label (TLD) must be at least 2 chars and can't end with hyphen
+        return dotCount >= 1 && labelLen >= 2 && labelLen <= 63 && 
+               hasValidTLD && !lastWasDot && domain.back() != '-';
+    }
+    
+    try {
+        return std::regex_match(std::string(domain), g_domainRegex.Get());
+    } catch (...) {
+        return false;
+    }
 }
 
 /**
@@ -183,12 +312,45 @@ namespace {
 
 /**
  * @brief Validate email address
+ * @details Thread-safe validation using lazily-initialized regex
  */
 [[nodiscard]] bool IsValidEmail(std::string_view email) noexcept {
-    static const std::regex emailRegex(
+    if (email.empty() || email.length() > 254) { // RFC 5321 max length
+        return false;
+    }
+    
+    // Initialize regex on first use (thread-safe via std::call_once)
+    if (!g_emailRegex.Initialize(
         R"(^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$)"
-    );
-    return std::regex_match(std::string(email), emailRegex);
+    )) {
+        // Regex compilation failed - fall back to manual validation
+        const auto atPos = email.find('@');
+        if (atPos == std::string_view::npos || atPos == 0 || atPos == email.size() - 1) {
+            return false;
+        }
+        
+        // Validate local part (before @)
+        const auto localPart = email.substr(0, atPos);
+        if (localPart.empty() || localPart.length() > 64) return false;
+        
+        for (char c : localPart) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                  c == '%' || c == '+' || c == '-')) {
+                return false;
+            }
+        }
+        
+        // Validate domain part (after @)
+        const auto domainPart = email.substr(atPos + 1);
+        return IsValidDomain(domainPart);
+    }
+    
+    try {
+        return std::regex_match(std::string(email), g_emailRegex.Get());
+    } catch (...) {
+        return false;
+    }
 }
 
 /**
@@ -205,15 +367,44 @@ namespace {
 }
 
 /**
- * @brief Parse hex string to bytes
+ * @brief Parse hex string to bytes with validation
+ * @param hex Input hex string (must have even length)
+ * @return Vector of bytes, empty if invalid input
+ * @details Validates:
+ *          - Even length
+ *          - All characters are valid hex digits
+ *          - No overflow during conversion
  */
-[[nodiscard]] std::vector<uint8_t> ParseHexString(std::string_view hex) {
+[[nodiscard]] std::vector<uint8_t> ParseHexString(std::string_view hex) noexcept {
     std::vector<uint8_t> bytes;
+    
+    // Validate even length
+    if (hex.empty() || (hex.length() % 2) != 0) {
+        return bytes; // Return empty for invalid input
+    }
+    
     bytes.reserve(hex.length() / 2);
     
-    for (size_t i = 0; i + 1 < hex.length(); i += 2) {
-        const auto byte = std::strtoul(std::string(hex.substr(i, 2)).c_str(), nullptr, 16);
-        bytes.push_back(static_cast<uint8_t>(byte));
+    // Lookup table for hex digit to value conversion
+    // Returns 255 (0xFF) for invalid characters
+    constexpr auto HexCharToValue = [](char c) noexcept -> uint8_t {
+        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+        return 0xFF; // Invalid character marker
+    };
+    
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        const uint8_t high = HexCharToValue(hex[i]);
+        const uint8_t low = HexCharToValue(hex[i + 1]);
+        
+        // Check for invalid hex characters
+        if (high == 0xFF || low == 0xFF) {
+            bytes.clear();
+            return bytes; // Return empty for invalid input
+        }
+        
+        bytes.push_back(static_cast<uint8_t>((high << 4) | low));
     }
     
     return bytes;
@@ -459,12 +650,27 @@ public:
     
     /**
      * @brief Add IOC to deduplication index
+     * @param type IOC type
+     * @param value IOC value
+     * @param entryId Entry ID (must be non-zero)
+     * @return true if added successfully, false if invalid parameters
      */
-    void Add(IOCType type, std::string_view value, uint64_t entryId) noexcept {
+    [[nodiscard]] bool Add(IOCType type, std::string_view value, uint64_t entryId) noexcept {
+        // Validate entry ID - system uses 1-based IDs
+        if (UNLIKELY(entryId == 0)) {
+            return false;
+        }
+        
+        // Validate value is not empty
+        if (UNLIKELY(value.empty())) {
+            return false;
+        }
+        
         const uint64_t hash = CalculateIOCHash(type, value);
         
         std::lock_guard lock(m_mutex);
         m_hashTable[hash] = entryId;
+        return true;
     }
     
     /**
@@ -597,6 +803,8 @@ public:
     
     /**
      * @brief Find shortest path between two IOCs
+     * @details Uses BFS for unweighted shortest path. Uses sentinel value for parent tracking
+     *          to properly handle entry ID 0.
      */
     [[nodiscard]] std::vector<uint64_t> FindPath(
         uint64_t sourceId,
@@ -604,27 +812,34 @@ public:
     ) const noexcept {
         std::shared_lock lock(m_mutex);
         
-        // BFS for shortest path
-        std::unordered_map<uint64_t, uint64_t> parent;
+        // Use optional to properly track parent without conflicting with valid entry ID 0
+        // Key = node, Value = parent (nullopt indicates this is the source node)
+        std::unordered_map<uint64_t, std::optional<uint64_t>> parent;
         std::unordered_set<uint64_t> visited;
         std::queue<uint64_t> queue;
         
         queue.push(sourceId);
         visited.insert(sourceId);
-        parent[sourceId] = 0;
+        parent[sourceId] = std::nullopt; // Source has no parent (sentinel)
         
         while (!queue.empty()) {
             const uint64_t current = queue.front();
             queue.pop();
             
             if (current == targetId) {
-                // Reconstruct path
+                // Reconstruct path from target back to source
                 std::vector<uint64_t> path;
-                uint64_t node = targetId;
-                while (node != 0) {
-                    path.push_back(node);
-                    node = parent[node];
+                std::optional<uint64_t> node = targetId;
+                
+                while (node.has_value()) {
+                    path.push_back(node.value());
+                    auto it = parent.find(node.value());
+                    if (it == parent.end()) {
+                        break; // Should not happen, but defensive check
+                    }
+                    node = it->second; // Get parent (nullopt for source)
                 }
+                
                 std::reverse(path.begin(), path.end());
                 return path;
             }
@@ -720,15 +935,53 @@ private:
 
 /**
  * @brief Internal version control system
+ * @details Tracks all changes to IOC entries with automatic version numbering
  */
 class IOCVersionControl {
 public:
     /**
-     * @brief Add version entry
+     * @brief Add version entry with automatic version numbering
      */
-    void AddVersion(const IOCVersionEntry& version) noexcept {
+    void AddVersion(IOCVersionEntry version) noexcept {
         std::lock_guard lock(m_mutex);
-        m_versions[version.entryId].push_back(version);
+        
+        auto& versions = m_versions[version.entryId];
+        
+        // Auto-assign next version number if not already set
+        if (version.version == 0 || versions.empty()) {
+            version.version = static_cast<uint32_t>(versions.size() + 1);
+        } else {
+            // Find the highest version and increment
+            uint32_t maxVersion = 0;
+            for (const auto& v : versions) {
+                if (v.version > maxVersion) {
+                    maxVersion = v.version;
+                }
+            }
+            version.version = maxVersion + 1;
+        }
+        
+        versions.push_back(version);
+    }
+    
+    /**
+     * @brief Get the next version number for an entry
+     */
+    [[nodiscard]] uint32_t GetNextVersionNumber(uint64_t entryId) const noexcept {
+        std::shared_lock lock(m_mutex);
+        
+        const auto it = m_versions.find(entryId);
+        if (it == m_versions.end() || it->second.empty()) {
+            return 1;
+        }
+        
+        uint32_t maxVersion = 0;
+        for (const auto& v : it->second) {
+            if (v.version > maxVersion) {
+                maxVersion = v.version;
+            }
+        }
+        return maxVersion + 1;
     }
     
     /**
@@ -1129,6 +1382,14 @@ IOCOperationResult ThreatIntelIOCManager::UpdateIOC(
         );
     }
     
+    // Validate entryId to prevent underflow when converting to index
+    if (UNLIKELY(entry.entryId == 0)) {
+        return IOCOperationResult::Error(
+            ThreatIntelError::InvalidEntry,
+            "Invalid entry ID (zero)"
+        );
+    }
+    
     // Find existing entry
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
     
@@ -1153,7 +1414,8 @@ IOCOperationResult ThreatIntelIOCManager::UpdateIOC(
     // Create version entry
     if (options.createAuditLog) {
         IOCVersionEntry version;
-        version.version = 2; // TODO: Track actual version numbers
+        // Version number will be auto-assigned by IOCVersionControl::AddVersion
+        version.version = m_impl->versionControl->GetNextVersionNumber(entry.entryId);
         version.entryId = entry.entryId;
         version.timestamp = GetCurrentTimestamp();
         version.modifiedBy = "System";
@@ -1188,6 +1450,14 @@ IOCOperationResult ThreatIntelIOCManager::DeleteIOC(
         return IOCOperationResult::Error(
             ThreatIntelError::NotInitialized,
             "Manager not initialized"
+        );
+    }
+    
+    // Validate entryId to prevent underflow when converting to index
+    if (UNLIKELY(entryId == 0)) {
+        return IOCOperationResult::Error(
+            ThreatIntelError::InvalidEntry,
+            "Invalid entry ID (zero)"
         );
     }
     
@@ -1253,6 +1523,14 @@ IOCOperationResult ThreatIntelIOCManager::RestoreIOC(uint64_t entryId) noexcept 
         );
     }
     
+    // Validate entryId to prevent underflow when converting to index
+    if (UNLIKELY(entryId == 0)) {
+        return IOCOperationResult::Error(
+            ThreatIntelError::InvalidEntry,
+            "Invalid entry ID (zero)"
+        );
+    }
+    
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
     
     auto* entry = m_impl->database->GetMutableEntry(
@@ -1304,12 +1582,19 @@ IOCBulkImportResult ThreatIntelIOCManager::BatchAddIOCs(
          GetOptimalThreadCount(entries.size())) : 1;
     
     if (options.parallel && threadCount > 1) {
-        // Parallel processing
+        // Parallel processing with proper synchronization
         std::vector<IOCBulkImportResult> threadResults(threadCount);
         std::vector<std::thread> threads;
         threads.reserve(threadCount);
         
         const size_t chunkSize = (entries.size() + threadCount - 1) / threadCount;
+        
+        // Atomic flag for early termination across all threads
+        std::atomic<bool> shouldStop{false};
+        
+        // Mutex for thread-safe progress callback invocation
+        std::mutex progressMutex;
+        std::atomic<size_t> totalProcessed{0};
         
         for (size_t t = 0; t < threadCount; ++t) {
             const size_t start = t * chunkSize;
@@ -1317,10 +1602,16 @@ IOCBulkImportResult ThreatIntelIOCManager::BatchAddIOCs(
             
             if (start >= end) break;
             
-            threads.emplace_back([this, &entries, &options, &threadResults, t, start, end]() {
+            threads.emplace_back([this, &entries, &options, &threadResults, &shouldStop, 
+                                  &progressMutex, &totalProcessed, t, start, end]() {
                 auto& localResult = threadResults[t];
                 
                 for (size_t i = start; i < end; ++i) {
+                    // Check for early termination from other threads
+                    if (shouldStop.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    
                     const auto opResult = AddIOC(entries[i], options.addOptions);
                     
                     if (opResult.success) {
@@ -1336,13 +1627,23 @@ IOCBulkImportResult ThreatIntelIOCManager::BatchAddIOCs(
                         ++localResult.errorCounts[opResult.errorCode];
                         
                         if (options.stopOnError) {
+                            // Signal all threads to stop
+                            shouldStop.store(true, std::memory_order_release);
                             break;
                         }
                     }
                     
-                    // Progress callback
-                    if (options.progressCallback && (i - start) % 100 == 0) {
-                        options.progressCallback(i + 1, entries.size());
+                    // Thread-safe progress callback invocation
+                    const size_t currentTotal = totalProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (options.progressCallback && currentTotal % 100 == 0) {
+                        std::lock_guard<std::mutex> lock(progressMutex);
+                        if (options.progressCallback) { // Double-check under lock
+                            try {
+                                options.progressCallback(currentTotal, entries.size());
+                            } catch (...) {
+                                // Swallow callback exceptions to prevent thread termination
+                            }
+                        }
                     }
                 }
             });
@@ -1460,6 +1761,11 @@ std::optional<IOCEntry> ThreatIntelIOCManager::GetIOC(
     const IOCQueryOptions& options
 ) const noexcept {
     if (UNLIKELY(!IsInitialized())) {
+        return std::nullopt;
+    }
+    
+    // Validate entryId to prevent underflow when converting to index
+    if (UNLIKELY(entryId == 0)) {
         return std::nullopt;
     }
     
@@ -1591,6 +1897,11 @@ bool ThreatIntelIOCManager::ExistsIOC(
     IOCType type,
     std::string_view value
 ) const noexcept {
+    // Critical: Must check initialization before accessing m_impl
+    if (UNLIKELY(!IsInitialized())) {
+        return false;
+    }
+    
     const auto entryId = m_impl->deduplicator->CheckDuplicate(type, value);
     return entryId.has_value();
 }
@@ -1599,6 +1910,11 @@ size_t ThreatIntelIOCManager::GetIOCCount(
     bool includeExpired,
     bool includeRevoked
 ) const noexcept {
+    // Critical: Must check initialization before accessing m_impl
+    if (UNLIKELY(!IsInitialized())) {
+        return 0;
+    }
+    
     if (includeExpired && includeRevoked) {
         return m_impl->stats.totalEntries.load(std::memory_order_relaxed);
     }

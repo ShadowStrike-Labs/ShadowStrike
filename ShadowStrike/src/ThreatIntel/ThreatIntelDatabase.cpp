@@ -86,6 +86,11 @@ constexpr uint32_t CRC32_TABLE[256] = {
  * @return CRC32 checksum
  */
 [[nodiscard]] uint32_t ComputeCRC32(const void* data, size_t size) noexcept {
+    // TITANIUM: Validate input parameters
+    if (data == nullptr || size == 0) {
+        return 0xFFFFFFFF;  // Return invalid CRC for null/empty data
+    }
+    
     const auto* bytes = static_cast<const uint8_t*>(data);
     uint32_t crc = 0xFFFFFFFF;
     
@@ -97,30 +102,63 @@ constexpr uint32_t CRC32_TABLE[256] = {
 }
 
 /**
+ * @brief Continue CRC32 computation from existing CRC value
+ * @param data Pointer to data
+ * @param size Size of data in bytes
+ * @param initialCrc Initial CRC value (should be XOR'd back to internal state)
+ * @return CRC32 checksum (internal state, not finalized)
+ */
+[[nodiscard]] uint32_t ContinueCRC32(const void* data, size_t size, uint32_t initialCrc) noexcept {
+    // TITANIUM: Validate input parameters
+    if (data == nullptr || size == 0) {
+        return initialCrc;
+    }
+    
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    uint32_t crc = initialCrc ^ 0xFFFFFFFF;  // Convert back to internal state
+    
+    for (size_t i = 0; i < size; ++i) {
+        crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
+    }
+    
+    return crc ^ 0xFFFFFFFF;  // Return finalized CRC
+}
+
+/**
  * @brief Compute CRC32 checksum for database header
  * @param header Header to compute checksum for
  * @return CRC32 checksum
- * @note headerCrc32 field must be zeroed before calling
+ * @note headerCrc32 field is excluded from computation
  */
 [[nodiscard]] uint32_t ComputeHeaderCRC32(const ThreatIntelDatabaseHeader& header) noexcept {
     // Compute CRC of header excluding the integrity section's headerCrc32 field
-    // We compute up to sha256Checksum + headerCrc32 offset
     constexpr size_t checksumOffset = offsetof(ThreatIntelDatabaseHeader, headerCrc32);
+    constexpr size_t afterChecksumOffset = checksumOffset + sizeof(uint32_t);
+    constexpr size_t headerSize = sizeof(ThreatIntelDatabaseHeader);
+    
+    // TITANIUM: Validate offsets are sane
+    static_assert(checksumOffset < headerSize, "headerCrc32 offset out of bounds");
+    static_assert(afterChecksumOffset <= headerSize, "after checksum offset out of bounds");
     
     // First part: everything before headerCrc32
-    uint32_t crc = ComputeCRC32(&header, checksumOffset);
+    const auto* headerBytes = reinterpret_cast<const uint8_t*>(&header);
+    uint32_t crc = 0xFFFFFFFF;
     
-    // Skip headerCrc32 (4 bytes) and continue with rest
-    constexpr size_t afterChecksumOffset = checksumOffset + sizeof(uint32_t);
-    const auto* afterChecksum = reinterpret_cast<const uint8_t*>(&header) + afterChecksumOffset;
-    size_t remainingSize = sizeof(ThreatIntelDatabaseHeader) - afterChecksumOffset;
-    
-    // Continue CRC computation
-    for (size_t i = 0; i < remainingSize; ++i) {
-        crc = CRC32_TABLE[(crc ^ afterChecksum[i]) & 0xFF] ^ (crc >> 8);
+    for (size_t i = 0; i < checksumOffset; ++i) {
+        crc = CRC32_TABLE[(crc ^ headerBytes[i]) & 0xFF] ^ (crc >> 8);
     }
     
-    return crc;
+    // Skip headerCrc32 (4 bytes) and continue with rest
+    if (afterChecksumOffset < headerSize) {
+        const size_t remainingSize = headerSize - afterChecksumOffset;
+        const uint8_t* afterChecksum = headerBytes + afterChecksumOffset;
+        
+        for (size_t i = 0; i < remainingSize; ++i) {
+            crc = CRC32_TABLE[(crc ^ afterChecksum[i]) & 0xFF] ^ (crc >> 8);
+        }
+    }
+    
+    return crc ^ 0xFFFFFFFF;
 }
 
 } // anonymous namespace
@@ -142,6 +180,7 @@ MappedRegion::MappedRegion(MappedRegion&& other) noexcept
     
     other.m_baseAddress = nullptr;
     other.m_size = 0;
+    other.m_readOnly = false;  // TITANIUM: Reset read-only flag
     other.m_fileHandle = nullptr;
     other.m_mappingHandle = nullptr;
 }
@@ -158,6 +197,7 @@ MappedRegion& MappedRegion::operator=(MappedRegion&& other) noexcept {
         
         other.m_baseAddress = nullptr;
         other.m_size = 0;
+        other.m_readOnly = false;  // TITANIUM: Reset read-only flag
         other.m_fileHandle = nullptr;
         other.m_mappingHandle = nullptr;
     }
@@ -165,21 +205,42 @@ MappedRegion& MappedRegion::operator=(MappedRegion&& other) noexcept {
 }
 
 bool MappedRegion::Flush(size_t offset, size_t length) noexcept {
-    if (!m_baseAddress || m_readOnly) {
+    // TITANIUM: Validate base address exists
+    if (!m_baseAddress) {
         return false;
     }
     
-    // Calculate flush range
-    void* flushAddr = static_cast<uint8_t*>(m_baseAddress) + offset;
-    SIZE_T flushSize = (length == 0) ? (m_size - offset) : length;
+    // TITANIUM: Read-only regions cannot be flushed (but return true as no-op)
+    if (m_readOnly) {
+        return true;
+    }
     
-    // Clamp to valid range
+    // TITANIUM: Validate offset is within bounds
     if (offset >= m_size) {
         return false;
     }
-    if (offset + flushSize > m_size) {
+    
+    // Calculate flush range with overflow protection
+    SIZE_T flushSize;
+    if (length == 0) {
         flushSize = m_size - offset;
+    } else {
+        // TITANIUM: Check for overflow in offset + length
+        if (length > SIZE_MAX - offset) {
+            flushSize = m_size - offset;  // Clamp to valid range
+        } else if (offset + length > m_size) {
+            flushSize = m_size - offset;  // Clamp to valid range
+        } else {
+            flushSize = length;
+        }
     }
+    
+    // TITANIUM: Ensure flushSize is valid
+    if (flushSize == 0) {
+        return true;  // Nothing to flush
+    }
+    
+    void* flushAddr = static_cast<uint8_t*>(m_baseAddress) + offset;
     
     return FlushViewOfFile(flushAddr, flushSize) != 0;
 }
@@ -223,13 +284,42 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         return false;
     }
     
+    // TITANIUM: Validate file path
+    if (config.filePath.empty()) {
+        return false;
+    }
+    
+    // TITANIUM: Check path length limit (MAX_PATH for Windows)
+    constexpr size_t kMaxPathLength = 32767;  // Windows extended path limit
+    if (config.filePath.length() >= kMaxPathLength) {
+        return false;
+    }
+    
+    // TITANIUM: Validate initial size limits
+    if (config.initialSize > 0 && config.initialSize > DATABASE_MAX_SIZE) {
+        return false;
+    }
+    
+    // TITANIUM: Validate max size configuration
+    if (config.maxSize > DATABASE_MAX_SIZE) {
+        return false;
+    }
+    
     std::unique_lock lock(m_mutex);
     
     // Store configuration
     m_config = config;
     
-    // Check if file exists
-    bool fileExists = std::filesystem::exists(config.filePath);
+    // Check if file exists - wrap in try/catch for filesystem errors
+    bool fileExists = false;
+    try {
+        fileExists = std::filesystem::exists(config.filePath);
+    } catch (const std::filesystem::filesystem_error&) {
+        // TITANIUM: Handle filesystem errors gracefully
+        return false;
+    } catch (const std::exception&) {
+        return false;
+    }
     
     if (fileExists) {
         // Open existing database
@@ -248,7 +338,8 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
     
     // Verify integrity if requested
     if (config.verifyOnOpen && !config.readOnly) {
-        if (!VerifyIntegrity()) {
+        // TITANIUM: Use internal verify that doesn't acquire mutex
+        if (!VerifyIntegrityInternal()) {
             Close();
             return false;
         }
@@ -407,11 +498,19 @@ size_t ThreatIntelDatabase::AllocateEntry() noexcept {
         return SIZE_MAX;
     }
     
+    // TITANIUM: Validate header pointers are within mapped region
+    if (!m_region.IsValid()) {
+        return SIZE_MAX;
+    }
+    
     // Calculate max entries from mapped size
-    size_t maxEntries = CalculateMaxEntries();
+    const size_t maxEntries = CalculateMaxEntries();
+    
+    // TITANIUM: Prevent overflow - check if we can safely compare
+    const uint64_t currentCount = m_header->totalActiveEntries;
     
     // Check if we need to extend
-    if (m_header->totalActiveEntries >= maxEntries) {
+    if (currentCount >= maxEntries) {
         // Try to extend
         lock.unlock();
         if (!EnsureCapacity(1)) {
@@ -419,17 +518,33 @@ size_t ThreatIntelDatabase::AllocateEntry() noexcept {
         }
         lock.lock();
         
+        // TITANIUM: Re-validate state after re-acquiring lock
+        if (!m_header || !m_entries || !m_region.IsValid()) {
+            return SIZE_MAX;
+        }
+        
         // Re-check after extension
-        maxEntries = CalculateMaxEntries();
-        if (m_header->totalActiveEntries >= maxEntries) {
+        const size_t newMaxEntries = CalculateMaxEntries();
+        if (m_header->totalActiveEntries >= newMaxEntries) {
             return SIZE_MAX;
         }
     }
     
+    // TITANIUM: Final bounds check before allocation
+    if (m_header->totalActiveEntries >= SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    
     // Allocate entry
-    size_t index = m_header->totalActiveEntries;
+    const size_t index = static_cast<size_t>(m_header->totalActiveEntries);
+    
+    // TITANIUM: Verify index is valid
+    if (index >= CalculateMaxEntries()) {
+        return SIZE_MAX;
+    }
+    
     m_header->totalActiveEntries++;
-    m_stats.entryCount = m_header->totalActiveEntries;
+    m_stats.entryCount = static_cast<size_t>(m_header->totalActiveEntries);
     
     return index;
 }
@@ -439,17 +554,29 @@ size_t ThreatIntelDatabase::AllocateEntries(size_t count) noexcept {
         return SIZE_MAX;
     }
     
+    // TITANIUM: Prevent ridiculously large allocations
+    constexpr size_t kMaxBatchAllocation = 10'000'000;  // 10 million entries max per batch
+    if (count > kMaxBatchAllocation) {
+        return SIZE_MAX;
+    }
+    
     std::unique_lock lock(m_mutex);
     
-    if (!m_header || !m_entries) {
+    if (!m_header || !m_entries || !m_region.IsValid()) {
         return SIZE_MAX;
     }
     
     // Calculate max entries from mapped size
-    size_t maxEntries = CalculateMaxEntries();
+    const size_t maxEntries = CalculateMaxEntries();
+    const uint64_t currentCount = m_header->totalActiveEntries;
+    
+    // TITANIUM: Overflow check - ensure currentCount doesn't exceed SIZE_MAX
+    if (currentCount > SIZE_MAX) {
+        return SIZE_MAX;
+    }
     
     // Check if we need to extend
-    size_t available = maxEntries - m_header->totalActiveEntries;
+    const size_t available = (maxEntries > currentCount) ? (maxEntries - static_cast<size_t>(currentCount)) : 0;
     
     if (available < count) {
         lock.unlock();
@@ -458,17 +585,28 @@ size_t ThreatIntelDatabase::AllocateEntries(size_t count) noexcept {
         }
         lock.lock();
         
-        maxEntries = CalculateMaxEntries();
-        available = maxEntries - m_header->totalActiveEntries;
-        if (available < count) {
+        // TITANIUM: Re-validate state after re-acquiring lock
+        if (!m_header || !m_entries || !m_region.IsValid()) {
+            return SIZE_MAX;
+        }
+        
+        const size_t newMaxEntries = CalculateMaxEntries();
+        const size_t newAvailable = (newMaxEntries > m_header->totalActiveEntries) ? 
+            (newMaxEntries - static_cast<size_t>(m_header->totalActiveEntries)) : 0;
+        if (newAvailable < count) {
             return SIZE_MAX;
         }
     }
     
+    // TITANIUM: Final overflow check for addition
+    if (m_header->totalActiveEntries > UINT64_MAX - count) {
+        return SIZE_MAX;
+    }
+    
     // Allocate entries
-    size_t startIndex = m_header->totalActiveEntries;
+    const size_t startIndex = static_cast<size_t>(m_header->totalActiveEntries);
     m_header->totalActiveEntries += static_cast<uint64_t>(count);
-    m_stats.entryCount = m_header->totalActiveEntries;
+    m_stats.entryCount = static_cast<size_t>(m_header->totalActiveEntries);
     
     return startIndex;
 }
@@ -518,17 +656,30 @@ bool ThreatIntelDatabase::Extend(size_t newSize) noexcept {
         return false;
     }
     
+    // TITANIUM: Validate newSize is reasonable
+    if (newSize == 0) {
+        return false;
+    }
+    
     std::unique_lock lock(m_mutex);
+    
+    // TITANIUM: Verify database is in valid state
+    if (!m_region.IsValid() || !m_header) {
+        return false;
+    }
     
     // Align to page boundary
     newSize = AlignToPage(newSize);
     
     // Check bounds
-    if (newSize <= m_region.Size()) {
+    const size_t currentSize = m_region.Size();
+    if (newSize <= currentSize) {
         return true; // Already big enough
     }
     
-    size_t maxAllowed = m_config.maxSize > 0 ? m_config.maxSize : DATABASE_MAX_SIZE;
+    // TITANIUM: Apply strict size limits
+    const size_t maxAllowed = (m_config.maxSize > 0 && m_config.maxSize <= DATABASE_MAX_SIZE) 
+        ? m_config.maxSize : DATABASE_MAX_SIZE;
     if (newSize > maxAllowed) {
         return false;
     }
@@ -537,30 +688,65 @@ bool ThreatIntelDatabase::Extend(size_t newSize) noexcept {
 }
 
 bool ThreatIntelDatabase::ExtendBy(size_t additionalBytes) noexcept {
+    // TITANIUM: Validate additionalBytes
+    if (additionalBytes == 0) {
+        return true;  // Nothing to extend
+    }
+    
     std::shared_lock lock(m_mutex);
-    size_t currentSize = m_region.Size();
+    const size_t currentSize = m_region.Size();
     lock.unlock();
+    
+    // TITANIUM: Check for overflow before addition
+    if (additionalBytes > SIZE_MAX - currentSize) {
+        return false;  // Would overflow
+    }
     
     return Extend(currentSize + additionalBytes);
 }
 
 bool ThreatIntelDatabase::EnsureCapacity(size_t additionalEntries) noexcept {
-    std::shared_lock lock(m_mutex);
+    // TITANIUM: Validate additionalEntries is reasonable
+    if (additionalEntries == 0) {
+        return true;  // Nothing needed
+    }
     
-    if (!m_header) {
+    // TITANIUM: Prevent unreasonably large allocations
+    constexpr size_t kMaxAdditionalEntries = 100'000'000;  // 100 million max
+    if (additionalEntries > kMaxAdditionalEntries) {
         return false;
     }
     
-    size_t maxEntries = CalculateMaxEntries();
-    size_t available = maxEntries - m_header->totalActiveEntries;
+    std::shared_lock lock(m_mutex);
+    
+    if (!m_header || !m_region.IsValid()) {
+        return false;
+    }
+    
+    const size_t maxEntries = CalculateMaxEntries();
+    const uint64_t currentCount = m_header->totalActiveEntries;
+    
+    // TITANIUM: Overflow check
+    if (currentCount > maxEntries) {
+        return false;  // Corrupted state
+    }
+    
+    const size_t available = maxEntries - static_cast<size_t>(currentCount);
     
     if (available >= additionalEntries) {
         return true; // Already have capacity
     }
     
-    // Calculate new size needed
-    size_t entriesNeeded = additionalEntries - available;
-    size_t bytesNeeded = entriesNeeded * sizeof(IOCEntry);
+    // Calculate new size needed with overflow protection
+    const size_t entriesNeeded = additionalEntries - available;
+    
+    // TITANIUM: Check for multiplication overflow
+    constexpr size_t entrySize = sizeof(IOCEntry);
+    if (entriesNeeded > SIZE_MAX / entrySize) {
+        return false;  // Would overflow
+    }
+    
+    size_t bytesNeeded = entriesNeeded * entrySize;
     
     // Add growth increment for future allocations
     bytesNeeded = std::max(bytesNeeded, DATABASE_GROWTH_INCREMENT);
@@ -683,9 +869,10 @@ bool ThreatIntelDatabase::Sync() noexcept {
 // Integrity Operations
 // ============================================================================
 
-bool ThreatIntelDatabase::VerifyIntegrity() const noexcept {
-    std::shared_lock lock(m_mutex);
-    
+/**
+ * @brief Internal integrity verification (caller must hold lock)
+ */
+bool ThreatIntelDatabase::VerifyIntegrityInternal() const noexcept {
     if (!m_region.IsValid() || !m_header) {
         return false;
     }
@@ -700,8 +887,8 @@ bool ThreatIntelDatabase::VerifyIntegrity() const noexcept {
         return false;
     }
     
-    // Verify header checksum
-    if (!VerifyHeaderChecksum()) {
+    // Verify header checksum (internal - no lock needed)
+    if (!VerifyHeaderChecksumInternal()) {
         return false;
     }
     
@@ -714,30 +901,64 @@ bool ThreatIntelDatabase::VerifyIntegrity() const noexcept {
         return false;
     }
     
+    // TITANIUM: Verify entryDataOffset is page-aligned for performance
+    if (m_header->entryDataOffset % DATABASE_PAGE_SIZE != 0) {
+        // Not page aligned - could indicate corruption but allow for compatibility
+    }
+    
     // Verify entry count against mapped size
-    size_t maxPossibleEntries = (m_region.Size() - m_header->entryDataOffset) / sizeof(IOCEntry);
+    const size_t regionSize = m_region.Size();
+    const size_t dataOffset = m_header->entryDataOffset;
+    
+    // TITANIUM: Prevent underflow
+    if (dataOffset >= regionSize) {
+        return false;
+    }
+    
+    const size_t dataSpace = regionSize - dataOffset;
+    const size_t maxPossibleEntries = dataSpace / sizeof(IOCEntry);
     
     if (m_header->totalActiveEntries > maxPossibleEntries) {
         return false;
     }
     
+    // TITANIUM: Verify totalFileSize matches actual mapped size
+    if (m_header->totalFileSize != 0 && m_header->totalFileSize != regionSize) {
+        // Mismatch - could indicate corruption or incomplete write
+        // Allow if file is larger (extended but header not updated)
+        if (m_header->totalFileSize > regionSize) {
+            return false;
+        }
+    }
+    
     return true;
 }
 
-bool ThreatIntelDatabase::VerifyHeaderChecksum() const noexcept {
-    std::shared_lock lock(m_mutex);
-    
+/**
+ * @brief Internal header checksum verification (caller must hold lock)
+ */
+bool ThreatIntelDatabase::VerifyHeaderChecksumInternal() const noexcept {
     if (!m_header) {
         return false;
     }
     
     // Get stored checksum
-    uint32_t storedChecksum = m_header->headerCrc32;
+    const uint32_t storedChecksum = m_header->headerCrc32;
     
     // Compute checksum (the function handles skipping headerCrc32 field)
-    uint32_t computedChecksum = ComputeHeaderCRC32(*m_header);
+    const uint32_t computedChecksum = ComputeHeaderCRC32(*m_header);
     
     return storedChecksum == computedChecksum;
+}
+
+bool ThreatIntelDatabase::VerifyIntegrity() const noexcept {
+    std::shared_lock lock(m_mutex);
+    return VerifyIntegrityInternal();
+}
+
+bool ThreatIntelDatabase::VerifyHeaderChecksum() const noexcept {
+    std::shared_lock lock(m_mutex);
+    return VerifyHeaderChecksumInternal();
 }
 
 bool ThreatIntelDatabase::UpdateHeaderChecksum() noexcept {
@@ -1089,11 +1310,28 @@ void ThreatIntelDatabase::InitializeHeader(size_t fileSize) noexcept {
 bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
     // Note: Caller must hold unique lock
     
+    // TITANIUM: Validate newSize
+    if (newSize == 0 || newSize > DATABASE_MAX_SIZE) {
+        return false;
+    }
+    
     if (!m_region.IsValid()) {
         return false;
     }
     
     HANDLE fileHandle = static_cast<HANDLE>(m_region.m_fileHandle);
+    
+    // TITANIUM: Validate file handle
+    if (fileHandle == nullptr || fileHandle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    // TITANIUM: Save current state for rollback on failure
+    const size_t oldSize = m_region.m_size;
+    void* oldBaseAddress = m_region.m_baseAddress;
+    void* oldMappingHandle = m_region.m_mappingHandle;
+    ThreatIntelDatabaseHeader* oldHeader = m_header;
+    IOCEntry* oldEntries = m_entries;
     
     // Flush before remapping
     m_region.Flush();
@@ -1110,15 +1348,29 @@ bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
         m_region.m_mappingHandle = nullptr;
     }
     
+    // Clear pointers since old mapping is gone
+    m_header = nullptr;
+    m_entries = nullptr;
+    
     // Extend file
     LARGE_INTEGER size;
     size.QuadPart = static_cast<LONGLONG>(newSize);
     
     if (!SetFilePointerEx(fileHandle, size, nullptr, FILE_BEGIN)) {
+        // TITANIUM: Cannot restore old mapping - file is now unmapped
+        // Mark region as invalid
+        m_region.m_size = 0;
         return false;
     }
     
     if (!SetEndOfFile(fileHandle)) {
+        // TITANIUM: Try to restore original file size
+        LARGE_INTEGER originalSize;
+        originalSize.QuadPart = static_cast<LONGLONG>(oldSize);
+        SetFilePointerEx(fileHandle, originalSize, nullptr, FILE_BEGIN);
+        SetEndOfFile(fileHandle);
+        
+        m_region.m_size = 0;
         return false;
     }
     
@@ -1133,6 +1385,36 @@ bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
     );
     
     if (mappingHandle == nullptr) {
+        // TITANIUM: Mapping failed - try to restore original size and re-map
+        LARGE_INTEGER originalSize;
+        originalSize.QuadPart = static_cast<LONGLONG>(oldSize);
+        SetFilePointerEx(fileHandle, originalSize, nullptr, FILE_BEGIN);
+        SetEndOfFile(fileHandle);
+        
+        // Try to re-map at original size
+        HANDLE restoredMapping = CreateFileMappingW(
+            fileHandle, nullptr, PAGE_READWRITE,
+            static_cast<DWORD>(originalSize.QuadPart >> 32),
+            static_cast<DWORD>(originalSize.QuadPart & 0xFFFFFFFF),
+            nullptr);
+        
+        if (restoredMapping) {
+            void* restoredBase = MapViewOfFile(restoredMapping, FILE_MAP_ALL_ACCESS, 0, 0, oldSize);
+            if (restoredBase) {
+                m_region.m_mappingHandle = restoredMapping;
+                m_region.m_baseAddress = restoredBase;
+                m_region.m_size = oldSize;
+                m_header = static_cast<ThreatIntelDatabaseHeader*>(restoredBase);
+                if (m_header->entryDataOffset < oldSize) {
+                    m_entries = reinterpret_cast<IOCEntry*>(
+                        static_cast<uint8_t*>(restoredBase) + m_header->entryDataOffset);
+                }
+                return false;
+            }
+            CloseHandle(restoredMapping);
+        }
+        
+        m_region.m_size = 0;
         return false;
     }
     
@@ -1147,6 +1429,14 @@ bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
     
     if (baseAddress == nullptr) {
         CloseHandle(mappingHandle);
+        
+        // TITANIUM: Try to restore original mapping
+        LARGE_INTEGER originalSize;
+        originalSize.QuadPart = static_cast<LONGLONG>(oldSize);
+        SetFilePointerEx(fileHandle, originalSize, nullptr, FILE_BEGIN);
+        SetEndOfFile(fileHandle);
+        
+        m_region.m_size = 0;
         return false;
     }
     
@@ -1157,6 +1447,20 @@ bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
     
     // Update pointers
     m_header = static_cast<ThreatIntelDatabaseHeader*>(baseAddress);
+    
+    // TITANIUM: Validate header data offset before calculating entries pointer
+    if (m_header->entryDataOffset >= newSize) {
+        // Corrupted header - cannot proceed safely
+        UnmapViewOfFile(baseAddress);
+        CloseHandle(mappingHandle);
+        m_region.m_baseAddress = nullptr;
+        m_region.m_mappingHandle = nullptr;
+        m_region.m_size = 0;
+        m_header = nullptr;
+        m_entries = nullptr;
+        return false;
+    }
+    
     m_entries = reinterpret_cast<IOCEntry*>(
         static_cast<uint8_t*>(baseAddress) + m_header->entryDataOffset
     );
@@ -1175,21 +1479,52 @@ bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
 }
 
 size_t ThreatIntelDatabase::AlignToPage(size_t size) noexcept {
-    return ((size + DATABASE_PAGE_SIZE - 1) / DATABASE_PAGE_SIZE) * DATABASE_PAGE_SIZE;
+    // TITANIUM: Handle edge case where size is 0
+    if (size == 0) {
+        return DATABASE_PAGE_SIZE;
+    }
+    
+    // TITANIUM: Check for overflow in alignment calculation
+    // (size + DATABASE_PAGE_SIZE - 1) could overflow
+    constexpr size_t alignMask = DATABASE_PAGE_SIZE - 1;
+    
+    if (size > SIZE_MAX - alignMask) {
+        // Would overflow - return maximum aligned value
+        return (SIZE_MAX / DATABASE_PAGE_SIZE) * DATABASE_PAGE_SIZE;
+    }
+    
+    return ((size + alignMask) / DATABASE_PAGE_SIZE) * DATABASE_PAGE_SIZE;
 }
 
 size_t ThreatIntelDatabase::CalculateMaxEntries() const noexcept {
-    if (!m_header || m_region.Size() == 0) {
+    // TITANIUM: Validate state
+    if (!m_header) {
+        return 0;
+    }
+    
+    const size_t regionSize = m_region.Size();
+    if (regionSize == 0) {
         return 0;
     }
     
     // Calculate how many IOCEntry structures can fit in the data section
-    size_t dataOffset = m_header->entryDataOffset;
-    if (dataOffset >= m_region.Size()) {
+    const size_t dataOffset = m_header->entryDataOffset;
+    
+    // TITANIUM: Validate data offset is within bounds
+    if (dataOffset >= regionSize) {
         return 0;
     }
     
-    size_t dataSpace = m_region.Size() - dataOffset;
+    // TITANIUM: Validate data offset is at least header size
+    if (dataOffset < sizeof(ThreatIntelDatabaseHeader)) {
+        return 0;
+    }
+    
+    const size_t dataSpace = regionSize - dataOffset;
+    
+    // TITANIUM: Ensure IOCEntry size is non-zero (compile-time check)
+    static_assert(sizeof(IOCEntry) > 0, "IOCEntry must have non-zero size");
+    
     return dataSpace / sizeof(IOCEntry);
 }
 

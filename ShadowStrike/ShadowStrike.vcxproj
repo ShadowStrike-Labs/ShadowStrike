@@ -158,7 +158,6 @@
     <ClCompile Include="external\tlsh\src\tlsh_impl.cpp" />
     <ClCompile Include="external\tlsh\src\tlsh_util.cpp" />
     <ClCompile Include="src\Cache\MemoryCache.cpp" />
-    <ClCompile Include="src\Cache\PersistentCache.cpp" />
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\Database\LogDB.cpp" />

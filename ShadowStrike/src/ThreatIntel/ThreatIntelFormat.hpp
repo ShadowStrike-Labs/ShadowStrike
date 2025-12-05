@@ -1086,7 +1086,7 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     
     /// @brief Inline IOC data (for small values like IPs, hashes)
     /// @note For larger values (URLs, domains), this contains offset to string pool
-    union {
+    union IOCValue {
         /// @brief IPv4 address data
         IPv4Address ipv4;
         
@@ -1106,7 +1106,27 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         } stringRef;
         
         /// @brief Raw bytes for custom data
-        std::array<uint8_t, 76> raw;
+        uint8_t raw[76];
+        
+        /// @brief Default constructor - zero-initializes the union
+        constexpr IOCValue() noexcept : raw{} {}
+        
+        /// @brief Copy constructor - uses constexpr-compatible element-wise copy
+        constexpr IOCValue(const IOCValue& other) noexcept : raw{} {
+            for (std::size_t i = 0; i < sizeof(raw); ++i) {
+                raw[i] = other.raw[i];
+            }
+        }
+        
+        /// @brief Copy assignment operator - uses constexpr-compatible element-wise copy
+        constexpr IOCValue& operator=(const IOCValue& other) noexcept {
+            if (this != &other) {
+                for (std::size_t i = 0; i < sizeof(raw); ++i) {
+                    raw[i] = other.raw[i];
+                }
+            }
+            return *this;
+        }
     } value;
     
     /// @brief Value type discriminator (mirrors IOCType for union access)
@@ -1164,6 +1184,7 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     
     // ========================================================================
     // STATISTICS & COUNTERS (16 bytes)
+    // Note: Using uint32_t for better alignment compatibility with std::atomic
     // ========================================================================
     
     /// @brief Hit count (how many times this IOC matched)
@@ -1172,14 +1193,11 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     /// @brief Last hit timestamp
     std::atomic<uint32_t> lastHitTime;
     
-    /// @brief False positive count (user feedback)
-    std::atomic<uint16_t> falsePositiveCount;
+    /// @brief False positive count (user feedback) - use lower 16 bits
+    std::atomic<uint32_t> falsePositiveCount;
     
-    /// @brief True positive count (confirmed)
-    std::atomic<uint16_t> truePositiveCount;
-    
-    /// @brief Reserved
-    uint8_t reserved4[4];
+    /// @brief True positive count (confirmed) - use lower 16 bits
+    std::atomic<uint32_t> truePositiveCount;
     
     // ========================================================================
     // API SOURCE DATA (32 bytes)
@@ -1203,9 +1221,9 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     
     // ========================================================================
     // PADDING TO 256 BYTES
+    // Note: Due to std::atomic alignment requirements, actual byte count
+    // before this padding varies. Use CACHE_LINE_SIZE (64) alignment.
     // ========================================================================
-    
-    uint8_t padding[16];
     
     // ========================================================================
     // CONSTRUCTORS
@@ -1217,8 +1235,8 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         // Placement-new the atomics to properly initialize them
         new (&hitCount) std::atomic<uint32_t>(0);
         new (&lastHitTime) std::atomic<uint32_t>(0);
-        new (&falsePositiveCount) std::atomic<uint16_t>(0);
-        new (&truePositiveCount) std::atomic<uint16_t>(0);
+        new (&falsePositiveCount) std::atomic<uint32_t>(0);
+        new (&truePositiveCount) std::atomic<uint32_t>(0);
     }
     
     /// @brief Copy constructor - manually copy atomic members
@@ -1229,8 +1247,8 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         // Placement-new and initialize atomics with other's values
         new (&hitCount) std::atomic<uint32_t>(other.hitCount.load(std::memory_order_relaxed));
         new (&lastHitTime) std::atomic<uint32_t>(other.lastHitTime.load(std::memory_order_relaxed));
-        new (&falsePositiveCount) std::atomic<uint16_t>(other.falsePositiveCount.load(std::memory_order_relaxed));
-        new (&truePositiveCount) std::atomic<uint16_t>(other.truePositiveCount.load(std::memory_order_relaxed));
+        new (&falsePositiveCount) std::atomic<uint32_t>(other.falsePositiveCount.load(std::memory_order_relaxed));
+        new (&truePositiveCount) std::atomic<uint32_t>(other.truePositiveCount.load(std::memory_order_relaxed));
         
         // Copy remaining bytes after atomics
         constexpr size_t atomicsEnd = offsetof(IOCEntry, hitCount) + 
@@ -1398,7 +1416,7 @@ struct FeedConfig {
     bool enabled;
     
     /// @brief Reserved
-    uint8_t reserved1[1];
+    uint8_t reserved1[2];
     
     /// @brief Update interval in seconds
     uint32_t updateIntervalSeconds;
@@ -1451,8 +1469,8 @@ struct FeedConfig {
     /// @brief Last error code
     uint32_t lastErrorCode;
     
-    /// @brief Reserved for future
-    uint8_t reserved3[20];
+    /// @brief Reserved for future expansion (81 + 47 = 128)
+    uint8_t reserved3[47];
 };
 #pragma pack(pop)
 
@@ -1492,8 +1510,8 @@ struct ThreatIntelDatabaseHeader {
     /// @brief Database format flags
     uint32_t formatFlags;
     
-    /// @brief Reserved
-    uint8_t reserved1[4];
+    /// @brief Reserved - padding to 64 bytes
+    uint8_t reserved1[12];
     
     // ========================================================================
     // SECTION OFFSETS (All 4KB page-aligned) (256 bytes)
@@ -1593,8 +1611,8 @@ struct ThreatIntelDatabaseHeader {
     uint64_t totalBlocks;
     uint64_t totalAlerts;
     
-    /// @brief Reserved
-    uint8_t reserved2[16];
+    /// @brief Reserved - padding to 128 bytes (136 - 128 = need 8 bytes less, so remove 8 from reserved2)
+    uint8_t reserved2[8];
     
     // ========================================================================
     // PERFORMANCE HINTS (64 bytes)
@@ -1630,8 +1648,8 @@ struct ThreatIntelDatabaseHeader {
     /// @brief Memory budget in MB
     uint32_t memoryBudgetMB;
     
-    /// @brief Reserved
-    uint8_t reserved4[28];
+    /// @brief Reserved - padding to 64 bytes (60 + 32 = need 4 more)
+    uint8_t reserved4[32];
     
     // ========================================================================
     // INTEGRITY (64 bytes)
@@ -1696,6 +1714,8 @@ struct ThreatIntelDatabaseHeader {
     
     // ========================================================================
     // RESERVED FOR FUTURE (Pad to exactly 4096 bytes)
+    // Total so far: 64 + 256 + 128 + 64 + 64 + 256 = 832 bytes
+    // Need: 4096 - 832 = 3264 bytes
     // ========================================================================
     
     std::array<uint8_t, 3264> reserved;
@@ -1729,7 +1749,7 @@ struct BloomFilterHeader {
     /// @brief Number of hash functions
     uint32_t hashFunctions;
     
-    /// @brief Reserved
+    /// @brief Reserved for alignment
     uint32_t reserved2;
     
     /// @brief Estimated elements added
@@ -1744,8 +1764,8 @@ struct BloomFilterHeader {
     /// @brief Size of bit array in bytes
     uint64_t dataSize;
     
-    /// @brief Reserved
-    uint8_t reserved3[8];
+    /// @brief Reserved padding to reach 64 bytes (60 + 4 = 64)
+    uint8_t reserved3[4];
 };
 #pragma pack(pop)
 

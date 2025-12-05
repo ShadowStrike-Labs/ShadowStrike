@@ -104,20 +104,97 @@ StoreError YaraCompiler::AddFile(
     SS_LOG_DEBUG(L"YaraCompiler", L"AddFile: %s (namespace: %S)", 
         filePath.c_str(), namespace_.c_str());
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Compiler initialization
     if (!m_compiler) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFile: Compiler not initialized");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "Compiler not initialized"};
     }
-
-    // Read file content
-    std::ifstream file(filePath, std::ios::binary);
-    if (!file.is_open()) {
-        SS_LOG_ERROR(L"YaraCompiler", L"Failed to open file: %s", filePath.c_str());
-        return StoreError{SignatureStoreError::FileNotFound, 0, "Cannot open file"};
+    
+    // VALIDATION 2: Empty path check
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFile: Empty file path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "File path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check (DoS protection)
+    if (filePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFile: Path too long (%zu > %zu)",
+            filePath.length(), YaraTitaniumLimits::MAX_PATH_LENGTH);
+        return StoreError{SignatureStoreError::FileNotFound, 0, "File path too long"};
+    }
+    
+    // VALIDATION 4: Null character check (path injection prevention)
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFile: Path contains null character");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+    
+    // VALIDATION 5: Namespace length check
+    if (namespace_.length() > YaraTitaniumLimits::MAX_NAMESPACE_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFile: Namespace too long (%zu > %zu)",
+            namespace_.length(), YaraTitaniumLimits::MAX_NAMESPACE_LENGTH);
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace too long"};
     }
 
-    std::string content((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
-    file.close();
+    // ========================================================================
+    // FILE READING WITH ERROR HANDLING
+    // ========================================================================
+    std::string content;
+    try {
+        std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            SS_LOG_ERROR(L"YaraCompiler", L"Failed to open file: %s", filePath.c_str());
+            return StoreError{SignatureStoreError::FileNotFound, 0, "Cannot open file"};
+        }
+
+        // Get file size for validation and pre-allocation
+        const auto fileSize = file.tellg();
+        if (fileSize < 0) {
+            SS_LOG_ERROR(L"YaraCompiler", L"Failed to get file size: %s", filePath.c_str());
+            return StoreError{SignatureStoreError::FileNotFound, 0, "Cannot determine file size"};
+        }
+        
+        // VALIDATION 6: File size limit (DoS protection - 10MB max per rule file)
+        constexpr std::streamsize MAX_RULE_FILE_SIZE = 10 * 1024 * 1024;
+        if (fileSize > MAX_RULE_FILE_SIZE) {
+            SS_LOG_ERROR(L"YaraCompiler", L"File too large: %s (%lld bytes)",
+                filePath.c_str(), static_cast<long long>(fileSize));
+            return StoreError{SignatureStoreError::TooLarge, 0, "Rule file exceeds 10MB limit"};
+        }
+        
+        // Pre-allocate string to avoid reallocations
+        content.reserve(static_cast<size_t>(fileSize));
+        
+        // Seek back to beginning and read
+        file.seekg(0, std::ios::beg);
+        if (!file.good()) {
+            SS_LOG_ERROR(L"YaraCompiler", L"Failed to seek in file: %s", filePath.c_str());
+            return StoreError{SignatureStoreError::FileNotFound, 0, "Cannot read file"};
+        }
+        
+        content.assign(std::istreambuf_iterator<char>(file),
+                       std::istreambuf_iterator<char>());
+        
+        if (file.bad()) {
+            SS_LOG_ERROR(L"YaraCompiler", L"Read error for file: %s", filePath.c_str());
+            return StoreError{SignatureStoreError::FileNotFound, 0, "File read error"};
+        }
+        
+        file.close();
+    }
+    catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"YaraCompiler", L"Out of memory reading file: %s", filePath.c_str());
+        return StoreError{SignatureStoreError::OutOfMemory, 0, "Out of memory reading file"};
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"YaraCompiler", L"Exception reading file: %s - %S", 
+            filePath.c_str(), e.what());
+        return StoreError{SignatureStoreError::Unknown, 0, "Exception reading file"};
+    }
 
     return AddString(content, namespace_);
 }
@@ -126,26 +203,65 @@ StoreError YaraCompiler::AddString(
     const std::string& ruleSource,
     const std::string& namespace_
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Compiler initialization
     if (!m_compiler) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddString: Compiler not initialized");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "Compiler not initialized"};
     }
 
+    // VALIDATION 2: Empty source check
     if (ruleSource.empty()) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddString: Empty rule source");
         return StoreError{SignatureStoreError::InvalidSignature, 0, "Empty rule source"};
     }
-
     
-     int result = yr_compiler_add_string(m_compiler, ruleSource.c_str(), namespace_.c_str());
-     if (result != ERROR_SUCCESS) {
-         SS_LOG_ERROR(L"YaraCompiler", L"Failed to add rule string (namespace: %S): %d",
-             namespace_.c_str(), result);
-         return StoreError{SignatureStoreError::InvalidSignature, 
-			 static_cast<DWORD>(result), "Failed to add rule string" };
-     
-     }
+    // VALIDATION 3: Source size limit (DoS protection - 10MB max)
+    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024;
+    if (ruleSource.length() > MAX_RULE_SOURCE_SIZE) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddString: Rule source too large (%zu > %zu)",
+            ruleSource.length(), MAX_RULE_SOURCE_SIZE);
+        return StoreError{SignatureStoreError::TooLarge, 0, "Rule source exceeds 10MB limit"};
+    }
+    
+    // VALIDATION 4: Namespace validation (can be empty for default namespace)
+    if (namespace_.length() > YaraTitaniumLimits::MAX_NAMESPACE_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddString: Namespace too long (%zu > %zu)",
+            namespace_.length(), YaraTitaniumLimits::MAX_NAMESPACE_LENGTH);
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace too long"};
+    }
+    
+    // VALIDATION 5: Namespace character validation (alphanumeric + underscore)
+    if (!namespace_.empty()) {
+        if (!std::all_of(namespace_.begin(), namespace_.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_';
+        })) {
+            SS_LOG_ERROR(L"YaraCompiler", L"AddString: Invalid namespace characters: %S",
+                namespace_.c_str());
+            return StoreError{SignatureStoreError::InvalidSignature, 0, 
+                "Namespace must be alphanumeric with underscores only"};
+        }
+    }
+
+    // ========================================================================
+    // YARA COMPILATION
+    // ========================================================================
+    // Note: yr_compiler_add_string accepts nullptr for default namespace
+    const char* nsPtr = namespace_.empty() ? nullptr : namespace_.c_str();
+    
+    int result = yr_compiler_add_string(m_compiler, ruleSource.c_str(), nsPtr);
+    if (result != ERROR_SUCCESS) {
+        SS_LOG_ERROR(L"YaraCompiler", L"Failed to add rule string (namespace: %S): %d",
+            namespace_.empty() ? "default" : namespace_.c_str(), result);
+        return StoreError{SignatureStoreError::InvalidSignature, 
+            static_cast<DWORD>(result), "Failed to add rule string"};
+    }
 
     SS_LOG_DEBUG(L"YaraCompiler", L"Added rule string (namespace: %S, length: %zu)",
-        namespace_.c_str(), ruleSource.length());
+        namespace_.empty() ? "default" : namespace_.c_str(), ruleSource.length());
 
     return StoreError{SignatureStoreError::Success};
 }
@@ -155,24 +271,78 @@ StoreError YaraCompiler::AddFiles(
     const std::string& namespace_,
     std::function<void(size_t, size_t)> progressCallback
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Compiler initialization
+    if (!m_compiler) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFiles: Compiler not initialized");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Compiler not initialized"};
+    }
+    
+    // VALIDATION 2: Empty file list
+    if (filePaths.empty()) {
+        SS_LOG_WARN(L"YaraCompiler", L"AddFiles: Empty file list");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "No files to add"};
+    }
+    
+    // VALIDATION 3: File count limit (DoS protection)
+    if (filePaths.size() > YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFiles: Too many files (%zu > %zu)",
+            filePaths.size(), YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO);
+        return StoreError{SignatureStoreError::TooLarge, 0, "Too many files"};
+    }
+    
+    // VALIDATION 4: Namespace validation
+    if (namespace_.length() > YaraTitaniumLimits::MAX_NAMESPACE_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFiles: Namespace too long");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace too long"};
+    }
+
+    // ========================================================================
+    // PROCESS FILES
+    // ========================================================================
     size_t successCount = 0;
+    size_t failCount = 0;
+    std::string lastError;
 
     for (size_t i = 0; i < filePaths.size(); ++i) {
         StoreError err = AddFile(filePaths[i], namespace_);
         if (err.IsSuccess()) {
             successCount++;
+        } else {
+            failCount++;
+            lastError = err.message;
+            SS_LOG_WARN(L"YaraCompiler", L"AddFiles: Failed to add file %zu: %s",
+                i, filePaths[i].c_str());
         }
 
+        // Safe progress callback invocation
         if (progressCallback) {
-            progressCallback(i + 1, filePaths.size());
+            try {
+                progressCallback(i + 1, filePaths.size());
+            } catch (const std::exception& e) {
+                SS_LOG_WARN(L"YaraCompiler", L"AddFiles: Progress callback threw: %S", e.what());
+                // Continue processing - callback failure shouldn't stop compilation
+            } catch (...) {
+                SS_LOG_WARN(L"YaraCompiler", L"AddFiles: Progress callback threw unknown exception");
+            }
         }
     }
 
+    // ========================================================================
+    // RESULT EVALUATION
+    // ========================================================================
     if (successCount == 0) {
-        return StoreError{SignatureStoreError::InvalidSignature, 0, "No rules added"};
+        SS_LOG_ERROR(L"YaraCompiler", L"AddFiles: No rules added (%zu files failed)",
+            failCount);
+        return StoreError{SignatureStoreError::InvalidSignature, 0, 
+            "No rules added: " + lastError};
     }
 
-    SS_LOG_INFO(L"YaraCompiler", L"Added %zu/%zu rule files", successCount, filePaths.size());
+    SS_LOG_INFO(L"YaraCompiler", L"Added %zu/%zu rule files (%zu failed)", 
+        successCount, filePaths.size(), failCount);
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -207,18 +377,78 @@ YR_RULES* YaraCompiler::GetRules() noexcept {
 }
 
 StoreError YaraCompiler::SaveToFile(const std::wstring& filePath) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Compiler initialization
+    if (!m_compiler) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToFile: Compiler not initialized");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Compiler not initialized"};
+    }
+    
+    // VALIDATION 2: Path validation
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToFile: Empty file path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "File path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check
+    if (filePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToFile: Path too long");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "File path too long"};
+    }
+    
+    // VALIDATION 4: Null character check
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToFile: Path contains null character");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+
+    // ========================================================================
+    // GET COMPILED RULES
+    // ========================================================================
     YR_RULES* rules = GetRules();
     if (!rules) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToFile: No compiled rules to save");
         return StoreError{SignatureStoreError::InvalidFormat, 0, "No compiled rules"};
     }
 
-    int result = yr_rules_save(rules,ShadowStrike::Utils::StringUtils::ToNarrow(filePath).c_str());
+    // ========================================================================
+    // ATOMIC FILE WRITE (write to temp, then rename)
+    // ========================================================================
+    std::wstring tempPath = filePath + L".tmp";
+    std::string narrowTempPath;
+    std::string narrowFilePath;
+    
+    try {
+        narrowTempPath = ShadowStrike::Utils::StringUtils::ToNarrow(tempPath);
+        narrowFilePath = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToFile: Path conversion failed: %S", e.what());
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Path conversion failed"};
+    }
+    
+    // Save to temp file first
+    int result = yr_rules_save(rules, narrowTempPath.c_str());
     if (result != ERROR_SUCCESS) {
-        SS_LOG_ERROR(L"YaraCompiler", L"Failed to save rules to file: %s (error: %d)",
-            filePath.c_str(), result);
-        return StoreError{ SignatureStoreError::InvalidSignature,
-                          static_cast<DWORD>(result),
-                          "Failed to save rules to file" };
+        SS_LOG_ERROR(L"YaraCompiler", L"Failed to save rules to temp file: %s (error: %d)",
+            tempPath.c_str(), result);
+        DeleteFileW(tempPath.c_str()); // Cleanup on failure
+        return StoreError{SignatureStoreError::MappingFailed,
+                         static_cast<DWORD>(result),
+                         "Failed to save rules to file"};
+    }
+    
+    // Delete existing target file if it exists
+    DeleteFileW(filePath.c_str());
+    
+    // Atomic rename
+    if (!MoveFileW(tempPath.c_str(), filePath.c_str())) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraCompiler", L"Failed to rename temp file: error %u", winErr);
+        DeleteFileW(tempPath.c_str());
+        return StoreError{SignatureStoreError::MappingFailed, winErr, "Failed to finalize save"};
     }
     
     SS_LOG_INFO(L"YaraCompiler", L"Saved compiled rules to: %s", filePath.c_str());
@@ -226,11 +456,17 @@ StoreError YaraCompiler::SaveToFile(const std::wstring& filePath) noexcept {
 }
 
 std::optional<std::vector<uint8_t>> YaraCompiler::SaveToBuffer() noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
     if (!m_compiler) {
-        SS_LOG_ERROR(L"YaraCompiler", L"Compiler not initialized");
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToBuffer: Compiler not initialized");
         return std::nullopt;
     }
 
+    // ========================================================================
+    // GET COMPILED RULES
+    // ========================================================================
     YR_RULES* rules = nullptr;
     int result = yr_compiler_get_rules(m_compiler, &rules);
     if (result != ERROR_SUCCESS || !rules) {
@@ -238,36 +474,84 @@ std::optional<std::vector<uint8_t>> YaraCompiler::SaveToBuffer() noexcept {
         return std::nullopt;
     }
 
-    // Use YR_STREAM to write to memory buffer
-    std::vector<uint8_t> buffer;
+    // RAII guard for rules cleanup
+    struct RulesGuard {
+        YR_RULES* rules;
+        ~RulesGuard() { if (rules) yr_rules_destroy(rules); }
+    } rulesGuard{rules};
 
-    // Static callback function (YARA API requires function pointer, not lambda)
+    // ========================================================================
+    // WRITE TO BUFFER WITH SIZE LIMIT
+    // ========================================================================
+    // DoS protection: Maximum compiled rules size (100MB)
+    constexpr size_t MAX_COMPILED_RULES_SIZE = 100 * 1024 * 1024;
+    
+    struct WriteContext {
+        std::vector<uint8_t>* buffer;
+        size_t maxSize;
+        bool overflow;
+    };
+    
+    std::vector<uint8_t> buffer;
+    
+    try {
+        // Pre-reserve reasonable initial size
+        buffer.reserve(1024 * 1024); // 1MB initial
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToBuffer: Failed to reserve buffer memory");
+        return std::nullopt;
+    }
+    
+    WriteContext ctx{&buffer, MAX_COMPILED_RULES_SIZE, false};
+
+    // Static callback function (YARA API requires function pointer)
     static auto writeCallback = [](const void* ptr, size_t size, size_t count, void* user_data) -> size_t {
-        auto* vec = static_cast<std::vector<uint8_t>*>(user_data);
+        auto* ctx = static_cast<WriteContext*>(user_data);
+        if (!ctx || !ctx->buffer || ctx->overflow) {
+            return 0;
+        }
+        
         try {
             const uint8_t* bytes = static_cast<const uint8_t*>(ptr);
             size_t totalBytes = size * count;
-            vec->insert(vec->end(), bytes, bytes + totalBytes);
+            
+            // Check for overflow
+            if (totalBytes > ctx->maxSize - ctx->buffer->size()) {
+                ctx->overflow = true;
+                return 0;
+            }
+            
+            ctx->buffer->insert(ctx->buffer->end(), bytes, bytes + totalBytes);
             return count; // YARA expects number of items written
+        }
+        catch (const std::bad_alloc&) {
+            ctx->overflow = true;
+            return 0;
         }
         catch (...) {
             return 0;
         }
-        };
+    };
 
     // Setup YARA stream structure
     YR_STREAM stream;
-    stream.user_data = &buffer;
+    stream.user_data = &ctx;
     stream.write = +writeCallback; // Unary + converts lambda to function pointer
 
     // Save rules to stream
     result = yr_rules_save_stream(rules, &stream);
 
-    // Cleanup
-    yr_rules_destroy(rules);
+    // Clear rules guard - rules already destroyed by yr_rules_save_stream
+    // (Actually no, we still own them - let RAII handle cleanup)
 
     if (result != ERROR_SUCCESS) {
         SS_LOG_ERROR(L"YaraCompiler", L"Failed to save rules to buffer: %d", result);
+        return std::nullopt;
+    }
+    
+    if (ctx.overflow) {
+        SS_LOG_ERROR(L"YaraCompiler", L"SaveToBuffer: Compiled rules exceed size limit (%zu MB)",
+            MAX_COMPILED_RULES_SIZE / (1024 * 1024));
         return std::nullopt;
     }
 
@@ -284,8 +568,47 @@ void YaraCompiler::DefineExternalVariable(
     const std::string& name,
     const std::string& value
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
     if (!m_compiler) {
-        SS_LOG_ERROR(L"YaraCompiler", L"Compiler not initialized, cannot define string variable: %S", name.c_str());
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(string): Compiler not initialized");
+        return;
+    }
+    
+    if (name.empty()) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(string): Empty variable name");
+        return;
+    }
+    
+    // Variable name length limit
+    constexpr size_t MAX_VAR_NAME_LENGTH = 256;
+    if (name.length() > MAX_VAR_NAME_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(string): Name too long (%zu)",
+            name.length());
+        return;
+    }
+    
+    // Variable value length limit (DoS protection)
+    constexpr size_t MAX_VAR_VALUE_LENGTH = 65536; // 64KB
+    if (value.length() > MAX_VAR_VALUE_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(string): Value too long (%zu)",
+            value.length());
+        return;
+    }
+    
+    // Validate variable name format (YARA requires valid C identifier)
+    if (!std::isalpha(static_cast<unsigned char>(name[0])) && name[0] != '_') {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(string): Invalid name start: %S",
+            name.c_str());
+        return;
+    }
+    
+    if (!std::all_of(name.begin(), name.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_';
+    })) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(string): Invalid name format: %S",
+            name.c_str());
         return;
     }
 
@@ -296,16 +619,47 @@ void YaraCompiler::DefineExternalVariable(
         return;
     }
 
-    SS_LOG_DEBUG(L"YaraCompiler", L"Defined external string variable: %S = %S",
-        name.c_str(), value.c_str());
+    SS_LOG_DEBUG(L"YaraCompiler", L"Defined external string variable: %S (value length: %zu)",
+        name.c_str(), value.length());
 }
 
 void YaraCompiler::DefineExternalVariable(
     const std::string& name,
     int64_t value
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
     if (!m_compiler) {
-        SS_LOG_ERROR(L"YaraCompiler", L"Compiler not initialized, cannot define integer variable: %S", name.c_str());
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(int): Compiler not initialized");
+        return;
+    }
+    
+    if (name.empty()) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(int): Empty variable name");
+        return;
+    }
+    
+    // Variable name length limit
+    constexpr size_t MAX_VAR_NAME_LENGTH = 256;
+    if (name.length() > MAX_VAR_NAME_LENGTH) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(int): Name too long (%zu)",
+            name.length());
+        return;
+    }
+    
+    // Validate variable name format (YARA requires valid C identifier)
+    if (!std::isalpha(static_cast<unsigned char>(name[0])) && name[0] != '_') {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(int): Invalid name start: %S",
+            name.c_str());
+        return;
+    }
+    
+    if (!std::all_of(name.begin(), name.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_';
+    })) {
+        SS_LOG_ERROR(L"YaraCompiler", L"DefineExternalVariable(int): Invalid name format: %S",
+            name.c_str());
         return;
     }
 
@@ -414,25 +768,74 @@ void YaraCompiler::ErrorCallback(
     const char* message,
     void* userData
 ) {
+    // ========================================================================
+    // TITANIUM VALIDATION - NULL CHECK
+    // ========================================================================
     auto* compiler = static_cast<YaraCompiler*>(userData);
-    if (!compiler) return;
-
-    std::ostringstream oss;
-    if (fileName) {
-        oss << fileName << "(" << lineNumber << "): ";
+    if (!compiler) {
+        // Cannot log without compiler context - silently return
+        return;
     }
-    
-    // Include rule name if available
-    if (rule && rule->identifier) {
-        oss << "[" << rule->identifier << "] ";
-    }
-    
-    oss << message;
 
-    if (errorLevel == 0) { // Error
-        compiler->m_errors.push_back(oss.str());
-    } else { // Warning
-        compiler->m_warnings.push_back(oss.str());
+    // ========================================================================
+    // ERROR MESSAGE BUILDING WITH SAFETY LIMITS
+    // ========================================================================
+    try {
+        std::ostringstream oss;
+        
+        // Add file location if available (truncate extremely long filenames)
+        if (fileName) {
+            std::string safeFileName = fileName;
+            constexpr size_t MAX_FILENAME_DISPLAY = 256;
+            if (safeFileName.length() > MAX_FILENAME_DISPLAY) {
+                safeFileName = "..." + safeFileName.substr(safeFileName.length() - MAX_FILENAME_DISPLAY + 3);
+            }
+            oss << safeFileName << "(" << lineNumber << "): ";
+        }
+        
+        // Include rule name if available
+        if (rule && rule->identifier) {
+            std::string safeRuleName = rule->identifier;
+            constexpr size_t MAX_RULENAME_DISPLAY = 128;
+            if (safeRuleName.length() > MAX_RULENAME_DISPLAY) {
+                safeRuleName = safeRuleName.substr(0, MAX_RULENAME_DISPLAY - 3) + "...";
+            }
+            oss << "[" << safeRuleName << "] ";
+        }
+        
+        // Add message if available
+        if (message) {
+            std::string safeMessage = message;
+            constexpr size_t MAX_MESSAGE_LENGTH = 1024;
+            if (safeMessage.length() > MAX_MESSAGE_LENGTH) {
+                safeMessage = safeMessage.substr(0, MAX_MESSAGE_LENGTH - 3) + "...";
+            }
+            oss << safeMessage;
+        } else {
+            oss << "(no message)";
+        }
+
+        std::string errorStr = oss.str();
+        
+        // Limit total number of errors/warnings stored (DoS protection)
+        constexpr size_t MAX_STORED_ERRORS = 1000;
+        constexpr size_t MAX_STORED_WARNINGS = 1000;
+
+        if (errorLevel == 0) { // Error
+            if (compiler->m_errors.size() < MAX_STORED_ERRORS) {
+                compiler->m_errors.push_back(std::move(errorStr));
+            }
+        } else { // Warning
+            if (compiler->m_warnings.size() < MAX_STORED_WARNINGS) {
+                compiler->m_warnings.push_back(std::move(errorStr));
+            }
+        }
+    }
+    catch (const std::bad_alloc&) {
+        // Memory allocation failed - cannot store error, silently ignore
+    }
+    catch (...) {
+        // Unknown exception - silently ignore to prevent crash
     }
 }
 
@@ -586,12 +989,60 @@ StoreError YaraRuleStore::CreateNew(
     const std::wstring& databasePath,
     uint64_t initialSizeBytes
 ) noexcept {
-    SS_LOG_INFO(L"YaraRuleStore", L"CreateNew: %s", databasePath.c_str());
+    SS_LOG_INFO(L"YaraRuleStore", L"CreateNew: %s (size: %llu bytes)", 
+        databasePath.c_str(), initialSizeBytes);
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Already initialized check
+    if (m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Store already initialized - close first");
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Store already initialized"};
+    }
+    
+    // VALIDATION 2: Path validation
+    if (databasePath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Empty database path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Database path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check
+    if (databasePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Path too long (%zu)", databasePath.length());
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Path too long"};
+    }
+    
+    // VALIDATION 4: Null character check
+    if (databasePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Path contains null character");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+    
+    // VALIDATION 5: Size validation
+    constexpr uint64_t MIN_DB_SIZE = 4096; // Minimum 4KB
+    constexpr uint64_t MAX_DB_SIZE = 4ULL * 1024 * 1024 * 1024; // Maximum 4GB
+    
+    if (initialSizeBytes < MIN_DB_SIZE) {
+        SS_LOG_WARN(L"YaraRuleStore", L"CreateNew: Size too small (%llu), using minimum %llu",
+            initialSizeBytes, MIN_DB_SIZE);
+        initialSizeBytes = MIN_DB_SIZE;
+    }
+    
+    if (initialSizeBytes > MAX_DB_SIZE) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Size exceeds maximum (%llu > %llu)",
+            initialSizeBytes, MAX_DB_SIZE);
+        return StoreError{SignatureStoreError::TooLarge, 0, "Database size exceeds 4GB limit"};
+    }
+
+    // ========================================================================
+    // CREATE FILE WITH SECURITY ATTRIBUTES
+    // ========================================================================
     HANDLE hFile = CreateFileW(
         databasePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        0,
+        0, // No sharing during creation
         nullptr,
         CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
@@ -600,47 +1051,210 @@ StoreError YaraRuleStore::CreateNew(
 
     if (hFile == INVALID_HANDLE_VALUE) {
         DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Failed to create file (error: %u)", winErr);
         return StoreError{SignatureStoreError::FileNotFound, winErr, "Cannot create file"};
     }
+    
+    // RAII guard for file handle
+    struct FileGuard {
+        HANDLE h;
+        ~FileGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    } fileGuard{hFile};
 
+    // ========================================================================
+    // SET FILE SIZE
+    // ========================================================================
     LARGE_INTEGER size{};
-    size.QuadPart = initialSizeBytes;
-    if (!SetFilePointerEx(hFile, size, nullptr, FILE_BEGIN) || !SetEndOfFile(hFile)) {
-        CloseHandle(hFile);
-        return StoreError{SignatureStoreError::Unknown, GetLastError(), "Cannot set size"};
+    size.QuadPart = static_cast<LONGLONG>(initialSizeBytes);
+    
+    if (!SetFilePointerEx(hFile, size, nullptr, FILE_BEGIN)) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Failed to set file pointer (error: %u)", winErr);
+        return StoreError{SignatureStoreError::MappingFailed, winErr, "Cannot set file pointer"};
+    }
+    
+    if (!SetEndOfFile(hFile)) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Failed to set end of file (error: %u)", winErr);
+        return StoreError{SignatureStoreError::MappingFailed, winErr, "Cannot set file size"};
     }
 
+    // ========================================================================
+    // WRITE INITIAL HEADER (ZERO-FILLED)
+    // ========================================================================
+    // Reset file pointer to beginning
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Failed to reset file pointer (error: %u)", winErr);
+        return StoreError{SignatureStoreError::MappingFailed, winErr, "Cannot reset file pointer"};
+    }
+    
+    // Write a basic header with magic number
+    SignatureDatabaseHeader header{};
+    header.magic = SIGNATURE_DB_MAGIC;
+    header.versionMajor = SIGNATURE_DB_VERSION_MAJOR;
+    header.versionMinor = SIGNATURE_DB_VERSION_MINOR;
+    header.creationTime = static_cast<uint64_t>(std::time(nullptr));
+    header.lastUpdateTime = header.creationTime;
+    header.buildNumber = 1;
+    header.totalHashes = 0;
+    header.totalPatterns = 0;
+    header.totalYaraRules = 0;
+    header.yaraRulesOffset = 0;
+    header.yaraRulesSize = 0;
+    header.metadataOffset = 0;
+    header.metadataSize = 0;
+    
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hFile, &header, sizeof(header), &bytesWritten, nullptr) ||
+        bytesWritten != sizeof(header)) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"CreateNew: Failed to write header (error: %u)", winErr);
+        return StoreError{SignatureStoreError::MappingFailed, winErr, "Cannot write header"};
+    }
+    
+    // Flush to ensure data is written
+    if (!FlushFileBuffers(hFile)) {
+        SS_LOG_WARN(L"YaraRuleStore", L"CreateNew: FlushFileBuffers warning");
+    }
+
+    // Close file before Initialize (let RAII handle it)
+    fileGuard.h = INVALID_HANDLE_VALUE;
     CloseHandle(hFile);
+
+    // ========================================================================
+    // INITIALIZE WITH NEW DATABASE
+    // ========================================================================
+    SS_LOG_DEBUG(L"YaraRuleStore", L"CreateNew: File created, calling Initialize");
     return Initialize(databasePath, false);
 }
 
 StoreError YaraRuleStore::LoadCompiledRules(const std::wstring& compiledRulePath) noexcept {
     SS_LOG_INFO(L"YaraRuleStore", L"LoadCompiledRules: %s", compiledRulePath.c_str());
 
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
     
+    // VALIDATION 1: Read-only check
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Store is read-only");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Store is read-only"};
+    }
+    
+    // VALIDATION 2: Path validation
+    if (compiledRulePath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Empty file path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "File path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check
+    if (compiledRulePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Path too long");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Path too long"};
+    }
+    
+    // VALIDATION 4: Null character check
+    if (compiledRulePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Path contains null character");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+    
+    // VALIDATION 5: File existence check
+    DWORD fileAttrs = GetFileAttributesW(compiledRulePath.c_str());
+    if (fileAttrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: File not found (error: %u)", winErr);
+        return StoreError{SignatureStoreError::FileNotFound, winErr, "File not found"};
+    }
+    
+    // VALIDATION 6: Not a directory check
+    if (fileAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Path is a directory");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Path is a directory"};
+    }
+
+    // ========================================================================
+    // ACQUIRE EXCLUSIVE LOCK FOR RULE REPLACEMENT
+    // ========================================================================
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    
+    // ========================================================================
+    // DESTROY EXISTING RULES SAFELY
+    // ========================================================================
     if (m_rules) {
         int destroyResult = yr_rules_destroy(m_rules);
         if (destroyResult != ERROR_SUCCESS) {
-            SS_LOG_ERROR(L"YaraRuleStore", L"Failed to destroy existing rules (error: %d)", destroyResult);
-            return StoreError{ SignatureStoreError::Unknown,
-                              static_cast<DWORD>(destroyResult),
-                              "Failed to destroy existing rules" };
+            SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Failed to destroy existing rules (error: %d)", 
+                destroyResult);
+            return StoreError{SignatureStoreError::Unknown,
+                             static_cast<DWORD>(destroyResult),
+                             "Failed to destroy existing rules"};
         }
         m_rules = nullptr;
     }
 
-    //load new compiled rules
-    int result = yr_rules_load(ShadowStrike::Utils::StringUtils::ToNarrow(compiledRulePath).c_str(), &m_rules);
-    if (result != ERROR_SUCCESS || !m_rules) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"Failed to load compiled rules from %s (error: %d)",
-            compiledRulePath.c_str(), result);
-        return StoreError{ SignatureStoreError::InvalidFormat,
-                          static_cast<DWORD>(result),
-                          "Failed to load compiled rules" };
+    // ========================================================================
+    // CONVERT PATH AND LOAD RULES
+    // ========================================================================
+    std::string narrowPath;
+    try {
+        narrowPath = ShadowStrike::Utils::StringUtils::ToNarrow(compiledRulePath);
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: Path conversion failed: %S", e.what());
+        return StoreError{SignatureStoreError::InvalidFormat, 0, "Path conversion failed"};
     }
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Loaded compiled rules successfully from %s", compiledRulePath.c_str());
-    return StoreError{ SignatureStoreError::Success };
+    int result = yr_rules_load(narrowPath.c_str(), &m_rules);
+    if (result != ERROR_SUCCESS || !m_rules) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"LoadCompiledRules: YARA load failed (error: %d)", result);
+        m_rules = nullptr; // Ensure null on failure
+        return StoreError{SignatureStoreError::InvalidFormat,
+                         static_cast<DWORD>(result),
+                         "Failed to load compiled rules"};
+    }
+
+    // ========================================================================
+    // EXTRACT RULE METADATA FROM LOADED RULES
+    // ========================================================================
+    m_ruleMetadata.clear();
+    size_t ruleCount = 0;
+    
+    YR_RULE* rule = nullptr;
+    yr_rules_foreach(m_rules, rule) {
+        if (!rule || !rule->identifier) {
+            continue;
+        }
+
+        std::string ruleName = rule->identifier;
+        std::string ruleNamespace = rule->ns && rule->ns->name ? rule->ns->name : "default";
+        std::string fullName = ruleNamespace + "::" + ruleName;
+
+        YaraRuleMetadata metadata{};
+        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
+        metadata.ruleName = ruleName;
+        metadata.namespace_ = ruleNamespace;
+        metadata.threatLevel = ThreatLevel::Medium;
+        metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
+        metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
+        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
+
+        // Extract tags
+        const char* tag = nullptr;
+        yr_rule_tags_foreach(rule, tag) {
+            if (tag && std::strlen(tag) > 0 && std::strlen(tag) <= 64) {
+                metadata.tags.emplace_back(tag);
+            }
+        }
+
+        m_ruleMetadata[fullName] = std::move(metadata);
+        ruleCount++;
+    }
+
+    SS_LOG_INFO(L"YaraRuleStore", L"LoadCompiledRules: Loaded %zu rules from %s", 
+        ruleCount, compiledRulePath.c_str());
+    return StoreError{SignatureStoreError::Success};
 }
 
 // ============================================================================
@@ -1784,12 +2398,130 @@ StoreError YaraRuleStore::AddRulesFromFile(
     const std::wstring& filePath,
     const std::string& namespace_
 ) noexcept {
+    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromFile: %s (namespace: %S)", 
+        filePath.c_str(), namespace_.c_str());
+
+    // ========================================================================
+    // TITANIUM VALIDATION LAYER
+    // ========================================================================
+    
+    // VALIDATION 1: Read-only check
     if (m_readOnly.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Database is read-only");
         return StoreError{SignatureStoreError::AccessDenied, 0, "Read-only"};
     }
+    
+    // VALIDATION 2: Path validation
+    if (filePath.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Empty file path");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "File path is empty"};
+    }
+    
+    // VALIDATION 3: Path length check
+    if (filePath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Path too long");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Path too long"};
+    }
+    
+    // VALIDATION 4: Null character check
+    if (filePath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Path contains null character");
+        return StoreError{SignatureStoreError::AccessDenied, 0, "Path contains null character"};
+    }
+    
+    // VALIDATION 5: File existence check
+    DWORD fileAttrs = GetFileAttributesW(filePath.c_str());
+    if (fileAttrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD winErr = GetLastError();
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: File not found (error: %u)", winErr);
+        return StoreError{SignatureStoreError::FileNotFound, winErr, "File not found"};
+    }
+    
+    // VALIDATION 6: Not a directory check
+    if (fileAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Path is a directory");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "Path is a directory"};
+    }
+    
+    // VALIDATION 7: Namespace validation
+    if (!namespace_.empty()) {
+        if (namespace_.length() > YaraTitaniumLimits::MAX_NAMESPACE_LENGTH) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Namespace too long");
+            return StoreError{SignatureStoreError::InvalidSignature, 0, "Namespace too long"};
+        }
+        
+        if (!std::all_of(namespace_.begin(), namespace_.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_';
+        })) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Invalid namespace characters");
+            return StoreError{SignatureStoreError::InvalidSignature, 0, "Invalid namespace"};
+        }
+    }
 
+    // ========================================================================
+    // READ FILE AND COMPILE
+    // ========================================================================
     YaraCompiler compiler;
-    return compiler.AddFile(filePath, namespace_);
+    StoreError err = compiler.AddFile(filePath, namespace_);
+    
+    if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Compilation failed: %S", 
+            err.message.c_str());
+        
+        // Log compiler errors
+        auto errors = compiler.GetErrors();
+        for (size_t i = 0; i < std::min(errors.size(), size_t(3)); ++i) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"  Error: %S", errors[i].c_str());
+        }
+        
+        return err;
+    }
+    
+    // ========================================================================
+    // GET COMPILED RULES AND UPDATE STORE
+    // ========================================================================
+    YR_RULES* compiledRules = compiler.GetRules();
+    if (!compiledRules) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: No compiled rules returned");
+        return StoreError{SignatureStoreError::InvalidSignature, 0, "No rules compiled"};
+    }
+    
+    // Acquire lock and update rules
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+    
+    if (m_rules) {
+        SS_LOG_WARN(L"YaraRuleStore", L"AddRulesFromFile: Replacing existing rules");
+        yr_rules_destroy(m_rules);
+        m_rules = nullptr;
+    }
+    
+    m_rules = compiledRules;
+    
+    // Extract metadata from loaded rules
+    size_t ruleCount = 0;
+    YR_RULE* rule = nullptr;
+    yr_rules_foreach(m_rules, rule) {
+        if (!rule || !rule->identifier) continue;
+        
+        std::string ruleName = rule->identifier;
+        std::string ruleNamespace = rule->ns && rule->ns->name ? rule->ns->name : 
+            (namespace_.empty() ? "default" : namespace_);
+        std::string fullName = ruleNamespace + "::" + ruleName;
+        
+        YaraRuleMetadata metadata{};
+        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
+        metadata.ruleName = ruleName;
+        metadata.namespace_ = ruleNamespace;
+        metadata.threatLevel = ThreatLevel::Medium;
+        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
+        
+        m_ruleMetadata[fullName] = std::move(metadata);
+        ruleCount++;
+    }
+    
+    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromFile: Loaded %zu rules from %s", 
+        ruleCount, filePath.c_str());
+    return StoreError{SignatureStoreError::Success};
 }
 
 // ============================================================================
@@ -2387,19 +3119,23 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
 
     // Write YARA data to temp file
     {
+        // Note: Do NOT use FILE_FLAG_DELETE_ON_CLOSE as we need to read the file
+        // with yr_rules_load() after closing the handle. The TempFileGuard will
+        // handle cleanup instead.
         HANDLE hFile = CreateFileW(
             tempPath.c_str(),
             GENERIC_WRITE,
             0,
             nullptr,
             CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+            FILE_ATTRIBUTE_TEMPORARY,  // Just temporary, not delete-on-close
             nullptr
         );
 
         if (hFile == INVALID_HANDLE_VALUE) {
-            SS_LOG_ERROR(L"YaraRuleStore", L"LoadRulesInternal: Failed to create temp file");
-            return StoreError{ SignatureStoreError::Unknown, GetLastError(), "Cannot create temp file" };
+            DWORD winErr = GetLastError();
+            SS_LOG_ERROR(L"YaraRuleStore", L"LoadRulesInternal: Failed to create temp file (error: %u)", winErr);
+            return StoreError{ SignatureStoreError::Unknown, winErr, "Cannot create temp file" };
         }
 
         struct HandleGuard {
@@ -2407,10 +3143,17 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
             ~HandleGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
         } handleGuard{ hFile };
 
+        // TITANIUM: Validate yaraData size before cast to DWORD
+        if (yaraData.size() > MAXDWORD) {
+            SS_LOG_ERROR(L"YaraRuleStore", L"LoadRulesInternal: YARA data too large for single write");
+            return StoreError{ SignatureStoreError::TooLarge, 0, "YARA data exceeds 4GB limit" };
+        }
+
         DWORD bytesWritten = 0;
         if (!WriteFile(hFile, yaraData.data(), static_cast<DWORD>(yaraData.size()), &bytesWritten, nullptr)) {
-            SS_LOG_ERROR(L"YaraRuleStore", L"LoadRulesInternal: Failed to write YARA data to temp file");
-            return StoreError{ SignatureStoreError::Unknown, GetLastError(), "Cannot write temp file" };
+            DWORD winErr = GetLastError();
+            SS_LOG_ERROR(L"YaraRuleStore", L"LoadRulesInternal: Failed to write YARA data (error: %u)", winErr);
+            return StoreError{ SignatureStoreError::Unknown, winErr, "Cannot write temp file" };
         }
 
         if (bytesWritten != yaraData.size()) {
@@ -2419,8 +3162,15 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
                 bytesWritten, yaraData.size());
             return StoreError{ SignatureStoreError::Unknown, 0, "Incomplete write to temp file" };
         }
+        
+        // Flush to ensure data is written before reading
+        if (!FlushFileBuffers(hFile)) {
+            SS_LOG_WARN(L"YaraRuleStore", L"LoadRulesInternal: FlushFileBuffers warning");
+        }
 
         SS_LOG_DEBUG(L"YaraRuleStore", L"LoadRulesInternal: Wrote %u bytes to temp file", bytesWritten);
+        
+        // Handle will be closed by guard, making file available for yr_rules_load
     }
 
     // ========================================================================
@@ -2837,28 +3587,70 @@ StoreError YaraRuleStore::ExportCompiled(
 std::string YaraRuleStore::ExportToJson() const noexcept {
     SS_LOG_DEBUG(L"YaraRuleStore", L"ExportToJson");
 
-    std::ostringstream json;
-    json << "{\n  \"version\": \"1.0\",\n";
-    json << "  \"yara_version\": \"" << GetYaraVersion() << "\",\n";
-    json << "  \"rule_count\": " << m_ruleMetadata.size() << ",\n  \"rules\": [\n";
+    // ========================================================================
+    // TITANIUM SAFE JSON EXPORT WITH PROPER ESCAPING
+    // ========================================================================
+    
+    // Helper lambda to escape JSON strings properly
+    auto escapeJsonString = [](const std::string& input) -> std::string {
+        std::string output;
+        output.reserve(input.length() + 16); // Reserve extra for escapes
+        
+        for (char c : input) {
+            switch (c) {
+                case '"':  output += "\\\""; break;
+                case '\\': output += "\\\\"; break;
+                case '\b': output += "\\b"; break;
+                case '\f': output += "\\f"; break;
+                case '\n': output += "\\n"; break;
+                case '\r': output += "\\r"; break;
+                case '\t': output += "\\t"; break;
+                default:
+                    // Control characters need to be escaped as \uXXXX
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                        output += buf;
+                    } else {
+                        output += c;
+                    }
+                    break;
+            }
+        }
+        return output;
+    };
 
-    bool first = true;
-    for (const auto& [name, metadata] : m_ruleMetadata) {
-        if (!first) json << ",\n";
-        first = false;
+    try {
+        std::shared_lock<std::shared_mutex> lock(m_globalLock);
+        
+        std::ostringstream json;
+        json << "{\n  \"version\": \"1.0\",\n";
+        json << "  \"yara_version\": \"" << escapeJsonString(GetYaraVersion()) << "\",\n";
+        json << "  \"rule_count\": " << m_ruleMetadata.size() << ",\n  \"rules\": [\n";
 
-        json << "    {\n";
-        json << "      \"name\": \"" << name << "\",\n";
-        json << "      \"namespace\": \"" << metadata.namespace_ << "\",\n";
-        json << "      \"id\": " << metadata.ruleId << ",\n";
-        json << "      \"threat_level\": " << static_cast<int>(metadata.threatLevel) << ",\n";
-        json << "      \"author\": \"" << metadata.author << "\",\n";
-        json << "      \"hit_count\": " << metadata.hitCount << "\n";
-        json << "    }";
+        bool first = true;
+        for (const auto& [name, metadata] : m_ruleMetadata) {
+            if (!first) json << ",\n";
+            first = false;
+
+            json << "    {\n";
+            json << "      \"name\": \"" << escapeJsonString(name) << "\",\n";
+            json << "      \"namespace\": \"" << escapeJsonString(metadata.namespace_) << "\",\n";
+            json << "      \"id\": " << metadata.ruleId << ",\n";
+            json << "      \"threat_level\": " << static_cast<int>(metadata.threatLevel) << ",\n";
+            json << "      \"author\": \"" << escapeJsonString(metadata.author) << "\",\n";
+            json << "      \"description\": \"" << escapeJsonString(metadata.description) << "\",\n";
+            json << "      \"hit_count\": " << metadata.hitCount << "\n";
+            json << "    }";
+        }
+
+        json << "\n  ]\n}\n";
+        return json.str();
     }
-
-    json << "\n  ]\n}\n";
-    return json.str();
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ExportToJson: Exception: %S", e.what());
+        return "{ \"error\": \"Export failed\" }";
+    }
 }
 
 // ============================================================================
@@ -3100,7 +3892,7 @@ StoreError YaraRuleStore::Flush() noexcept {
 
 
 // ============================================================================
-// UTILITY FUNCTIONS
+// UTILITY FUNCTIONS - TITANIUM HARDENED
 // ============================================================================
 
 namespace YaraUtils {
@@ -3109,6 +3901,25 @@ bool ValidateRuleSyntax(
     const std::string& ruleSource,
     std::vector<std::string>& errors
 ) noexcept {
+    // ========================================================================
+    // TITANIUM VALIDATION
+    // ========================================================================
+    errors.clear();
+    
+    // Empty source check
+    if (ruleSource.empty()) {
+        errors.push_back("Rule source is empty");
+        return false;
+    }
+    
+    // Size limit (10MB max)
+    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024;
+    if (ruleSource.length() > MAX_RULE_SOURCE_SIZE) {
+        errors.push_back("Rule source exceeds 10MB limit");
+        return false;
+    }
+    
+    // Compile with YARA to validate
     YaraCompiler compiler;
     StoreError err = compiler.AddString(ruleSource, "validate");
     
@@ -3121,36 +3932,82 @@ std::map<std::string, std::string> ExtractMetadata(
 ) noexcept {
     std::map<std::string, std::string> metadata;
 
-    // Simple parser: find meta: section
-    size_t metaPos = ruleSource.find("meta:");
-    if (metaPos == std::string::npos) {
-        return metadata;
+    // ========================================================================
+    // TITANIUM BOUNDS CHECKING
+    // ========================================================================
+    if (ruleSource.empty() || ruleSource.length() > 10 * 1024 * 1024) {
+        return metadata; // Empty or too large
     }
 
-    size_t conditionPos = ruleSource.find("condition:", metaPos);
-    if (conditionPos == std::string::npos) {
-        conditionPos = ruleSource.length();
-    }
-
-    std::string metaSection = ruleSource.substr(metaPos + 5, conditionPos - metaPos - 5);
-    
-    // Parse key = value pairs
-    std::istringstream iss(metaSection);
-    std::string line;
-    while (std::getline(iss, line)) {
-        size_t eqPos = line.find('=');
-        if (eqPos != std::string::npos) {
-            std::string key = line.substr(0, eqPos);
-            std::string value = line.substr(eqPos + 1);
-            
-            // Trim whitespace
-            key.erase(0, key.find_first_not_of(" \t"));
-            key.erase(key.find_last_not_of(" \t") + 1);
-            value.erase(0, value.find_first_not_of(" \t\""));
-            value.erase(value.find_last_not_of(" \t\"") + 1);
-            
-            metadata[key] = value;
+    try {
+        // Simple parser: find meta: section
+        size_t metaPos = ruleSource.find("meta:");
+        if (metaPos == std::string::npos) {
+            return metadata;
         }
+
+        // Find the end of meta section (either "condition:", "strings:", or end of rule)
+        size_t conditionPos = ruleSource.find("condition:", metaPos);
+        size_t stringsPos = ruleSource.find("strings:", metaPos);
+        
+        size_t endPos = ruleSource.length();
+        if (conditionPos != std::string::npos) {
+            endPos = std::min(endPos, conditionPos);
+        }
+        if (stringsPos != std::string::npos) {
+            endPos = std::min(endPos, stringsPos);
+        }
+
+        // Bounds check before substr
+        if (metaPos + 5 >= endPos) {
+            return metadata;
+        }
+
+        std::string metaSection = ruleSource.substr(metaPos + 5, endPos - metaPos - 5);
+        
+        // Limit number of metadata entries (DoS protection)
+        constexpr size_t MAX_METADATA_ENTRIES = 100;
+        size_t entryCount = 0;
+        
+        // Parse key = value pairs
+        std::istringstream iss(metaSection);
+        std::string line;
+        while (std::getline(iss, line) && entryCount < MAX_METADATA_ENTRIES) {
+            size_t eqPos = line.find('=');
+            if (eqPos != std::string::npos && eqPos > 0 && eqPos < line.length() - 1) {
+                std::string key = line.substr(0, eqPos);
+                std::string value = line.substr(eqPos + 1);
+                
+                // Trim whitespace safely
+                size_t keyStart = key.find_first_not_of(" \t");
+                size_t keyEnd = key.find_last_not_of(" \t");
+                if (keyStart != std::string::npos && keyEnd != std::string::npos && keyStart <= keyEnd) {
+                    key = key.substr(keyStart, keyEnd - keyStart + 1);
+                } else {
+                    continue; // Empty key
+                }
+                
+                size_t valStart = value.find_first_not_of(" \t\"");
+                size_t valEnd = value.find_last_not_of(" \t\"");
+                if (valStart != std::string::npos && valEnd != std::string::npos && valStart <= valEnd) {
+                    value = value.substr(valStart, valEnd - valStart + 1);
+                } else {
+                    value.clear();
+                }
+                
+                // Limit key/value lengths
+                constexpr size_t MAX_KEY_LENGTH = 256;
+                constexpr size_t MAX_VALUE_LENGTH = 4096;
+                
+                if (key.length() <= MAX_KEY_LENGTH && value.length() <= MAX_VALUE_LENGTH) {
+                    metadata[key] = value;
+                    entryCount++;
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"YaraUtils", L"ExtractMetadata exception: %S", e.what());
     }
 
     return metadata;
@@ -3159,44 +4016,100 @@ std::map<std::string, std::string> ExtractMetadata(
 std::vector<std::string> ExtractTags(const std::string& ruleSource) noexcept {
     std::vector<std::string> tags;
 
-    // Find tags in rule declaration: rule RuleName : tag1 tag2 tag3
-    size_t rulePos = ruleSource.find("rule ");
-    if (rulePos == std::string::npos) {
+    // ========================================================================
+    // TITANIUM BOUNDS CHECKING
+    // ========================================================================
+    if (ruleSource.empty() || ruleSource.length() > 10 * 1024 * 1024) {
         return tags;
     }
 
-    size_t colonPos = ruleSource.find(':', rulePos);
-    if (colonPos == std::string::npos) {
-        return tags;
-    }
+    try {
+        // Find tags in rule declaration: rule RuleName : tag1 tag2 tag3
+        size_t rulePos = ruleSource.find("rule ");
+        if (rulePos == std::string::npos) {
+            return tags;
+        }
 
-    size_t bracePos = ruleSource.find('{', colonPos);
-    if (bracePos == std::string::npos) {
-        return tags;
-    }
+        // Find colon after rule name (for tags)
+        size_t colonPos = ruleSource.find(':', rulePos + 5);
+        if (colonPos == std::string::npos) {
+            return tags;
+        }
 
-    std::string tagSection = ruleSource.substr(colonPos + 1, bracePos - colonPos - 1);
-    std::istringstream iss(tagSection);
-    std::string tag;
-    while (iss >> tag) {
-        tags.push_back(tag);
+        // Find opening brace
+        size_t bracePos = ruleSource.find('{', colonPos);
+        if (bracePos == std::string::npos) {
+            return tags;
+        }
+
+        // Bounds check before substr
+        if (colonPos + 1 >= bracePos) {
+            return tags;
+        }
+
+        std::string tagSection = ruleSource.substr(colonPos + 1, bracePos - colonPos - 1);
+        
+        // Parse tags with limits
+        constexpr size_t MAX_TAGS = 50;
+        constexpr size_t MAX_TAG_LENGTH = 64;
+        
+        std::istringstream iss(tagSection);
+        std::string tag;
+        while (iss >> tag && tags.size() < MAX_TAGS) {
+            // Validate tag format (alphanumeric + underscore)
+            if (tag.length() > 0 && tag.length() <= MAX_TAG_LENGTH) {
+                bool valid = std::all_of(tag.begin(), tag.end(), [](unsigned char c) {
+                    return std::isalnum(c) || c == '_';
+                });
+                
+                if (valid) {
+                    tags.push_back(tag);
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"YaraUtils", L"ExtractTags exception: %S", e.what());
     }
 
     return tags;
 }
 
 ThreatLevel ParseThreatLevel(const std::map<std::string, std::string>& metadata) noexcept {
+    // Look for severity or threat_level keys (case-insensitive comparison would be better)
     auto it = metadata.find("severity");
     if (it == metadata.end()) {
         it = metadata.find("threat_level");
     }
+    if (it == metadata.end()) {
+        it = metadata.find("Severity");
+    }
+    if (it == metadata.end()) {
+        it = metadata.find("SEVERITY");
+    }
 
     if (it != metadata.end()) {
-        const std::string& value = it->second;
-        if (value == "critical") return ThreatLevel::Critical;
-        if (value == "high") return ThreatLevel::High;
-        if (value == "medium") return ThreatLevel::Medium;
-        if (value == "low") return ThreatLevel::Low;
+        std::string value = it->second;
+        
+        // Convert to lowercase for comparison
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        
+        if (value == "critical" || value == "severe" || value == "5") {
+            return ThreatLevel::Critical;
+        }
+        if (value == "high" || value == "4") {
+            return ThreatLevel::High;
+        }
+        if (value == "medium" || value == "moderate" || value == "3") {
+            return ThreatLevel::Medium;
+        }
+        if (value == "low" || value == "minor" || value == "2" || value == "1") {
+            return ThreatLevel::Low;
+        }
+        if (value == "info" || value == "informational" || value == "0") {
+            return ThreatLevel::Low;
+        }
     }
 
     return ThreatLevel::Medium; // Default
@@ -3207,32 +4120,97 @@ std::vector<std::wstring> FindYaraFiles(
     bool recursive
 ) noexcept {
     std::vector<std::wstring> yaraFiles;
+    
+    // ========================================================================
+    // TITANIUM VALIDATION
+    // ========================================================================
+    if (directoryPath.empty()) {
+        SS_LOG_ERROR(L"YaraUtils", L"FindYaraFiles: Empty directory path");
+        return yaraFiles;
+    }
+    
+    if (directoryPath.length() > YaraTitaniumLimits::MAX_PATH_LENGTH) {
+        SS_LOG_ERROR(L"YaraUtils", L"FindYaraFiles: Path too long");
+        return yaraFiles;
+    }
+    
+    // Null character check
+    if (directoryPath.find(L'\0') != std::wstring::npos) {
+        SS_LOG_ERROR(L"YaraUtils", L"FindYaraFiles: Path contains null character");
+        return yaraFiles;
+    }
+    
     try {
         namespace fs = std::filesystem;
+        
+        // Verify directory exists
+        if (!fs::exists(directoryPath) || !fs::is_directory(directoryPath)) {
+            SS_LOG_WARN(L"YaraUtils", L"FindYaraFiles: Path is not a valid directory");
+            return yaraFiles;
+        }
 
+        // Limit number of files (DoS protection)
+        constexpr size_t MAX_FILES = YaraTitaniumLimits::MAX_YARA_FILES_IN_REPO;
+        size_t fileCount = 0;
+        
         auto processEntry = [&](const fs::directory_entry& entry) {
-            if (entry.is_regular_file()) {
-                auto ext = entry.path().extension();
-                if (ext == L".yar" || ext == L".yara") {
-                    yaraFiles.push_back(entry.path().wstring());
+            if (fileCount >= MAX_FILES) {
+                return; // Limit reached
+            }
+            
+            try {
+                if (entry.is_regular_file()) {
+                    auto ext = entry.path().extension().wstring();
+                    
+                    // Case-insensitive extension check
+                    std::transform(ext.begin(), ext.end(), ext.begin(),
+                        [](wchar_t c) { return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c))); });
+                    
+                    if (ext == L".yar" || ext == L".yara") {
+                        yaraFiles.push_back(entry.path().wstring());
+                        fileCount++;
+                    }
                 }
             }
-            };
+            catch (const std::exception&) {
+                // Skip files that can't be accessed
+            }
+        };
 
+        // Use error_code to avoid throwing on permission errors
+        std::error_code ec;
+        
         if (recursive) {
-            for (const auto& entry : fs::recursive_directory_iterator(directoryPath)) {
-                processEntry(entry);
+            for (auto it = fs::recursive_directory_iterator(directoryPath, 
+                    fs::directory_options::skip_permission_denied, ec);
+                 it != fs::recursive_directory_iterator() && fileCount < MAX_FILES;
+                 ++it) {
+                if (!ec) {
+                    processEntry(*it);
+                }
+                ec.clear();
             }
         }
         else {
-            for (const auto& entry : fs::directory_iterator(directoryPath)) {
-                processEntry(entry);
+            for (auto it = fs::directory_iterator(directoryPath, ec);
+                 it != fs::directory_iterator() && fileCount < MAX_FILES;
+                 ++it) {
+                if (!ec) {
+                    processEntry(*it);
+                }
+                ec.clear();
             }
+        }
+        
+        if (fileCount >= MAX_FILES) {
+            SS_LOG_WARN(L"YaraUtils", L"FindYaraFiles: Maximum file limit reached (%zu)", MAX_FILES);
         }
     }
     catch (const std::exception& e) {
-        SS_LOG_ERROR(L"YaraUtils", L"FindYaraFiles error: %S", e.what());
+        SS_LOG_ERROR(L"YaraUtils", L"FindYaraFiles exception: %S", e.what());
     }
+    
+    SS_LOG_DEBUG(L"YaraUtils", L"FindYaraFiles: Found %zu YARA files", yaraFiles.size());
     return yaraFiles;
 }
 

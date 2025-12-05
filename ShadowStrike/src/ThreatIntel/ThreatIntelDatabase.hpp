@@ -546,6 +546,16 @@ private:
      */
     [[nodiscard]] size_t CalculateMaxEntries() const noexcept;
     
+    /**
+     * @brief Internal integrity verification (caller must hold lock)
+     */
+    [[nodiscard]] bool VerifyIntegrityInternal() const noexcept;
+    
+    /**
+     * @brief Internal header checksum verification (caller must hold lock)
+     */
+    [[nodiscard]] bool VerifyHeaderChecksumInternal() const noexcept;
+    
     // =========================================================================
     // Member Variables
     // =========================================================================

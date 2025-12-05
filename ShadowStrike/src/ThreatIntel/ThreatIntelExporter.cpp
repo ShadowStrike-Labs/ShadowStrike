@@ -18,6 +18,11 @@
 #include <bcrypt.h>
 #include <wincrypt.h>
 
+// NT_SUCCESS macro for NTSTATUS checks (may not be available in all SDK versions)
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
 
@@ -111,41 +116,98 @@ std::optional<ExportFormat> ParseExportFormat(std::string_view str) noexcept {
     return std::nullopt;
 }
 
+/**
+ * @brief Generate a cryptographically secure UUID v4
+ * 
+ * Uses Windows BCrypt API with fallback to std::random_device.
+ * RAII pattern ensures no resource leaks.
+ * 
+ * @return UUID string in format "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+ */
 std::string GenerateUUID() {
-    // Use Windows crypto API for secure random UUID generation
-    std::array<uint8_t, 16> bytes{};
+    // RAII wrapper for BCrypt algorithm handle
+    struct BcryptAlgHandleGuard {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        ~BcryptAlgHandleGuard() {
+            if (handle) {
+                BCryptCloseAlgorithmProvider(handle, 0);
+            }
+        }
+        // Non-copyable, non-movable
+        BcryptAlgHandleGuard() = default;
+        BcryptAlgHandleGuard(const BcryptAlgHandleGuard&) = delete;
+        BcryptAlgHandleGuard& operator=(const BcryptAlgHandleGuard&) = delete;
+    };
     
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RNG_ALGORITHM, nullptr, 0) == 0) {
-        BCryptGenRandom(hAlg, bytes.data(), static_cast<ULONG>(bytes.size()), 0);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-    } else {
-        // Fallback to std::random_device
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dis;
+    std::array<uint8_t, 16> bytes{};
+    bool cryptoSuccess = false;
+    
+    // Attempt BCrypt random generation
+    {
+        BcryptAlgHandleGuard algGuard;
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &algGuard.handle,
+            BCRYPT_RNG_ALGORITHM,
+            nullptr,
+            0
+        );
         
-        uint64_t* ptr = reinterpret_cast<uint64_t*>(bytes.data());
-        ptr[0] = dis(gen);
-        ptr[1] = dis(gen);
+        if (NT_SUCCESS(status) && algGuard.handle) {
+            status = BCryptGenRandom(
+                algGuard.handle,
+                bytes.data(),
+                static_cast<ULONG>(bytes.size()),
+                0
+            );
+            cryptoSuccess = NT_SUCCESS(status);
+        }
+        // RAII: algGuard destructor closes handle automatically
     }
     
-    // Set version (4) and variant bits
-    bytes[6] = (bytes[6] & 0x0F) | 0x40;  // Version 4
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;  // Variant 1
+    // Fallback if BCrypt failed
+    if (!cryptoSuccess) {
+        try {
+            std::random_device rd;
+            std::mt19937_64 gen(rd());
+            std::uniform_int_distribution<uint64_t> dis;
+            
+            // Safe memcpy instead of aliasing cast
+            uint64_t rand1 = dis(gen);
+            uint64_t rand2 = dis(gen);
+            std::memcpy(bytes.data(), &rand1, sizeof(rand1));
+            std::memcpy(bytes.data() + 8, &rand2, sizeof(rand2));
+        } catch (...) {
+            // Last resort: use time-based entropy (not cryptographically secure)
+            auto now = std::chrono::high_resolution_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()
+            ).count();
+            std::memcpy(bytes.data(), &ns, sizeof(ns));
+            // XOR with process ID for additional entropy
+            DWORD pid = GetCurrentProcessId();
+            std::memcpy(bytes.data() + 8, &pid, sizeof(pid));
+        }
+    }
     
-    // Format as UUID string
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
+    // Set version (4) and variant bits per RFC 4122
+    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0F) | 0x40);  // Version 4
+    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3F) | 0x80);  // Variant 1
+    
+    // Format as UUID string - preallocate for performance
+    std::string result;
+    result.reserve(36);  // UUID format: 8-4-4-4-12 = 36 chars
+    
+    static constexpr char hexChars[] = "0123456789abcdef";
     
     for (size_t i = 0; i < 16; ++i) {
         if (i == 4 || i == 6 || i == 8 || i == 10) {
-            oss << '-';
+            result += '-';
         }
-        oss << std::setw(2) << static_cast<int>(bytes[i]);
+        result += hexChars[(bytes[i] >> 4) & 0x0F];
+        result += hexChars[bytes[i] & 0x0F];
     }
     
-    return oss.str();
+    return result;
 }
 
 std::string FormatISO8601Timestamp(uint64_t timestamp) {
@@ -174,8 +236,68 @@ std::string FormatISO8601Timestamp(uint64_t timestamp) {
     return oss.str();
 }
 
+/**
+ * @brief Calculate SHA256 hash of a file
+ * 
+ * Uses Windows BCrypt API with full RAII resource management.
+ * All handles are guaranteed to be cleaned up even on exceptions.
+ * 
+ * @param filePath Path to the file to hash
+ * @return Lowercase hexadecimal SHA256 hash string, or empty on error
+ */
 std::string CalculateFileSHA256(const std::wstring& filePath) {
-    HANDLE hFile = CreateFileW(
+    // Safety limits
+    static constexpr DWORD kMaxHashObjectSize = 4096;       // BCrypt should never need more
+    static constexpr size_t kReadBufferSize = 65536;        // 64KB read buffer
+    static constexpr size_t kSHA256DigestSize = 32;         // SHA256 produces 32 bytes
+    
+    // Validate input
+    if (filePath.empty()) {
+        return "";
+    }
+    
+    // RAII wrapper for Windows HANDLE
+    struct HandleGuard {
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        ~HandleGuard() {
+            if (handle != INVALID_HANDLE_VALUE && handle != nullptr) {
+                CloseHandle(handle);
+            }
+        }
+        HandleGuard() = default;
+        HandleGuard(const HandleGuard&) = delete;
+        HandleGuard& operator=(const HandleGuard&) = delete;
+    };
+    
+    // RAII wrapper for BCrypt algorithm handle
+    struct BcryptAlgGuard {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        ~BcryptAlgGuard() {
+            if (handle) {
+                BCryptCloseAlgorithmProvider(handle, 0);
+            }
+        }
+        BcryptAlgGuard() = default;
+        BcryptAlgGuard(const BcryptAlgGuard&) = delete;
+        BcryptAlgGuard& operator=(const BcryptAlgGuard&) = delete;
+    };
+    
+    // RAII wrapper for BCrypt hash handle
+    struct BcryptHashGuard {
+        BCRYPT_HASH_HANDLE handle = nullptr;
+        ~BcryptHashGuard() {
+            if (handle) {
+                BCryptDestroyHash(handle);
+            }
+        }
+        BcryptHashGuard() = default;
+        BcryptHashGuard(const BcryptHashGuard&) = delete;
+        BcryptHashGuard& operator=(const BcryptHashGuard&) = delete;
+    };
+    
+    // Open file with RAII protection
+    HandleGuard fileGuard;
+    fileGuard.handle = CreateFileW(
         filePath.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
@@ -185,52 +307,109 @@ std::string CalculateFileSHA256(const std::wstring& filePath) {
         nullptr
     );
     
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (fileGuard.handle == INVALID_HANDLE_VALUE) {
         return "";
     }
     
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-    std::string result;
+    // Open BCrypt algorithm provider
+    BcryptAlgGuard algGuard;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(
+        &algGuard.handle,
+        BCRYPT_SHA256_ALGORITHM,
+        nullptr,
+        0
+    );
     
-    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0) {
-        DWORD hashObjectSize = 0;
-        DWORD dataSize = 0;
-        
-        BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, 
-                          reinterpret_cast<PUCHAR>(&hashObjectSize), 
-                          sizeof(DWORD), &dataSize, 0);
-        
-        std::vector<uint8_t> hashObject(hashObjectSize);
-        
-        if (BCryptCreateHash(hAlg, &hHash, hashObject.data(), hashObjectSize, 
-                             nullptr, 0, 0) == 0) {
-            
-            std::array<uint8_t, 65536> buffer;
-            DWORD bytesRead = 0;
-            
-            while (ReadFile(hFile, buffer.data(), static_cast<DWORD>(buffer.size()), 
-                           &bytesRead, nullptr) && bytesRead > 0) {
-                BCryptHashData(hHash, buffer.data(), bytesRead, 0);
-            }
-            
-            std::array<uint8_t, 32> hash;
-            if (BCryptFinishHash(hHash, hash.data(), static_cast<ULONG>(hash.size()), 0) == 0) {
-                std::ostringstream oss;
-                oss << std::hex << std::setfill('0');
-                for (uint8_t b : hash) {
-                    oss << std::setw(2) << static_cast<int>(b);
-                }
-                result = oss.str();
-            }
-            
-            BCryptDestroyHash(hHash);
-        }
-        
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!NT_SUCCESS(status) || !algGuard.handle) {
+        return "";
     }
     
-    CloseHandle(hFile);
+    // Get hash object size with validation
+    DWORD hashObjectSize = 0;
+    DWORD dataSize = 0;
+    
+    status = BCryptGetProperty(
+        algGuard.handle,
+        BCRYPT_OBJECT_LENGTH,
+        reinterpret_cast<PUCHAR>(&hashObjectSize),
+        sizeof(DWORD),
+        &dataSize,
+        0
+    );
+    
+    if (!NT_SUCCESS(status) || dataSize != sizeof(DWORD)) {
+        return "";
+    }
+    
+    // Validate hash object size is reasonable
+    if (hashObjectSize == 0 || hashObjectSize > kMaxHashObjectSize) {
+        return "";
+    }
+    
+    // Allocate hash object buffer
+    std::vector<uint8_t> hashObject;
+    try {
+        hashObject.resize(hashObjectSize);
+    } catch (const std::bad_alloc&) {
+        return "";
+    }
+    
+    // Create hash
+    BcryptHashGuard hashGuard;
+    status = BCryptCreateHash(
+        algGuard.handle,
+        &hashGuard.handle,
+        hashObject.data(),
+        hashObjectSize,
+        nullptr,
+        0,
+        0
+    );
+    
+    if (!NT_SUCCESS(status) || !hashGuard.handle) {
+        return "";
+    }
+    
+    // Read and hash file contents
+    std::array<uint8_t, kReadBufferSize> buffer{};
+    DWORD bytesRead = 0;
+    
+    while (ReadFile(fileGuard.handle, buffer.data(), 
+                    static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
+        if (bytesRead == 0) {
+            break;  // EOF
+        }
+        
+        status = BCryptHashData(hashGuard.handle, buffer.data(), bytesRead, 0);
+        if (!NT_SUCCESS(status)) {
+            return "";
+        }
+    }
+    
+    // Finalize hash
+    std::array<uint8_t, kSHA256DigestSize> hash{};
+    status = BCryptFinishHash(
+        hashGuard.handle,
+        hash.data(),
+        static_cast<ULONG>(hash.size()),
+        0
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        return "";
+    }
+    
+    // Convert to hex string - preallocate for performance
+    std::string result;
+    result.reserve(kSHA256DigestSize * 2);
+    
+    static constexpr char hexChars[] = "0123456789abcdef";
+    
+    for (uint8_t b : hash) {
+        result += hexChars[(b >> 4) & 0x0F];
+        result += hexChars[b & 0x0F];
+    }
+    
     return result;
 }
 
@@ -439,119 +618,283 @@ ExportOptions ExportOptions::CompressedJSON() {
 namespace {
 
 /**
- * @brief Format IPv4 address to string
+ * @brief Format IPv4 address to string with CIDR notation
+ * 
+ * Thread-safe, exception-safe implementation using direct string building.
+ * 
+ * @param addr IPv4Address structure containing address and prefix length
+ * @return Formatted string like "192.168.1.1" or "192.168.1.0/24"
  */
-std::string FormatIPv4(const IPv4Address& addr) {
+std::string FormatIPv4(const IPv4Address& addr) noexcept {
+    // Pre-allocate reasonable size: "255.255.255.255/32" = 18 chars max
+    std::string result;
+    result.reserve(18);
+    
     uint32_t ip = addr.address;
-    std::ostringstream oss;
-    oss << ((ip >> 24) & 0xFF) << '.'
-        << ((ip >> 16) & 0xFF) << '.'
-        << ((ip >> 8) & 0xFF) << '.'
-        << (ip & 0xFF);
     
+    // Format octets using fast integer-to-string without ostringstream
+    auto appendOctet = [&result](uint32_t val) {
+        if (val >= 100) {
+            result += static_cast<char>('0' + val / 100);
+            val %= 100;
+            result += static_cast<char>('0' + val / 10);
+            result += static_cast<char>('0' + val % 10);
+        } else if (val >= 10) {
+            result += static_cast<char>('0' + val / 10);
+            result += static_cast<char>('0' + val % 10);
+        } else {
+            result += static_cast<char>('0' + val);
+        }
+    };
+    
+    appendOctet((ip >> 24) & 0xFF);
+    result += '.';
+    appendOctet((ip >> 16) & 0xFF);
+    result += '.';
+    appendOctet((ip >> 8) & 0xFF);
+    result += '.';
+    appendOctet(ip & 0xFF);
+    
+    // Add CIDR notation if not a /32 (single host)
     if (addr.prefixLength < 32) {
-        oss << '/' << static_cast<int>(addr.prefixLength);
+        result += '/';
+        appendOctet(static_cast<uint32_t>(addr.prefixLength));
     }
     
-    return oss.str();
+    return result;
 }
 
 /**
- * @brief Format IPv6 address to string
+ * @brief Format IPv6 address to string with prefix notation
+ * 
+ * Outputs full colon-hex notation without zero compression.
+ * Thread-safe, bounds-checked implementation.
+ * 
+ * @param addr IPv6Address structure containing 16-byte address and prefix length
+ * @return Formatted string like "2001:0db8:0000:0000:0000:0000:0000:0001/64"
  */
-std::string FormatIPv6(const IPv6Address& addr) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
+std::string FormatIPv6(const IPv6Address& addr) noexcept {
+    // Verify IPv6Address has correct structure
+    static_assert(sizeof(addr.address) >= 16, "IPv6Address must have at least 16 bytes");
     
-    for (int i = 0; i < 8; ++i) {
-        if (i > 0) oss << ':';
-        uint16_t segment = (static_cast<uint16_t>(addr.address[i * 2]) << 8) |
-                           static_cast<uint16_t>(addr.address[i * 2 + 1]);
-        oss << std::setw(4) << segment;
+    // Pre-allocate: "xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx/128" = 43 chars max
+    std::string result;
+    result.reserve(44);
+    
+    static constexpr char hexChars[] = "0123456789abcdef";
+    
+    for (size_t i = 0; i < 8; ++i) {
+        if (i > 0) {
+            result += ':';
+        }
+        
+        // Bounds-safe access to two bytes per segment
+        const size_t byteIndex = i * 2;
+        // Static_assert ensures we have 16 bytes, so byteIndex+1 < 16 when i < 8
+        
+        const uint8_t highByte = addr.address[byteIndex];
+        const uint8_t lowByte = addr.address[byteIndex + 1];
+        
+        // Format as 4 hex digits
+        result += hexChars[(highByte >> 4) & 0x0F];
+        result += hexChars[highByte & 0x0F];
+        result += hexChars[(lowByte >> 4) & 0x0F];
+        result += hexChars[lowByte & 0x0F];
     }
     
+    // Add prefix notation if not a /128 (single address)
     if (addr.prefixLength < 128) {
-        oss << '/' << std::dec << static_cast<int>(addr.prefixLength);
+        result += '/';
+        // Prefix length is 0-128, max 3 digits
+        if (addr.prefixLength >= 100) {
+            result += '1';
+            const uint8_t rem = addr.prefixLength - 100;
+            result += static_cast<char>('0' + rem / 10);
+            result += static_cast<char>('0' + rem % 10);
+        } else if (addr.prefixLength >= 10) {
+            result += static_cast<char>('0' + addr.prefixLength / 10);
+            result += static_cast<char>('0' + addr.prefixLength % 10);
+        } else {
+            result += static_cast<char>('0' + addr.prefixLength);
+        }
     }
     
-    return oss.str();
+    return result;
 }
 
 /**
- * @brief Format hash value to hex string
+ * @brief Format hash value to lowercase hex string
+ * 
+ * Validates hash length against algorithm and data size.
+ * Thread-safe, bounds-checked implementation.
+ * 
+ * @param hash HashValue structure containing algorithm type and data
+ * @return Lowercase hex string, or empty string on invalid hash
  */
-std::string FormatHash(const HashValue& hash) {
-    uint8_t len = GetHashLength(hash.algorithm);
-    if (len == 0 || len > hash.data.size()) {
+std::string FormatHash(const HashValue& hash) noexcept {
+    // Get expected length for this algorithm
+    const uint8_t expectedLen = GetHashLength(hash.algorithm);
+    
+    // Validate: algorithm known, and data has sufficient bytes
+    if (expectedLen == 0) {
+        return "";  // Unknown algorithm
+    }
+    
+    if (hash.data.size() < expectedLen) {
+        return "";  // Data too short for algorithm
+    }
+    
+    // Safety limit to prevent excessive allocation
+    static constexpr uint8_t kMaxHashLength = 128;  // SHA-1024 theoretical max
+    if (expectedLen > kMaxHashLength) {
         return "";
     }
     
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
+    // Pre-allocate result string: 2 hex chars per byte
+    std::string result;
+    result.reserve(static_cast<size_t>(expectedLen) * 2);
     
-    for (uint8_t i = 0; i < len; ++i) {
-        oss << std::setw(2) << static_cast<int>(hash.data[i]);
+    static constexpr char hexChars[] = "0123456789abcdef";
+    
+    for (uint8_t i = 0; i < expectedLen; ++i) {
+        const uint8_t b = hash.data[i];
+        result += hexChars[(b >> 4) & 0x0F];
+        result += hexChars[b & 0x0F];
     }
     
-    return oss.str();
+    return result;
 }
 
 } // anonymous namespace
 
+/**
+ * @brief Format an IOC entry's value to human-readable string
+ * 
+ * Handles all IOC types with proper validation and error handling.
+ * Thread-safe when stringPool is thread-safe for reads.
+ * 
+ * @param entry The IOC entry to format
+ * @param stringPool Optional string pool reader for string-based IOCs
+ * @return Formatted string representation, empty string on error
+ */
 std::string ThreatIntelExporter::FormatIOCValue(
     const IOCEntry& entry,
     const IStringPoolReader* stringPool
-) {
-    switch (entry.type) {
-        case IOCType::IPv4:
-        case IOCType::CIDRv4:
-            return FormatIPv4(entry.value.ipv4);
-            
-        case IOCType::IPv6:
-        case IOCType::CIDRv6:
-            return FormatIPv6(entry.value.ipv6);
-            
-        case IOCType::FileHash:
-            return FormatHash(entry.value.hash);
-            
-        case IOCType::Domain:
-        case IOCType::URL:
-        case IOCType::Email:
-        case IOCType::CertFingerprint:
-        case IOCType::JA3:
-        case IOCType::JA3S:
-        case IOCType::RegistryKey:
-        case IOCType::ProcessName:
-        case IOCType::MutexName:
-        case IOCType::NamedPipe:
-        case IOCType::UserAgent:
-        case IOCType::YaraRule:
-        case IOCType::SigmaRule:
-        case IOCType::MitreAttack:
-        case IOCType::CVE:
-        case IOCType::STIXPattern:
-            // String reference - read from string pool
-            if (stringPool && stringPool->IsValidOffset(entry.value.stringRef.stringOffset)) {
-                auto sv = stringPool->ReadString(
-                    entry.value.stringRef.stringOffset,
-                    entry.value.stringRef.stringLength
-                );
+) noexcept {
+    try {
+        switch (entry.type) {
+            case IOCType::IPv4:
+            case IOCType::CIDRv4:
+                return FormatIPv4(entry.value.ipv4);
+                
+            case IOCType::IPv6:
+            case IOCType::CIDRv6:
+                return FormatIPv6(entry.value.ipv6);
+                
+            case IOCType::FileHash:
+                return FormatHash(entry.value.hash);
+                
+            case IOCType::Domain:
+            case IOCType::URL:
+            case IOCType::Email:
+            case IOCType::CertFingerprint:
+            case IOCType::JA3:
+            case IOCType::JA3S:
+            case IOCType::RegistryKey:
+            case IOCType::ProcessName:
+            case IOCType::MutexName:
+            case IOCType::NamedPipe:
+            case IOCType::UserAgent:
+            case IOCType::YaraRule:
+            case IOCType::SigmaRule:
+            case IOCType::MitreAttack:
+            case IOCType::CVE:
+            case IOCType::STIXPattern: {
+                // String reference - read from string pool with validation
+                if (!stringPool) {
+                    return "";
+                }
+                
+                // Validate string reference bounds
+                const auto& strRef = entry.value.stringRef;
+                static constexpr uint32_t kMaxStringLength = 1024 * 1024;  // 1MB limit
+                
+                if (strRef.stringLength == 0 || strRef.stringLength > kMaxStringLength) {
+                    return "";
+                }
+                
+                if (!stringPool->IsValidOffset(strRef.stringOffset)) {
+                    return "";
+                }
+                
+                // Read string with length limit
+                auto sv = stringPool->ReadString(strRef.stringOffset, strRef.stringLength);
+                if (sv.empty()) {
+                    return "";
+                }
+                
                 return std::string(sv);
             }
-            return "";
-            
-        case IOCType::ASN:
-            // ASN stored as uint32 in raw bytes
-            if (entry.value.raw.size() >= 4) {
-                uint32_t asn = *reinterpret_cast<const uint32_t*>(entry.value.raw.data());
-                return "AS" + std::to_string(asn);
+                
+            case IOCType::ASN: {
+                // ASN stored as uint32 in raw bytes - use memcpy for safe unaligned access
+                if (entry.value.raw.size() < sizeof(uint32_t)) {
+                    return "";
+                }
+                
+                uint32_t asn = 0;
+                std::memcpy(&asn, entry.value.raw.data(), sizeof(uint32_t));
+                
+                // ASN numbers are 32-bit, max is 4294967295
+                // Pre-allocate string: "AS" + up to 10 digits = 12 chars
+                std::string result;
+                result.reserve(12);
+                result = "AS";
+                result += std::to_string(asn);
+                return result;
             }
-            return "";
-            
-        default:
-            return "";
+                
+            default:
+                return "";
+        }
+    } catch (const std::exception&) {
+        // Catch any allocation failures or other exceptions
+        return "";
     }
 }
+
+// ============================================================================
+// Stream Error Capture Helper
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Capture stream state as an error string
+ * 
+ * Translates std::ostream state bits to human-readable error messages.
+ * 
+ * @param stream The stream to check
+ * @return Error message string, empty if stream is good
+ */
+std::string CaptureStreamError(const std::ostream& stream) noexcept {
+    if (stream.good()) {
+        return "";
+    }
+    
+    std::string error;
+    if (stream.bad()) {
+        error = "Stream I/O error (badbit set)";
+    } else if (stream.fail()) {
+        error = "Stream operation failed (failbit set)";
+    } else if (stream.eof()) {
+        error = "End of stream reached";
+    }
+    
+    return error;
+}
+
+} // anonymous namespace
 
 // ============================================================================
 // CSVExportWriter Implementation
@@ -568,19 +911,28 @@ bool CSVExportWriter::Begin(const ExportOptions& options) {
     m_options = options;
     m_bytesWritten = 0;
     m_buffer.clear();
+    m_lastError.clear();
     
     // Write BOM if requested
     if (options.includeBOM) {
         m_output.write("\xEF\xBB\xBF", 3);
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
         m_bytesWritten += 3;
     }
     
     // Write header
     if (options.includeHeader) {
         WriteHeader();
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
     }
     
-    return m_output.good();
+    return true;
 }
 
 void CSVExportWriter::WriteHeader() {
@@ -618,7 +970,24 @@ void CSVExportWriter::WriteHeader() {
     m_bytesWritten += m_buffer.size();
 }
 
+/**
+ * @brief Escape a CSV field value with proper quoting
+ * 
+ * Follows RFC 4180 CSV escaping rules:
+ * - Fields containing delimiters, quotes, or newlines are quoted
+ * - Quotes within quoted fields are doubled
+ * 
+ * @param field The field value to escape
+ */
 void CSVExportWriter::WriteEscapedField(std::string_view field) {
+    // Safety limit to prevent memory exhaustion
+    static constexpr size_t kMaxFieldSize = 10 * 1024 * 1024;  // 10MB max per field
+    
+    if (field.size() > kMaxFieldSize) {
+        // Truncate to avoid memory issues
+        field = field.substr(0, kMaxFieldSize);
+    }
+    
     // Check if escaping is needed
     bool needsQuotes = false;
     for (char c : field) {
@@ -634,11 +1003,17 @@ void CSVExportWriter::WriteEscapedField(std::string_view field) {
         return;
     }
     
+    // Pre-reserve space for worst case (all quotes doubled + surrounding quotes)
+    const size_t worstCase = field.size() * 2 + 2;
+    if (m_buffer.capacity() - m_buffer.size() < worstCase) {
+        m_buffer.reserve(m_buffer.size() + worstCase);
+    }
+    
     // Escape with quotes
     m_buffer += m_options.csvQuote;
     for (char c : field) {
         if (c == m_options.csvQuote) {
-            m_buffer += m_options.csvQuote; // Double the quote
+            m_buffer += m_options.csvQuote;  // Double the quote
         }
         m_buffer += c;
     }
@@ -747,14 +1122,23 @@ bool CSVExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolReader*
     m_buffer += m_options.windowsNewlines ? "\r\n" : "\n";
     
     m_output.write(m_buffer.data(), static_cast<std::streamsize>(m_buffer.size()));
-    m_bytesWritten += m_buffer.size();
     
-    return m_output.good();
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    m_bytesWritten += m_buffer.size();
+    return true;
 }
 
 bool CSVExportWriter::End() {
     Flush();
-    return m_output.good();
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    return true;
 }
 
 void CSVExportWriter::Flush() {
@@ -785,11 +1169,16 @@ bool JSONExportWriter::Begin(const ExportOptions& options) {
     m_bytesWritten = 0;
     m_entryCount = 0;
     m_buffer.clear();
+    m_lastError.clear();
     m_isJsonLines = (options.format == ExportFormat::JSONL);
     
     // Write BOM if requested
     if (options.includeBOM) {
         m_output.write("\xEF\xBB\xBF", 3);
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
         m_bytesWritten += 3;
     }
     
@@ -800,10 +1189,16 @@ bool JSONExportWriter::Begin(const ExportOptions& options) {
         } else {
             m_output << "{\"entries\":[";
         }
+        
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
+        
         m_bytesWritten += m_options.prettyPrint ? 18 : 12;
     }
     
-    return m_output.good();
+    return true;
 }
 
 void JSONExportWriter::WriteIndent(int level) {
@@ -813,7 +1208,30 @@ void JSONExportWriter::WriteIndent(int level) {
     }
 }
 
+/**
+ * @brief JSON string escaping with safety limits
+ * 
+ * Escapes special characters per RFC 8259 (JSON spec):
+ * - Quote, backslash, and control characters are escaped
+ * - Control characters (< 0x20) encoded as \uXXXX
+ * 
+ * @param str The string to escape
+ */
 void JSONExportWriter::WriteEscapedString(std::string_view str) {
+    // Safety limit to prevent memory exhaustion
+    static constexpr size_t kMaxStringSize = 10 * 1024 * 1024;  // 10MB max per string
+    
+    if (str.size() > kMaxStringSize) {
+        str = str.substr(0, kMaxStringSize);
+    }
+    
+    // Pre-reserve space for worst case: control chars expand to 6 chars (\uXXXX)
+    // Plus 2 for surrounding quotes
+    const size_t estimatedSize = str.size() * 2 + 2;  // Reasonable estimate
+    if (m_buffer.capacity() - m_buffer.size() < estimatedSize) {
+        m_buffer.reserve(m_buffer.size() + estimatedSize);
+    }
+    
     m_buffer += '"';
     for (char c : str) {
         switch (c) {
@@ -827,9 +1245,10 @@ void JSONExportWriter::WriteEscapedString(std::string_view str) {
             default:
                 if (static_cast<unsigned char>(c) < 0x20) {
                     // Control character - encode as \u00XX
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                    m_buffer += buf;
+                    static constexpr char hexDigits[] = "0123456789abcdef";
+                    m_buffer += "\\u00";
+                    m_buffer += hexDigits[(static_cast<unsigned char>(c) >> 4) & 0x0F];
+                    m_buffer += hexDigits[static_cast<unsigned char>(c) & 0x0F];
                 } else {
                     m_buffer += c;
                 }
@@ -990,6 +1409,11 @@ bool JSONExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolReader
     if (m_entryCount > 0 && !m_isJsonLines) {
         m_output << ',';
         if (m_options.prettyPrint) m_output << '\n';
+        
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
         m_bytesWritten += m_options.prettyPrint ? 2 : 1;
     }
     
@@ -1000,10 +1424,16 @@ bool JSONExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolReader
     }
     
     m_output.write(m_buffer.data(), static_cast<std::streamsize>(m_buffer.size()));
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten += m_buffer.size();
     m_entryCount++;
     
-    return m_output.good();
+    return true;
 }
 
 bool JSONExportWriter::End() {
@@ -1018,7 +1448,13 @@ bool JSONExportWriter::End() {
     }
     
     Flush();
-    return m_output.good();
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    return true;
 }
 
 void JSONExportWriter::Flush() {
@@ -1049,6 +1485,7 @@ bool STIX21ExportWriter::Begin(const ExportOptions& options) {
     m_bytesWritten = 0;
     m_objectCount = 0;
     m_buffer.clear();
+    m_lastError.clear();
     
     // Generate bundle ID if not provided
     m_bundleId = options.stixBundleId.empty() 
@@ -1067,9 +1504,14 @@ bool STIX21ExportWriter::Begin(const ExportOptions& options) {
     m_output << "\"objects\":[";
     if (pp) m_output << "\n";
     
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten = static_cast<uint64_t>(m_output.tellp());
     
-    return m_output.good();
+    return true;
 }
 
 std::string STIX21ExportWriter::GenerateSTIXId(const IOCEntry& entry) const {
@@ -1288,15 +1730,26 @@ bool STIX21ExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolRead
     if (m_objectCount > 0) {
         m_output << ',';
         if (m_options.prettyPrint) m_output << '\n';
+        
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
     }
     
     WriteIndicatorObject(entry, stringPool);
     
     m_output.write(m_buffer.data(), static_cast<std::streamsize>(m_buffer.size()));
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten += m_buffer.size();
     m_objectCount++;
     
-    return m_output.good();
+    return true;
 }
 
 bool STIX21ExportWriter::End() {
@@ -1307,7 +1760,13 @@ bool STIX21ExportWriter::End() {
     }
     
     Flush();
-    return m_output.good();
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    return true;
 }
 
 void STIX21ExportWriter::Flush() {
@@ -1338,6 +1797,7 @@ bool MISPExportWriter::Begin(const ExportOptions& options) {
     m_bytesWritten = 0;
     m_attributeCount = 0;
     m_buffer.clear();
+    m_lastError.clear();
     
     m_eventUuid = options.mispEventUuid.empty() 
         ? GenerateUUID() 
@@ -1367,9 +1827,14 @@ bool MISPExportWriter::Begin(const ExportOptions& options) {
     m_output << "\"Attribute\":[";
     if (pp) m_output << "\n";
     
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten = static_cast<uint64_t>(m_output.tellp());
     
-    return m_output.good();
+    return true;
 }
 
 std::string MISPExportWriter::MapIOCTypeToMISPType(IOCType type) const {
@@ -1485,15 +1950,26 @@ bool MISPExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolReader
     if (m_attributeCount > 0) {
         m_output << ',';
         if (m_options.prettyPrint) m_output << '\n';
+        
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
     }
     
     WriteAttribute(entry, stringPool);
     
     m_output.write(m_buffer.data(), static_cast<std::streamsize>(m_buffer.size()));
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten += m_buffer.size();
     m_attributeCount++;
     
-    return m_output.good();
+    return true;
 }
 
 bool MISPExportWriter::End() {
@@ -1504,7 +1980,13 @@ bool MISPExportWriter::End() {
     }
     
     Flush();
-    return m_output.good();
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    return true;
 }
 
 void MISPExportWriter::Flush() {
@@ -1534,6 +2016,7 @@ bool OpenIOCExportWriter::Begin(const ExportOptions& options) {
     m_options = options;
     m_bytesWritten = 0;
     m_buffer.clear();
+    m_lastError.clear();
     
     // Write XML header and OpenIOC root
     m_output << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
@@ -1555,12 +2038,42 @@ bool OpenIOCExportWriter::Begin(const ExportOptions& options) {
     m_output << "  <definition>\n";
     m_output << "    <Indicator operator=\"OR\" id=\"" << GenerateUUID() << "\">\n";
     
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten = static_cast<uint64_t>(m_output.tellp());
     
-    return m_output.good();
+    return true;
 }
 
+/**
+ * @brief XML character escaping with safety limits
+ * 
+ * Escapes the five predefined XML entities:
+ * - & -> &amp;
+ * - < -> &lt;
+ * - > -> &gt;
+ * - " -> &quot;
+ * - ' -> &apos;
+ * 
+ * @param str The string to escape for XML content
+ */
 void OpenIOCExportWriter::WriteXMLEscaped(std::string_view str) {
+    // Safety limit to prevent memory exhaustion
+    static constexpr size_t kMaxStringSize = 10 * 1024 * 1024;  // 10MB max per string
+    
+    if (str.size() > kMaxStringSize) {
+        str = str.substr(0, kMaxStringSize);
+    }
+    
+    // Pre-reserve: worst case is all ampersands (&amp; = 5x expansion)
+    const size_t estimatedSize = str.size() * 5;
+    if (m_buffer.capacity() - m_buffer.size() < estimatedSize) {
+        m_buffer.reserve(m_buffer.size() + estimatedSize);
+    }
+    
     for (char c : str) {
         switch (c) {
             case '&':  m_buffer += "&amp;"; break;
@@ -1568,7 +2081,13 @@ void OpenIOCExportWriter::WriteXMLEscaped(std::string_view str) {
             case '>':  m_buffer += "&gt;"; break;
             case '"':  m_buffer += "&quot;"; break;
             case '\'': m_buffer += "&apos;"; break;
-            default:   m_buffer += c; break;
+            default:
+                // Filter out invalid XML characters (control chars except \t, \n, \r)
+                if (static_cast<unsigned char>(c) >= 0x20 || c == '\t' || c == '\n' || c == '\r') {
+                    m_buffer += c;
+                }
+                // Invalid chars are silently dropped to maintain XML validity
+                break;
         }
     }
 }
@@ -1633,9 +2152,15 @@ bool OpenIOCExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolRea
     WriteIndicatorItem(entry, stringPool);
     
     m_output.write(m_buffer.data(), static_cast<std::streamsize>(m_buffer.size()));
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
     m_bytesWritten += m_buffer.size();
     
-    return m_output.good();
+    return true;
 }
 
 bool OpenIOCExportWriter::End() {
@@ -1644,7 +2169,13 @@ bool OpenIOCExportWriter::End() {
     m_output << "</ioc>\n";
     
     Flush();
-    return m_output.good();
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    return true;
 }
 
 void OpenIOCExportWriter::Flush() {
@@ -1672,13 +2203,18 @@ PlainTextExportWriter::~PlainTextExportWriter() = default;
 bool PlainTextExportWriter::Begin(const ExportOptions& options) {
     m_options = options;
     m_bytesWritten = 0;
+    m_lastError.clear();
     
     if (options.includeBOM) {
         m_output.write("\xEF\xBB\xBF", 3);
+        if (!m_output.good()) {
+            m_lastError = CaptureStreamError(m_output);
+            return false;
+        }
         m_bytesWritten += 3;
     }
     
-    return m_output.good();
+    return true;
 }
 
 std::string PlainTextExportWriter::FormatIOCValue(
@@ -1694,18 +2230,28 @@ bool PlainTextExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolR
     m_output << value;
     if (m_options.windowsNewlines) {
         m_output << "\r\n";
-        m_bytesWritten += value.size() + 2;
     } else {
         m_output << '\n';
-        m_bytesWritten += value.size() + 1;
     }
     
-    return m_output.good();
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    m_bytesWritten += value.size() + (m_options.windowsNewlines ? 2 : 1);
+    return true;
 }
 
 bool PlainTextExportWriter::End() {
     Flush();
-    return m_output.good();
+    
+    if (!m_output.good()) {
+        m_lastError = CaptureStreamError(m_output);
+        return false;
+    }
+    
+    return true;
 }
 
 void PlainTextExportWriter::Flush() {
@@ -2096,6 +2642,18 @@ std::string ThreatIntelExporter::ExportEntry(
     return oss.str();
 }
 
+/**
+ * @brief Export IOCs grouped by type to separate files
+ * 
+ * Creates one file per IOC type in the specified output directory.
+ * Thread-safe, handles memory limits for large databases.
+ * 
+ * @param database Source database
+ * @param outputDir Output directory path (created if doesn't exist)
+ * @param options Export configuration
+ * @param progressCallback Optional progress callback
+ * @return Map of IOCType to ExportResult for each exported type
+ */
 std::unordered_map<IOCType, ExportResult> ThreatIntelExporter::ExportByType(
     const ThreatIntelDatabase& database,
     const std::wstring& outputDir,
@@ -2103,6 +2661,11 @@ std::unordered_map<IOCType, ExportResult> ThreatIntelExporter::ExportByType(
     ExportProgressCallback progressCallback
 ) {
     std::unordered_map<IOCType, ExportResult> results;
+    
+    // Validate output directory path
+    if (outputDir.empty()) {
+        return results;
+    }
     
     // Get all IOC types present in database
     const IOCEntry* entries = database.GetEntries();
@@ -2112,25 +2675,80 @@ std::unordered_map<IOCType, ExportResult> ThreatIntelExporter::ExportByType(
         return results;
     }
     
+    // Safety limit to prevent memory exhaustion
+    static constexpr size_t kMaxEntriesPerType = 100'000'000;  // 100M entries max
+    
     // Group entries by type
     std::unordered_map<IOCType, std::vector<const IOCEntry*>> entriesByType;
     
-    for (size_t i = 0; i < entryCount; ++i) {
-        entriesByType[entries[i].type].push_back(&entries[i]);
+    try {
+        for (size_t i = 0; i < entryCount; ++i) {
+            auto& typeVec = entriesByType[entries[i].type];
+            if (typeVec.size() < kMaxEntriesPerType) {
+                typeVec.push_back(&entries[i]);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        // Memory allocation failed - return partial results
+        return results;
     }
+    
+    // Helper to safely convert char* to wstring
+    auto safeCharToWstring = [](const char* str) -> std::wstring {
+        if (!str || str[0] == '\0') {
+            return L"unknown";
+        }
+        
+        // Calculate length with safety limit
+        size_t len = 0;
+        static constexpr size_t kMaxLen = 256;
+        while (len < kMaxLen && str[len] != '\0') {
+            ++len;
+        }
+        
+        // Convert using safe method
+        std::wstring result;
+        result.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            result += static_cast<wchar_t>(static_cast<unsigned char>(str[i]));
+        }
+        return result;
+    };
     
     // Export each type
     for (const auto& [type, typeEntries] : entriesByType) {
-        std::wstring filename = outputDir + L"/" + 
-            std::wstring(IOCTypeToString(type), IOCTypeToString(type) + strlen(IOCTypeToString(type))) +
-            std::wstring(GetExportFormatExtension(options.format), 
-                         GetExportFormatExtension(options.format) + strlen(GetExportFormatExtension(options.format)));
+        // Check cancellation
+        if (m_cancellationRequested.load(std::memory_order_relaxed)) {
+            break;
+        }
         
-        // Create vector from pointers
+        // Build filename safely
+        const char* typeStr = IOCTypeToString(type);
+        const char* extStr = GetExportFormatExtension(options.format);
+        
+        std::wstring filename = outputDir;
+        // Ensure path separator
+        if (!filename.empty() && filename.back() != L'/' && filename.back() != L'\\') {
+            filename += L'/';
+        }
+        filename += safeCharToWstring(typeStr);
+        filename += safeCharToWstring(extStr);
+        
+        // Create vector from pointers with allocation safety
         std::vector<IOCEntry> entriesVec;
-        entriesVec.reserve(typeEntries.size());
-        for (const IOCEntry* e : typeEntries) {
-            entriesVec.push_back(*e);
+        try {
+            entriesVec.reserve(typeEntries.size());
+            for (const IOCEntry* e : typeEntries) {
+                if (e) {
+                    entriesVec.push_back(*e);
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            ExportResult failResult;
+            failResult.success = false;
+            failResult.errorMessage = "Memory allocation failed for type entries";
+            results[type] = failResult;
+            continue;
         }
         
         results[type] = ExportToFile(

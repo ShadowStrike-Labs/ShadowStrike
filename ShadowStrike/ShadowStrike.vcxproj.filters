@@ -201,9 +201,6 @@
     <ClCompile Include="src\Cache\MemoryCache.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="src\Cache\PersistentCache.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="external\tlsh\src\tlsh.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>

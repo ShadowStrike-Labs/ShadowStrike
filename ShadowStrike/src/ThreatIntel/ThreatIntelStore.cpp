@@ -66,6 +66,18 @@ namespace ShadowStrike {
 namespace ThreatIntel {
 
 // ============================================================================
+// Compile-Time Validations
+// ============================================================================
+
+static_assert(sizeof(uint8_t) == 1, "uint8_t must be 1 byte");
+static_assert(sizeof(uint32_t) == 4, "uint32_t must be 4 bytes");
+static_assert(sizeof(uint64_t) == 8, "uint64_t must be 8 bytes");
+static_assert(sizeof(IN6_ADDR) == 16, "IN6_ADDR must be 16 bytes");
+
+// Default TTL for IOC entries (30 days in seconds)
+constexpr uint64_t DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -73,142 +85,229 @@ namespace {
 
 /**
  * @brief Convert string to IPv4Address
+ * 
+ * Safe parsing without exceptions. Handles CIDR notation.
+ * 
+ * @param str IPv4 address string (e.g., "192.168.1.1" or "10.0.0.0/8")
+ * @return Parsed IPv4Address or nullopt on failure
  */
 [[nodiscard]] std::optional<IPv4Address> ParseIPv4(std::string_view str) noexcept {
-    try {
-        IPv4Address addr{};
-        addr.prefixLength = 32; // Default full address
-        
-        // Check for CIDR notation
-        size_t slashPos = str.find('/');
-        std::string_view ipPart = (slashPos != std::string_view::npos) 
-            ? str.substr(0, slashPos) 
-            : str;
-        
-        if (slashPos != std::string_view::npos) {
-            std::string_view prefixStr = str.substr(slashPos + 1);
-            addr.prefixLength = static_cast<uint8_t>(std::stoi(std::string(prefixStr)));
-            if (addr.prefixLength > 32) return std::nullopt;
-        }
-        
-        // Parse octets
-        uint32_t result = 0;
-        int octetIndex = 0;
-        size_t start = 0;
-        
-        for (size_t i = 0; i <= ipPart.length(); ++i) {
-            if (i == ipPart.length() || ipPart[i] == '.') {
-                if (octetIndex >= 4) return std::nullopt;
-                
-                std::string octetStr(ipPart.substr(start, i - start));
-                int octet = std::stoi(octetStr);
-                if (octet < 0 || octet > 255) return std::nullopt;
-                
-                result = (result << 8) | static_cast<uint8_t>(octet);
-                ++octetIndex;
-                start = i + 1;
-            }
-        }
-        
-        if (octetIndex != 4) return std::nullopt;
-        
-        addr.address = result;
-        return addr;
-    } catch (...) {
+    if (str.empty() || str.size() > 18) {  // Max: "255.255.255.255/32"
         return std::nullopt;
     }
+    
+    IPv4Address addr{};
+    addr.prefixLength = 32;  // Default full address
+    
+    // Check for CIDR notation
+    size_t slashPos = str.find('/');
+    std::string_view ipPart = (slashPos != std::string_view::npos) 
+        ? str.substr(0, slashPos) 
+        : str;
+    
+    // Parse CIDR prefix if present
+    if (slashPos != std::string_view::npos) {
+        std::string_view prefixStr = str.substr(slashPos + 1);
+        if (prefixStr.empty() || prefixStr.size() > 2) {
+            return std::nullopt;
+        }
+        
+        uint32_t prefix = 0;
+        for (char c : prefixStr) {
+            if (c < '0' || c > '9') {
+                return std::nullopt;
+            }
+            prefix = prefix * 10 + static_cast<uint32_t>(c - '0');
+        }
+        
+        if (prefix > 32) {
+            return std::nullopt;
+        }
+        addr.prefixLength = static_cast<uint8_t>(prefix);
+    }
+    
+    // Parse octets safely without exceptions
+    uint32_t result = 0;
+    int octetIndex = 0;
+    uint32_t currentOctet = 0;
+    size_t digitCount = 0;
+    
+    for (size_t i = 0; i <= ipPart.size(); ++i) {
+        if (i == ipPart.size() || ipPart[i] == '.') {
+            // Validate octet
+            if (digitCount == 0 || currentOctet > 255 || octetIndex >= 4) {
+                return std::nullopt;
+            }
+            
+            result = (result << 8) | currentOctet;
+            ++octetIndex;
+            currentOctet = 0;
+            digitCount = 0;
+        } else {
+            char c = ipPart[i];
+            if (c < '0' || c > '9') {
+                return std::nullopt;
+            }
+            
+            currentOctet = currentOctet * 10 + static_cast<uint32_t>(c - '0');
+            ++digitCount;
+            
+            // Prevent overflow and leading zeros check
+            if (digitCount > 3 || currentOctet > 255) {
+                return std::nullopt;
+            }
+        }
+    }
+    
+    if (octetIndex != 4) {
+        return std::nullopt;
+    }
+    
+    addr.address = result;
+    return addr;
 }
 
 /**
  * @brief Convert string to IPv6Address
+ * 
+ * Safe parsing using Windows InetPtonA. Handles CIDR notation.
+ * 
+ * @param str IPv6 address string (e.g., "::1" or "2001:db8::/32")
+ * @return Parsed IPv6Address or nullopt on failure
  */
 [[nodiscard]] std::optional<IPv6Address> ParseIPv6(std::string_view str) noexcept {
-    try {
-        IPv6Address addr{};
-        addr.prefixLength = 128; // Default full address
-        
-        // Check for CIDR notation
-        size_t slashPos = str.find('/');
-        std::string_view ipPart = (slashPos != std::string_view::npos) 
-            ? str.substr(0, slashPos) 
-            : str;
-        
-        if (slashPos != std::string_view::npos) {
-            std::string_view prefixStr = str.substr(slashPos + 1);
-            addr.prefixLength = static_cast<uint8_t>(std::stoi(std::string(prefixStr)));
-            if (addr.prefixLength > 128) return std::nullopt;
-        }
-        
-        // Use Windows API for IPv6 parsing
-        std::string ipStr(ipPart);
-        IN6_ADDR in6addr{};
-        if (InetPtonA(AF_INET6, ipStr.c_str(), &in6addr) != 1) {
+    // Validate input length (min "::" = 2, max with CIDR ~50)
+    if (str.size() < 2 || str.size() > 50) {
+        return std::nullopt;
+    }
+    
+    IPv6Address addr{};
+    addr.prefixLength = 128;  // Default full address
+    
+    // Check for CIDR notation
+    size_t slashPos = str.find('/');
+    std::string_view ipPart = (slashPos != std::string_view::npos) 
+        ? str.substr(0, slashPos) 
+        : str;
+    
+    // Parse CIDR prefix if present
+    if (slashPos != std::string_view::npos) {
+        std::string_view prefixStr = str.substr(slashPos + 1);
+        if (prefixStr.empty() || prefixStr.size() > 3) {
             return std::nullopt;
         }
         
-        std::memcpy(addr.address.data(), in6addr.u.Byte, 16);
-        return addr;
-    } catch (...) {
+        uint32_t prefix = 0;
+        for (char c : prefixStr) {
+            if (c < '0' || c > '9') {
+                return std::nullopt;
+            }
+            prefix = prefix * 10 + static_cast<uint32_t>(c - '0');
+        }
+        
+        if (prefix > 128) {
+            return std::nullopt;
+        }
+        addr.prefixLength = static_cast<uint8_t>(prefix);
+    }
+    
+    // Use Windows API for IPv6 parsing (thread-safe)
+    // Create null-terminated string for API
+    if (ipPart.size() >= 46) {  // INET6_ADDRSTRLEN is 46
         return std::nullopt;
     }
+    
+    char ipBuffer[46] = {0};
+    std::memcpy(ipBuffer, ipPart.data(), ipPart.size());
+    
+    IN6_ADDR in6addr{};
+    if (InetPtonA(AF_INET6, ipBuffer, &in6addr) != 1) {
+        return std::nullopt;
+    }
+    
+    static_assert(sizeof(addr.address) >= 16, "IPv6 address buffer too small");
+    std::memcpy(addr.address.data(), in6addr.u.Byte, 16);
+    
+    return addr;
 }
 
 /**
  * @brief Detect hash algorithm from hex string length
+ * 
+ * @param hashHex Hex-encoded hash string
+ * @return Detected algorithm or MD5 as conservative fallback
  */
-[[nodiscard]] HashAlgorithm DetectHashAlgorithm(std::string_view hashHex) noexcept {
-    switch (hashHex.length()) {
-        case 32:  return HashAlgorithm::MD5;
-        case 40:  return HashAlgorithm::SHA1;
-        case 64:  return HashAlgorithm::SHA256;
-        case 96:  return HashAlgorithm::SHA256; // Fallback to SHA256
-        case 128: return HashAlgorithm::SHA512;
-        default:  return HashAlgorithm::MD5; // Fallback to MD5
+[[nodiscard]] constexpr HashAlgorithm DetectHashAlgorithm(size_t hexLength) noexcept {
+    switch (hexLength) {
+        case 32:  return HashAlgorithm::MD5;      // 16 bytes = 32 hex chars
+        case 40:  return HashAlgorithm::SHA1;     // 20 bytes = 40 hex chars
+        case 64:  return HashAlgorithm::SHA256;   // 32 bytes = 64 hex chars
+        case 128: return HashAlgorithm::SHA512;   // 64 bytes = 128 hex chars
+        default:  return HashAlgorithm::SHA256;   // Conservative fallback for unknown
     }
 }
 
 /**
  * @brief Parse hash string to HashValue
+ * 
+ * Converts hex-encoded hash string to HashValue structure.
+ * Auto-detects algorithm from length if not specified.
+ * 
+ * @param algorithm Algorithm name (empty string for auto-detect)
+ * @param hashHex Hex-encoded hash string
+ * @return Parsed HashValue or nullopt on failure
  */
 [[nodiscard]] std::optional<HashValue> ParseHash(std::string_view algorithm, std::string_view hashHex) noexcept {
-    try {
-        HashValue hash{};
-        
-        // Determine algorithm
-        if (algorithm == "MD5" || algorithm == "md5") {
-            hash.algorithm = HashAlgorithm::MD5;
-        } else if (algorithm == "SHA1" || algorithm == "sha1" || algorithm == "SHA-1") {
-            hash.algorithm = HashAlgorithm::SHA1;
-        } else if (algorithm == "SHA256" || algorithm == "sha256" || algorithm == "SHA-256") {
-            hash.algorithm = HashAlgorithm::SHA256;
-        } else if (algorithm == "SHA384" || algorithm == "sha384" || algorithm == "SHA-384") {
-            hash.algorithm = HashAlgorithm::SHA256; // Fallback to SHA256
-        } else if (algorithm == "SHA512" || algorithm == "sha512" || algorithm == "SHA-512") {
-            hash.algorithm = HashAlgorithm::SHA512;
-        } else {
-            // Try to auto-detect from length
-            hash.algorithm = DetectHashAlgorithm(hashHex);
-        }
-        
-        // Algorithm is always set now, no Unknown check needed
-        
-        // Parse hex string
-        std::vector<uint8_t> bytes;
-        if (!Utils::HashUtils::FromHex(hashHex, bytes)) {
-            return std::nullopt;
-        }
-        
-        if (bytes.size() > hash.data.size()) {
-            return std::nullopt;
-        }
-        
-        hash.length = static_cast<uint8_t>(bytes.size());
-        std::memcpy(hash.data.data(), bytes.data(), bytes.size());
-        
-        return hash;
-    } catch (...) {
+    // Validate hex string length (must be even)
+    if (hashHex.empty() || hashHex.length() % 2 != 0 || hashHex.length() > 128) {
         return std::nullopt;
     }
+    
+    HashValue hash{};
+    
+    // Determine algorithm - check explicit algorithm first
+    if (algorithm == "MD5" || algorithm == "md5") {
+        hash.algorithm = HashAlgorithm::MD5;
+    } else if (algorithm == "SHA1" || algorithm == "sha1" || algorithm == "SHA-1") {
+        hash.algorithm = HashAlgorithm::SHA1;
+    } else if (algorithm == "SHA256" || algorithm == "sha256" || algorithm == "SHA-256") {
+        hash.algorithm = HashAlgorithm::SHA256;
+    } else if (algorithm == "SHA384" || algorithm == "sha384" || algorithm == "SHA-384") {
+        hash.algorithm = HashAlgorithm::SHA256;  // Store as SHA256, closest match
+    } else if (algorithm == "SHA512" || algorithm == "sha512" || algorithm == "SHA-512") {
+        hash.algorithm = HashAlgorithm::SHA512;
+    } else {
+        // Auto-detect from length
+        hash.algorithm = DetectHashAlgorithm(hashHex.length());
+    }
+    
+    // Parse hex string to bytes manually (no exceptions)
+    const size_t byteCount = hashHex.length() / 2;
+    if (byteCount > hash.data.size()) {
+        return std::nullopt;
+    }
+    
+    auto hexDigit = [](char c) noexcept -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;  // Invalid
+    };
+    
+    for (size_t i = 0; i < byteCount; ++i) {
+        const int high = hexDigit(hashHex[i * 2]);
+        const int low = hexDigit(hashHex[i * 2 + 1]);
+        
+        if (high < 0 || low < 0) {
+            return std::nullopt;  // Invalid hex character
+        }
+        
+        hash.data[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+    
+    hash.length = static_cast<uint8_t>(byteCount);
+    
+    return hash;
 }
 
 /**
@@ -224,12 +323,31 @@ namespace {
 
 /**
  * @brief Get high-resolution timestamp in nanoseconds
+ * 
+ * Uses QueryPerformanceCounter with cached frequency for efficiency.
+ * Thread-safe due to static initialization guarantees.
  */
 [[nodiscard]] inline uint64_t GetNanoseconds() noexcept {
-    LARGE_INTEGER frequency, counter;
-    QueryPerformanceFrequency(&frequency);
-    QueryPerformanceCounter(&counter);
-    return (counter.QuadPart * 1000000000ULL) / frequency.QuadPart;
+    // Cache frequency - initialized once, thread-safe in C++11+
+    static const uint64_t frequency = []() noexcept -> uint64_t {
+        LARGE_INTEGER freq;
+        if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
+            return 1;  // Fallback to prevent division by zero
+        }
+        return static_cast<uint64_t>(freq.QuadPart);
+    }();
+    
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) {
+        return 0;  // Error case
+    }
+    
+    // Convert to nanoseconds with overflow protection
+    // counter * 1e9 / frequency, but avoid overflow
+    const uint64_t seconds = static_cast<uint64_t>(counter.QuadPart) / frequency;
+    const uint64_t remainder = static_cast<uint64_t>(counter.QuadPart) % frequency;
+    
+    return seconds * 1000000000ULL + (remainder * 1000000000ULL) / frequency;
 }
 
 } // anonymous namespace
@@ -320,52 +438,74 @@ public:
 
     /**
      * @brief Fire event to registered callbacks
+     * 
+     * Iterates through all registered callbacks and invokes them.
+     * Exceptions from callbacks are caught and suppressed.
+     * Thread-safe: acquires lock on callbackMutex.
+     * 
+     * @param event Event to fire to callbacks
      */
     void FireEvent(const StoreEvent& event) noexcept {
         std::lock_guard<std::mutex> lock(callbackMutex);
         for (const auto& [id, callback] : eventCallbacks) {
+            if (!callback) {
+                continue;  // Skip null callbacks
+            }
             try {
                 callback(event);
             } catch (...) {
-                // Swallow exceptions from user callbacks
+                // Swallow exceptions from user callbacks to prevent propagation
+                // In production, consider logging callback failures
             }
         }
     }
 
     /**
      * @brief Update statistics from subsystems
+     * 
+     * Aggregates statistics from all initialized subsystems.
+     * Thread-safe: acquires exclusive lock on statsMutex.
      */
     void UpdateStatistics() noexcept {
         std::unique_lock<std::shared_mutex> lock(statsMutex);
 
-        if (database && database->IsOpen()) {
-            auto dbStats = database->GetStats();
-            stats.databaseSizeBytes = dbStats.mappedSize;
-            stats.totalIOCEntries = dbStats.entryCount;
-        }
+        try {
+            if (database && database->IsOpen()) {
+                auto dbStats = database->GetStats();
+                stats.databaseSizeBytes = dbStats.mappedSize;
+                stats.totalIOCEntries = dbStats.entryCount;
+            }
 
-        if (cache) {
-            auto cacheStats = cache->GetStatistics();
-            stats.cacheSizeBytes = cacheStats.memoryUsageBytes;
-            stats.cacheHits.store(cacheStats.cacheHits, std::memory_order_relaxed);
-            stats.cacheMisses.store(cacheStats.cacheMisses, std::memory_order_relaxed);
-        }
+            if (cache) {
+                auto cacheStats = cache->GetStatistics();
+                stats.cacheSizeBytes = cacheStats.memoryUsageBytes;
+                stats.cacheHits.store(cacheStats.cacheHits, std::memory_order_relaxed);
+                stats.cacheMisses.store(cacheStats.cacheMisses, std::memory_order_relaxed);
+            }
 
-        if (index) {
-            auto indexStats = index->GetStatistics();
-            stats.totalHashEntries = indexStats.hashEntries;
-            stats.totalIPEntries = indexStats.ipv4Entries + indexStats.ipv6Entries;
-            // Note: totalIPv4Entries and totalIPv6Entries not in StoreStatistics
-            stats.totalDomainEntries = indexStats.domainEntries;
-            stats.totalURLEntries = indexStats.urlEntries;
-            stats.totalEmailEntries = indexStats.emailEntries;
-        }
+            if (index) {
+                auto indexStats = index->GetStatistics();
+                stats.totalHashEntries = indexStats.hashEntries;
+                stats.totalIPEntries = indexStats.ipv4Entries + indexStats.ipv6Entries;
+                stats.totalDomainEntries = indexStats.domainEntries;
+                stats.totalURLEntries = indexStats.urlEntries;
+                stats.totalEmailEntries = indexStats.emailEntries;
+            }
 
-        stats.lastUpdateAt = std::chrono::system_clock::now();
+            stats.lastUpdateAt = std::chrono::system_clock::now();
+        } catch (...) {
+            // Statistics update failed - non-critical, continue
+        }
     }
 
     /**
-     * @brief Convert LookupResult to store-level result format
+     * @brief Convert ThreatLookupResult to store-level LookupResult format
+     * 
+     * Maps fields from internal ThreatLookupResult to public LookupResult.
+     * All fields are copied by value - no ownership transfer.
+     * 
+     * @param tlResult Internal lookup result
+     * @return Public LookupResult structure
      */
     [[nodiscard]] LookupResult ConvertLookupResult(
         const ThreatLookupResult& tlResult
@@ -906,13 +1046,19 @@ BatchLookupResult ThreatIntelStore::BatchLookupHashes(
     for (const auto& hashStr : hashes) {
         auto lookupResult = LookupHash(algorithm, hashStr, options);
         
-        // Convert LookupResult to ThreatLookupResult
+        // Convert LookupResult to ThreatLookupResult for internal storage
         ThreatLookupResult tlr{};
         tlr.found = lookupResult.found;
         tlr.reputation = lookupResult.reputation;
         tlr.confidence = lookupResult.confidence;
         tlr.category = lookupResult.category;
         tlr.latencyNs = lookupResult.latencyNs;
+        tlr.primarySource = lookupResult.primarySource;
+        tlr.sourceFlags = lookupResult.sourceFlags;
+        tlr.threatScore = lookupResult.score;
+        tlr.firstSeen = lookupResult.firstSeen;
+        tlr.lastSeen = lookupResult.lastSeen;
+        tlr.entry = lookupResult.entry;
         result.results.push_back(tlr);
 
         if (lookupResult.found) {
@@ -933,12 +1079,6 @@ BatchLookupResult ThreatIntelStore::BatchLookupHashes(
     }
 
     result.notFoundCount = result.totalProcessed - result.foundCount;
-    const uint64_t totalTime = GetNanoseconds() - startTime;
-    result.totalLatencyNs = totalTime;
-
-    if (result.totalProcessed > 0) {
-        result.avgLatencyNs = totalTime / result.totalProcessed;
-    }
 
     return result;
 }
@@ -967,21 +1107,26 @@ BatchLookupResult ThreatIntelStore::BatchLookupIPv4(
     auto tlResult = m_impl->lookup->BatchLookupIPv4(views, options);
     
     for (const auto& tr : tlResult.results) {
+        result.results.push_back(tr);  // Store ThreatLookupResult directly
         auto lr = m_impl->Impl::ConvertLookupResult(tr);
-        result.results.push_back(tr); // Push ThreatLookupResult
 
         if (lr.found) {
             ++result.foundCount;
-            if (lr.fromCache) ++result.sharedCacheHits;
-            else ++result.databaseHits;
+            if (lr.fromCache) {
+                ++result.sharedCacheHits;
+            } else {
+                ++result.databaseHits;
+            }
             
-            if (lr.IsMalicious()) ++result.maliciousCount;
-            else if (lr.IsSuspicious()) ++result.suspiciousCount;
+            if (lr.IsMalicious()) {
+                ++result.maliciousCount;
+            } else if (lr.IsSuspicious()) {
+                ++result.suspiciousCount;
+            }
         }
     }
 
     result.notFoundCount = result.totalProcessed - result.foundCount;
-    result.totalLatencyNs = GetNanoseconds() - startTime;
 
     return result;
 }
@@ -1010,21 +1155,26 @@ BatchLookupResult ThreatIntelStore::BatchLookupDomains(
     auto tlResult = m_impl->lookup->BatchLookupDomains(views, options);
     
     for (const auto& tr : tlResult.results) {
+        result.results.push_back(tr);  // Store ThreatLookupResult directly
         auto lr = m_impl->Impl::ConvertLookupResult(tr);
-        result.results.push_back(tr); // Push ThreatLookupResult
 
         if (lr.found) {
             ++result.foundCount;
-            if (lr.fromCache) ++result.sharedCacheHits;
-            else ++result.databaseHits;
+            if (lr.fromCache) {
+                ++result.sharedCacheHits;
+            } else {
+                ++result.databaseHits;
+            }
             
-            if (lr.IsMalicious()) ++result.maliciousCount;
-            else if (lr.IsSuspicious()) ++result.suspiciousCount;
+            if (lr.IsMalicious()) {
+                ++result.maliciousCount;
+            } else if (lr.IsSuspicious()) {
+                ++result.suspiciousCount;
+            }
         }
     }
 
     result.notFoundCount = result.totalProcessed - result.foundCount;
-    result.totalLatencyNs = GetNanoseconds() - startTime;
 
     return result;
 }
@@ -1047,13 +1197,19 @@ BatchLookupResult ThreatIntelStore::BatchLookupIOCs(
     for (const auto& [type, value] : iocs) {
         auto lookupResult = LookupIOC(type, value, options);
         
-        // Convert to ThreatLookupResult
+        // Convert LookupResult to ThreatLookupResult for internal storage
         ThreatLookupResult tlr{};
         tlr.found = lookupResult.found;
         tlr.reputation = lookupResult.reputation;
         tlr.confidence = lookupResult.confidence;
         tlr.category = lookupResult.category;
         tlr.latencyNs = lookupResult.latencyNs;
+        tlr.primarySource = lookupResult.primarySource;
+        tlr.sourceFlags = lookupResult.sourceFlags;
+        tlr.threatScore = lookupResult.score;
+        tlr.firstSeen = lookupResult.firstSeen;
+        tlr.lastSeen = lookupResult.lastSeen;
+        tlr.entry = lookupResult.entry;
         result.results.push_back(tlr);
 
         if (lookupResult.found) {
@@ -1074,7 +1230,6 @@ BatchLookupResult ThreatIntelStore::BatchLookupIOCs(
     }
 
     result.notFoundCount = result.totalProcessed - result.foundCount;
-    result.totalLatencyNs = GetNanoseconds() - startTime;
 
     return result;
 }
@@ -1213,6 +1368,11 @@ size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept
         return 0;
     }
 
+    // Empty span check - early exit optimization
+    if (entries.empty()) {
+        return 0;
+    }
+
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
     size_t added = 0;
@@ -1224,23 +1384,38 @@ size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept
         }
     }
 
-    m_impl->stats.totalImportedEntries.fetch_add(added, std::memory_order_relaxed);
+    // Update statistics atomically
+    if (added > 0) {
+        m_impl->stats.totalImportedEntries.fetch_add(added, std::memory_order_relaxed);
+        
+        // Fire bulk event to notify listeners
+        StoreEvent event;
+        event.type = StoreEventType::DataImported;
+        event.timestamp = std::chrono::system_clock::now();
+        event.iocType = std::nullopt;  // Mixed types in bulk - no specific type
+        m_impl->FireEvent(event);
+    }
 
     return added;
 }
 
 bool ThreatIntelStore::HasIOC(IOCType type, std::string_view value) const noexcept {
-    if (!IsInitialized() || !m_impl->iocManager) {
+    if (!IsInitialized() || !m_impl->lookup) {
         return false;
     }
 
+    // Use shared lock for read-only operation
     std::shared_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    // Check via lookup with default options (cast away const)
-    auto* self = const_cast<ThreatIntelStore*>(this);
-    LookupOptions opts{};
-    auto result = self->LookupIOC(type, std::string(value), opts);
-    return result.found;
+    // Perform lookup through the lookup interface directly
+    // Note: m_impl->lookup methods are const-correct and thread-safe
+    // Use fast lookup options for existence check
+    LookupOptions opts = LookupOptions::FastestLookup();
+    opts.cacheResult = false;  // Don't modify cache for existence check
+    opts.includeMetadata = false;
+    
+    auto tlResult = m_impl->lookup->Lookup(type, value, opts);
+    return tlResult.found;
 }
 
 // ============================================================================
@@ -1360,23 +1535,20 @@ ImportResult ThreatIntelStore::ImportSTIX(
     const ImportOptions& options
 ) noexcept {
     ImportResult result;
+    result.success = false;
     
     if (!IsInitialized() || !m_impl->importer) {
-        result.success = false;
-        // No errorMessages field
         return result;
     }
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    const auto startTime = std::chrono::steady_clock::now();
+    [[maybe_unused]] const auto startTime = std::chrono::steady_clock::now();
 
+    // TODO: Implement actual STIX import
     // result = m_impl->importer->ImportFromFile(filePath, ImportFormat::STIX21);
 
-    // No duration field
-
-    if (result.success) {
-        // Use 'imported' field from ImportResult
+    if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
     }
 
@@ -1388,19 +1560,20 @@ ImportResult ThreatIntelStore::ImportCSV(
     const ImportOptions& options
 ) noexcept {
     ImportResult result;
+    result.success = false;
     
     if (!IsInitialized() || !m_impl->importer) {
-        result.success = false;
         return result;
     }
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    const auto startTime = std::chrono::steady_clock::now();
+    [[maybe_unused]] const auto startTime = std::chrono::steady_clock::now();
 
+    // TODO: Implement actual CSV import
     // result = m_impl->importer->ImportFromFile(filePath, ImportFormat::CSV);
 
-    if (result.success) {
+    if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
     }
 
@@ -1412,19 +1585,20 @@ ImportResult ThreatIntelStore::ImportJSON(
     const ImportOptions& options
 ) noexcept {
     ImportResult result;
+    result.success = false;
     
     if (!IsInitialized() || !m_impl->importer) {
-        result.success = false;
         return result;
     }
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    const auto startTime = std::chrono::steady_clock::now();
+    [[maybe_unused]] const auto startTime = std::chrono::steady_clock::now();
 
+    // TODO: Implement actual JSON import
     // result = m_impl->importer->ImportFromFile(filePath, ImportFormat::JSON);
 
-    if (result.success) {
+    if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
     }
 
@@ -1437,19 +1611,20 @@ ImportResult ThreatIntelStore::ImportPlainText(
     const ImportOptions& options
 ) noexcept {
     ImportResult result;
+    result.success = false;
     
     if (!IsInitialized() || !m_impl->importer) {
-        result.success = false;
         return result;
     }
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    const auto startTime = std::chrono::steady_clock::now();
+    [[maybe_unused]] const auto startTime = std::chrono::steady_clock::now();
 
+    // TODO: Implement actual PlainText import
     // result = m_impl->importer->ImportFromFile(filePath, ImportFormat::PlainText);
 
-    if (result.success) {
+    if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
     }
 
@@ -1461,22 +1636,28 @@ ExportResult ThreatIntelStore::Export(
     const ExportOptions& options
 ) noexcept {
     ExportResult result;
+    result.success = false;
+    result.totalExported = 0;
+    result.bytesWritten = 0;
     
     if (!IsInitialized() || !m_impl->exporter) {
-        result.success = false;
         result.errorMessage = "Store not initialized or exporter unavailable";
+        return result;
+    }
+    
+    if (filePath.empty()) {
+        result.errorMessage = "Output file path is empty";
         return result;
     }
 
     std::shared_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    const auto startTime = std::chrono::steady_clock::now();
+    [[maybe_unused]] const auto startTime = std::chrono::steady_clock::now();
 
-    // result = m_impl->exporter->ExportToFile(filePath, format);
+    // TODO: Implement actual export
+    // result = m_impl->exporter->ExportToFile(filePath, options.format);
 
-    // No duration field in ExportResult
-
-    if (result.success) {
+    if (result.success && result.totalExported > 0) {
         m_impl->stats.totalExportedEntries.fetch_add(result.totalExported, std::memory_order_relaxed);
     }
 
@@ -1487,6 +1668,16 @@ ExportResult ThreatIntelStore::Export(
 // Maintenance Operations
 // ============================================================================
 
+/**
+ * @brief Compacts the database to reclaim unused space.
+ * 
+ * This operation defragments the database file and reduces its size.
+ * Should be called periodically during low-activity periods.
+ * 
+ * @return Number of bytes reclaimed by the compaction operation
+ * @note Thread-safe: Uses exclusive lock during compaction
+ * @warning This operation may take significant time for large databases
+ */
 size_t ThreatIntelStore::Compact() noexcept {
     if (!IsInitialized() || !m_impl->database) {
         return 0;
@@ -1494,9 +1685,30 @@ size_t ThreatIntelStore::Compact() noexcept {
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    return m_impl->database->Compact();
+    const size_t reclaimedBytes = m_impl->database->Compact();
+    
+    // Fire maintenance event if bytes were reclaimed
+    if (reclaimedBytes > 0) {
+        StoreEvent event;
+        event.type = StoreEventType::DatabaseCompacted;
+        event.timestamp = std::chrono::system_clock::now();
+        m_impl->FireEvent(event);
+    }
+    
+    return reclaimedBytes;
 }
 
+/**
+ * @brief Verifies the integrity of the threat intelligence store.
+ * 
+ * This method performs comprehensive verification of both the database
+ * and index components. Database integrity is verified first, followed
+ * by index verification if available.
+ * 
+ * @return true if both database and index are valid, false otherwise
+ * @note Thread-safe: Uses shared lock for concurrent read access
+ * @note Database must be initialized before calling this method
+ */
 bool ThreatIntelStore::VerifyIntegrity() const noexcept {
     if (!IsInitialized() || !m_impl->database) {
         return false;
@@ -1504,14 +1716,21 @@ bool ThreatIntelStore::VerifyIntegrity() const noexcept {
 
     std::shared_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    bool dbIntegrity = m_impl->database->VerifyIntegrity();
+    // Verify database integrity first (primary data source)
+    const bool dbIntegrity = m_impl->database->VerifyIntegrity();
     
+    // If database is corrupt, no need to verify index
+    if (!dbIntegrity) {
+        return false;
+    }
+    
+    // Verify index if present
     if (m_impl->index) {
         auto verifyError = m_impl->index->Verify();
-        return dbIntegrity && (verifyError.code == ThreatIntelError::Success);
+        return verifyError.code == ThreatIntelError::Success;
     }
 
-    return dbIntegrity;
+    return true;  // Database valid, no index to verify
 }
 
 bool ThreatIntelStore::RebuildIndexes() noexcept {
@@ -1521,15 +1740,28 @@ bool ThreatIntelStore::RebuildIndexes() noexcept {
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    // Get all entries
+    // Get all entries from database
     const IOCEntry* entries = m_impl->database->GetEntries();
-    size_t entryCount = m_impl->database->GetEntryCount();
+    const size_t entryCount = m_impl->database->GetEntryCount();
 
-    if (!entries || entryCount == 0) {
-        return true; // Nothing to rebuild
+    // Early exit conditions - nothing to rebuild is still success
+    if (entryCount == 0) {
+        return true;
     }
 
-    std::vector<IOCEntry> entryVec(entries, entries + entryCount);
+    // Validate pointer is valid when count > 0
+    if (!entries) {
+        return false;  // Invalid state: non-zero count with null pointer
+    }
+
+    // Allocate vector with exception safety
+    std::vector<IOCEntry> entryVec;
+    try {
+        entryVec.reserve(entryCount);
+        entryVec.assign(entries, entries + entryCount);
+    } catch (const std::exception&) {
+        return false;  // Memory allocation failure
+    }
     
     auto rebuildError = m_impl->index->RebuildAll(entryVec);
     
@@ -1541,7 +1773,9 @@ void ThreatIntelStore::Flush() noexcept {
         return;
     }
 
-    std::shared_lock<std::shared_mutex> lock(m_impl->rwLock);
+    // Use unique_lock since Flush operations may write to disk
+    // and require exclusive access to prevent data corruption
+    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
     if (m_impl->database && m_impl->database->IsOpen()) {
         m_impl->database->Flush();
@@ -1552,8 +1786,18 @@ void ThreatIntelStore::Flush() noexcept {
     }
 }
 
+/**
+ * @brief Evicts expired entries from the reputation cache.
+ * 
+ * This method removes cache entries that have exceeded their TTL.
+ * Should be called periodically to maintain cache efficiency.
+ * 
+ * @return Number of entries evicted from the cache
+ * @note Thread-safe: Cache internally handles its own locking
+ * @note Does not affect persistent database entries
+ */
 size_t ThreatIntelStore::EvictExpiredEntries() noexcept {
-    if (!IsInitialized() || !m_impl->cache) {
+    if (!IsInitialized() || !m_impl || !m_impl->cache) {
         return 0;
     }
 
@@ -1565,10 +1809,22 @@ size_t ThreatIntelStore::PurgeOldEntries(std::chrono::hours maxAge) noexcept {
         return 0;
     }
 
+    // Validate maxAge is positive and within reasonable bounds
+    if (maxAge.count() <= 0) {
+        return 0;  // Invalid max age
+    }
+
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    const uint64_t cutoffTime = GetUnixTimestamp() - 
-        static_cast<uint64_t>(maxAge.count() * 3600);
+    const uint64_t currentTime = GetUnixTimestamp();
+    const uint64_t maxAgeSeconds = static_cast<uint64_t>(maxAge.count()) * 3600ULL;
+    
+    // Prevent underflow: if maxAgeSeconds >= currentTime, nothing to purge
+    if (maxAgeSeconds >= currentTime) {
+        return 0;  // All entries would be in valid time range
+    }
+    
+    [[maybe_unused]] const uint64_t cutoffTime = currentTime - maxAgeSeconds;
 
     // Purge via IOC manager
     size_t purged = 0;
@@ -1581,31 +1837,53 @@ size_t ThreatIntelStore::PurgeOldEntries(std::chrono::hours maxAge) noexcept {
 // ============================================================================
 
 StoreStatistics ThreatIntelStore::GetStatistics() const noexcept {
-    if (!IsInitialized()) {
+    if (!IsInitialized() || !m_impl) {
         return StoreStatistics{};
     }
 
+    // Update statistics before returning
     const_cast<Impl*>(m_impl.get())->UpdateStatistics();
 
+    // Return copy under lock to ensure consistency
     std::shared_lock<std::shared_mutex> lock(m_impl->statsMutex);
     return m_impl->stats;
 }
 
+/**
+ * @brief Retrieves cache performance statistics.
+ * 
+ * Returns detailed statistics about cache hit rates, memory usage,
+ * and eviction counts.
+ * 
+ * @return CacheStatistics structure with current cache metrics
+ * @note Returns empty statistics if store not initialized
+ */
 CacheStatistics ThreatIntelStore::GetCacheStatistics() const noexcept {
-    if (!IsInitialized() || !m_impl->cache) {
+    if (!IsInitialized() || !m_impl || !m_impl->cache) {
         return CacheStatistics{};
     }
 
     return m_impl->cache->GetStatistics();
 }
 
+/**
+ * @brief Resets all statistical counters to their initial values.
+ * 
+ * This method atomically resets all performance and operational statistics.
+ * The reset is performed under exclusive lock to ensure consistency.
+ * 
+ * @note Thread-safe: Uses unique lock for exclusive access
+ * @note minLookupTimeNs is reset to UINT64_MAX (no minimum recorded)
+ */
 void ThreatIntelStore::ResetStatistics() noexcept {
-    if (!IsInitialized()) {
+    if (!IsInitialized() || !m_impl) {
         return;
     }
 
     std::unique_lock<std::shared_mutex> lock(m_impl->statsMutex);
 
+    // Reset all counters atomically with relaxed ordering
+    // (strict ordering not required for statistics)
     m_impl->stats.totalLookups.store(0, std::memory_order_relaxed);
     m_impl->stats.cacheHits.store(0, std::memory_order_relaxed);
     m_impl->stats.cacheMisses.store(0, std::memory_order_relaxed);
@@ -1624,13 +1902,23 @@ void ThreatIntelStore::ResetStatistics() noexcept {
 
 size_t ThreatIntelStore::RegisterEventCallback(StoreEventCallback callback) noexcept {
     if (!callback) {
-        return 0;
+        return 0;  // Invalid callback
     }
 
     std::lock_guard<std::mutex> lock(m_impl->callbackMutex);
 
+    // Prevent callback ID overflow (extremely unlikely but safe)
+    if (m_impl->nextCallbackId == SIZE_MAX) {
+        return 0;  // Cannot allocate new ID
+    }
+    
     const size_t id = m_impl->nextCallbackId++;
-    m_impl->eventCallbacks[id] = std::move(callback);
+    
+    try {
+        m_impl->eventCallbacks[id] = std::move(callback);
+    } catch (...) {
+        return 0;  // Allocation failed
+    }
     
     return id;
 }
@@ -1645,35 +1933,51 @@ void ThreatIntelStore::UnregisterEventCallback(size_t callbackId) noexcept {
 // ============================================================================
 
 std::unique_ptr<ThreatIntelStore> CreateThreatIntelStore() {
-    auto store = std::make_unique<ThreatIntelStore>();
-    if (!store->Initialize()) {
+    try {
+        auto store = std::make_unique<ThreatIntelStore>();
+        if (!store->Initialize()) {
+            return nullptr;
+        }
+        return store;
+    } catch (...) {
         return nullptr;
     }
-    return store;
 }
 
 std::unique_ptr<ThreatIntelStore> CreateThreatIntelStore(const StoreConfig& config) {
-    auto store = std::make_unique<ThreatIntelStore>();
-    if (!store->Initialize(config)) {
+    try {
+        auto store = std::make_unique<ThreatIntelStore>();
+        if (!store->Initialize(config)) {
+            return nullptr;
+        }
+        return store;
+    } catch (...) {
         return nullptr;
     }
-    return store;
 }
 
 std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore() {
-    auto store = std::make_unique<ThreatIntelStore>();
-    if (!store->Initialize(StoreConfig::CreateHighPerformance())) {
+    try {
+        auto store = std::make_unique<ThreatIntelStore>();
+        if (!store->Initialize(StoreConfig::CreateHighPerformance())) {
+            return nullptr;
+        }
+        return store;
+    } catch (...) {
         return nullptr;
     }
-    return store;
 }
 
 std::unique_ptr<ThreatIntelStore> CreateLowMemoryThreatIntelStore() {
-    auto store = std::make_unique<ThreatIntelStore>();
-    if (!store->Initialize(StoreConfig::CreateLowMemory())) {
+    try {
+        auto store = std::make_unique<ThreatIntelStore>();
+        if (!store->Initialize(StoreConfig::CreateLowMemory())) {
+            return nullptr;
+        }
+        return store;
+    } catch (...) {
         return nullptr;
     }
-    return store;
 }
 
 } // namespace ThreatIntel

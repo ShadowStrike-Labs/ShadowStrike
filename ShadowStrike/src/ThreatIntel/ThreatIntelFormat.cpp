@@ -66,9 +66,15 @@ thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
 /// @brief Convert nibble value to hex character
 /// @param nibble Value 0-15
 /// @param uppercase Use uppercase letters
-/// @return Hex character
+/// @return Hex character, or '?' if nibble is out of range
 [[nodiscard]] constexpr char NibbleToHexChar(int nibble, bool uppercase = false) noexcept {
-    if (nibble < 10) return static_cast<char>('0' + nibble);
+    // Validate nibble is in valid range [0, 15]
+    if (nibble < 0 || nibble > 15) {
+        return '?';  // Invalid nibble - return safe sentinel
+    }
+    if (nibble < 10) {
+        return static_cast<char>('0' + nibble);
+    }
     return static_cast<char>((uppercase ? 'A' : 'a') + (nibble - 10));
 }
 
@@ -85,7 +91,7 @@ thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
 
 /// @brief Parse hex string to bytes
 /// @param hexStr Hex string (must be even length)
-/// @param outBytes Output buffer
+/// @param outBytes Output buffer (must not be null)
 /// @param maxBytes Maximum bytes to parse
 /// @return Number of bytes parsed, or 0 on error
 [[nodiscard]] size_t ParseHexString(
@@ -93,18 +99,34 @@ thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
     uint8_t* outBytes,
     size_t maxBytes
 ) noexcept {
+    // Validate output buffer
+    if (outBytes == nullptr || maxBytes == 0) {
+        return 0;
+    }
+    
+    // Validate input string
     if (hexStr.empty() || (hexStr.length() % 2) != 0) {
         return 0;
     }
     
+    // Check for potential overflow in division (hexStr.length() is always even here)
     size_t byteCount = hexStr.length() / 2;
     if (byteCount > maxBytes) {
         byteCount = maxBytes;
     }
     
+    // Parse each byte
     for (size_t i = 0; i < byteCount; ++i) {
-        int high = HexCharToNibble(hexStr[i * 2]);
-        int low = HexCharToNibble(hexStr[i * 2 + 1]);
+        // Bounds check indices (should always be valid given length check above)
+        const size_t highIdx = i * 2;
+        const size_t lowIdx = highIdx + 1;
+        
+        if (highIdx >= hexStr.length() || lowIdx >= hexStr.length()) {
+            return 0;  // Safety check
+        }
+        
+        int high = HexCharToNibble(hexStr[highIdx]);
+        int low = HexCharToNibble(hexStr[lowIdx]);
         
         if (high < 0 || low < 0) {
             return 0;
@@ -117,17 +139,32 @@ thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
 }
 
 /// @brief Format bytes to hex string
-/// @param bytes Input bytes
+/// @param bytes Input bytes (must not be null if length > 0)
 /// @param length Number of bytes
 /// @param uppercase Use uppercase letters
-/// @return Hex string
+/// @return Hex string, empty if bytes is null
 [[nodiscard]] std::string FormatHexString(
     const uint8_t* bytes,
     size_t length,
     bool uppercase = false
 ) {
+    // Handle null pointer safely
+    if (bytes == nullptr || length == 0) {
+        return {};
+    }
+    
+    // Guard against excessive allocation (max 1MB of hex output)
+    constexpr size_t MAX_HEX_LENGTH = 512 * 1024;  // 512KB of bytes = 1MB hex
+    if (length > MAX_HEX_LENGTH) {
+        length = MAX_HEX_LENGTH;
+    }
+    
     std::string result;
-    result.reserve(length * 2);
+    try {
+        result.reserve(length * 2);
+    } catch (const std::bad_alloc&) {
+        return {};  // Allocation failed
+    }
     
     for (size_t i = 0; i < length; ++i) {
         result += NibbleToHexChar((bytes[i] >> 4) & 0x0F, uppercase);
@@ -149,9 +186,20 @@ thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
 }
 
 /// @brief Convert string to lowercase
+/// @param str Input string view
+/// @return Lowercase copy of string, empty on allocation failure
 [[nodiscard]] std::string ToLowerCase(std::string_view str) {
+    if (str.empty()) {
+        return {};
+    }
+    
     std::string result;
-    result.reserve(str.length());
+    try {
+        result.reserve(str.length());
+    } catch (const std::bad_alloc&) {
+        return {};  // Allocation failed
+    }
+    
     for (char c : str) {
         result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
@@ -159,24 +207,47 @@ thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
 }
 
 /// @brief Split string by delimiter
+/// @param str Input string view
+/// @param delimiter Character to split on
+/// @return Vector of string views (may be empty on allocation failure)
 [[nodiscard]] std::vector<std::string_view> SplitString(
     std::string_view str,
     char delimiter
 ) {
     std::vector<std::string_view> result;
+    
+    if (str.empty()) {
+        return result;
+    }
+    
+    // Pre-reserve reasonable capacity to avoid frequent reallocations
+    try {
+        result.reserve(16);  // Common case: few segments
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
+    
     size_t start = 0;
     
     for (size_t i = 0; i < str.length(); ++i) {
         if (str[i] == delimiter) {
             if (i > start) {
-                result.push_back(str.substr(start, i - start));
+                try {
+                    result.push_back(str.substr(start, i - start));
+                } catch (const std::bad_alloc&) {
+                    return result;  // Return what we have so far
+                }
             }
             start = i + 1;
         }
     }
     
     if (start < str.length()) {
-        result.push_back(str.substr(start));
+        try {
+            result.push_back(str.substr(start));
+        } catch (const std::bad_alloc&) {
+            // Ignore - return what we have
+        }
     }
     
     return result;
@@ -759,13 +830,19 @@ std::optional<HashValue> ParseHashString(
     
     // For SSDEEP and TLSH, the string IS the hash (not hex encoded)
     if (algo == HashAlgorithm::SSDEEP || algo == HashAlgorithm::TLSH) {
-        if (hashStr.length() > 72) {
+        // Validate length fits in hash data array
+        constexpr size_t MAX_FUZZY_HASH_LEN = 72;
+        if (hashStr.length() > MAX_FUZZY_HASH_LEN || 
+            hashStr.length() > sizeof(HashValue::data)) {
             return std::nullopt;
         }
         
         HashValue hash;
         hash.algorithm = algo;
         hash.length = static_cast<uint8_t>(hashStr.length());
+        
+        // Clear buffer first for safety
+        hash.data.fill(0);
         std::memcpy(hash.data.data(), hashStr.data(), hashStr.length());
         
         return hash;
@@ -813,9 +890,15 @@ std::string FormatHashString(const HashValue& hash) {
         return {};
     }
     
+    // Validate length doesn't exceed data array bounds
+    if (hash.length > hash.data.size()) {
+        return {};  // Invalid hash state
+    }
+    
     // For SSDEEP and TLSH, return as-is (not hex encoded)
     if (hash.algorithm == HashAlgorithm::SSDEEP || 
         hash.algorithm == HashAlgorithm::TLSH) {
+        // Ensure null-safety: don't read past actual length
         return std::string(
             reinterpret_cast<const char*>(hash.data.data()),
             hash.length
@@ -837,8 +920,22 @@ std::string NormalizeDomain(std::string_view domain) {
         return {};
     }
     
-    // Convert to lowercase
-    std::string normalized = ToLowerCase(domain);
+    // Sanity check length before processing
+    if (domain.length() > MAX_DOMAIN_LENGTH) {
+        return {};  // Domain too long
+    }
+    
+    // Convert to lowercase with allocation safety
+    std::string normalized;
+    try {
+        normalized = ToLowerCase(domain);
+    } catch (const std::exception&) {
+        return {};  // Allocation failure
+    }
+    
+    if (normalized.empty()) {
+        return {};
+    }
     
     // Remove trailing dot if present (FQDN notation)
     if (!normalized.empty() && normalized.back() == '.') {
@@ -850,7 +947,7 @@ std::string NormalizeDomain(std::string_view domain) {
         normalized.erase(0, 1);
     }
     
-    // Remove any whitespace
+    // Remove any embedded whitespace (should not happen after trimming, but be defensive)
     normalized.erase(
         std::remove_if(normalized.begin(), normalized.end(),
                        [](char c) { return std::isspace(static_cast<unsigned char>(c)); }),
@@ -1232,8 +1329,15 @@ size_t CalculateBloomFilterSize(
     size_t expectedElements,
     double falsePositiveRate
 ) noexcept {
+    // Validate inputs
     if (expectedElements == 0 || falsePositiveRate <= 0.0 || falsePositiveRate >= 1.0) {
         return 0;
+    }
+    
+    // Additional validation: ensure falsePositiveRate isn't too close to 0 (would cause huge sizes)
+    constexpr double MIN_FPR = 1e-10;
+    if (falsePositiveRate < MIN_FPR) {
+        falsePositiveRate = MIN_FPR;
     }
     
     // Optimal size formula: m = -n * ln(p) / (ln(2)^2)
@@ -1244,13 +1348,25 @@ size_t CalculateBloomFilterSize(
     
     constexpr double LN2_SQUARED = 0.480453013918201;  // ln(2)^2
     
+    // Use safe arithmetic: log of small numbers is large negative, so result is large positive
     double m = -static_cast<double>(expectedElements) * std::log(falsePositiveRate) / LN2_SQUARED;
+    
+    // Check for NaN or infinity
+    if (!std::isfinite(m) || m < 0.0) {
+        return 0;
+    }
+    
+    // Sanity check - don't exceed 4GB (32 billion bits)
+    constexpr double MAX_BLOOM_BITS_D = 32.0 * 1024.0 * 1024.0 * 1024.0;
+    if (m > MAX_BLOOM_BITS_D) {
+        m = MAX_BLOOM_BITS_D;
+    }
     
     // Round up to multiple of 64 (for cache-line alignment and atomic operations)
     size_t bits = static_cast<size_t>(std::ceil(m));
     bits = (bits + 63) & ~static_cast<size_t>(63);
     
-    // Sanity check - don't exceed 4GB
+    // Final bounds check
     constexpr size_t MAX_BLOOM_BITS = 32ULL * 1024 * 1024 * 1024;
     if (bits > MAX_BLOOM_BITS) {
         bits = MAX_BLOOM_BITS;
@@ -1267,8 +1383,15 @@ size_t CalculateBloomHashFunctions(
     size_t filterSize,
     size_t expectedElements
 ) noexcept {
+    // Validate inputs
     if (filterSize == 0 || expectedElements == 0) {
         return 0;
+    }
+    
+    // Prevent division by zero and overflow
+    if (filterSize < expectedElements) {
+        // Undersized filter - use minimum hash functions
+        return 1;
     }
     
     // Optimal number of hash functions: k = (m/n) * ln(2)
@@ -1279,7 +1402,20 @@ size_t CalculateBloomHashFunctions(
     
     constexpr double LN2 = 0.693147180559945;
     
-    double k = (static_cast<double>(filterSize) / static_cast<double>(expectedElements)) * LN2;
+    double ratio = static_cast<double>(filterSize) / static_cast<double>(expectedElements);
+    
+    // Guard against unreasonable ratios
+    constexpr double MAX_RATIO = 1000000.0;
+    if (ratio > MAX_RATIO) {
+        ratio = MAX_RATIO;
+    }
+    
+    double k = ratio * LN2;
+    
+    // Check for NaN or infinity
+    if (!std::isfinite(k)) {
+        return 1;
+    }
     
     // Round to nearest integer, minimum 1
     size_t hashFunctions = static_cast<size_t>(std::round(k));
@@ -1427,18 +1563,36 @@ std::optional<uint64_t> ParseSTIXTimestamp(std::string_view timestamp) noexcept 
 // ----------------------------------------------------------------------------
 
 std::string FormatSTIXTimestamp(uint64_t epoch) {
+    // Validate epoch is in reasonable range
+    constexpr uint64_t MIN_EPOCH = 0;           // 1970-01-01
+    constexpr uint64_t MAX_EPOCH = 4102444800;  // 2100-01-01
+    
+    if (epoch > MAX_EPOCH) {
+        return {};  // Invalid epoch
+    }
+    
     time_t time = static_cast<time_t>(epoch);
     std::tm tm{};
     
 #ifdef _WIN32
-    gmtime_s(&tm, &time);
+    errno_t err = gmtime_s(&tm, &time);
+    if (err != 0) {
+        return {};  // Conversion failed
+    }
 #else
-    gmtime_r(&time, &tm);
+    if (gmtime_r(&time, &tm) == nullptr) {
+        return {};  // Conversion failed
+    }
 #endif
+    
+    // Validate resulting tm values are reasonable
+    if (tm.tm_year < 70 || tm.tm_year > 200) {  // 1970-2100
+        return {};
+    }
     
     // Format: YYYY-MM-DDTHH:MM:SS.000Z
     char buffer[32];
-    std::snprintf(buffer, sizeof(buffer),
+    int written = std::snprintf(buffer, sizeof(buffer),
                   "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
                   tm.tm_year + 1900,
                   tm.tm_mon + 1,
@@ -1446,6 +1600,10 @@ std::string FormatSTIXTimestamp(uint64_t epoch) {
                   tm.tm_hour,
                   tm.tm_min,
                   tm.tm_sec);
+    
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(buffer)) {
+        return {};  // Formatting failed
+    }
     
     return buffer;
 }
@@ -1455,20 +1613,28 @@ std::string FormatSTIXTimestamp(uint64_t epoch) {
 // ----------------------------------------------------------------------------
 
 std::array<uint8_t, 16> GenerateUUID() noexcept {
-    std::array<uint8_t, 16> uuid;
+    std::array<uint8_t, 16> uuid{};  // Zero-initialize for safety
     
-    // Generate random bytes
-    std::uniform_int_distribution<uint32_t> dist(0, 255);
-    
-    for (size_t i = 0; i < 16; ++i) {
-        uuid[i] = static_cast<uint8_t>(dist(g_randomEngine));
+    try {
+        // Generate random bytes using thread-local engine
+        std::uniform_int_distribution<uint32_t> dist(0, 255);
+        
+        for (size_t i = 0; i < 16; ++i) {
+            uuid[i] = static_cast<uint8_t>(dist(g_randomEngine));
+        }
+        
+        // Set version (4 = random) in byte 6, bits 4-7
+        uuid[6] = (uuid[6] & 0x0F) | 0x40;
+        
+        // Set variant (RFC 4122) in byte 8, bits 6-7
+        uuid[8] = (uuid[8] & 0x3F) | 0x80;
+    } catch (...) {
+        // If random generation fails, return zeroed UUID with version/variant set
+        // This is suboptimal but safe
+        uuid.fill(0);
+        uuid[6] = 0x40;  // Version 4
+        uuid[8] = 0x80;  // Variant
     }
-    
-    // Set version (4 = random)
-    uuid[6] = (uuid[6] & 0x0F) | 0x40;
-    
-    // Set variant (RFC 4122)
-    uuid[8] = (uuid[8] & 0x3F) | 0x80;
     
     return uuid;
 }
@@ -1852,85 +2018,141 @@ bool CreateDatabase(
     // For a new empty database, we just allocate minimal space for each section
     uint64_t currentOffset = PAGE_SIZE;  // After header
     
+    // Helper lambda to safely add to offset with overflow check
+    auto safeAddOffset = [&currentOffset, initialSize](uint64_t size) -> bool {
+        if (currentOffset > initialSize - size) {
+            return false;  // Would overflow
+        }
+        currentOffset += size;
+        return true;
+    };
+    
     // IPv4 index - allocate 1 page initially
     header->ipv4IndexOffset = currentOffset;
     header->ipv4IndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        UnmapViewOfFile(baseAddress);
+        CloseHandle(mappingHandle);
+        CloseHandle(fileHandle);
+        DeleteFileW(path.c_str());
+        error = StoreError::WithMessage(ThreatIntelError::DatabaseTooLarge,
+                                        "Initial size too small for database sections");
+        return false;
+    }
     
     // IPv6 index
     header->ipv6IndexOffset = currentOffset;
     header->ipv6IndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // Domain index
     header->domainIndexOffset = currentOffset;
     header->domainIndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // URL index
     header->urlIndexOffset = currentOffset;
     header->urlIndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // Hash index
     header->hashIndexOffset = currentOffset;
     header->hashIndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // Email index
     header->emailIndexOffset = currentOffset;
     header->emailIndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // Certificate index
     header->certIndexOffset = currentOffset;
     header->certIndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // JA3 index
     header->ja3IndexOffset = currentOffset;
     header->ja3IndexSize = PAGE_SIZE;
-    currentOffset += PAGE_SIZE;
+    if (!safeAddOffset(PAGE_SIZE)) {
+        goto cleanup_error;
+    }
     
     // Entry data section (bulk of the file)
-    header->entryDataOffset = currentOffset;
-    header->entryDataSize = (initialSize - currentOffset) / 2;
-    header->entryDataSize = Format::AlignToPage(header->entryDataSize);
-    currentOffset += header->entryDataSize;
+    // Calculate remaining space for variable-size sections
+    {
+        const uint64_t fixedSectionsSize = PAGE_SIZE * (16 + 64 + 256 + 16 + 4 + 4);  // compact + string + bloom + stix + feed + meta
+        if (currentOffset >= initialSize || (initialSize - currentOffset) <= fixedSectionsSize) {
+            goto cleanup_error;
+        }
+        
+        const uint64_t availableForEntryData = (initialSize - currentOffset - fixedSectionsSize) / 2;
+        header->entryDataOffset = currentOffset;
+        header->entryDataSize = Format::AlignToPage(availableForEntryData);
+        if (!safeAddOffset(header->entryDataSize)) {
+            goto cleanup_error;
+        }
+    }
     
     // Compact entry section
     header->compactEntryOffset = currentOffset;
     header->compactEntrySize = PAGE_SIZE * 16;  // 64KB
-    currentOffset += header->compactEntrySize;
+    if (!safeAddOffset(header->compactEntrySize)) {
+        goto cleanup_error;
+    }
     
     // String pool
     header->stringPoolOffset = currentOffset;
     header->stringPoolSize = PAGE_SIZE * 64;  // 256KB
-    currentOffset += header->stringPoolSize;
+    if (!safeAddOffset(header->stringPoolSize)) {
+        goto cleanup_error;
+    }
     
     // Bloom filter
     header->bloomFilterOffset = currentOffset;
     header->bloomFilterSize = PAGE_SIZE * 256;  // 1MB
-    currentOffset += header->bloomFilterSize;
+    if (!safeAddOffset(header->bloomFilterSize)) {
+        goto cleanup_error;
+    }
     
     // STIX bundle
     header->stixBundleOffset = currentOffset;
     header->stixBundleSize = PAGE_SIZE * 16;  // 64KB
-    currentOffset += header->stixBundleSize;
+    if (!safeAddOffset(header->stixBundleSize)) {
+        goto cleanup_error;
+    }
     
     // Feed config
     header->feedConfigOffset = currentOffset;
     header->feedConfigSize = PAGE_SIZE * 4;  // 16KB
-    currentOffset += header->feedConfigSize;
+    if (!safeAddOffset(header->feedConfigSize)) {
+        goto cleanup_error;
+    }
     
     // Metadata
     header->metadataOffset = currentOffset;
     header->metadataSize = PAGE_SIZE * 4;  // 16KB
-    currentOffset += header->metadataSize;
+    if (!safeAddOffset(header->metadataSize)) {
+        goto cleanup_error;
+    }
     
-    // Relation graph
+    // Relation graph - gets the rest of the file
     header->relationGraphOffset = currentOffset;
-    header->relationGraphSize = initialSize - currentOffset;  // Rest of file
+    if (currentOffset > initialSize) {
+        goto cleanup_error;
+    }
+    header->relationGraphSize = initialSize - currentOffset;
     
     // Performance hints
     header->recommendedCacheSize = 64;  // 64MB
@@ -1963,6 +2185,16 @@ bool CreateDatabase(
     
     error = StoreError::Success();
     return true;
+    
+    // Error cleanup label for section allocation failures
+cleanup_error:
+    UnmapViewOfFile(baseAddress);
+    CloseHandle(mappingHandle);
+    CloseHandle(fileHandle);
+    DeleteFileW(path.c_str());
+    error = StoreError::WithMessage(ThreatIntelError::DatabaseTooLarge,
+                                    "Initial size too small for database sections");
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -1970,31 +2202,35 @@ bool CreateDatabase(
 // ----------------------------------------------------------------------------
 
 void CloseView(MemoryMappedView& view) noexcept {
-    // Unmap view
+    // Unmap view first (order matters for proper cleanup)
     if (view.baseAddress != nullptr) {
-        // Unlock memory (ignore errors)
-        VirtualUnlock(view.baseAddress, static_cast<SIZE_T>(
-            std::min<uint64_t>(view.fileSize, 64 * 1024 * 1024)
-        ));
+        // Unlock memory (ignore errors - best effort)
+        if (view.fileSize > 0) {
+            const SIZE_T unlockSize = static_cast<SIZE_T>(
+                std::min<uint64_t>(view.fileSize, 64 * 1024 * 1024)
+            );
+            VirtualUnlock(view.baseAddress, unlockSize);
+        }
         
-        // Flush if writable
+        // Flush if writable (ignore errors - best effort)
         if (!view.readOnly) {
             FlushViewOfFile(view.baseAddress, 0);
         }
         
+        // Unmap the view
         UnmapViewOfFile(view.baseAddress);
         view.baseAddress = nullptr;
     }
     
-    // Close mapping handle
+    // Close mapping handle (must be after unmapping)
     if (view.mappingHandle != nullptr && view.mappingHandle != INVALID_HANDLE_VALUE) {
         CloseHandle(view.mappingHandle);
         view.mappingHandle = nullptr;
     }
     
-    // Close file handle
-    if (view.fileHandle != INVALID_HANDLE_VALUE) {
-        // Flush file buffers before closing
+    // Close file handle last
+    if (view.fileHandle != nullptr && view.fileHandle != INVALID_HANDLE_VALUE) {
+        // Flush file buffers before closing (ignore errors)
         if (!view.readOnly) {
             FlushFileBuffers(view.fileHandle);
         }
@@ -2002,7 +2238,7 @@ void CloseView(MemoryMappedView& view) noexcept {
         view.fileHandle = INVALID_HANDLE_VALUE;
     }
     
-    // Reset other fields
+    // Reset all fields to safe state
     view.fileSize = 0;
     view.readOnly = true;
 }

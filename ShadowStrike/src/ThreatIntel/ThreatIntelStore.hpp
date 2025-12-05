@@ -175,9 +175,12 @@ struct StoreConfig {
 // ============================================================================
 
 /**
- * @brief Options for IOC lookup operations
+ * @brief Options for IOC lookup operations via ThreatIntelStore
+ * 
+ * @note This is a higher-level options struct for ThreatIntelStore API.
+ * Distinguished from ThreatIntelFormat::LookupOptions and ThreatIntelLookup::LookupOptions.
  */
-struct LookupOptions {
+struct StoreLookupOptions {
     // Check cache before database
     bool useCache = true;
     
@@ -211,8 +214,8 @@ struct LookupOptions {
     /**
      * @brief Create options for fastest lookup
      */
-    static LookupOptions FastLookup() {
-        LookupOptions opts;
+    [[nodiscard]] static StoreLookupOptions FastLookup() noexcept {
+        StoreLookupOptions opts;
         opts.includeMetadata = false;
         opts.includeSourceAttribution = false;
         return opts;
@@ -221,8 +224,8 @@ struct LookupOptions {
     /**
      * @brief Create options for detailed lookup
      */
-    static LookupOptions DetailedLookup() {
-        LookupOptions opts;
+    [[nodiscard]] static StoreLookupOptions DetailedLookup() noexcept {
+        StoreLookupOptions opts;
         opts.includeMetadata = true;
         opts.includeConfidence = true;
         opts.includeSourceAttribution = true;
@@ -231,9 +234,14 @@ struct LookupOptions {
 };
 
 /**
- * @brief Result of an IOC lookup
+ * @brief Result of an IOC lookup via ThreatIntelStore
+ * 
+ * Contains comprehensive information about a threat intelligence lookup.
+ * Thread-safe for reading after construction.
+ * 
+ * @note Distinguished from ThreatIntelFormat::LookupResult which is lower-level.
  */
-struct LookupResult {
+struct StoreLookupResult {
     // Whether the IOC was found
     bool found = false;
     
@@ -268,8 +276,18 @@ struct LookupResult {
     // Related indicators (if available)
     std::vector<std::pair<IOCType, std::string>> relatedIndicators;
     
+    // Default constructor - initializes to "not found" state
+    StoreLookupResult() noexcept = default;
+    
+    // Copy and move operations (vectors may throw but we handle gracefully)
+    StoreLookupResult(const StoreLookupResult&) = default;
+    StoreLookupResult& operator=(const StoreLookupResult&) = default;
+    StoreLookupResult(StoreLookupResult&&) noexcept = default;
+    StoreLookupResult& operator=(StoreLookupResult&&) noexcept = default;
+    
     /**
      * @brief Check if IOC is malicious
+     * @return true if found and reputation is Malicious or HighRisk
      */
     [[nodiscard]] bool IsMalicious() const noexcept {
         return found && (reputation == ReputationLevel::Malicious ||
@@ -278,6 +296,7 @@ struct LookupResult {
     
     /**
      * @brief Check if IOC is suspicious
+     * @return true if found and reputation indicates suspicion
      */
     [[nodiscard]] bool IsSuspicious() const noexcept {
         return found && (reputation == ReputationLevel::Suspicious ||
@@ -287,6 +306,7 @@ struct LookupResult {
     
     /**
      * @brief Check if IOC is known-good
+     * @return true if found and reputation is Safe or Trusted
      */
     [[nodiscard]] bool IsKnownGood() const noexcept {
         return found && (reputation == ReputationLevel::Safe ||
@@ -295,9 +315,15 @@ struct LookupResult {
 };
 
 /**
- * @brief Result of a batch lookup operation
+ * @brief Result of a batch lookup operation via ThreatIntelStore
+ * 
+ * Aggregates results from multiple IOC lookups into a single response.
+ * Provides summary statistics and per-item results.
+ * 
+ * @note The results vector index corresponds to the input index.
+ * Distinguished from ThreatIntelFormat::BatchLookupResult.
  */
-struct BatchLookupResult {
+struct StoreBatchLookupResult {
     // Total items processed
     size_t totalProcessed = 0;
     
@@ -326,7 +352,32 @@ struct BatchLookupResult {
     std::chrono::nanoseconds averageTimePerItem{0};
     
     // Individual results (index matches input index)
-    std::vector<LookupResult> results;
+    std::vector<StoreLookupResult> results;
+    
+    // Default constructor
+    StoreBatchLookupResult() noexcept = default;
+    
+    // Copy/move operations (vector may throw on copy but we mark noexcept for move)
+    StoreBatchLookupResult(const StoreBatchLookupResult&) = default;
+    StoreBatchLookupResult& operator=(const StoreBatchLookupResult&) = default;
+    StoreBatchLookupResult(StoreBatchLookupResult&&) noexcept = default;
+    StoreBatchLookupResult& operator=(StoreBatchLookupResult&&) noexcept = default;
+    
+    /**
+     * @brief Calculate the cache hit rate for this batch
+     * @return Cache hit rate as a percentage (0.0 to 1.0)
+     */
+    [[nodiscard]] double GetCacheHitRate() const noexcept {
+        return totalProcessed > 0 ? 
+            static_cast<double>(cacheHits) / static_cast<double>(totalProcessed) : 0.0;
+    }
+    
+    /**
+     * @brief Check if any malicious IOCs were found
+     */
+    [[nodiscard]] bool HasMalicious() const noexcept {
+        return maliciousCount > 0;
+    }
 };
 
 // ============================================================================
@@ -364,9 +415,12 @@ enum class FeedAuthType : uint8_t {
 };
 
 /**
- * @brief Configuration for a threat intelligence feed
+ * @brief Configuration for a threat intelligence feed (high-level API)
+ * 
+ * @note Distinguished from ThreatIntelFormat::FeedConfig which is a binary packed struct.
+ * This is the user-facing configuration structure for feed management.
  */
-struct FeedConfig {
+struct FeedConfiguration {
     // Unique feed identifier
     std::string feedId;
     
@@ -442,8 +496,8 @@ struct FeedConfig {
     /**
      * @brief Create VirusTotal feed configuration
      */
-    static FeedConfig CreateVirusTotal(const std::string& apiKey) {
-        FeedConfig config;
+    [[nodiscard]] static FeedConfiguration CreateVirusTotal(const std::string& apiKey) {
+        FeedConfiguration config;
         config.feedId = "virustotal";
         config.name = "VirusTotal";
         config.description = "VirusTotal threat intelligence feed";
@@ -458,8 +512,8 @@ struct FeedConfig {
     /**
      * @brief Create AlienVault OTX feed configuration
      */
-    static FeedConfig CreateAlienVaultOTX(const std::string& apiKey) {
-        FeedConfig config;
+    [[nodiscard]] static FeedConfiguration CreateAlienVaultOTX(const std::string& apiKey) {
+        FeedConfiguration config;
         config.feedId = "alienvault_otx";
         config.name = "AlienVault OTX";
         config.description = "AlienVault Open Threat Exchange";
@@ -475,8 +529,8 @@ struct FeedConfig {
     /**
      * @brief Create Abuse.ch feeds configuration
      */
-    static FeedConfig CreateAbuseCH(const std::string& feedName) {
-        FeedConfig config;
+    [[nodiscard]] static FeedConfiguration CreateAbuseCH(const std::string& feedName) {
+        FeedConfiguration config;
         config.feedId = "abusech_" + feedName;
         config.name = "Abuse.ch " + feedName;
         config.type = FeedType::PlainText;
@@ -503,8 +557,8 @@ struct FeedConfig {
     /**
      * @brief Create MISP feed configuration
      */
-    static FeedConfig CreateMISP(const std::string& serverUrl, const std::string& apiKey) {
-        FeedConfig config;
+    [[nodiscard]] static FeedConfiguration CreateMISP(const std::string& serverUrl, const std::string& apiKey) {
+        FeedConfiguration config;
         config.feedId = "misp";
         config.name = "MISP";
         config.description = "Malware Information Sharing Platform";
@@ -547,9 +601,11 @@ struct FeedStatus {
 // ============================================================================
 
 /**
- * @brief Options for importing threat intelligence data
+ * @brief Simplified options for importing threat intelligence data via ThreatIntelStore
+ * 
+ * @note For advanced import options, use ThreatIntelImporter::ImportOptions directly.
  */
-struct ImportOptions {
+struct StoreImportOptions {
     // Overwrite existing entries
     bool overwriteExisting = true;
     
@@ -585,9 +641,11 @@ struct ImportOptions {
 };
 
 /**
- * @brief Options for exporting threat intelligence data
+ * @brief Simplified options for exporting threat intelligence data via ThreatIntelStore
+ * 
+ * @note For advanced export options, use ThreatIntelExporter::ExportOptions directly.
  */
-struct ExportOptions {
+struct StoreExportOptions {
     // Export format
     enum class Format : uint8_t {
         STIX21,       // STIX 2.1 JSON
@@ -628,32 +686,52 @@ struct ExportOptions {
 
 /**
  * @brief Result of an import operation
+ * 
+ * Contains detailed statistics about a completed import operation,
+ * including counts of processed, imported, updated, and failed entries.
  */
 struct ImportResult {
-    bool success = false;
-    size_t totalProcessed = 0;
-    size_t imported = 0;
-    size_t updated = 0;
-    size_t skipped = 0;
-    size_t errors = 0;
+    bool success = false;        ///< Overall operation success
+    size_t totalProcessed = 0;   ///< Total entries processed
+    size_t imported = 0;         ///< New entries imported
+    size_t updated = 0;          ///< Existing entries updated
+    size_t skipped = 0;          ///< Entries skipped (duplicates, filtered)
+    size_t errors = 0;           ///< Entries that failed to import
     
-    std::chrono::milliseconds duration{0};
+    std::chrono::milliseconds duration{0};  ///< Total operation duration
     
-    std::vector<std::string> errorMessages;
+    std::vector<std::string> errorMessages;  ///< Detailed error messages
+    
+    /**
+     * @brief Check if any entries were imported or updated
+     */
+    [[nodiscard]] bool HasChanges() const noexcept {
+        return imported > 0 || updated > 0;
+    }
 };
 
 /**
  * @brief Result of an export operation
+ * 
+ * Contains information about a completed export operation,
+ * including the output path and statistics.
  */
 struct ExportResult {
-    bool success = false;
-    size_t totalExported = 0;
-    size_t bytesWritten = 0;
+    bool success = false;         ///< Overall operation success
+    size_t totalExported = 0;     ///< Total entries exported
+    size_t bytesWritten = 0;      ///< Bytes written to output file
     
-    std::chrono::milliseconds duration{0};
+    std::chrono::milliseconds duration{0};  ///< Total operation duration
     
-    std::string outputPath;
-    std::string errorMessage;
+    std::string outputPath;    ///< Path to the output file (UTF-8)
+    std::string errorMessage;  ///< Error description if failed
+    
+    /**
+     * @brief Check if export produced output
+     */
+    [[nodiscard]] bool HasOutput() const noexcept {
+        return success && bytesWritten > 0;
+    }
 };
 
 // ============================================================================
@@ -662,6 +740,13 @@ struct ExportResult {
 
 /**
  * @brief Comprehensive statistics for the threat intelligence store
+ * 
+ * Contains both regular and atomic counters for thread-safe access to
+ * frequently updated metrics. Use the copy/move operations to safely
+ * retrieve a snapshot of the statistics.
+ * 
+ * @note Atomic members use relaxed memory ordering for performance
+ * @note Thread-safe for reading individual atomic counters
  */
 struct StoreStatistics {
     // Database statistics
@@ -678,7 +763,7 @@ struct StoreStatistics {
     size_t memorySizeBytes = 0;
     size_t cacheSizeBytes = 0;
     
-    // Performance statistics
+    // Performance statistics (atomic for thread-safe updates)
     std::atomic<uint64_t> totalLookups{0};
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
@@ -695,7 +780,7 @@ struct StoreStatistics {
     size_t feedUpdatesPending = 0;
     size_t totalFeedErrors = 0;
     
-    // Import/export statistics
+    // Import/export statistics (atomic for thread-safe updates)
     std::atomic<uint64_t> totalImportedEntries{0};
     std::atomic<uint64_t> totalExportedEntries{0};
     
@@ -704,7 +789,12 @@ struct StoreStatistics {
     std::chrono::system_clock::time_point lastUpdateAt;
     std::chrono::system_clock::time_point lastLookupAt;
 
-    StoreStatistics() = default;
+    /// @brief Default constructor - initializes all values safely
+    StoreStatistics() noexcept {
+        // Atomic members are already initialized via member initializers
+        // Non-atomic members initialized to zero/default values
+    }
+    
     StoreStatistics(const StoreStatistics& other) noexcept { CopyFrom(other); }
     StoreStatistics& operator=(const StoreStatistics& other) noexcept {
         if (this != &other) {
@@ -778,38 +868,62 @@ private:
 
 /**
  * @brief Event types for store callbacks
+ * 
+ * Defines all possible events that can be fired by the threat intelligence store.
+ * Subscribe using RegisterEventCallback to receive notifications.
  */
 enum class StoreEventType : uint8_t {
-    IOCAdded,
-    IOCUpdated,
-    IOCRemoved,
-    FeedUpdateStarted,
-    FeedUpdateCompleted,
-    FeedUpdateFailed,
-    CacheEviction,
-    DatabaseCompacted,
-    IntegrityCheckCompleted,
-    Error
+    IOCAdded,                 ///< Single IOC entry added
+    IOCUpdated,               ///< IOC entry updated
+    IOCRemoved,               ///< IOC entry removed
+    DataImported,             ///< Bulk data import completed
+    FeedUpdateStarted,        ///< Feed update process started
+    FeedUpdateCompleted,      ///< Feed update completed successfully
+    FeedUpdateFailed,         ///< Feed update failed
+    CacheEviction,            ///< Cache entries evicted
+    DatabaseCompacted,        ///< Database compaction completed
+    IntegrityCheckCompleted,  ///< Integrity verification finished
+    Error                     ///< General error event
 };
 
 /**
  * @brief Event data for store callbacks
+ * 
+ * Contains all information about an event fired by the store.
+ * Event handlers receive a const reference to this structure.
  */
 struct StoreEvent {
-    StoreEventType type;
-    std::chrono::system_clock::time_point timestamp;
+    StoreEventType type;                                ///< Event type
+    std::chrono::system_clock::time_point timestamp;    ///< When event occurred
     
     // For IOC events
-    std::optional<IOCEntry> entry;
-    std::optional<IOCType> iocType;
+    std::optional<IOCEntry> entry;     ///< IOC entry (if applicable)
+    std::optional<IOCType> iocType;    ///< IOC type (if applicable)
     
     // For feed events
-    std::string feedId;
-    size_t entriesAffected = 0;
+    std::string feedId;                ///< Feed identifier (if feed event)
+    size_t entriesAffected = 0;        ///< Number of entries affected
     
     // Error information
-    std::string errorMessage;
-    int errorCode = 0;
+    std::string errorMessage;          ///< Error description (if error event)
+    int errorCode = 0;                 ///< Error code (if error event)
+    
+    /**
+     * @brief Check if this is an error event
+     */
+    [[nodiscard]] bool IsError() const noexcept {
+        return type == StoreEventType::Error || 
+               type == StoreEventType::FeedUpdateFailed;
+    }
+    
+    /**
+     * @brief Check if this is an IOC modification event
+     */
+    [[nodiscard]] bool IsIOCEvent() const noexcept {
+        return type == StoreEventType::IOCAdded ||
+               type == StoreEventType::IOCUpdated ||
+               type == StoreEventType::IOCRemoved;
+    }
 };
 
 using StoreEventCallback = std::function<void(const StoreEvent&)>;
@@ -843,10 +957,13 @@ using StoreEventCallback = std::function<void(const StoreEvent&)>;
  */
 class ThreatIntelStore final {
 public:
+    /// @brief Default constructor - creates an uninitialized store
     ThreatIntelStore();
+    
+    /// @brief Destructor - automatically calls Shutdown() if initialized
     ~ThreatIntelStore();
     
-    // Non-copyable, non-movable (owns resources)
+    // Non-copyable, non-movable (owns unique resources)
     ThreatIntelStore(const ThreatIntelStore&) = delete;
     ThreatIntelStore& operator=(const ThreatIntelStore&) = delete;
     ThreatIntelStore(ThreatIntelStore&&) = delete;
