@@ -25,8 +25,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/PatternStore.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
+#include "../../src/PatternStore/PatternStore.hpp"
+#include "../../src/SignatureStore/SignatureFormat.hpp"
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -243,7 +243,9 @@ TEST_F(AhoCorasickTest, LargeScalePatternAddition) {
     // Add 10,000 unique patterns
     const size_t patternCount = 10000;
     std::mt19937 rng(42);
-    std::uniform_int_distribution<uint8_t> dist(0, 255);
+    std::uniform_int_distribution<unsigned int> dist(0, 255);
+    uint8_t value = static_cast<uint8_t>(dist(rng));
+
 
     for (size_t i = 0; i < patternCount; ++i) {
         std::vector<uint8_t> pattern(8);
@@ -416,7 +418,9 @@ TEST_F(SIMDMatcherTest, AVX2VsScalarConsistency) {
     // Generate random buffer
     std::vector<uint8_t> buffer(10000);
     std::mt19937 rng(12345);
-    std::uniform_int_distribution<uint8_t> dist(0, 255);
+    std::uniform_int_distribution<unsigned int> dist(0, 255);
+    uint8_t value = static_cast<uint8_t>(dist(rng));
+
     for (auto& byte : buffer) {
         byte = dist(rng);
     }

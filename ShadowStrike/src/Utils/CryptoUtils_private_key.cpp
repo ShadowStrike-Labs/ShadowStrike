@@ -1,3 +1,11 @@
+/**
+ * @file CryptoUtils_private_key.cpp
+ * @brief Enterprise-grade cryptographic utilities implementation
+ *
+ * Implements Private Key implementation using Windows CNG APIs.
+ *
+ * @copyright Copyright (c) 2025 ShadowStrike Security Suite
+ */
 
 #include"CryptoUtils.hpp"
 #include"CryptoUtilsCommon.hpp"
@@ -380,6 +388,6 @@ namespace ShadowStrike {
 					return true;
 				}
 			}
-		}
-	}
-}
+		}//namespace CryptoUtils
+	}// namespace Utils
+}// namespace ShadowStrike

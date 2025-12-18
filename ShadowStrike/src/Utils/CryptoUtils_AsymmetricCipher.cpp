@@ -1,4 +1,29 @@
-﻿#include "CryptoUtils.hpp"
+﻿
+/**
+ * @file CryptoUtils_AsymmetricCipher.cpp
+ * @brief Enterprise-grade asymmetric cryptography implementation
+ *
+ * Implements AsymmetricCipher with RSA encryption/decryption, digital signatures,
+ * ECC Diffie-Hellman key exchange, and key derivation functions using Windows CNG APIs.
+ *
+ * Features:
+ * - RSA Encryption: 2048/3072/4096-bit with PKCS#1 v1.5 and OAEP padding (SHA1/256/384/512)
+ * - RSA Signatures: PKCS#1 v1.5 and PSS padding with configurable hash algorithms
+ * - ECC ECDH: P-256/P-384/P-521 for shared secret derivation
+ * - Key Generation: Secure RSA/ECC key pair generation with proper finalization
+ * - Key Import/Export: PEM and DER format support for public/private keys
+ * - Key Derivation: PBKDF2, HKDF (RFC 5869) for key derivation from passwords
+ *
+ * Security Features:
+ * - Secure key import: Private keys zeroed after BCrypt import
+ * - Padding validation: RFC 8017 PSS salt length = hash length
+ * - Blob integrity checks: BCRYPT_RSAKEY_BLOB header validation
+ * - Thread-safe RAII: EcdhProviderHandle for resource management
+ * - Constant-time operations: BCRYPT crypto primitives prevent timing attacks
+ *
+ * @copyright Copyright (c) 2025 ShadowStrike Security Suite
+ */
+#include "CryptoUtils.hpp"
 #include"CryptoUtilsCommon.hpp"
 #include<sstream>
 

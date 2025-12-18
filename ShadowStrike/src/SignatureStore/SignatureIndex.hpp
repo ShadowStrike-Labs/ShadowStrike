@@ -398,11 +398,22 @@ public:
         [[nodiscard]] std::vector<DetectionResult> Feed(
             std::span<const uint8_t> chunk
         ) noexcept;
+        
+        // Get accumulated buffer for external processing
+        [[nodiscard]] std::span<const uint8_t> GetBuffer() const noexcept {
+            return std::span<const uint8_t>(m_buffer);
+        }
+        
+        // Get current position in buffer
+        [[nodiscard]] size_t GetPosition() const noexcept {
+            return m_position;
+        }
 
     private:
         friend class PatternIndex;
         std::vector<uint8_t> m_buffer;
-       
+        const PatternIndex* m_patternIndex{nullptr};  // Back-pointer for searches
+        uint32_t m_currentNodeOffset{0};               // Current trie node for streaming
         size_t m_position{0};
     };
 

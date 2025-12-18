@@ -133,13 +133,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_main_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_utils_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_format_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp" />
-    <ClCompile Include="..\..\..\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp" />
     <ClCompile Include="external\pugixml\pugixml.cpp" />
     <ClCompile Include="external\SQLiteCpp\sqlite3\sqlite3.c" />
     <ClCompile Include="external\SQLiteCpp\src\Backup.cpp" />
@@ -156,7 +149,6 @@
     <ClCompile Include="external\tlsh\src\tlsh.cpp" />
     <ClCompile Include="external\tlsh\src\tlsh_impl.cpp" />
     <ClCompile Include="external\tlsh\src\tlsh_util.cpp" />
-    <ClCompile Include="src\Cache\MemoryCache.cpp" />
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\Database\LogDB.cpp" />
@@ -164,6 +156,9 @@
     <ClCompile Include="src\HashStore\BloomFilter_impl.cpp" />
     <ClCompile Include="src\HashStore\HashBucket_impl.cpp" />
     <ClCompile Include="src\HashStore\HashStore.cpp" />
+    <ClCompile Include="src\HashStore\HashStore_import_export.cpp" />
+    <ClCompile Include="src\HashStore\HashStore_mgnmnt.cpp" />
+    <ClCompile Include="src\HashStore\HashStore_query_operations.cpp" />
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\PatternStore\aho_crsck_impl.cpp" />
     <ClCompile Include="src\PatternStore\boyer_moore_impl.cpp" />
@@ -180,7 +175,6 @@
     <ClCompile Include="src\SignatureStore\sig_builder_serialization.cpp" />
     <ClCompile Include="src\SignatureStore\sig_builder_utils.cpp" />
     <ClCompile Include="src\SignatureStore\sig_indx_internal_node_mng.cpp" />
-    <ClCompile Include="src\SignatureStore\SIMD_matcher_impl.cpp" />
     <ClCompile Include="src\SignatureStore\YaraRuleStore.cpp" />
     <ClCompile Include="src\ThreatIntel\ReputationCache.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelDatabase.cpp" />
@@ -196,12 +190,26 @@
     <ClCompile Include="src\Utils\CacheManager.cpp" />
     <ClCompile Include="src\Utils\CompressionUtils.cpp" />
     <ClCompile Include="src\Utils\CryptoUtils.cpp" />
+    <ClCompile Include="src\Utils\CryptoUtilsCommon.cpp" />
+    <ClCompile Include="src\Utils\CryptoUtils_AsymmetricCipher.cpp" />
+    <ClCompile Include="src\Utils\CryptoUtils_private_key.cpp" />
+    <ClCompile Include="src\Utils\CryptoUtils_SecureBuffer.cpp" />
+    <ClCompile Include="src\Utils\CryptoUtils_Secure_Random.cpp" />
+    <ClCompile Include="src\Utils\CryptoUtils_SymmetricCipher.cpp" />
     <ClCompile Include="src\Utils\FileUtils.cpp" />
     <ClCompile Include="src\Utils\HashUtils.cpp" />
     <ClCompile Include="src\Utils\JSONUtils.cpp" />
     <ClCompile Include="src\Utils\Logger.cpp" />
     <ClCompile Include="src\Utils\MemoryUtils.cpp" />
+    <ClCompile Include="src\Utils\NetworkSecurity_SSL_TLS.cpp" />
     <ClCompile Include="src\Utils\NetworkUtils.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtilsIpAddress.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtilsMacAdress.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtils_Adapter.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtils_DNS.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtils_http_https.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtils_proxy.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtils_URL.cpp" />
     <ClCompile Include="src\Utils\PE_sig_verf.cpp" />
     <ClCompile Include="src\Utils\ProcessUtils.cpp" />
     <ClCompile Include="src\Utils\RegistryUtils.cpp" />
@@ -299,6 +307,7 @@
     <ClInclude Include="src\Utils\CacheManager.hpp" />
     <ClInclude Include="src\Utils\CompressionUtils.hpp" />
     <ClInclude Include="src\Utils\CryptoUtils.hpp" />
+    <ClInclude Include="src\Utils\CryptoUtilsCommon.hpp" />
     <ClInclude Include="src\Utils\FileUtils.hpp" />
     <ClInclude Include="src\Utils\HashUtils.hpp" />
     <ClInclude Include="src\Utils\JSONUtils.hpp" />
