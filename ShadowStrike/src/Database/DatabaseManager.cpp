@@ -1,4 +1,20 @@
-﻿#include "DatabaseManager.hpp"
+﻿/*
+ * ============================================================================
+ * ShadowStrike DatabaseManager - IMPLEMENTATION
+ * ============================================================================
+ *
+ * Copyright (c) 2026 ShadowStrike Security Suite
+ * All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL
+ *
+ * CRITICAL: Sub-microsecond performance required!
+ *
+ * ============================================================================
+ */
+
+
+#include "DatabaseManager.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
@@ -608,13 +624,13 @@ namespace ShadowStrike {
                 }
             }
 
-            // ✅ Release connection
+            // Release connection
             if (m_connection && m_manager) {
                 m_manager->ReleaseConnection(m_connection);
             }
         }
 
-        // ✅ NEW: Execute on transaction's connection
+        // Execute on transaction's connection
         bool Transaction::Execute(std::string_view sql, DatabaseError* err) {
             if (!m_active || !m_db) {
                 if (err) {

@@ -513,7 +513,7 @@ public:
     [[nodiscard]] size_t GetBitCount() const noexcept { return m_bitCount; }
     
     /// @brief Get filter size in bytes
-    [[nodiscard]] size_t GetByteCount() const noexcept { return m_data.size() * sizeof(uint64_t); }
+    [[nodiscard]] size_t GetByteCount() const noexcept { return m_dataSize * sizeof(uint64_t); }
     
     /// @brief Get number of hash functions
     [[nodiscard]] size_t GetHashFunctions() const noexcept { return CacheConfig::BLOOM_HASH_FUNCTIONS; }
@@ -530,8 +530,12 @@ public:
     }
     
 private:
-    /// @brief Bit array (using atomic for thread-safe bit operations)
-    std::vector<std::atomic<uint64_t>> m_data;
+    /// @brief Bit array (using unique_ptr to atomic array for thread-safe bit operations)
+    /// Note: std::vector<std::atomic<T>> is invalid because atomic is not copyable/movable
+    std::unique_ptr<std::atomic<uint64_t>[]> m_data;
+    
+    /// @brief Data array size (number of uint64_t elements)
+    size_t m_dataSize{0};
     
     /// @brief Total bit count
     size_t m_bitCount{0};

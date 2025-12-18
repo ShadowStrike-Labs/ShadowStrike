@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ============================================================================
  * ShadowStrike Cache Manager Implementation
  * ============================================================================
@@ -512,7 +512,7 @@ namespace ShadowStrike {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             catch (const std::system_error& ex) {
-                SS_LOG_ERROR(L"CacheManager", L"Failed to start maintenance thread");
+                SS_LOG_ERROR(L"CacheManager", L"Failed to start maintenance thread : ",ex.what());
                 m_shutdown.store(true, std::memory_order_release);
                 return;
             }
@@ -754,10 +754,8 @@ namespace ShadowStrike {
         }
 
         bool CacheManager::Get(const std::wstring& key, std::vector<uint8_t>& outData) {
-            // Always clear output first
             outData.clear();
 
-            // Validate input
             if (key.empty()) {
                 return false;
             }
@@ -767,10 +765,13 @@ namespace ShadowStrike {
             Entry entryCopyForPersist;
             bool foundInMemory = false;
 
-            // ----------------------------------------------------------------
-            // Check In-Memory Cache
-            // ----------------------------------------------------------------
+            // Variables for deferred disk cleanup
+            std::wstring keyToRemoveFromDisk;
+            bool shouldRemoveFromDisk = false;
 
+            // ================================================================
+            // Check In-Memory Cache
+            // ================================================================
             {
                 SRWExclusive guard(m_lock);
 
@@ -780,7 +781,11 @@ namespace ShadowStrike {
 
                     // Check expiration
                     if (isExpired_NoLock(*entry, now)) {
-                        // Remove expired entry
+                        // Prepare for cleanup BEFORE releasing lock
+                        shouldRemoveFromDisk = entry->persistent;
+                        keyToRemoveFromDisk = key;
+
+                        // Update tracking under lock
                         if (m_totalBytes >= entry->sizeBytes) {
                             m_totalBytes -= entry->sizeBytes;
                         }
@@ -789,21 +794,12 @@ namespace ShadowStrike {
                         }
 
                         m_lru.erase(entry->lruIt);
-                        const bool wasPersistent = entry->persistent;
                         m_map.erase(it);
 
-                        // Clean up disk file outside lock
-                        if (wasPersistent) {
-                            // Release lock before disk operation
-                            guard.~SRWExclusive();
-                            persistRemoveByKey(key);
-                        }
-
-                        return false;
+                        // LOCK RELEASED HERE automatically when guard destructs
                     }
-
-                    // Update sliding expiration if enabled
-                    if (entry->sliding && entry->ttl.count() > 0) {
+                    else if (entry->sliding && entry->ttl.count() > 0) {
+                        // Update sliding expiration if enabled
                         ULARGE_INTEGER currentTime{};
                         currentTime.LowPart = now.dwLowDateTime;
                         currentTime.HighPart = now.dwHighDateTime;
@@ -811,7 +807,6 @@ namespace ShadowStrike {
                         constexpr uint64_t kTicksPerMs = 10000ULL;
                         const uint64_t delta100ns = static_cast<uint64_t>(entry->ttl.count()) * kTicksPerMs;
 
-                        // Check for overflow before updating
                         if (currentTime.QuadPart <= std::numeric_limits<uint64_t>::max() - delta100ns) {
                             ULARGE_INTEGER newExpire{};
                             newExpire.QuadPart = currentTime.QuadPart + delta100ns;
@@ -819,55 +814,82 @@ namespace ShadowStrike {
                             entry->expire.dwLowDateTime = newExpire.LowPart;
                             entry->expire.dwHighDateTime = newExpire.HighPart;
 
-                            // Schedule persist update if disk-backed
                             if (entry->persistent) {
                                 needsPersistUpdate = true;
                                 entryCopyForPersist = *entry;
                             }
                         }
-                    }
 
-                    // Copy data to output
-                    try {
-                        outData = entry->value;
-                    }
-                    catch (const std::bad_alloc&) {
-                        return false;
-                    }
+                        // Copy data and update LRU under lock
+                        try {
+                            outData = entry->value;
+                        }
+                        catch (const std::bad_alloc&) {
+                            return false;
+                        }
 
-                    // Update LRU position
-                    touchLRU_NoLock(key, entry);
-                    foundInMemory = true;
+                        touchLRU_NoLock(key, entry);
+                        foundInMemory = true;
+                    }
+                    else {
+                        // Entry is valid and not sliding
+                        try {
+                            outData = entry->value;
+                        }
+                        catch (const std::bad_alloc&) {
+                            return false;
+                        }
+
+                        touchLRU_NoLock(key, entry);
+                        foundInMemory = true;
+                    }
+                }
+            } // ← LOCK EXPLICITLY RELEASED HERE
+
+            // ================================================================
+            // Cleanup Operations Outside Lock
+            // ================================================================
+
+            // Remove expired entry from disk if needed
+            if (shouldRemoveFromDisk) {
+                if (!persistRemoveByKey(keyToRemoveFromDisk)) {
+                    SS_LOG_ERROR(L"CacheManager", L"Failed to remove expired cache entry from disk");
+                    // Don't return false - entry is already removed from memory
+                }
+                return false; // Expired entry, nothing to return
+            }
+
+            // Update persistent storage for sliding expiration
+            if (needsPersistUpdate) {
+                if (!persistWrite(key, entryCopyForPersist)) {
+                    SS_LOG_ERROR(L"CacheManager", L"Failed to update sliding expiration in disk cache");
+                    // Don't return false - entry is valid in memory
                 }
             }
 
-            // Update persistent storage outside lock
-            if (needsPersistUpdate) {
-                persistWrite(key, entryCopyForPersist);
-            }
-
-            // Return if found in memory
             if (foundInMemory) {
                 return true;
             }
 
-            // ----------------------------------------------------------------
+            // ================================================================
             // Check Disk Cache
-            // ----------------------------------------------------------------
+            // ================================================================
 
             Entry diskEntry;
             if (!persistRead(key, diskEntry)) {
                 return false;
             }
 
-            // Validate disk entry hasn't expired
             const FILETIME now2 = nowFileTime();
             if (isExpired_NoLock(diskEntry, now2)) {
-                persistRemoveByKey(key);
+                auto res = persistRemoveByKey(key);
+                if (res == false) {
+                   SS_LOG_ERROR(L"CacheManager", L"Failed to remove expired cache entry from disk");
+                   return false;
+                }
                 return false;
             }
 
-            // Load disk entry into memory cache
             std::shared_ptr<Entry> entry;
             try {
                 entry = std::make_shared<Entry>(std::move(diskEntry));
@@ -879,10 +901,8 @@ namespace ShadowStrike {
             {
                 SRWExclusive guard(m_lock);
 
-                // Check if another thread added this key while we were reading
                 auto existingIt = m_map.find(key);
                 if (existingIt != m_map.end()) {
-                    // Another thread beat us - use their copy
                     try {
                         outData = existingIt->second->value;
                     }
@@ -893,17 +913,14 @@ namespace ShadowStrike {
                     return true;
                 }
 
-                // Add to cache
                 m_lru.push_front(key);
                 entry->lruIt = m_lru.begin();
                 m_totalBytes += entry->sizeBytes;
                 m_map.emplace(key, entry);
 
-                // Ensure we're within limits
                 evictIfNeeded_NoLock();
-            }
+            } // ← LOCK RELEASED HERE
 
-            // Copy data to output
             try {
                 outData = entry->value;
             }
@@ -946,80 +963,115 @@ namespace ShadowStrike {
 
             // Always try to remove from disk (in case it exists there but not in memory)
             if (wasPersistent || removed) {
-                persistRemoveByKey(key);
+                [[maybe_unused]] auto res = persistRemoveByKey(key);
+                if(res == false) {
+                    SS_LOG_ERROR(L"CacheManager", L"Failed to remove cache entry from disk");
+					// Don't return false - entry is already removed from memory
+				}
             }
 
             return removed;
         }
 
+
         void CacheManager::Clear() {
-            // Clear in-memory cache
+            // PHASE 1: Clear in-memory cache under exclusive lock
+            // RAII guard ensures lock is released when scope exits
             {
-                SRWExclusive guard(m_lock);
+                SRWExclusive memGuard(m_lock);
                 m_map.clear();
                 m_lru.clear();
                 m_totalBytes = 0;
-            }
+            } // ← Lock automatically released here by destructor
 
-            // Clear disk cache
+            // PHASE 2: Clear disk cache - only proceed if base directory is configured
             if (m_baseDir.empty()) {
+                SS_LOG_INFO(L"CacheManager", L"Cache cleared (memory only)");
                 return;
             }
 
-            SRWExclusive diskGuard(m_diskLock);
+            // PHASE 3: Disk cleanup with exclusive disk lock
+            {
+                SRWExclusive diskGuard(m_diskLock);
 
-            // Build search mask
-            std::wstring mask = m_baseDir;
-            if (!mask.empty() && mask.back() != L'\\') {
-                mask.push_back(L'\\');
-            }
-            mask += L"*";
+                // Build search mask for immediate subdirectories
+                std::wstring searchMask = m_baseDir;
+                if (!searchMask.empty() && searchMask.back() != L'\\') {
+                    searchMask.push_back(L'\\');
+                }
+                searchMask += L"*";
 
-            WIN32_FIND_DATAW fd{};
-            HANDLE hFind = FindFirstFileW(mask.c_str(), &fd);
-            if (hFind == INVALID_HANDLE_VALUE) {
-                return;
-            }
+                WIN32_FIND_DATAW findData{};
+                HANDLE hFindSubdirs = FindFirstFileW(searchMask.c_str(), &findData);
 
-            // Iterate subdirectories (2-char hex prefixes)
-            do {
-                // Only process directories
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    continue;
+                if (hFindSubdirs == INVALID_HANDLE_VALUE) {
+                    SS_LOG_WARN(L"CacheManager", L"Could not enumerate cache subdirectories");
+                    return;
                 }
 
-                // Skip . and ..
-                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
-                    continue;
-                }
+                // RAII wrapper for subdirectory find handle - ensures cleanup
+                struct FindHandleGuard {
+                    HANDLE handle;
+                    ~FindHandleGuard() { if (handle != INVALID_HANDLE_VALUE) FindClose(handle); }
+                } subdirGuard{ hFindSubdirs };
 
-                // Build path to cache files in this subdirectory
-                std::wstring subMask = m_baseDir + L"\\" + fd.cFileName + L"\\*.cache";
+                // Iterate through all subdirectories (2-char hex prefixes)
+                do {
+                    // Skip non-directory entries
+                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        continue;
+                    }
 
-                WIN32_FIND_DATAW fd2{};
-                HANDLE hFind2 = FindFirstFileW(subMask.c_str(), &fd2);
-                if (hFind2 != INVALID_HANDLE_VALUE) {
-                    do {
-                        // Skip directories
-                        if (fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                            continue;
-                        }
+                    // Skip special entries (. and ..)
+                    if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+                        continue;
+                    }
 
-                        // Build full path and delete
-                        std::wstring filePath = m_baseDir + L"\\" + fd.cFileName + L"\\" + fd2.cFileName;
-                        DeleteFileW(filePath.c_str());
+                    // Build path to cache files within this subdirectory
+                    std::wstring cacheFilesMask = m_baseDir + L"\\" + findData.cFileName + L"\\*.cache";
 
-                    } while (FindNextFileW(hFind2, &fd2));
+                    WIN32_FIND_DATAW cacheFileData{};
+                    HANDLE hFindCacheFiles = FindFirstFileW(cacheFilesMask.c_str(), &cacheFileData);
 
-                    FindClose(hFind2);
-                }
+                    if (hFindCacheFiles != INVALID_HANDLE_VALUE) {
+                        // RAII wrapper for cache files find handle
+                        struct CacheFilesGuard {
+                            HANDLE handle;
+                            ~CacheFilesGuard() { if (handle != INVALID_HANDLE_VALUE) FindClose(handle); }
+                        } cacheGuard{ hFindCacheFiles };
 
-            } while (FindNextFileW(hFind, &fd));
+                        // Delete each cache file in this subdirectory
+                        do {
+                            // Skip directory entries (shouldn't happen with *.cache pattern, but be defensive)
+                            if (cacheFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                                continue;
+                            }
 
-            FindClose(hFind);
+                            // Build full path to cache file
+                            std::wstring cacheFilePath = m_baseDir + L"\\" +
+                                findData.cFileName + L"\\" +
+                                cacheFileData.cFileName;
 
-            SS_LOG_INFO(L"CacheManager", L"Cache cleared");
+                            // Attempt to delete the file
+                            if (!DeleteFileW(cacheFilePath.c_str())) {
+                                const DWORD deleteError = GetLastError();
+                                // Log all errors except file-not-found (already deleted by another thread)
+                                if (deleteError != ERROR_FILE_NOT_FOUND) {
+                                    SS_LOG_WARN(L"CacheManager", L"Failed to delete cache file");
+                                }
+                            }
+
+                        } while (FindNextFileW(hFindCacheFiles, &cacheFileData));
+                        // ← hFindCacheFiles automatically closed by ~CacheFilesGuard
+                    }
+
+                } while (FindNextFileW(hFindSubdirs, &findData));
+                // ← hFindSubdirs automatically closed by ~subdirGuard
+            } // ← diskGuard released here
+
+            SS_LOG_INFO(L"CacheManager", L"Cache cleared successfully (memory + disk)");
         }
+
 
         bool CacheManager::Contains(const std::wstring& key) const {
             if (key.empty()) {
@@ -1168,7 +1220,11 @@ namespace ShadowStrike {
                 if (!removedKeys.empty()) {
                     for (const auto& key : removedKeys) {
                         try {
-                            persistRemoveByKey(key);
+                            auto res = persistRemoveByKey(key);
+							if (res == false) {
+                                SS_LOG_ERROR(L"CacheManager", L"Failed to remove expired cache entry from disk");
+                                return;
+                            }
                         }
                         catch (const std::exception&) {
                             // Log but continue with other deletions
@@ -1618,39 +1674,42 @@ namespace ShadowStrike {
          * @note This method uses FILE_FLAG_WRITE_THROUGH for durability
          *       and MOVEFILE_WRITE_THROUGH for atomic rename.
          */
+
         bool CacheManager::persistWrite(const std::wstring& key, const Entry& entry) {
-            // Validate prerequisites
-            if (m_baseDir.empty()) {
-                return false;
-            }
-            if (key.empty()) {
+            // INPUT VALIDATION
+            if (m_baseDir.empty() || key.empty()) {
                 return false;
             }
 
-            // Acquire disk lock and track operation
+            // PHASE 1: Acquire exclusive disk lock and track pending operation
+            // Both guards use RAII - automatically released on scope exit
             SRWExclusive diskGuard(m_diskLock);
             DiskOpGuard opGuard(m_pendingDiskOps);
 
-            // Generate hash-based file path
+            // PHASE 2: Generate and validate cryptographic hash of key
             const std::wstring hex = hashKeyToHex(key);
             if (hex.size() < 2 || hex.empty()) {
+                SS_LOG_ERROR(L"CacheManager", L"Failed to hash cache key");
                 return false;
             }
 
-            // Ensure subdirectory exists
+            // PHASE 3: Ensure subdirectory exists
             if (!ensureSubdirForHash(hex.substr(0, 2))) {
+                SS_LOG_ERROR(L"CacheManager", L"Failed to create cache subdirectory");
                 return false;
             }
 
-            // Get validated final path
+            // PHASE 4: Get validated final destination path (with path traversal protection)
             std::wstring finalPath = pathForKeyHex(hex);
             if (finalPath.empty()) {
+                SS_LOG_ERROR(L"CacheManager", L"Invalid cache file path generated");
                 return false;
             }
 
-            // Generate unique temporary file path
+            // PHASE 5: Generate unique temporary file path for atomic write
+            // Using timestamp + pointer address + process ID for uniqueness
             wchar_t tempPath[MAX_PATH] = {};
-            const int written = swprintf_s(
+            const int pathFormatResult = swprintf_s(
                 tempPath,
                 MAX_PATH,
                 L"%s.tmp.%08X%08X",
@@ -1658,97 +1717,136 @@ namespace ShadowStrike {
                 static_cast<unsigned>(GetTickCount64() & 0xFFFFFFFF),
                 static_cast<unsigned>(reinterpret_cast<uintptr_t>(this) & 0xFFFFFFFF)
             );
-            if (written <= 0) {
+            if (pathFormatResult <= 0) {
+                SS_LOG_ERROR(L"CacheManager", L"Failed to format temporary file path");
                 return false;
             }
 
-            // Create temporary file with write-through flag for durability
-            FileHandle hFile(CreateFileW(
+            // PHASE 6: Create temporary file with write-through flag for durability
+            // FileHandle uses RAII - destructor calls Close() automatically
+            FileHandle tempFileHandle(CreateFileW(
                 tempPath,
                 GENERIC_WRITE,
-                0,                          // No sharing during write
+                0,  // Exclusive access during write
                 nullptr,
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                CREATE_ALWAYS,  // Create new or truncate existing
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,  // Ensure data hits disk
                 nullptr
             ));
 
-            if (!hFile.IsValid()) {
+            if (!tempFileHandle.IsValid()) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to create temporary cache file");
                 return false;
             }
 
-            // Prepare header with explicit initialization
-            ULARGE_INTEGER expireTime{};
-            expireTime.LowPart = entry.expire.dwLowDateTime;
-            expireTime.HighPart = entry.expire.dwHighDateTime;
+            // PHASE 7: Prepare cache file header
+            ULARGE_INTEGER expireTimeValue{};
+            expireTimeValue.LowPart = entry.expire.dwLowDateTime;
+            expireTimeValue.HighPart = entry.expire.dwHighDateTime;
 
-            // Validate key size fits in uint32_t
+            // Validate key size fits in uint32_t (required for header)
             const size_t keyBytesRaw = key.size() * sizeof(wchar_t);
             if (keyBytesRaw > UINT32_MAX) {
-                hFile.Close();
+                SS_LOG_ERROR(L"CacheManager", L"Cache key too large for serialization");
+                // tempFileHandle destructor will close the file
                 DeleteFileW(tempPath);
                 return false;
             }
             const uint32_t keyBytes = static_cast<uint32_t>(keyBytesRaw);
 
-            // Validate value size fits in uint64_t and DWORD for WriteFile
+            // Validate value size fits in DWORD (required for WriteFile)
             if (entry.value.size() > UINT32_MAX) {
-                hFile.Close();
+                SS_LOG_ERROR(L"CacheManager", L"Cache value too large for serialization");
+                // tempFileHandle destructor will close the file
                 DeleteFileW(tempPath);
                 return false;
             }
 
-            // Build header
-            CacheFileHeader hdr{};
-            hdr.magic = kCacheMagic;
-            hdr.version = kCacheVersion;
-            hdr.reserved = 0;
-            hdr.expire100ns = expireTime.QuadPart;
-            hdr.flags = (entry.sliding ? 0x1u : 0u) | (entry.persistent ? 0x2u : 0u);
-            hdr.keyBytes = keyBytes;
-            hdr.valueBytes = static_cast<uint64_t>(entry.value.size());
-            hdr.ttlMs = static_cast<uint64_t>(entry.ttl.count());
+            // Build the cache file header
+            CacheFileHeader fileHeader{};
+            fileHeader.magic = kCacheMagic;
+            fileHeader.version = kCacheVersion;
+            fileHeader.reserved = 0;
+            fileHeader.expire100ns = expireTimeValue.QuadPart;
+            fileHeader.flags = (entry.sliding ? 0x1u : 0u) | (entry.persistent ? 0x2u : 0u);
+            fileHeader.keyBytes = keyBytes;
+            fileHeader.valueBytes = static_cast<uint64_t>(entry.value.size());
+            fileHeader.ttlMs = static_cast<uint64_t>(entry.ttl.count());
 
-            // Write header
+            // PHASE 8: Write header to temporary file
             DWORD bytesWritten = 0;
-            BOOL ok = WriteFile(hFile.Get(), &hdr, sizeof(hdr), &bytesWritten, nullptr);
-            if (!ok || bytesWritten != sizeof(hdr)) {
-                hFile.Close();
+            BOOL writeResult = WriteFile(
+                tempFileHandle.Get(),
+                &fileHeader,
+                sizeof(fileHeader),
+                &bytesWritten,
+                nullptr  // Synchronous write
+            );
+
+            if (!writeResult || bytesWritten != sizeof(fileHeader)) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to write cache file header");
+                // tempFileHandle destructor closes file, then manually delete temp
                 DeleteFileW(tempPath);
                 return false;
             }
 
-            // Write key data
+            // PHASE 9: Write key data to file
             if (keyBytes > 0) {
-                ok = WriteFile(hFile.Get(), key.data(), keyBytes, &bytesWritten, nullptr);
-                if (!ok || bytesWritten != keyBytes) {
-                    hFile.Close();
+                writeResult = WriteFile(
+                    tempFileHandle.Get(),
+                    key.data(),
+                    keyBytes,
+                    &bytesWritten,
+                    nullptr
+                );
+
+                if (!writeResult || bytesWritten != keyBytes) {
+                    SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to write cache key data");
                     DeleteFileW(tempPath);
                     return false;
                 }
             }
 
-            // Write value data
+            // PHASE 10: Write value data to file
             if (!entry.value.empty()) {
-                const DWORD valueBytes = static_cast<DWORD>(entry.value.size());
-                ok = WriteFile(hFile.Get(), entry.value.data(), valueBytes, &bytesWritten, nullptr);
-                if (!ok || bytesWritten != valueBytes) {
-                    hFile.Close();
+                const DWORD valueBytesToWrite = static_cast<DWORD>(entry.value.size());
+                writeResult = WriteFile(
+                    tempFileHandle.Get(),
+                    entry.value.data(),
+                    valueBytesToWrite,
+                    &bytesWritten,
+                    nullptr
+                );
+
+                if (!writeResult || bytesWritten != valueBytesToWrite) {
+                    SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to write cache value data");
                     DeleteFileW(tempPath);
                     return false;
                 }
             }
 
-            // Flush buffers to ensure data is on disk
-            FlushFileBuffers(hFile.Get());
-            hFile.Close();
-
-            // Atomic move: temp file -> final path
-            if (!MoveFileExW(tempPath, finalPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            // PHASE 11: Flush buffers to ensure all data is written to disk
+            if (!FlushFileBuffers(tempFileHandle.Get())) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to flush cache file buffers");
                 DeleteFileW(tempPath);
                 return false;
             }
 
+            // PHASE 12: Close temporary file before atomic rename
+            // This ensures all data is flushed and file is fully written
+            tempFileHandle.Close();  // Explicit close, though ~FileHandle would do this
+
+            // PHASE 13: Atomically move temporary file to final location
+            // MOVEFILE_WRITE_THROUGH ensures metadata is written to disk immediately
+            // MOVEFILE_REPLACE_EXISTING allows overwriting existing cache file
+            if (!MoveFileExW(tempPath, finalPath.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to move cache file to final location");
+                DeleteFileW(tempPath);  // Clean up orphaned temp file
+                return false;
+            }
+
+            SS_LOG_DEBUG(L"CacheManager", L"Successfully persisted cache entry to disk");
             return true;
         }
 
@@ -1765,159 +1863,199 @@ namespace ShadowStrike {
          * @note Key verification prevents cache poisoning attacks where
          *       a malicious file claims to hold a different key's value.
          */
+
         bool CacheManager::persistRead(const std::wstring& key, Entry& outEntry) {
-            // Validate prerequisites
-            if (m_baseDir.empty()) {
-                return false;
-            }
-            if (key.empty()) {
+            // INPUT VALIDATION
+            if (m_baseDir.empty() || key.empty()) {
                 return false;
             }
 
-            // Acquire shared disk lock and track operation
+            // PHASE 1: Acquire shared disk lock and track pending operation
+            // Shared lock allows multiple concurrent reads, exclusive write blocks all
             SRWShared diskGuard(m_diskLock);
             DiskOpGuard opGuard(m_pendingDiskOps);
 
-            // Generate hash-based file path
+            // PHASE 2: Generate cryptographic hash of key for file lookup
             const std::wstring hex = hashKeyToHex(key);
             if (hex.size() < 2 || hex.empty()) {
                 return false;
             }
 
-            // Get validated path
-            const std::wstring finalPath = pathForKeyHex(hex);
-            if (finalPath.empty()) {
+            // PHASE 3: Get validated file path (with path traversal protection)
+            const std::wstring filePath = pathForKeyHex(hex);
+            if (filePath.empty()) {
                 return false;
             }
 
-            // Open file for reading
-            FileHandle hFile(CreateFileW(
-                finalPath.c_str(),
+            // PHASE 4: Open cache file for reading (read-only, sequential scan)
+            // FileHandle uses RAII - destructor closes handle automatically
+            FileHandle cacheFileHandle(CreateFileW(
+                filePath.c_str(),
                 GENERIC_READ,
-                FILE_SHARE_READ,
+                FILE_SHARE_READ,  // Allow other readers (no exclusive access)
                 nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                OPEN_EXISTING,    // File must exist
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,  // Optimization hint for OS
                 nullptr
             ));
 
-            if (!hFile.IsValid()) {
+            if (!cacheFileHandle.IsValid()) {
+                // File not found is not an error - just indicates no cached entry
                 return false;
             }
 
-            // Read header
-            CacheFileHeader hdr{};
+            // PHASE 5: Read and validate file header
+            CacheFileHeader fileHeader{};
             DWORD bytesRead = 0;
 
-            if (!ReadFile(hFile.Get(), &hdr, sizeof(hdr), &bytesRead, nullptr) || bytesRead != sizeof(hdr)) {
+            if (!ReadFile(cacheFileHandle.Get(), &fileHeader, sizeof(fileHeader), &bytesRead, nullptr)) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to read cache file header");
                 return false;
             }
 
-            // Validate magic number
-            if (hdr.magic != kCacheMagic) {
+            if (bytesRead != sizeof(fileHeader)) {
+                SS_LOG_ERROR(L"CacheManager", L"Cache file header is truncated or corrupted");
                 return false;
             }
 
-            // Validate version
-            if (hdr.version != kCacheVersion) {
+            // PHASE 6: Validate magic number (identifies valid cache file)
+            if (fileHeader.magic != kCacheMagic) {
+                SS_LOG_WARN(L"CacheManager", L"Cache file has invalid magic number");
                 return false;
             }
 
-            // Validate key size (security limits)
-            constexpr uint32_t kMaxKeyBytes = 8192; // 4096 wchar_t
-            if (hdr.keyBytes == 0 || hdr.keyBytes > kMaxKeyBytes) {
-                return false;
-            }
-            if (hdr.keyBytes % sizeof(wchar_t) != 0) {
-                return false; // Key bytes must be even (wchar_t alignment)
-            }
-
-            // Validate value size (security limits)
-            constexpr uint64_t kMaxValueBytes = 100ULL * 1024 * 1024; // 100 MB
-            if (hdr.valueBytes > kMaxValueBytes) {
+            // PHASE 7: Validate version (ensures format compatibility)
+            if (fileHeader.version != kCacheVersion) {
+                SS_LOG_WARN(L"CacheManager", L"Cache file version mismatch (expected %u, got %u)",
+                    kCacheVersion, fileHeader.version);
                 return false;
             }
 
-            // Validate file size matches expected content
-            LARGE_INTEGER fileSize{};
-            if (!GetFileSizeEx(hFile.Get(), &fileSize)) {
+            // PHASE 8: Validate key size (security limits)
+            constexpr uint32_t kMaxKeyBytes = 8192;  // 4096 wchar_t
+            if (fileHeader.keyBytes == 0 || fileHeader.keyBytes > kMaxKeyBytes) {
+                SS_LOG_ERROR(L"CacheManager", L"Invalid key size in cache file");
                 return false;
             }
 
-            const uint64_t expectedSize = sizeof(CacheFileHeader) 
-                + static_cast<uint64_t>(hdr.keyBytes) 
-                + hdr.valueBytes;
-
-            if (static_cast<uint64_t>(fileSize.QuadPart) < expectedSize) {
-                return false; // File truncated
+            // Key must be aligned to wchar_t boundary (2 bytes)
+            if ((fileHeader.keyBytes % sizeof(wchar_t)) != 0) {
+                SS_LOG_ERROR(L"CacheManager", L"Cache key is not wchar_t aligned");
+                return false;
             }
 
-            // Read key data
-            std::vector<wchar_t> keyBuf;
+            // PHASE 9: Validate value size (security limits - prevent DoS via huge cache)
+            constexpr uint64_t kMaxValueBytes = 100ULL * 1024 * 1024;  // 100 MB max
+            if (fileHeader.valueBytes > kMaxValueBytes) {
+                SS_LOG_ERROR(L"CacheManager", L"Cache value exceeds maximum size limit");
+                return false;
+            }
+
+            // PHASE 10: Validate entire file size matches expected content
+            LARGE_INTEGER fileSizeValue{};
+            if (!GetFileSizeEx(cacheFileHandle.Get(), &fileSizeValue)) {
+                SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to get cache file size");
+                return false;
+            }
+
+            const uint64_t expectedTotalSize = sizeof(CacheFileHeader) +
+                static_cast<uint64_t>(fileHeader.keyBytes) +
+                fileHeader.valueBytes;
+
+            if (static_cast<uint64_t>(fileSizeValue.QuadPart) < expectedTotalSize) {
+                SS_LOG_ERROR(L"CacheManager", L"Cache file is truncated (expected %llu bytes, got %lld)",
+                    expectedTotalSize, fileSizeValue.QuadPart);
+                return false;
+            }
+
+            // PHASE 11: Read key data from file
+            std::vector<wchar_t> keyBuffer;
             try {
-                keyBuf.resize(hdr.keyBytes / sizeof(wchar_t));
+                keyBuffer.resize(fileHeader.keyBytes / sizeof(wchar_t));
             }
             catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"CacheManager", L"Failed to allocate key buffer");
                 return false;
             }
 
-            if (hdr.keyBytes > 0) {
+            if (fileHeader.keyBytes > 0) {
                 bytesRead = 0;
-                if (!ReadFile(hFile.Get(), keyBuf.data(), hdr.keyBytes, &bytesRead, nullptr) || 
-                    bytesRead != hdr.keyBytes) {
+                if (!ReadFile(cacheFileHandle.Get(), keyBuffer.data(), fileHeader.keyBytes, &bytesRead, nullptr)) {
+                    SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to read cache key");
+                    return false;
+                }
+
+                if (bytesRead != fileHeader.keyBytes) {
+                    SS_LOG_ERROR(L"CacheManager", L"Cache key read is incomplete");
                     return false;
                 }
             }
 
-            // SECURITY: Verify key matches to prevent cache poisoning
-            if (key.size() != keyBuf.size()) {
-                return false;
-            }
-            if (hdr.keyBytes > 0 && wmemcmp(key.data(), keyBuf.data(), keyBuf.size()) != 0) {
+            // PHASE 12: SECURITY - Verify key matches to prevent cache poisoning attacks
+            // A malicious cache file could claim to hold a different key's value
+            std::wstring readKey(keyBuffer.begin(), keyBuffer.end());
+
+            if (key.size() != readKey.size()) {
+                SS_LOG_WARN(L"CacheManager", L"Cache key size mismatch - possible poisoning attempt");
                 return false;
             }
 
-            // Read value data
-            std::vector<uint8_t> value;
+            if (fileHeader.keyBytes > 0 && wmemcmp(key.data(), readKey.data(), key.size()) != 0) {
+                SS_LOG_WARN(L"CacheManager", L"Cache key content mismatch - possible poisoning attempt");
+                return false;
+            }
+
+            // PHASE 13: Read value data from file
+            std::vector<uint8_t> valueBuffer;
             try {
-                value.resize(static_cast<size_t>(hdr.valueBytes));
+                valueBuffer.resize(static_cast<size_t>(fileHeader.valueBytes));
             }
             catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"CacheManager", L"Failed to allocate value buffer");
                 return false;
             }
 
-            if (hdr.valueBytes > 0) {
+            if (fileHeader.valueBytes > 0) {
                 // Validate value size fits in DWORD for ReadFile
-                if (hdr.valueBytes > UINT32_MAX) {
+                if (fileHeader.valueBytes > UINT32_MAX) {
+                    SS_LOG_ERROR(L"CacheManager", L"Value size exceeds DWORD maximum");
                     return false;
                 }
-                const DWORD valueBytes = static_cast<DWORD>(hdr.valueBytes);
 
+                const DWORD valueBytesToRead = static_cast<DWORD>(fileHeader.valueBytes);
                 bytesRead = 0;
-                if (!ReadFile(hFile.Get(), value.data(), valueBytes, &bytesRead, nullptr) ||
-                    bytesRead != valueBytes) {
+
+                if (!ReadFile(cacheFileHandle.Get(), valueBuffer.data(), valueBytesToRead, &bytesRead, nullptr)) {
+                    SS_LOG_LAST_ERROR(L"CacheManager", L"Failed to read cache value");
+                    return false;
+                }
+
+                if (bytesRead != valueBytesToRead) {
+                    SS_LOG_ERROR(L"CacheManager", L"Cache value read is incomplete");
                     return false;
                 }
             }
 
-            // Populate output entry
+            // PHASE 14: Construct output entry from read data
             outEntry.key = key;
-            outEntry.value = std::move(value);
+            outEntry.value = std::move(valueBuffer);
             outEntry.sizeBytes = (key.size() * sizeof(wchar_t)) + outEntry.value.size() + sizeof(Entry);
 
-            // Convert expiration time
-            ULARGE_INTEGER expireTime{};
-            expireTime.QuadPart = hdr.expire100ns;
-            outEntry.expire.dwLowDateTime = expireTime.LowPart;
-            outEntry.expire.dwHighDateTime = expireTime.HighPart;
+            // Convert expiration time from header format to FILETIME
+            ULARGE_INTEGER expireTimeValue{};
+            expireTimeValue.QuadPart = fileHeader.expire100ns;
+            outEntry.expire.dwLowDateTime = expireTimeValue.LowPart;
+            outEntry.expire.dwHighDateTime = expireTimeValue.HighPart;
 
-            // Parse flags
-            outEntry.sliding = (hdr.flags & 0x1u) != 0;
-            outEntry.persistent = (hdr.flags & 0x2u) != 0;
-            outEntry.ttl = std::chrono::milliseconds(hdr.ttlMs);
+            // Parse flags from header
+            outEntry.sliding = (fileHeader.flags & 0x1u) != 0;
+            outEntry.persistent = (fileHeader.flags & 0x2u) != 0;
+            outEntry.ttl = std::chrono::milliseconds(fileHeader.ttlMs);
 
+            // cacheFileHandle destructor closes the file automatically
             return true;
         }
+
 
         /**
          * @brief Removes a cache entry file from disk.
@@ -2114,75 +2252,101 @@ namespace ShadowStrike {
          *       before the maintenance thread starts.
          * @note Uses careful lock ordering to prevent deadlocks.
          */
+
         void CacheManager::loadPersistentEntries() {
+            // Early return if no cache directory configured
             if (m_baseDir.empty()) {
                 return;
             }
 
-            // Verify cache directory exists
-            const DWORD attribs = GetFileAttributesW(m_baseDir.c_str());
-            if (attribs == INVALID_FILE_ATTRIBUTES) {
-                return;
-            }
-            if (!(attribs & FILE_ATTRIBUTE_DIRECTORY)) {
-                return;
-            }
-
-            // Build search mask for subdirectories
-            std::wstring mask = m_baseDir;
-            if (!mask.empty() && mask.back() != L'\\') {
-                mask.push_back(L'\\');
-            }
-            mask += L"*";
-
-            WIN32_FIND_DATAW fd{};
-            HANDLE hFind = FindFirstFileW(mask.c_str(), &fd);
-            if (hFind == INVALID_HANDLE_VALUE) {
+            // PHASE 1: Verify cache directory exists and is actually a directory
+            const DWORD directoryAttribs = GetFileAttributesW(m_baseDir.c_str());
+            if (directoryAttribs == INVALID_FILE_ATTRIBUTES) {
+                SS_LOG_WARN(L"CacheManager", L"Cache directory does not exist");
                 return;
             }
 
-            size_t loadedCount = 0;
-            const FILETIME now = nowFileTime();
+            if (!(directoryAttribs & FILE_ATTRIBUTE_DIRECTORY)) {
+                SS_LOG_ERROR(L"CacheManager", L"Cache base path is not a directory");
+                return;
+            }
 
-            // Iterate through subdirectories (2-char hex prefixes)
+            // PHASE 2: Build search mask for subdirectories (2-char hex prefixes)
+            std::wstring subdirSearchMask = m_baseDir;
+            if (!subdirSearchMask.empty() && subdirSearchMask.back() != L'\\') {
+                subdirSearchMask.push_back(L'\\');
+            }
+            subdirSearchMask += L"*";
+
+            // PHASE 3: Start searching for subdirectories
+            WIN32_FIND_DATAW subdirFindData{};
+            HANDLE hFindSubdirs = FindFirstFileW(subdirSearchMask.c_str(), &subdirFindData);
+
+            if (hFindSubdirs == INVALID_HANDLE_VALUE) {
+                SS_LOG_WARN(L"CacheManager", L"No cache subdirectories found");
+                return;
+            }
+
+            // RAII wrapper ensures FindClose is called even if exceptions occur
+            struct FindHandleGuard {
+                HANDLE handle;
+                explicit FindHandleGuard(HANDLE h) : handle(h) {}
+                ~FindHandleGuard() {
+                    if (handle != INVALID_HANDLE_VALUE) FindClose(handle);
+                }
+                // Non-copyable
+                FindHandleGuard(const FindHandleGuard&) = delete;
+                FindHandleGuard& operator=(const FindHandleGuard&) = delete;
+            } subdirGuard(hFindSubdirs);
+
+            size_t totalLoadedEntries = 0;
+            const FILETIME currentTime = nowFileTime();
+
+            // PHASE 4: Iterate through each subdirectory
             do {
-                // Skip non-directories
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                // Skip non-directory entries
+                if (!(subdirFindData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                     continue;
                 }
 
-                // Skip . and ..
-                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+                // Skip system entries (. and ..)
+                if (wcscmp(subdirFindData.cFileName, L".") == 0 ||
+                    wcscmp(subdirFindData.cFileName, L"..") == 0) {
                     continue;
                 }
 
-                // Search for cache files in subdirectory
-                std::wstring subMask = m_baseDir + L"\\" + fd.cFileName + L"\\*.cache";
+                // PHASE 5: Build search mask for cache files within this subdirectory
+                std::wstring cacheFileSearchMask = m_baseDir + L"\\" +
+                    subdirFindData.cFileName + L"\\*.cache";
 
-                WIN32_FIND_DATAW fd2{};
-                HANDLE hFind2 = FindFirstFileW(subMask.c_str(), &fd2);
-                if (hFind2 != INVALID_HANDLE_VALUE) {
+                WIN32_FIND_DATAW cacheFileFindData{};
+                HANDLE hFindCacheFiles = FindFirstFileW(cacheFileSearchMask.c_str(), &cacheFileFindData);
+
+                if (hFindCacheFiles != INVALID_HANDLE_VALUE) {
+                    // RAII wrapper for cache files find handle
+                    FindHandleGuard cacheFilesGuard(hFindCacheFiles);
+
+                    // PHASE 6: Process each cache file in this subdirectory
                     do {
-                        // Skip directories
-                        if (fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                        // Skip directory entries (shouldn't happen with *.cache pattern)
+                        if (cacheFileFindData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                             continue;
                         }
 
-                        // Validate filename format
-                        std::wstring filename(fd2.cFileName);
-                        if (filename.size() < 7) {
-                            continue;
-                        }
-                        if (filename.substr(filename.size() - 6) != L".cache") {
+                        // PHASE 7: Validate filename format (.cache extension)
+                        std::wstring fileName(cacheFileFindData.cFileName);
+                        if (fileName.size() < 7 || fileName.substr(fileName.size() - 6) != L".cache") {
                             continue;
                         }
 
-                        // Build full path
-                        std::wstring filePath = m_baseDir + L"\\" + fd.cFileName + L"\\" + filename;
+                        // PHASE 8: Build full path to cache file
+                        std::wstring fullCacheFilePath = m_baseDir + L"\\" +
+                            subdirFindData.cFileName + L"\\" +
+                            fileName;
 
-                        // Open cache file
-                        FileHandle hFile(CreateFileW(
-                            filePath.c_str(),
+                        // PHASE 9: Open cache file for reading
+                        FileHandle cacheFileHandle(CreateFileW(
+                            fullCacheFilePath.c_str(),
                             GENERIC_READ,
                             FILE_SHARE_READ,
                             nullptr,
@@ -2191,146 +2355,153 @@ namespace ShadowStrike {
                             nullptr
                         ));
 
-                        if (!hFile.IsValid()) {
-                            continue;
+                        if (!cacheFileHandle.IsValid()) {
+                            continue;  // File disappeared or became inaccessible
                         }
 
-                        // Read and validate header
-                        CacheFileHeader hdr{};
+                        // PHASE 10: Read and validate cache file header
+                        CacheFileHeader fileHeader{};
                         DWORD bytesRead = 0;
 
-                        if (!ReadFile(hFile.Get(), &hdr, sizeof(hdr), &bytesRead, nullptr) ||
-                            bytesRead != sizeof(hdr)) {
+                        if (!ReadFile(cacheFileHandle.Get(), &fileHeader, sizeof(fileHeader), &bytesRead, nullptr) ||
+                            bytesRead != sizeof(fileHeader)) {
+                            continue;  // Corrupted or incomplete header
+                        }
+
+                        // Validate magic number
+                        if (fileHeader.magic != kCacheMagic) {
                             continue;
                         }
 
-                        // Validate magic and version
-                        if (hdr.magic != kCacheMagic) {
-                            continue;
-                        }
-                        if (hdr.version != kCacheVersion) {
+                        // Validate version
+                        if (fileHeader.version != kCacheVersion) {
                             continue;
                         }
 
-                        // Validate key size
+                        // PHASE 11: Validate key size
                         constexpr uint32_t kMaxKeyBytes = 8192;
-                        if (hdr.keyBytes == 0 || hdr.keyBytes > kMaxKeyBytes) {
-                            continue;
-                        }
-                        if ((hdr.keyBytes % sizeof(wchar_t)) != 0) {
+                        if (fileHeader.keyBytes == 0 || fileHeader.keyBytes > kMaxKeyBytes) {
                             continue;
                         }
 
-                        // Read key
-                        std::vector<wchar_t> keyBuf;
+                        if ((fileHeader.keyBytes % sizeof(wchar_t)) != 0) {
+                            continue;  // Key not wchar_t aligned
+                        }
+
+                        // PHASE 12: Read key data
+                        std::vector<wchar_t> keyBuffer;
                         try {
-                            keyBuf.resize(hdr.keyBytes / sizeof(wchar_t));
+                            keyBuffer.resize(fileHeader.keyBytes / sizeof(wchar_t));
                         }
                         catch (const std::bad_alloc&) {
-                            continue;
+                            continue;  // Memory exhausted, skip this entry
                         }
 
-                        if (!ReadFile(hFile.Get(), keyBuf.data(), hdr.keyBytes, &bytesRead, nullptr) ||
-                            bytesRead != hdr.keyBytes) {
-                            continue;
+                        bytesRead = 0;
+                        if (!ReadFile(cacheFileHandle.Get(), keyBuffer.data(), fileHeader.keyBytes, &bytesRead, nullptr) ||
+                            bytesRead != fileHeader.keyBytes) {
+                            continue;  // Failed to read key
                         }
 
-                        std::wstring key(keyBuf.begin(), keyBuf.end());
+                        std::wstring key(keyBuffer.begin(), keyBuffer.end());
 
-                        // Check expiration
-                        ULARGE_INTEGER expireTime{};
-                        expireTime.QuadPart = hdr.expire100ns;
+                        // PHASE 13: Check if entry has expired
+                        ULARGE_INTEGER expireTimeValue{};
+                        expireTimeValue.QuadPart = fileHeader.expire100ns;
 
-                        FILETIME expireFt{};
-                        expireFt.dwLowDateTime = expireTime.LowPart;
-                        expireFt.dwHighDateTime = expireTime.HighPart;
+                        FILETIME expireTime{};
+                        expireTime.dwLowDateTime = expireTimeValue.LowPart;
+                        expireTime.dwHighDateTime = expireTimeValue.HighPart;
 
-                        if (fileTimeLessOrEqual(expireFt, now)) {
-                            // Entry expired - delete file
-                            hFile.Close();
-                            DeleteFileW(filePath.c_str());
-                            continue;
+                        if (fileTimeLessOrEqual(expireTime, currentTime)) {
+                            // Entry has expired - delete the cache file
+                            cacheFileHandle.Close();
+                            DeleteFileW(fullCacheFilePath.c_str());
+                            continue;  // Don't load expired entries
                         }
 
-                        // Validate value size
+                        // PHASE 14: Validate value size
                         constexpr uint64_t kMaxValueBytes = 100ULL * 1024 * 1024;
-                        if (hdr.valueBytes > kMaxValueBytes) {
-                            continue;
+                        if (fileHeader.valueBytes > kMaxValueBytes) {
+                            continue;  // Value exceeds size limit
                         }
 
-                        // Read value
-                        std::vector<uint8_t> value;
+                        // PHASE 15: Read value data
+                        std::vector<uint8_t> valueBuffer;
                         try {
-                            value.resize(static_cast<size_t>(hdr.valueBytes));
+                            valueBuffer.resize(static_cast<size_t>(fileHeader.valueBytes));
                         }
                         catch (const std::bad_alloc&) {
-                            continue;
+                            continue;  // Memory exhausted
                         }
 
-                        if (hdr.valueBytes > 0) {
-                            if (hdr.valueBytes > UINT32_MAX) {
+                        if (fileHeader.valueBytes > 0) {
+                            // Check value size fits in DWORD for ReadFile
+                            if (fileHeader.valueBytes > UINT32_MAX) {
                                 continue;
                             }
-                            const DWORD valueBytes = static_cast<DWORD>(hdr.valueBytes);
-                            if (!ReadFile(hFile.Get(), value.data(), valueBytes, &bytesRead, nullptr) ||
-                                bytesRead != valueBytes) {
-                                continue;
+
+                            const DWORD valueBytesToRead = static_cast<DWORD>(fileHeader.valueBytes);
+                            bytesRead = 0;
+
+                            if (!ReadFile(cacheFileHandle.Get(), valueBuffer.data(), valueBytesToRead, &bytesRead, nullptr) ||
+                                bytesRead != valueBytesToRead) {
+                                continue;  // Failed to read value
                             }
                         }
 
-                        hFile.Close();
+                        cacheFileHandle.Close();  // Explicit close before insertion (not strictly necessary but clear)
 
-                        // Create entry object
+                        // PHASE 16: Create entry object from loaded data
                         std::shared_ptr<Entry> entry;
                         try {
                             entry = std::make_shared<Entry>();
                         }
                         catch (const std::bad_alloc&) {
-                            continue;
+                            continue;  // Memory exhausted
                         }
 
+                        // Populate entry from loaded data
                         entry->key = key;
-                        entry->value = std::move(value);
-                        entry->expire = expireFt;
-                        entry->ttl = std::chrono::milliseconds(hdr.ttlMs);
-                        entry->sliding = (hdr.flags & 0x1u) != 0;
+                        entry->value = std::move(valueBuffer);
+                        entry->expire = expireTime;
+                        entry->ttl = std::chrono::milliseconds(fileHeader.ttlMs);
+                        entry->sliding = (fileHeader.flags & 0x1u) != 0;
                         entry->persistent = true;
                         entry->sizeBytes = (key.size() * sizeof(wchar_t)) + entry->value.size() + sizeof(Entry);
 
-                        // Insert into cache (under lock)
+                        // PHASE 17: Insert entry into in-memory cache under exclusive lock
                         {
-                            SRWExclusive guard(m_lock);
+                            SRWExclusive memGuard(m_lock);
 
-                            // Check if already exists
+                            // Check if key already exists (race condition from another thread)
                             if (m_map.find(key) != m_map.end()) {
-                                continue;
+                                continue;  // Skip duplicate
                             }
 
-                            // Check byte limit
+                            // Check if we have room (respect configured byte limit)
                             if (m_maxBytes > 0 && (m_totalBytes + entry->sizeBytes) > m_maxBytes) {
-                                continue;
+                                continue;  // Cache would exceed configured limit
                             }
 
-                            // Insert into LRU and map
+                            // Add entry to LRU and map
                             m_lru.push_front(key);
                             entry->lruIt = m_lru.begin();
                             m_map.emplace(key, entry);
                             m_totalBytes += entry->sizeBytes;
 
-                            ++loadedCount;
-                        }
+                            ++totalLoadedEntries;
+                        } // ← Memory lock released here
 
-                    } while (FindNextFileW(hFind2, &fd2));
-
-                    FindClose(hFind2);
+                    } while (FindNextFileW(hFindCacheFiles, &cacheFileFindData));
+                    // ← hFindCacheFiles closed by ~FindHandleGuard
                 }
 
-            } while (FindNextFileW(hFind, &fd));
+            } while (FindNextFileW(hFindSubdirs, &subdirFindData));
+            // ← hFindSubdirs closed by ~subdirGuard
 
-            FindClose(hFind);
-
-            if (loadedCount > 0) {
-                SS_LOG_INFO(L"CacheManager", L"Loaded persistent entries from disk");
+            if (totalLoadedEntries > 0) {
+                SS_LOG_INFO(L"CacheManager", L"Loaded %zu persistent cache entries from disk", totalLoadedEntries);
             }
         }
 

@@ -37,9 +37,9 @@
 
 #pragma once
 
-#include "SignatureFormat.hpp"
+#include "../SignatureStore/SignatureFormat.hpp"
 #include"../Utils/HashUtils.hpp"
-#include "SignatureIndex.hpp"
+#include "../SignatureStore/SignatureIndex.hpp"
 #include <memory>
 #include <unordered_map>
 #include <atomic>

@@ -499,18 +499,18 @@ public:
     }
 
     /**
-     * @brief Convert ThreatLookupResult to store-level LookupResult format
+     * @brief Convert ThreatLookupResult to store-level StoreLookupResult format
      * 
-     * Maps fields from internal ThreatLookupResult to public LookupResult.
+     * Maps fields from internal ThreatLookupResult to public StoreLookupResult.
      * All fields are copied by value - no ownership transfer.
      * 
      * @param tlResult Internal lookup result
-     * @return Public LookupResult structure
+     * @return Public StoreLookupResult structure
      */
-    [[nodiscard]] LookupResult ConvertLookupResult(
+    [[nodiscard]] StoreLookupResult ConvertLookupResult(
         const ThreatLookupResult& tlResult
     ) const noexcept {
-        LookupResult result;
+        StoreLookupResult result;
         result.found = tlResult.found;
         result.fromCache = (tlResult.source == ThreatLookupResult::Source::SharedCache ||
                            tlResult.source == ThreatLookupResult::Source::ThreadLocalCache);
@@ -815,13 +815,13 @@ bool ThreatIntelStore::IsInitialized() const noexcept {
 // IOC Lookups
 // ============================================================================
 
-LookupResult ThreatIntelStore::LookupHash(
+StoreLookupResult ThreatIntelStore::LookupHash(
     std::string_view algorithm,
     std::string_view hashValue,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     const auto startTime = GetNanoseconds();
@@ -829,7 +829,7 @@ LookupResult ThreatIntelStore::LookupHash(
     // Parse hash
     auto hashOpt = ParseHash(algorithm, hashValue);
     if (!hashOpt.has_value()) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     // Perform lookup through unified lookup interface
@@ -868,13 +868,13 @@ LookupResult ThreatIntelStore::LookupHash(
     return result;
 }
 
-LookupResult ThreatIntelStore::LookupHash(
+StoreLookupResult ThreatIntelStore::LookupHash(
     uint64_t hashHigh,
     uint64_t hashLow,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     // Convert to HashValue structure (assume SHA256 from 128-bit input)
@@ -892,49 +892,49 @@ LookupResult ThreatIntelStore::LookupHash(
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupIPv4(
+StoreLookupResult ThreatIntelStore::LookupIPv4(
     std::string_view address,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->LookupIPv4(address, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupIPv4(
+StoreLookupResult ThreatIntelStore::LookupIPv4(
     uint32_t address,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->LookupIPv4(address, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupIPv6(
+StoreLookupResult ThreatIntelStore::LookupIPv6(
     std::string_view address,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->LookupIPv6(address, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupIPv6(
+StoreLookupResult ThreatIntelStore::LookupIPv6(
     uint64_t addressHigh,
     uint64_t addressLow,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     IPv6Address addr{};
@@ -950,73 +950,73 @@ LookupResult ThreatIntelStore::LookupIPv6(
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupDomain(
+StoreLookupResult ThreatIntelStore::LookupDomain(
     std::string_view domain,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->LookupDomain(domain, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupURL(
+StoreLookupResult ThreatIntelStore::LookupURL(
     std::string_view url,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->LookupURL(url, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupEmail(
+StoreLookupResult ThreatIntelStore::LookupEmail(
     std::string_view email,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->LookupEmail(email, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupJA3(
+StoreLookupResult ThreatIntelStore::LookupJA3(
     std::string_view fingerprint,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->Lookup(IOCType::JA3, fingerprint, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupCVE(
+StoreLookupResult ThreatIntelStore::LookupCVE(
     std::string_view cveId,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->Lookup(IOCType::CVE, cveId, options);
     return m_impl->Impl::ConvertLookupResult(tlResult);
 }
 
-LookupResult ThreatIntelStore::LookupIOC(
+StoreLookupResult ThreatIntelStore::LookupIOC(
     IOCType iocType,
     std::string_view value,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
-        return LookupResult{};
+        return StoreLookupResult{};
     }
 
     auto tlResult = m_impl->lookup->Lookup(iocType, value, options);
@@ -1030,9 +1030,9 @@ LookupResult ThreatIntelStore::LookupIOC(
 BatchLookupResult ThreatIntelStore::BatchLookupHashes(
     std::string_view algorithm,
     std::span<const std::string> hashes,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
-    BatchLookupResult result;
+    StoreBatchLookupResult result;
     
     if (!IsInitialized() || !m_impl->lookup) {
         return result;
@@ -1044,35 +1044,35 @@ BatchLookupResult ThreatIntelStore::BatchLookupHashes(
     result.results.reserve(hashes.size());
 
     for (const auto& hashStr : hashes) {
-        auto lookupResult = LookupHash(algorithm, hashStr, options);
+        auto StoreLookupResult = LookupHash(algorithm, hashStr, options);
         
-        // Convert LookupResult to ThreatLookupResult for internal storage
+        // Convert StoreLookupResult to ThreatLookupResult for internal storage
         ThreatLookupResult tlr{};
-        tlr.found = lookupResult.found;
-        tlr.reputation = lookupResult.reputation;
-        tlr.confidence = lookupResult.confidence;
-        tlr.category = lookupResult.category;
-        tlr.latencyNs = lookupResult.latencyNs;
-        tlr.primarySource = lookupResult.primarySource;
-        tlr.sourceFlags = lookupResult.sourceFlags;
-        tlr.threatScore = lookupResult.score;
-        tlr.firstSeen = lookupResult.firstSeen;
-        tlr.lastSeen = lookupResult.lastSeen;
-        tlr.entry = lookupResult.entry;
+        tlr.found = StoreLookupResult.found;
+        tlr.reputation = StoreLookupResult.reputation;
+        tlr.confidence = StoreLookupResult.confidence;
+        tlr.category = StoreLookupResult.category;
+        tlr.latencyNs = StoreLookupResult.latencyNs;
+        tlr.primarySource = StoreLookupResult.primarySource;
+        tlr.sourceFlags = StoreLookupResult.sourceFlags;
+        tlr.threatScore = StoreLookupResult.score;
+        tlr.firstSeen = StoreLookupResult.firstSeen;
+        tlr.lastSeen = StoreLookupResult.lastSeen;
+        tlr.entry = StoreLookupResult.entry;
         result.results.push_back(tlr);
 
-        if (lookupResult.found) {
+        if (StoreLookupResult.found) {
             ++result.foundCount;
             
-            if (lookupResult.fromCache) {
+            if (StoreLookupResult.fromCache) {
                 ++result.sharedCacheHits;
             } else {
                 ++result.databaseHits;
             }
 
-            if (lookupResult.IsMalicious()) {
+            if (StoreLookupResult.IsMalicious()) {
                 ++result.maliciousCount;
-            } else if (lookupResult.IsSuspicious()) {
+            } else if (StoreLookupResult.IsSuspicious()) {
                 ++result.suspiciousCount;
             }
         }
@@ -1085,9 +1085,9 @@ BatchLookupResult ThreatIntelStore::BatchLookupHashes(
 
 BatchLookupResult ThreatIntelStore::BatchLookupIPv4(
     std::span<const std::string> addresses,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
-    BatchLookupResult result;
+    StoreBatchLookupResult result;
     
     if (!IsInitialized() || !m_impl->lookup) {
         return result;
@@ -1133,9 +1133,9 @@ BatchLookupResult ThreatIntelStore::BatchLookupIPv4(
 
 BatchLookupResult ThreatIntelStore::BatchLookupDomains(
     std::span<const std::string> domains,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
-    BatchLookupResult result;
+    StoreBatchLookupResult result;
     
     if (!IsInitialized() || !m_impl->lookup) {
         return result;
@@ -1181,9 +1181,9 @@ BatchLookupResult ThreatIntelStore::BatchLookupDomains(
 
 BatchLookupResult ThreatIntelStore::BatchLookupIOCs(
     std::span<const std::pair<IOCType, std::string>> iocs,
-    const LookupOptions& options
+    const StoreLookupOptions& options
 ) noexcept {
-    BatchLookupResult result;
+    StoreBatchLookupResult result;
     
     if (!IsInitialized() || !m_impl->lookup) {
         return result;
@@ -1195,35 +1195,35 @@ BatchLookupResult ThreatIntelStore::BatchLookupIOCs(
     result.results.reserve(iocs.size());
 
     for (const auto& [type, value] : iocs) {
-        auto lookupResult = LookupIOC(type, value, options);
+        auto StoreLookupResult = LookupIOC(type, value, options);
         
-        // Convert LookupResult to ThreatLookupResult for internal storage
+        // Convert StoreLookupResult to ThreatLookupResult for internal storage
         ThreatLookupResult tlr{};
-        tlr.found = lookupResult.found;
-        tlr.reputation = lookupResult.reputation;
-        tlr.confidence = lookupResult.confidence;
-        tlr.category = lookupResult.category;
-        tlr.latencyNs = lookupResult.latencyNs;
-        tlr.primarySource = lookupResult.primarySource;
-        tlr.sourceFlags = lookupResult.sourceFlags;
-        tlr.threatScore = lookupResult.score;
-        tlr.firstSeen = lookupResult.firstSeen;
-        tlr.lastSeen = lookupResult.lastSeen;
-        tlr.entry = lookupResult.entry;
+        tlr.found = StoreLookupResult.found;
+        tlr.reputation = StoreLookupResult.reputation;
+        tlr.confidence = StoreLookupResult.confidence;
+        tlr.category = StoreLookupResult.category;
+        tlr.latencyNs = StoreLookupResult.latencyNs;
+        tlr.primarySource = StoreLookupResult.primarySource;
+        tlr.sourceFlags = StoreLookupResult.sourceFlags;
+        tlr.threatScore = StoreLookupResult.score;
+        tlr.firstSeen = StoreLookupResult.firstSeen;
+        tlr.lastSeen = StoreLookupResult.lastSeen;
+        tlr.entry = StoreLookupResult.entry;
         result.results.push_back(tlr);
 
-        if (lookupResult.found) {
+        if (StoreLookupResult.found) {
             ++result.foundCount;
             
-            if (lookupResult.fromCache) {
+            if (StoreLookupResult.fromCache) {
                 ++result.sharedCacheHits;
             } else {
                 ++result.databaseHits;
             }
 
-            if (lookupResult.IsMalicious()) {
+            if (StoreLookupResult.IsMalicious()) {
                 ++result.maliciousCount;
-            } else if (lookupResult.IsSuspicious()) {
+            } else if (StoreLookupResult.IsSuspicious()) {
                 ++result.suspiciousCount;
             }
         }
@@ -1410,7 +1410,7 @@ bool ThreatIntelStore::HasIOC(IOCType type, std::string_view value) const noexce
     // Perform lookup through the lookup interface directly
     // Note: m_impl->lookup methods are const-correct and thread-safe
     // Use fast lookup options for existence check
-    LookupOptions opts = LookupOptions::FastestLookup();
+    StoreLookupOptions opts = StoreLookupOptions::FastLookup();
     opts.cacheResult = false;  // Don't modify cache for existence check
     opts.includeMetadata = false;
     

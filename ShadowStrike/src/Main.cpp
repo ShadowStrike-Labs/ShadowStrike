@@ -3,8 +3,7 @@
 #include <iomanip>
 #include <chrono>
 #include <exception>
-#include "../../../src/Utils/Logger.hpp"
-
+#include "../../src/Utils/Logger.hpp"
 
 using namespace ShadowStrike::Utils;
 
@@ -20,7 +19,7 @@ public:
     void OnTestProgramStart(const ::testing::UnitTest& u) override {
         default_->OnTestProgramStart(u);
         std::cout << "\n========================================================================\n"
-            << "  ShadowStrike CryptoUtils Test Suite\n"
+            << "  ShadowStrike  Test Suite\n"
             << "========================================================================\n\n";
     }
     void OnTestIterationStart(const ::testing::UnitTest& u, int it) override {

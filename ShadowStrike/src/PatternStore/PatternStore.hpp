@@ -31,8 +31,8 @@
 
 #pragma once
 
-#include "SignatureFormat.hpp"
-#include "SignatureIndex.hpp"
+#include "../SignatureStore/SignatureFormat.hpp"
+#include "../SignatureStore/SignatureIndex.hpp"
 #include <memory>
 #include <vector>
 #include <span>

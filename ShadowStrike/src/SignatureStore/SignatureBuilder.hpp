@@ -39,8 +39,8 @@
 #include "SignatureFormat.hpp"
 #include"../Utils/StringUtils.hpp"
 #include"../Utils/JSONUtils.hpp"
-#include "HashStore.hpp"
-#include "PatternStore.hpp"
+#include "../HashStore/HashStore.hpp"
+#include "../PatternStore/PatternStore.hpp"
 #include "YaraRuleStore.hpp"
 #include <memory>
 #include <vector>

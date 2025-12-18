@@ -1007,10 +1007,10 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupHash(
+    [[nodiscard]] StoreLookupResult LookupHash(
         std::string_view algorithm,
         std::string_view hashValue,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup a hash by binary value
@@ -1019,10 +1019,10 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupHash(
+    [[nodiscard]] StoreLookupResult LookupHash(
         uint64_t hashHigh,
         uint64_t hashLow,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup an IPv4 address
@@ -1030,9 +1030,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupIPv4(
+    [[nodiscard]] StoreLookupResult LookupIPv4(
         std::string_view address,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup an IPv4 address by numeric value
@@ -1040,9 +1040,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupIPv4(
+    [[nodiscard]] StoreLookupResult LookupIPv4(
         uint32_t address,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup an IPv6 address
@@ -1050,9 +1050,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupIPv6(
+    [[nodiscard]] StoreLookupResult LookupIPv6(
         std::string_view address,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup an IPv6 address by binary value
@@ -1061,10 +1061,10 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupIPv6(
+    [[nodiscard]] StoreLookupResult LookupIPv6(
         uint64_t addressHigh,
         uint64_t addressLow,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup a domain name
@@ -1072,9 +1072,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupDomain(
+    [[nodiscard]] StoreLookupResult LookupDomain(
         std::string_view domain,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup a URL
@@ -1082,9 +1082,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupURL(
+    [[nodiscard]] StoreLookupResult LookupURL(
         std::string_view url,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup an email address
@@ -1092,9 +1092,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupEmail(
+    [[nodiscard]] StoreLookupResult LookupEmail(
         std::string_view email,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup a JA3/JA3S fingerprint
@@ -1102,9 +1102,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupJA3(
+    [[nodiscard]] StoreLookupResult LookupJA3(
         std::string_view fingerprint,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup a CVE identifier
@@ -1112,9 +1112,9 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupCVE(
+    [[nodiscard]] StoreLookupResult LookupCVE(
         std::string_view cveId,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Lookup a generic IOC
@@ -1123,10 +1123,10 @@ public:
      * @param options Lookup options
      * @return Lookup result
      */
-    [[nodiscard]] LookupResult LookupIOC(
+    [[nodiscard]] StoreLookupResult LookupIOC(
         IOCType iocType,
         std::string_view value,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     // =========================================================================
     // Batch Lookups
@@ -1139,10 +1139,10 @@ public:
      * @param options Lookup options
      * @return Batch lookup result
      */
-    [[nodiscard]] BatchLookupResult BatchLookupHashes(
+    [[nodiscard]] StoreBatchLookupResult BatchLookupHashes(
         std::string_view algorithm,
         std::span<const std::string> hashes,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Batch lookup multiple IPv4 addresses
@@ -1150,9 +1150,9 @@ public:
      * @param options Lookup options
      * @return Batch lookup result
      */
-    [[nodiscard]] BatchLookupResult BatchLookupIPv4(
+    [[nodiscard]] StoreBatchLookupResult BatchLookupIPv4(
         std::span<const std::string> addresses,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Batch lookup multiple domains
@@ -1160,9 +1160,9 @@ public:
      * @param options Lookup options
      * @return Batch lookup result
      */
-    [[nodiscard]] BatchLookupResult BatchLookupDomains(
+    [[nodiscard]] StoreBatchLookupResult BatchLookupDomains(
         std::span<const std::string> domains,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     /**
      * @brief Batch lookup multiple IOCs of mixed types
@@ -1170,9 +1170,9 @@ public:
      * @param options Lookup options
      * @return Batch lookup result
      */
-    [[nodiscard]] BatchLookupResult BatchLookupIOCs(
+    [[nodiscard]] StoreBatchLookupResult BatchLookupIOCs(
         std::span<const std::pair<IOCType, std::string>> iocs,
-        const LookupOptions& options = LookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     // =========================================================================
     // IOC Management

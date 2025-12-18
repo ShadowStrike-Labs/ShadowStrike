@@ -12,7 +12,6 @@
  * Coverage: Path operations, file I/O, atomic operations, directory management,
  *           walking, ADS, SHA-256, secure erase, permissions, edge cases
  *
- * Test Standards: Sophos/CrowdStrike enterprise quality
  *
  * ============================================================================
  */

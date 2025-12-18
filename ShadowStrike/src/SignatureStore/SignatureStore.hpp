@@ -57,8 +57,8 @@
 #pragma once
 
 #include "SignatureFormat.hpp"
-#include "HashStore.hpp"
-#include "PatternStore.hpp"
+#include "../HashStore/HashStore.hpp"
+#include "../PatternStore/PatternStore.hpp"
 #include "SignatureIndex.hpp"
 #include "SignatureBuilder.hpp"
 #include "YaraRuleStore.hpp"

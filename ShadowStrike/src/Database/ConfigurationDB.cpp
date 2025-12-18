@@ -1,5 +1,17 @@
-﻿
-
+﻿/*
+ * ============================================================================
+ * ShadowStrike ConfigurationDatabase - IMPLEMENTATION
+ * ============================================================================
+ *
+ * Copyright (c) 2026 ShadowStrike Security Suite
+ * All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL
+ *
+ * CRITICAL: Sub-microsecond performance required!
+ *
+ * ============================================================================
+ */
 
 #include "ConfigurationDB.hpp"
 #include"DatabaseManager.hpp"
@@ -2674,10 +2686,10 @@ namespace ShadowStrike {
                 auto scope = static_cast<ConfigScope>(result.GetInt(2));
 
                 ConfigValue value = blobToValue(valueBlob, type);
-
+                
                 // Restore the value
                 std::wstring reason = L"Rolled back to version " + std::to_wstring(version);
-                if (!Set(keyWide, value, scope, changedBy, reason, err)) {
+                if (!Set(key, value, scope, changedBy, reason, err)) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Rollback: Failed to restore value");
                     return false;
                 }

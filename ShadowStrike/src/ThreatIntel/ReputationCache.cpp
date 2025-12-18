@@ -64,18 +64,20 @@ BloomFilter::BloomFilter(size_t expectedElements, double falsePositiveRate) {
 
     const size_t wordCount = (m_bitCount + 63) / 64;
     
-    // TITANIUM: Use reserve + resize pattern for safer allocation
+    // TITANIUM: Allocate atomic array using unique_ptr (std::vector<atomic> is invalid)
     try {
-        m_data.reserve(wordCount);
-        m_data.resize(wordCount);
+        m_data = std::make_unique<std::atomic<uint64_t>[]>(wordCount);
+        m_dataSize = wordCount;
     } catch (const std::bad_alloc&) {
         // TITANIUM: Graceful degradation - use minimum size on allocation failure
         m_bitCount = 64;
-        m_data.resize(1);
+        m_data = std::make_unique<std::atomic<uint64_t>[]>(1);
+        m_dataSize = 1;
     }
     
-    for (auto& word : m_data) {
-        word.store(0, std::memory_order_relaxed);
+    // Initialize all bits to zero
+    for (size_t i = 0; i < m_dataSize; ++i) {
+        m_data[i].store(0, std::memory_order_relaxed);
     }
 
     m_elementCount.store(0, std::memory_order_relaxed);
@@ -92,7 +94,7 @@ void BloomFilter::Add(const CacheKey& key) noexcept {
 void BloomFilter::Add(
     const std::array<uint64_t, CacheConfig::BLOOM_HASH_FUNCTIONS>& hashes) noexcept {
     // TITANIUM: Early exit if bloom filter is not properly initialized
-    if (m_bitCount == 0 || m_data.empty()) {
+    if (m_bitCount == 0 || !m_data || m_dataSize == 0) {
         return;
     }
     
@@ -115,7 +117,7 @@ bool BloomFilter::MightContain(const CacheKey& key) const noexcept {
 bool BloomFilter::MightContain(
     const std::array<uint64_t, CacheConfig::BLOOM_HASH_FUNCTIONS>& hashes) const noexcept {
     // TITANIUM: Early exit if bloom filter is not properly initialized
-    if (m_bitCount == 0 || m_data.empty()) {
+    if (m_bitCount == 0 || !m_data || m_dataSize == 0) {
         return false;
     }
     
@@ -129,20 +131,22 @@ bool BloomFilter::MightContain(
 }
 
 void BloomFilter::Clear() noexcept {
-    for (auto& word : m_data) {
-        word.store(0, std::memory_order_relaxed);
+    if (m_data && m_dataSize > 0) {
+        for (size_t i = 0; i < m_dataSize; ++i) {
+            m_data[i].store(0, std::memory_order_relaxed);
+        }
     }
     m_elementCount.store(0, std::memory_order_relaxed);
 }
 
 double BloomFilter::EstimateFillRate() const noexcept {
-    if (m_bitCount == 0) {
+    if (m_bitCount == 0 || !m_data || m_dataSize == 0) {
         return 0.0;
     }
 
     size_t setBits = 0;
-    for (const auto& word : m_data) {
-        setBits += std::popcount(word.load(std::memory_order_relaxed));
+    for (size_t i = 0; i < m_dataSize; ++i) {
+        setBits += std::popcount(m_data[i].load(std::memory_order_relaxed));
     }
 
     return static_cast<double>(setBits) / static_cast<double>(m_bitCount);
@@ -162,14 +166,14 @@ double BloomFilter::EstimateFalsePositiveRate() const noexcept {
 
 void BloomFilter::SetBit(size_t index) noexcept {
     // TITANIUM: Defensive bounds check to prevent out-of-bounds access
-    if (m_data.empty()) {
+    if (!m_data || m_dataSize == 0) {
         return;
     }
     
     const size_t wordIndex = index / 64;
     
     // TITANIUM: Validate wordIndex is within bounds before access
-    if (wordIndex >= m_data.size()) {
+    if (wordIndex >= m_dataSize) {
         return;
     }
     
@@ -179,14 +183,14 @@ void BloomFilter::SetBit(size_t index) noexcept {
 
 bool BloomFilter::TestBit(size_t index) const noexcept {
     // TITANIUM: Defensive bounds check to prevent out-of-bounds access
-    if (m_data.empty()) {
+    if (!m_data || m_dataSize == 0) {
         return false;
     }
     
     const size_t wordIndex = index / 64;
     
     // TITANIUM: Validate wordIndex is within bounds before access
-    if (wordIndex >= m_data.size()) {
+    if (wordIndex >= m_dataSize) {
         return false;
     }
     
