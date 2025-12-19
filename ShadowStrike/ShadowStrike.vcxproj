@@ -186,6 +186,7 @@
     <ClCompile Include="src\ThreatIntel\ThreatIntelIOCManager.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelLookup.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelStore.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntel_bloom_filter.cpp" />
     <ClCompile Include="src\Utils\Base64Utils.cpp" />
     <ClCompile Include="src\Utils\CacheManager.cpp" />
     <ClCompile Include="src\Utils\CompressionUtils.cpp" />
@@ -241,6 +242,7 @@
     <ClCompile Include="tests\unit\Database\sig_store\sig_index_tests.cpp" />
     <ClCompile Include="tests\unit\Database\sig_store\sig_store_tests.cpp" />
     <ClCompile Include="tests\unit\Database\sig_store\yara_rule_store_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\threat_intel\ReputationCache_tests.cpp" />
     <ClCompile Include="tests\unit\Database\white_list\whitelist_frmt_tests.cpp" />
     <ClCompile Include="tests\unit\Database\white_list\whitelist_store_tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />

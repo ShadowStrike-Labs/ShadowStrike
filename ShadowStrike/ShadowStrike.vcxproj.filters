@@ -384,6 +384,12 @@
     <ClCompile Include="src\Utils\CryptoUtils_SecureBuffer.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ReputationCache_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntel_bloom_filter.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Utils\Logger.hpp">

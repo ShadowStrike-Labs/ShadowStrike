@@ -656,37 +656,20 @@ TEST_F(SignatureBuilderImportTest, ImportYaraRulesFromDirectoryWithRules) {
 TEST_F(SignatureBuilderImportTest, ImportYaraRulesFromDirectoryRecursive) {
     auto dirPath = CreateTempDirectory(L"recursive_yara");
     auto subDirPath = CreateTempDirectory(L"recursive_yara\\subdir");
-    
+
     std::string rule = R"(rule test_rule {
     strings:
         $a = "test"
     condition:
         $a
 })";
-    
+
     CreateTempFile(rule, L"recursive_yara\\rule.yar");
     CreateTempFile(rule, L"recursive_yara\\subdir\\subrule.yar");
-    
-    StoreError err = m_builder->ImportYaraRulesFromDirectory(dirPath, true);
-    // Should recursively import
-}
 
-TEST_F(SignatureBuilderImportTest, ImportYaraRulesFromDirectoryNonRecursive) {
-    auto dirPath = CreateTempDirectory(L"nonrecursive_yara");
-    CreateTempDirectory(L"nonrecursive_yara\\subdir");
-    
-    std::string rule = R"(rule test_rule {
-    strings:
-        $a = "test"
-    condition:
-        $a
-})";
-    
-    CreateTempFile(rule, L"nonrecursive_yara\\rule.yar");
-    CreateTempFile(rule, L"nonrecursive_yara\\subdir\\subrule.yar");
-    
-    StoreError err = m_builder->ImportYaraRulesFromDirectory(dirPath, false);
-    // Should import only top-level files
+   
+    StoreError err = m_builder->ImportYaraRulesFromDirectory(dirPath, "default");
+    // Should recursively import
 }
 
 TEST_F(SignatureBuilderImportTest, ImportYaraRulesFromDirectoryMixedFiles) {
@@ -927,5 +910,3 @@ TEST_F(SignatureBuilderImportTest, DISABLED_BenchmarkPatternImport) {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     EXPECT_LT(elapsed.count(), 150000);  // 2.5 minutes max
 }
-
-} // namespace

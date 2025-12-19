@@ -566,8 +566,8 @@ TEST_F(SignatureBuilderTest, SetCustomOptimization) {
 TEST_F(SignatureBuilderTest, SetBuildPriority) {
     // Verify no exception
     EXPECT_NO_THROW(m_builder->SetBuildPriority(THREAD_PRIORITY_NORMAL));
-    EXPECT_NO_THROW(m_builder->SetBuildPriority(THREAD_PRIORITY_HIGH));
-    EXPECT_NO_THROW(m_builder->SetBuildPriority(THREAD_PRIORITY_LOW));
+    EXPECT_NO_THROW(m_builder->SetBuildPriority(THREAD_PRIORITY_HIGHEST));
+    EXPECT_NO_THROW(m_builder->SetBuildPriority(THREAD_PRIORITY_LOWEST));
 }
 
 // ============================================================================
@@ -957,4 +957,4 @@ TEST_F(SignatureBuilderTest, DISABLED_BenchmarkQueryMethods) {
     EXPECT_LT(elapsed.count(), 2000);  // 2 seconds max
 }
 
-}
+

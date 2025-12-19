@@ -332,6 +332,14 @@ public:
         return m_buildInProgress.load(std::memory_order_acquire);
     }
 
+    void ReportProgress(
+        const std::string& stage,
+        size_t current,
+        size_t total
+    ) const noexcept;
+
+    void Log(const std::string& message) const noexcept;
+
     // ========================================================================
     // VALIDATION & TESTING
     // ========================================================================
@@ -427,6 +435,17 @@ public:
     LARGE_INTEGER m_perfFrequency{};
     LARGE_INTEGER m_buildStartTime{};
 
+  // ========================================================================
+  // HELPER METHODS
+  // ========================================================================
+
+    [[nodiscard]] uint64_t CalculateRequiredSize() const noexcept;
+    [[nodiscard]] std::array<uint8_t, 16> GenerateDatabaseUUID() const noexcept;
+    [[nodiscard]] std::array<uint8_t, 32> ComputeDatabaseChecksum() const noexcept;
+
+
+    [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
+
 
 private:
 
@@ -484,23 +503,7 @@ private:
     [[nodiscard]] StoreError SerializeMetadata() noexcept;
     [[nodiscard]] StoreError SerializeHeader() noexcept;
 
-    // ========================================================================
-    // HELPER METHODS
-    // ========================================================================
-
-    [[nodiscard]] uint64_t CalculateRequiredSize() const noexcept;
-    [[nodiscard]] std::array<uint8_t, 16> GenerateDatabaseUUID() const noexcept;
-    [[nodiscard]] std::array<uint8_t, 32> ComputeDatabaseChecksum() const noexcept;
-
-    void ReportProgress(
-        const std::string& stage,
-        size_t current,
-        size_t total
-    ) const noexcept;
-
-    void Log(const std::string& message) const noexcept;
-
-    [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
+  
 
     std::atomic<uint32_t> m_consecutiveDuplicates{ 0 };  // Track duplicate rate
   
