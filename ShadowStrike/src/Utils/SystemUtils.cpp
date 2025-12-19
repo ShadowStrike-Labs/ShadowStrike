@@ -1177,24 +1177,24 @@ namespace SystemUtils {
         if (pSetContext != nullptr) {
             // Define DPI_AWARENESS_CONTEXT values if not available
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-            constexpr DPI_AWARENESS_CONTEXT kDpiContextPerMonitorV2 =
+            const DPI_AWARENESS_CONTEXT kDpiContextPerMonitorV2 =
                 reinterpret_cast<DPI_AWARENESS_CONTEXT>(static_cast<intptr_t>(-4));
 #else
-            constexpr DPI_AWARENESS_CONTEXT kDpiContextPerMonitorV2 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
+            const DPI_AWARENESS_CONTEXT kDpiContextPerMonitorV2 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
 #endif
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
-            constexpr DPI_AWARENESS_CONTEXT kDpiContextPerMonitor =
+            const DPI_AWARENESS_CONTEXT kDpiContextPerMonitor =
                 reinterpret_cast<DPI_AWARENESS_CONTEXT>(static_cast<intptr_t>(-3));
 #else
-            constexpr DPI_AWARENESS_CONTEXT kDpiContextPerMonitor = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE;
+            const DPI_AWARENESS_CONTEXT kDpiContextPerMonitor = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE;
 #endif
 
 #ifndef DPI_AWARENESS_CONTEXT_SYSTEM_AWARE
-            constexpr DPI_AWARENESS_CONTEXT kDpiContextSystemAware =
+            const DPI_AWARENESS_CONTEXT kDpiContextSystemAware =
                 reinterpret_cast<DPI_AWARENESS_CONTEXT>(static_cast<intptr_t>(-2));
 #else
-            constexpr DPI_AWARENESS_CONTEXT kDpiContextSystemAware = DPI_AWARENESS_CONTEXT_SYSTEM_AWARE;
+            const DPI_AWARENESS_CONTEXT kDpiContextSystemAware = DPI_AWARENESS_CONTEXT_SYSTEM_AWARE;
 #endif
 
             // Try Per-Monitor V2 first (best for Windows 10 1703+)

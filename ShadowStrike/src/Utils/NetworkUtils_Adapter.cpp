@@ -1,7 +1,7 @@
 ﻿
 #include"NetworkUtils.hpp"
-
-
+#include <wbemidl.h>
+#include <comdef.h>  
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "WinInet.lib")
@@ -241,18 +241,902 @@ namespace ShadowStrike {
 			// Network Interface Control
 			// ============================================================================
 
-			//***************************************************************************
-			//Maybe we can use in the future
 			bool EnableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights and netsh or WMI
+				try {
+					// ====================================================================
+					// VALIDATION: Adapter name cannot be empty
+					// ====================================================================
+					if (adapterName.empty()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name cannot be empty");
+						return false;
+					}
+
+					// ====================================================================
+					// VALIDATION: Check for path traversal and injection attacks
+					// ====================================================================
+					if (adapterName.find(L"..") != std::wstring::npos ||
+						adapterName.find(L'/') != std::wstring::npos ||
+						adapterName.find(L'\\') != std::wstring::npos ||
+						adapterName.find(L'\0') != std::wstring::npos ||
+						adapterName.find(L';') != std::wstring::npos ||
+						adapterName.find(L'&') != std::wstring::npos ||
+						adapterName.find(L'|') != std::wstring::npos) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid characters in adapter name");
+						return false;
+					}
+
+					// ====================================================================
+					// VALIDATION: Length check (prevent buffer overflow)
+					// ====================================================================
+					
+					if (adapterName.length() > MAX_ADAPTER_NAME_LENGTH) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name too long");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 1: Initialize COM for WMI (Windows Management Instrumentation)
+					// ====================================================================
+					HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+					bool comInitialized = SUCCEEDED(hr);
+
+					// If already initialized, S_FALSE is returned - that's OK
+					if (hr != S_OK && hr != S_FALSE && FAILED(hr)) {
+						Internal::SetError(err, hr, L"CoInitializeEx failed");
+						return false;
+					}
+
+					// RAII for COM cleanup
+					struct ComUninitializer {
+						bool shouldUninitialize;
+						~ComUninitializer() {
+							if (shouldUninitialize) {
+								::CoUninitialize();
+							}
+						}
+					} comGuard{ comInitialized };
+
+					// ====================================================================
+					// STEP 2: Set COM security levels
+					// ====================================================================
+					hr = ::CoInitializeSecurity(
+						nullptr,
+						-1,                          // COM authentication
+						nullptr,                     // Authentication services
+						nullptr,                     // Reserved
+						RPC_C_AUTHN_LEVEL_DEFAULT,   // Default authentication
+						RPC_C_IMP_LEVEL_IMPERSONATE, // Impersonation level
+						nullptr,                     // Authentication info
+						EOAC_NONE,                   // Additional capabilities
+						nullptr                      // Reserved
+					);
+
+					// S_OK or RPC_E_TOO_LATE (already initialized) are acceptable
+					if (FAILED(hr) && hr != RPC_E_TOO_LATE) {
+						Internal::SetError(err, hr, L"CoInitializeSecurity failed");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 3: Obtain WMI locator
+					// ====================================================================
+					IWbemLocator* pLoc = nullptr;
+					hr = ::CoCreateInstance(
+						CLSID_WbemLocator,
+						nullptr,
+						CLSCTX_INPROC_SERVER,
+						IID_IWbemLocator,
+						reinterpret_cast<LPVOID*>(&pLoc)
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Failed to create IWbemLocator");
+						return false;
+					}
+
+					// RAII for locator
+					struct LocatorReleaser {
+						IWbemLocator* locator;
+						~LocatorReleaser() {
+							if (locator) locator->Release();
+						}
+					} locatorGuard{ pLoc };
+
+					// ====================================================================
+					// STEP 4: Connect to WMI namespace
+					// ====================================================================
+					IWbemServices* pSvc = nullptr;
+					hr = pLoc->ConnectServer(
+						::SysAllocString(L"ROOT\\CIMV2"),  // WMI namespace
+						nullptr,                            // User name (use current)
+						nullptr,                            // Password (use current)
+						nullptr,                            // Locale
+						0,                                  // Security flags
+						nullptr,                            // Authority
+						nullptr,                            // Context object
+						&pSvc                               // IWbemServices proxy
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Could not connect to WMI namespace");
+						return false;
+					}
+
+					// RAII for service
+					struct ServiceReleaser {
+						IWbemServices* service;
+						~ServiceReleaser() {
+							if (service) service->Release();
+						}
+					} serviceGuard{ pSvc };
+
+					// ====================================================================
+					// STEP 5: Set security levels on WMI connection
+					// ====================================================================
+					hr = ::CoSetProxyBlanket(
+						pSvc,                        // Indicates proxy to set
+						RPC_C_AUTHN_WINNT,           // RPC_C_AUTHN_xxx
+						RPC_C_AUTHZ_NONE,            // RPC_C_AUTHZ_xxx
+						nullptr,                     // Server principal name
+						RPC_C_AUTHN_LEVEL_CALL,      // RPC_C_AUTHN_LEVEL_xxx
+						RPC_C_IMP_LEVEL_IMPERSONATE, // RPC_C_IMP_LEVEL_xxx
+						nullptr,                     // client identity
+						EOAC_NONE                    // proxy capabilities
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Could not set proxy blanket");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 6: Query for the network adapter
+					// ====================================================================
+					// Escape single quotes in adapter name for WQL query
+					std::wstring escapedName = adapterName;
+					size_t pos = 0;
+					while ((pos = escapedName.find(L'\'', pos)) != std::wstring::npos) {
+						escapedName.replace(pos, 1, L"''");
+						pos += 2;
+					}
+
+					std::wstring query = L"SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID = '" + escapedName + L"'";
+
+					IEnumWbemClassObject* pEnumerator = nullptr;
+					hr = pSvc->ExecQuery(
+						::SysAllocString(L"WQL"),
+						::SysAllocString(query.c_str()),
+						WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+						nullptr,
+						&pEnumerator
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"WMI query failed");
+						return false;
+					}
+
+					// RAII for enumerator
+					struct EnumeratorReleaser {
+						IEnumWbemClassObject* enumerator;
+						~EnumeratorReleaser() {
+							if (enumerator) enumerator->Release();
+						}
+					} enumGuard{ pEnumerator };
+
+					// ====================================================================
+					// STEP 7: Get the adapter object
+					// ====================================================================
+					IWbemClassObject* pclsObj = nullptr;
+					ULONG uReturn = 0;
+
+					hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+
+					if (FAILED(hr) || uReturn == 0) {
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Network adapter not found");
+						return false;
+					}
+
+					// RAII for class object
+					struct ClassObjectReleaser {
+						IWbemClassObject* obj;
+						~ClassObjectReleaser() {
+							if (obj) obj->Release();
+						}
+					} objGuard{ pclsObj };
+
+					// ====================================================================
+					// STEP 8: Check if adapter is already enabled
+					// ====================================================================
+					VARIANT vtProp;
+					::VariantInit(&vtProp);
+
+					hr = pclsObj->Get(L"NetEnabled", 0, &vtProp, nullptr, nullptr);
+					if (SUCCEEDED(hr) && vtProp.vt == VT_BOOL) {
+						if (vtProp.boolVal == VARIANT_TRUE) {
+							::VariantClear(&vtProp);
+							// Already enabled
+							return true;
+						}
+					}
+					::VariantClear(&vtProp);
+
+					// ====================================================================
+					// STEP 9: Enable the adapter by calling Enable method
+					// ====================================================================
+					IWbemClassObject* pClass = nullptr;
+					hr = pSvc->GetObject(
+						::SysAllocString(L"Win32_NetworkAdapter"),
+						0,
+						nullptr,
+						&pClass,
+						nullptr
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Failed to get Win32_NetworkAdapter class");
+						return false;
+					}
+
+					// RAII for class
+					struct ClassReleaser {
+						IWbemClassObject* cls;
+						~ClassReleaser() {
+							if (cls) cls->Release();
+						}
+					} classGuard{ pClass };
+
+					IWbemClassObject* pInParamsDefinition = nullptr;
+					hr = pClass->GetMethod(L"Enable", 0, &pInParamsDefinition, nullptr);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Failed to get Enable method");
+						return false;
+					}
+
+					// RAII for input params
+					struct InParamsReleaser {
+						IWbemClassObject* params;
+						~InParamsReleaser() {
+							if (params) params->Release();
+						}
+					} inParamsGuard{ pInParamsDefinition };
+
+					// Get object path
+					::VariantInit(&vtProp);
+					hr = pclsObj->Get(L"__PATH", 0, &vtProp, nullptr, nullptr);
+
+					if (FAILED(hr) || vtProp.vt != VT_BSTR) {
+						::VariantClear(&vtProp);
+						Internal::SetError(err, hr, L"Failed to get adapter path");
+						return false;
+					}
+
+					BSTR objectPath = vtProp.bstrVal;
+
+					// Execute Enable method
+					IWbemClassObject* pOutParams = nullptr;
+					hr = pSvc->ExecMethod(
+						objectPath,
+						::SysAllocString(L"Enable"),
+						0,
+						nullptr,
+						nullptr,
+						&pOutParams,
+						nullptr
+					);
+
+					::VariantClear(&vtProp);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Enable method execution failed");
+						return false;
+					}
+
+					// RAII for output params
+					struct OutParamsReleaser {
+						IWbemClassObject* params;
+						~OutParamsReleaser() {
+							if (params) params->Release();
+						}
+					} outParamsGuard{ pOutParams };
+
+					// Check return value
+					if (pOutParams) {
+						::VariantInit(&vtProp);
+						hr = pOutParams->Get(L"ReturnValue", 0, &vtProp, nullptr, nullptr);
+
+						if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+							LONG retVal = vtProp.lVal;
+							::VariantClear(&vtProp);
+
+							if (retVal != 0) {
+								Internal::SetError(err, retVal, L"Enable operation returned error code");
+								return false;
+							}
+						}
+						else {
+							::VariantClear(&vtProp);
+						}
+					}
+
+					return true;
+
+				}
+				catch (const std::exception& e) {
+					if (err) {
+						err->win32 = ERROR_UNHANDLED_EXCEPTION;
+						err->message = L"Exception in EnableNetworkAdapter";
+						char buffer[256];
+						std::strncpy(buffer, e.what(), sizeof(buffer) - 1);
+						buffer[sizeof(buffer) - 1] = '\0';
+						// Convert to wstring if needed for context
+					}
+					return false;
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_UNHANDLED_EXCEPTION, L"Unknown exception in EnableNetworkAdapter");
+					return false;
+				}
 			}
 
 			bool DisableNetworkAdapter(const std::wstring& adapterName, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights and netsh or WMI
+				try {
+					// ====================================================================
+					// VALIDATION: Adapter name cannot be empty
+					// ====================================================================
+					if (adapterName.empty()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name cannot be empty");
+						return false;
+					}
+
+					// ====================================================================
+					// VALIDATION: Check for path traversal and injection attacks
+					// ====================================================================
+					if (adapterName.find(L"..") != std::wstring::npos ||
+						adapterName.find(L'/') != std::wstring::npos ||
+						adapterName.find(L'\\') != std::wstring::npos ||
+						adapterName.find(L'\0') != std::wstring::npos ||
+						adapterName.find(L';') != std::wstring::npos ||
+						adapterName.find(L'&') != std::wstring::npos ||
+						adapterName.find(L'|') != std::wstring::npos) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid characters in adapter name");
+						return false;
+					}
+
+					// ====================================================================
+					// VALIDATION: Length check
+					// ====================================================================
+					
+					if (adapterName.length() > MAX_ADAPTER_NAME_LENGTH) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name too long");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 1: Initialize COM
+					// ====================================================================
+					HRESULT hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+					bool comInitialized = SUCCEEDED(hr);
+
+					if (hr != S_OK && hr != S_FALSE && FAILED(hr)) {
+						Internal::SetError(err, hr, L"CoInitializeEx failed");
+						return false;
+					}
+
+					struct ComUninitializer {
+						bool shouldUninitialize;
+						~ComUninitializer() {
+							if (shouldUninitialize) {
+								::CoUninitialize();
+							}
+						}
+					} comGuard{ comInitialized };
+
+					// ====================================================================
+					// STEP 2: Set COM security
+					// ====================================================================
+					hr = ::CoInitializeSecurity(
+						nullptr,
+						-1,
+						nullptr,
+						nullptr,
+						RPC_C_AUTHN_LEVEL_DEFAULT,
+						RPC_C_IMP_LEVEL_IMPERSONATE,
+						nullptr,
+						EOAC_NONE,
+						nullptr
+					);
+
+					if (FAILED(hr) && hr != RPC_E_TOO_LATE) {
+						Internal::SetError(err, hr, L"CoInitializeSecurity failed");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 3: Obtain WMI locator
+					// ====================================================================
+					IWbemLocator* pLoc = nullptr;
+					hr = ::CoCreateInstance(
+						CLSID_WbemLocator,
+						nullptr,
+						CLSCTX_INPROC_SERVER,
+						IID_IWbemLocator,
+						reinterpret_cast<LPVOID*>(&pLoc)
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Failed to create IWbemLocator");
+						return false;
+					}
+
+					struct LocatorReleaser {
+						IWbemLocator* locator;
+						~LocatorReleaser() {
+							if (locator) locator->Release();
+						}
+					} locatorGuard{ pLoc };
+
+					// ====================================================================
+					// STEP 4: Connect to WMI
+					// ====================================================================
+					IWbemServices* pSvc = nullptr;
+					hr = pLoc->ConnectServer(
+						::SysAllocString(L"ROOT\\CIMV2"),
+						nullptr,
+						nullptr,
+						nullptr,
+						0,
+						nullptr,
+						nullptr,
+						&pSvc
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Could not connect to WMI namespace");
+						return false;
+					}
+
+					struct ServiceReleaser {
+						IWbemServices* service;
+						~ServiceReleaser() {
+							if (service) service->Release();
+						}
+					} serviceGuard{ pSvc };
+
+					// ====================================================================
+					// STEP 5: Set security on WMI connection
+					// ====================================================================
+					hr = ::CoSetProxyBlanket(
+						pSvc,
+						RPC_C_AUTHN_WINNT,
+						RPC_C_AUTHZ_NONE,
+						nullptr,
+						RPC_C_AUTHN_LEVEL_CALL,
+						RPC_C_IMP_LEVEL_IMPERSONATE,
+						nullptr,
+						EOAC_NONE
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Could not set proxy blanket");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 6: Query for adapter
+					// ====================================================================
+					std::wstring escapedName = adapterName;
+					size_t pos = 0;
+					while ((pos = escapedName.find(L'\'', pos)) != std::wstring::npos) {
+						escapedName.replace(pos, 1, L"''");
+						pos += 2;
+					}
+
+					std::wstring query = L"SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID = '" + escapedName + L"'";
+
+					IEnumWbemClassObject* pEnumerator = nullptr;
+					hr = pSvc->ExecQuery(
+						::SysAllocString(L"WQL"),
+						::SysAllocString(query.c_str()),
+						WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+						nullptr,
+						&pEnumerator
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"WMI query failed");
+						return false;
+					}
+
+					struct EnumeratorReleaser {
+						IEnumWbemClassObject* enumerator;
+						~EnumeratorReleaser() {
+							if (enumerator) enumerator->Release();
+						}
+					} enumGuard{ pEnumerator };
+
+					// ====================================================================
+					// STEP 7: Get adapter object
+					// ====================================================================
+					IWbemClassObject* pclsObj = nullptr;
+					ULONG uReturn = 0;
+
+					hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+
+					if (FAILED(hr) || uReturn == 0) {
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Network adapter not found");
+						return false;
+					}
+
+					struct ClassObjectReleaser {
+						IWbemClassObject* obj;
+						~ClassObjectReleaser() {
+							if (obj) obj->Release();
+						}
+					} objGuard{ pclsObj };
+
+					// ====================================================================
+					// STEP 8: Check if already disabled
+					// ====================================================================
+					VARIANT vtProp;
+					::VariantInit(&vtProp);
+
+					hr = pclsObj->Get(L"NetEnabled", 0, &vtProp, nullptr, nullptr);
+					if (SUCCEEDED(hr) && vtProp.vt == VT_BOOL) {
+						if (vtProp.boolVal == VARIANT_FALSE) {
+							::VariantClear(&vtProp);
+							// Already disabled
+							return true;
+						}
+					}
+					::VariantClear(&vtProp);
+
+					// ====================================================================
+					// STEP 9: Disable the adapter
+					// ====================================================================
+					IWbemClassObject* pClass = nullptr;
+					hr = pSvc->GetObject(
+						::SysAllocString(L"Win32_NetworkAdapter"),
+						0,
+						nullptr,
+						&pClass,
+						nullptr
+					);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Failed to get Win32_NetworkAdapter class");
+						return false;
+					}
+
+					struct ClassReleaser {
+						IWbemClassObject* cls;
+						~ClassReleaser() {
+							if (cls) cls->Release();
+						}
+					} classGuard{ pClass };
+
+					IWbemClassObject* pInParamsDefinition = nullptr;
+					hr = pClass->GetMethod(L"Disable", 0, &pInParamsDefinition, nullptr);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Failed to get Disable method");
+						return false;
+					}
+
+					struct InParamsReleaser {
+						IWbemClassObject* params;
+						~InParamsReleaser() {
+							if (params) params->Release();
+						}
+					} inParamsGuard{ pInParamsDefinition };
+
+					::VariantInit(&vtProp);
+					hr = pclsObj->Get(L"__PATH", 0, &vtProp, nullptr, nullptr);
+
+					if (FAILED(hr) || vtProp.vt != VT_BSTR) {
+						::VariantClear(&vtProp);
+						Internal::SetError(err, hr, L"Failed to get adapter path");
+						return false;
+					}
+
+					BSTR objectPath = vtProp.bstrVal;
+
+					IWbemClassObject* pOutParams = nullptr;
+					hr = pSvc->ExecMethod(
+						objectPath,
+						::SysAllocString(L"Disable"),
+						0,
+						nullptr,
+						nullptr,
+						&pOutParams,
+						nullptr
+					);
+
+					::VariantClear(&vtProp);
+
+					if (FAILED(hr)) {
+						Internal::SetError(err, hr, L"Disable method execution failed");
+						return false;
+					}
+
+					struct OutParamsReleaser {
+						IWbemClassObject* params;
+						~OutParamsReleaser() {
+							if (params) params->Release();
+						}
+					} outParamsGuard{ pOutParams };
+
+					if (pOutParams) {
+						::VariantInit(&vtProp);
+						hr = pOutParams->Get(L"ReturnValue", 0, &vtProp, nullptr, nullptr);
+
+						if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+							LONG retVal = vtProp.lVal;
+							::VariantClear(&vtProp);
+
+							if (retVal != 0) {
+								Internal::SetError(err, retVal, L"Disable operation returned error code");
+								return false;
+							}
+						}
+						else {
+							::VariantClear(&vtProp);
+						}
+					}
+
+					return true;
+
+				}
+				catch (const std::exception& e) {
+					if (err) {
+						err->win32 = ERROR_UNHANDLED_EXCEPTION;
+						err->message = L"Exception in DisableNetworkAdapter";
+					}
+					return false;
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_UNHANDLED_EXCEPTION, L"Unknown exception in DisableNetworkAdapter");
+					return false;
+				}
 			}
-			//***************************************************************************
+
+			bool RenewDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
+				try {
+					// ====================================================================
+					// VALIDATION: Adapter name
+					// ====================================================================
+					if (adapterName.empty()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name cannot be empty");
+						return false;
+					}
+
+					
+					if (adapterName.length() > MAX_ADAPTER_NAME_LENGTH) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name too long");
+						return false;
+					}
+
+					// Security validation
+					if (adapterName.find(L'\0') != std::wstring::npos) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid null character in adapter name");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 1: Get adapter information to find interface index
+					// ====================================================================
+					std::vector<NetworkAdapterInfo> adapters;
+					if (!GetNetworkAdapters(adapters, err)) {
+						return false;
+					}
+
+					uint32_t interfaceIndex = 0;
+					bool found = false;
+
+					for (const auto& adapter : adapters) {
+						if (Internal::EqualsIgnoreCase(adapter.friendlyName, adapterName) ||
+							Internal::EqualsIgnoreCase(adapter.description, adapterName)) {
+							interfaceIndex = adapter.interfaceIndex;
+							found = true;
+							break;
+						}
+					}
+
+					if (!found) {
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Network adapter not found");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 2: Release current DHCP lease
+					// ====================================================================
+					DWORD result = ::IpReleaseAddress(nullptr); // Release all adapters first
+
+					// Then specifically target our adapter
+					IP_ADAPTER_INDEX_MAP adapterInfo{};
+					adapterInfo.Index = interfaceIndex;
+
+					result = ::IpReleaseAddress(&adapterInfo);
+					if (result != NO_ERROR && result != ERROR_INVALID_PARAMETER) {
+						Internal::SetError(err, result, L"IpReleaseAddress failed");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 3: Brief delay to allow release to complete
+					// ====================================================================
+					::Sleep(500);
+
+					// ====================================================================
+					// STEP 4: Renew DHCP lease
+					// ====================================================================
+					result = ::IpRenewAddress(&adapterInfo);
+					if (result != NO_ERROR) {
+						Internal::SetError(err, result, L"IpRenewAddress failed");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 5: Verify renewal by checking for valid IP
+					// ====================================================================
+					::Sleep(1000); // Wait for DHCP negotiation
+
+					std::vector<NetworkAdapterInfo> updatedAdapters;
+					if (GetNetworkAdapters(updatedAdapters, nullptr)) {
+						for (const auto& adapter : updatedAdapters) {
+							if (adapter.interfaceIndex == interfaceIndex) {
+								if (adapter.ipAddresses.empty()) {
+									Internal::SetError(err, ERROR_NO_DATA, L"DHCP renewal did not assign IP address");
+									return false;
+								}
+
+								// Check if IP is not APIPA (169.254.x.x)
+								for (const auto& ip : adapter.ipAddresses) {
+									if (ip.IsIPv4()) {
+										auto* ipv4 = ip.AsIPv4();
+										uint32_t addr = ipv4->ToUInt32();
+										uint32_t apipaPrefix = 0xA9FE0000; // 169.254.0.0
+										uint32_t apipaMask = 0xFFFF0000;
+
+										if ((addr & apipaMask) == apipaPrefix) {
+											Internal::SetError(err, ERROR_DHCP_ADDRESS_CONFLICT, L"DHCP renewal resulted in APIPA address");
+											return false;
+										}
+									}
+								}
+
+								break;
+							}
+						}
+					}
+
+					return true;
+
+				}
+				catch (const std::exception& e) {
+					if (err) {
+						err->win32 = ERROR_UNHANDLED_EXCEPTION;
+						err->message = L"Exception in RenewDhcpLease";
+					}
+					return false;
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_UNHANDLED_EXCEPTION, L"Unknown exception in RenewDhcpLease");
+					return false;
+				}
+			}
+
+			bool ReleaseDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
+				try {
+					// ====================================================================
+					// VALIDATION
+					// ====================================================================
+					if (adapterName.empty()) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name cannot be empty");
+						return false;
+					}
+
+					
+					if (adapterName.length() > MAX_ADAPTER_NAME_LENGTH) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Adapter name too long");
+						return false;
+					}
+
+					if (adapterName.find(L'\0') != std::wstring::npos) {
+						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"Invalid null character in adapter name");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 1: Find adapter by name
+					// ====================================================================
+					std::vector<NetworkAdapterInfo> adapters;
+					if (!GetNetworkAdapters(adapters, err)) {
+						return false;
+					}
+
+					uint32_t interfaceIndex = 0;
+					bool found = false;
+
+					for (const auto& adapter : adapters) {
+						if (Internal::EqualsIgnoreCase(adapter.friendlyName, adapterName) ||
+							Internal::EqualsIgnoreCase(adapter.description, adapterName)) {
+							interfaceIndex = adapter.interfaceIndex;
+							found = true;
+							break;
+						}
+					}
+
+					if (!found) {
+						Internal::SetError(err, ERROR_NOT_FOUND, L"Network adapter not found");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 2: Release DHCP lease for specific adapter
+					// ====================================================================
+					IP_ADAPTER_INDEX_MAP adapterInfo{};
+					adapterInfo.Index = interfaceIndex;
+
+					DWORD result = ::IpReleaseAddress(&adapterInfo);
+					if (result != NO_ERROR && result != ERROR_INVALID_PARAMETER) {
+						Internal::SetError(err, result, L"IpReleaseAddress failed");
+						return false;
+					}
+
+					// ====================================================================
+					// STEP 3: Verify release by checking IP addresses
+					// ====================================================================
+					::Sleep(500);
+
+					std::vector<NetworkAdapterInfo> updatedAdapters;
+					if (GetNetworkAdapters(updatedAdapters, nullptr)) {
+						for (const auto& adapter : updatedAdapters) {
+							if (adapter.interfaceIndex == interfaceIndex) {
+								// After release, adapter should either have no IP or APIPA
+								bool hasValidDhcpIp = false;
+
+								for (const auto& ip : adapter.ipAddresses) {
+									if (ip.IsIPv4()) {
+										auto* ipv4 = ip.AsIPv4();
+										uint32_t addr = ipv4->ToUInt32();
+										uint32_t apipaPrefix = 0xA9FE0000; // 169.254.0.0
+										uint32_t apipaMask = 0xFFFF0000;
+
+										// If not APIPA and not loopback, still has DHCP IP
+										if ((addr & apipaMask) != apipaPrefix && !ip.IsLoopback()) {
+											hasValidDhcpIp = true;
+											break;
+										}
+									}
+								}
+
+								if (hasValidDhcpIp) {
+									Internal::SetError(err, ERROR_OPERATION_ABORTED, L"DHCP lease was not fully released");
+									return false;
+								}
+
+								break;
+							}
+						}
+					}
+
+					return true;
+
+				}
+				catch (const std::exception& e) {
+					if (err) {
+						err->win32 = ERROR_UNHANDLED_EXCEPTION;
+						err->message = L"Exception in ReleaseDhcpLease";
+					}
+					return false;
+				}
+				catch (...) {
+					Internal::SetError(err, ERROR_UNHANDLED_EXCEPTION, L"Unknown exception in ReleaseDhcpLease");
+					return false;
+				}
+			}
 
 			bool FlushDnsCache(Error* err) noexcept {
 				// DnsFlushResolverCache may not be available on all Windows versions
@@ -282,17 +1166,6 @@ namespace ShadowStrike {
 				Internal::SetError(err, ::GetLastError(), L"Failed to flush DNS cache");
 				return false;
 			}
-
-			bool RenewDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
-			}
-
-			bool ReleaseDhcpLease(const std::wstring& adapterName, Error* err) noexcept {
-				Internal::SetError(err, ERROR_NOT_SUPPORTED, L"Function requires elevated privileges");
-				return false; // Requires admin rights
-			}
-
 			// ============================================================================
 			// Routing Table
 			// ============================================================================

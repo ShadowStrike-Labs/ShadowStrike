@@ -25,10 +25,10 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/SignatureBuilder.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
-#include "../../../../src/SignatureStore/HashStore.hpp"
-#include "../../../../src/SignatureStore/PatternStore.hpp"
+#include "../../src/SignatureStore/SignatureBuilder.hpp"
+#include "../../src/SignatureStore/SignatureFormat.hpp"
+#include "../../src/HashStore/HashStore.hpp"
+#include "../../src/PatternStore/PatternStore.hpp"
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -693,7 +693,4 @@ TEST_F(SignatureBuilderSerializationTest, Concurrency_MultipleBuildersSequential
 // MAIN TEST RUNNER
 // ============================================================================
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+

@@ -390,6 +390,63 @@
     <ClCompile Include="src\ThreatIntel\ThreatIntel_bloom_filter.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureIndex_Query.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureIndex_modification.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureIndex_stat_maintenance.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureIndex_COW.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureIndex_Cache_mngmnt.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureStore_scan.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureStore_Query.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SignatureStore\SignatureStore_mngmnt.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\sig_store\SIMD_matcher_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntel_bloom_filter_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelExporter_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManager_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelImporter_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelLookup_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelStoreTests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Utils\Logger.hpp">
@@ -597,5 +654,9 @@
   <ItemGroup>
     <None Include="..\.github\copilot-instructions.md" />
     <None Include="src\SignatureStore\ARCHITECTURE.md" />
+    <None Include="ARCHITECTURE_GUIDE_TR.md" />
+    <None Include="MODULAR_ARCHITECTURE_DETAILED_TR.md" />
+    <None Include="SIGNATUREINDEX_DETAILED_GUIDE_TR.md" />
+    <None Include=".clang-tidy" />
   </ItemGroup>
 </Project>

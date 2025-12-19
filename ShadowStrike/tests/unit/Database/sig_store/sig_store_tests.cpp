@@ -10,11 +10,11 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/SignatureStore.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
-#include "../../../../src/SignatureStore/HashStore.hpp"
-#include "../../../../src/SignatureStore/PatternStore.hpp"
-#include "../../../../src/SignatureStore/YaraRuleStore.hpp"
+#include "../../src/SignatureStore/SignatureStore.hpp"
+#include "../../src/SignatureStore/SignatureFormat.hpp"
+#include "../../src/HashStore/HashStore.hpp"
+#include "../../src/PatternStore/PatternStore.hpp"
+#include "../../src/SignatureStore/YaraRuleStore.hpp"
 #include <memory>
 #include <vector>
 #include <string>
@@ -964,7 +964,4 @@ TEST_F(SignatureStoreTest, Stress_ManyFiles) {
 // Entry Point
 // ============================================================================
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+

@@ -50,6 +50,11 @@
 namespace ShadowStrike {
 namespace ThreatIntel {
 
+// ThreatIntelLookup.hpp exposes UnifiedLookupOptions as the public options type.
+// The implementation historically used the name LookupOptions; keep that name
+// here as an alias to avoid changing a large amount of code.
+using LookupOptions = UnifiedLookupOptions;
+
 // ============================================================================
 // COMPILE-TIME VALIDATIONS
 // ============================================================================

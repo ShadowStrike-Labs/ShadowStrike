@@ -23,8 +23,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/SignatureBuilder.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
+#include "../../src/SignatureStore/SignatureBuilder.hpp"
+#include "../../src/SignatureStore/SignatureFormat.hpp"
 #include <filesystem>
 #include <fstream>
 #include<vector>
@@ -738,7 +738,4 @@ TEST_F(SignatureBuilderUtilsTest, SHA1_KnownVector) {
 // MAIN TEST RUNNER
 // ============================================================================
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+
