@@ -28,6 +28,8 @@
 #pragma once
 
 #include "ThreatIntelFormat.hpp"
+#include"ThreatIntelImporter.hpp"
+#include "ThreatIntelExporter.hpp"
 #include "ReputationCache.hpp"
 
 #include <string>
@@ -684,56 +686,6 @@ struct StoreExportOptions {
     std::function<void(size_t processed, size_t total)> progressCallback;
 };
 
-/**
- * @brief Result of an import operation
- * 
- * Contains detailed statistics about a completed import operation,
- * including counts of processed, imported, updated, and failed entries.
- */
-struct ImportResult {
-    bool success = false;        ///< Overall operation success
-    size_t totalProcessed = 0;   ///< Total entries processed
-    size_t imported = 0;         ///< New entries imported
-    size_t updated = 0;          ///< Existing entries updated
-    size_t skipped = 0;          ///< Entries skipped (duplicates, filtered)
-    size_t errors = 0;           ///< Entries that failed to import
-    
-    std::chrono::milliseconds duration{0};  ///< Total operation duration
-    
-    std::vector<std::string> errorMessages;  ///< Detailed error messages
-    
-    /**
-     * @brief Check if any entries were imported or updated
-     */
-    [[nodiscard]] bool HasChanges() const noexcept {
-        return imported > 0 || updated > 0;
-    }
-};
-
-/**
- * @brief Result of an export operation
- * 
- * Contains information about a completed export operation,
- * including the output path and statistics.
- */
-struct ExportResult {
-    bool success = false;         ///< Overall operation success
-    size_t totalExported = 0;     ///< Total entries exported
-    size_t bytesWritten = 0;      ///< Bytes written to output file
-    
-    std::chrono::milliseconds duration{0};  ///< Total operation duration
-    
-    std::string outputPath;    ///< Path to the output file (UTF-8)
-    std::string errorMessage;  ///< Error description if failed
-    
-    /**
-     * @brief Check if export produced output
-     */
-    [[nodiscard]] bool HasOutput() const noexcept {
-        return success && bytesWritten > 0;
-    }
-};
-
 // ============================================================================
 // Statistics
 // ============================================================================
@@ -1220,6 +1172,37 @@ public:
      * @return Number of entries successfully added
      */
     [[nodiscard]] size_t BulkAddIOCs(std::span<const IOCEntry> entries) noexcept;
+    
+    /**
+     * @brief Result of bulk IOC add operation with statistics
+     * 
+     * Provides accurate count of new, updated, skipped, and error entries
+     * without using heuristics.
+     */
+    struct BulkAddStatsResult {
+        size_t totalProcessed = 0;      ///< Total entries processed
+        size_t newEntries = 0;          ///< New unique entries added
+        size_t updatedEntries = 0;      ///< Existing entries updated
+        size_t skippedEntries = 0;      ///< Entries skipped (filtered/invalid)
+        size_t errorCount = 0;          ///< Entries that failed to add
+        
+        /// @brief Total successful (new + updated)
+        [[nodiscard]] size_t GetSuccessCount() const noexcept {
+            return newEntries + updatedEntries;
+        }
+    };
+    
+    /**
+     * @brief Bulk add IOC entries with detailed statistics
+     * @param entries Span of IOC entries to add
+     * @return BulkAddStatsResult with accurate counts
+     * 
+     * Unlike BulkAddIOCs, this method tracks exactly which entries were
+     * newly added vs updated vs skipped, enabling accurate sync reporting.
+     * 
+     * @note Thread-safe with internal locking
+     */
+    [[nodiscard]] BulkAddStatsResult BulkAddIOCsWithStats(std::span<const IOCEntry> entries) noexcept;
     
     /**
      * @brief Check if an IOC exists

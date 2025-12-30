@@ -1399,6 +1399,76 @@ size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept
     return added;
 }
 
+ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
+    std::span<const IOCEntry> entries) noexcept {
+    
+    BulkAddStatsResult result;
+    result.totalProcessed = entries.size();
+    
+    if (!IsInitialized() || !m_impl->iocManager) {
+        result.errorCount = entries.size();
+        return result;
+    }
+    
+    // Empty span - early exit
+    if (entries.empty()) {
+        return result;
+    }
+    
+    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
+    
+    IOCAddOptions addOpts;
+    
+    for (const auto& entry : entries) {
+        // Validate entry before processing
+        if (entry.value[0] == '\0' || entry.type == IOCType::Unknown) {
+            ++result.skippedEntries;
+            continue;
+        }
+        
+        // Check if entry already exists using lookup interface
+        StoreLookupOptions lookupOpts = StoreLookupOptions::FastLookup();
+        lookupOpts.cacheResult = false;
+        lookupOpts.includeMetadata = false;
+        
+        auto lookupResult = m_impl->lookup->Lookup(entry.type, entry.value, lookupOpts);
+        
+        if (lookupResult.found) {
+            // Entry exists - try to update if newer
+            // For now, count as updated (actual update logic depends on IOCManager)
+            auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+            if (opResult.success) {
+                ++result.updatedEntries;
+            } else {
+                ++result.errorCount;
+            }
+        } else {
+            // New entry - add it
+            auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+            if (opResult.success) {
+                ++result.newEntries;
+            } else {
+                ++result.errorCount;
+            }
+        }
+    }
+    
+    // Update statistics atomically
+    const size_t totalAdded = result.newEntries + result.updatedEntries;
+    if (totalAdded > 0) {
+        m_impl->stats.totalImportedEntries.fetch_add(totalAdded, std::memory_order_relaxed);
+        
+        // Fire bulk event to notify listeners
+        StoreEvent event;
+        event.type = StoreEventType::DataImported;
+        event.timestamp = std::chrono::system_clock::now();
+        event.iocType = std::nullopt;
+        m_impl->FireEvent(event);
+    }
+    
+    return result;
+}
+
 bool ThreatIntelStore::HasIOC(IOCType type, std::string_view value) const noexcept {
     if (!IsInitialized() || !m_impl->lookup) {
         return false;

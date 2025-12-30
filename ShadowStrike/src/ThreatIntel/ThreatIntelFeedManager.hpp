@@ -813,6 +813,47 @@ struct SyncResult {
 };
 
 /**
+ * @brief Progress information for sync operations
+ * 
+ * Used by progress callbacks to report detailed status during
+ * long-running sync operations (fetch, parse, store).
+ */
+struct SyncProgress {
+    std::string feedId;             ///< Feed identifier
+    std::string phase;              ///< Current phase (Fetching, Parsing, Storing, Complete)
+    
+    size_t totalItems = 0;          ///< Total items to process
+    size_t processedItems = 0;      ///< Items processed so far
+    uint32_t percentComplete = 0;   ///< Progress percentage (0-100)
+    
+    uint64_t newItems = 0;          ///< New items added
+    uint64_t updatedItems = 0;      ///< Existing items updated
+    uint64_t skippedItems = 0;      ///< Items skipped (invalid/filtered)
+    
+    uint64_t bytesDownloaded = 0;   ///< Bytes downloaded so far
+    uint64_t estimatedTimeMs = 0;   ///< Estimated time remaining (ms)
+};
+
+/**
+ * @brief Result of bulk IOC add operation
+ * 
+ * Returned by ThreatIntelStore::BulkAddIOCsWithStats to provide
+ * accurate statistics without heuristics.
+ */
+struct BulkAddResult {
+    size_t totalProcessed = 0;      ///< Total entries processed
+    size_t newEntries = 0;          ///< New unique entries added
+    size_t updatedEntries = 0;      ///< Existing entries updated
+    size_t skippedEntries = 0;      ///< Entries skipped (filtered/invalid)
+    size_t errorCount = 0;          ///< Entries that failed to add
+    
+    /// @brief Total successful (new + updated)
+    [[nodiscard]] size_t GetSuccessCount() const noexcept {
+        return newEntries + updatedEntries;
+    }
+};
+
+/**
  * @brief Feed event type for notifications
  */
 enum class FeedEventType : uint8_t {
@@ -849,8 +890,23 @@ struct FeedEvent {
 // CALLBACK TYPES
 // ============================================================================
 
-/// @brief Sync progress callback
-using SyncProgressCallback = std::function<bool(
+/**
+ * @brief Sync progress callback for detailed progress reporting
+ * @param progress SyncProgress struct with detailed progress info
+ * @return true to continue, false to cancel
+ * 
+ * The callback receives comprehensive progress information including:
+ * - Feed ID and current phase (Fetching, Parsing, Storing)
+ * - Total and processed item counts
+ * - New/updated/skipped item counts
+ * - Estimated time remaining
+ * 
+ * Return false from the callback to request cancellation.
+ */
+using SyncProgressCallback = std::function<bool(const SyncProgress& progress)>;
+
+/// @brief Legacy sync progress callback (simple version)
+using LegacySyncProgressCallback = std::function<bool(
     const std::string& feedId,
     uint64_t processed,
     uint64_t total,
@@ -1567,11 +1623,23 @@ private:
         std::vector<IOCEntry>& outEntries
     );
     
-    /// @brief Store parsed IOCs
+    /**
+     * @brief Store parsed IOCs to threat intelligence store
+     * @param context Feed context
+     * @param entries IOC entries to store
+     * @param result Sync result to update with statistics
+     * @param progressCallback Optional callback for progress reporting
+     * @return true if storage succeeded
+     * 
+     * @note Uses BulkAddIOCsWithStats for accurate statistics,
+     *       performs deduplication via FindEntry before add,
+     *       and reports progress through callback if provided.
+     */
     [[nodiscard]] bool StoreIOCs(
         FeedContext& context,
         const std::vector<IOCEntry>& entries,
-        SyncResult& result
+        SyncResult& result,
+        SyncProgressCallback progressCallback = nullptr
     );
     
     /// @brief Apply rate limiting

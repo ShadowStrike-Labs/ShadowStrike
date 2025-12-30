@@ -21,8 +21,6 @@
  * - UUID generation and parsing
  * - Bloom filter size calculations
  *
- * Performance Standards: CrowdStrike Falcon / Microsoft Defender ATP quality
- *
  * ============================================================================
  */
 
@@ -1712,10 +1710,6 @@ std::optional<std::array<uint8_t, 16>> ParseUUID(std::string_view str) noexcept 
     return uuid;
 }
 
-// ============================================================================
-// PART 2/3 COMPLETE - Domain/URL/Email validation, STIX, UUID, Bloom calculations
-// ============================================================================
-
 } // namespace Format
 
 // ============================================================================
@@ -2500,10 +2494,6 @@ bool RemapView(
 }
 
 } // namespace MemoryMapping
-
-// ============================================================================
-// PART 3/3 COMPLETE - Memory-mapped file operations
-// ============================================================================
 
 } // namespace ThreatIntel
 } // namespace ShadowStrike

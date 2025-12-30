@@ -20,10 +20,12 @@
 #include "ThreatIntelFormat.hpp"
 
 #include <string>
+#include <string_view>
 #include <memory>
 #include <optional>
 #include <atomic>
 #include <shared_mutex>
+#include <vector>
 
 // Forward declare Windows types to avoid header pollution
 struct _SECURITY_ATTRIBUTES;
@@ -363,6 +365,58 @@ public:
     [[nodiscard]] IOCEntry* GetMutableEntry(size_t index) noexcept;
     
     /**
+     * @brief Find an existing entry by value and type
+     * @param value IOC value to search for
+     * @param type IOC type to match
+     * @return Index of found entry or SIZE_MAX if not found
+     * 
+     * @note This performs a linear scan of all entries.
+     *       For large databases, use an index structure for O(1) lookup.
+     *       Thread-safe with shared lock during iteration.
+     */
+    [[nodiscard]] size_t FindEntry(std::string_view value, IOCType type) const noexcept;
+    
+    /**
+     * @brief Check if an entry with given value and type exists
+     * @param value IOC value to check
+     * @param type IOC type to match
+     * @return true if entry exists
+     */
+    [[nodiscard]] bool HasEntry(std::string_view value, IOCType type) const noexcept {
+        return FindEntry(value, type) != SIZE_MAX;
+    }
+    
+    /**
+     * @brief Add entry to deduplication index
+     * @param index Index of the entry in the database
+     * @param value IOC value for indexing
+     * @param type IOC type for indexing
+     * 
+     * @note This is a placeholder for future hash-based index implementation.
+     *       Currently a no-op as FindEntry uses linear scan.
+     *       Enterprise deployments should implement a proper hash index
+     *       using std::unordered_map<uint64_t, std::vector<size_t>> for O(1) lookup.
+     */
+    void AddToIndex(size_t index, std::string_view value, IOCType type) noexcept;
+    
+    /**
+     * @brief Format IOCEntry value for index lookup
+     * @param entry The IOC entry containing the value
+     * @return String representation suitable for FindEntry/AddToIndex
+     * 
+     * This converts the union-based IOCValue to a string representation
+     * that can be used with the hash-based index.
+     */
+    [[nodiscard]] static std::string FormatIOCValueForIndex(const IOCEntry& entry) noexcept;
+    
+    /**
+     * @brief Find entry by IOCEntry (convenience overload)
+     * @param entry Entry to search for
+     * @return Index of found entry or SIZE_MAX if not found
+     */
+    [[nodiscard]] size_t FindEntry(const IOCEntry& entry) const noexcept;
+    
+    /**
      * @brief Get current entry count
      */
     [[nodiscard]] size_t GetEntryCount() const noexcept;
@@ -556,6 +610,20 @@ private:
      */
     [[nodiscard]] bool VerifyHeaderChecksumInternal() const noexcept;
     
+    /**
+     * @brief Compute hash key for value indexing
+     * @param value IOC value string
+     * @param type IOC type for disambiguation
+     * @return 64-bit hash key using FNV-1a algorithm
+     */
+    [[nodiscard]] static uint64_t ComputeIndexHash(std::string_view value, IOCType type) noexcept;
+    
+    /**
+     * @brief Load hash index from database memory
+     * Called after Open() to rebuild in-memory index
+     */
+    void RebuildHashIndex() noexcept;
+    
     // =========================================================================
     // Member Variables
     // =========================================================================
@@ -580,6 +648,40 @@ private:
     
     /// Statistics
     mutable DatabaseStats m_stats;
+    
+    // =========================================================================
+    // ENTERPRISE-GRADE HASH INDEX FOR O(1) LOOKUPS
+    // =========================================================================
+    
+    /**
+     * @brief Hash bucket entry for collision chain
+     * 
+     * Uses separate chaining for collision resolution.
+     * Each bucket contains indices of entries with matching hash.
+     */
+    struct HashBucketEntry {
+        size_t entryIndex;          ///< Index into m_entries array
+        uint64_t fullHash;          ///< Full 64-bit hash for verification
+    };
+    
+    /// Number of hash buckets (power of 2 for fast modulo)
+    static constexpr size_t HASH_BUCKET_COUNT = 65536;  // 64K buckets
+    
+    /// Maximum entries per bucket before warning
+    static constexpr size_t MAX_BUCKET_DEPTH = 100;
+    
+    /**
+     * @brief In-memory hash index for O(1) average lookup
+     * 
+     * Maps: hash(value + type) % HASH_BUCKET_COUNT -> list of entry indices
+     * 
+     * Memory overhead: ~8 bytes per entry for index storage
+     * Lookup complexity: O(1) average, O(n/BUCKET_COUNT) worst case
+     */
+    std::vector<std::vector<HashBucketEntry>> m_hashIndex;
+    
+    /// Flag indicating if hash index is built
+    bool m_hashIndexBuilt = false;
 };
 
 // ============================================================================

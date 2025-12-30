@@ -228,12 +228,6 @@
     <ClCompile Include="src\SignatureStore\sig_builder_serialization.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="tests\unit\Database\white_list\whitelist_frmt_tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
-    <ClCompile Include="tests\unit\Database\white_list\whitelist_store_tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="tests\unit\Database\sig_store\pattern_store_tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
@@ -426,9 +420,6 @@
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelExporter_Tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManager_tests.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
@@ -445,6 +436,33 @@
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelStoreTests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListBloomFilter_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListFormatTests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListHashIndex_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListPatternIndex_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListStore_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListStringPool_Tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager_parsers.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
   </ItemGroup>
@@ -648,6 +666,9 @@
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
     <ClInclude Include="src\Utils\CryptoUtilsCommon.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager_Util.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
   </ItemGroup>

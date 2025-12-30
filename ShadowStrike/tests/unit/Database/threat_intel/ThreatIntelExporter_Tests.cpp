@@ -310,7 +310,7 @@ TEST(ThreatIntelExporter_FormatIOCValue, StringTypes_ValidateStringPool) {
 TEST(ThreatIntelExporter_FormatIOCValue, ASN_UsesRawBytes) {
 	IOCEntry e = MakeActiveBaseEntry(20, IOCType::ASN);
 	const uint32_t asn = 13335;
-	std::memcpy(e.value.raw.data(), &asn, sizeof(asn));
+	std::memcpy(e.value.raw, &asn, sizeof(asn));
 	EXPECT_EQ(ThreatIntelExporter::FormatIOCValue(e, nullptr), "AS13335");
 }
 
@@ -992,7 +992,10 @@ TEST(ThreatIntelExporter_Export, JSON_UnicodeHandling) {
 	options.fields = ExportFields::Type | ExportFields::Value;
 
 	TestStringPool pool;
-	const std::string unicode = u8"Hello™€中文🔥"; // Trademark, Euro, Chinese, Emoji
+	// UTF-8 string with Unicode characters (Trademark™, Euro€, Chinese中文, Emoji🔥)
+	const std::string unicode = std::string(
+		reinterpret_cast<const char*>(u8"Hello™€中文🔥")
+	);
 	const uint64_t off = pool.Put(unicode);
 
 	IOCEntry e = MakeActiveBaseEntry(1, IOCType::Domain);
@@ -1033,7 +1036,6 @@ TEST(ThreatIntelExporter_Export, CSV_AlternativeDelimiters) {
 	// Field with delimiter and quote should be quoted and quotes doubled
 	EXPECT_NE(out.find("'test;with''delimiter'"), std::string::npos);
 }
-
 // Test mixed IOC types in single export
 TEST(ThreatIntelExporter_Export, MixedIOCTypes_AllFormatsCorrectly) {
 	ThreatIntelExporter exporter;
@@ -1057,7 +1059,7 @@ TEST(ThreatIntelExporter_Export, MixedIOCTypes_AllFormatsCorrectly) {
 	entries[1].value.stringRef.stringLength = static_cast<uint32_t>(domain.size());
 
 	const uint32_t asn = 64512;
-	std::memcpy(entries[2].value.raw.data(), &asn, sizeof(asn));
+	std::memcpy(entries[2].value.raw, &asn, sizeof(asn));  
 
 	std::string out;
 	ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(entries), &pool, out, options);

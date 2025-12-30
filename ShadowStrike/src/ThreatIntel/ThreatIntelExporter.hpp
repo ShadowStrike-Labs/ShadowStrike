@@ -463,6 +463,13 @@ struct ExportResult {
     
     /// @brief Was export cancelled
     bool wasCancelled = false;
+
+    /**
+     * @brief Check if export produced output
+     */
+    [[nodiscard]] bool HasOutput() const noexcept {
+        return success && bytesWritten > 0;
+    }
 };
 
 // ============================================================================
@@ -764,11 +771,7 @@ public:
     ThreatIntelExporter();
     ~ThreatIntelExporter();
     
-    // Non-copyable, movable
-    ThreatIntelExporter(const ThreatIntelExporter&) = delete;
-    ThreatIntelExporter& operator=(const ThreatIntelExporter&) = delete;
-    ThreatIntelExporter(ThreatIntelExporter&&) noexcept;
-    ThreatIntelExporter& operator=(ThreatIntelExporter&&) noexcept;
+   
     
     // =========================================================================
     // File Export
@@ -915,7 +918,7 @@ public:
     [[nodiscard]] static std::string FormatIOCValue(
         const IOCEntry& entry,
         const IStringPoolReader* stringPool
-    );
+    ) noexcept;
     
     // =========================================================================
     // Batch Export

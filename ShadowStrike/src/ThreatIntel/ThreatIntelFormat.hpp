@@ -226,7 +226,11 @@ enum class IOCType : uint8_t {
     /// @brief STIX pattern
     STIXPattern = 21,
     
-    /// @brief Reserved for future use
+    /// @brief Unknown or unrecognized IOC type
+    /// Used for validation, error handling, and default initialization
+    Unknown = 254,
+    
+    /// @brief Reserved for future use (binary compatibility)
     Reserved = 255
 };
 
@@ -255,6 +259,8 @@ enum class IOCType : uint8_t {
         case IOCType::MitreAttack:    return "attack-pattern";
         case IOCType::CVE:            return "vulnerability";
         case IOCType::STIXPattern:    return "stix-pattern";
+        case IOCType::Unknown:        return "unknown";
+        case IOCType::Reserved:       return "reserved";
         default:                      return "unknown";
     }
 }
@@ -2081,7 +2087,7 @@ struct LookupResult {
     uint64_t entryId{0};
     
     /// @brief IOC type
-    IOCType type{IOCType::Reserved};
+    IOCType type{IOCType::Unknown};
     
     /// @brief Reputation level
     ReputationLevel reputation{ReputationLevel::Unknown};

@@ -6,7 +6,7 @@
  * formats with streaming capabilities and progress tracking.
  *
  * @author ShadowStrike Security Team
- * @copyright 2024 ShadowStrike Project
+ * @copyright 2026 ShadowStrike Project
  */
 
 #include "ThreatIntelExporter.hpp"
@@ -835,25 +835,28 @@ std::string ThreatIntelExporter::FormatIOCValue(
                 
                 return std::string(sv);
             }
-                
-            case IOCType::ASN: {
+            case IOCType::ASN:
+            {
                 // ASN stored as uint32 in raw bytes - use memcpy for safe unaligned access
-                if (entry.value.raw.size() < sizeof(uint32_t)) {
+                if (sizeof(entry.value.raw) < sizeof(uint32_t))
+                {
                     return "";
                 }
-                
+
                 uint32_t asn = 0;
-                std::memcpy(&asn, entry.value.raw.data(), sizeof(uint32_t));
-                
+                std::memcpy(&asn, entry.value.raw, sizeof(uint32_t));
+
                 // ASN numbers are 32-bit, max is 4294967295
                 // Pre-allocate string: "AS" + up to 10 digits = 12 chars
                 std::string result;
                 result.reserve(12);
                 result = "AS";
                 result += std::to_string(asn);
+
                 return result;
             }
-                
+
+          
             default:
                 return "";
         }
@@ -2272,9 +2275,6 @@ std::string PlainTextExportWriter::GetLastError() const {
 
 ThreatIntelExporter::ThreatIntelExporter() = default;
 ThreatIntelExporter::~ThreatIntelExporter() = default;
-
-ThreatIntelExporter::ThreatIntelExporter(ThreatIntelExporter&&) noexcept = default;
-ThreatIntelExporter& ThreatIntelExporter::operator=(ThreatIntelExporter&&) noexcept = default;
 
 std::unique_ptr<IExportWriter> ThreatIntelExporter::CreateWriter(
     std::ostream& output,

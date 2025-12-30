@@ -684,6 +684,12 @@ struct ImportResult {
         if (totalParsed == 0) return 0.0;
         return static_cast<double>(totalImported + totalUpdated) / totalParsed;
     }
+    /**
+     * @brief Check if any entries were imported or updated
+     */
+    [[nodiscard]] bool HasChanges() const noexcept {
+        return totalImported > 0 || totalUpdated > 0;
+    }
 };
 
 // ============================================================================
@@ -807,6 +813,7 @@ private:
     std::vector<CSVColumnMapping> m_columnMappings;
     std::vector<std::string> m_currentRow;
     size_t m_currentLine = 0;
+    size_t m_lineNumber = 0;   ///< Total lines processed for estimation
     uint64_t m_bytesRead = 0;
     std::string m_lastError;
     std::optional<ParseError> m_lastParseError;
@@ -856,7 +863,14 @@ private:
     bool m_isJsonLines = false;
     bool m_endOfInput = false;
     
+    /// Cached JSON entries for efficient iteration (avoids re-parsing)
+    std::vector<std::string> m_cachedEntries;
+    
+    /// Flag indicating document has been parsed and cached
+    bool m_documentParsed = false;
+    
     bool ParseDocument();
+    bool ParseAndCacheEntries();
     bool ParseEntryFromJSON(const std::string& jsonStr, IOCEntry& entry, IStringPoolWriter* stringPool);
     bool ReadNextJSONLine(std::string& line);
 };
@@ -931,6 +945,22 @@ private:
     std::string m_lastError;
     std::optional<ParseError> m_lastParseError;
     bool m_initialized = false;
+    
+    /// Cached event metadata for attribute enrichment
+    struct EventMetadata {
+        std::string eventId;           ///< MISP Event ID
+        std::string orgId;             ///< Organization ID (source attribution)
+        std::string eventInfo;         ///< Event description/title
+        uint8_t threatLevelId = 4;     ///< 1=High, 2=Medium, 3=Low, 4=Undefined
+        uint8_t analysisLevel = 0;     ///< 0=Initial, 1=Ongoing, 2=Complete
+        uint64_t eventTimestamp = 0;   ///< Event creation timestamp
+        bool isValid = false;          ///< Whether metadata was successfully parsed
+    };
+    EventMetadata m_eventMetadata;
+    
+    /// Cached attributes for iteration
+    std::vector<std::string> m_cachedAttributes;
+    bool m_eventParsed = false;
     
     bool ParseEvent();
     bool ParseAttribute(const std::string& attrJson, IOCEntry& entry, IStringPoolWriter* stringPool);

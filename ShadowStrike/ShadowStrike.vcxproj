@@ -193,6 +193,7 @@
     <ClCompile Include="src\ThreatIntel\ThreatIntelDatabase.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelExporter.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager_parsers.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelFormat.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelImporter.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelIndex.cpp" />
@@ -259,7 +260,8 @@
     <ClCompile Include="tests\unit\Database\threat_intel\ReputationCache_tests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelExporter_Tests.cpp" />
-    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManager_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp" />
+    <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelImporter_Tests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp" />
@@ -267,8 +269,12 @@
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelLookup_tests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelStoreTests.cpp" />
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntel_bloom_filter_tests.cpp" />
-    <ClCompile Include="tests\unit\Database\white_list\whitelist_frmt_tests.cpp" />
-    <ClCompile Include="tests\unit\Database\white_list\whitelist_store_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListBloomFilter_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListFormatTests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListHashIndex_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListPatternIndex_Tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListStore_tests.cpp" />
+    <ClCompile Include="tests\unit\Database\white_list\WhiteListStringPool_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CompressionUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CryptoUtils_Tests.cpp" />
@@ -323,6 +329,7 @@
     <ClInclude Include="src\ThreatIntel\ThreatIntelDatabase.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelExporter.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager_Util.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelFormat.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelImporter.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex.hpp" />

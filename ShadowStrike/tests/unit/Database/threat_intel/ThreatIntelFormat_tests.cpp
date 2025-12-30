@@ -13,6 +13,7 @@
 
 #include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
 
+#include<unordered_set>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -28,6 +29,16 @@ namespace ShadowStrike::ThreatIntel::Tests {
 
 using namespace ShadowStrike::ThreatIntel;
 using namespace ShadowStrike::ThreatIntel::Format;
+
+
+// ============================================================================
+// MINIMUM DATABASE SIZE CONSTANT
+// ============================================================================
+
+/// @brief Minimum size for a valid threat intel database
+/// @details Must accommodate header (4KB) + minimal data sections
+constexpr size_t MIN_DATABASE_SIZE = 10 * 1024 * 1024;  // 10 MB minimum
+
 
 // ============================================================================
 // TEST HELPERS & FIXTURES
@@ -63,7 +74,6 @@ struct TempDir {
 	header.magic = THREATINTEL_DB_MAGIC;
 	header.versionMajor = THREATINTEL_DB_VERSION_MAJOR;
 	header.versionMinor = THREATINTEL_DB_VERSION_MINOR;
-	header.headerSize = sizeof(ThreatIntelDatabaseHeader);
 	header.creationTime = 1609459200; // 2021-01-01
 	header.lastUpdateTime = 1609459200;
 	header.totalFileSize = MIN_DATABASE_SIZE;
