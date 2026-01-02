@@ -73,6 +73,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 #include <array>
 
@@ -1177,6 +1178,30 @@ public:
      */
     [[nodiscard]] StoreError BatchInsert(
         std::span<const std::pair<IOCEntry, uint64_t>> entries
+    ) noexcept;
+    
+    /**
+     * @brief Enterprise-grade batch removal with transaction-like semantics
+     * @param entries Entries to remove
+     * @return StoreError with success/failure details
+     * 
+     * Removes all specified entries from indexes. Returns partial success
+     * if some entries were not found.
+     */
+    [[nodiscard]] StoreError BatchRemove(
+        std::span<const IOCEntry> entries
+    ) noexcept;
+    
+    /**
+     * @brief Enterprise-grade batch update with transaction-like semantics
+     * @param updates Vector of (oldEntry, newEntry, newOffset) tuples
+     * @return StoreError with success/failure details
+     * 
+     * Atomically updates all specified entries. Each update removes the old entry
+     * and inserts the new entry. Returns partial success if some updates failed.
+     */
+    [[nodiscard]] StoreError BatchUpdate(
+        std::span<const std::tuple<IOCEntry, IOCEntry, uint64_t>> updates
     ) noexcept;
     
     // =========================================================================

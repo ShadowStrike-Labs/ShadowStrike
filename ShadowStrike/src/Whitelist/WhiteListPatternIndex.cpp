@@ -37,10 +37,242 @@
 #include <iomanip>
 #include <limits>
 #include <climits>
+#include <type_traits>
+#include <bit>
+#include <atomic>
+
+// ============================================================================
+// PLATFORM-SPECIFIC SIMD AND INTRINSICS
+// ============================================================================
+#if defined(_MSC_VER)
+    #include <intrin.h>
+    #include <immintrin.h>
+    #include <nmmintrin.h>  // SSE4.2 for CRC32
+    
+    // Cache prefetch macros for memory access optimization
+    #define SS_PREFETCH_READ(addr)      _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+    #define SS_PREFETCH_WRITE(addr)     _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+    #define SS_PREFETCH_NTA(addr)       _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_NTA)
+    #define SS_PREFETCH_READ_L2(addr)   _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T1)
+    
+    // Memory barrier intrinsics
+    #define SS_MEMORY_FENCE()           _mm_mfence()
+    #define SS_STORE_FENCE()            _mm_sfence()
+    #define SS_LOAD_FENCE()             _mm_lfence()
+    
+    // Compiler memory barrier
+    #define SS_COMPILER_BARRIER()       _ReadWriteBarrier()
+    
+#elif defined(__GNUC__) || defined(__clang__)
+    #include <x86intrin.h>
+    #include <cpuid.h>
+    
+    #define SS_PREFETCH_READ(addr)      __builtin_prefetch(addr, 0, 3)
+    #define SS_PREFETCH_WRITE(addr)     __builtin_prefetch(addr, 1, 3)
+    #define SS_PREFETCH_NTA(addr)       __builtin_prefetch(addr, 0, 0)
+    #define SS_PREFETCH_READ_L2(addr)   __builtin_prefetch(addr, 0, 2)
+    
+    #define SS_MEMORY_FENCE()           __sync_synchronize()
+    #define SS_STORE_FENCE()            __sync_synchronize()
+    #define SS_LOAD_FENCE()             __sync_synchronize()
+    
+    #define SS_COMPILER_BARRIER()       asm volatile("" ::: "memory")
+#else
+    // Fallback: no-op prefetch for unsupported platforms
+    #define SS_PREFETCH_READ(addr)      ((void)0)
+    #define SS_PREFETCH_WRITE(addr)     ((void)0)
+    #define SS_PREFETCH_NTA(addr)       ((void)0)
+    #define SS_PREFETCH_READ_L2(addr)   ((void)0)
+    
+    #define SS_MEMORY_FENCE()           std::atomic_thread_fence(std::memory_order_seq_cst)
+    #define SS_STORE_FENCE()            std::atomic_thread_fence(std::memory_order_release)
+    #define SS_LOAD_FENCE()             std::atomic_thread_fence(std::memory_order_acquire)
+    
+    #define SS_COMPILER_BARRIER()       std::atomic_signal_fence(std::memory_order_seq_cst)
+#endif
 
 
 
 namespace ShadowStrike::Whitelist {
+
+// ============================================================================
+// COMPILE-TIME CONSTANTS FOR PATH INDEX
+// ============================================================================
+namespace {
+
+/// @brief Cache line size for memory alignment optimization
+constexpr size_t CACHE_LINE_SIZE_LOCAL = 64;
+
+/// @brief Path index header size (must match CreateNew allocation)
+constexpr uint64_t PATH_INDEX_HEADER_SIZE = 64;
+
+/// @brief Maximum safe trie traversal depth to prevent infinite loops
+constexpr size_t SAFE_MAX_TRIE_DEPTH = 512;
+
+/// @brief Maximum Windows path length (UNC paths)
+constexpr size_t MAX_WINDOWS_PATH_LENGTH = 32767;
+
+/// @brief Prefetch distance for trie node traversal
+constexpr size_t TRIE_PREFETCH_DISTANCE = 2;
+
+/// @brief Batch processing chunk size for optimal cache utilization
+constexpr size_t BATCH_CHUNK_SIZE = 8;
+
+/// @brief FNV-1a hash constants for segment hashing
+constexpr uint32_t FNV1A_OFFSET_BASIS = 2166136261u;
+constexpr uint32_t FNV1A_PRIME = 16777619u;
+
+// ============================================================================
+// HARDWARE FEATURE DETECTION
+// ============================================================================
+
+/**
+ * @brief Detect POPCNT instruction support at runtime
+ * @return True if POPCNT is available
+ */
+[[nodiscard]] inline bool HasPOPCNT() noexcept {
+#if defined(_MSC_VER)
+    int cpuInfo[4] = {0};
+    __cpuid(cpuInfo, 1);
+    return (cpuInfo[2] & (1 << 23)) != 0; // POPCNT bit
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+        return (ecx & (1 << 23)) != 0;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+/**
+ * @brief Detect BMI2 instruction support (PEXT/PDEP)
+ * @return True if BMI2 is available
+ */
+[[nodiscard]] inline bool HasBMI2() noexcept {
+#if defined(_MSC_VER)
+    int cpuInfo[4] = {0};
+    __cpuidex(cpuInfo, 7, 0);
+    return (cpuInfo[1] & (1 << 8)) != 0; // BMI2 bit
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        return (ebx & (1 << 8)) != 0;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+/**
+ * @brief Detect SSE4.2 support (CRC32 instruction)
+ * @return True if SSE4.2 is available
+ */
+[[nodiscard]] inline bool HasSSE42() noexcept {
+#if defined(_MSC_VER)
+    int cpuInfo[4] = {0};
+    __cpuid(cpuInfo, 1);
+    return (cpuInfo[2] & (1 << 20)) != 0; // SSE4.2 bit
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+        return (ecx & (1 << 20)) != 0;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+// ============================================================================
+// SECURE MEMORY OPERATIONS
+// ============================================================================
+
+/**
+ * @brief Securely zero memory region (not optimized away by compiler)
+ * @param ptr Pointer to memory region
+ * @param size Size in bytes
+ */
+inline void SecureZeroMemoryRegion(void* ptr, size_t size) noexcept {
+    if (!ptr || size == 0) return;
+    
+#if defined(_MSC_VER)
+    SecureZeroMemory(ptr, size);
+#else
+    volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
+    while (size--) {
+        *p++ = 0;
+    }
+    SS_COMPILER_BARRIER();
+#endif
+}
+
+/**
+ * @brief Full memory barrier for safe multi-threaded access
+ */
+inline void FullMemoryBarrier() noexcept {
+    SS_MEMORY_FENCE();
+}
+
+/**
+ * @brief Align value up to cache line boundary
+ * @param value Value to align
+ * @return Aligned value
+ */
+[[nodiscard]] constexpr uint64_t AlignToCacheLine(uint64_t value) noexcept {
+    return (value + CACHE_LINE_SIZE_LOCAL - 1) & ~(CACHE_LINE_SIZE_LOCAL - 1);
+}
+
+// ============================================================================
+// BIT MANIPULATION UTILITIES
+// ============================================================================
+
+/**
+ * @brief Count leading zeros (CLZ) with hardware acceleration
+ * @param value Input value (must be non-zero)
+ * @return Number of leading zero bits
+ */
+[[nodiscard]] inline uint32_t CountLeadingZeros32(uint32_t value) noexcept {
+    if (value == 0) return 32;
+#if defined(_MSC_VER)
+    unsigned long index = 0;
+    _BitScanReverse(&index, value);
+    return 31 - index;
+#elif defined(__GNUC__) || defined(__clang__)
+    return static_cast<uint32_t>(__builtin_clz(value));
+#else
+    // Fallback software implementation
+    uint32_t n = 0;
+    if ((value & 0xFFFF0000) == 0) { n += 16; value <<= 16; }
+    if ((value & 0xFF000000) == 0) { n += 8; value <<= 8; }
+    if ((value & 0xF0000000) == 0) { n += 4; value <<= 4; }
+    if ((value & 0xC0000000) == 0) { n += 2; value <<= 2; }
+    if ((value & 0x80000000) == 0) { n += 1; }
+    return n;
+#endif
+}
+
+/**
+ * @brief Count population (number of set bits) with hardware acceleration
+ * @param value Input value
+ * @return Number of set bits
+ */
+[[nodiscard]] inline uint32_t PopCount32(uint32_t value) noexcept {
+#if defined(_MSC_VER)
+    return static_cast<uint32_t>(__popcnt(value));
+#elif defined(__GNUC__) || defined(__clang__)
+    return static_cast<uint32_t>(__builtin_popcount(value));
+#else
+    // Fallback software implementation
+    value = value - ((value >> 1) & 0x55555555);
+    value = (value & 0x33333333) + ((value >> 2) & 0x33333333);
+    return ((value + (value >> 4) & 0x0F0F0F0F) * 0x01010101) >> 24;
+#endif
+}
+
+} // anonymous namespace (constants and hardware detection)
 
 // ============================================================================
 // PATH INDEX IMPLEMENTATION (Compressed Trie)
@@ -130,33 +362,86 @@ static_assert(sizeof(PathTrieNode) == 64, "PathTrieNode must be 64 bytes");
 
 namespace {
 
+// ============================================================================
+// ENHANCED SAFE ARITHMETIC WITH COMPILER BUILTINS
+// ============================================================================
+
 /**
- * @brief Safely add two values with overflow check
+ * @brief Safely add two values with overflow check using compiler builtins
  * @tparam T Integral type (must be unsigned for correct overflow detection)
  * @param a First operand
  * @param b Second operand
  * @param result Output result (only valid if function returns true)
  * @return True if addition succeeded, false if overflow would occur
+ * 
+ * Uses compiler intrinsics for optimal codegen (single instruction on modern CPUs)
  */
 template<typename T>
 [[nodiscard]] inline bool SafeAdd(T a, T b, T& result) noexcept {
     static_assert(std::is_integral_v<T>, "SafeAdd requires integral type");
-    if constexpr (std::is_unsigned_v<T>) {
-        if (a > std::numeric_limits<T>::max() - b) {
-            return false;
+    
+#if defined(_MSC_VER) && defined(_M_X64)
+    // MSVC x64: Use intrinsics for unsigned types
+    if constexpr (std::is_same_v<T, uint64_t>) {
+        unsigned char carry = _addcarry_u64(0, a, b, &result);
+        return carry == 0;
+    } else if constexpr (std::is_same_v<T, uint32_t>) {
+        unsigned char carry = _addcarry_u32(0, a, b, &result);
+        return carry == 0;
+    } else
+#elif defined(__GNUC__) || defined(__clang__)
+    // GCC/Clang: Use __builtin_add_overflow for all types
+    return !__builtin_add_overflow(a, b, &result);
+#endif
+    {
+        // Fallback for other types/compilers
+        if constexpr (std::is_unsigned_v<T>) {
+            if (a > std::numeric_limits<T>::max() - b) {
+                return false;
+            }
+        } else {
+            if ((b > 0 && a > std::numeric_limits<T>::max() - b) ||
+                (b < 0 && a < std::numeric_limits<T>::min() - b)) {
+                return false;
+            }
         }
-    } else {
-        if ((b > 0 && a > std::numeric_limits<T>::max() - b) ||
-            (b < 0 && a < std::numeric_limits<T>::min() - b)) {
-            return false;
-        }
+        result = a + b;
+        return true;
     }
-    result = a + b;
-    return true;
 }
 
 /**
- * @brief Safely multiply two values with overflow check
+ * @brief Safely subtract two values with underflow check
+ * @tparam T Integral type
+ * @param a Minuend
+ * @param b Subtrahend
+ * @param result Output result (only valid if function returns true)
+ * @return True if subtraction succeeded, false if underflow would occur
+ */
+template<typename T>
+[[nodiscard]] inline bool SafeSub(T a, T b, T& result) noexcept {
+    static_assert(std::is_integral_v<T>, "SafeSub requires integral type");
+    
+#if defined(__GNUC__) || defined(__clang__)
+    return !__builtin_sub_overflow(a, b, &result);
+#else
+    if constexpr (std::is_unsigned_v<T>) {
+        if (a < b) {
+            return false; // Underflow
+        }
+    } else {
+        if ((b > 0 && a < std::numeric_limits<T>::min() + b) ||
+            (b < 0 && a > std::numeric_limits<T>::max() + b)) {
+            return false;
+        }
+    }
+    result = a - b;
+    return true;
+#endif
+}
+
+/**
+ * @brief Safely multiply two values with overflow check using compiler builtins
  * @tparam T Integral type
  * @param a First operand
  * @param b Second operand
@@ -166,25 +451,42 @@ template<typename T>
 template<typename T>
 [[nodiscard]] inline bool SafeMul(T a, T b, T& result) noexcept {
     static_assert(std::is_integral_v<T>, "SafeMul requires integral type");
+    
+    // Fast path for zero operands
     if (a == 0 || b == 0) {
         result = 0;
         return true;
     }
-    if constexpr (std::is_unsigned_v<T>) {
-        if (a > std::numeric_limits<T>::max() / b) {
-            return false;
-        }
-    } else {
-        if (a > 0) {
-            if (b > 0 && a > std::numeric_limits<T>::max() / b) return false;
-            if (b < 0 && b < std::numeric_limits<T>::min() / a) return false;
+    
+#if defined(__GNUC__) || defined(__clang__)
+    // GCC/Clang: Use __builtin_mul_overflow
+    return !__builtin_mul_overflow(a, b, &result);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    // MSVC x64: Use _umul128 for 64-bit unsigned
+    if constexpr (std::is_same_v<T, uint64_t>) {
+        uint64_t high = 0;
+        result = _umul128(a, b, &high);
+        return high == 0;
+    } else
+#endif
+    {
+        // Fallback implementation
+        if constexpr (std::is_unsigned_v<T>) {
+            if (a > std::numeric_limits<T>::max() / b) {
+                return false;
+            }
         } else {
-            if (b > 0 && a < std::numeric_limits<T>::min() / b) return false;
-            if (b < 0 && a < std::numeric_limits<T>::max() / b) return false;
+            if (a > 0) {
+                if (b > 0 && a > std::numeric_limits<T>::max() / b) return false;
+                if (b < 0 && b < std::numeric_limits<T>::min() / a) return false;
+            } else if (a < 0) {
+                if (b > 0 && a < std::numeric_limits<T>::min() / b) return false;
+                if (b < 0 && a != 0 && b < std::numeric_limits<T>::max() / a) return false;
+            }
         }
+        result = a * b;
+        return true;
     }
-    result = a * b;
-    return true;
 }
 
 /**
@@ -198,6 +500,147 @@ template<typename T>
 template<typename T>
 [[nodiscard]] constexpr T Clamp(T value, T minVal, T maxVal) noexcept {
     return (value < minVal) ? minVal : ((value > maxVal) ? maxVal : value);
+}
+
+// ============================================================================
+// TRIE NODE VALIDATION HELPERS
+// ============================================================================
+
+/**
+ * @brief Validate node offset is within bounds
+ * @param offset Node offset to validate
+ * @param indexSize Total index size
+ * @return True if offset is valid for a PathTrieNode
+ */
+[[nodiscard]] inline bool IsValidNodeOffset(uint64_t offset, uint64_t indexSize) noexcept {
+    if (offset == 0) return false;
+    if (offset >= indexSize) return false;
+    
+    uint64_t endOffset = 0;
+    if (!SafeAdd(offset, static_cast<uint64_t>(sizeof(PathTrieNode)), endOffset)) {
+        return false;
+    }
+    return endOffset <= indexSize;
+}
+
+/**
+ * @brief Validate PathTrieNode integrity for corruption detection
+ * @param node Pointer to node
+ * @param indexSize Total index size for child offset validation
+ * @return True if node passes integrity checks
+ */
+[[nodiscard]] inline bool ValidateNodeIntegrity(
+    const PathTrieNode* node,
+    uint64_t indexSize
+) noexcept {
+    if (!node) return false;
+    
+    // Check segment length is within bounds
+    if (node->segmentLength > PathTrieNode::MAX_SEGMENT_LENGTH) {
+        return false;
+    }
+    
+    // Check child count is reasonable
+    if (node->childCount > PathTrieNode::MAX_CHILDREN) {
+        return false;
+    }
+    
+    // Validate match mode is in valid range
+    if (static_cast<uint8_t>(node->matchMode) > static_cast<uint8_t>(PathMatchMode::Regex)) {
+        return false;
+    }
+    
+    // Check reserved field is zero (indicates uninitialized or corrupted node)
+    // Note: This check can be disabled if reserved field is repurposed
+    // if (node->reserved1 != 0) return false;
+    
+    // Validate child offsets are within bounds
+    uint32_t actualChildCount = 0;
+    for (size_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
+        const uint32_t childOff = node->children[i];
+        if (childOff != 0) {
+            if (!IsValidNodeOffset(static_cast<uint64_t>(childOff), indexSize)) {
+                return false;
+            }
+            ++actualChildCount;
+        }
+    }
+    
+    // Verify child count matches actual non-zero children
+    if (actualChildCount != node->childCount) {
+        return false;
+    }
+    
+    return true;
+}
+
+/**
+ * @brief Check if pointer is within memory region (for safe dereferencing)
+ * @param ptr Pointer to check
+ * @param base Base address of region
+ * @param size Size of region in bytes
+ * @param objSize Size of object being accessed
+ * @return True if pointer is safely within bounds
+ */
+[[nodiscard]] inline bool IsPointerInRange(
+    const void* ptr,
+    const void* base,
+    uint64_t size,
+    size_t objSize
+) noexcept {
+    if (!ptr || !base || size == 0 || objSize == 0) return false;
+    
+    const auto ptrAddr = reinterpret_cast<uintptr_t>(ptr);
+    const auto baseAddr = reinterpret_cast<uintptr_t>(base);
+    
+    // Check pointer is >= base
+    if (ptrAddr < baseAddr) return false;
+    
+    // Check object fits within region
+    const uint64_t offset = ptrAddr - baseAddr;
+    uint64_t endOffset = 0;
+    if (!SafeAdd(offset, static_cast<uint64_t>(objSize), endOffset)) {
+        return false;
+    }
+    
+    return endOffset <= size;
+}
+
+// ============================================================================
+// OPTIMIZED HASH FUNCTION WITH SSE4.2 CRC32
+// ============================================================================
+
+/**
+ * @brief Calculate FNV-1a hash for segment (optimized with hardware CRC32 when available)
+ * @param segment Path segment to hash
+ * @return Hash value modulo MAX_CHILDREN (0-3)
+ */
+[[nodiscard]] inline uint32_t SegmentHashOptimized(std::string_view segment) noexcept {
+    if (segment.empty()) {
+        return 0;
+    }
+    
+    uint32_t hash = 0;
+    
+#if defined(_MSC_VER) && defined(__SSE4_2__)
+    // Use hardware CRC32 if available
+    if (HasSSE42()) {
+        hash = 0xFFFFFFFF;
+        for (char c : segment) {
+            hash = _mm_crc32_u8(hash, static_cast<unsigned char>(c));
+        }
+        return hash % PathTrieNode::MAX_CHILDREN;
+    }
+#endif
+    
+    // FNV-1a fallback (still very fast)
+    hash = FNV1A_OFFSET_BASIS;
+    for (char c : segment) {
+        hash ^= static_cast<uint8_t>(c);
+        hash *= FNV1A_PRIME;
+    }
+    
+    return hash % PathTrieNode::MAX_CHILDREN;
 }
 
 /**
@@ -270,40 +713,95 @@ template<typename T>
 }
 
 /**
- * @brief Calculate hash for child index selection
+ * @brief Calculate hash for child index selection (wrapper for optimized version)
  * @param segment Path segment
  * @return Index 0-3 for child selection
  */
-[[nodiscard]] uint32_t SegmentHash(std::string_view segment) noexcept {
-    if (segment.empty()) {
-        return 0;
-    }
-    
-    // FNV-1a hash
-    uint32_t hash = 2166136261u;
-    for (char c : segment) {
-        hash ^= static_cast<uint8_t>(c);
-        hash *= 16777619u;
-    }
-    
-    return hash % PathTrieNode::MAX_CHILDREN;
+[[nodiscard]] inline uint32_t SegmentHash(std::string_view segment) noexcept {
+    return SegmentHashOptimized(segment);
 }
 
 /**
- * @brief Find common prefix length between two strings
+ * @brief Find common prefix length between two strings (SIMD-optimized)
  * @param a First string
  * @param b Second string
  * @return Length of common prefix
+ * 
+ * Uses SIMD comparison for longer strings when available
  */
 [[nodiscard]] size_t CommonPrefixLength(std::string_view a, std::string_view b) noexcept {
-    size_t len = std::min(a.length(), b.length());
+    const size_t len = std::min(a.length(), b.length());
+    
+    // For very short strings, use simple loop
+    if (len < 16) {
+        for (size_t i = 0; i < len; ++i) {
+            if (a[i] != b[i]) {
+                return i;
+            }
+        }
+        return len;
+    }
+    
+#if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+    // Process 8 bytes at a time using XOR for mismatch detection
+    const char* pa = a.data();
+    const char* pb = b.data();
+    size_t i = 0;
+    
+    // Process 8-byte chunks
+    while (i + 8 <= len) {
+        uint64_t va, vb;
+        std::memcpy(&va, pa + i, 8);
+        std::memcpy(&vb, pb + i, 8);
+        
+        if (va != vb) {
+            // Find first differing byte using XOR and trailing zeros
+            uint64_t diff = va ^ vb;
+#if defined(_MSC_VER)
+            unsigned long idx;
+            _BitScanForward64(&idx, diff);
+            return i + (idx / 8);
+#else
+            return i + (__builtin_ctzll(diff) / 8);
+#endif
+        }
+        i += 8;
+    }
+    
+    // Handle remaining bytes
+    for (; i < len; ++i) {
+        if (pa[i] != pb[i]) {
+            return i;
+        }
+    }
+    
+    return len;
+#else
+    // Fallback simple implementation
     for (size_t i = 0; i < len; ++i) {
         if (a[i] != b[i]) {
             return i;
         }
     }
     return len;
+#endif
 }
+
+// ============================================================================
+// RAII HELPERS FOR SCOPED OPERATIONS
+// ============================================================================
+
+/**
+ * @brief RAII guard for scoped memory fence operations
+ */
+class ScopedMemoryFence {
+public:
+    ScopedMemoryFence() noexcept { SS_LOAD_FENCE(); }
+    ~ScopedMemoryFence() noexcept { SS_STORE_FENCE(); }
+    
+    ScopedMemoryFence(const ScopedMemoryFence&) = delete;
+    ScopedMemoryFence& operator=(const ScopedMemoryFence&) = delete;
+};
 
 } // anonymous namespace
 
@@ -520,7 +1018,7 @@ std::vector<uint64_t> PathIndex::Lookup(
 ) const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE PATH TRIE LOOKUP
+     * ENTERPRISE-GRADE PATH TRIE LOOKUP WITH PREFETCHING
      * ========================================================================
      *
      * Implements compressed trie lookup with support for multiple match modes:
@@ -529,6 +1027,11 @@ std::vector<uint64_t> PathIndex::Lookup(
      * - Suffix: Path must end with pattern
      * - Glob: Pattern uses wildcards (* and ?)
      * - Regex: Full regex matching (expensive, use sparingly)
+     *
+     * Performance Optimizations:
+     * - Cache prefetching for next trie node during traversal
+     * - Validated node integrity checks for corruption detection
+     * - Early exit paths for common cases
      *
      * Security Note: Returns empty vector on any error (conservative).
      * Unknown paths should NOT be whitelisted.
@@ -540,29 +1043,29 @@ std::vector<uint64_t> PathIndex::Lookup(
     
     std::vector<uint64_t> results;
     
-    // Validate input
+    // Validate input - empty paths never match
     if (path.empty()) {
         return results;
     }
     
-    // Validate path length
-    constexpr size_t MAX_PATH_LENGTH = 32767; // Windows MAX_PATH limit
-    if (path.length() > MAX_PATH_LENGTH) {
-        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: path exceeds max length");
+    // Validate path length against Windows MAX_PATH limit
+    if (path.length() > MAX_WINDOWS_PATH_LENGTH) {
+        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: path exceeds max length (%zu)", path.length());
         return results;
     }
     
-    // Validate state
+    // Validate state - ensure index is initialized
     if (!m_view && !m_baseAddress) {
         return results; // Not initialized
     }
     
-    // Check if index is empty
-    if (m_pathCount.load(std::memory_order_acquire) == 0) {
+    // Fast path: empty index returns immediately
+    const uint64_t pathCount = m_pathCount.load(std::memory_order_acquire);
+    if (pathCount == 0) {
         return results;
     }
     
-    // Normalize path for lookup
+    // Normalize path for lookup (lowercase, forward slashes)
     std::string normalizedPath;
     if (!NormalizePath(path, normalizedPath)) {
         SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: path normalization failed");
@@ -583,10 +1086,10 @@ std::vector<uint64_t> PathIndex::Lookup(
         uint64_t baseSize = 0;
         
         if (m_view) {
-            // Validate view bounds
+            // Validate view bounds with overflow protection
             uint64_t effectiveBase = 0;
             if (!SafeAdd(reinterpret_cast<uint64_t>(m_view->baseAddress), m_indexOffset, effectiveBase)) {
-                return results; // Overflow
+                return results; // Overflow - return empty (security)
             }
             base = static_cast<const uint8_t*>(m_view->baseAddress) + m_indexOffset;
             baseSize = m_indexSize;
@@ -600,29 +1103,34 @@ std::vector<uint64_t> PathIndex::Lookup(
         }
         
         // Validate root offset before starting traversal
-        if (m_rootOffset == 0 || m_rootOffset >= baseSize) {
+        if (!IsValidNodeOffset(m_rootOffset, baseSize)) {
             return results;
         }
+        
+        // Prefetch root node for cache efficiency
+        SS_PREFETCH_READ(base + m_rootOffset);
         
         // Start at root node
         uint64_t currentOffset = m_rootOffset;
         std::string_view remaining(normalizedPath);
         
         // Traverse trie with depth limit to prevent infinite loops
-        constexpr size_t MAX_DEPTH = 512;
         size_t depth = 0;
         
-        while (!remaining.empty() && depth < MAX_DEPTH) {
-            // Comprehensive bounds check for node access
-            uint64_t nodeEndOffset = 0;
-            if (!SafeAdd(currentOffset, static_cast<uint64_t>(sizeof(PathTrieNode)), nodeEndOffset) ||
-                nodeEndOffset > baseSize) {
-                SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: node offset out of bounds (%llu + %zu > %llu)",
-                           currentOffset, sizeof(PathTrieNode), baseSize);
+        while (!remaining.empty() && depth < SAFE_MAX_TRIE_DEPTH) {
+            // Validate node offset
+            if (!IsValidNodeOffset(currentOffset, baseSize)) {
+                SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: invalid node offset at depth %zu", depth);
                 break;
             }
             
             const auto* node = reinterpret_cast<const PathTrieNode*>(base + currentOffset);
+            
+            // Validate node integrity for corruption detection
+            if (!ValidateNodeIntegrity(node, baseSize)) {
+                SS_LOG_ERROR(L"Whitelist", L"PathIndex::Lookup: corrupted node at offset %llu", currentOffset);
+                break;
+            }
             
             // Check node segment
             std::string_view nodeSegment = node->GetSegment();
@@ -634,7 +1142,7 @@ std::vector<uint64_t> PathIndex::Lookup(
                     // Mismatch - check for prefix match mode
                     if (mode == PathMatchMode::Prefix && node->IsTerminal()) {
                         // This node might match as a prefix
-                        size_t commonLen = CommonPrefixLength(remaining, nodeSegment);
+                        const size_t commonLen = CommonPrefixLength(remaining, nodeSegment);
                         if (commonLen > 0 && commonLen == remaining.length()) {
                             results.push_back(node->entryOffset);
                         }
@@ -667,7 +1175,7 @@ std::vector<uint64_t> PathIndex::Lookup(
             }
             
             // Find next segment (split by '/')
-            size_t nextSep = remaining.find('/');
+            const size_t nextSep = remaining.find('/');
             std::string_view nextSegment;
             
             if (nextSep != std::string_view::npos) {
@@ -676,40 +1184,50 @@ std::vector<uint64_t> PathIndex::Lookup(
                 nextSegment = remaining;
             }
             
-            // Calculate child index
-            uint32_t childIdx = SegmentHash(nextSegment);
+            // Calculate child index using optimized hash
+            const uint32_t childIdx = SegmentHash(nextSegment);
             
-            // Bounds check child index
+            // Bounds check child index (should always pass due to modulo)
             if (childIdx >= PathTrieNode::MAX_CHILDREN) {
                 break;
             }
             
             uint32_t childOffset = node->children[childIdx];
+            
+            // Prefetch next node if we have a direct hit
+            if (childOffset != 0 && IsValidNodeOffset(childOffset, baseSize)) {
+                SS_PREFETCH_READ(base + childOffset);
+            }
+            
             if (childOffset == 0) {
                 // No child in this slot - try linear search through all children
                 bool found = false;
+                
+                // Prefetch all potential children for cache efficiency
+                for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
+                    if (node->children[i] != 0 && IsValidNodeOffset(node->children[i], baseSize)) {
+                        SS_PREFETCH_READ_L2(base + node->children[i]);
+                    }
+                }
+                
                 for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN && !found; ++i) {
                     const uint32_t childOff = node->children[i];
                     
-                    // Validate child offset before access
+                    // Skip empty slots
                     if (childOff == 0) {
                         continue;
                     }
                     
-                    // Bounds validation for child node
-                    uint64_t childEndOffset = 0;
-                    if (!SafeAdd(static_cast<uint64_t>(childOff), 
-                                static_cast<uint64_t>(sizeof(PathTrieNode)), 
-                                childEndOffset) ||
-                        childEndOffset > baseSize) {
-                        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: child offset %u out of bounds", childOff);
+                    // Validate child offset
+                    if (!IsValidNodeOffset(static_cast<uint64_t>(childOff), baseSize)) {
+                        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: invalid child offset %u", childOff);
                         continue;
                     }
                     
                     const auto* childNode = reinterpret_cast<const PathTrieNode*>(base + childOff);
                     std::string_view childSeg = childNode->GetSegment();
                     
-                    // Validate segment length before comparison
+                    // Check if remaining path starts with child segment
                     if (!childSeg.empty() && remaining.length() >= childSeg.length() &&
                         remaining.substr(0, childSeg.length()) == childSeg) {
                         currentOffset = childOff;
@@ -721,13 +1239,9 @@ std::vector<uint64_t> PathIndex::Lookup(
                     break; // No matching child
                 }
             } else {
-                // Validate direct child offset before using
-                uint64_t childEndOffset = 0;
-                if (!SafeAdd(static_cast<uint64_t>(childOffset), 
-                            static_cast<uint64_t>(sizeof(PathTrieNode)), 
-                            childEndOffset) ||
-                    childEndOffset > baseSize) {
-                    SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: direct child offset %u invalid", childOffset);
+                // Validate direct child offset
+                if (!IsValidNodeOffset(static_cast<uint64_t>(childOffset), baseSize)) {
+                    SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: invalid direct child %u", childOffset);
                     break;
                 }
                 currentOffset = childOffset;
@@ -745,12 +1259,11 @@ std::vector<uint64_t> PathIndex::Lookup(
         // For suffix mode, we need a different approach (scan all paths)
         // This is expensive but necessary for correct suffix matching
         if (mode == PathMatchMode::Suffix && results.empty()) {
-            // Suffix matching requires scanning - return empty for now
-            // Full implementation would need a reverse index
-            SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Lookup: suffix mode not fully implemented");
+            // Suffix matching requires reverse index - not implemented in base trie
+            SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Lookup: suffix mode requires reverse index");
         }
         
-        // Remove duplicates if any
+        // Remove duplicates if any (sort + unique for O(n log n))
         if (results.size() > 1) {
             std::sort(results.begin(), results.end());
             results.erase(std::unique(results.begin(), results.end()), results.end());
@@ -907,24 +1420,27 @@ StoreError PathIndex::Insert(
     
     // Allocate root node if needed
     if (currentNodeCount == 0) {
-        // Create root node
+        // Create root node - use secure zero initialization
         auto* root = reinterpret_cast<PathTrieNode*>(base + HEADER_SIZE);
-        std::memset(root, 0, sizeof(PathTrieNode));
+        SecureZeroMemoryRegion(root, sizeof(PathTrieNode));
         
         // Store path segment (truncate if necessary)
-        size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
+        const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
         std::memcpy(root->segment, remaining.data(), segLen);
         root->segmentLength = static_cast<uint8_t>(segLen);
         root->matchMode = mode;
         root->entryOffset = entryOffset;
         root->SetTerminal(true);
         
+        // Memory fence before updating shared state
+        SS_STORE_FENCE();
+        
         // Update counters
         m_rootOffset = HEADER_SIZE;
         m_nodeCount.store(1, std::memory_order_release);
         m_pathCount.fetch_add(1, std::memory_order_release);
         
-        // Update header
+        // Update header with proper ordering
         auto* headerRoot = reinterpret_cast<uint64_t*>(base);
         *headerRoot = m_rootOffset;
         
@@ -938,14 +1454,15 @@ StoreError PathIndex::Insert(
         return StoreError::Success();
     }
     
-    // Traverse trie to find insertion point
-    constexpr size_t MAX_DEPTH = 512;
+    // Traverse trie to find insertion point with prefetching
     size_t depth = 0;
     
-    while (depth < MAX_DEPTH) {
-        // Comprehensive bounds check for node access
-        uint64_t nodeEndOffset = 0;
-        if (!SafeAdd(currentOffset, nodeSize, nodeEndOffset) || nodeEndOffset > m_indexSize) {
+    // Prefetch root node
+    SS_PREFETCH_WRITE(base + currentOffset);
+    
+    while (depth < SAFE_MAX_TRIE_DEPTH) {
+        // Validate node offset
+        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
             return StoreError::WithMessage(
                 WhitelistStoreError::IndexCorrupted,
                 "Node offset out of bounds during insert traversal"
@@ -955,13 +1472,12 @@ StoreError PathIndex::Insert(
         auto* node = reinterpret_cast<PathTrieNode*>(base + currentOffset);
         std::string_view nodeSegment = node->GetSegment();
         
-        // Find common prefix
-        size_t commonLen = CommonPrefixLength(remaining, nodeSegment);
+        // Find common prefix using optimized comparison
+        const size_t commonLen = CommonPrefixLength(remaining, nodeSegment);
         
         if (commonLen == 0 && !nodeSegment.empty()) {
             // No common prefix - need to find/create sibling
-            // For now, use existing children or allocate new node
-            uint32_t childIdx = SegmentHash(remaining);
+            const uint32_t childIdx = SegmentHash(remaining);
             
             if (childIdx < PathTrieNode::MAX_CHILDREN && node->children[childIdx] == 0) {
                 // Calculate new node offset with overflow protection
@@ -975,7 +1491,7 @@ StoreError PathIndex::Insert(
                 }
                 
                 uint64_t newNodeOffset = 0;
-                if (!SafeAdd(HEADER_SIZE, newNodeSpace, newNodeOffset)) {
+                if (!SafeAdd(PATH_INDEX_HEADER_SIZE, newNodeSpace, newNodeOffset)) {
                     return StoreError::WithMessage(
                         WhitelistStoreError::IndexFull,
                         "New node offset calculation overflow"
@@ -999,17 +1515,21 @@ StoreError PathIndex::Insert(
                     );
                 }
                 
+                // Allocate and initialize new node securely
                 auto* newNode = reinterpret_cast<PathTrieNode*>(base + newNodeOffset);
-                std::memset(newNode, 0, sizeof(PathTrieNode));
+                SecureZeroMemoryRegion(newNode, sizeof(PathTrieNode));
                 
-                size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
+                const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
                 std::memcpy(newNode->segment, remaining.data(), segLen);
                 newNode->segmentLength = static_cast<uint8_t>(segLen);
                 newNode->matchMode = mode;
                 newNode->entryOffset = entryOffset;
                 newNode->SetTerminal(true);
                 
-                // Link to parent
+                // Memory fence before linking to parent
+                SS_STORE_FENCE();
+                
+                // Link to parent atomically
                 node->children[childIdx] = static_cast<uint32_t>(newNodeOffset);
                 node->childCount++;
                 
@@ -1028,6 +1548,8 @@ StoreError PathIndex::Insert(
             
             // Child slot occupied - try to traverse
             if (node->children[childIdx] != 0) {
+                // Prefetch next node
+                SS_PREFETCH_WRITE(base + node->children[childIdx]);
                 currentOffset = node->children[childIdx];
                 ++depth;
                 continue;
@@ -1136,14 +1658,17 @@ StoreError PathIndex::Insert(
             }
             
             auto* newNode = reinterpret_cast<PathTrieNode*>(base + newNodeOffset);
-            std::memset(newNode, 0, sizeof(PathTrieNode));
+            SecureZeroMemoryRegion(newNode, sizeof(PathTrieNode));
             
-            size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
+            const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
             std::memcpy(newNode->segment, remaining.data(), segLen);
             newNode->segmentLength = static_cast<uint8_t>(segLen);
             newNode->matchMode = mode;
             newNode->entryOffset = entryOffset;
             newNode->SetTerminal(true);
+            
+            // Memory fence before linking
+            SS_STORE_FENCE();
             
             if (childIdx < PathTrieNode::MAX_CHILDREN) {
                 node->children[childIdx] = static_cast<uint32_t>(newNodeOffset);
@@ -1203,14 +1728,17 @@ StoreError PathIndex::Insert(
             }
             
             auto* newNode = reinterpret_cast<PathTrieNode*>(base + newNodeOffset);
-            std::memset(newNode, 0, sizeof(PathTrieNode));
+            SecureZeroMemoryRegion(newNode, sizeof(PathTrieNode));
             
-            size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
+            const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
             std::memcpy(newNode->segment, remaining.data(), segLen);
             newNode->segmentLength = static_cast<uint8_t>(segLen);
             newNode->matchMode = mode;
             newNode->entryOffset = entryOffset;
             newNode->SetTerminal(true);
+            
+            // Memory fence before linking
+            SS_STORE_FENCE();
             
             node->children[childIdx] = static_cast<uint32_t>(newNodeOffset);
             node->childCount++;
@@ -1230,15 +1758,15 @@ StoreError PathIndex::Insert(
         
         // Last resort - continue to child if exists
         if (childIdx < PathTrieNode::MAX_CHILDREN && node->children[childIdx] != 0) {
-            // Validate child offset before traversing
+            // Prefetch next node and validate child offset
             const uint64_t childOff = node->children[childIdx];
-            uint64_t childEndOff = 0;
-            if (!SafeAdd(childOff, nodeSize, childEndOff) || childEndOff > m_indexSize) {
+            if (!IsValidNodeOffset(childOff, m_indexSize)) {
                 return StoreError::WithMessage(
                     WhitelistStoreError::IndexCorrupted,
                     "Child offset invalid in split fallback"
                 );
             }
+            SS_PREFETCH_WRITE(base + childOff);
             currentOffset = childOff;
             ++depth;
             continue;
@@ -1259,11 +1787,16 @@ StoreError PathIndex::Remove(
 ) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE PATH TRIE REMOVE
+     * ENTERPRISE-GRADE PATH TRIE REMOVE WITH SECURE DELETION
      * ========================================================================
      *
      * Removes a path pattern from the trie. The node is marked as non-terminal
      * rather than physically deleted (lazy deletion for performance).
+     *
+     * Security Features:
+     * - Node validation before modification
+     * - Secure memory clearing of sensitive data
+     * - Atomic counter updates with underflow protection
      *
      * Physical cleanup happens during compaction.
      *
@@ -1291,16 +1824,16 @@ StoreError PathIndex::Remove(
     }
     
     // Validate path length
-    constexpr size_t MAX_PATH_LENGTH = 32767;
-    if (path.length() > MAX_PATH_LENGTH) {
+    if (path.length() > MAX_WINDOWS_PATH_LENGTH) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidEntry,
             "Path exceeds maximum length"
         );
     }
     
-    // Check if index has any paths
-    if (m_pathCount.load(std::memory_order_acquire) == 0) {
+    // Fast path: empty index
+    const uint64_t currentPathCount = m_pathCount.load(std::memory_order_acquire);
+    if (currentPathCount == 0) {
         return StoreError::WithMessage(
             WhitelistStoreError::EntryNotFound,
             "Index is empty"
@@ -1336,25 +1869,26 @@ StoreError PathIndex::Remove(
     auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
     
     // Validate root offset
-    if (m_rootOffset == 0 || m_rootOffset >= m_indexSize) {
+    if (!IsValidNodeOffset(m_rootOffset, m_indexSize)) {
         return StoreError::WithMessage(
             WhitelistStoreError::EntryNotFound,
             "Root offset invalid - index may be corrupted or empty"
         );
     }
     
-    // Navigate to the node
+    // Navigate to the node with prefetching
     uint64_t currentOffset = m_rootOffset;
     std::string_view remaining(normalizedPath);
     const uint64_t nodeSize = sizeof(PathTrieNode);
     
-    constexpr size_t MAX_DEPTH = 512;
+    // Prefetch root node
+    SS_PREFETCH_WRITE(base + currentOffset);
+    
     size_t depth = 0;
     
-    while (depth < MAX_DEPTH) {
-        // Comprehensive bounds check
-        uint64_t nodeEndOffset = 0;
-        if (!SafeAdd(currentOffset, nodeSize, nodeEndOffset) || nodeEndOffset > m_indexSize) {
+    while (depth < SAFE_MAX_TRIE_DEPTH) {
+        // Validate node offset
+        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
             return StoreError::WithMessage(
                 WhitelistStoreError::IndexCorrupted,
                 "Node offset out of bounds during remove"
@@ -1362,6 +1896,15 @@ StoreError PathIndex::Remove(
         }
         
         auto* node = reinterpret_cast<PathTrieNode*>(base + currentOffset);
+        
+        // Validate node integrity
+        if (!ValidateNodeIntegrity(node, m_indexSize)) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::IndexCorrupted,
+                "Corrupted node detected during remove"
+            );
+        }
+        
         std::string_view nodeSegment = node->GetSegment();
         
         // Check if segments match
@@ -1383,9 +1926,14 @@ StoreError PathIndex::Remove(
             if (node->IsTerminal() && node->matchMode == mode) {
                 // Found it - mark as non-terminal (lazy delete)
                 node->SetTerminal(false);
+                
+                // Securely clear the entry offset to prevent information leakage
                 node->entryOffset = 0;
                 
-                // Atomic decrement with proper ordering
+                // Memory fence to ensure visibility
+                SS_STORE_FENCE();
+                
+                // Atomic decrement with proper ordering and underflow protection
                 const uint64_t previousCount = m_pathCount.fetch_sub(1, std::memory_order_acq_rel);
                 
                 // Safety check: ensure we didn't underflow
@@ -1393,6 +1941,10 @@ StoreError PathIndex::Remove(
                     // This shouldn't happen, but restore count and log
                     m_pathCount.fetch_add(1, std::memory_order_relaxed);
                     SS_LOG_WARN(L"Whitelist", L"PathIndex::Remove: path count underflow prevented");
+                    return StoreError::WithMessage(
+                        WhitelistStoreError::InternalError,
+                        "Counter underflow detected"
+                    );
                 }
                 
                 // Update header with current count
@@ -1420,10 +1972,14 @@ StoreError PathIndex::Remove(
                 node->SetTerminal(false);
                 node->entryOffset = 0;
                 
+                // Memory fence for visibility
+                SS_STORE_FENCE();
+                
                 // Atomic decrement with underflow protection
                 const uint64_t previousCount = m_pathCount.fetch_sub(1, std::memory_order_acq_rel);
                 if (previousCount == 0) {
                     m_pathCount.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"Whitelist", L"PathIndex::Remove: underflow in terminal check");
                 }
                 
                 // Update header
@@ -1447,25 +2003,34 @@ StoreError PathIndex::Remove(
             );
         }
         
-        uint32_t childIdx = SegmentHash(remaining);
+        const uint32_t childIdx = SegmentHash(remaining);
         
-        // Try direct child first with bounds validation
+        // Try direct child first with validation and prefetching
         if (childIdx < PathTrieNode::MAX_CHILDREN && node->children[childIdx] != 0) {
             const uint64_t childOff = node->children[childIdx];
-            uint64_t childEndOff = 0;
-            if (!SafeAdd(childOff, nodeSize, childEndOff) || childEndOff > m_indexSize) {
+            if (!IsValidNodeOffset(childOff, m_indexSize)) {
                 return StoreError::WithMessage(
                     WhitelistStoreError::IndexCorrupted,
                     "Child offset invalid during remove traversal"
                 );
             }
+            // Prefetch next node
+            SS_PREFETCH_WRITE(base + childOff);
             currentOffset = childOff;
             ++depth;
             continue;
         }
         
-        // Linear search children with bounds validation
+        // Linear search children with validation
         bool found = false;
+        
+        // Prefetch all potential children
+        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
+            if (node->children[i] != 0 && IsValidNodeOffset(node->children[i], m_indexSize)) {
+                SS_PREFETCH_READ_L2(base + node->children[i]);
+            }
+        }
+        
         for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN && !found; ++i) {
             const uint32_t childOff = node->children[i];
             if (childOff == 0) {
@@ -1473,8 +2038,7 @@ StoreError PathIndex::Remove(
             }
             
             // Validate child offset
-            uint64_t childEndOff = 0;
-            if (!SafeAdd(static_cast<uint64_t>(childOff), nodeSize, childEndOff) || childEndOff > m_indexSize) {
+            if (!IsValidNodeOffset(static_cast<uint64_t>(childOff), m_indexSize)) {
                 SS_LOG_WARN(L"Whitelist", L"PathIndex::Remove: skipping invalid child offset %u", childOff);
                 continue;
             }
@@ -1504,5 +2068,21 @@ StoreError PathIndex::Remove(
         "Path not found - max depth exceeded"
     );
 }
+
+// ============================================================================
+// DIAGNOSTIC AND STATISTICS FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Get diagnostic information about the path index
+ * @note This is a stub for future implementation
+ */
+// void PathIndex::GetDiagnostics(PathIndexDiagnostics& diag) const noexcept {
+//     std::shared_lock lock(m_rwLock);
+//     diag.pathCount = m_pathCount.load(std::memory_order_acquire);
+//     diag.nodeCount = m_nodeCount.load(std::memory_order_acquire);
+//     diag.indexSize = m_indexSize;
+//     diag.rootOffset = m_rootOffset;
+// }
 
 } // namespace ShadowStrike::Whitelist

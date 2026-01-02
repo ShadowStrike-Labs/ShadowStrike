@@ -84,14 +84,17 @@ struct TempDir {
 
 [[nodiscard]] IOCEntry MakeTestIOCEntry(IOCType type, const std::string& value) {
 	IOCEntry entry{};
+	entry.entryId = 0; // Will be assigned by store
 	entry.type = type;
 	entry.confidence = ConfidenceLevel::High;
-	entry.reputation = ThreatReputation::Malicious;
+	entry.reputation = ReputationLevel::Malicious;
 	entry.category = ThreatCategory::Malware;
 	entry.source = ThreatIntelSource::Internal;
 	entry.firstSeen = static_cast<uint64_t>(std::time(nullptr));
 	entry.lastSeen = entry.firstSeen;
 	entry.flags = IOCFlags::None;
+	entry.feedId = 0;
+	entry.sourceCount = 1;
 
 	// Type-specific parsing would happen in AddIOC
 	// For tests, we mainly verify API behavior
@@ -245,7 +248,7 @@ TEST(ThreatIntelStore_Lookups, LookupHash_SHA256_ValidFormat) {
 	const auto sha256 = MakeValidSHA256();
 	const auto result = store->LookupHash("SHA256", sha256);
 
-	EXPECT_EQ(result.iocType, IOCType::FileHash);
+	// StoreLookupResult doesn't contain iocType - it's inferred from the lookup method used
 	// Not found expected (empty DB)
 	EXPECT_FALSE(result.found);
 
@@ -259,7 +262,7 @@ TEST(ThreatIntelStore_Lookups, LookupHash_MD5_ValidFormat) {
 	const auto md5 = MakeValidMD5();
 	const auto result = store->LookupHash("MD5", md5);
 
-	EXPECT_EQ(result.iocType, IOCType::FileHash);
+	// Result is valid, just not found in empty DB
 	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
@@ -280,7 +283,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv4_String_ValidAddress) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupIPv4("192.168.1.1");
-	EXPECT_EQ(result.iocType, IOCType::IPv4);
+	// Verify lookup completes without errors
 	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
@@ -292,7 +295,8 @@ TEST(ThreatIntelStore_Lookups, LookupIPv4_Uint32_NetworkByteOrder) {
 
 	const uint32_t addr = 0x08080808; // 8.8.8.8 in network byte order
 	const auto result = store->LookupIPv4(addr);
-	EXPECT_EQ(result.iocType, IOCType::IPv4);
+	// Verify lookup completes successfully
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -312,7 +316,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv6_String_ValidAddress) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupIPv6("2001:4860:4860::8888");
-	EXPECT_EQ(result.iocType, IOCType::IPv6);
+	// Verify lookup returns valid result
 	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
@@ -323,7 +327,8 @@ TEST(ThreatIntelStore_Lookups, LookupIPv6_Uint64_HighLow) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupIPv6(0x2001486048600000ULL, 0x0000000000008888ULL);
-	EXPECT_EQ(result.iocType, IOCType::IPv6);
+	// Verify lookup executes without errors
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -333,7 +338,7 @@ TEST(ThreatIntelStore_Lookups, LookupDomain_ValidDomain) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupDomain("evil.example.com");
-	EXPECT_EQ(result.iocType, IOCType::Domain);
+	// Verify domain lookup returns valid result
 	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
@@ -344,7 +349,8 @@ TEST(ThreatIntelStore_Lookups, LookupURL_ValidURL) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupURL("http://malicious.site/payload.exe");
-	EXPECT_EQ(result.iocType, IOCType::URL);
+	// URL lookup should complete successfully
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -354,7 +360,8 @@ TEST(ThreatIntelStore_Lookups, LookupEmail_ValidEmail) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupEmail("phishing@scam.com");
-	EXPECT_EQ(result.iocType, IOCType::Email);
+	// Email lookup should return valid result
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -364,7 +371,8 @@ TEST(ThreatIntelStore_Lookups, LookupJA3_ValidFingerprint) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupJA3("abc123def456");
-	EXPECT_EQ(result.iocType, IOCType::JA3);
+	// JA3 fingerprint lookup should execute successfully
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -374,7 +382,8 @@ TEST(ThreatIntelStore_Lookups, LookupCVE_ValidCVEID) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupCVE("CVE-2024-1234");
-	EXPECT_EQ(result.iocType, IOCType::CVE);
+	// CVE lookup should complete without errors
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -384,7 +393,8 @@ TEST(ThreatIntelStore_Lookups, LookupIOC_GenericLookup) {
 	ASSERT_TRUE(store->Initialize());
 
 	const auto result = store->LookupIOC(IOCType::Domain, "test.com");
-	EXPECT_EQ(result.iocType, IOCType::Domain);
+	// Generic IOC lookup should execute successfully
+	EXPECT_FALSE(result.found);
 
 	store->Shutdown();
 }
@@ -587,7 +597,7 @@ TEST(ThreatIntelStore_IOCMgmt, UpdateIOC_ExistingEntry) {
 	auto entry = MakeTestIOCEntry(IOCType::Domain, "update-test.com");
 	ASSERT_TRUE(store->AddIOC(entry));
 
-	entry.reputation = ThreatReputation::Safe;
+	entry.reputation = ReputationLevel::Safe;
 	EXPECT_TRUE(store->UpdateIOC(entry));
 
 	store->Shutdown();
@@ -670,7 +680,7 @@ TEST(ThreatIntelStore_Feeds, AddFeed_ValidConfig) {
 	auto store = CreateThreatIntelStore();
 	ASSERT_TRUE(store->Initialize());
 
-	FeedConfig feedCfg;
+	FeedConfiguration feedCfg;
 	feedCfg.feedId = "test-feed-001";
 	feedCfg.name = "Test Feed";
 	feedCfg.enabled = true;
@@ -684,7 +694,7 @@ TEST(ThreatIntelStore_Feeds, RemoveFeed_ExistingFeed) {
 	auto store = CreateThreatIntelStore();
 	ASSERT_TRUE(store->Initialize());
 
-	FeedConfig feedCfg;
+	FeedConfiguration feedCfg;
 	feedCfg.feedId = "remove-feed-001";
 	feedCfg.name = "Remove Test Feed";
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -698,7 +708,7 @@ TEST(ThreatIntelStore_Feeds, EnableDisableFeed_TogglesState) {
 	auto store = CreateThreatIntelStore();
 	ASSERT_TRUE(store->Initialize());
 
-	FeedConfig feedCfg;
+	FeedConfiguration feedCfg;
 	feedCfg.feedId = "toggle-feed-001";
 	feedCfg.name = "Toggle Feed";
 	feedCfg.enabled = true;
@@ -714,7 +724,7 @@ TEST(ThreatIntelStore_Feeds, UpdateFeed_TriggersFeedUpdate) {
 	auto store = CreateThreatIntelStore();
 	ASSERT_TRUE(store->Initialize());
 
-	FeedConfig feedCfg;
+	FeedConfiguration feedCfg;
 	feedCfg.feedId = "update-feed-001";
 	feedCfg.name = "Update Test Feed";
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -738,7 +748,7 @@ TEST(ThreatIntelStore_Feeds, GetFeedStatus_ExistingFeed) {
 	auto store = CreateThreatIntelStore();
 	ASSERT_TRUE(store->Initialize());
 
-	FeedConfig feedCfg;
+	FeedConfiguration feedCfg;
 	feedCfg.feedId = "status-feed-001";
 	feedCfg.name = "Status Test Feed";
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -800,7 +810,8 @@ TEST(ThreatIntelStore_Import, ImportSTIX_ValidFile) {
 	ImportOptions opts;
 	const auto result = store->ImportSTIX(filePath.wstring(), opts);
 
-	EXPECT_GE(result.totalProcessed, 0u);
+	// ImportResult uses totalParsed, not totalProcessed
+	EXPECT_GE(result.totalParsed, 0u);
 
 	store->Shutdown();
 }
@@ -820,7 +831,8 @@ TEST(ThreatIntelStore_Import, ImportCSV_ValidFile) {
 	ImportOptions opts;
 	const auto result = store->ImportCSV(filePath.wstring(), opts);
 
-	EXPECT_GE(result.totalProcessed, 0u);
+	// Verify parsing completed without crashes
+	EXPECT_GE(result.totalParsed, 0u);
 
 	store->Shutdown();
 }
@@ -839,7 +851,8 @@ TEST(ThreatIntelStore_Import, ImportJSON_ValidFile) {
 	ImportOptions opts;
 	const auto result = store->ImportJSON(filePath.wstring(), opts);
 
-	EXPECT_GE(result.totalProcessed, 0u);
+	// JSON import should complete successfully
+	EXPECT_GE(result.totalParsed, 0u);
 
 	store->Shutdown();
 }
@@ -859,7 +872,8 @@ TEST(ThreatIntelStore_Import, ImportPlainText_ValidFile) {
 	ImportOptions opts;
 	const auto result = store->ImportPlainText(filePath.wstring(), IOCType::IPv4, opts);
 
-	EXPECT_GE(result.totalProcessed, 0u);
+	// Plain text import should complete
+	EXPECT_GE(result.totalParsed, 0u);
 
 	store->Shutdown();
 }
@@ -871,7 +885,8 @@ TEST(ThreatIntelStore_Import, Import_NonExistentFile_Fails) {
 	ImportOptions opts;
 	const auto result = store->ImportSTIX(L"C:\\non-existent-file.stix", opts);
 
-	EXPECT_EQ(result.successCount, 0u);
+	// Non-existent file should result in zero imports
+	EXPECT_EQ(result.totalImported, 0u);
 
 	store->Shutdown();
 }
@@ -887,7 +902,7 @@ TEST(ThreatIntelStore_Export, Export_ValidPath) {
 	opts.format = ExportFormat::JSON;
 	const auto result = store->Export(exportPath.wstring(), opts);
 
-	EXPECT_GE(result.exportedCount, 0u);
+	EXPECT_GE(result.totalExported, 0u);
 
 	store->Shutdown();
 }

@@ -119,6 +119,28 @@ inline constexpr size_t MIN_BLOOM_HASHES = 3;
 inline constexpr size_t MAX_BLOOM_HASHES = 16;
 
 // ============================================================================
+// BLOOM FILTER STATISTICS (for GetDetailedStats)
+// ============================================================================
+
+/**
+ * @brief Detailed statistics for BloomFilter monitoring and diagnostics
+ */
+struct BloomFilterStats {
+    size_t bitCount = 0;              ///< Total number of bits in filter
+    size_t hashFunctions = 0;         ///< Number of hash functions
+    size_t expectedElements = 0;      ///< Expected element count (design parameter)
+    uint64_t elementsAdded = 0;       ///< Approximate number of elements added
+    size_t memoryBytes = 0;           ///< Current memory usage in bytes
+    size_t allocatedBytes = 0;        ///< Total allocated bytes (may be > memoryBytes)
+    double targetFPR = 0.0;           ///< Target false positive rate
+    double estimatedFPR = 0.0;        ///< Estimated current false positive rate
+    double fillRate = 0.0;            ///< Proportion of bits set (0.0 - 1.0)
+    double loadFactor = 0.0;          ///< elementsAdded / expectedElements
+    bool isMemoryMapped = false;      ///< Using external memory-mapped storage
+    bool isReady = false;             ///< Filter is initialized and ready for use
+};
+
+// ============================================================================
 // BLOOM FILTER (Nanosecond-level negative lookups)
 // ============================================================================
 
@@ -282,6 +304,36 @@ public:
     
     /// @brief Estimate current false positive rate
     [[nodiscard]] double EstimatedFalsePositiveRate() const noexcept;
+    
+    // ========================================================================
+    // BATCH OPERATIONS (Enterprise Feature)
+    // ========================================================================
+    
+    /**
+     * @brief Add multiple elements efficiently
+     * @param hashes Span of hash values to add
+     * @return Number of elements successfully added
+     * @note Thread-safe, uses cache-optimized access patterns
+     */
+    [[nodiscard]] size_t BatchAdd(std::span<const uint64_t> hashes) noexcept;
+    
+    /**
+     * @brief Query multiple elements efficiently
+     * @param hashes Span of hash values to query
+     * @param results Output span for results (true = might contain, false = definitely not)
+     * @return Number of elements that might be contained (positive results)
+     * @note Thread-safe, uses prefetching for better cache behavior
+     */
+    [[nodiscard]] size_t BatchQuery(
+        std::span<const uint64_t> hashes,
+        std::span<bool> results
+    ) const noexcept;
+    
+    /**
+     * @brief Get detailed statistics about the bloom filter
+     * @return BloomFilterStats structure with all metrics
+     */
+    [[nodiscard]] struct BloomFilterStats GetDetailedStats() const noexcept;
     
 private:
     // ========================================================================

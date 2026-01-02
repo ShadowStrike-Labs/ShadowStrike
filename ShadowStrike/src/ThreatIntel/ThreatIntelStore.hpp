@@ -30,6 +30,7 @@
 #include "ThreatIntelFormat.hpp"
 #include"ThreatIntelImporter.hpp"
 #include "ThreatIntelExporter.hpp"
+#include"ThreatIntelLookup.hpp"
 #include "ReputationCache.hpp"
 
 #include <string>
@@ -1078,7 +1079,7 @@ public:
     [[nodiscard]] StoreLookupResult LookupIOC(
         IOCType iocType,
         std::string_view value,
-        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
+        const UnifiedLookupOptions& options = UnifiedLookupOptions{}) noexcept;
     
     // =========================================================================
     // Batch Lookups
