@@ -270,9 +270,6 @@
     <ClCompile Include="src\ThreatIntel\ThreatIntelImporter.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex.cpp">
-      <Filter>Kaynak Dosyalar</Filter>
-    </ClCompile>
     <ClCompile Include="src\ThreatIntel\ThreatIntelIOCManager.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
@@ -463,6 +460,24 @@
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\Database\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Core.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Trees.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Lookups.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Modifications.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
   </ItemGroup>
@@ -669,6 +684,18 @@
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
     <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager_Util.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_LRU.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Trees.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
   </ItemGroup>
