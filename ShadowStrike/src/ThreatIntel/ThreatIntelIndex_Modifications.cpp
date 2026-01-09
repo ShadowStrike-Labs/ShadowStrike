@@ -1,13 +1,22 @@
+/*
+ * ============================================================================
+ * ShadowStrike ThreatIntelIndex - Modification Operations
+ * ============================================================================
+ *
+ * Copyright (c) 2026 ShadowStrike Security Suite
+ * All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL
+ *
+ * Index modification operations: Insert, Update, Remove, Batch operations
+ *
+ * ============================================================================
+ */
 
-
-
-#include "ThreatIntelIndex.hpp"
-#include "ThreatIntelDatabase.hpp"
-#include"ThreatIntelIndex_Internal.hpp"
+#include "ThreatIntelIndex_Internal.hpp"
 
 namespace ShadowStrike {
-	namespace ThreatIntel {
-        
+namespace ThreatIntel {
 
         // ============================================================================
         // INDEX MODIFICATION OPERATIONS
@@ -32,11 +41,8 @@ namespace ShadowStrike {
             switch (entry.type) {
             case IOCType::IPv4:
                 if (m_impl->ipv4Index) {
-                    success = m_impl->ipv4Index->Insert(
-                        entry.value.ipv4,
-                        entry.entryId,
-                        entryOffset
-                    );
+                    IndexValue indexValue(entry.entryId, entryOffset);
+                    success = m_impl->ipv4Index->Insert(entry.value.ipv4, indexValue);
 
                     // Update bloom filter
                     if (success) {
@@ -51,11 +57,8 @@ namespace ShadowStrike {
 
             case IOCType::IPv6:
                 if (m_impl->ipv6Index) {
-                    success = m_impl->ipv6Index->Insert(
-                        entry.value.ipv6,
-                        entry.entryId,
-                        entryOffset
-                    );
+                    IndexValue indexValue(entry.entryId, entryOffset);
+                    success = m_impl->ipv6Index->Insert(entry.value.ipv6, indexValue);
 
                     if (success) {
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv6);
@@ -72,10 +75,10 @@ namespace ShadowStrike {
                     size_t algoIndex = static_cast<size_t>(entry.value.hash.algorithm);
                     if (algoIndex < m_impl->hashIndexes.size() &&
                         m_impl->hashIndexes[algoIndex]) {
+                        IndexValue indexValue(entry.entryId, entryOffset);
                         success = m_impl->hashIndexes[algoIndex]->Insert(
                             entry.value.hash,
-                            entry.entryId,
-                            entryOffset
+                            indexValue
                         );
 
                         if (success) {
@@ -97,11 +100,8 @@ namespace ShadowStrike {
                         entry.value.stringRef.stringLength
                     );
 
-                    success = m_impl->domainIndex->Insert(
-                        domain,
-                        entry.entryId,
-                        entryOffset
-                    );
+                    IndexValue indexValue(entry.entryId, entryOffset);
+                    success = m_impl->domainIndex->Insert(domain, indexValue);
 
                     if (success) {
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::Domain);
@@ -120,11 +120,8 @@ namespace ShadowStrike {
                         entry.value.stringRef.stringLength
                     );
 
-                    success = m_impl->urlIndex->Insert(
-                        url,
-                        entry.entryId,
-                        entryOffset
-                    );
+                    IndexValue indexValue(entry.entryId, entryOffset);
+                    success = m_impl->urlIndex->Insert(url, indexValue);
 
                     if (success) {
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::URL);
@@ -143,11 +140,8 @@ namespace ShadowStrike {
                         entry.value.stringRef.stringLength
                     );
 
-                    success = m_impl->emailIndex->Insert(
-                        email,
-                        entry.entryId,
-                        entryOffset
-                    );
+                    IndexValue indexValue(entry.entryId, entryOffset);
+                    success = m_impl->emailIndex->Insert(email, indexValue);
 
                     if (success) {
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::Email);
@@ -183,11 +177,8 @@ namespace ShadowStrike {
                         std::memcpy(&key, entry.value.raw, bytesToCopy);
                     }
 
-                    success = m_impl->genericIndex->Insert(
-                        key,
-                        entry.entryId,
-                        entryOffset
-                    );
+                    IndexValue indexValue(entry.entryId, entryOffset);
+                    success = m_impl->genericIndex->Insert(key, indexValue);
 
                     if (success) {
                         ++m_impl->stats.otherEntries;
@@ -463,7 +454,8 @@ namespace ShadowStrike {
             switch (newEntry.type) {
             case IOCType::IPv4:
                 if (m_impl->ipv4Index) {
-                    insertSucceeded = m_impl->ipv4Index->Insert(newEntry.value.ipv4, newEntry.entryId, newEntryOffset);
+                    IndexValue indexValue(newEntry.entryId, newEntryOffset);
+                    insertSucceeded = m_impl->ipv4Index->Insert(newEntry.value.ipv4, indexValue);
                     if (insertSucceeded) {
                         ++m_impl->stats.ipv4Entries;
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv4);
@@ -475,7 +467,8 @@ namespace ShadowStrike {
                 break;
             case IOCType::IPv6:
                 if (m_impl->ipv6Index) {
-                    insertSucceeded = m_impl->ipv6Index->Insert(newEntry.value.ipv6, newEntry.entryId, newEntryOffset);
+                    IndexValue indexValue(newEntry.entryId, newEntryOffset);
+                    insertSucceeded = m_impl->ipv6Index->Insert(newEntry.value.ipv6, indexValue);
                     if (insertSucceeded) {
                         ++m_impl->stats.ipv6Entries;
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv6);
@@ -489,8 +482,9 @@ namespace ShadowStrike {
                 if (!m_impl->hashIndexes.empty()) {
                     size_t algoIndex = static_cast<size_t>(newEntry.value.hash.algorithm);
                     if (algoIndex < m_impl->hashIndexes.size() && m_impl->hashIndexes[algoIndex]) {
+                        IndexValue indexValue(newEntry.entryId, newEntryOffset);
                         insertSucceeded = m_impl->hashIndexes[algoIndex]->Insert(
-                            newEntry.value.hash, newEntry.entryId, newEntryOffset);
+                            newEntry.value.hash, indexValue);
                         if (insertSucceeded) {
                             ++m_impl->stats.hashEntries;
                             auto bloomIt = m_impl->bloomFilters.find(IOCType::FileHash);
@@ -507,7 +501,8 @@ namespace ShadowStrike {
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
-                    insertSucceeded = m_impl->domainIndex->Insert(domain, newEntry.entryId, newEntryOffset);
+                    IndexValue indexValue(newEntry.entryId, newEntryOffset);
+                    insertSucceeded = m_impl->domainIndex->Insert(domain, indexValue);
                     if (insertSucceeded) {
                         ++m_impl->stats.domainEntries;
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::Domain);
@@ -523,7 +518,8 @@ namespace ShadowStrike {
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
-                    insertSucceeded = m_impl->urlIndex->Insert(url, newEntry.entryId, newEntryOffset);
+                    IndexValue indexValue(newEntry.entryId, newEntryOffset);
+                    insertSucceeded = m_impl->urlIndex->Insert(url, indexValue);
                     if (insertSucceeded) {
                         ++m_impl->stats.urlEntries;
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::URL);
@@ -539,7 +535,8 @@ namespace ShadowStrike {
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
-                    insertSucceeded = m_impl->emailIndex->Insert(email, newEntry.entryId, newEntryOffset);
+                    IndexValue indexValue(newEntry.entryId, newEntryOffset);
+                    insertSucceeded = m_impl->emailIndex->Insert(email, indexValue);
                     if (insertSucceeded) {
                         ++m_impl->stats.emailEntries;
                         auto bloomIt = m_impl->bloomFilters.find(IOCType::Email);
@@ -562,7 +559,8 @@ namespace ShadowStrike {
                     else {
                         std::memcpy(&key, newEntry.value.raw, sizeof(uint64_t));
                     }
-                    insertSucceeded = m_impl->genericIndex->Insert(key, newEntry.entryId, newEntryOffset);
+                    IndexValue indexValue(newEntry.entryId, newEntryOffset);
+                    insertSucceeded = m_impl->genericIndex->Insert(key, indexValue);
                     if (insertSucceeded) {
                         ++m_impl->stats.otherEntries;
                     }
@@ -804,20 +802,23 @@ namespace ShadowStrike {
                 switch (newEntry.type) {
                 case IOCType::IPv4:
                     if (m_impl->ipv4Index) {
-                        insertSuccess = m_impl->ipv4Index->Insert(newEntry.value.ipv4, newEntry.entryId, newOffset);
+                        IndexValue indexValue(newEntry.entryId, newOffset);
+                        insertSuccess = m_impl->ipv4Index->Insert(newEntry.value.ipv4, indexValue);
                     }
                     break;
                 case IOCType::IPv6:
                     if (m_impl->ipv6Index) {
-                        insertSuccess = m_impl->ipv6Index->Insert(newEntry.value.ipv6, newEntry.entryId, newOffset);
+                        IndexValue indexValue(newEntry.entryId, newOffset);
+                        insertSuccess = m_impl->ipv6Index->Insert(newEntry.value.ipv6, indexValue);
                     }
                     break;
                 case IOCType::FileHash:
                     if (!m_impl->hashIndexes.empty()) {
                         size_t idx = static_cast<size_t>(newEntry.value.hash.algorithm);
                         if (idx < m_impl->hashIndexes.size() && m_impl->hashIndexes[idx]) {
+                            IndexValue indexValue(newEntry.entryId, newOffset);
                             insertSuccess = m_impl->hashIndexes[idx]->Insert(
-                                newEntry.value.hash, newEntry.entryId, newOffset);
+                                newEntry.value.hash, indexValue);
                         }
                     }
                     break;
@@ -825,21 +826,24 @@ namespace ShadowStrike {
                     if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                         auto d = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
-                        insertSuccess = m_impl->domainIndex->Insert(d, newEntry.entryId, newOffset);
+                        IndexValue indexValue(newEntry.entryId, newOffset);
+                        insertSuccess = m_impl->domainIndex->Insert(d, indexValue);
                     }
                     break;
                 case IOCType::URL:
                     if (m_impl->urlIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                         auto u = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
-                        insertSuccess = m_impl->urlIndex->Insert(u, newEntry.entryId, newOffset);
+                        IndexValue indexValue(newEntry.entryId, newOffset);
+                        insertSuccess = m_impl->urlIndex->Insert(u, indexValue);
                     }
                     break;
                 case IOCType::Email:
                     if (m_impl->emailIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
                         auto e = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
-                        insertSuccess = m_impl->emailIndex->Insert(e, newEntry.entryId, newOffset);
+                        IndexValue indexValue(newEntry.entryId, newOffset);
+                        insertSuccess = m_impl->emailIndex->Insert(e, indexValue);
                     }
                     break;
                 default:
@@ -853,7 +857,8 @@ namespace ShadowStrike {
                         else {
                             std::memcpy(&key, newEntry.value.raw, sizeof(uint64_t));
                         }
-                        insertSuccess = m_impl->genericIndex->Insert(key, newEntry.entryId, newOffset);
+                        IndexValue indexValue(newEntry.entryId, newOffset);
+                        insertSuccess = m_impl->genericIndex->Insert(key, indexValue);
                     }
                     break;
                 }

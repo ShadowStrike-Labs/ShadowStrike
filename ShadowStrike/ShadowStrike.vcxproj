@@ -339,6 +339,7 @@
     <ClInclude Include="src\ThreatIntel\ThreatIntelImporter.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Internal.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_LRU.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Trees.hpp" />
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.hpp" />
@@ -371,9 +372,6 @@
   <ItemGroup>
     <None Include="..\.github\copilot-instructions.md" />
     <None Include=".clang-tidy" />
-    <None Include="ARCHITECTURE_GUIDE_TR.md" />
-    <None Include="MODULAR_ARCHITECTURE_DETAILED_TR.md" />
-    <None Include="SIGNATUREINDEX_DETAILED_GUIDE_TR.md" />
     <None Include="src\SignatureStore\ARCHITECTURE.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

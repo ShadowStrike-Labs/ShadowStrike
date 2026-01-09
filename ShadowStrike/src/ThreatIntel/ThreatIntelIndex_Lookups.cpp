@@ -1,50 +1,23 @@
+/*
+ * ============================================================================
+ * ShadowStrike ThreatIntelIndex - Lookup Operations
+ * ============================================================================
+ *
+ * Copyright (c) 2026 ShadowStrike Security Suite
+ * All rights reserved.
+ *
+ * PROPRIETARY AND CONFIDENTIAL
+ *
+ * High-performance lookup operations for threat intelligence index.
+ * Includes SIMD-optimized batch lookups with AVX2/SSE4.2 acceleration.
+ *
+ * ============================================================================
+ */
 
-
-
-#include "ThreatIntelIndex.hpp"
-#include "ThreatIntelDatabase.hpp"
-#include"ThreatIntelIndex_Internal.hpp"
-
-
-// Windows-specific includes
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <Windows.h>
-#include <intrin.h>
-#include <immintrin.h>  // SIMD intrinsics (AVX2, SSE4)
-
-// Prefetch hint macro
-#ifdef _MSC_VER
-#define PREFETCH_READ(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
-#define PREFETCH_WRITE(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T1)
-#else
-#define PREFETCH_READ(addr) __builtin_prefetch(addr, 0, 3)
-#define PREFETCH_WRITE(addr) __builtin_prefetch(addr, 1, 3)
-#endif
-
-// Branch prediction hints
-#ifdef __GNUC__
-#define LIKELY(x) __builtin_expect(!!(x), 1)
-#define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define LIKELY(x) (x)
-#define UNLIKELY(x) (x)
-#endif
-
-// Compiler barrier
-#ifdef _MSC_VER
-#define COMPILER_BARRIER() _ReadWriteBarrier()
-#else
-#define COMPILER_BARRIER() asm volatile("" ::: "memory")
-#endif
-
+#include "ThreatIntelIndex_Internal.hpp"
 
 namespace ShadowStrike {
-	namespace ThreatIntel {
+namespace ThreatIntel {
 
         // ============================================================================
         // LOOKUP OPERATIONS - IPv4
@@ -87,12 +60,13 @@ namespace ShadowStrike {
             }
 
             // Perform index lookup
-            auto lookupResult = m_impl->ipv4Index->Lookup(addr);
+            IndexValue lookupValue;
+            bool found = m_impl->ipv4Index->Lookup(addr, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
 
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
@@ -168,12 +142,13 @@ namespace ShadowStrike {
             }
 
             // Perform lookup
-            auto lookupResult = m_impl->ipv6Index->Lookup(addr);
+            IndexValue lookupValue;
+            bool found = m_impl->ipv6Index->Lookup(addr, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
             else {
@@ -231,12 +206,13 @@ namespace ShadowStrike {
             }
 
             // Perform lookup
-            auto lookupResult = m_impl->domainIndex->Lookup(domain);
+            IndexValue lookupValue;
+            bool found = m_impl->domainIndex->Lookup(domain, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
             else {
@@ -294,12 +270,13 @@ namespace ShadowStrike {
             }
 
             // Perform lookup
-            auto lookupResult = m_impl->urlIndex->Lookup(url);
+            IndexValue lookupValue;
+            bool found = m_impl->urlIndex->Lookup(url, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
             else {
@@ -364,12 +341,13 @@ namespace ShadowStrike {
             }
 
             // Perform lookup
-            auto lookupResult = m_impl->hashIndexes[algoIndex]->Lookup(hash);
+            IndexValue lookupValue;
+            bool found = m_impl->hashIndexes[algoIndex]->Lookup(hash, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
             else {
@@ -427,12 +405,13 @@ namespace ShadowStrike {
             }
 
             // Perform lookup
-            auto lookupResult = m_impl->emailIndex->Lookup(email);
+            IndexValue lookupValue;
+            bool found = m_impl->emailIndex->Lookup(email, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
             else {
@@ -470,12 +449,13 @@ namespace ShadowStrike {
             uint64_t key = HashString(value);
 
             // Perform lookup
-            auto lookupResult = m_impl->genericIndex->Lookup(key);
+            IndexValue lookupValue;
+            bool found = m_impl->genericIndex->Lookup(key, lookupValue);
 
-            if (lookupResult.has_value()) {
+            if (found) {
                 result.found = true;
-                result.entryId = lookupResult->first;
-                result.entryOffset = lookupResult->second;
+                result.entryId = lookupValue.entryId;
+                result.entryOffset = lookupValue.entryOffset;
                 m_impl->stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
             }
             else {
@@ -844,12 +824,13 @@ namespace ShadowStrike {
                         PREFETCH_READ(&addresses[batchStart + i + 1]);
                     }
 
-                    auto lookupResult = m_impl->ipv4Index->Lookup(addresses[batchStart + i]);
+                    IndexValue lookupValue;
+                    bool found = m_impl->ipv4Index->Lookup(addresses[batchStart + i], lookupValue);
 
-                    if (lookupResult.has_value()) {
+                    if (found) {
                         results[batchStart + i].found = true;
-                        results[batchStart + i].entryId = lookupResult->first;
-                        results[batchStart + i].entryOffset = lookupResult->second;
+                        results[batchStart + i].entryId = lookupValue.entryId;
+                        results[batchStart + i].entryOffset = lookupValue.entryOffset;
                         ++successful;
                     }
                     else {
@@ -975,12 +956,13 @@ namespace ShadowStrike {
                     }
 
                     // Index lookup
-                    auto lookupResult = hashIndex->Lookup(hash);
+                    IndexValue lookupValue;
+                    bool found = hashIndex->Lookup(hash, lookupValue);
 
-                    if (lookupResult.has_value()) {
+                    if (found) {
                         results[idx].found = true;
-                        results[idx].entryId = lookupResult->first;
-                        results[idx].entryOffset = lookupResult->second;
+                        results[idx].entryId = lookupValue.entryId;
+                        results[idx].entryOffset = lookupValue.entryOffset;
                         ++successful;
                     }
                     else {
@@ -1097,12 +1079,13 @@ namespace ShadowStrike {
                 }
 
                 // Index lookup
-                auto lookupResult = m_impl->domainIndex->Lookup(domain);
+                IndexValue lookupValue;
+                bool found = m_impl->domainIndex->Lookup(domain, lookupValue);
 
-                if (lookupResult.has_value()) {
+                if (found) {
                     results[i].found = true;
-                    results[i].entryId = lookupResult->first;
-                    results[i].entryOffset = lookupResult->second;
+                    results[i].entryId = lookupValue.entryId;
+                    results[i].entryOffset = lookupValue.entryOffset;
                     ++successful;
                 }
                 else {
@@ -1239,5 +1222,5 @@ namespace ShadowStrike {
             }
         }
 
-	}
-}
+} // namespace ThreatIntel
+} // namespace ShadowStrike

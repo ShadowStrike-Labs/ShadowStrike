@@ -1,9 +1,14 @@
 #pragma once
 
-
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <optional>
+#include <shared_mutex>
+#include <unordered_map>
 
 namespace ShadowStrike {
-	namespace ThreatIntel {
+namespace ThreatIntel {
 
 
         // ============================================================================
@@ -67,6 +72,29 @@ namespace ShadowStrike {
                 ++m_hitCount;
 
                 return it->second->value;
+            }
+
+            /**
+             * @brief Get value from cache with output parameter
+             * @param key Key to look up
+             * @param outValue Output parameter for the value
+             * @return true if found, false otherwise
+             */
+            [[nodiscard]] bool Get(const Key& key, Value& outValue) const noexcept {
+                std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+                auto it = m_map.find(key);
+                if (it == m_map.end()) {
+                    ++m_missCount;
+                    return false;
+                }
+
+                // Move to front (most recently used) - const_cast safe for mutable LRU ordering
+                const_cast<LRUCache*>(this)->MoveToFront(it->second);
+                ++m_hitCount;
+
+                outValue = it->second->value;
+                return true;
             }
 
             /**
@@ -207,5 +235,5 @@ namespace ShadowStrike {
             mutable std::shared_mutex m_mutex;
         };
 
-	}
-}
+} // namespace ThreatIntel
+} // namespace ShadowStrike

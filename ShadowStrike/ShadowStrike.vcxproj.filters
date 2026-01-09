@@ -698,13 +698,13 @@
     <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Trees.hpp">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Internal.hpp">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.github\copilot-instructions.md" />
     <None Include="src\SignatureStore\ARCHITECTURE.md" />
-    <None Include="ARCHITECTURE_GUIDE_TR.md" />
-    <None Include="MODULAR_ARCHITECTURE_DETAILED_TR.md" />
-    <None Include="SIGNATUREINDEX_DETAILED_GUIDE_TR.md" />
     <None Include=".clang-tidy" />
   </ItemGroup>
 </Project>

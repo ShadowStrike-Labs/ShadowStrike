@@ -3,7 +3,7 @@
  * ShadowStrike ThreatIntelIndex - Internal Implementation Header
  * ============================================================================
  *
- * Copyright (c) 2026 ShadowStrike Security Suite
+ * Copyright (c) 2024 ShadowStrike Security Suite
  * All rights reserved.
  *
  * PROPRIETARY AND CONFIDENTIAL
@@ -83,6 +83,124 @@
 
 namespace ShadowStrike {
 namespace ThreatIntel {
+
+// ============================================================================
+// INTERNAL HELPER FUNCTIONS - Shared across all modular .cpp files
+// ============================================================================
+
+/**
+ * @brief Get cached performance counter frequency (thread-safe, lazily initialized)
+ * 
+ * Uses static local variable for thread-safe lazy initialization (C++11 magic statics).
+ * QueryPerformanceFrequency is guaranteed to succeed on Windows XP and later.
+ * 
+ * @return Performance counter frequency in counts per second
+ */
+[[nodiscard]] inline LONGLONG GetCachedPerformanceFrequency() noexcept {
+    static const LONGLONG frequency = []() {
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);  // Cannot fail on Windows XP+
+        return freq.QuadPart;
+    }();
+    return frequency;
+}
+
+/**
+ * @brief Get high-resolution timestamp in nanoseconds
+ * 
+ * Uses Windows QueryPerformanceCounter for nanosecond-level precision.
+ * Handles potential overflow for very large counter values.
+ * 
+ * @return Current timestamp in nanoseconds, or 0 on failure
+ */
+[[nodiscard]] inline uint64_t GetNanoseconds() noexcept {
+    LARGE_INTEGER counter;
+    if (UNLIKELY(!QueryPerformanceCounter(&counter))) {
+        return 0;  // Counter unavailable - should never happen on modern Windows
+    }
+
+    // Get cached frequency (guaranteed non-zero)
+    const LONGLONG frequency = GetCachedPerformanceFrequency();
+
+    // Convert to nanoseconds with overflow protection
+    constexpr uint64_t NANOSECONDS_PER_SECOND = 1000000000ULL;
+    constexpr uint64_t MAX_SAFE_COUNTER = UINT64_MAX / NANOSECONDS_PER_SECOND;
+
+    if (static_cast<uint64_t>(counter.QuadPart) <= MAX_SAFE_COUNTER) {
+        // Safe to multiply directly
+        return (static_cast<uint64_t>(counter.QuadPart) * NANOSECONDS_PER_SECOND)
+            / static_cast<uint64_t>(frequency);
+    }
+    else {
+        // Use safer calculation for large counter values
+        const uint64_t seconds = static_cast<uint64_t>(counter.QuadPart)
+            / static_cast<uint64_t>(frequency);
+        const uint64_t remainder = static_cast<uint64_t>(counter.QuadPart)
+            % static_cast<uint64_t>(frequency);
+
+        return (seconds * NANOSECONDS_PER_SECOND) +
+            (remainder * NANOSECONDS_PER_SECOND / static_cast<uint64_t>(frequency));
+    }
+}
+
+/**
+ * @brief Calculate FNV-1a hash for string
+ * 
+ * Fast, high-quality hash function suitable for hash tables and bloom filters.
+ * Uses 64-bit FNV-1a algorithm with official offset basis and prime.
+ * 
+ * @param str String to hash
+ * @return 64-bit hash value
+ */
+[[nodiscard]] inline uint64_t HashString(std::string_view str) noexcept {
+    uint64_t hash = 14695981039346656037ULL;  // FNV offset basis
+    for (char c : str) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= 1099511628211ULL;  // FNV prime
+    }
+    return hash;
+}
+
+/**
+ * @brief Normalize domain name (lowercase, trim whitespace)
+ * 
+ * Uses locale-independent character handling for security.
+ * 
+ * @param domain Domain name to normalize
+ * @return Normalized domain string
+ */
+[[nodiscard]] inline std::string NormalizeDomain(std::string_view domain) noexcept {
+    std::string result;
+    result.reserve(domain.size());
+
+    // Skip leading whitespace (locale-independent)
+    size_t start = 0;
+    while (start < domain.size()) {
+        const char c = domain[start];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\v' && c != '\f') {
+            break;
+        }
+        ++start;
+    }
+
+    // Convert to lowercase and remove trailing whitespace
+    for (size_t i = start; i < domain.size(); ++i) {
+        const char c = domain[i];
+        // Check for whitespace (locale-independent)
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f') {
+            break;
+        }
+        // Lowercase conversion (ASCII only, safe for domains)
+        if (c >= 'A' && c <= 'Z') {
+            result.push_back(static_cast<char>(c + ('a' - 'A')));
+        }
+        else {
+            result.push_back(c);
+        }
+    }
+
+    return result;
+}
 
 // ============================================================================
 // THREATINTELINDEX::IMPL - COMPLETE INTERNAL IMPLEMENTATION

@@ -70,10 +70,20 @@ namespace ShadowStrike {
             IPv4RadixTree();
             ~IPv4RadixTree();
 
-            void Insert(uint32_t ipv4, uint8_t prefixLen, const IndexValue& value);
-            [[nodiscard]] bool Lookup(uint32_t ipv4, IndexValue& outValue) const;
-            [[nodiscard]] bool Contains(uint32_t ipv4) const;
-            void Remove(uint32_t ipv4, uint8_t prefixLen);
+            /// @brief Insert an IPv4 address with its index value
+            /// @return true if inserted successfully, false if already exists
+            [[nodiscard]] bool Insert(const IPv4Address& addr, const IndexValue& value);
+            
+            /// @brief Lookup an IPv4 address
+            /// @param addr IPv4 address to look up
+            /// @param outValue Output parameter for the result
+            /// @return true if found, false otherwise
+            [[nodiscard]] bool Lookup(const IPv4Address& addr, IndexValue& outValue) const;
+            [[nodiscard]] bool Contains(const IPv4Address& addr) const;
+            
+            /// @brief Remove an IPv4 address
+            /// @return true if removed successfully, false if not found
+            [[nodiscard]] bool Remove(const IPv4Address& addr);
             void Clear() noexcept;
 
             template<typename Func>
@@ -99,10 +109,20 @@ namespace ShadowStrike {
             IPv6PatriciaTrie();
             ~IPv6PatriciaTrie();
 
-            void Insert(std::string_view ipv6, uint8_t prefixLen, const IndexValue& value);
-            [[nodiscard]] bool Lookup(std::string_view ipv6, IndexValue& outValue) const;
-            [[nodiscard]] bool Contains(std::string_view ipv6) const;
-            void Remove(std::string_view ipv6, uint8_t prefixLen);
+            /// @brief Insert an IPv6 address with its index value
+            /// @return true if inserted successfully, false if already exists
+            [[nodiscard]] bool Insert(const IPv6Address& addr, const IndexValue& value);
+            
+            /// @brief Lookup an IPv6 address
+            /// @param addr IPv6 address to look up
+            /// @param outValue Output parameter for the result
+            /// @return true if found, false otherwise
+            [[nodiscard]] bool Lookup(const IPv6Address& addr, IndexValue& outValue) const;
+            [[nodiscard]] bool Contains(const IPv6Address& addr) const;
+            
+            /// @brief Remove an IPv6 address
+            /// @return true if removed successfully, false if not found
+            [[nodiscard]] bool Remove(const IPv6Address& addr);
             void Clear() noexcept;
 
             template<typename Func>
@@ -128,10 +148,20 @@ namespace ShadowStrike {
             DomainSuffixTrie();
             ~DomainSuffixTrie();
 
-            void Insert(std::string_view domain, const IndexValue& value);
+            /// @brief Insert a domain with its index value
+            /// @return true if inserted successfully, false if already exists
+            [[nodiscard]] bool Insert(std::string_view domain, const IndexValue& value);
+            
+            /// @brief Lookup a domain
+            /// @param domain Domain to look up
+            /// @param outValue Output parameter for the result
+            /// @return true if found, false otherwise
             [[nodiscard]] bool Lookup(std::string_view domain, IndexValue& outValue) const;
             [[nodiscard]] bool Contains(std::string_view domain) const;
-            void Remove(std::string_view domain);
+            
+            /// @brief Remove a domain
+            /// @return true if removed successfully, false if not found
+            [[nodiscard]] bool Remove(std::string_view domain);
             void Clear() noexcept;
 
             template<typename Func>
@@ -157,10 +187,20 @@ namespace ShadowStrike {
             explicit EmailHashTable(size_t initialCapacity = 1'000'000);
             ~EmailHashTable() = default;
 
-            void Insert(std::string_view email, const IndexValue& value);
+            /// @brief Insert an email with its index value
+            /// @return true if inserted successfully, false if already exists
+            [[nodiscard]] bool Insert(std::string_view email, const IndexValue& value);
+            
+            /// @brief Lookup an email
+            /// @param email Email to look up
+            /// @param outValue Output parameter for the result
+            /// @return true if found, false otherwise
             [[nodiscard]] bool Lookup(std::string_view email, IndexValue& outValue) const;
             [[nodiscard]] bool Contains(std::string_view email) const;
-            void Remove(std::string_view email);
+            
+            /// @brief Remove an email
+            /// @return true if removed successfully, false if not found
+            [[nodiscard]] bool Remove(std::string_view email);
             void Clear() noexcept;
 
             template<typename Func>

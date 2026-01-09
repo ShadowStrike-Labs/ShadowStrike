@@ -505,6 +505,37 @@ enum class ThreatIntelSource : uint16_t {
 }
 
 // ============================================================================
+// INDEX VALUE STRUCTURE
+// ============================================================================
+/**
+ * @brief Generic value stored in index structures.
+ * Encapsulates the unique IOC entry ID and its absolute database offset
+ * for nanosecond-level direct access. Designed for cache-line efficiency.
+ */
+struct IndexValue {
+    uint64_t entryId{ 0 };      ///< Unique ID of the IOC entry
+    uint64_t entryOffset{ 0 };  ///< File offset to the packed entry data
+
+    constexpr IndexValue() noexcept = default;
+    constexpr IndexValue(uint64_t id, uint64_t offset) noexcept
+        : entryId(id), entryOffset(offset) {
+    }
+
+    /**
+     * @brief Checks if the value points to a valid database entry.
+     * @return true if entryId is non-zero.
+     */
+    [[nodiscard]] constexpr bool IsValid() const noexcept {
+        return entryId != 0;
+    }
+
+    /**
+     * @brief C++20 Three-way comparison operator (Spaceship operator).
+     * Enables automatic generation of all relational operators for sorted containers.
+     */
+    auto operator<=>(const IndexValue&) const = default;
+};
+// ============================================================================
 // HASH ALGORITHM TYPES
 // ============================================================================
 
@@ -566,9 +597,12 @@ enum class HashAlgorithm : uint8_t {
 /// @brief IPv4 address with CIDR prefix support (cache-line optimized)
 #pragma pack(push, 1)
 struct alignas(4) IPv4Address {
-    /// @brief IPv4 address in network byte order (big-endian)
-    uint32_t address;
-    
+
+    union {
+        uint32_t address;               ///< Network byte order (big-endian)
+        std::array<uint8_t, 4> octets;  ///< Octets for Radix Tree traversal
+    };
+
     /// @brief CIDR prefix length (0-32, 32 = exact match)
     uint8_t prefixLength;
     
@@ -580,15 +614,20 @@ struct alignas(4) IPv4Address {
     
     /// @brief Construct from 4 octets
     IPv4Address(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) noexcept
-        : address((static_cast<uint32_t>(a) << 24) | 
-                  (static_cast<uint32_t>(b) << 16) |
-                  (static_cast<uint32_t>(c) << 8) | 
-                  static_cast<uint32_t>(d)),
-          prefixLength(prefix), reserved{} {}
-    
+        : address((static_cast<uint32_t>(a) << 24) |
+            (static_cast<uint32_t>(b) << 16) |
+            (static_cast<uint32_t>(c) << 8) |
+            static_cast<uint32_t>(d)),
+        prefixLength(prefix), reserved{} {}
+
+
     /// @brief Construct from raw 32-bit value (host byte order)
     explicit IPv4Address(uint32_t addr, uint8_t prefix = 32) noexcept
         : address(addr), prefixLength(prefix), reserved{} {}
+
+    /// @brief Updated constructor to initialize union members correctly
+    IPv4Address(std::array<uint8_t, 4> arr, uint8_t prefix = 32) noexcept : 
+        octets(arr), prefixLength(prefix), reserved{} {}
     
     /// @brief Get network mask for CIDR prefix
     [[nodiscard]] uint32_t GetNetworkMask() const noexcept {
@@ -686,9 +725,12 @@ static_assert(sizeof(IPv4Address) == 8, "IPv4Address must be exactly 8 bytes");
 /// @brief IPv6 address with CIDR prefix support (128-bit optimized)
 #pragma pack(push, 1)
 struct alignas(8) IPv6Address {
-    /// @brief IPv6 address bytes (network byte order, big-endian)
-    std::array<uint8_t, 16> address;
-    
+
+    union {
+        std::array<uint8_t, 16> address; ///< Raw bytes access
+        std::array<uint16_t, 8> groups;  ///< 16-bit groups for Patricia Trie storage
+    };
+
     /// @brief CIDR prefix length (0-128, 128 = exact match)
     uint8_t prefixLength;
     
@@ -2159,34 +2201,6 @@ struct LookupResult {
             (static_cast<uint16_t>(reputation) * static_cast<uint16_t>(confidence)) / 100
         );
     }
-};
-
-// ============================================================================
-// BATCH LOOKUP RESULT
-// ============================================================================
-
-/// @brief Result of batch lookup operation
-struct BatchLookupResult {
-    /// @brief Individual results (parallel to input)
-    std::vector<LookupResult> results;
-    
-    /// @brief Total lookup time in microseconds
-    uint64_t totalTimeUs{0};
-    
-    /// @brief Number of items found
-    size_t foundCount{0};
-    
-    /// @brief Number of items that should block
-    size_t blockCount{0};
-    
-    /// @brief Number of items that should alert
-    size_t alertCount{0};
-    
-    /// @brief Cache hit rate for this batch
-    double cacheHitRate{0.0};
-    
-    /// @brief Bloom filter rejection rate
-    double bloomRejectRate{0.0};
 };
 
 // ============================================================================

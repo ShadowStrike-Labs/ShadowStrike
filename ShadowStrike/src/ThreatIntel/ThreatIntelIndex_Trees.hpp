@@ -16,6 +16,7 @@
 #pragma once
 
 #include "ThreatIntelFormat.hpp"
+#include"ThreatIntelIndex.hpp"
 #include "ThreatIntelIndex_LRU.hpp"
 #include <cstdint>
 #include <memory>
@@ -33,13 +34,23 @@ namespace ShadowStrike {
 
         class HashBPlusTree {
         public:
-            explicit HashBPlusTree(size_t initialCapacity = 1'000'000);
+            explicit HashBPlusTree(HashAlgorithm algorithm = HashAlgorithm::SHA256);
             ~HashBPlusTree();
 
-            void Insert(uint64_t hash, const IndexValue& value);
-            [[nodiscard]] bool Lookup(uint64_t hash, IndexValue& outValue) const;
-            [[nodiscard]] bool Contains(uint64_t hash) const;
-            void Remove(uint64_t hash);
+            /// @brief Insert a hash with its index value
+            /// @return true if inserted successfully, false if already exists
+            [[nodiscard]] bool Insert(const HashValue& hash, const IndexValue& value);
+            
+            /// @brief Lookup a hash
+            /// @param hash Hash to look up
+            /// @param outValue Output parameter for the result
+            /// @return true if found, false otherwise
+            [[nodiscard]] bool Lookup(const HashValue& hash, IndexValue& outValue) const;
+            [[nodiscard]] bool Contains(const HashValue& hash) const;
+            
+            /// @brief Remove a hash
+            /// @return true if removed successfully, false if not found
+            [[nodiscard]] bool Remove(const HashValue& hash);
             void Clear() noexcept;
 
             template<typename Func>
@@ -47,17 +58,19 @@ namespace ShadowStrike {
 
             [[nodiscard]] size_t GetSize() const noexcept;
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
+            [[nodiscard]] HashAlgorithm GetAlgorithm() const noexcept { return m_algorithm; }
 
         private:
             struct BNode;
             std::unique_ptr<BNode> m_root;
             LRUCache<uint64_t, IndexValue> m_cache;
+            HashAlgorithm m_algorithm;
             uint32_t m_height = 0;
             mutable std::shared_mutex m_mutex;
         };
 
         // ============================================================================
-        // GenericBPlusTree Declaration (for FileHash)
+        // GenericBPlusTree Declaration (for miscellaneous IOC types)
         // ============================================================================
 
         class GenericBPlusTree {
@@ -65,10 +78,20 @@ namespace ShadowStrike {
             explicit GenericBPlusTree(size_t initialCapacity = 500'000);
             ~GenericBPlusTree();
 
-            void Insert(std::string_view key, const IndexValue& value);
-            [[nodiscard]] bool Lookup(std::string_view key, IndexValue& outValue) const;
-            [[nodiscard]] bool Contains(std::string_view key) const;
-            void Remove(std::string_view key);
+            /// @brief Insert a key with its index value
+            /// @return true if inserted successfully, false if already exists
+            [[nodiscard]] bool Insert(uint64_t key, const IndexValue& value);
+            
+            /// @brief Lookup a key
+            /// @param key Key to look up
+            /// @param outValue Output parameter for the result
+            /// @return true if found, false otherwise
+            [[nodiscard]] bool Lookup(uint64_t key, IndexValue& outValue) const;
+            [[nodiscard]] bool Contains(uint64_t key) const;
+            
+            /// @brief Remove a key
+            /// @return true if removed successfully, false if not found
+            [[nodiscard]] bool Remove(uint64_t key);
             void Clear() noexcept;
 
             template<typename Func>
@@ -76,11 +99,11 @@ namespace ShadowStrike {
 
             [[nodiscard]] size_t GetSize() const noexcept;
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
-
+             
         private:
             struct BNode;
             std::unique_ptr<BNode> m_root;
-            LRUCache<std::string, IndexValue> m_cache;
+            LRUCache<uint64_t, IndexValue> m_cache;
             uint32_t m_height = 0;
             mutable std::shared_mutex m_mutex;
         };
