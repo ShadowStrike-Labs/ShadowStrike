@@ -479,23 +479,9 @@ IOCEntry* ThreatIntelDatabase::GetMutableEntry(size_t index) noexcept {
 // ============================================================================
 
 uint64_t ThreatIntelDatabase::ComputeIndexHash(std::string_view value, IOCType type) noexcept {
-    // FNV-1a 64-bit hash - excellent distribution, fast computation
-    constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
-    constexpr uint64_t FNV_PRIME = 1099511628211ULL;
-    
-    uint64_t hash = FNV_OFFSET_BASIS;
-    
-    // Include IOC type in hash for disambiguation
-    hash ^= static_cast<uint64_t>(type);
-    hash *= FNV_PRIME;
-    
-    // Hash each byte of the value
-    for (const char c : value) {
-        hash ^= static_cast<uint64_t>(static_cast<uint8_t>(c));
-        hash *= FNV_PRIME;
-    }
-    
-    return hash;
+    // Delegate to canonical implementation in Format namespace
+    // Format::HashFNV1aWithType uses the same FNV-1a algorithm with type discrimination
+    return Format::HashFNV1aWithType(value, type);
 }
 
 void ThreatIntelDatabase::RebuildHashIndex() noexcept {
@@ -522,7 +508,7 @@ void ThreatIntelDatabase::RebuildHashIndex() noexcept {
         bucket.reserve(avgEntriesPerBucket * 2);  // 2x for collision headroom
     }
     
-    // Index all existing entries
+    // Index all existing entries using centralized FormatIOCValueForIndex
     for (size_t i = 0; i < entryCount; ++i) {
         const IOCEntry& entry = m_entries[i];
         
@@ -531,79 +517,8 @@ void ThreatIntelDatabase::RebuildHashIndex() noexcept {
             continue;
         }
         
-        // Extract string value based on IOC type
-        std::string valueStr;
-        
-        switch (entry.type) {
-            case IOCType::IPv4: {
-                // Format IPv4 as string for hashing
-                const auto& ipv4 = entry.value.ipv4;
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u/%u",
-                    (ipv4.address >> 24) & 0xFF,
-                    (ipv4.address >> 16) & 0xFF,
-                    (ipv4.address >> 8) & 0xFF,
-                    ipv4.address & 0xFF,
-                    ipv4.prefixLength);
-                valueStr = buf;
-                break;
-            }
-            
-            case IOCType::IPv6: {
-                // Format IPv6 as hex string for hashing
-                const auto& ipv6 = entry.value.ipv6;
-                char buf[64];
-                snprintf(buf, sizeof(buf), 
-                    "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x/%u",
-                    ipv6.address[0], ipv6.address[1], ipv6.address[2], ipv6.address[3],
-                    ipv6.address[4], ipv6.address[5], ipv6.address[6], ipv6.address[7],
-                    ipv6.address[8], ipv6.address[9], ipv6.address[10], ipv6.address[11],
-                    ipv6.address[12], ipv6.address[13], ipv6.address[14], ipv6.address[15],
-                    ipv6.prefixLength);
-                valueStr = buf;
-                break;
-            }
-            
-            case IOCType::FileHash: {
-                // Format hash as hex string
-                const auto& hash = entry.value.hash;
-                valueStr.reserve(hash.length * 2);
-                for (size_t j = 0; j < hash.length; ++j) {
-                    char hex[3];
-                    snprintf(hex, sizeof(hex), "%02x", hash.data[j]);
-                    valueStr += hex;
-                }
-                break;
-            }
-            
-            case IOCType::Domain:
-            case IOCType::URL:
-            case IOCType::Email:
-            case IOCType::JA3:
-            case IOCType::JA3S:
-            case IOCType::RegistryKey:
-            case IOCType::ProcessName:
-            case IOCType::MutexName:
-            case IOCType::NamedPipe:
-            case IOCType::CertFingerprint: {
-                // String-based types use stringRef
-                // Note: Actual string would be in string pool, we hash the offset/length combo
-                // For proper implementation, string pool access is needed
-                const auto& strRef = entry.value.stringRef;
-                char buf[64];
-                snprintf(buf, sizeof(buf), "strref:%llu:%u", 
-                    static_cast<unsigned long long>(strRef.stringOffset), 
-                    strRef.stringLength);
-                valueStr = buf;
-                break;
-            }
-            
-            default:
-                // Unknown type - use raw bytes
-                valueStr.assign(reinterpret_cast<const char*>(entry.value.raw), 
-                               sizeof(entry.value.raw));
-                break;
-        }
+        // Use centralized formatting function - eliminates code duplication
+        const std::string valueStr = FormatIOCValueForIndex(entry);
         
         if (!valueStr.empty()) {
             const uint64_t fullHash = ComputeIndexHash(valueStr, entry.type);
@@ -636,6 +551,45 @@ size_t ThreatIntelDatabase::FindEntry(std::string_view value, IOCType type) cons
     // Compute hash for the search value
     const uint64_t searchHash = ComputeIndexHash(value, type);
     
+    // Helper lambda for value comparison using centralized FormatIOCValueForIndex
+    // This eliminates the massive code duplication in type-specific comparisons
+    auto compareEntryValue = [&value](const IOCEntry& entry) -> bool {
+        const std::string entryValue = FormatIOCValueForIndex(entry);
+        if (entryValue.empty()) {
+            return false;
+        }
+        
+        // For FileHash type, do case-insensitive comparison
+        if (entry.type == IOCType::FileHash) {
+            if (value.size() != entryValue.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < value.size(); ++i) {
+                char a = static_cast<char>(std::tolower(static_cast<unsigned char>(value[i])));
+                char b = static_cast<char>(std::tolower(static_cast<unsigned char>(entryValue[i])));
+                if (a != b) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        
+        // For IPv4 with /32 prefix, also check without prefix suffix
+        if (entry.type == IOCType::IPv4 && entry.value.ipv4.prefixLength == 32) {
+            // entryValue is without prefix for /32, so direct comparison
+            if (value == entryValue) {
+                return true;
+            }
+            // Also check with /32 suffix appended
+            if (value.size() == entryValue.size() + 3) {
+                std::string withPrefix = entryValue + "/32";
+                return value == withPrefix;
+            }
+        }
+        
+        return value == entryValue;
+    };
+    
     // If hash index is built, use O(1) lookup
     if (m_hashIndexBuilt && !m_hashIndex.empty()) {
         const size_t bucketIdx = searchHash % HASH_BUCKET_COUNT;
@@ -664,101 +618,8 @@ size_t ThreatIntelDatabase::FindEntry(std::string_view value, IOCType type) cons
                 continue;
             }
             
-            // Full value comparison based on type
-            bool match = false;
-            
-            switch (type) {
-                case IOCType::IPv4: {
-                    // Parse input value as IPv4
-                    const auto& ipv4 = entry.value.ipv4;
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "%u.%u.%u.%u/%u",
-                        (ipv4.address >> 24) & 0xFF,
-                        (ipv4.address >> 16) & 0xFF,
-                        (ipv4.address >> 8) & 0xFF,
-                        ipv4.address & 0xFF,
-                        ipv4.prefixLength);
-                    match = (value == buf);
-                    
-                    // Also check without prefix if exact match
-                    if (!match && ipv4.prefixLength == 32) {
-                        snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                            (ipv4.address >> 24) & 0xFF,
-                            (ipv4.address >> 16) & 0xFF,
-                            (ipv4.address >> 8) & 0xFF,
-                            ipv4.address & 0xFF);
-                        match = (value == buf);
-                    }
-                    break;
-                }
-                
-                case IOCType::IPv6: {
-                    const auto& ipv6 = entry.value.ipv6;
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), 
-                        "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x/%u",
-                        ipv6.address[0], ipv6.address[1], ipv6.address[2], ipv6.address[3],
-                        ipv6.address[4], ipv6.address[5], ipv6.address[6], ipv6.address[7],
-                        ipv6.address[8], ipv6.address[9], ipv6.address[10], ipv6.address[11],
-                        ipv6.address[12], ipv6.address[13], ipv6.address[14], ipv6.address[15],
-                        ipv6.prefixLength);
-                    match = (value == buf);
-                    break;
-                }
-                
-                case IOCType::FileHash: {
-                    const auto& hash = entry.value.hash;
-                    std::string hashStr;
-                    hashStr.reserve(hash.length * 2);
-                    for (size_t j = 0; j < hash.length; ++j) {
-                        char hex[3];
-                        snprintf(hex, sizeof(hex), "%02x", hash.data[j]);
-                        hashStr += hex;
-                    }
-                    // Case-insensitive comparison for hashes
-                    if (value.size() == hashStr.size()) {
-                        match = true;
-                        for (size_t j = 0; j < value.size(); ++j) {
-                            char a = static_cast<char>(std::tolower(static_cast<unsigned char>(value[j])));
-                            char b = static_cast<char>(std::tolower(static_cast<unsigned char>(hashStr[j])));
-                            if (a != b) {
-                                match = false;
-                                break;
-                            }
-                        }
-                    }
-                    break;
-                }
-                
-                case IOCType::Domain:
-                case IOCType::URL:
-                case IOCType::Email:
-                case IOCType::JA3:
-                case IOCType::JA3S:
-                case IOCType::RegistryKey:
-                case IOCType::ProcessName:
-                case IOCType::MutexName:
-                case IOCType::NamedPipe:
-                case IOCType::CertFingerprint: {
-                    // String types - compare stringRef encoding
-                    const auto& strRef = entry.value.stringRef;
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "strref:%llu:%u", 
-                        static_cast<unsigned long long>(strRef.stringOffset), 
-                        strRef.stringLength);
-                    match = (value == buf);
-                    break;
-                }
-                
-                default:
-                    // Raw bytes comparison
-                    if (value.size() == sizeof(entry.value.raw)) {
-                        match = (std::memcmp(value.data(), entry.value.raw, sizeof(entry.value.raw)) == 0);
-                    }
-                    break;
-            }
-            
-            if (match) {
+            // Use centralized comparison via lambda
+            if (compareEntryValue(entry)) {
                 return bucketEntry.entryIndex;
             }
         }
@@ -781,96 +642,8 @@ size_t ThreatIntelDatabase::FindEntry(std::string_view value, IOCType type) cons
             continue;
         }
         
-        // Type-specific comparison (same as hash index path)
-        bool match = false;
-        
-        switch (type) {
-            case IOCType::IPv4: {
-                const auto& ipv4 = entry.value.ipv4;
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u/%u",
-                    (ipv4.address >> 24) & 0xFF,
-                    (ipv4.address >> 16) & 0xFF,
-                    (ipv4.address >> 8) & 0xFF,
-                    ipv4.address & 0xFF,
-                    ipv4.prefixLength);
-                match = (value == buf);
-                
-                if (!match && ipv4.prefixLength == 32) {
-                    snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                        (ipv4.address >> 24) & 0xFF,
-                        (ipv4.address >> 16) & 0xFF,
-                        (ipv4.address >> 8) & 0xFF,
-                        ipv4.address & 0xFF);
-                    match = (value == buf);
-                }
-                break;
-            }
-            
-            case IOCType::IPv6: {
-                const auto& ipv6 = entry.value.ipv6;
-                char buf[64];
-                snprintf(buf, sizeof(buf), 
-                    "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x/%u",
-                    ipv6.address[0], ipv6.address[1], ipv6.address[2], ipv6.address[3],
-                    ipv6.address[4], ipv6.address[5], ipv6.address[6], ipv6.address[7],
-                    ipv6.address[8], ipv6.address[9], ipv6.address[10], ipv6.address[11],
-                    ipv6.address[12], ipv6.address[13], ipv6.address[14], ipv6.address[15],
-                    ipv6.prefixLength);
-                match = (value == buf);
-                break;
-            }
-            
-            case IOCType::FileHash: {
-                const auto& hash = entry.value.hash;
-                std::string hashStr;
-                hashStr.reserve(hash.length * 2);
-                for (size_t j = 0; j < hash.length; ++j) {
-                    char hex[3];
-                    snprintf(hex, sizeof(hex), "%02x", hash.data[j]);
-                    hashStr += hex;
-                }
-                if (value.size() == hashStr.size()) {
-                    match = true;
-                    for (size_t j = 0; j < value.size(); ++j) {
-                        char a = static_cast<char>(std::tolower(static_cast<unsigned char>(value[j])));
-                        char b = static_cast<char>(std::tolower(static_cast<unsigned char>(hashStr[j])));
-                        if (a != b) {
-                            match = false;
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
-            
-            case IOCType::Domain:
-            case IOCType::URL:
-            case IOCType::Email:
-            case IOCType::JA3:
-            case IOCType::JA3S:
-            case IOCType::RegistryKey:
-            case IOCType::ProcessName:
-            case IOCType::MutexName:
-            case IOCType::NamedPipe:
-            case IOCType::CertFingerprint: {
-                const auto& strRef = entry.value.stringRef;
-                char buf[64];
-                snprintf(buf, sizeof(buf), "strref:%llu:%u", 
-                    static_cast<unsigned long long>(strRef.stringOffset), 
-                    strRef.stringLength);
-                match = (value == buf);
-                break;
-            }
-            
-            default:
-                if (value.size() == sizeof(entry.value.raw)) {
-                    match = (std::memcmp(value.data(), entry.value.raw, sizeof(entry.value.raw)) == 0);
-                }
-                break;
-        }
-        
-        if (match) {
+        // Use centralized comparison via lambda (same logic as hash index path)
+        if (compareEntryValue(entry)) {
             return i;
         }
     }
@@ -912,54 +685,22 @@ void ThreatIntelDatabase::AddToIndex(size_t index, std::string_view value, IOCTy
 }
 
 std::string ThreatIntelDatabase::FormatIOCValueForIndex(const IOCEntry& entry) noexcept {
-    std::string result;
+    // Use centralized Format:: functions for consistent value formatting
+    // This ensures search keys match the canonical format used across the codebase
     
     switch (entry.type) {
-        case IOCType::IPv4: {
-            const auto& ipv4 = entry.value.ipv4;
-            char buf[32];
-            if (ipv4.prefixLength == 32) {
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                    (ipv4.address >> 24) & 0xFF,
-                    (ipv4.address >> 16) & 0xFF,
-                    (ipv4.address >> 8) & 0xFF,
-                    ipv4.address & 0xFF);
-            } else {
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u/%u",
-                    (ipv4.address >> 24) & 0xFF,
-                    (ipv4.address >> 16) & 0xFF,
-                    (ipv4.address >> 8) & 0xFF,
-                    ipv4.address & 0xFF,
-                    ipv4.prefixLength);
-            }
-            result = buf;
-            break;
-        }
+        case IOCType::IPv4:
+            // Use Format::FormatIPv4 for consistent formatting
+            // Note: Format::FormatIPv4 omits /32 suffix for exact matches
+            return Format::FormatIPv4(entry.value.ipv4);
         
-        case IOCType::IPv6: {
-            const auto& ipv6 = entry.value.ipv6;
-            char buf[64];
-            snprintf(buf, sizeof(buf), 
-                "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x/%u",
-                ipv6.address[0], ipv6.address[1], ipv6.address[2], ipv6.address[3],
-                ipv6.address[4], ipv6.address[5], ipv6.address[6], ipv6.address[7],
-                ipv6.address[8], ipv6.address[9], ipv6.address[10], ipv6.address[11],
-                ipv6.address[12], ipv6.address[13], ipv6.address[14], ipv6.address[15],
-                ipv6.prefixLength);
-            result = buf;
-            break;
-        }
+        case IOCType::IPv6:
+            // Use Format::FormatIPv6 for proper IPv6 formatting with zero compression
+            return Format::FormatIPv6(entry.value.ipv6);
         
-        case IOCType::FileHash: {
-            const auto& hash = entry.value.hash;
-            result.reserve(hash.length * 2);
-            for (size_t j = 0; j < hash.length; ++j) {
-                char hex[3];
-                snprintf(hex, sizeof(hex), "%02x", hash.data[j]);
-                result += hex;
-            }
-            break;
-        }
+        case IOCType::FileHash:
+            // Use Format::FormatHashString for consistent hash formatting
+            return Format::FormatHashString(entry.value.hash);
         
         case IOCType::Domain:
         case IOCType::URL:
@@ -971,28 +712,19 @@ std::string ThreatIntelDatabase::FormatIOCValueForIndex(const IOCEntry& entry) n
         case IOCType::MutexName:
         case IOCType::NamedPipe:
         case IOCType::CertFingerprint: {
-            // String types use stringRef - format as offset:length pair
+            // String types use stringRef - format as offset:length pair for indexing
             const auto& strRef = entry.value.stringRef;
             char buf[64];
             snprintf(buf, sizeof(buf), "strref:%llu:%u", 
                 static_cast<unsigned long long>(strRef.stringOffset), 
                 strRef.stringLength);
-            result = buf;
-            break;
+            return std::string(buf);
         }
-        
+       
         default:
-            // Unknown type - encode raw bytes as hex
-            result.reserve(sizeof(entry.value.raw) * 2);
-            for (size_t j = 0; j < sizeof(entry.value.raw); ++j) {
-                char hex[3];
-                snprintf(hex, sizeof(hex), "%02x", entry.value.raw[j]);
-                result += hex;
-            }
-            break;
+            // Unknown type - encode raw bytes as hex using Format utility
+            return Format::FormatHexString(entry.value.raw, sizeof(entry.value.raw), false);
     }
-    
-    return result;
 }
 
 size_t ThreatIntelDatabase::FindEntry(const IOCEntry& entry) const noexcept {
@@ -1555,10 +1287,6 @@ DatabaseStats ThreatIntelDatabase::GetStats() const noexcept {
 const std::wstring& ThreatIntelDatabase::GetFilePath() const noexcept {
     return m_config.filePath;
 }
-
-// ============================================================================
-// Private Implementation
-// ============================================================================
 
 bool ThreatIntelDatabase::CreateDatabase(const DatabaseConfig& config) noexcept {
     try {

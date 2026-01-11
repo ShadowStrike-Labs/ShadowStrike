@@ -23,13 +23,17 @@ namespace ThreatIntel {
 // ============================================================================
 
 /**
- * @brief Calculate optimal bloom filter size
+ * @brief Calculate optimal bloom filter size (single-argument convenience wrapper)
+ * 
+ * Delegates to Format::CalculateBloomFilterSize with default FPR.
+ * Uses BLOOM_FILTER_DEFAULT_FPR constant from ThreatIntelFormat.hpp.
+ * 
+ * @param expectedElements Expected number of elements
+ * @return Optimal bloom filter size in bits
  */
-[[nodiscard]] inline size_t CalculateBloomFilterSize(size_t expectedElements) noexcept {
-    // Target 1% false positive rate
-    // m = -n * ln(p) / (ln(2)^2)
-    // For p = 0.01, m ≈ n * 9.6
-    return expectedElements * IndexConfig::BLOOM_BITS_PER_ELEMENT;
+[[nodiscard]] inline size_t CalculateBloomFilterSizeDefault(size_t expectedElements) noexcept {
+    // Delegate to canonical implementation with default FPR
+    return Format::CalculateBloomFilterSize(expectedElements, BLOOM_FILTER_DEFAULT_FPR);
 }
 
 // ============================================================================
@@ -121,7 +125,7 @@ StoreError ThreatIntelIndex::Initialize(
 
     // Initialize bloom filters if enabled
     if (options.buildBloomFilters) {
-        size_t bloomSize = CalculateBloomFilterSize(header->totalActiveEntries);
+        size_t bloomSize = CalculateBloomFilterSizeDefault(header->totalActiveEntries);
 
         if (options.buildIPv4) {
             m_impl->bloomFilters[IOCType::IPv4] =

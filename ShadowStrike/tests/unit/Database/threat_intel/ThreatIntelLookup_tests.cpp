@@ -39,6 +39,15 @@ namespace ShadowStrike::ThreatIntel::Tests {
 
 using namespace ShadowStrike::ThreatIntel;
 
+
+// ============================================================================
+// MINIMUM DATABASE SIZE CONSTANT
+// ============================================================================
+
+/// @brief Minimum size for a valid threat intel database
+/// @details Must accommodate header (4KB) + minimal data sections
+constexpr size_t MIN_DATABASE_SIZE = 10 * 1024 * 1024;  // 10 MB minimum
+
 namespace {
 
 // Temporary directory helper (mirrors ThreatIntelIndex_tests.cpp style)
@@ -94,28 +103,28 @@ struct TempDir {
 	IOCEntry entry{};
 	entry.type = type;
 	entry.confidence = ConfidenceLevel::High;
-	entry.reputation = ThreatReputation::Malicious;
-	entry.category = ThreatCategory::C2;
+	entry.reputation = ThreatIntel::ReputationLevel::Malicious;
+	entry.category = ThreatCategory::C2Server;
 
 	switch (type) {
 		case IOCType::IPv4: {
 			auto parsed = Format::ParseIPv4(value);
 			if (parsed.has_value()) {
-				entry.data.ipv4 = *parsed;
+				entry.value.ipv4 = *parsed;
 			}
 			break;
 		}
 		case IOCType::IPv6: {
 			auto parsed = Format::ParseIPv6(value);
 			if (parsed.has_value()) {
-				entry.data.ipv6 = *parsed;
+				entry.value.ipv6 = *parsed;
 			}
 			break;
 		}
 		case IOCType::FileHash: {
 			auto parsed = Format::ParseHashString(value, HashAlgorithm::SHA256);
 			if (parsed.has_value()) {
-				entry.data.hash = *parsed;
+				entry.value.hash = *parsed;
 			}
 			break;
 		}
@@ -543,7 +552,7 @@ TEST(ThreatIntelLookup_IOCTypes, DomainLookup_MaliciousDomain_IndexHit) {
 	IOCEntry entry{};
 	entry.type = IOCType::Domain;
 	entry.confidence = ConfidenceLevel::High;
-	entry.reputation = ThreatReputation::Malicious;
+	entry.reputation = ThreatIntel::ReputationLevel::Malicious;
 	ASSERT_TRUE(index.Insert(entry, 3000).IsSuccess());
 
 	ThreatIntelLookup lookup;

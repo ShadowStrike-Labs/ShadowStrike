@@ -13,6 +13,7 @@
  */
 
 #include "ThreatIntelLookup.hpp"
+#include "ThreatIntelFormat.hpp"    // Format namespace utilities
 
 #include <algorithm>
 #include <array>
@@ -257,28 +258,22 @@ private:
     };
     
     /**
-     * @brief FNV-1a hash constants (compile-time)
-     */
-    static constexpr uint32_t FNV1A_OFFSET_BASIS = 2166136261u;
-    static constexpr uint32_t FNV1A_PRIME = 16777619u;
-    
-    /**
-     * @brief Compute FNV-1a hash
+     * @brief Compute cache key hash combining type and value
      * 
-     * Uses FNV-1a algorithm for fast, well-distributed hashing.
+     * Uses canonical FNV-1a from Format namespace, combined with IOCType.
+     * Returns 32-bit hash suitable for cache bucket indexing.
      * Thread-safe: no shared state modified.
+     * 
+     * @note Delegates core hashing to Format::HashFNV1a for consistency
      */
-    [[nodiscard]] static constexpr uint32_t ComputeHash(IOCType type, std::string_view value) noexcept {
-        uint32_t hash = FNV1A_OFFSET_BASIS;
-        hash ^= static_cast<uint32_t>(type);
-        hash *= FNV1A_PRIME;
+    [[nodiscard]] static uint32_t ComputeHash(IOCType type, std::string_view value) noexcept {
+        // Get 64-bit hash from canonical implementation
+        const uint64_t baseHash = Format::HashFNV1a(value);
         
-        for (const char c : value) {
-            hash ^= static_cast<uint8_t>(c);
-            hash *= FNV1A_PRIME;
-        }
-        
-        return hash;
+        // Combine with IOCType and fold to 32-bit for cache indexing
+        // XOR-folding preserves hash quality while reducing bit width
+        const uint64_t combined = baseHash ^ (static_cast<uint64_t>(type) * 0x9E3779B97F4A7C15ULL);
+        return static_cast<uint32_t>((combined >> 32) ^ combined);
     }
     
     void MoveToFront(CacheEntry* entry) noexcept {
@@ -1191,7 +1186,7 @@ private:
                     break;
                     
                 case 3:  // AlienVault OTX
-                    extResult.source = ThreatIntelSource::AlienVault;
+                    extResult.source = ThreatIntelSource::AlienVaultOTX;
                     // In production: Call OTX API
                     // extResult = QueryOTX(type, value, options.timeoutMs);
                     break;
@@ -1259,8 +1254,12 @@ private:
             result.primarySource = bestSource;
             result.sourceCount = static_cast<uint16_t>(externalResults.size());
             result.threatScore = static_cast<uint8_t>(
-                std::min(totalScore / externalResults.size(), static_cast<uint32_t>(100))
-            );
+                std::min<uint32_t>(
+                    static_cast<uint32_t>(totalScore / externalResults.size()),
+                    100u
+                )
+                );
+
             
             // Set timestamps
             const auto nowTime = std::chrono::system_clock::now();
@@ -1320,7 +1319,7 @@ private:
         
         // If we have an entry, store its ID for potential full lookup later
         if (result.entry.has_value()) {
-            cacheValue.entryId = result.entry.value().id;
+            cacheValue.entryId = result.entry.value().entryId;
         }
         
         // =====================================================================

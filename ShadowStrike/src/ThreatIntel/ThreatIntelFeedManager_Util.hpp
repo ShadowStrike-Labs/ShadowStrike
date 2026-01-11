@@ -1,12 +1,13 @@
 ﻿
 #pragma once
 
-#include<chrono>
-#include<iostream>
-#include<string>
-#include<random>
-#include<thread>
-#include"../../src/Utils/Base64Utils.hpp"
+#include <chrono>
+#include <iostream>
+#include <string>
+#include <random>
+#include <thread>
+#include "ThreatIntelFormat.hpp"  // For Format:: utilities
+#include "../../src/Utils/Base64Utils.hpp"
 
 
 namespace ShadowStrike {
@@ -16,13 +17,14 @@ namespace ShadowStrike {
             // ============================================================================
             // UTILITY FUNCTION IMPLEMENTATIONS
             // ============================================================================
-
-
-
+            
+            // NOTE: String/parsing utilities have been moved to ThreatIntel::Format namespace.
+            // Use Format::TrimWhitespace, Format::ToLowerASCII, Format::SafeParseIPv4, etc.
+            // The functions below delegate to Format:: for backward compatibility.
                 /**
                  * @brief Get current timestamp in seconds since epoch
                  */
-            [[nodiscard]] uint64_t GetCurrentTimestampImpl() noexcept {
+            [[nodiscard]] inline uint64_t GetCurrentTimestampImpl() noexcept {
                 return static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::system_clock::now().time_since_epoch()
@@ -33,7 +35,7 @@ namespace ShadowStrike {
             /**
              * @brief Get current timestamp in milliseconds since epoch
              */
-            [[nodiscard]] uint64_t GetCurrentTimestampMs() noexcept {
+            [[nodiscard]] inline uint64_t GetCurrentTimestampMs() noexcept {
                 return static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()
@@ -50,7 +52,7 @@ namespace ShadowStrike {
              * @param factor Jitter factor (e.g., 0.25 for +/- 25%)
              * @return Random jitter value in range [-factor, factor]
              */
-            [[nodiscard]] double GetRandomJitter(double factor) noexcept {
+            [[nodiscard]] inline double GetRandomJitter(double factor) noexcept {
                 // Validate factor to prevent invalid distribution or NaN propagation
                 if (factor <= 0.0 || !std::isfinite(factor) || std::isnan(factor)) {
                     return 0.0;
@@ -89,61 +91,25 @@ namespace ShadowStrike {
 
             /**
              * @brief Trim whitespace from string
-             *
-             * Safely removes leading and trailing whitespace.
-             * Handles all common whitespace characters including vertical tabs and form feeds.
+             * @note Delegates to ThreatIntel::Format::TrimWhitespace.
              *
              * @param str Input string view
              * @return Trimmed string, empty if input is all whitespace
              */
-            [[nodiscard]] std::string TrimString(std::string_view str) {
-                if (str.empty()) {
-                    return "";
-                }
-
-                // Use extended whitespace character set for security
-                constexpr std::string_view kWhitespace = " \t\r\n\v\f";
-
-                const size_t start = str.find_first_not_of(kWhitespace);
-                if (start == std::string_view::npos) {
-                    return "";  // All whitespace
-                }
-
-                const size_t end = str.find_last_not_of(kWhitespace);
-                // end is guaranteed >= start since start found a non-whitespace char
-
-                // Calculate length with overflow protection
-                const size_t length = end - start + 1;
-                if (length > str.size()) {
-                    return "";  // Defensive check
-                }
-
-                return std::string(str.substr(start, length));
+            [[nodiscard]] inline std::string TrimString(std::string_view str) {
+                auto trimmed = ThreatIntel::Format::TrimWhitespace(str);
+                return std::string(trimmed);
             }
 
             /**
              * @brief Convert string to lowercase
-             *
-             * Safely converts ASCII characters to lowercase. Uses unsigned char
-             * cast to prevent UB with negative char values on some platforms.
+             * @note Delegates to ThreatIntel::Format::ToLowerASCII.
              *
              * @param str Input string view
              * @return Lowercase string
              */
-            [[nodiscard]] std::string ToLowerCase(std::string_view str) {
-                std::string result;
-                try {
-                    result.reserve(str.size());
-                }
-                catch (const std::bad_alloc&) {
-                    return "";  // Return empty on allocation failure
-                }
-
-                for (const char c : str) {
-                    // Cast to unsigned char to avoid UB with std::tolower on negative char values
-                    result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                }
-                return result;
+            [[nodiscard]] inline std::string ToLowerCase(std::string_view str) {
+                return ThreatIntel::Format::ToLowerCase(str);
             }
 
             /**
@@ -155,7 +121,7 @@ namespace ShadowStrike {
              * @param str Input string view
              * @return URL-encoded string, empty on allocation failure
              */
-            [[nodiscard]] std::string UrlEncode(std::string_view str) {
+            [[nodiscard]] inline std::string UrlEncode(std::string_view str) {
                 if (str.empty()) {
                     return "";
                 }
@@ -577,115 +543,38 @@ namespace ShadowStrike {
 
             /**
              * @brief Convert single hex character to value
+             * @note Delegates to ThreatIntel::Format::HexCharToValue.
              *
              * @param c Hex character ('0'-'9', 'a'-'f', 'A'-'F')
              * @return Value 0-15, or -1 if invalid character
              */
             [[nodiscard]] constexpr int HexCharToValue(char c) noexcept {
-                if (c >= '0' && c <= '9') return c - '0';
-                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                return -1;  // Invalid character
+                return ThreatIntel::Format::HexCharToValue(c);
             }
 
             /**
              * @brief Parse hex string to bytes
-             *
-             * Converts a hex string (e.g., "DEADBEEF") to binary bytes.
+             * @note Delegates to ThreatIntel::Format::ParseHexString.
              *
              * @param hex Hex string (must be exactly 2*outLen characters)
              * @param out Output buffer for bytes
              * @param outLen Size of output buffer in bytes
              * @return true if parse successful, false on invalid input
              */
-            [[nodiscard]] bool ParseHexString(std::string_view hex, uint8_t* out, size_t outLen) {
-                if (!out || outLen == 0) {
-                    return false;
-                }
-
-                if (hex.size() != outLen * 2) {
-                    return false;
-                }
-
-                for (size_t i = 0; i < outLen; ++i) {
-                    const int highVal = HexCharToValue(hex[i * 2]);
-                    const int lowVal = HexCharToValue(hex[i * 2 + 1]);
-
-                    if (highVal < 0 || lowVal < 0) {
-                        return false;  // Invalid hex character
-                    }
-
-                    out[i] = static_cast<uint8_t>((highVal << 4) | lowVal);
-                }
-
-                return true;
+            [[nodiscard]] inline bool ParseHexString(std::string_view hex, uint8_t* out, size_t outLen) {
+                return ThreatIntel::Format::ParseHexString(hex, out, outLen);
             }
 
             /**
              * @brief Safely parse IPv4 address string to octets
-             *
-             * Parses dotted-decimal notation (e.g., "192.168.1.1") with full validation.
-             * Does NOT use sscanf to avoid potential security issues with malformed input.
-             * Rejects leading zeros (which could indicate octal interpretation in some systems).
+             * @note Delegates to ThreatIntel::Format::SafeParseIPv4.
              *
              * @param str IPv4 address string
              * @param octets Output array for 4 octets (must be size 4)
              * @return true if parse successful and valid IPv4 address
              */
-            [[nodiscard]] bool SafeParseIPv4(std::string_view str, uint8_t octets[4]) noexcept {
-                if (!octets) {
-                    return false;  // Null pointer check
-                }
-
-                if (str.empty() || str.size() > 15) {
-                    return false;
-                }
-
-                // Initialize output
-                octets[0] = octets[1] = octets[2] = octets[3] = 0;
-
-                size_t octetIndex = 0;
-                int currentValue = 0;
-                int digitCount = 0;
-                size_t segmentStart = 0;
-
-                for (size_t i = 0; i <= str.size(); ++i) {
-                    const char c = (i < str.size()) ? str[i] : '.';  // Treat end as final separator
-
-                    if (c == '.') {
-                        // Validate octet
-                        if (digitCount == 0 || currentValue > 255) {
-                            return false;
-                        }
-                        if (octetIndex >= 4) {
-                            return false;
-                        }
-
-                        // Check for leading zeros (security: prevent octal interpretation)
-                        if (digitCount > 1 && str[segmentStart] == '0') {
-                            return false;  // Leading zero detected (e.g., "01" or "007")
-                        }
-
-                        octets[octetIndex++] = static_cast<uint8_t>(currentValue);
-                        currentValue = 0;
-                        digitCount = 0;
-                        segmentStart = i + 1;
-                    }
-                    else if (c >= '0' && c <= '9') {
-                        currentValue = currentValue * 10 + (c - '0');
-                        digitCount++;
-
-                        if (digitCount > 3 || currentValue > 255) {
-                            return false;
-                        }
-                    }
-                    else {
-                        return false;  // Invalid character
-                    }
-                }
-
-                // Must have exactly 4 octets and ended cleanly
-                return octetIndex == 4 && digitCount == 0;
+            [[nodiscard]] inline bool SafeParseIPv4(std::string_view str, uint8_t octets[4]) noexcept {
+                return ThreatIntel::Format::SafeParseIPv4(str, octets);
             }
     }
 

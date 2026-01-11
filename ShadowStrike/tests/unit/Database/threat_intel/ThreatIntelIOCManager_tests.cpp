@@ -27,6 +27,7 @@
 #include "../../../../src/ThreatIntel/ThreatIntelIOCManager.hpp"
 #include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
 #include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
+#include"../../../../src/ThreatIntel/ReputationCache.hpp"
 
 #include <array>
 #include <atomic>
@@ -79,21 +80,22 @@ struct TempDir {
 	IOCEntry entry{};
 	entry.type = type;
 	entry.confidence = ConfidenceLevel::High;
-	entry.reputation = ThreatReputation::Malicious;
-	entry.category = ThreatCategory::C2;
+	entry.reputation = ThreatIntel::ReputationLevel::Malicious;
+	entry.category = ThreatCategory::C2Server;
 	entry.createdTime = static_cast<uint64_t>(std::time(nullptr));
 	entry.firstSeen = entry.createdTime;
 	entry.lastSeen = entry.createdTime;
-	
+
 	switch (type) {
 		case IOCType::IPv4:
 			if (!value.empty()) {
 				auto parsed = Format::ParseIPv4(value);
 				if (parsed.has_value()) {
-					entry.data.ipv4 = *parsed;
+					entry.value.ipv4 = *parsed;
+					
 				}
 			} else {
-				entry.data.ipv4 = IPv4Address(192, 168, 1, 1);
+				entry.value.ipv4 = IPv4Address(192, 168, 1, 1);
 			}
 			break;
 			
@@ -101,7 +103,7 @@ struct TempDir {
 			if (!value.empty()) {
 				auto parsed = Format::ParseIPv6(value);
 				if (parsed.has_value()) {
-					entry.data.ipv6 = *parsed;
+					entry.value.ipv6 = *parsed;
 				}
 			}
 			break;
@@ -110,12 +112,12 @@ struct TempDir {
 			if (!value.empty()) {
 				auto parsed = Format::ParseHashString(value, HashAlgorithm::SHA256);
 				if (parsed.has_value()) {
-					entry.data.hash = *parsed;
+					entry.value.hash = *parsed;
 				}
 			} else {
-				entry.data.hash.algorithm = HashAlgorithm::MD5;
-				entry.data.hash.length = 16;
-				std::fill(entry.data.hash.data.begin(), entry.data.hash.data.begin() + 16, 0xAB);
+				entry.value.hash.algorithm = HashAlgorithm::MD5;
+				entry.value.hash.length = 16;
+				std::fill(entry.value.hash.data.begin(), entry.value.hash.data.begin() + 16, 0xAB);
 			}
 			break;
 			
@@ -133,9 +135,10 @@ struct TempDir {
 	const std::filesystem::path& dbPath
 ) {
 	StoreError error;
-	
+	ThreatIntel::DatabaseConfig config = 
+		ThreatIntel::DatabaseConfig::CreateDefault(dbPath.wstring());
 	// Create database
-	if (!database.Create(dbPath.wstring(), error)) {
+	if (!database.CreateDatabase(config)) {
 		return false;
 	}
 	

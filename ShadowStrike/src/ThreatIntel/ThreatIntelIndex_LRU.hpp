@@ -185,6 +185,17 @@ namespace ThreatIntel {
                 uint64_t total = hits + misses;
                 return total > 0 ? static_cast<double>(hits) / total : 0.0;
             }
+            
+            /**
+             * @brief Estimate memory usage in bytes
+             */
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept {
+                std::shared_lock<std::shared_mutex> lock(m_mutex);
+                // Hash map buckets + entries + nodes
+                const size_t mapOverhead = m_map.bucket_count() * sizeof(void*);
+                const size_t nodeSize = sizeof(CacheNode) + sizeof(void*);  // Node + map entry
+                return mapOverhead + m_map.size() * nodeSize;
+            }
 
         private:
             void MoveToFront(CacheNode* node) noexcept {
@@ -228,9 +239,9 @@ namespace ThreatIntel {
             CacheNode* m_head{ nullptr };
             CacheNode* m_tail{ nullptr };
 
-            std::atomic<uint64_t> m_hitCount{ 0 };
-            std::atomic<uint64_t> m_missCount{ 0 };
-            std::atomic<uint64_t> m_evictionCount{ 0 };
+            mutable std::atomic<uint64_t> m_hitCount{ 0 };
+            mutable std::atomic<uint64_t> m_missCount{ 0 };
+            mutable std::atomic<uint64_t> m_evictionCount{ 0 };
 
             mutable std::shared_mutex m_mutex;
         };

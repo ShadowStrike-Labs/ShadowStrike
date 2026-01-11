@@ -83,19 +83,19 @@ constexpr size_t DEFAULT_ENTRIES_PER_SHARD = 16384;
 /// @brief Total default cache capacity
 constexpr size_t DEFAULT_CACHE_CAPACITY = DEFAULT_SHARD_COUNT * DEFAULT_ENTRIES_PER_SHARD;
 
-/// @brief Default TTL in seconds (1 hour)
-constexpr uint32_t DEFAULT_TTL_SECONDS = 3600;
+/// @brief Default TTL derived from central constants
+constexpr uint32_t DEFAULT_TTL_SECONDS = DefaultConstants::MEMORY_CACHE_TTL;
 
-/// @brief Minimum TTL (1 minute)
-constexpr uint32_t MIN_TTL_SECONDS = 60;
+/// @brief Minimum TTL derived from central constants
+constexpr uint32_t MIN_TTL_SECONDS = DefaultConstants::MIN_TTL_SECONDS;
 
-/// @brief Maximum TTL (7 days)
-constexpr uint32_t MAX_TTL_SECONDS = 604800;
+/// @brief Maximum TTL derived from central constants
+constexpr uint32_t MAX_TTL_SECONDS = DefaultConstants::MAX_TTL_SECONDS;
 
 /// @brief Bloom filter bits per element (for ~1% false positive rate)
 constexpr size_t BLOOM_BITS_PER_ELEMENT = 10;
 
-/// @brief Number of bloom filter hash functions
+/// @brief Number of bloom filter hash functions;
 constexpr size_t BLOOM_HASH_FUNCTIONS = 7;
 
 /// @brief Cache line size for alignment

@@ -384,6 +384,12 @@ struct CSVParserConfig {
     
     /// @brief Auto-detect IOC type from value format
     bool autoDetectIOCType = true;
+
+	// @brief Column index for IOC value (if fixed)
+    int csvValueColumn = -1; 
+
+	// @brief Column index for IOC type (if fixed)
+    int csvTypeColumn = -1;  
 };
 
 // ============================================================================

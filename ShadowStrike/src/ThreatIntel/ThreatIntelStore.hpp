@@ -29,6 +29,7 @@
 
 #include "ThreatIntelFormat.hpp"
 #include"ThreatIntelImporter.hpp"
+#include"ThreatIntelFeedManager.hpp"
 #include "ThreatIntelExporter.hpp"
 #include"ThreatIntelLookup.hpp"
 #include "ReputationCache.hpp"
@@ -76,6 +77,12 @@ struct StoreConfig {
     // Cache configuration for the in-memory reputation cache
     CacheOptions cacheOptions;
     
+    // Simple cache enable flag (uses cacheOptions internally)
+    bool enableCache = true;
+    
+    // Simple cache capacity (overrides cacheOptions.totalCapacity if set)
+    size_t cacheCapacity = 0;  // 0 = use cacheOptions.totalCapacity
+    
     // Maximum database size (0 = auto-grow)
     size_t maxDatabaseSize = 0;
     
@@ -94,8 +101,14 @@ struct StoreConfig {
     // Flush WAL to disk interval
     std::chrono::seconds walFlushInterval = std::chrono::seconds(30);
     
+    // Enable automatic feed updates (alias for enableAutoFeedUpdate)
+    bool enableAutoFeedUpdates = true;
+    
     // Enable automatic feed updates
     bool enableAutoFeedUpdate = true;
+    
+    // Enable statistics collection
+    bool enableStatistics = true;
     
     // Feed update interval
     std::chrono::hours feedUpdateInterval = std::chrono::hours(1);
@@ -718,6 +731,8 @@ struct StoreStatistics {
     
     // Performance statistics (atomic for thread-safe updates)
     std::atomic<uint64_t> totalLookups{0};
+    std::atomic<uint64_t> successfulLookups{0};  // Lookups that found an entry
+    std::atomic<uint64_t> failedLookups{0};      // Lookups that did not find an entry
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
     std::atomic<uint64_t> databaseHits{0};
@@ -799,6 +814,8 @@ private:
         lastLookupAt = other.lastLookupAt;
 
         totalLookups.store(other.totalLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        successfulLookups.store(other.successfulLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        failedLookups.store(other.failedLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
         cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
         cacheMisses.store(other.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
         databaseHits.store(other.databaseHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1079,7 +1096,7 @@ public:
     [[nodiscard]] StoreLookupResult LookupIOC(
         IOCType iocType,
         std::string_view value,
-        const UnifiedLookupOptions& options = UnifiedLookupOptions{}) noexcept;
+        const StoreLookupOptions& options = StoreLookupOptions{}) noexcept;
     
     // =========================================================================
     // Batch Lookups
@@ -1223,6 +1240,12 @@ public:
      * @return true if feed added successfully
      */
     [[nodiscard]] bool AddFeed(const FeedConfig& config) noexcept;
+
+    /**
+     * @brief Converts high-level FeedConfiguration into the internal structure expected by FeedManager.
+     * Type-safe mapping for FeedManager
+     */
+	[[nodiscard]] bool AddFeed(const FeedConfiguration& config) noexcept;
     
     /**
      * @brief Remove a feed

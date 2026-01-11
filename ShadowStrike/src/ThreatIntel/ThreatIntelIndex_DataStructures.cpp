@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>  // For std::function in ForEach
 #include <span>
 
 namespace ShadowStrike {
@@ -34,53 +35,34 @@ namespace ThreatIntel {
 
 namespace {
 
+// ============================================================================
+// DELEGATING WRAPPERS - Use Format namespace canonical implementations
+// ============================================================================
+
 /**
  * @brief Split domain into labels (reversed for suffix matching)
+ * @note Delegates to Format::SplitDomainLabelsReversed for consistency.
  * Example: "www.example.com" -> ["com", "example", "www"]
  */
-[[nodiscard]] std::vector<std::string_view> SplitDomainLabels(std::string_view domain) noexcept {
-    std::vector<std::string_view> labels;
-    labels.reserve(8);  // Most domains have < 8 labels
-    
-    size_t start = 0;
-    while (start < domain.size()) {
-        size_t end = domain.find('.', start);
-        if (end == std::string_view::npos) {
-            end = domain.size();
-        }
-        
-        if (end > start) {
-            labels.push_back(domain.substr(start, end - start));
-        }
-        
-        start = end + 1;
-    }
-    
-    // Reverse for suffix matching (TLD first)
-    std::reverse(labels.begin(), labels.end());
-    
-    return labels;
+[[nodiscard]] inline std::vector<std::string_view> SplitDomainLabels(std::string_view domain) noexcept {
+    return Format::SplitDomainLabelsReversed(domain);
 }
 
 /**
- * @brief Calculate optimal bloom filter size
+ * @brief Calculate optimal bloom filter size (local wrapper)
+ * @note Delegates to Format::CalculateBloomFilterSize for consistency.
  */
-[[nodiscard]] inline size_t CalculateBloomFilterSize(size_t expectedElements, double falsePosRate) noexcept {
-    // m = -n * ln(p) / (ln(2)^2)
-    const double ln2sq = 0.480453013918201;  // ln(2)^2
-    return static_cast<size_t>(
-        std::ceil(-static_cast<double>(expectedElements) * std::log(falsePosRate) / ln2sq)
-    );
+[[nodiscard]] inline size_t CalculateBloomFilterSizeLocal(size_t expectedElements, double falsePosRate) noexcept {
+    return Format::CalculateBloomFilterSize(expectedElements, falsePosRate);
 }
 
 /**
  * @brief Calculate optimal number of hash functions
+ * @note Delegates to Format::CalculateBloomHashFunctions for consistency.
  */
 [[nodiscard]] inline uint32_t CalculateOptimalHashCount(size_t numBits, size_t expectedElements) noexcept {
-    // k = (m/n) * ln(2)
-    if (expectedElements == 0) return 1;
-    const double k = (static_cast<double>(numBits) / expectedElements) * 0.693147181;  // ln(2)
-    return std::max(1u, std::min(16u, static_cast<uint32_t>(std::round(k))));
+    size_t k = Format::CalculateBloomHashFunctions(numBits, expectedElements);
+    return static_cast<uint32_t>(std::min<size_t>(k, 16));
 }
 
 /**
@@ -107,7 +89,7 @@ namespace {
 // ============================================================================
 
 IndexBloomFilter::IndexBloomFilter(uint64_t expectedElements, double falsePosRate) {
-    m_numBits = CalculateBloomFilterSize(expectedElements, falsePosRate);
+    m_numBits = CalculateBloomFilterSizeLocal(expectedElements, falsePosRate);
     m_numHashes = CalculateOptimalHashCount(m_numBits, expectedElements);
     
     // Round up to nearest 64-bit word
@@ -273,6 +255,7 @@ bool IPv4RadixTree::Insert(const IPv4Address& addr, const IndexValue& value) {
     
     node->isTerminal = true;
     node->value = value;
+    ++m_entryCount;  // Track actual entries
     return true;
 }
 
@@ -323,6 +306,7 @@ bool IPv4RadixTree::Remove(const IPv4Address& addr) {
     if (node->isTerminal) {
         node->isTerminal = false;
         node->value = {};
+        if (m_entryCount > 0) --m_entryCount;  // Track actual entries
         return true;
     }
     
@@ -334,7 +318,45 @@ void IPv4RadixTree::Clear() noexcept {
     
     m_root = std::make_unique<RadixNode>();
     m_nodeCount = 1;
+    m_entryCount = 0;  // Reset entry count
     m_height = 0;
+}
+
+size_t IPv4RadixTree::GetMemoryUsage() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    // Each RadixNode has 256 unique_ptr children + IndexValue + bool
+    // Approximate: 256 * 8 + 16 + 1 = ~2065 bytes per node
+    constexpr size_t NODE_SIZE = 256 * sizeof(std::unique_ptr<RadixNode>) + sizeof(IndexValue) + sizeof(bool);
+    return m_nodeCount * NODE_SIZE;
+}
+
+void IPv4RadixTree::ForEach(const std::function<void(const IPv4Address&, const IndexValue&)>& callback) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Helper to reconstruct IPv4 address during traversal
+    std::function<void(const RadixNode*, std::array<uint8_t, 4>&, int)> traverse;
+    traverse = [&callback, &traverse](const RadixNode* node, std::array<uint8_t, 4>& octets, int level) {
+        if (!node) return;
+        
+        if (level == 4 && node->isTerminal) {
+            IPv4Address addr;
+            addr.octets = octets;
+            callback(addr, node->value);
+            return;
+        }
+        
+        if (level < 4) {
+            for (int i = 0; i < 256; ++i) {
+                if (node->children[i]) {
+                    octets[level] = static_cast<uint8_t>(i);
+                    traverse(node->children[i].get(), octets, level + 1);
+                }
+            }
+        }
+    };
+    
+    std::array<uint8_t, 4> octets{};
+    traverse(m_root.get(), octets, 0);
 }
 
 // ============================================================================
@@ -417,6 +439,7 @@ bool IPv6PatriciaTrie::Insert(const IPv6Address& addr, const IndexValue& value) 
             childRef->isTerminal = true;
 
             ++m_nodeCount;
+            ++m_entryCount;  // Track actual entries
             m_height = std::max(m_height, static_cast<uint32_t>(bit + 1));
             return true;
         }
@@ -471,6 +494,7 @@ bool IPv6PatriciaTrie::Remove(const IPv6Address& addr) {
         if (node && node->isTerminal && std::memcmp(&node->key, &addr, sizeof(addr)) == 0) {
             node->isTerminal = false;
             node->value = {};
+            if (m_entryCount > 0) --m_entryCount;  // Track actual entries
             return true;
         }
     }
@@ -483,7 +507,36 @@ void IPv6PatriciaTrie::Clear() noexcept {
     
     m_root = std::make_unique<PatriciaNode>();
     m_nodeCount = 1;
+    m_entryCount = 0;  // Reset entry count
     m_height = 0;
+}
+
+size_t IPv6PatriciaTrie::GetMemoryUsage() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    // Patricia node: bitPosition + 2 unique_ptr + IPv6Address + IndexValue + bool
+    // Approximate: 1 + 16 + 16 + 16 + 1 = ~50 bytes per node
+    constexpr size_t NODE_SIZE = sizeof(uint8_t) + 2 * sizeof(std::unique_ptr<PatriciaNode>) + 
+                                  sizeof(IPv6Address) + sizeof(IndexValue) + sizeof(bool);
+    return m_nodeCount * NODE_SIZE;
+}
+
+void IPv6PatriciaTrie::ForEach(const std::function<void(const IPv6Address&, const IndexValue&)>& callback) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Helper to traverse Patricia trie
+    std::function<void(const PatriciaNode*)> traverse;
+    traverse = [&callback, &traverse](const PatriciaNode* node) {
+        if (!node) return;
+        
+        if (node->isTerminal) {
+            callback(node->key, node->value);
+        }
+        
+        traverse(node->left.get());
+        traverse(node->right.get());
+    };
+    
+    traverse(m_root.get());
 }
 
 // ============================================================================
@@ -552,6 +605,9 @@ bool DomainSuffixTrie::Insert(std::string_view domain, const IndexValue& value) 
         }
     }
     
+    if (!node->isTerminal) {
+        ++m_entryCount;  // New entry, not an update
+    }
     node->isTerminal = true;
     node->value = value;
     return true;
@@ -621,6 +677,7 @@ bool DomainSuffixTrie::Remove(std::string_view domain) {
     if (node->isTerminal) {
         node->isTerminal = false;
         node->value = {};
+        if (m_entryCount > 0) --m_entryCount;
         return true;
     }
     
@@ -632,7 +689,47 @@ void DomainSuffixTrie::Clear() noexcept {
     
     m_root = std::make_unique<TrieNode>();
     m_nodeCount = 1;
+    m_entryCount = 0;
     m_height = 0;
+}
+
+size_t DomainSuffixTrie::GetMemoryUsage() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    // Trie node: unordered_map + IndexValue + bool
+    // Approximate: bucket_count * ptr + entries * (key+value) + IndexValue + bool
+    // Rough estimate: ~200 bytes per node average
+    constexpr size_t NODE_BASE_SIZE = sizeof(std::unordered_map<std::string, std::unique_ptr<TrieNode>>) + 
+                                       sizeof(IndexValue) + sizeof(bool);
+    return m_nodeCount * NODE_BASE_SIZE;
+}
+
+void DomainSuffixTrie::ForEach(const std::function<void(const std::string&, const IndexValue&)>& callback) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Helper to traverse trie and reconstruct domain name
+    std::function<void(const TrieNode*, std::vector<std::string>&)> traverse;
+    traverse = [&callback, &traverse](const TrieNode* node, std::vector<std::string>& labels) {
+        if (!node) return;
+        
+        if (node->isTerminal) {
+            // Reconstruct domain (labels are in reverse order: TLD first)
+            std::string domain;
+            for (auto it = labels.rbegin(); it != labels.rend(); ++it) {
+                if (!domain.empty()) domain += '.';
+                domain += *it;
+            }
+            callback(domain, node->value);
+        }
+        
+        for (const auto& [label, child] : node->children) {
+            labels.push_back(label);
+            traverse(child.get(), labels);
+            labels.pop_back();
+        }
+    };
+    
+    std::vector<std::string> labels;
+    traverse(m_root.get(), labels);
 }
 
 // ============================================================================

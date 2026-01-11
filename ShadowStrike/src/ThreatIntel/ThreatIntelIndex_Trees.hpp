@@ -19,6 +19,7 @@
 #include"ThreatIntelIndex.hpp"
 #include "ThreatIntelIndex_LRU.hpp"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -53,15 +54,25 @@ namespace ShadowStrike {
             [[nodiscard]] bool Remove(const HashValue& hash);
             void Clear() noexcept;
 
-            template<typename Func>
-            void ForEach(Func&& callback) const;
+            /// @brief Iterate over all entries
+            /// @param callback Callback function(const HashValue& hash, const IndexValue& value)
+            void ForEach(const std::function<void(const HashValue&, const IndexValue&)>& callback) const;
 
             [[nodiscard]] size_t GetSize() const noexcept;
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
             [[nodiscard]] HashAlgorithm GetAlgorithm() const noexcept { return m_algorithm; }
+            
+            /// @brief Get entry count (alias for GetSize)
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return GetSize(); }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept;
 
-        private:
+            // Internal node structure - defined in implementation file
+            // Made public for implementation methods to access
             struct BNode;
+        
+        private:
             std::unique_ptr<BNode> m_root;
             LRUCache<uint64_t, IndexValue> m_cache;
             HashAlgorithm m_algorithm;
@@ -94,14 +105,24 @@ namespace ShadowStrike {
             [[nodiscard]] bool Remove(uint64_t key);
             void Clear() noexcept;
 
-            template<typename Func>
-            void ForEach(Func&& callback) const;
+            /// @brief Iterate over all entries
+            /// @param callback Callback function(uint64_t key, const IndexValue& value)
+            void ForEach(const std::function<void(uint64_t, const IndexValue&)>& callback) const;
 
             [[nodiscard]] size_t GetSize() const noexcept;
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
+            
+            /// @brief Get entry count (alias for GetSize)
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return GetSize(); }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept;
+        
+            // Internal node structure - defined in implementation file
+            // Made public for implementation methods to access
+            struct BNode;
              
         private:
-            struct BNode;
             std::unique_ptr<BNode> m_root;
             LRUCache<uint64_t, IndexValue> m_cache;
             uint32_t m_height = 0;

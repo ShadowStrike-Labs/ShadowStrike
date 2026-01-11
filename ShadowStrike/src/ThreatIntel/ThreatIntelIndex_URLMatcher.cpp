@@ -37,7 +37,7 @@ namespace ThreatIntel {
 // CONSTANTS
 // ============================================================================
 
-static constexpr size_t CACHE_LINE_SIZE = 64;
+// Note: CACHE_LINE_SIZE is defined in ThreatIntelFormat.hpp, using it from there
 static constexpr size_t MAX_URL_PATTERN_LENGTH = 4096;
 
 // ============================================================================
@@ -445,6 +445,33 @@ void URLPatternMatcher::Clear() noexcept {
 size_t URLPatternMatcher::GetPatternCount() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     return m_automaton.GetPatternCount();
+}
+
+size_t URLPatternMatcher::GetStateCount() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    // Return number of states in automaton
+    // Each state represents a unique prefix seen during pattern addition
+    return m_patterns.size();  // Approximate - actual states may be more or less
+}
+
+size_t URLPatternMatcher::GetMemoryUsage() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Pattern strings
+    size_t patternBytes = 0;
+    for (const auto& [pattern, value] : m_patterns) {
+        patternBytes += pattern.capacity() + sizeof(IndexValue);
+    }
+    
+    // Vector overhead
+    patternBytes += m_patterns.capacity() * sizeof(std::pair<std::string, IndexValue>);
+    
+    // Automaton states (approximate)
+    // Each state has 256 transitions (int32_t each) + failure link + output
+    constexpr size_t APPROX_STATE_SIZE = 256 * sizeof(int32_t) + sizeof(int32_t) + sizeof(IndexValue) + sizeof(bool) + 7;
+    const size_t automatonBytes = m_automaton.GetPatternCount() * APPROX_STATE_SIZE;
+    
+    return patternBytes + automatonBytes;
 }
 
 } // namespace ThreatIntel

@@ -90,6 +90,7 @@
 #include <span>
 #include <chrono>
 #include <atomic>
+#include<random>
 #include <bitset>
 #include <variant>
 
@@ -108,6 +109,86 @@
 namespace ShadowStrike {
 namespace ThreatIntel {
 
+    namespace DefaultConstants {
+        /// @brief Disk-based IOC entry TTL (Enterprise: 30 Days)
+        constexpr uint32_t DATABASE_IOC_TTL = 30 * 24 * 60 * 60;
+
+        /// @brief In-memory cache TTL (Enterprise: 1 Hour)
+        constexpr uint32_t MEMORY_CACHE_TTL = 3600;
+
+        /// @brief Negative cache TTL (Enterprise: 5 Minutes)
+        constexpr uint32_t NEGATIVE_CACHE_TTL = 300;
+
+        /// @brief Minimum allowed TTL (Enterprise Protection)
+        constexpr uint32_t MIN_TTL_SECONDS = 60;
+
+        /// @brief Maximum allowed TTL (7 Days)
+        constexpr uint32_t MAX_TTL_SECONDS = 604800;
+    }
+
+    // ========================================================================
+   // FORMAT HELPER METHODS
+   // ========================================================================
+    namespace Format {
+        /// @brief Thread-local random engine for UUID generation
+        extern thread_local std::mt19937_64 g_randomEngine;
+
+        /// @brief Convert hex character to nibble value
+        /// @param c Hex character ('0'-'9', 'a'-'f', 'A'-'F')
+        /// @return Nibble value (0-15) or -1 on error
+        constexpr int HexCharToNibble(char c) noexcept;
+
+        /// @brief Convert nibble value to hex character
+        /// @param nibble Value 0-15
+        /// @param uppercase Use uppercase letters
+        /// @return Hex character, or '?' if nibble is out of range
+        constexpr char NibbleToHexChar(int nibble, bool uppercase = false) noexcept;
+
+        /// @brief Check if character is valid hex digit
+        constexpr bool IsHexDigit(char c) noexcept;
+
+        /// @brief Check if character is valid domain character
+        constexpr bool IsDomainChar(char c) noexcept;
+
+        /**
+         * @brief Parse hex string to binary bytes
+         *
+         * Converts hexadecimal string to binary representation. Validates that all
+         * characters are valid hex digits (0-9, a-f, A-F).
+         *
+         * @param hex Hex string to parse (must be exactly outLen * 2 characters)
+         * @param out Output buffer for binary bytes
+         * @param outLen Expected output length in bytes
+         * @return true if parse successful
+         */
+        size_t ParseHexString(std::string_view hexStr, uint8_t* outBytes, size_t maxBytes) noexcept;
+
+        /// @brief Format bytes to hex string
+       /// @param bytes Input bytes (must not be null if length > 0)
+       /// @param length Number of bytes
+      /// @param uppercase Use uppercase letters
+      /// @return Hex string, empty if bytes is null
+        std::string FormatHexString(const uint8_t* bytes, size_t length, bool uppercase = false);
+
+        /// @brief Trim whitespace from string view
+        std::string_view TrimWhitespace(std::string_view str) noexcept;
+
+        /// @brief Convert string to lowercase
+       /// @param str Input string view
+       /// @return Lowercase copy of string, empty on allocation failure
+        std::string ToLowerCase(std::string_view str);
+
+        /// @brief Split string by delimiter
+       /// @param str Input string view
+      /// @param delimiter Character to split on
+      /// @return Vector of string views (may be empty on allocation failure)
+        std::vector<std::string_view> SplitString(std::string_view str, char delimiter);
+
+        /// @brief Convert hex character to its numeric value (0-15)
+        constexpr uint8_t HexCharToValue(char c) noexcept;
+
+    }//namespace Format
+    
 // ============================================================================
 // CORE CONSTANTS & CONFIGURATION
 // ============================================================================
@@ -146,13 +227,54 @@ constexpr uint64_t MAX_IOC_ENTRIES = 1'000'000'000;    // 1 billion IOC entries 
 /// @brief Cache configuration
 constexpr size_t QUERY_CACHE_SIZE = 131072;             // 128K cache entries
 constexpr size_t STRING_POOL_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB string pool chunks
-constexpr uint32_t DEFAULT_TTL_SECONDS = 86400;        // 24 hours default TTL
-constexpr uint32_t MIN_TTL_SECONDS = 60;               // 1 minute minimum TTL
-constexpr uint32_t MAX_TTL_SECONDS = 604800;           // 7 days maximum TTL
+constexpr uint32_t DEFAULT_TTL_SECONDS = DefaultConstants::DATABASE_IOC_TTL;
+constexpr uint32_t MIN_TTL_SECONDS = DefaultConstants::MIN_TTL_SECONDS;
+constexpr uint32_t MAX_TTL_SECONDS = DefaultConstants::DATABASE_IOC_TTL;
 
 /// @brief API rate limiting defaults
 constexpr uint32_t DEFAULT_API_RATE_LIMIT = 1000;      // Requests per minute
-constexpr uint32_t DEFAULT_API_TIMEOUT_MS = 30000;     // 30 seconds API timeout
+constexpr uint32_t DEFAULT_API_TIMEOUT_MS = 30000;     // 30 seconds API timeout;
+
+// ============================================================================
+// BLOOM FILTER & MEMORY ESTIMATION CONSTANTS
+// ============================================================================
+
+/// @brief Default false positive rate for bloom filters (1%)
+constexpr double BLOOM_FILTER_DEFAULT_FPR = 0.01;
+
+/// @brief Minimum allowed false positive rate (to prevent excessive memory)
+constexpr double BLOOM_FILTER_MIN_FPR = 1e-10;
+
+/// @brief Maximum bloom filter size in bits (32 billion = 4GB)
+constexpr size_t BLOOM_FILTER_MAX_BITS = 32ULL * 1024 * 1024 * 1024;
+
+/// @brief Memory estimation: bytes per IPv4 entry (with index overhead)
+constexpr size_t MEMORY_PER_IPV4_ENTRY = 4096;
+
+/// @brief Memory estimation: bytes per IPv6 entry (with index overhead)
+constexpr size_t MEMORY_PER_IPV6_ENTRY = 8192;
+
+/// @brief Memory estimation: bytes per domain entry (with index overhead)
+constexpr size_t MEMORY_PER_DOMAIN_ENTRY = 512;
+
+/// @brief Memory estimation: bytes per URL entry (with index overhead)
+constexpr size_t MEMORY_PER_URL_ENTRY = 1024;
+
+/// @brief Memory estimation: bytes per hash entry (with index overhead)
+constexpr size_t MEMORY_PER_HASH_ENTRY = 256;
+
+/// @brief Memory estimation: bytes per generic IOC entry
+constexpr size_t MEMORY_PER_GENERIC_ENTRY = 384;
+
+// ============================================================================
+// FNV-1A HASH CONSTANTS (64-bit)
+// ============================================================================
+
+/// @brief FNV-1a 64-bit offset basis
+constexpr uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;
+
+/// @brief FNV-1a 64-bit prime multiplier
+constexpr uint64_t FNV1A_PRIME = 1099511628211ULL;
 
 // ============================================================================
 // IOC (INDICATOR OF COMPROMISE) TYPES
@@ -1329,7 +1451,6 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         }
         return *this;
     }
-    
     // ========================================================================
     // METHODS
     // ========================================================================
@@ -2400,6 +2521,12 @@ namespace Format {
     HashAlgorithm algo
 ) noexcept;
 
+/// @brief Validate IPv4 address format
+[[nodiscard]] bool IsValidIPv4(std::string_view addr) noexcept;
+
+/// @brief Validate IPv6 address format
+[[nodiscard]] bool IsValidIPv6(std::string_view addr) noexcept;
+
 /// @brief Format IPv4 address to string
 [[nodiscard]] std::string FormatIPv4(const IPv4Address& addr);
 
@@ -2423,6 +2550,9 @@ namespace Format {
 
 /// @brief Validate email address format
 [[nodiscard]] bool IsValidEmail(std::string_view email) noexcept;
+
+/// @brief Validate file hash format
+[[nodiscard]] bool IsValidFileHash(std::string_view hash) noexcept;
 
 /// @brief Calculate optimal bloom filter size
 [[nodiscard]] size_t CalculateBloomFilterSize(
@@ -2453,6 +2583,191 @@ namespace Format {
 
 /// @brief Parse UUID from string
 [[nodiscard]] std::optional<std::array<uint8_t, 16>> ParseUUID(std::string_view str) noexcept;
+
+// ============================================================================
+// CENTRALIZED PARSING & HASHING UTILITIES
+// ============================================================================
+
+/**
+ * @brief Calculate FNV-1a 64-bit hash for string
+ * 
+ * Fast, high-quality hash function suitable for hash tables and bloom filters.
+ * Uses official 64-bit FNV-1a algorithm with offset basis and prime.
+ * This is the CANONICAL implementation - use this instead of local copies.
+ * 
+ * @param str String to hash
+ * @return 64-bit hash value
+ */
+[[nodiscard]] inline uint64_t HashFNV1a(std::string_view str) noexcept {
+    uint64_t hash = FNV1A_OFFSET_BASIS;
+    for (const char c : str) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= FNV1A_PRIME;
+    }
+    return hash;
+}
+
+/**
+ * @brief Calculate FNV-1a hash with IOC type discriminator
+ * 
+ * Includes IOC type in hash computation for disambiguation between
+ * identical values of different types (e.g., same string as domain vs URL).
+ * 
+ * @param str String value to hash
+ * @param type IOC type for disambiguation
+ * @return 64-bit hash value
+ */
+[[nodiscard]] inline uint64_t HashFNV1aWithType(std::string_view str, IOCType type) noexcept {
+    uint64_t hash = FNV1A_OFFSET_BASIS;
+    
+    // Include IOC type first for disambiguation
+    hash ^= static_cast<uint64_t>(type);
+    hash *= FNV1A_PRIME;
+    
+    for (const char c : str) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= FNV1A_PRIME;
+    }
+    return hash;
+}
+
+/**
+ * @brief Safely parse IPv4 address from dotted-decimal string
+ * 
+ * Parses standard dotted-decimal notation (e.g., "192.168.1.1") with full validation.
+ * Does NOT use sscanf to avoid potential security issues with malformed input.
+ * This is the CANONICAL implementation - use this instead of local copies.
+ * 
+ * @param str IPv4 address string to parse
+ * @param octets Output array for 4 octets (must be valid pointer to size 4)
+ * @return true if parse successful and valid IPv4 address
+ */
+[[nodiscard]] bool SafeParseIPv4(std::string_view str, uint8_t octets[4]) noexcept;
+
+/**
+ * @brief Safely parse IPv6 address from string
+ * 
+ * Supports full IPv6 notation, compressed notation (::), and mixed notation
+ * (IPv4-mapped addresses like ::ffff:192.168.1.1).
+ * 
+ * @param str IPv6 address string to parse
+ * @param segments Output array for 8 16-bit segments (must be valid pointer to size 8)
+ * @return true if parse successful and valid IPv6 address
+ */
+[[nodiscard]] bool SafeParseIPv6(std::string_view str, uint16_t segments[8]) noexcept;
+
+
+/**
+ * @brief Trim whitespace from beginning and end of string
+ * 
+ * Removes ASCII whitespace characters (space, tab, newline, carriage return,
+ * vertical tab, form feed) from both ends of the string.
+ * 
+ * @param str String view to trim
+ * @return Trimmed string view (references original string)
+ */
+[[nodiscard]] std::string_view TrimWhitespace(std::string_view str) noexcept;
+
+
+/**
+ * @brief Estimate memory usage for index based on entry counts
+ * 
+ * Provides memory estimation for planning and pre-allocation purposes.
+ * Uses the MEMORY_PER_*_ENTRY constants for calculations.
+ * 
+ * @param ipv4Count Number of IPv4 entries
+ * @param ipv6Count Number of IPv6 entries  
+ * @param domainCount Number of domain entries
+ * @param urlCount Number of URL entries
+ * @param hashCount Number of hash entries
+ * @param genericCount Number of generic IOC entries
+ * @param falsePositiveRate FPR for bloom filters (default: BLOOM_FILTER_DEFAULT_FPR)
+ * @return Estimated memory usage in bytes
+ */
+[[nodiscard]] size_t EstimateIndexMemory(
+    size_t ipv4Count,
+    size_t ipv6Count,
+    size_t domainCount,
+    size_t urlCount,
+    size_t hashCount,
+    size_t genericCount,
+    double falsePositiveRate = BLOOM_FILTER_DEFAULT_FPR
+) noexcept;
+
+// ============================================================================
+// DOMAIN UTILITIES - Centralized domain parsing/normalization
+// ============================================================================
+
+/**
+ * @brief Split domain into labels
+ * 
+ * Splits a domain name into individual labels (e.g., "www.example.com" -> ["www", "example", "com"]).
+ * This is the CANONICAL implementation - use this instead of local copies.
+ * 
+ * @param domain Domain string to split
+ * @return Vector of domain labels (owning strings)
+ */
+[[nodiscard]] std::vector<std::string> SplitDomainLabels(std::string_view domain);
+
+/**
+ * @brief Split domain into labels (non-owning version)
+ * 
+ * Splits a domain name into individual labels using string_view for zero-copy performance.
+ * Labels reference the original domain string - ensure domain outlives returned views.
+ * 
+ * @param domain Domain string to split  
+ * @return Vector of domain label views (non-owning, references original string)
+ */
+[[nodiscard]] std::vector<std::string_view> SplitDomainLabelsView(std::string_view domain);
+
+/**
+ * @brief Split domain into labels reversed for suffix matching
+ * 
+ * Splits and reverses labels for efficient TLD-first lookup (e.g., "www.example.com" -> ["com", "example", "www"]).
+ * Optimized for domain suffix trie operations.
+ * 
+ * @param domain Domain string to split
+ * @return Vector of domain labels in reverse order (TLD first)
+ */
+[[nodiscard]] std::vector<std::string_view> SplitDomainLabelsReversed(std::string_view domain);
+
+/**
+ * @brief Normalize domain name for consistent lookups
+ * 
+ * Performs domain normalization: lowercase conversion, whitespace trimming,
+ * and optional trailing dot removal. Idempotent operation.
+ * 
+ * @param domain Domain name to normalize
+ * @return Normalized domain string
+ */
+[[nodiscard]] std::string NormalizeDomainName(std::string_view domain);
+
+/**
+ * @brief Convert domain to reverse label format
+ * 
+ * Converts domain to reverse label format for suffix matching
+ * (e.g., "www.example.com" -> "com.example.www").
+ * 
+ * @param domain Domain to convert
+ * @return Reversed domain string
+ */
+[[nodiscard]] std::string ReverseDomainLabels(std::string_view domain);
+
+// ============================================================================
+// INDEX SIZE CALCULATION - Centralized memory estimation per IOC type
+// ============================================================================
+
+/**
+ * @brief Calculate estimated index memory for a specific IOC type
+ * 
+ * Uses standardized MEMORY_PER_*_ENTRY constants for consistent estimation.
+ * This is the CANONICAL implementation - use this instead of hardcoded values.
+ * 
+ * @param type IOC type
+ * @param entryCount Number of entries
+ * @return Estimated memory usage in bytes
+ */
+[[nodiscard]] uint64_t CalculateIndexSizeForType(IOCType type, uint64_t entryCount) noexcept;
 
 } // namespace Format
 
@@ -2497,6 +2812,7 @@ void CloseView(MemoryMappedView& view) noexcept;
 ) noexcept;
 
 } // namespace MemoryMapping
+
 
 // ============================================================================
 // CRC32 LOOKUP TABLE (IEEE 802.3 polynomial)

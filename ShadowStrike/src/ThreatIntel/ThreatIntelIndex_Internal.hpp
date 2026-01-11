@@ -144,32 +144,44 @@ namespace ThreatIntel {
 }
 
 /**
- * @brief Calculate FNV-1a hash for string
+ * @brief Alias for Format::HashFNV1a for backward compatibility
  * 
- * Fast, high-quality hash function suitable for hash tables and bloom filters.
- * Uses 64-bit FNV-1a algorithm with official offset basis and prime.
+ * @deprecated Use Format::HashFNV1a directly in new code.
+ * This inline wrapper delegates to the canonical implementation in Format namespace.
  * 
  * @param str String to hash
  * @return 64-bit hash value
  */
 [[nodiscard]] inline uint64_t HashString(std::string_view str) noexcept {
-    uint64_t hash = 14695981039346656037ULL;  // FNV offset basis
-    for (char c : str) {
-        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
-        hash *= 1099511628211ULL;  // FNV prime
-    }
-    return hash;
+    // Delegate to canonical implementation in Format namespace
+    return Format::HashFNV1a(str);
 }
 
 /**
  * @brief Normalize domain name (lowercase, trim whitespace)
  * 
  * Uses locale-independent character handling for security.
+ * @note Consider using Format::ToLowerASCII and Format::TrimWhitespace for new code.
  * 
  * @param domain Domain name to normalize
  * @return Normalized domain string
  */
 [[nodiscard]] inline std::string NormalizeDomain(std::string_view domain) noexcept {
+    // Use Format utilities for trimming and lowercase
+    std::string_view trimmed = Format::TrimWhitespace(domain);
+    return Format::ToLowerCase(trimmed);
+}
+
+/**
+ * @brief Normalize domain name (locale-independent implementation)
+ * 
+ * Alternative implementation with explicit whitespace handling.
+ * Kept for compatibility with existing callers.
+ * 
+ * @param domain Domain name to normalize
+ * @return Normalized domain string
+ */
+[[nodiscard]] inline std::string NormalizeDomainLegacy(std::string_view domain) noexcept {
     std::string result;
     result.reserve(domain.size());
 

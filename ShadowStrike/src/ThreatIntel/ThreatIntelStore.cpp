@@ -75,8 +75,7 @@ static_assert(sizeof(uint32_t) == 4, "uint32_t must be 4 bytes");
 static_assert(sizeof(uint64_t) == 8, "uint64_t must be 8 bytes");
 static_assert(sizeof(IN6_ADDR) == 16, "IN6_ADDR must be 16 bytes");
 
-// Default TTL for IOC entries (30 days in seconds)
-constexpr uint64_t DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60;
+
 
 // ============================================================================
 // Helper Functions
@@ -554,13 +553,16 @@ public:
      * 
      * Maps fields from internal ThreatLookupResult to public StoreLookupResult.
      * All fields are copied by value - no ownership transfer.
+     * Also updates successfulLookups/failedLookups statistics atomically.
      * 
      * @param tlResult Internal lookup result
      * @return Public StoreLookupResult structure
+     * 
+     * @note Thread-safe: Uses atomic operations for statistics updates
      */
     [[nodiscard]] StoreLookupResult ConvertLookupResult(
         const ThreatLookupResult& tlResult
-    ) const noexcept {
+    ) noexcept {
         StoreLookupResult result;
         result.found = tlResult.found;
         result.fromCache = (tlResult.source == ThreatLookupResult::Source::SharedCache ||
@@ -575,6 +577,15 @@ public:
         result.firstSeen = tlResult.firstSeen;
         result.lastSeen = tlResult.lastSeen;
         result.entry = tlResult.entry;
+        
+        // Update lookup success/failure statistics atomically
+        // These counters track all lookup operations through Store interface
+        if (result.found) {
+            stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+        }
+        
         return result;
     }
 };
@@ -648,18 +659,27 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
         }
 
         // Initialize reputation cache with options
-        m_impl->cache = std::make_unique<ReputationCache>(config.cacheOptions);
-        auto cacheInitErr = m_impl->cache->Initialize();
-        if (cacheInitErr.code != ThreatIntelError::Success) {
-            Utils::Logger::Instance().LogEx(
-                Utils::LogLevel::Error,
-                L"ThreatIntelStore",
-                __FILEW__,
-                __LINE__,
-                __FUNCTIONW__,
-                L"Failed to initialize reputation cache"
-            );
-            return false;
+        // Apply simple config overrides if set
+        CacheOptions effectiveCacheOptions = config.cacheOptions;
+        if (config.cacheCapacity > 0) {
+            effectiveCacheOptions.totalCapacity = config.cacheCapacity;
+        }
+        
+        // Only create cache if enabled
+        if (config.enableCache) {
+            m_impl->cache = std::make_unique<ReputationCache>(effectiveCacheOptions);
+            auto cacheInitErr = m_impl->cache->Initialize();
+            if (cacheInitErr.code != ThreatIntelError::Success) {
+                Utils::Logger::Instance().LogEx(
+                    Utils::LogLevel::Error,
+                    L"ThreatIntelStore",
+                    __FILEW__,
+                    __LINE__,
+                    __FUNCTIONW__,
+                    L"Failed to initialize reputation cache"
+                );
+                return false;
+            }
         }
 
         // Initialize index structures
@@ -890,7 +910,7 @@ StoreLookupResult ThreatIntelStore::LookupHash(
     auto tlResult = m_impl->lookup->LookupHash(hashOpt.value(), unifiedOpts);
     auto result = m_impl->ConvertLookupResult(tlResult);
     
-    // Update statistics
+    // Update statistics (successfulLookups/failedLookups updated in ConvertLookupResult)
     m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
     if (result.found) {
         m_impl->stats.databaseHits.fetch_add(1, std::memory_order_relaxed);
@@ -1328,6 +1348,7 @@ bool ThreatIntelStore::AddIOC(const IOCEntry& entry) noexcept {
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
     IOCAddOptions addOpts;
+    addOpts.defaultTTL = DefaultConstants::DATABASE_IOC_TTL;
     auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
     
     if (opResult.success) {
@@ -1503,20 +1524,22 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
     
     for (const auto& entry : entries) {
         // Validate entry before processing
-        if (entry.value[0] == '\0' || entry.type == IOCType::Unknown) {
+        if (entry.type == IOCType::Unknown || entry.type == IOCType::Reserved) {
             ++result.skippedEntries;
             continue;
         }
         
         // Check if entry already exists using lookup interface
         StoreLookupOptions storeLookupOpts = StoreLookupOptions::FastLookup();
-        storeLookupOpts.cacheResult = false;
+        storeLookupOpts.updateCache = false;
         storeLookupOpts.includeMetadata = false;
         
         // Convert to UnifiedLookupOptions for internal lookup
         const auto lookupOpts = Impl::ConvertToUnifiedOptions(storeLookupOpts);
         
-        auto lookupResult = m_impl->lookup->Lookup(entry.type, entry.value, lookupOpts);
+        auto lookupResult = m_impl->lookup->Lookup(entry.type,
+            ThreatIntelDatabase::FormatIOCValueForIndex(entry)
+            , lookupOpts);
         
         if (lookupResult.found) {
             // Entry exists - try to update if newer
@@ -1566,7 +1589,7 @@ bool ThreatIntelStore::HasIOC(IOCType type, std::string_view value) const noexce
     // Note: m_impl->lookup methods are const-correct and thread-safe
     // Use fast lookup options for existence check
     StoreLookupOptions storeOpts = StoreLookupOptions::FastLookup();
-    storeOpts.cacheResult = false;  // Don't modify cache for existence check
+    storeOpts.updateCache = false;  // Don't modify cache for existence check
     storeOpts.includeMetadata = false;
     
     // Convert to UnifiedLookupOptions for internal lookup
@@ -1588,12 +1611,54 @@ bool ThreatIntelStore::AddFeed(const FeedConfig& config) noexcept {
     // Convert FeedConfig to ThreatFeedConfig
     ThreatFeedConfig feedCfg;
     feedCfg.feedId = config.feedId;
-    feedCfg.name = config.name;
-    // Note: ThreatFeedConfig may not have url and updateIntervalHours fields
+    feedCfg.name = std::string(IOCTypeToString(static_cast<IOCType>(config.sourceType)));
+   
     feedCfg.enabled = config.enabled;
+
+    feedCfg.defaultTtlSeconds = DefaultConstants::DATABASE_IOC_TTL;
     
     return m_impl->feedManager->AddFeed(feedCfg);
 }
+
+/**
+ * @brief Converts high-level FeedConfiguration into the internal structure expected by FeedManager.
+ * Type-safe mapping for FeedManager
+ */
+bool ThreatIntelStore::AddFeed(const FeedConfiguration& config) noexcept
+{
+    if (!IsInitialized() || !m_impl->feedManager) {
+        return false;
+    }
+
+    try {
+        std::unique_lock lock(m_impl->rwLock);
+
+        // 1. Facade DTO -> Manager Config conversion (Enterprise Mapping)
+        ThreatFeedConfig managerCfg;
+        managerCfg.feedId = config.feedId;
+        managerCfg.name = config.name;
+        managerCfg.description = config.description;
+        managerCfg.enabled = config.enabled;
+        managerCfg.endpoint.baseUrl = config.url; // URL mapping
+        managerCfg.syncIntervalSeconds = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(config.updateInterval).count());
+
+        // 2. Authentication mapping
+        managerCfg.auth.method = static_cast<AuthMethod>(config.authType);
+        managerCfg.auth.apiKey = config.apiKey;
+        managerCfg.auth.username = config.username;
+        managerCfg.auth.password = config.password;
+
+        // 3. Pass to FeedManager (It now expects ThreatFeedConfig)
+        return m_impl->feedManager->AddFeed(managerCfg);
+
+    }
+    catch (const std::exception& ex) {
+        // Log error...
+        return false;
+    }
+}
+
 
 bool ThreatIntelStore::RemoveFeed(const std::string& feedId) noexcept {
     if (!IsInitialized() || !m_impl->feedManager) {
@@ -3983,6 +4048,8 @@ void ThreatIntelStore::ResetStatistics() noexcept {
     // Reset all counters atomically with relaxed ordering
     // (strict ordering not required for statistics)
     m_impl->stats.totalLookups.store(0, std::memory_order_relaxed);
+    m_impl->stats.successfulLookups.store(0, std::memory_order_relaxed);
+    m_impl->stats.failedLookups.store(0, std::memory_order_relaxed);
     m_impl->stats.cacheHits.store(0, std::memory_order_relaxed);
     m_impl->stats.cacheMisses.store(0, std::memory_order_relaxed);
     m_impl->stats.databaseHits.store(0, std::memory_order_relaxed);

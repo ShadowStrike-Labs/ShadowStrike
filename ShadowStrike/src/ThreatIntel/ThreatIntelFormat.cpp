@@ -41,223 +41,231 @@
 
 namespace ShadowStrike {
 namespace ThreatIntel {
-
-// ============================================================================
-// ANONYMOUS NAMESPACE FOR INTERNAL HELPERS
-// ============================================================================
-
-namespace {
-
-/// @brief Thread-local random engine for UUID generation
-thread_local std::mt19937_64 g_randomEngine{std::random_device{}()};
-
-/// @brief Convert hex character to nibble value
-/// @param c Hex character ('0'-'9', 'a'-'f', 'A'-'F')
-/// @return Nibble value (0-15) or -1 on error
-[[nodiscard]] constexpr int HexCharToNibble(char c) noexcept {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return -1;
-}
-
-/// @brief Convert nibble value to hex character
-/// @param nibble Value 0-15
-/// @param uppercase Use uppercase letters
-/// @return Hex character, or '?' if nibble is out of range
-[[nodiscard]] constexpr char NibbleToHexChar(int nibble, bool uppercase = false) noexcept {
-    // Validate nibble is in valid range [0, 15]
-    if (nibble < 0 || nibble > 15) {
-        return '?';  // Invalid nibble - return safe sentinel
-    }
-    if (nibble < 10) {
-        return static_cast<char>('0' + nibble);
-    }
-    return static_cast<char>((uppercase ? 'A' : 'a') + (nibble - 10));
-}
-
-/// @brief Check if character is valid hex digit
-[[nodiscard]] constexpr bool IsHexDigit(char c) noexcept {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
-
-/// @brief Check if character is valid domain character
-[[nodiscard]] constexpr bool IsDomainChar(char c) noexcept {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '-' || c == '.';
-}
-
-/// @brief Parse hex string to bytes
-/// @param hexStr Hex string (must be even length)
-/// @param outBytes Output buffer (must not be null)
-/// @param maxBytes Maximum bytes to parse
-/// @return Number of bytes parsed, or 0 on error
-[[nodiscard]] size_t ParseHexString(
-    std::string_view hexStr,
-    uint8_t* outBytes,
-    size_t maxBytes
-) noexcept {
-    // Validate output buffer
-    if (outBytes == nullptr || maxBytes == 0) {
-        return 0;
-    }
-    
-    // Validate input string
-    if (hexStr.empty() || (hexStr.length() % 2) != 0) {
-        return 0;
-    }
-    
-    // Check for potential overflow in division (hexStr.length() is always even here)
-    size_t byteCount = hexStr.length() / 2;
-    if (byteCount > maxBytes) {
-        byteCount = maxBytes;
-    }
-    
-    // Parse each byte
-    for (size_t i = 0; i < byteCount; ++i) {
-        // Bounds check indices (should always be valid given length check above)
-        const size_t highIdx = i * 2;
-        const size_t lowIdx = highIdx + 1;
-        
-        if (highIdx >= hexStr.length() || lowIdx >= hexStr.length()) {
-            return 0;  // Safety check
-        }
-        
-        int high = HexCharToNibble(hexStr[highIdx]);
-        int low = HexCharToNibble(hexStr[lowIdx]);
-        
-        if (high < 0 || low < 0) {
-            return 0;
-        }
-        
-        outBytes[i] = static_cast<uint8_t>((high << 4) | low);
-    }
-    
-    return byteCount;
-}
-
-/// @brief Format bytes to hex string
-/// @param bytes Input bytes (must not be null if length > 0)
-/// @param length Number of bytes
-/// @param uppercase Use uppercase letters
-/// @return Hex string, empty if bytes is null
-[[nodiscard]] std::string FormatHexString(
-    const uint8_t* bytes,
-    size_t length,
-    bool uppercase = false
-) {
-    // Handle null pointer safely
-    if (bytes == nullptr || length == 0) {
-        return {};
-    }
-    
-    // Guard against excessive allocation (max 1MB of hex output)
-    constexpr size_t MAX_HEX_LENGTH = 512 * 1024;  // 512KB of bytes = 1MB hex
-    if (length > MAX_HEX_LENGTH) {
-        length = MAX_HEX_LENGTH;
-    }
-    
-    std::string result;
-    try {
-        result.reserve(length * 2);
-    } catch (const std::bad_alloc&) {
-        return {};  // Allocation failed
-    }
-    
-    for (size_t i = 0; i < length; ++i) {
-        result += NibbleToHexChar((bytes[i] >> 4) & 0x0F, uppercase);
-        result += NibbleToHexChar(bytes[i] & 0x0F, uppercase);
-    }
-    
-    return result;
-}
-
-/// @brief Trim whitespace from string view
-[[nodiscard]] std::string_view TrimWhitespace(std::string_view str) noexcept {
-    while (!str.empty() && std::isspace(static_cast<unsigned char>(str.front()))) {
-        str.remove_prefix(1);
-    }
-    while (!str.empty() && std::isspace(static_cast<unsigned char>(str.back()))) {
-        str.remove_suffix(1);
-    }
-    return str;
-}
-
-/// @brief Convert string to lowercase
-/// @param str Input string view
-/// @return Lowercase copy of string, empty on allocation failure
-[[nodiscard]] std::string ToLowerCase(std::string_view str) {
-    if (str.empty()) {
-        return {};
-    }
-    
-    std::string result;
-    try {
-        result.reserve(str.length());
-    } catch (const std::bad_alloc&) {
-        return {};  // Allocation failed
-    }
-    
-    for (char c : str) {
-        result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return result;
-}
-
-/// @brief Split string by delimiter
-/// @param str Input string view
-/// @param delimiter Character to split on
-/// @return Vector of string views (may be empty on allocation failure)
-[[nodiscard]] std::vector<std::string_view> SplitString(
-    std::string_view str,
-    char delimiter
-) {
-    std::vector<std::string_view> result;
-    
-    if (str.empty()) {
-        return result;
-    }
-    
-    // Pre-reserve reasonable capacity to avoid frequent reallocations
-    try {
-        result.reserve(16);  // Common case: few segments
-    } catch (const std::bad_alloc&) {
-        return {};
-    }
-    
-    size_t start = 0;
-    
-    for (size_t i = 0; i < str.length(); ++i) {
-        if (str[i] == delimiter) {
-            if (i > start) {
-                try {
-                    result.push_back(str.substr(start, i - start));
-                } catch (const std::bad_alloc&) {
-                    return result;  // Return what we have so far
-                }
-            }
-            start = i + 1;
-        }
-    }
-    
-    if (start < str.length()) {
-        try {
-            result.push_back(str.substr(start));
-        } catch (const std::bad_alloc&) {
-            // Ignore - return what we have
-        }
-    }
-    
-    return result;
-}
-
-} // anonymous namespace
+       
 
 // ============================================================================
 // FORMAT NAMESPACE IMPLEMENTATION
 // ============================================================================
 
 namespace Format {
+    // ========================================================================
+     // FORMAT HELPER METHODS
+     // ========================================================================
+
+/// @brief Thread-local random engine for UUID generation
+    thread_local std::mt19937_64 g_randomEngine{ std::random_device{}() };
+
+    /// @brief Convert hex character to nibble value
+    /// @param c Hex character ('0'-'9', 'a'-'f', 'A'-'F')
+    /// @return Nibble value (0-15) or -1 on error
+    constexpr int HexCharToNibble(char c) noexcept {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    }
+
+    /// @brief Convert nibble value to hex character
+    /// @param nibble Value 0-15
+    /// @param uppercase Use uppercase letters
+    /// @return Hex character, or '?' if nibble is out of range
+    constexpr char NibbleToHexChar(int nibble, bool uppercase) noexcept {
+        // Validate nibble is in valid range [0, 15]
+        if (nibble < 0 || nibble > 15) {
+            return '?';  // Invalid nibble - return safe sentinel
+        }
+        if (nibble < 10) {
+            return static_cast<char>('0' + nibble);
+        }
+        return static_cast<char>((uppercase ? 'A' : 'a') + (nibble - 10));
+    }
+
+    /// @brief Check if character is valid hex digit
+    constexpr bool IsHexDigit(char c) noexcept {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
+    /// @brief Convert hex character to its numeric value (0-15)
+    constexpr uint8_t HexCharToValue(char c) noexcept {
+        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+        return 0xFF; // Invalid
+    }
+
+    /// @brief Check if character is valid domain character
+    constexpr bool IsDomainChar(char c) noexcept {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '.';
+    }
+
+    /// @brief Parse hex string to bytes
+    /// @param hexStr Hex string (must be even length)
+    /// @param outBytes Output buffer (must not be null)
+    /// @param maxBytes Maximum bytes to parse
+    /// @return Number of bytes parsed, or 0 on error
+    size_t ParseHexString(
+        std::string_view hexStr,
+        uint8_t* outBytes,
+        size_t maxBytes
+    ) noexcept {
+        // Validate output buffer
+        if (outBytes == nullptr || maxBytes == 0) {
+            return 0;
+        }
+
+        // Validate input string
+        if (hexStr.empty() || (hexStr.length() % 2) != 0) {
+            return 0;
+        }
+
+        // Check for potential overflow in division (hexStr.length() is always even here)
+        size_t byteCount = hexStr.length() / 2;
+        if (byteCount > maxBytes) {
+            byteCount = maxBytes;
+        }
+
+        // Parse each byte
+        for (size_t i = 0; i < byteCount; ++i) {
+            // Bounds check indices (should always be valid given length check above)
+            const size_t highIdx = i * 2;
+            const size_t lowIdx = highIdx + 1;
+
+            if (highIdx >= hexStr.length() || lowIdx >= hexStr.length()) {
+                return 0;  // Safety check
+            }
+
+            int high = HexCharToNibble(hexStr[highIdx]);
+            int low = HexCharToNibble(hexStr[lowIdx]);
+
+            if (high < 0 || low < 0) {
+                return 0;
+            }
+
+            outBytes[i] = static_cast<uint8_t>((high << 4) | low);
+        }
+
+        return byteCount;
+    }
+
+    /// @brief Format bytes to hex string
+    /// @param bytes Input bytes (must not be null if length > 0)
+    /// @param length Number of bytes
+    /// @param uppercase Use uppercase letters
+    /// @return Hex string, empty if bytes is null
+    std::string FormatHexString(
+        const uint8_t* bytes,
+        size_t length,
+        bool uppercase
+    ) {
+        // Handle null pointer safely
+        if (bytes == nullptr || length == 0) {
+            return {};
+        }
+
+        // Guard against excessive allocation (max 1MB of hex output)
+        constexpr size_t MAX_HEX_LENGTH = 512 * 1024;  // 512KB of bytes = 1MB hex
+        if (length > MAX_HEX_LENGTH) {
+            length = MAX_HEX_LENGTH;
+        }
+
+        std::string result;
+        try {
+            result.reserve(length * 2);
+        }
+        catch (const std::bad_alloc&) {
+            return {};  // Allocation failed
+        }
+
+        for (size_t i = 0; i < length; ++i) {
+            result += NibbleToHexChar((bytes[i] >> 4) & 0x0F, uppercase);
+            result += NibbleToHexChar(bytes[i] & 0x0F, uppercase);
+        }
+
+        return result;
+    }
+
+    /// @brief Trim whitespace from string view
+    std::string_view TrimWhitespace(std::string_view str) noexcept {
+        while (!str.empty() && std::isspace(static_cast<unsigned char>(str.front()))) {
+            str.remove_prefix(1);
+        }
+        while (!str.empty() && std::isspace(static_cast<unsigned char>(str.back()))) {
+            str.remove_suffix(1);
+        }
+        return str;
+    }
+
+    /// @brief Convert string to lowercase
+    /// @param str Input string view
+    /// @return Lowercase copy of string, empty on allocation failure
+    std::string ToLowerCase(std::string_view str) {
+        if (str.empty()) {
+            return {};
+        }
+
+        std::string result;
+        try {
+            result.reserve(str.length());
+        }
+        catch (const std::bad_alloc&) {
+            return {};  // Allocation failed
+        }
+
+        for (char c : str) {
+            result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return result;
+    }
+    /// @brief Split string by delimiter
+   /// @param str Input string view
+   /// @param delimiter Character to split on
+   /// @return Vector of string views (may be empty on allocation failure)
+    std::vector<std::string_view> SplitString(
+        std::string_view str,
+        char delimiter
+    ) {
+        std::vector<std::string_view> result;
+
+        if (str.empty()) {
+            return result;
+        }
+
+        // Pre-reserve reasonable capacity to avoid frequent reallocations
+        try {
+            result.reserve(16);  // Common case: few segments
+        }
+        catch (const std::bad_alloc&) {
+            return {};
+        }
+
+        size_t start = 0;
+
+        for (size_t i = 0; i < str.length(); ++i) {
+            if (str[i] == delimiter) {
+                if (i > start) {
+                    try {
+                        result.push_back(str.substr(start, i - start));
+                    }
+                    catch (const std::bad_alloc&) {
+                        return result;  // Return what we have so far
+                    }
+                }
+                start = i + 1;
+            }
+        }
+
+        if (start < str.length()) {
+            try {
+                result.push_back(str.substr(start));
+            }
+            catch (const std::bad_alloc&) {
+                // Ignore - return what we have
+            }
+        }
+
+        return result;
+    }
 
 // ----------------------------------------------------------------------------
 // HEADER VALIDATION
@@ -1019,10 +1027,6 @@ bool IsValidDomain(std::string_view domain) noexcept {
         return false;
     }
     
-    // TLD should contain at least one letter (not all-numeric)
-    // This helps reject IP addresses parsed as domains
-    // Note: We already checked hasAlpha above
-    
     return true;
 }
 
@@ -1250,6 +1254,188 @@ bool IsValidURL(std::string_view url) noexcept {
     
     // Validate as domain
     return IsValidDomain(host);
+}
+
+
+// ============================================================================
+// IOC VALIDATION - Enterprise-grade validators (regex-free, nanosecond performance)
+// ============================================================================
+
+/**
+ * @brief Validate IPv4 address string with optional CIDR notation
+ *
+ * Enterprise-grade IPv4 validation using manual parsing instead of regex.
+ * Validates standard dotted-decimal notation (e.g., "192.168.1.1") with optional
+ * CIDR suffix (e.g., "/24"). This is ~1000x faster than regex-based validation.
+ *
+ * @param addr IPv4 address string to validate
+ * @return true if valid IPv4 address (optionally with valid CIDR prefix)
+ */
+ bool IsValidIPv4(std::string_view addr) noexcept {
+    if (addr.empty() || addr.size() > 18) return false;  // Max: "255.255.255.255/32"
+
+    size_t pos = 0;
+    int octets = 0;
+
+    while (pos < addr.size() && octets < 4) {
+        // Parse numeric octet value
+        uint32_t num = 0;
+        size_t digits = 0;
+
+        while (pos < addr.size() && addr[pos] >= '0' && addr[pos] <= '9') {
+            num = num * 10 + static_cast<uint32_t>(addr[pos] - '0');
+            if (num > 255) return false;
+            ++pos;
+            ++digits;
+        }
+
+        // Validate octet: 1-3 digits, no leading zeros (except for "0" itself)
+        if (digits == 0 || digits > 3) return false;
+        if (digits > 1 && addr[pos - digits] == '0') return false;  // Leading zero
+
+        ++octets;
+
+        // Expect dot separator between octets
+        if (octets < 4) {
+            if (pos >= addr.size() || addr[pos] != '.') return false;
+            ++pos;  // Skip dot
+        }
+    }
+
+    if (octets != 4) return false;
+
+    // Check for optional CIDR notation
+    if (pos < addr.size()) {
+        if (addr[pos] != '/') return false;
+        ++pos;
+
+        uint32_t cidr = 0;
+        size_t cidrDigits = 0;
+
+        while (pos < addr.size() && addr[pos] >= '0' && addr[pos] <= '9') {
+            cidr = cidr * 10 + static_cast<uint32_t>(addr[pos] - '0');
+            ++pos;
+            ++cidrDigits;
+        }
+
+        if (cidrDigits == 0 || cidrDigits > 2 || cidr > 32) return false;
+    }
+
+    return pos == addr.size();
+}
+
+/**
+ * @brief Validate IPv6 address string with optional CIDR notation
+ *
+ * Enterprise-grade IPv6 validation. Supports:
+ * - Full notation: "2001:0db8:0000:0000:0000:0000:0000:0001"
+ * - Compressed notation: "2001:db8::1"
+ * - Mixed (IPv4-mapped): "::ffff:192.168.1.1"
+ * - Optional CIDR suffix: "2001:db8::/32"
+ *
+ * @param addr IPv6 address string to validate
+ * @return true if valid IPv6 address
+ */
+ bool IsValidIPv6(std::string_view addr) noexcept {
+    if (addr.empty() || addr.size() > 49) return false;  // Max: full notation + /128
+
+    // Find optional CIDR suffix
+    std::string_view ipPart = addr;
+    size_t slashPos = addr.rfind('/');
+    if (slashPos != std::string_view::npos) {
+        // Validate CIDR prefix (0-128)
+        std::string_view cidrPart = addr.substr(slashPos + 1);
+        if (cidrPart.empty() || cidrPart.size() > 3) return false;
+
+        uint32_t cidr = 0;
+        for (char c : cidrPart) {
+            if (c < '0' || c > '9') return false;
+            cidr = cidr * 10 + static_cast<uint32_t>(c - '0');
+        }
+        if (cidr > 128) return false;
+
+        ipPart = addr.substr(0, slashPos);
+    }
+
+    // Count colons and detect "::" compression
+    int colonCount = 0;
+    int doubleColonCount = 0;
+    size_t prevColon = std::string_view::npos;
+
+    for (size_t i = 0; i < ipPart.size(); ++i) {
+        if (ipPart[i] == ':') {
+            ++colonCount;
+            if (prevColon != std::string_view::npos && i == prevColon + 1) {
+                ++doubleColonCount;
+            }
+            prevColon = i;
+        }
+    }
+
+    // Max one "::" allowed
+    if (doubleColonCount > 1) return false;
+
+    // Must have at least 2 colons and at most 7 (or less with ::)
+    if (colonCount < 2 || (doubleColonCount == 0 && colonCount != 7)) return false;
+
+    // Validate each hex segment
+    size_t pos = 0;
+    int segments = 0;
+
+    while (pos < ipPart.size()) {
+        if (ipPart[pos] == ':') {
+            ++pos;
+            continue;
+        }
+
+        // Parse hex segment
+        size_t hexDigits = 0;
+        while (pos < ipPart.size() && ipPart[pos] != ':') {
+            char c = ipPart[pos];
+            bool isHex = (c >= '0' && c <= '9') ||
+                (c >= 'a' && c <= 'f') ||
+                (c >= 'A' && c <= 'F') ||
+                (c == '.');  // For IPv4-mapped suffix
+            if (!isHex) return false;
+            ++hexDigits;
+            ++pos;
+        }
+
+        // Segment must have 1-4 hex digits (or be IPv4 part)
+        if (hexDigits > 0) ++segments;
+    }
+
+    return segments >= 2 && segments <= 8;
+}
+
+/**
+ * @brief Validate file hash string (MD5, SHA1, SHA256, SHA512)
+ *
+ * Validates hex-encoded hash strings of correct length:
+ * - MD5: 32 characters
+ * - SHA1: 40 characters
+ * - SHA256: 64 characters
+ * - SHA512: 128 characters
+ *
+ * @param hash Hash string to validate
+ * @return true if valid hash (any supported algorithm)
+ */
+ bool IsValidFileHash(std::string_view hash) noexcept {
+    // Valid lengths for supported hash algorithms
+    if (hash.size() != 32 && hash.size() != 40 &&
+        hash.size() != 64 && hash.size() != 128) {
+        return false;
+    }
+
+    // All characters must be valid hex
+    for (char c : hash) {
+        bool valid = (c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F');
+        if (!valid) return false;
+    }
+
+    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -1708,6 +1894,395 @@ std::optional<std::array<uint8_t, 16>> ParseUUID(std::string_view str) noexcept 
     }
     
     return uuid;
+}
+
+// ----------------------------------------------------------------------------
+// CENTRALIZED PARSING UTILITIES - SafeParseIPv4
+// ----------------------------------------------------------------------------
+
+bool SafeParseIPv4(std::string_view str, uint8_t octets[4]) noexcept {
+    // Validate output pointer
+    if (octets == nullptr) {
+        return false;
+    }
+    
+    // Validate input bounds
+    if (str.empty() || str.size() > 15) {
+        return false;
+    }
+    
+    // Zero-initialize output for safety
+    octets[0] = octets[1] = octets[2] = octets[3] = 0;
+    
+    size_t octetIdx = 0;
+    int value = 0;
+    int digitCount = 0;
+    size_t segmentStart = 0;
+    
+    for (size_t i = 0; i <= str.size(); ++i) {
+        const char c = (i < str.size()) ? str[i] : '.';
+        
+        if (c == '.') {
+            // Validate octet
+            if (digitCount == 0 || value > 255 || octetIdx >= 4) {
+                return false;
+            }
+            
+            // Security: Reject leading zeros to prevent octal interpretation
+            // (e.g., "01.02.03.04" or "007.008.009.010")
+            if (digitCount > 1 && str[segmentStart] == '0') {
+                return false;
+            }
+            
+            octets[octetIdx++] = static_cast<uint8_t>(value);
+            value = 0;
+            digitCount = 0;
+            segmentStart = i + 1;
+        } else if (c >= '0' && c <= '9') {
+            // Overflow check before multiplication
+            if (value > 25 || (value == 25 && (c - '0') > 5)) {
+                return false;  // Would exceed 255
+            }
+            value = value * 10 + (c - '0');
+            digitCount++;
+            if (digitCount > 3) {
+                return false;
+            }
+        } else {
+            return false;  // Invalid character
+        }
+    }
+    
+    // Must have exactly 4 octets and no trailing digits
+    return octetIdx == 4 && digitCount == 0;
+}
+
+// ----------------------------------------------------------------------------
+// CENTRALIZED PARSING UTILITIES - SafeParseIPv6
+// ----------------------------------------------------------------------------
+
+bool SafeParseIPv6(std::string_view str, uint16_t segments[8]) noexcept {
+    if (segments == nullptr || str.empty()) {
+        return false;
+    }
+    
+    // Maximum IPv6 string length: "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255" (45 chars)
+    if (str.size() > 45) {
+        return false;
+    }
+    
+    // Zero-initialize output
+    for (int i = 0; i < 8; ++i) {
+        segments[i] = 0;
+    }
+    
+    // Handle :: compression
+    size_t doubleColonPos = str.find("::");
+    bool hasDoubleColon = (doubleColonPos != std::string_view::npos);
+    
+    // Cannot have more than one ::
+    if (hasDoubleColon && str.find("::", doubleColonPos + 2) != std::string_view::npos) {
+        return false;
+    }
+    
+    // Split into before and after ::
+    std::string_view beforeDC = hasDoubleColon ? str.substr(0, doubleColonPos) : str;
+    std::string_view afterDC = hasDoubleColon ? str.substr(doubleColonPos + 2) : std::string_view{};
+    
+    // Parse segments before ::
+    size_t segIdx = 0;
+    if (!beforeDC.empty()) {
+        size_t pos = 0;
+        while (pos < beforeDC.size() && segIdx < 8) {
+            size_t colonPos = beforeDC.find(':', pos);
+            if (colonPos == std::string_view::npos) {
+                colonPos = beforeDC.size();
+            }
+            
+            std::string_view hexStr = beforeDC.substr(pos, colonPos - pos);
+            if (hexStr.empty() || hexStr.size() > 4) {
+                return false;
+            }
+            
+            uint32_t value = 0;
+            for (char c : hexStr) {
+                int nibble = Format::HexCharToValue(c);
+                if (nibble < 0) {
+                    return false;
+                }
+                value = (value << 4) | static_cast<uint32_t>(nibble);
+            }
+            
+            if (value > 0xFFFF) {
+                return false;
+            }
+            
+            segments[segIdx++] = static_cast<uint16_t>(value);
+            pos = colonPos + 1;
+        }
+    }
+    
+    // Parse segments after ::
+    size_t afterSegments[8] = {0};
+    size_t afterCount = 0;
+    
+    if (!afterDC.empty()) {
+        // Check for IPv4-mapped address at end
+        bool hasIPv4 = (afterDC.find('.') != std::string_view::npos);
+        
+        size_t pos = 0;
+        while (pos < afterDC.size() && afterCount < 8) {
+            size_t colonPos = afterDC.find(':', pos);
+            if (colonPos == std::string_view::npos) {
+                colonPos = afterDC.size();
+            }
+            
+            std::string_view part = afterDC.substr(pos, colonPos - pos);
+            
+            // Check if this is IPv4 part
+            if (part.find('.') != std::string_view::npos) {
+                // Parse IPv4 into last 2 segments
+                uint8_t ipv4[4];
+                if (!SafeParseIPv4(part, ipv4)) {
+                    return false;
+                }
+                afterSegments[afterCount++] = (static_cast<uint16_t>(ipv4[0]) << 8) | ipv4[1];
+                afterSegments[afterCount++] = (static_cast<uint16_t>(ipv4[2]) << 8) | ipv4[3];
+                break;
+            }
+            
+            if (part.empty() || part.size() > 4) {
+                return false;
+            }
+            
+            uint32_t value = 0;
+            for (char c : part) {
+                int nibble = HexCharToValue(c);
+                if (nibble < 0) {
+                    return false;
+                }
+                value = (value << 4) | static_cast<uint32_t>(nibble);
+            }
+            
+            if (value > 0xFFFF) {
+                return false;
+            }
+            
+            afterSegments[afterCount++] = value;
+            pos = colonPos + 1;
+        }
+    }
+    
+    // Calculate total segments
+    size_t totalSegments = segIdx + afterCount;
+    
+    if (hasDoubleColon) {
+        // With ::, total must be <= 8
+        if (totalSegments > 8) {
+            return false;
+        }
+        
+        // Fill compressed zeros
+        size_t zerosNeeded = 8 - totalSegments;
+        size_t insertPos = segIdx;
+        
+        // Move after-segments to their correct positions
+        for (size_t i = 0; i < afterCount; ++i) {
+            segments[insertPos + zerosNeeded + i] = static_cast<uint16_t>(afterSegments[i]);
+        }
+        // Zeros in between are already 0 from initialization
+    } else {
+        // Without ::, must have exactly 8 segments
+        if (totalSegments != 8) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// MEMORY ESTIMATION
+// ----------------------------------------------------------------------------
+
+size_t EstimateIndexMemory(
+    size_t ipv4Count,
+    size_t ipv6Count,
+    size_t domainCount,
+    size_t urlCount,
+    size_t hashCount,
+    size_t genericCount,
+    double falsePositiveRate
+) noexcept {
+    // Validate FPR
+    if (falsePositiveRate <= 0.0 || falsePositiveRate >= 1.0) {
+        falsePositiveRate = BLOOM_FILTER_DEFAULT_FPR;
+    }
+    if (falsePositiveRate < BLOOM_FILTER_MIN_FPR) {
+        falsePositiveRate = BLOOM_FILTER_MIN_FPR;
+    }
+    
+    // Calculate base memory for entries
+    size_t totalMemory = 0;
+    totalMemory += ipv4Count * MEMORY_PER_IPV4_ENTRY;
+    totalMemory += ipv6Count * MEMORY_PER_IPV6_ENTRY;
+    totalMemory += domainCount * MEMORY_PER_DOMAIN_ENTRY;
+    totalMemory += urlCount * MEMORY_PER_URL_ENTRY;
+    totalMemory += hashCount * MEMORY_PER_HASH_ENTRY;
+    totalMemory += genericCount * MEMORY_PER_GENERIC_ENTRY;
+    
+    // Add bloom filter memory (bits to bytes)
+    size_t totalEntries = ipv4Count + ipv6Count + domainCount + urlCount + hashCount + genericCount;
+    if (totalEntries > 0) {
+        size_t bloomBits = CalculateBloomFilterSize(totalEntries, falsePositiveRate);
+        totalMemory += (bloomBits + 7) / 8;  // Convert bits to bytes, round up
+    }
+    
+    return totalMemory;
+}
+
+// ----------------------------------------------------------------------------
+// DOMAIN UTILITIES - Centralized implementations
+// ----------------------------------------------------------------------------
+
+std::vector<std::string> SplitDomainLabels(std::string_view domain) {
+    std::vector<std::string> labels;
+    
+    if (domain.empty()) {
+        return labels;
+    }
+    
+    // Reserve approximate space (most domains have < 5 labels)
+    labels.reserve(5);
+    
+    size_t start = 0;
+    while (start < domain.size()) {
+        size_t end = domain.find('.', start);
+        if (end == std::string_view::npos) {
+            end = domain.size();
+        }
+        
+        if (end > start) {
+            labels.emplace_back(domain.substr(start, end - start));
+        }
+        
+        start = end + 1;
+    }
+    
+    return labels;
+}
+
+std::vector<std::string_view> SplitDomainLabelsView(std::string_view domain) {
+    std::vector<std::string_view> labels;
+    
+    if (domain.empty()) {
+        return labels;
+    }
+    
+    labels.reserve(5);
+    
+    size_t start = 0;
+    while (start < domain.size()) {
+        size_t end = domain.find('.', start);
+        if (end == std::string_view::npos) {
+            end = domain.size();
+        }
+        
+        if (end > start) {
+            labels.push_back(domain.substr(start, end - start));
+        }
+        
+        start = end + 1;
+    }
+    
+    return labels;
+}
+
+std::vector<std::string_view> SplitDomainLabelsReversed(std::string_view domain) {
+    auto labels = SplitDomainLabelsView(domain);
+    std::reverse(labels.begin(), labels.end());
+    return labels;
+}
+
+std::string NormalizeDomainName(std::string_view domain) {
+    // Trim whitespace first
+    domain = TrimWhitespace(domain);
+    
+    if (domain.empty()) {
+        return "";
+    }
+    
+    // Remove trailing dot if present (FQDN format)
+    if (domain.back() == '.') {
+        domain.remove_suffix(1);
+    }
+    
+    // Convert to lowercase
+    return ToLowerCase(domain);
+}
+
+std::string ReverseDomainLabels(std::string_view domain) {
+    auto labels = SplitDomainLabels(domain);
+    std::reverse(labels.begin(), labels.end());
+    
+    std::string result;
+    for (size_t i = 0; i < labels.size(); ++i) {
+        if (i > 0) {
+            result += '.';
+        }
+        result += labels[i];
+    }
+    
+    return result;
+}
+
+// ----------------------------------------------------------------------------
+// INDEX SIZE CALCULATION - Per IOC type memory estimation
+// ----------------------------------------------------------------------------
+
+uint64_t CalculateIndexSizeForType(IOCType type, uint64_t entryCount) noexcept {
+    switch (type) {
+        case IOCType::IPv4:
+        case IOCType::CIDRv4:
+            // Radix tree: uses MEMORY_PER_IPV4_ENTRY constant
+            return entryCount * MEMORY_PER_IPV4_ENTRY;
+            
+        case IOCType::IPv6:
+        case IOCType::CIDRv6:
+            // Patricia trie: uses MEMORY_PER_IPV6_ENTRY constant
+            return entryCount * MEMORY_PER_IPV6_ENTRY;
+            
+        case IOCType::Domain:
+            // Suffix trie + hash table: uses MEMORY_PER_DOMAIN_ENTRY constant
+            return entryCount * MEMORY_PER_DOMAIN_ENTRY;
+            
+        case IOCType::URL:
+            // Aho-Corasick automaton: uses MEMORY_PER_URL_ENTRY constant
+            return entryCount * MEMORY_PER_URL_ENTRY;
+            
+        case IOCType::FileHash:
+            // B+Tree: uses MEMORY_PER_HASH_ENTRY constant
+            return entryCount * MEMORY_PER_HASH_ENTRY;
+            
+        case IOCType::Email:
+        case IOCType::JA3:
+        case IOCType::JA3S:
+        case IOCType::CertFingerprint:
+        case IOCType::RegistryKey:
+        case IOCType::ProcessName:
+        case IOCType::MutexName:
+        case IOCType::NamedPipe:
+        case IOCType::UserAgent:
+        case IOCType::ASN:
+        case IOCType::YaraRule:
+        case IOCType::SigmaRule:
+        case IOCType::MitreAttack:
+        case IOCType::CVE:
+        case IOCType::STIXPattern:
+        default:
+            // Generic entries: uses MEMORY_PER_GENERIC_ENTRY constant
+            return entryCount * MEMORY_PER_GENERIC_ENTRY;
+    }
 }
 
 } // namespace Format

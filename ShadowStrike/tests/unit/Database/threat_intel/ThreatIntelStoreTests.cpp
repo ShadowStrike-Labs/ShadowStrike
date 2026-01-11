@@ -76,9 +76,9 @@ struct TempDir {
 	StoreConfig cfg;
 	cfg.databasePath = dbPath.wstring();
 	cfg.enableCache = true;
-	cfg.cacheCapacity = 1024;
-	cfg.enableAutoFeedUpdates = false; // Disable for deterministic tests
-	cfg.enableStatistics = true;
+	cfg.cacheOptions.totalCapacity = 1024;
+	cfg.enableAutoFeedUpdate = false; // Disable for deterministic tests
+	cfg.cacheOptions.enableStatistics = true;
 	return cfg;
 }
 
@@ -89,7 +89,7 @@ struct TempDir {
 	entry.confidence = ConfidenceLevel::High;
 	entry.reputation = ReputationLevel::Malicious;
 	entry.category = ThreatCategory::Malware;
-	entry.source = ThreatIntelSource::Internal;
+	entry.source = ThreatIntelSource::InternalAnalysis;
 	entry.firstSeen = static_cast<uint64_t>(std::time(nullptr));
 	entry.lastSeen = entry.firstSeen;
 	entry.flags = IOCFlags::None;
@@ -570,7 +570,7 @@ TEST(ThreatIntelStore_IOCMgmt, AddIOC_Simplified_IPv4) {
 		IOCType::IPv4,
 		"192.0.2.1",
 		ReputationLevel::Malicious,
-		ThreatIntelSource::Internal
+		ThreatIntelSource::InternalAnalysis
 	));
 
 	store->Shutdown();
@@ -607,7 +607,7 @@ TEST(ThreatIntelStore_IOCMgmt, RemoveIOC_ValidType) {
 	auto store = CreateThreatIntelStore();
 	ASSERT_TRUE(store->Initialize());
 
-	ASSERT_TRUE(store->AddIOC(IOCType::Domain, "remove-test.com", ReputationLevel::Malicious, ThreatIntelSource::Internal));
+	ASSERT_TRUE(store->AddIOC(IOCType::Domain, "remove-test.com", ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis));
 	EXPECT_TRUE(store->RemoveIOC(IOCType::Domain, "remove-test.com"));
 
 	store->Shutdown();
@@ -646,7 +646,7 @@ TEST(ThreatIntelStore_IOCMgmt, HasIOC_AfterAdd_ReturnsTrue) {
 	ASSERT_TRUE(store->Initialize());
 
 	const std::string domain = "check-exists.com";
-	ASSERT_TRUE(store->AddIOC(IOCType::Domain, domain, ReputationLevel::Malicious, ThreatIntelSource::Internal));
+	ASSERT_TRUE(store->AddIOC(IOCType::Domain, domain, ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis));
 
 	EXPECT_TRUE(store->HasIOC(IOCType::Domain, domain));
 
@@ -1093,7 +1093,7 @@ TEST(ThreatIntelStore_Events, MultipleCallbacks_AllReceiveEvents) {
 	});
 
 	// Trigger some events
-	(void)store->AddIOC(IOCType::Domain, "event-test.com", ReputationLevel::Malicious, ThreatIntelSource::Internal);
+	(void)store->AddIOC(IOCType::Domain, "event-test.com", ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis);
 
 	// Give callbacks time to process
 	std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1144,7 +1144,7 @@ TEST(ThreatIntelStore_EdgeCases, SpecialCharacters_HandleSafely) {
 
 	EXPECT_NO_THROW({
 		(void)store->LookupDomain(special);
-		(void)store->AddIOC(IOCType::Domain, special, ReputationLevel::Malicious, ThreatIntelSource::Internal);
+		(void)store->AddIOC(IOCType::Domain, special, ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis);
 	});
 
 	store->Shutdown();
@@ -1238,7 +1238,7 @@ TEST(ThreatIntelStore_Production, ConcurrentIOCManagement_Stable) {
 			}
 			for (int i = 0; i < kIters; ++i) {
 				const std::string domain = "concurrent-" + std::to_string(t) + "-" + std::to_string(i) + ".com";
-				(void)store->AddIOC(IOCType::Domain, domain, ReputationLevel::Malicious, ThreatIntelSource::Internal);
+				(void)store->AddIOC(IOCType::Domain, domain, ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis);
 				(void)store->HasIOC(IOCType::Domain, domain);
 			}
 		});
@@ -1270,7 +1270,7 @@ TEST(ThreatIntelStore_Production, MixedOperationsStress_AllAPIs) {
 		int counter = 0;
 		while (!stop.load(std::memory_order_acquire)) {
 			(void)store->AddIOC(IOCType::Domain, "stress-" + std::to_string(counter++) + ".com", 
-			                     ReputationLevel::Malicious, ThreatIntelSource::Internal);
+			                     ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis);
 		}
 	});
 

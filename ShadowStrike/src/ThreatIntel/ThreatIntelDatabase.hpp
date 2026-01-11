@@ -326,6 +326,27 @@ public:
     // Database Access
     // =========================================================================
     
+
+    /**
+     * @brief Create a new database file
+     */
+    [[nodiscard]] bool CreateDatabase(const DatabaseConfig& config) noexcept;
+
+    /**
+     * @brief Open an existing database file
+     */
+    [[nodiscard]] bool OpenExisting(const DatabaseConfig& config) noexcept;
+
+    /**
+     * @brief Initialize header for new database
+     */
+    void InitializeHeader(size_t fileSize) noexcept;
+
+    /**
+     * @brief Remap the database after extension
+     */
+    [[nodiscard]] bool Remap(size_t newSize) noexcept;
+
     /**
      * @brief Get database header (read-only)
      * @return Pointer to header or nullptr if not open
@@ -568,27 +589,6 @@ private:
     // =========================================================================
     // Private Implementation
     // =========================================================================
-    
-    /**
-     * @brief Create a new database file
-     */
-    [[nodiscard]] bool CreateDatabase(const DatabaseConfig& config) noexcept;
-    
-    /**
-     * @brief Open an existing database file
-     */
-    [[nodiscard]] bool OpenExisting(const DatabaseConfig& config) noexcept;
-    
-    /**
-     * @brief Initialize header for new database
-     */
-    void InitializeHeader(size_t fileSize) noexcept;
-    
-    /**
-     * @brief Remap the database after extension
-     */
-    [[nodiscard]] bool Remap(size_t newSize) noexcept;
-    
     /**
      * @brief Align size to page boundary
      */

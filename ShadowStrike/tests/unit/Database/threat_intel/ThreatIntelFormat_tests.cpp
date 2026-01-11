@@ -489,34 +489,34 @@ TEST(ThreatIntelFormat_Domain, NormalizeDomain_TooLong) {
 }
 
 TEST(ThreatIntelFormat_Domain, IsValidDomain_Valid) {
-	EXPECT_TRUE(IsValidDomain("example.com"));
-	EXPECT_TRUE(IsValidDomain("sub.example.com"));
-	EXPECT_TRUE(IsValidDomain("test-site.co.uk"));
-	EXPECT_TRUE(IsValidDomain("example123.org"));
+	EXPECT_TRUE(Format::IsValidDomain("example.com"));
+	EXPECT_TRUE(Format::IsValidDomain("sub.example.com"));
+	EXPECT_TRUE(Format::IsValidDomain("test-site.co.uk"));
+	EXPECT_TRUE(Format::IsValidDomain("example123.org"));
 }
 
 TEST(ThreatIntelFormat_Domain, IsValidDomain_Invalid) {
-	EXPECT_FALSE(IsValidDomain(""));
-	EXPECT_FALSE(IsValidDomain(".com"));                // Starts with dot
-	EXPECT_FALSE(IsValidDomain("example..com"));        // Double dot
-	EXPECT_FALSE(IsValidDomain("-example.com"));        // Starts with hyphen
-	EXPECT_FALSE(IsValidDomain("example-.com"));        // Ends with hyphen
-	EXPECT_FALSE(IsValidDomain("exam ple.com"));        // Space
-	EXPECT_FALSE(IsValidDomain("192.168.1.1"));         // IP address
+	EXPECT_FALSE(Format::IsValidDomain(""));
+	EXPECT_FALSE(Format::IsValidDomain(".com"));                // Starts with dot
+	EXPECT_FALSE(Format::IsValidDomain("example..com"));        // Double dot
+	EXPECT_FALSE(Format::IsValidDomain("-example.com"));        // Starts with hyphen
+	EXPECT_FALSE(Format::IsValidDomain("example-.com"));        // Ends with hyphen
+	EXPECT_FALSE(Format::IsValidDomain("exam ple.com"));        // Space
+	EXPECT_FALSE(Format::IsValidDomain("192.168.1.1"));         // IP address
 }
 
 TEST(ThreatIntelFormat_Domain, IsValidDomain_EdgeCases) {
 	// Single character label
-	EXPECT_FALSE(IsValidDomain("a"));
+	EXPECT_FALSE(Format::IsValidDomain("a"));
 	
 	// Too long
 	std::string longDomain(MAX_DOMAIN_LENGTH + 10, 'a');
-	EXPECT_FALSE(IsValidDomain(longDomain));
+	EXPECT_FALSE(Format::IsValidDomain(longDomain));
 	
 	// Label too long (>63 chars)
 	std::string longLabel(64, 'a');
 	longLabel += ".com";
-	EXPECT_FALSE(IsValidDomain(longLabel));
+	EXPECT_FALSE(Format::IsValidDomain(longLabel));
 }
 
 // ----------------------------------------------------------------------------
@@ -582,30 +582,30 @@ TEST(ThreatIntelFormat_URL, IsValidURL_EdgeCases) {
 // ----------------------------------------------------------------------------
 
 TEST(ThreatIntelFormat_Email, IsValidEmail_Valid) {
-	EXPECT_TRUE(IsValidEmail("user@example.com"));
-	EXPECT_TRUE(IsValidEmail("test.user@example.com"));
-	EXPECT_TRUE(IsValidEmail("user+tag@example.co.uk"));
-	EXPECT_TRUE(IsValidEmail("123@example.com"));
+	EXPECT_TRUE(Format::IsValidEmail("user@example.com"));
+	EXPECT_TRUE(Format::IsValidEmail("test.user@example.com"));
+	EXPECT_TRUE(Format::IsValidEmail("user+tag@example.co.uk"));
+	EXPECT_TRUE(Format::IsValidEmail("123@example.com"));
 }
 
 TEST(ThreatIntelFormat_Email, IsValidEmail_Invalid) {
-	EXPECT_FALSE(IsValidEmail(""));
-	EXPECT_FALSE(IsValidEmail("no-at-sign"));
-	EXPECT_FALSE(IsValidEmail("@example.com"));         // No local part
-	EXPECT_FALSE(IsValidEmail("user@"));                // No domain
-	EXPECT_FALSE(IsValidEmail("user@@example.com"));    // Double @
-	EXPECT_FALSE(IsValidEmail("user@.com"));            // Domain starts with dot
-	EXPECT_FALSE(IsValidEmail("user@example"));         // No TLD
+	EXPECT_FALSE(Format::IsValidEmail(""));
+	EXPECT_FALSE(Format::IsValidEmail("no-at-sign"));
+	EXPECT_FALSE(Format::IsValidEmail("@example.com"));         // No local part
+	EXPECT_FALSE(Format::IsValidEmail("user@"));                // No domain
+	EXPECT_FALSE(Format::IsValidEmail("user@@example.com"));    // Double @
+	EXPECT_FALSE(Format::IsValidEmail("user@.com"));            // Domain starts with dot
+	EXPECT_FALSE(Format::IsValidEmail("user@example"));         // No TLD
 }
 
 TEST(ThreatIntelFormat_Email, IsValidEmail_EdgeCases) {
 	// Very long email
 	std::string longEmail = std::string(300, 'a') + "@example.com";
-	EXPECT_FALSE(IsValidEmail(longEmail));
+	EXPECT_FALSE(Format::IsValidEmail(longEmail));
 	
 	// Local part too long
 	std::string longLocal = std::string(65, 'a') + "@example.com";
-	EXPECT_FALSE(IsValidEmail(longLocal));
+	EXPECT_FALSE(Format::IsValidEmail(longLocal));
 }
 
 // ============================================================================

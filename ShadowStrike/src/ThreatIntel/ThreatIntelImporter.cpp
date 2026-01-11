@@ -7,6 +7,7 @@
 
 #include "ThreatIntelImporter.hpp"
 #include "ThreatIntelDatabase.hpp"
+#include "ThreatIntelFormat.hpp"  // For Format:: utilities
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/Base64Utils.hpp"
@@ -47,20 +48,23 @@ namespace {
     /// @brief Maximum JSON buffer size
     constexpr size_t MAX_JSON_BUFFER_SIZE = 256 * 1024 * 1024;  // 256MB
 
+    // ========================================================================
+    // DELEGATING WRAPPERS - Use Format namespace canonical implementations
+    // ========================================================================
+    
     /**
      * @brief Safe hex character to value conversion
+     * @note Delegates to Format::HexCharToValue for consistency.
      * @param c Hex character
      * @return Value 0-15, or -1 if invalid
      */
     [[nodiscard]] constexpr int HexCharToValue(char c) noexcept {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
+        return ShadowStrike::ThreatIntel::Format::HexCharToValue(c);
     }
     
     /**
-     * @brief Parse hex string to bytes safely
+     * @brief Parse hex string to bytes safely (span version)
+     * @note Uses Format::ParseHexString internally.
      * @param hex Hex string input
      * @param out Output span for bytes
      * @return true if successful
@@ -87,80 +91,19 @@ namespace {
             return false;
         }
         
-        for (size_t i = 0; i < byteCount; ++i) {
-            const size_t hexIdx = i * 2;
-            
-            // Bounds check (should always pass due to length validation above)
-            if (hexIdx + 1 >= hex.length()) {
-                return false;
-            }
-            
-            const int high = HexCharToValue(hex[hexIdx]);
-            const int low = HexCharToValue(hex[hexIdx + 1]);
-            
-            if (high < 0 || low < 0) {
-                return false;
-            }
-            
-            out[i] = static_cast<uint8_t>((high << 4) | low);
-        }
-        return true;
+        // Delegate to Format::ParseHexString
+        return ShadowStrike::ThreatIntel::Format::ParseHexString(hex.substr(0, byteCount * 2), out.data(), byteCount);
     }
     
     /**
      * @brief Safely parse IPv4 address
+     * @note Delegates to Format::SafeParseIPv4 for consistency.
      * @param str IPv4 address string
      * @param out Output array for 4 octets (must not be null)
      * @return true if valid IPv4
      */
     [[nodiscard]] bool SafeParseIPv4(std::string_view str, uint8_t out[4]) noexcept {
-        // Validate output pointer
-        if (out == nullptr) {
-            return false;
-        }
-        
-        // Validate input bounds
-        if (str.empty() || str.size() > 15) {
-            return false;
-        }
-        
-        // Zero-initialize output for safety
-        out[0] = out[1] = out[2] = out[3] = 0;
-        
-        size_t octetIdx = 0;
-        int value = 0;
-        int digitCount = 0;
-        
-        for (size_t i = 0; i <= str.size(); ++i) {
-            const char c = (i < str.size()) ? str[i] : '.';
-            
-            if (c == '.') {
-                // Validate octet
-                if (digitCount == 0 || value > 255 || octetIdx >= 4) {
-                    return false;
-                }
-                // Check for leading zeros (e.g., "01.02.03.04" is invalid in strict mode)
-                // For compatibility, we allow it but validate range
-                out[octetIdx++] = static_cast<uint8_t>(value);
-                value = 0;
-                digitCount = 0;
-            } else if (c >= '0' && c <= '9') {
-                // Overflow check before multiplication
-                if (value > 25 || (value == 25 && (c - '0') > 5)) {
-                    return false;  // Would exceed 255
-                }
-                value = value * 10 + (c - '0');
-                digitCount++;
-                if (digitCount > 3) {
-                    return false;
-                }
-            } else {
-                return false;  // Invalid character
-            }
-        }
-        
-        // Must have exactly 4 octets and no trailing digits
-        return octetIdx == 4 && digitCount == 0;
+        return ShadowStrike::ThreatIntel::Format::SafeParseIPv4(str, out);
     }
     
     /**
@@ -190,29 +133,23 @@ namespace {
     
     /**
      * @brief Safely trim whitespace from string view
+     * @note Delegates to Format::TrimWhitespace for consistency.
      * @param str Input string view
      * @return Trimmed string view
      */
     [[nodiscard]] std::string_view SafeTrim(std::string_view str) noexcept {
-        while (!str.empty() && std::isspace(static_cast<unsigned char>(str.front()))) {
-            str.remove_prefix(1);
-        }
-        while (!str.empty() && std::isspace(static_cast<unsigned char>(str.back()))) {
-            str.remove_suffix(1);
-        }
-        return str;
+        // Delegate to Format::TrimWhitespace
+        return ShadowStrike::ThreatIntel::Format::TrimWhitespace(str);
     }
     
     /**
      * @brief Parse single hex digit to value
+     * @note Alias for HexCharToValue - delegates to Format::HexCharToValue.
      * @param c Character to parse
      * @return Value 0-15, or -1 if invalid
      */
     [[nodiscard]] constexpr int ParseHexDigit(char c) noexcept {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
+        return ShadowStrike::ThreatIntel::Format::HexCharToValue(c);
     }
     
     /**

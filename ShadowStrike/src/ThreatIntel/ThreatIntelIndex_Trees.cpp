@@ -21,6 +21,8 @@
 
 #include "ThreatIntelIndex_Internal.hpp"
 #include "ThreatIntelIndex_Trees.hpp"
+#include <functional>  // For std::function in ForEach
+#include <queue>  // For BFS in GetMemoryUsage
 
 namespace ShadowStrike {
 namespace ThreatIntel {
@@ -29,8 +31,7 @@ namespace ThreatIntel {
 // CONSTANTS AND CONFIGURATION
 // ============================================================================
 
-/// Cache line size for alignment
-static constexpr size_t CACHE_LINE_SIZE = 64;
+// Note: CACHE_LINE_SIZE is defined in ThreatIntelFormat.hpp, using it from there
 
 /// B+Tree branching factor (keys per node) - optimized for cache efficiency
 static constexpr size_t BRANCHING_FACTOR = 64;
@@ -614,6 +615,63 @@ size_t HashBPlusTree::GetSize() const noexcept {
     return count;
 }
 
+size_t HashBPlusTree::GetMemoryUsage() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Count nodes
+    size_t nodeCount = 0;
+    
+    // BFS to count all nodes
+    std::queue<const BNode*> queue;
+    if (m_root) {
+        queue.push(m_root.get());
+    }
+    
+    while (!queue.empty()) {
+        const BNode* node = queue.front();
+        queue.pop();
+        ++nodeCount;
+        
+        if (!node->IsLeaf()) {
+            for (uint16_t i = 0; i <= node->keyCount; ++i) {
+                if (node->data.children[i]) {
+                    queue.push(node->data.children[i]);
+                }
+            }
+        }
+    }
+    
+    // Each BNode is cache-line aligned and roughly sizeof(BNode)
+    return nodeCount * sizeof(BNode) + m_cache.GetMemoryUsage();
+}
+
+void HashBPlusTree::ForEach(const std::function<void(const HashValue&, const IndexValue&)>& callback) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Find first leaf
+    const BNode* leaf = m_root.get();
+    while (leaf != nullptr && !leaf->IsLeaf()) {
+        leaf = leaf->data.children[0];
+    }
+    
+    // Note: HashBPlusTree stores hash values as 64-bit keys (FNV-1a hash)
+    // We cannot reconstruct the original HashValue from the key alone
+    // This is a limitation - for full ForEach, we'd need to store full hash values
+    // For now, we provide a placeholder implementation
+    while (leaf != nullptr) {
+        for (uint16_t i = 0; i < leaf->keyCount; ++i) {
+            // Create a HashValue from the key (limited - only hash is available)
+            HashValue hash{};
+            hash.algorithm = m_algorithm;
+            // The key is a 64-bit hash, not the original hash bytes
+            // Copy what we can for statistics purposes
+            std::memcpy(hash.data.data(), &leaf->keys[i], sizeof(uint64_t));
+            callback(hash, leaf->data.entries[i]);
+        }
+        leaf = leaf->nextLeaf;
+    }
+}
+
 // ============================================================================
 // GENERIC B+TREE - PRIVATE HELPER METHODS (FILE-LOCAL)
 // ============================================================================
@@ -976,6 +1034,52 @@ size_t GenericBPlusTree::GetSize() const noexcept {
     }
     
     return count;
+}
+
+size_t GenericBPlusTree::GetMemoryUsage() const noexcept {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Count nodes via BFS
+    size_t nodeCount = 0;
+    
+    std::queue<const BNode*> queue;
+    if (m_root) {
+        queue.push(m_root.get());
+    }
+    
+    while (!queue.empty()) {
+        const BNode* node = queue.front();
+        queue.pop();
+        ++nodeCount;
+        
+        if (!node->IsLeaf()) {
+            for (uint16_t i = 0; i <= node->keyCount; ++i) {
+                if (node->data.children[i]) {
+                    queue.push(node->data.children[i]);
+                }
+            }
+        }
+    }
+    
+    return nodeCount * sizeof(BNode) + m_cache.GetMemoryUsage();
+}
+
+void GenericBPlusTree::ForEach(const std::function<void(uint64_t, const IndexValue&)>& callback) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    
+    // Find first leaf
+    const BNode* leaf = m_root.get();
+    while (leaf != nullptr && !leaf->IsLeaf()) {
+        leaf = leaf->data.children[0];
+    }
+    
+    // Iterate through all leaves
+    while (leaf != nullptr) {
+        for (uint16_t i = 0; i < leaf->keyCount; ++i) {
+            callback(leaf->keys[i], leaf->data.entries[i]);
+        }
+        leaf = leaf->nextLeaf;
+    }
 }
 
 } // namespace ThreatIntel

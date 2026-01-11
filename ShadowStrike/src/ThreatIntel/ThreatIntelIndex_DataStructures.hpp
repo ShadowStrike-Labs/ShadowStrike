@@ -19,6 +19,7 @@
 
 #include "ThreatIntelFormat.hpp"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -54,6 +55,14 @@ namespace ShadowStrike {
             void Clear() noexcept;
             [[nodiscard]] double GetEstimatedFillRate() const noexcept;
             [[nodiscard]] double GetEstimatedFalsePositiveRate() const noexcept;
+            
+            /// @brief Get the number of bits in the bloom filter
+            [[nodiscard]] uint64_t GetBitCount() const noexcept { return m_numBits; }
+            
+            /// @brief Get memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept { 
+                return m_bits.capacity() * sizeof(uint64_t); 
+            }
 
         private:
             std::vector<uint64_t> m_bits;
@@ -86,16 +95,24 @@ namespace ShadowStrike {
             [[nodiscard]] bool Remove(const IPv4Address& addr);
             void Clear() noexcept;
 
-            template<typename Func>
-            void ForEach(Func&& callback) const;
+            /// @brief Iterate over all entries
+            /// @param callback Callback function(const IPv4Address& addr, const IndexValue& value)
+            void ForEach(const std::function<void(const IPv4Address&, const IndexValue&)>& callback) const;
 
             [[nodiscard]] size_t GetNodeCount() const noexcept { return m_nodeCount; }
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
+            
+            /// @brief Get entry count (same as node count for radix tree)
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return m_entryCount; }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept;
 
         private:
             struct RadixNode;
             std::unique_ptr<RadixNode> m_root;
             size_t m_nodeCount = 0;
+            size_t m_entryCount = 0;  ///< Track actual entry count separately
             uint32_t m_height = 0;
             mutable std::shared_mutex m_mutex;
         };
@@ -125,16 +142,24 @@ namespace ShadowStrike {
             [[nodiscard]] bool Remove(const IPv6Address& addr);
             void Clear() noexcept;
 
-            template<typename Func>
-            void ForEach(Func&& callback) const;
+            /// @brief Iterate over all entries
+            /// @param callback Callback function(const IPv6Address& addr, const IndexValue& value)
+            void ForEach(const std::function<void(const IPv6Address&, const IndexValue&)>& callback) const;
 
             [[nodiscard]] size_t GetNodeCount() const noexcept { return m_nodeCount; }
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
+            
+            /// @brief Get entry count
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return m_entryCount; }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept;
 
         private:
             struct PatriciaNode;
             std::unique_ptr<PatriciaNode> m_root;
             size_t m_nodeCount = 0;
+            size_t m_entryCount = 0;  ///< Track actual entry count
             uint32_t m_height = 0;
             mutable std::shared_mutex m_mutex;
         };
@@ -164,16 +189,24 @@ namespace ShadowStrike {
             [[nodiscard]] bool Remove(std::string_view domain);
             void Clear() noexcept;
 
-            template<typename Func>
-            void ForEach(Func&& callback) const;
+            /// @brief Iterate over all entries
+            /// @param callback Callback function(const std::string& domain, const IndexValue& value)
+            void ForEach(const std::function<void(const std::string&, const IndexValue&)>& callback) const;
 
             [[nodiscard]] size_t GetNodeCount() const noexcept { return m_nodeCount; }
             [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
+            
+            /// @brief Get entry count
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return m_entryCount; }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept;
 
         private:
             struct TrieNode;
             std::unique_ptr<TrieNode> m_root;
             size_t m_nodeCount = 0;
+            size_t m_entryCount = 0;  ///< Track actual entry count
             uint32_t m_height = 0;
             mutable std::shared_mutex m_mutex;
         };
@@ -208,11 +241,39 @@ namespace ShadowStrike {
 
             [[nodiscard]] size_t GetSize() const noexcept { return m_entries.size(); }
             [[nodiscard]] double GetLoadFactor() const noexcept;
+            
+            /// @brief Get entry count (alias for GetSize)
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return m_entries.size(); }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept {
+                // Approximate: key strings + values + bucket overhead
+                size_t usage = m_entries.bucket_count() * sizeof(void*);
+                for (const auto& [key, val] : m_entries) {
+                    usage += key.capacity() + sizeof(IndexValue) + sizeof(void*);
+                }
+                return usage;
+            }
 
         private:
             std::unordered_map<std::string, IndexValue> m_entries;
             mutable std::shared_mutex m_mutex;
         };
+
+        // ============================================================================
+        // TEMPLATE IMPLEMENTATIONS (must be in header)
+        // ============================================================================
+
+        /**
+         * @brief EmailHashTable ForEach - iterate over all email entries
+         */
+        template<typename Func>
+        void EmailHashTable::ForEach(Func&& callback) const {
+            std::shared_lock<std::shared_mutex> lock(m_mutex);
+            for (const auto& [email, value] : m_entries) {
+                callback(email, value);
+            }
+        }
 
     } // namespace ThreatIntel
 } // namespace ShadowStrike

@@ -89,6 +89,22 @@ namespace ShadowStrike {
             void Clear() noexcept;
 
             [[nodiscard]] size_t GetPatternCount() const noexcept;
+            
+            /// @brief Get entry count (alias for GetPatternCount)
+            [[nodiscard]] size_t GetEntryCount() const noexcept { return GetPatternCount(); }
+            
+            /// @brief Get state count in the automaton (for statistics)
+            [[nodiscard]] size_t GetStateCount() const noexcept;
+            
+            /// @brief Rebuild automaton immediately (alias for Build)
+            void RebuildNow() { Build(); }
+            
+            /// @brief Estimate memory usage in bytes
+            [[nodiscard]] size_t GetMemoryUsage() const noexcept;
+            
+            /// @brief Iterate over all patterns
+            template<typename Func>
+            void ForEach(Func&& callback) const;
 
         private:
             AhoCorasickAutomaton m_automaton;
@@ -96,6 +112,15 @@ namespace ShadowStrike {
             bool m_needsRebuild = false;
             mutable std::shared_mutex m_mutex;
         };
+
+        // Template implementation (must be in header)
+        template<typename Func>
+        void URLPatternMatcher::ForEach(Func&& callback) const {
+            std::shared_lock<std::shared_mutex> lock(m_mutex);
+            for (const auto& [pattern, value] : m_patterns) {
+                callback(pattern, value);
+            }
+        }
 
     } // namespace ThreatIntel
 } // namespace ShadowStrike

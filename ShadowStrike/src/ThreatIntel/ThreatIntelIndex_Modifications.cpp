@@ -18,6 +18,89 @@
 namespace ShadowStrike {
 namespace ThreatIntel {
 
+    // ========================================================================
+    // DELEGATING WRAPPERS - Use Format namespace canonical implementations
+    // ========================================================================
+    
+    /**
+     * @brief Split domain into labels
+     * @note Delegates to Format::SplitDomainLabels for consistency.
+     */
+    [[nodiscard]] inline std::vector<std::string> SplitDomainLabels(std::string_view domain) noexcept {
+        return Format::SplitDomainLabels(domain);
+    }
+
+    /**
+     * @brief Calculate estimated index memory for a specific IOC type
+     * @note Delegates to Format::CalculateIndexSizeForType using standardized constants.
+     */
+    [[nodiscard]] inline uint64_t CalculateIndexSize(IOCType type, uint64_t entryCount) noexcept {
+        return Format::CalculateIndexSizeForType(type, entryCount);
+    }
+
+    uint64_t EstimateIndexMemory(
+        std::span<const IOCEntry> entries,
+        const IndexBuildOptions& options
+    ) noexcept {
+        std::unordered_map<IOCType, uint64_t> entryCounts;
+
+        for (const auto& entry : entries) {
+            ++entryCounts[entry.type];
+        }
+
+        uint64_t totalMemory = 0;
+
+        for (const auto& [type, count] : entryCounts) {
+            totalMemory += CalculateIndexSize(type, count);
+        }
+
+        // Add bloom filter overhead if enabled
+        if (options.buildBloomFilters) {
+            // Use standardized FPR constant from ThreatIntelFormat.hpp
+            totalMemory += Format::CalculateBloomFilterSize(entries.size(), BLOOM_FILTER_DEFAULT_FPR) / 8;
+        }
+
+        return totalMemory;
+    }
+
+    /**
+     * @brief Convert domain to reverse label format
+     * @note Delegates to Format::ReverseDomainLabels for consistency.
+     */
+    [[nodiscard]] inline std::string ConvertToReverseDomain(std::string_view domain) noexcept {
+        return Format::ReverseDomainLabels(domain);
+    }
+
+    /**
+     * @brief Normalize URL for indexing
+     * @note Delegates to Format::NormalizeURL for enterprise-grade URL handling
+     *       Handles scheme normalization, host lowercase, port removal, encoding, etc.
+     */
+    [[nodiscard]] inline std::string NormalizeURL(std::string_view url) noexcept {
+        try {
+            return Format::NormalizeURL(url);
+        } catch (...) {
+            // Fallback: simple lowercase conversion on failure
+            return Format::ToLowerCase(url);
+        }
+    }
+
+    bool ValidateIndexConfiguration(
+        const IndexBuildOptions& options,
+        std::string& errorMessage
+    ) noexcept {
+        // At least one index type must be enabled
+        if (!options.buildIPv4 && !options.buildIPv6 &&
+            !options.buildDomain && !options.buildURL &&
+            !options.buildHash && !options.buildEmail &&
+            !options.buildGeneric) {
+            errorMessage = "At least one index type must be enabled";
+            return false;
+        }
+
+        return true;
+    }
+
         // ============================================================================
         // INDEX MODIFICATION OPERATIONS
         // ============================================================================
@@ -980,7 +1063,8 @@ namespace ThreatIntel {
                 // offset would be calculated from entry array base)
                 uint64_t offset = processed * sizeof(IOCEntry);
 
-                Insert(entry, offset);
+                // Insert and handle result (suppress nodiscard warning)
+                [[maybe_unused]] auto insertResult = Insert(entry, offset);
 
                 ++processed;
 
@@ -1046,7 +1130,7 @@ namespace ThreatIntel {
             for (const auto& entry : entries) {
                 if (entry.type == indexType) {
                     uint64_t offset = processed * sizeof(IOCEntry);
-                    Insert(entry, offset);
+                    [[maybe_unused]] auto insertResult = Insert(entry, offset);
                 }
                 ++processed;
             }
@@ -1071,15 +1155,14 @@ namespace ThreatIntel {
             if (m_impl->buildOptions.buildBloomFilters) {
                 // IPv4 Bloom Filter - rebuild and repopulate
                 if (m_impl->ipv4Index && m_impl->bloomFilters.count(IOCType::IPv4)) {
-                    const size_t entryCount = m_impl->ipv4Index->GetEntryCount();
+                    const size_t entryCount = m_impl->stats.ipv4Entries;
                     if (entryCount > 0) {
-                        const size_t optimalSize = CalculateBloomFilterSize(entryCount);
-                        auto newFilter = std::make_unique<IndexBloomFilter>(optimalSize);
+                        auto newFilter = std::make_unique<IndexBloomFilter>(entryCount, BLOOM_FILTER_DEFAULT_FPR);
 
                         // Enterprise-grade: Repopulate bloom filter by iterating entries
-                        m_impl->ipv4Index->ForEach([&newFilter](uint64_t entryId, uint64_t entryOffset, uint8_t prefixLength) {
-                            // Use entryId as hash since we don't have original IPv4Address
-                            newFilter->Add(entryId);
+                        m_impl->ipv4Index->ForEach([&newFilter](const IPv4Address& addr, const IndexValue& value) {
+                            // Use IPv4 address hash
+                            newFilter->Add(addr.FastHash());
                             });
 
                         m_impl->bloomFilters[IOCType::IPv4] = std::move(newFilter);
@@ -1088,13 +1171,12 @@ namespace ThreatIntel {
 
                 // IPv6 Bloom Filter - rebuild and repopulate
                 if (m_impl->ipv6Index && m_impl->bloomFilters.count(IOCType::IPv6)) {
-                    const size_t entryCount = m_impl->ipv6Index->GetEntryCount();
+                    const size_t entryCount = m_impl->stats.ipv6Entries;
                     if (entryCount > 0) {
-                        const size_t optimalSize = CalculateBloomFilterSize(entryCount);
-                        auto newFilter = std::make_unique<IndexBloomFilter>(optimalSize);
+                        auto newFilter = std::make_unique<IndexBloomFilter>(entryCount, BLOOM_FILTER_DEFAULT_FPR);
 
-                        m_impl->ipv6Index->ForEach([&newFilter](uint64_t entryId, uint64_t entryOffset, uint8_t prefixLength) {
-                            newFilter->Add(entryId);
+                        m_impl->ipv6Index->ForEach([&newFilter](const IPv6Address& addr, const IndexValue& value) {
+                            newFilter->Add(addr.FastHash());
                             });
 
                         m_impl->bloomFilters[IOCType::IPv6] = std::move(newFilter);
@@ -1103,12 +1185,11 @@ namespace ThreatIntel {
 
                 // Domain Bloom Filter - rebuild and repopulate
                 if (m_impl->domainIndex && m_impl->bloomFilters.count(IOCType::Domain)) {
-                    const size_t entryCount = m_impl->domainIndex->GetEntryCount();
+                    const size_t entryCount = m_impl->stats.domainEntries;
                     if (entryCount > 0) {
-                        const size_t optimalSize = CalculateBloomFilterSize(entryCount);
-                        auto newFilter = std::make_unique<IndexBloomFilter>(optimalSize);
+                        auto newFilter = std::make_unique<IndexBloomFilter>(entryCount, BLOOM_FILTER_DEFAULT_FPR);
 
-                        m_impl->domainIndex->ForEach([&newFilter](const std::string& domain, uint64_t entryId, uint64_t entryOffset) {
+                        m_impl->domainIndex->ForEach([&newFilter](const std::string& domain, const IndexValue& value) {
                             newFilter->Add(HashString(domain));
                             });
 
@@ -1118,13 +1199,11 @@ namespace ThreatIntel {
 
                 // URL Bloom Filter - rebuild and repopulate
                 if (m_impl->urlIndex && m_impl->bloomFilters.count(IOCType::URL)) {
-                    const size_t entryCount = m_impl->urlIndex->GetEntryCount();
+                    const size_t entryCount = m_impl->stats.urlEntries;
                     if (entryCount > 0) {
-                        const size_t optimalSize = CalculateBloomFilterSize(entryCount);
-                        auto newFilter = std::make_unique<IndexBloomFilter>(optimalSize);
-
-                        m_impl->urlIndex->ForEach([&newFilter](uint64_t hash, uint64_t entryId, uint64_t entryOffset) {
-                            newFilter->Add(hash);
+                        auto newFilter = std::make_unique<IndexBloomFilter>(entryCount, BLOOM_FILTER_DEFAULT_FPR);
+                        m_impl->urlIndex->ForEach([&newFilter](const std::string& pattern, const IndexValue& value) {
+                            newFilter->Add(HashString(pattern));
                             });
 
                         m_impl->bloomFilters[IOCType::URL] = std::move(newFilter);
@@ -1133,13 +1212,12 @@ namespace ThreatIntel {
 
                 // Email Bloom Filter - rebuild and repopulate
                 if (m_impl->emailIndex && m_impl->bloomFilters.count(IOCType::Email)) {
-                    const size_t entryCount = m_impl->emailIndex->GetEntryCount();
+                    const size_t entryCount = m_impl->stats.emailEntries;
                     if (entryCount > 0) {
-                        const size_t optimalSize = CalculateBloomFilterSize(entryCount);
-                        auto newFilter = std::make_unique<IndexBloomFilter>(optimalSize);
+                        auto newFilter = std::make_unique<IndexBloomFilter>(entryCount, BLOOM_FILTER_DEFAULT_FPR);
 
-                        m_impl->emailIndex->ForEach([&newFilter](uint64_t hash, uint64_t entryId, uint64_t entryOffset) {
-                            newFilter->Add(hash);
+                        m_impl->emailIndex->ForEach([&newFilter](const std::string& email, const IndexValue& value) {
+                            newFilter->Add(HashString(email));
                             });
 
                         m_impl->bloomFilters[IOCType::Email] = std::move(newFilter);
@@ -1151,11 +1229,12 @@ namespace ThreatIntel {
                     size_t totalHashEntries = 0;
                     for (const auto& hashIndex : m_impl->hashIndexes) {
                         if (hashIndex) {
-                            totalHashEntries += hashIndex->GetEntryCount();
+                            totalHashEntries += hashIndex->GetSize();
                         }
                     }
                     if (totalHashEntries > 0) {
-                        const size_t optimalSize = CalculateBloomFilterSize(totalHashEntries);
+                        // Use standardized FPR constant from ThreatIntelFormat.hpp
+                        const size_t optimalSize = Format::CalculateBloomFilterSize(totalHashEntries, BLOOM_FILTER_DEFAULT_FPR);
                         auto newFilter = std::make_unique<IndexBloomFilter>(optimalSize);
 
                         // Repopulate from all hash indexes
@@ -1797,120 +1876,5 @@ namespace ThreatIntel {
             return true;
         }
 
-        // ============================================================================
-        // UTILITY FUNCTIONS
-        // ============================================================================
-
-        uint64_t CalculateIndexSize(
-            IOCType type,
-            uint64_t entryCount
-        ) noexcept {
-            // Rough estimates based on index type
-            switch (type) {
-            case IOCType::IPv4:
-                // Radix tree: ~1KB per node, ~4 nodes per entry average
-                return entryCount * 4 * 1024;
-
-            case IOCType::IPv6:
-                // Patricia trie: ~2KB per node (compressed)
-                return entryCount * 2 * 1024;
-
-            case IOCType::Domain:
-                // Suffix trie + hash table: ~512 bytes per entry
-                return entryCount * 512;
-
-            case IOCType::URL:
-                // Aho-Corasick: ~256 bytes per pattern
-                return entryCount * 256;
-
-            case IOCType::FileHash:
-                // B+Tree: ~128 bytes per entry
-                return entryCount * 128;
-
-            case IOCType::Email:
-                // Hash table: ~64 bytes per entry
-                return entryCount * 64;
-
-            default:
-                // Generic B+Tree: ~128 bytes per entry
-                return entryCount * 128;
-            }
-        }
-
-        uint64_t EstimateIndexMemory(
-            std::span<const IOCEntry> entries,
-            const IndexBuildOptions& options
-        ) noexcept {
-            std::unordered_map<IOCType, uint64_t> entryCounts;
-
-            for (const auto& entry : entries) {
-                ++entryCounts[entry.type];
-            }
-
-            uint64_t totalMemory = 0;
-
-            for (const auto& [type, count] : entryCounts) {
-                totalMemory += CalculateIndexSize(type, count);
-            }
-
-            // Add bloom filter overhead if enabled
-            if (options.buildBloomFilters) {
-                totalMemory += CalculateBloomFilterSize(entries.size()) / 8;
-            }
-
-            return totalMemory;
-        }
-
-        std::string ConvertToReverseDomain(std::string_view domain) noexcept {
-            auto labels = SplitDomainLabels(domain);
-            std::reverse(labels.begin(), labels.end());
-
-            std::string result;
-            for (size_t i = 0; i < labels.size(); ++i) {
-                if (i > 0) result += '.';
-                result += labels[i];
-            }
-
-            return result;
-        }
-
-        std::string NormalizeURL(std::string_view url) noexcept {
-            // Simple normalization:
-            // - Convert to lowercase
-            // - Remove fragment (#)
-            // - Sort query parameters (in a full implementation)
-
-            std::string result(url);
-
-            // Convert to lowercase (locale-independent, ASCII-safe for URLs)
-            std::transform(result.begin(), result.end(), result.begin(),
-                [](char c) -> char {
-                    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
-                });
-
-            // Remove fragment
-            size_t fragmentPos = result.find('#');
-            if (fragmentPos != std::string::npos) {
-                result = result.substr(0, fragmentPos);
-            }
-
-            return result;
-        }
-
-        bool ValidateIndexConfiguration(
-            const IndexBuildOptions& options,
-            std::string& errorMessage
-        ) noexcept {
-            // At least one index type must be enabled
-            if (!options.buildIPv4 && !options.buildIPv6 &&
-                !options.buildDomain && !options.buildURL &&
-                !options.buildHash && !options.buildEmail &&
-                !options.buildGeneric) {
-                errorMessage = "At least one index type must be enabled";
-                return false;
-            }
-
-            return true;
-        }
 	}
 }
