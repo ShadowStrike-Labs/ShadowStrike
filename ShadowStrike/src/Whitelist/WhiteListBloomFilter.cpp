@@ -1,6 +1,3 @@
-
-
-
 /**
  * ============================================================================
  * ShadowStrike WhitelistStore - BLOOM FILTER IMPLEMENTATION
@@ -425,8 +422,8 @@ bool BloomFilter::Initialize(const void* data, size_t bitCount, size_t hashFunct
     }
     
     // Clear any existing local storage to free memory
-    m_bits.clear();
-    m_bits.shrink_to_fit();
+    std::vector<std::atomic<uint64_t>> empty;
+    m_bits.swap(empty);
     
     // Set up memory-mapped mode
     m_mappedBits = static_cast<const uint64_t*>(data);
@@ -477,13 +474,14 @@ bool BloomFilter::InitializeForBuild() noexcept {
         }
         
         // Clear and allocate bit array
-        m_bits.clear();
-        m_bits.resize(wordCount);
+        std::vector<std::atomic<uint64_t>> newBits(wordCount);
+
         
         // Zero all bits explicitly (resize should zero-init, but be explicit for security)
-        for (auto& word : m_bits) {
-            word.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < wordCount; ++i) {
+            newBits[i].store(0, std::memory_order_relaxed);
         }
+        m_bits.swap(newBits);
         
         m_elementsAdded.store(0, std::memory_order_relaxed);
         

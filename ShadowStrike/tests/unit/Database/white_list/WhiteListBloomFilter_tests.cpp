@@ -357,9 +357,9 @@ TEST(BloomFilter_SingleOps, Add_WithHashValue_Works) {
     HashValue hv{};
     hv.algorithm = HashAlgorithm::SHA256;
     // Set some bytes
-    hv.sha256[0] = 0x12;
-    hv.sha256[1] = 0x34;
-    hv.sha256[31] = 0xFF;
+    hv.data[0] = 0x12;
+    hv.data[1] = 0x34;
+    hv.data[31] = 0xFF;
     
     filter.Add(hv);
     EXPECT_TRUE(filter.MightContain(hv));
@@ -397,7 +397,8 @@ TEST(BloomFilter_BatchOps, BatchQuery_EmptyInput_ReturnsZero) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     std::vector<uint64_t> empty;
-    std::vector<bool> results;
+    bool dummy;
+    std::span<bool> results(&dummy, 0);
     
     EXPECT_EQ(filter.BatchQuery(empty, results), 0u);
 }
@@ -407,7 +408,8 @@ TEST(BloomFilter_BatchOps, BatchQuery_MismatchedSizes_ReturnsZero) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     std::vector<uint64_t> hashes = {1, 2, 3};
-    std::vector<bool> results(5);  // Wrong size
+    auto results_buf = std::make_unique<bool[]>(5);
+    std::span<bool> results(results_buf.get(), 5);
     
     EXPECT_EQ(filter.BatchQuery(hashes, results), 0u);
 }
@@ -419,28 +421,33 @@ TEST(BloomFilter_BatchOps, BatchQuery_AfterBatchAdd_AllPositive) {
     const auto testHashes = GenerateTestHashes(1000);
     filter.BatchAdd(testHashes);
     
-    std::vector<bool> results(testHashes.size());
+    const size_t count = testHashes.size();
+    auto results_buf = std::make_unique<bool[]>(count);
+    std::span<bool> results(results_buf.get(), count);
     const size_t positives = filter.BatchQuery(testHashes, results);
     
     // All should be positive (no false negatives)
-    EXPECT_EQ(positives, testHashes.size());
-    for (bool r : results) {
-        EXPECT_TRUE(r);
+    EXPECT_EQ(positives, count);
+    for (size_t i = 0; i < count; ++i) {
+        EXPECT_TRUE(results[i]);
     }
 }
 
 TEST(BloomFilter_BatchOps, BatchQuery_EmptyFilter_MostlyNegative) {
     BloomFilter filter(DEFAULT_TEST_ELEMENTS, DEFAULT_TEST_FPR);
     ASSERT_TRUE(filter.InitializeForBuild());
-    
+
     const auto testHashes = GenerateTestHashes(1000);
-    std::vector<bool> results(testHashes.size());
-    
+
+   
+    const size_t count = testHashes.size();
+    auto results_buf = std::make_unique<bool[]>(count);
+    std::span<bool> results(results_buf.get(), count);
+
     const size_t positives = filter.BatchQuery(testHashes, results);
-    
-    // Empty filter should have very few false positives
-    // (ideally zero, but depends on implementation)
-    EXPECT_LT(positives, testHashes.size() / 10);  // Less than 10%
+
+  
+    EXPECT_LT(positives, count / 10);
 }
 
 // ============================================================================

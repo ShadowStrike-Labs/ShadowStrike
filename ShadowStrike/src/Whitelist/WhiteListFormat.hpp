@@ -434,7 +434,10 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
     uint32_t policyId;
     
     /// @brief Hit count (how many times this entry matched)
-    std::atomic<uint32_t> hitCount;
+    /// @note Using volatile + Interlocked for memory-mapped compatibility
+    ///       std::atomic is NOT trivially copyable, making it incompatible with
+    ///       memory-mapped file structures that require trivially copyable types
+    volatile uint32_t hitCount;
     
     /// @brief Reserved for future expansion
     uint8_t reserved2[2];
@@ -468,16 +471,31 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
     }
     
     /// @brief Increment hit counter (thread-safe)
-    /// @note Uses relaxed memory order for performance; sufficient for statistics
+    /// @note Uses Windows Interlocked intrinsics for memory-mapped compatibility
+    ///       This provides atomicity without std::atomic (which is not trivially copyable)
     void IncrementHitCount() noexcept {
+        // Use Windows Interlocked for thread-safe increment on memory-mapped storage
         // Prevent overflow - cap at max value
-        uint32_t current = hitCount.load(std::memory_order_relaxed);
-        while (current < (std::numeric_limits<uint32_t>::max)()) {
-            if (hitCount.compare_exchange_weak(current, current + 1u,
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
-                break;
+        LONG current = static_cast<LONG>(hitCount);
+        while (static_cast<uint32_t>(current) < (std::numeric_limits<uint32_t>::max)()) {
+            // InterlockedCompareExchange: atomically compare and swap
+            // Returns the original value; if unchanged, swap occurred
+            LONG original = InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(&hitCount),
+                current + 1,
+                current
+            );
+            if (original == current) {
+                break; // Successfully incremented
             }
+            current = original; // Retry with new value
         }
+    }
+    
+    /// @brief Get current hit count (thread-safe read)
+    [[nodiscard]] uint32_t GetHitCount() const noexcept {
+        // Use volatile read for memory-mapped consistency
+        return hitCount;
     }
     
     /// @brief Default constructor - zero-initialize all members
@@ -507,7 +525,7 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
         hashData.fill(0u);
     }
 
-    /// @brief Copy constructor - performs deep copy with atomic safety
+    /// @brief Copy constructor - performs deep copy with thread-safe read
     WhitelistEntry(const WhitelistEntry& other) noexcept
         : entryId(other.entryId),
           type(other.type),
@@ -528,11 +546,11 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
           descriptionLength(other.descriptionLength),
           createdByOffset(other.createdByOffset),
           policyId(other.policyId),
-          hitCount(other.hitCount.load(std::memory_order_acquire)),
+          hitCount(other.hitCount),  // volatile read is thread-safe
           reserved2{other.reserved2[0], other.reserved2[1]}
     {}
 
-    /// @brief Copy assignment operator - performs deep copy with atomic safety
+    /// @brief Copy assignment operator - performs deep copy with thread-safe access
     WhitelistEntry& operator=(const WhitelistEntry& other) noexcept {
         if (this != &other) {
             entryId = other.entryId;
@@ -555,8 +573,7 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
             descriptionLength = other.descriptionLength;
             createdByOffset = other.createdByOffset;
             policyId = other.policyId;
-            hitCount.store(other.hitCount.load(std::memory_order_acquire), 
-                          std::memory_order_release);
+            hitCount = other.hitCount;  // volatile read/write is thread-safe
             reserved2[0] = other.reserved2[0];
             reserved2[1] = other.reserved2[1];
         }
@@ -584,7 +601,7 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
           descriptionLength(other.descriptionLength),
           createdByOffset(other.createdByOffset),
           policyId(other.policyId),
-          hitCount(other.hitCount.load(std::memory_order_acquire)),
+          hitCount(other.hitCount),  // volatile read is thread-safe
           reserved2{other.reserved2[0], other.reserved2[1]}
     {}
     
@@ -611,8 +628,7 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
             descriptionLength = other.descriptionLength;
             createdByOffset = other.createdByOffset;
             policyId = other.policyId;
-            hitCount.store(other.hitCount.load(std::memory_order_acquire),
-                          std::memory_order_release);
+            hitCount = other.hitCount;  // volatile read/write is thread-safe
             reserved2[0] = other.reserved2[0];
             reserved2[1] = other.reserved2[1];
         }
@@ -1318,6 +1334,16 @@ namespace Format {
 
 /// @brief Get reason name
 [[nodiscard]] const char* ReasonToString(WhitelistReason reason) noexcept;
+
+/// @brief Get path match mode name
+[[nodiscard]] const char* PathMatchModeToString(PathMatchMode mode) noexcept;
+
+/// @brief Convert WhitelistFlags bitmask to comma-separated string of flag names
+[[nodiscard]] std::string FlagsToString(WhitelistFlags flags);
+
+/// @brief Secure constant-time hash comparison (prevents timing attacks)
+/// @security Use this for security-critical hash comparisons
+[[nodiscard]] bool SecureHashCompare(const HashValue& a, const HashValue& b) noexcept;
 
 /// @brief Parse hash string to HashValue
 [[nodiscard]] std::optional<HashValue> ParseHashString(

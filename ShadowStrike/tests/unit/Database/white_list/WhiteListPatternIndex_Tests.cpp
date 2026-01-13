@@ -205,7 +205,7 @@ protected:
         uint64_t usedSize = 0;
         auto result = index->CreateNew(m_buffer->Data(), bufferSize, usedSize);
         
-        EXPECT_TRUE(result.IsSuccess()) << "Failed to create index: " << result.GetMessage();
+        EXPECT_TRUE(result.IsSuccess()) << "Failed to create index: " << result.code;
         EXPECT_GT(usedSize, 0ULL) << "Used size should be positive";
         
         return index;

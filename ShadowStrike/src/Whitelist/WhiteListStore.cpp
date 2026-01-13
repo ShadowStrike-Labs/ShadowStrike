@@ -41,6 +41,7 @@
 #include <iomanip>
 #include <limits>
 #include <climits>
+#include <utility>   // For std::exchange
 
 // Windows headers
 #include <windows.h>
@@ -166,8 +167,113 @@ WhitelistStore::~WhitelistStore() {
     Close();
 }
 
-WhitelistStore::WhitelistStore(WhitelistStore&&) noexcept = default;
-WhitelistStore& WhitelistStore::operator=(WhitelistStore&&) noexcept = default;
+WhitelistStore::WhitelistStore(WhitelistStore&& other) noexcept
+    : m_databasePath(std::move(other.m_databasePath))
+    , m_mappedView(std::exchange(other.m_mappedView, MemoryMappedView{}))
+    , m_initialized(other.m_initialized.exchange(false, std::memory_order_acq_rel))
+    , m_readOnly(other.m_readOnly.load(std::memory_order_acquire))
+    , m_hashBloomFilter(std::move(other.m_hashBloomFilter))
+    , m_pathBloomFilter(std::move(other.m_pathBloomFilter))
+    , m_hashIndex(std::move(other.m_hashIndex))
+    , m_pathIndex(std::move(other.m_pathIndex))
+    , m_stringPool(std::move(other.m_stringPool))
+    , m_queryCache(std::move(other.m_queryCache))
+    , m_cacheAccessCounter(other.m_cacheAccessCounter.exchange(0, std::memory_order_acq_rel))
+    , m_cachingEnabled(other.m_cachingEnabled.load(std::memory_order_acquire))
+    , m_bloomFilterEnabled(other.m_bloomFilterEnabled.load(std::memory_order_acquire))
+    , m_nextEntryId(other.m_nextEntryId.exchange(1, std::memory_order_acq_rel))
+    , m_entryDataUsed(other.m_entryDataUsed.exchange(0, std::memory_order_acq_rel))
+    , m_totalLookups(other.m_totalLookups.exchange(0, std::memory_order_acq_rel))
+    , m_cacheHits(other.m_cacheHits.exchange(0, std::memory_order_acq_rel))
+    , m_cacheMisses(other.m_cacheMisses.exchange(0, std::memory_order_acq_rel))
+    , m_bloomHits(other.m_bloomHits.exchange(0, std::memory_order_acq_rel))
+    , m_bloomRejects(other.m_bloomRejects.exchange(0, std::memory_order_acq_rel))
+    , m_totalHits(other.m_totalHits.exchange(0, std::memory_order_acq_rel))
+    , m_totalMisses(other.m_totalMisses.exchange(0, std::memory_order_acq_rel))
+    , m_totalLookupTimeNs(other.m_totalLookupTimeNs.exchange(0, std::memory_order_acq_rel))
+    , m_minLookupTimeNs(other.m_minLookupTimeNs.exchange(UINT64_MAX, std::memory_order_acq_rel))
+    , m_maxLookupTimeNs(other.m_maxLookupTimeNs.exchange(0, std::memory_order_acq_rel))
+    // Note: m_globalLock, m_entryAllocMutex, m_callbackMutex are default-initialized (new mutexes)
+    , m_matchCallback(std::move(other.m_matchCallback))
+    , m_perfFrequency(other.m_perfFrequency)
+{
+    // Clear other's performance frequency
+    other.m_perfFrequency = {};
+}
+
+WhitelistStore& WhitelistStore::operator=(WhitelistStore&& other) noexcept {
+    if (this != &other) {
+        // Close current resources first
+        Close();
+        
+        // Move data from other
+        m_databasePath = std::move(other.m_databasePath);
+        m_mappedView = std::exchange(other.m_mappedView, MemoryMappedView{});
+        m_initialized.store(other.m_initialized.exchange(false, std::memory_order_acq_rel), 
+                           std::memory_order_release);
+        m_readOnly.store(other.m_readOnly.load(std::memory_order_acquire), 
+                        std::memory_order_release);
+        
+        // Move unique_ptrs
+        m_hashBloomFilter = std::move(other.m_hashBloomFilter);
+        m_pathBloomFilter = std::move(other.m_pathBloomFilter);
+        m_hashIndex = std::move(other.m_hashIndex);
+        m_pathIndex = std::move(other.m_pathIndex);
+        m_stringPool = std::move(other.m_stringPool);
+        
+        // Move cache
+        m_queryCache = std::move(other.m_queryCache);
+        m_cacheAccessCounter.store(other.m_cacheAccessCounter.exchange(0, std::memory_order_acq_rel),
+                                   std::memory_order_release);
+        m_cachingEnabled.store(other.m_cachingEnabled.load(std::memory_order_acquire),
+                              std::memory_order_release);
+        m_bloomFilterEnabled.store(other.m_bloomFilterEnabled.load(std::memory_order_acquire),
+                                  std::memory_order_release);
+        
+        // Move entry allocation state
+        m_nextEntryId.store(other.m_nextEntryId.exchange(1, std::memory_order_acq_rel),
+                           std::memory_order_release);
+        m_entryDataUsed.store(other.m_entryDataUsed.exchange(0, std::memory_order_acq_rel),
+                             std::memory_order_release);
+        
+        // Move statistics
+        m_totalLookups.store(other.m_totalLookups.exchange(0, std::memory_order_acq_rel),
+                            std::memory_order_release);
+        m_cacheHits.store(other.m_cacheHits.exchange(0, std::memory_order_acq_rel),
+                         std::memory_order_release);
+        m_cacheMisses.store(other.m_cacheMisses.exchange(0, std::memory_order_acq_rel),
+                           std::memory_order_release);
+        m_bloomHits.store(other.m_bloomHits.exchange(0, std::memory_order_acq_rel),
+                         std::memory_order_release);
+        m_bloomRejects.store(other.m_bloomRejects.exchange(0, std::memory_order_acq_rel),
+                            std::memory_order_release);
+        m_totalHits.store(other.m_totalHits.exchange(0, std::memory_order_acq_rel),
+                         std::memory_order_release);
+        m_totalMisses.store(other.m_totalMisses.exchange(0, std::memory_order_acq_rel),
+                           std::memory_order_release);
+        m_totalLookupTimeNs.store(other.m_totalLookupTimeNs.exchange(0, std::memory_order_acq_rel),
+                                 std::memory_order_release);
+        m_minLookupTimeNs.store(other.m_minLookupTimeNs.exchange(UINT64_MAX, std::memory_order_acq_rel),
+                               std::memory_order_release);
+        m_maxLookupTimeNs.store(other.m_maxLookupTimeNs.exchange(0, std::memory_order_acq_rel),
+                               std::memory_order_release);
+        
+        // Note: Mutexes cannot be moved - they are default-initialized
+        // We don't need to move them since this object has its own mutexes
+        
+        // Move callback
+        {
+            std::lock_guard lockOther(other.m_callbackMutex);
+            std::lock_guard lockThis(m_callbackMutex);
+            m_matchCallback = std::move(other.m_matchCallback);
+        }
+        
+        // Copy performance frequency
+        m_perfFrequency = other.m_perfFrequency;
+        other.m_perfFrequency = {};
+    }
+    return *this;
+}
 
 // ============================================================================
 // WHITELIST STORE - LIFECYCLE
@@ -442,11 +548,14 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
                 if (SafeAdd(header->bloomFilterOffset, header->bloomFilterSize, bloomEnd)) {
                     const void* bloomData = m_mappedView.GetAt<uint8_t>(header->bloomFilterOffset);
                     if (bloomData) {
-                        m_hashBloomFilter->Initialize(
+                        bool initSuccess = m_hashBloomFilter->Initialize(
                             bloomData,
                             header->bloomFilterSize * 8, // Convert bytes to bits
                             7 // Default hash function count
                         );
+                        if (!initSuccess) {
+                            SS_LOG_WARN(L"Whitelist", L"Failed to initialize bloom filter from mapped data");
+                        }
                     }
                 }
             }
@@ -2184,7 +2293,11 @@ StoreError WhitelistStore::UpdateEntryFlags(
             HashValue hash(foundEntry->hashAlgorithm,
                 foundEntry->hashData.data(),
                 foundEntry->hashLength);
-            m_hashIndex->Remove(hash); // Best effort - ignore error
+            auto removeResult = m_hashIndex->Remove(hash);
+            if (!removeResult.IsSuccess() && 
+                removeResult.code != WhitelistStoreError::EntryNotFound) {
+                SS_LOG_WARN(L"Whitelist", L"Failed to remove revoked hash from index");
+            }
         } else if ((foundEntry->type == WhitelistEntryType::FilePath ||
                     foundEntry->type == WhitelistEntryType::ProcessPath) &&
                    m_pathIndex && m_stringPool) {
@@ -2192,7 +2305,11 @@ StoreError WhitelistStore::UpdateEntryFlags(
                 foundEntry->pathOffset,
                 foundEntry->pathLength);
             if (!pathView.empty()) {
-                m_pathIndex->Remove(pathView, foundEntry->matchMode); // Best effort
+                auto removeResult = m_pathIndex->Remove(pathView, foundEntry->matchMode);
+                if (!removeResult.IsSuccess() && 
+                    removeResult.code != WhitelistStoreError::EntryNotFound) {
+                    SS_LOG_WARN(L"Whitelist", L"Failed to remove revoked path from index");
+                }
             }
         }
     }
@@ -2568,7 +2685,12 @@ StoreError WhitelistStore::ImportFromJSONString(
         
         // Save changes
         if (imported > 0) {
-            Save();
+            auto saveResult = Save();
+            if (!saveResult.IsSuccess()) {
+                SS_LOG_WARN(L"Whitelist", L"Failed to save after JSON import: %S", 
+                    saveResult.message.c_str());
+                // Continue - entries are in memory even if save failed
+            }
         }
         
         return StoreError::Success();
@@ -2912,7 +3034,12 @@ StoreError WhitelistStore::ImportFromCSV(
         
         // Save changes
         if (imported > 0) {
-            Save();
+            auto saveResult = Save();
+            if (!saveResult.IsSuccess()) {
+                SS_LOG_WARN(L"Whitelist", L"Failed to save after CSV import: %S",
+                    saveResult.message.c_str());
+                // Continue - entries are in memory even if save failed
+            }
         }
         
         return StoreError::Success();
@@ -3679,14 +3806,22 @@ StoreError WhitelistStore::PurgeExpired() noexcept {
                 HashValue hash(entry->hashAlgorithm,
                     entry->hashData.data(),
                     entry->hashLength);
-                m_hashIndex->Remove(hash); // Best effort
+                auto removeResult = m_hashIndex->Remove(hash);
+                if (!removeResult.IsSuccess() && 
+                    removeResult.code != WhitelistStoreError::EntryNotFound) {
+                    SS_LOG_WARN(L"Whitelist", L"Failed to remove expired hash from index");
+                }
             } else if ((entryType == WhitelistEntryType::FilePath ||
                         entryType == WhitelistEntryType::ProcessPath) &&
                        m_pathIndex && m_stringPool) {
                 auto pathView = m_stringPool->GetWideString(
                     entry->pathOffset, entry->pathLength);
                 if (!pathView.empty()) {
-                    m_pathIndex->Remove(pathView, entry->matchMode); // Best effort
+                    auto removeResult = m_pathIndex->Remove(pathView, entry->matchMode);
+                    if (!removeResult.IsSuccess() && 
+                        removeResult.code != WhitelistStoreError::EntryNotFound) {
+                        SS_LOG_WARN(L"Whitelist", L"Failed to remove expired path from index");
+                    }
                 }
             }
             
@@ -3957,7 +4092,11 @@ StoreError WhitelistStore::Compact() noexcept {
                     HashValue hash(entry.hashAlgorithm,
                         entry.hashData.data(),
                         entry.hashLength);
-                    m_hashIndex->Insert(hash, offset);
+                    auto insertResult = m_hashIndex->Insert(hash, offset);
+                    if (!insertResult.IsSuccess() && 
+                        insertResult.code != WhitelistStoreError::DuplicateEntry) {
+                        SS_LOG_WARN(L"Whitelist", L"Failed to reindex hash in compact");
+                    }
                 }
             } else if ((entry.type == WhitelistEntryType::FilePath ||
                         entry.type == WhitelistEntryType::ProcessPath) &&
@@ -3974,7 +4113,11 @@ StoreError WhitelistStore::Compact() noexcept {
                         }
                         m_pathBloomFilter->Add(pathHash);
                     }
-                    m_pathIndex->Insert(pathView, entry.matchMode, offset);
+                    auto insertResult = m_pathIndex->Insert(pathView, entry.matchMode, offset);
+                    if (!insertResult.IsSuccess() && 
+                        insertResult.code != WhitelistStoreError::DuplicateEntry) {
+                        SS_LOG_WARN(L"Whitelist", L"Failed to reindex path in compact");
+                    }
                 }
             }
             
@@ -4211,14 +4354,59 @@ StoreError WhitelistStore::RebuildIndices() noexcept {
                 }
                 
             } else if (entry->type == WhitelistEntryType::Certificate) {
-                // Certificate entries - could be indexed by thumbprint
-                // For now, just track count
-                // Future: Add certificate index
+                // Certificate entries are indexed by thumbprint (stored as hash)
+                // SHA-256 thumbprint is stored in hashData field
+                if (m_hashIndex && entry->hashLength > 0) {
+                    HashValue certHash(entry->hashAlgorithm,
+                        entry->hashData.data(),
+                        entry->hashLength);
+                    
+                    auto insertResult = m_hashIndex->Insert(certHash, offset);
+                    if (!insertResult.IsSuccess() && 
+                        insertResult.code != WhitelistStoreError::DuplicateEntry) {
+                        SS_LOG_WARN(L"Whitelist", 
+                            L"Failed to index certificate entry ID %llu", entry->entryId);
+                        ++indexErrors;
+                    }
+                    
+                    // Also add to bloom filter for fast negative lookups
+                    if (m_hashBloomFilter) {
+                        m_hashBloomFilter->Add(certHash.FastHash());
+                    }
+                }
                 
             } else if (entry->type == WhitelistEntryType::Publisher) {
-                // Publisher entries - could be indexed by publisher name
-                // For now, just track count
-                // Future: Add publisher index
+                // Publisher entries are indexed by publisher name (stored as path)
+                // Uses the path index for efficient string matching
+                if (m_stringPool && m_pathIndex && entry->pathLength > 0) {
+                    auto publisherName = m_stringPool->GetWideString(
+                        entry->pathOffset, entry->pathLength);
+                    
+                    if (!publisherName.empty()) {
+                        auto insertResult = m_pathIndex->Insert(
+                            publisherName, entry->matchMode, offset);
+                        if (!insertResult.IsSuccess() && 
+                            insertResult.code != WhitelistStoreError::DuplicateEntry) {
+                            SS_LOG_WARN(L"Whitelist",
+                                L"Failed to index publisher entry ID %llu", entry->entryId);
+                            ++indexErrors;
+                        }
+                        
+                        // Also add to path bloom filter
+                        if (m_pathBloomFilter) {
+                            uint64_t publisherHash = 14695981039346656037ULL;
+                            for (wchar_t c : publisherName) {
+                                publisherHash ^= static_cast<uint64_t>(c);
+                                publisherHash *= 1099511628211ULL;
+                            }
+                            m_pathBloomFilter->Add(publisherHash);
+                        }
+                    } else {
+                        SS_LOG_WARN(L"Whitelist",
+                            L"Empty publisher name for entry ID %llu", entry->entryId);
+                        ++indexErrors;
+                    }
+                }
             }
             
         } catch (const std::exception& e) {

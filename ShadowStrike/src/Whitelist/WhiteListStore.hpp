@@ -370,6 +370,177 @@ private:
 };
 
 // ============================================================================
+// HASH INDEX STATISTICS (for GetDetailedStats)
+// ============================================================================
+
+/**
+ * @brief Detailed statistics for HashIndex monitoring and diagnostics
+ * 
+ * Contains comprehensive metrics about the B+Tree index state including:
+ * - Entry and node counts
+ * - Memory usage metrics
+ * - Tree structure information
+ * - Performance characteristics
+ */
+struct HashIndexStats {
+    // ========================================================================
+    // COUNT METRICS
+    // ========================================================================
+    
+    uint64_t entryCount{0};           ///< Total number of hash entries in index
+    uint64_t nodeCount{0};            ///< Total number of B+Tree nodes
+    uint64_t leafNodeCount{0};        ///< Number of leaf nodes only
+    uint64_t internalNodeCount{0};    ///< Number of internal nodes only
+    
+    // ========================================================================
+    // TREE STRUCTURE METRICS  
+    // ========================================================================
+    
+    uint32_t treeDepth{0};            ///< Current depth of the tree
+    double avgLeafFillRate{0.0};      ///< Average fill rate of leaf nodes (0.0-1.0)
+    double avgInternalFillRate{0.0};  ///< Average fill rate of internal nodes (0.0-1.0)
+    uint32_t minLeafKeys{0};          ///< Minimum keys in any leaf node
+    uint32_t maxLeafKeys{0};          ///< Maximum keys in any leaf node
+    
+    // ========================================================================
+    // MEMORY METRICS
+    // ========================================================================
+    
+    uint64_t indexSize{0};            ///< Total allocated index size in bytes
+    uint64_t usedSize{0};             ///< Actually used size in bytes
+    uint64_t freeSpace{0};            ///< Available space for new nodes
+    double fragmentationRatio{0.0};   ///< Ratio of wasted space due to fragmentation
+    
+    // ========================================================================
+    // PERFORMANCE METRICS
+    // ========================================================================
+    
+    uint64_t lookupCount{0};          ///< Total lookup operations performed
+    uint64_t insertCount{0};          ///< Total insert operations performed  
+    uint64_t removeCount{0};          ///< Total remove operations performed
+    uint64_t splitCount{0};           ///< Number of node splits that occurred
+    uint64_t cacheHits{0};            ///< Cache hit count (if caching enabled)
+    uint64_t cacheMisses{0};          ///< Cache miss count (if caching enabled)
+    
+    // ========================================================================
+    // STATE FLAGS
+    // ========================================================================
+    
+    bool isReady{false};              ///< Index is initialized and ready
+    bool isWritable{false};           ///< Index is in writable mode
+    bool isMemoryMapped{false};       ///< Index is using memory-mapped I/O
+    bool needsRebalancing{false};     ///< Index may benefit from rebalancing
+    bool needsCompaction{false};      ///< Index may benefit from compaction
+    
+    // ========================================================================
+    // INTEGRITY STATUS
+    // ========================================================================
+    
+    bool lastIntegrityCheckPassed{true};  ///< Result of last integrity check
+    uint64_t lastIntegrityCheckTime{0};   ///< Timestamp of last integrity check (Unix epoch)
+    uint32_t corruptedNodes{0};           ///< Number of corrupted nodes found
+};
+
+// ============================================================================
+// HASH INDEX ITERATOR (Forward iteration over entries)
+// ============================================================================
+
+// Forward declaration
+class HashIndex;
+
+/**
+ * @brief Forward iterator for HashIndex entries
+ * 
+ * Provides STL-compatible iteration over B+Tree leaf nodes.
+ * Uses the leaf linked list for efficient sequential access.
+ * 
+ * Thread-safety:
+ * - Iterator holds a shared_lock on the index during iteration
+ * - Iterator is invalidated by any modification to the index
+ * 
+ * Usage:
+ * @code
+ * for (auto it = index.begin(); it != index.end(); ++it) {
+ *     auto [key, offset] = *it;
+ *     // ... use key and offset
+ * }
+ * @endcode
+ */
+class HashIndexIterator {
+public:
+    // ========================================================================
+    // STL ITERATOR TYPE DEFINITIONS
+    // ========================================================================
+    using value_type = std::pair<uint64_t, uint64_t>;   // (key, entryOffset)
+    using reference = value_type;
+    using pointer = const value_type*;
+    using difference_type = std::ptrdiff_t;
+    using iterator_category = std::forward_iterator_tag;
+    
+    /**
+     * @brief Default constructor - creates end iterator
+     */
+    HashIndexIterator() noexcept = default;
+    
+    /**
+     * @brief Construct iterator at specific position
+     * @param index Pointer to HashIndex (not owned)
+     * @param leafOffset Offset of current leaf node
+     * @param keyIndex Index within current leaf
+     */
+    HashIndexIterator(
+        const HashIndex* index,
+        uint64_t leafOffset,
+        uint32_t keyIndex
+    ) noexcept;
+    
+    /**
+     * @brief Dereference - get current entry
+     * @return Pair of (key, entryOffset)
+     * @note UB if iterator is at end
+     */
+    [[nodiscard]] value_type operator*() const noexcept;
+    
+    /**
+     * @brief Pre-increment - advance to next entry
+     * @return Reference to this iterator
+     */
+    HashIndexIterator& operator++() noexcept;
+    
+    /**
+     * @brief Post-increment - advance to next entry
+     * @return Copy of iterator before increment
+     */
+    HashIndexIterator operator++(int) noexcept;
+    
+    /**
+     * @brief Equality comparison
+     * @param other Iterator to compare with
+     * @return True if both iterators point to same position
+     */
+    [[nodiscard]] bool operator==(const HashIndexIterator& other) const noexcept;
+    
+    /**
+     * @brief Inequality comparison
+     * @param other Iterator to compare with
+     * @return True if iterators point to different positions
+     */
+    [[nodiscard]] bool operator!=(const HashIndexIterator& other) const noexcept;
+    
+    /**
+     * @brief Check if iterator is valid (not at end)
+     * @return True if iterator can be dereferenced
+     */
+    [[nodiscard]] bool IsValid() const noexcept;
+    
+private:
+    const HashIndex* m_index{nullptr};    ///< Pointer to index (not owned)
+    uint64_t m_leafOffset{0};             ///< Current leaf node offset
+    uint32_t m_keyIndex{0};               ///< Current key index within leaf
+    bool m_atEnd{true};                   ///< True if at end position
+};
+
+// ============================================================================
 // HASH INDEX (B+Tree for hash lookups)
 // ============================================================================
 
@@ -392,6 +563,12 @@ private:
  */
 class HashIndex {
 public:
+    // ========================================================================
+    // ITERATOR TYPE ALIASES
+    // ========================================================================
+    using iterator = HashIndexIterator;
+    using const_iterator = HashIndexIterator;
+    
     HashIndex();
     ~HashIndex();
     
@@ -521,7 +698,120 @@ public:
         return m_baseAddress != nullptr;
     }
     
+    /**
+     * @brief Get detailed statistics about the index
+     * @return HashIndexStats structure with comprehensive metrics
+     * @note Thread-safe (acquires shared lock)
+     */
+    [[nodiscard]] HashIndexStats GetDetailedStats() const noexcept;
+    
+    // ========================================================================
+    // ITERATOR SUPPORT (Enterprise Features)
+    // ========================================================================
+    
+    /**
+     * @brief Get iterator to the beginning (first entry)
+     * @return Iterator pointing to first entry, or end() if empty
+     * @note NOT thread-safe during iteration - use with caution
+     * @warning Iterator is invalidated by any modification to the index
+     */
+    [[nodiscard]] iterator begin() const noexcept;
+    
+    /**
+     * @brief Get iterator past the end
+     * @return End iterator sentinel
+     */
+    [[nodiscard]] iterator end() const noexcept;
+    
+    /**
+     * @brief Get const iterator to the beginning
+     * @return Const iterator pointing to first entry
+     */
+    [[nodiscard]] const_iterator cbegin() const noexcept { return begin(); }
+    
+    /**
+     * @brief Get const iterator past the end
+     * @return Const end iterator sentinel
+     */
+    [[nodiscard]] const_iterator cend() const noexcept { return end(); }
+    
+    // ========================================================================
+    // RANGE OPERATIONS (Enterprise Features)
+    // ========================================================================
+    
+    /**
+     * @brief Find all entries within a key range (inclusive)
+     * @param minKey Minimum key value (inclusive)
+     * @param maxKey Maximum key value (inclusive)
+     * @param[out] results Vector of (key, offset) pairs found in range
+     * @param maxResults Maximum number of results to return (0 = no limit)
+     * @return Number of entries found
+     * @note Uses leaf linked list for efficient sequential access
+     */
+    [[nodiscard]] size_t FindInRange(
+        uint64_t minKey,
+        uint64_t maxKey,
+        std::vector<std::pair<uint64_t, uint64_t>>& results,
+        size_t maxResults = 0
+    ) const noexcept;
+    
+    /**
+     * @brief Get first N entries from the index (for iteration/pagination)
+     * @param offset Starting offset (skip first N entries)
+     * @param count Maximum number of entries to retrieve
+     * @param[out] results Vector of (key, offset) pairs
+     * @return Actual number of entries retrieved
+     */
+    [[nodiscard]] size_t GetEntries(
+        size_t offset,
+        size_t count,
+        std::vector<std::pair<uint64_t, uint64_t>>& results
+    ) const noexcept;
+    
+    // ========================================================================
+    // MAINTENANCE OPERATIONS (Enterprise Features)
+    // ========================================================================
+    
+    /**
+     * @brief Verify integrity of the entire index
+     * @param[out] corruptedNodes Number of corrupted nodes found
+     * @param repairIfPossible Attempt to repair minor issues
+     * @return True if index passes all integrity checks
+     * @note Thread-safe (acquires exclusive lock if repair enabled)
+     */
+    [[nodiscard]] bool VerifyIntegrity(
+        uint32_t& corruptedNodes,
+        bool repairIfPossible = false
+    ) noexcept;
+    
+    /**
+     * @brief Compact the index to reclaim fragmented space
+     * @param[out] reclaimedBytes Number of bytes reclaimed
+     * @return Success or error code
+     * @note Requires writable mode, acquires exclusive lock
+     */
+    [[nodiscard]] StoreError Compact(uint64_t& reclaimedBytes) noexcept;
+    
+    /**
+     * @brief Rebalance the tree to optimize performance
+     * @return Success or error code
+     * @note Requires writable mode, acquires exclusive lock
+     */
+    [[nodiscard]] StoreError Rebalance() noexcept;
+    
+    /**
+     * @brief Clear all entries from the index
+     * @return Success or error code
+     * @note Requires writable mode
+     */
+    [[nodiscard]] StoreError Clear() noexcept;
+    
 private:
+    // ========================================================================
+    // FRIEND DECLARATIONS
+    // ========================================================================
+    friend class HashIndexIterator;  // Allow iterator access to GetLeafAt
+    
     // ========================================================================
     // INTERNAL METHODS
     // ========================================================================
@@ -541,6 +831,30 @@ private:
     /// @brief Validate offset is within bounds
     [[nodiscard]] bool IsOffsetValid(uint64_t offset) const noexcept;
     
+    /// @brief Get first leaf node (leftmost)
+    [[nodiscard]] const BPlusTreeNode* GetFirstLeaf() const noexcept;
+    
+    /// @brief Get leaf node at specific offset
+    [[nodiscard]] const BPlusTreeNode* GetLeafAt(uint64_t offset) const noexcept;
+    
+    /// @brief Propagate key to parent after split
+    [[nodiscard]] StoreError PropagateToParent(
+        BPlusTreeNode* node,
+        uint64_t promotedKey,
+        uint64_t newChildOffset
+    ) noexcept;
+    
+    /// @brief Handle underflow after remove (merge/redistribute)
+    [[nodiscard]] StoreError HandleUnderflow(BPlusTreeNode* node) noexcept;
+    
+    /// @brief Count leaf nodes and gather statistics (helper for GetDetailedStats)
+    void GatherLeafStats(
+        uint64_t& leafCount,
+        uint64_t& totalLeafKeys,
+        uint32_t& minKeys,
+        uint32_t& maxKeys
+    ) const noexcept;
+    
     // ========================================================================
     // MEMBER DATA
     // ========================================================================
@@ -556,8 +870,114 @@ private:
     std::atomic<uint64_t> m_nodeCount{0};      ///< Number of nodes
     mutable std::shared_mutex m_rwLock;         ///< Reader-writer lock
     
+    // Performance counters (mutable for const methods)
+    mutable std::atomic<uint64_t> m_lookupCount{0};   ///< Total lookups
+    mutable std::atomic<uint64_t> m_insertCount{0};   ///< Total inserts
+    mutable std::atomic<uint64_t> m_removeCount{0};   ///< Total removes
+    mutable std::atomic<uint64_t> m_splitCount{0};    ///< Total splits
+    
     /// @brief Maximum tree depth to prevent infinite loops
     static constexpr uint32_t MAX_TREE_DEPTH = 32;
+};
+
+// ============================================================================
+// PATH INDEX STATISTICS (for GetDetailedStats)
+// ============================================================================
+
+/**
+ * @brief Detailed statistics for PathIndex monitoring and diagnostics
+ * 
+ * Contains comprehensive metrics about the compressed trie state including:
+ * - Path and node counts
+ * - Memory usage metrics
+ * - Trie structure information
+ * - Performance characteristics
+ * - Integrity status
+ */
+struct PathIndexStats {
+    // ========================================================================
+    // COUNT METRICS
+    // ========================================================================
+    
+    uint64_t pathCount{0};            ///< Total number of indexed paths
+    uint64_t nodeCount{0};            ///< Total number of trie nodes
+    uint64_t terminalNodes{0};        ///< Number of terminal nodes (with entries)
+    uint64_t internalNodes{0};        ///< Number of non-terminal nodes
+    uint64_t emptyChildSlots{0};      ///< Total empty child slots across all nodes
+    
+    // ========================================================================
+    // TRIE STRUCTURE METRICS
+    // ========================================================================
+    
+    uint32_t maxDepth{0};             ///< Maximum depth of the trie
+    uint32_t avgDepth{0};             ///< Average depth to terminal nodes
+    double avgChildCount{0.0};        ///< Average children per internal node
+    double avgSegmentLength{0.0};     ///< Average segment length per node
+    uint32_t longestSegment{0};       ///< Longest segment in any node
+    
+    // ========================================================================
+    // MEMORY METRICS
+    // ========================================================================
+    
+    uint64_t indexSize{0};            ///< Total allocated index size in bytes
+    uint64_t usedSize{0};             ///< Actually used size in bytes
+    uint64_t freeSpace{0};            ///< Available space for new nodes
+    double fragmentationRatio{0.0};   ///< Ratio of wasted space (lazy deleted nodes)
+    uint64_t deletedNodes{0};         ///< Number of lazy-deleted nodes
+    
+    // ========================================================================
+    // MATCH MODE DISTRIBUTION
+    // ========================================================================
+    
+    uint64_t exactMatchPaths{0};      ///< Paths with Exact match mode
+    uint64_t prefixMatchPaths{0};     ///< Paths with Prefix match mode
+    uint64_t suffixMatchPaths{0};     ///< Paths with Suffix match mode
+    uint64_t globMatchPaths{0};       ///< Paths with Glob match mode
+    uint64_t regexMatchPaths{0};      ///< Paths with Regex match mode
+    
+    // ========================================================================
+    // PERFORMANCE METRICS
+    // ========================================================================
+    
+    uint64_t lookupCount{0};          ///< Total lookup operations performed
+    uint64_t insertCount{0};          ///< Total insert operations performed
+    uint64_t removeCount{0};          ///< Total remove operations performed
+    uint64_t lookupHits{0};           ///< Successful lookups (found paths)
+    uint64_t lookupMisses{0};         ///< Failed lookups (path not found)
+    
+    // ========================================================================
+    // STATE FLAGS
+    // ========================================================================
+    
+    bool isReady{false};              ///< Index is initialized and ready
+    bool isWritable{false};           ///< Index is in writable mode
+    bool needsCompaction{false};      ///< Index may benefit from compaction
+    
+    // ========================================================================
+    // INTEGRITY STATUS
+    // ========================================================================
+    
+    bool lastIntegrityCheckPassed{true};  ///< Result of last integrity check
+    uint64_t lastIntegrityCheckTime{0};   ///< Timestamp of last check (Unix epoch)
+    uint32_t corruptedNodes{0};           ///< Number of corrupted nodes found
+    uint32_t orphanedNodes{0};            ///< Nodes not reachable from root
+};
+
+// ============================================================================
+// PATH INDEX INTEGRITY RESULT
+// ============================================================================
+
+/**
+ * @brief Result of integrity verification for PathIndex
+ */
+struct PathIndexIntegrityResult {
+    bool isValid{false};              ///< Overall integrity status
+    uint32_t nodesChecked{0};         ///< Total nodes examined
+    uint32_t corruptedNodes{0};       ///< Nodes with corruption
+    uint32_t orphanedNodes{0};        ///< Unreachable nodes
+    uint32_t invalidOffsets{0};       ///< Invalid child offsets found
+    uint32_t cycleDetected{0};        ///< Cycles found in trie
+    std::string errorDetails;         ///< Detailed error description
 };
 
 // ============================================================================
@@ -679,8 +1099,22 @@ public:
         PathMatchMode mode
     ) noexcept;
     
+    /**
+     * @brief Clear all paths from index
+     * @return Success or error code
+     * @note Requires exclusive lock, not thread-safe during operation
+     */
+    [[nodiscard]] StoreError Clear() noexcept;
+    
+    /**
+     * @brief Compact index by removing lazy-deleted nodes
+     * @return Success or error code
+     * @note This is an expensive operation that rebuilds the trie
+     */
+    [[nodiscard]] StoreError Compact() noexcept;
+    
     // ========================================================================
-    // STATISTICS
+    // STATISTICS AND DIAGNOSTICS
     // ========================================================================
     
     [[nodiscard]] uint64_t GetPathCount() const noexcept { 
@@ -694,6 +1128,18 @@ public:
     [[nodiscard]] bool IsReady() const noexcept {
         return (m_view != nullptr) || (m_baseAddress != nullptr);
     }
+    
+    /**
+     * @brief Get detailed statistics about the path index
+     * @return PathIndexStats structure with comprehensive metrics
+     */
+    [[nodiscard]] PathIndexStats GetDetailedStats() const noexcept;
+    
+    /**
+     * @brief Verify integrity of the trie structure
+     * @return PathIndexIntegrityResult with detailed status
+     */
+    [[nodiscard]] PathIndexIntegrityResult VerifyIntegrity() const noexcept;
     
 private:
     // ========================================================================
@@ -713,6 +1159,12 @@ private:
     std::atomic<uint64_t> m_pathCount{0};      ///< Number of paths
     std::atomic<uint64_t> m_nodeCount{0};      ///< Number of nodes
     mutable std::shared_mutex m_rwLock;         ///< Reader-writer lock
+    
+    // Performance counters (mutable for const methods)
+    mutable std::atomic<uint64_t> m_lookupCount{0};   ///< Total lookups
+    mutable std::atomic<uint64_t> m_lookupHits{0};    ///< Successful lookups
+    mutable std::atomic<uint64_t> m_insertCount{0};   ///< Total inserts
+    mutable std::atomic<uint64_t> m_removeCount{0};   ///< Total removes
 };
 
 // ============================================================================

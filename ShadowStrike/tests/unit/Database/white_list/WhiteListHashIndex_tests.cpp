@@ -141,14 +141,15 @@ public:
      */
     [[nodiscard]] HashValue Generate(uint64_t index) const {
         HashValue hash{};
-        hash.type = HashType::SHA256;
-        
+        hash.algorithm = HashAlgorithm::SHA256;
+        hash.length = 32;
+
         // Create deterministic SHA256-like data based on index
         const uint64_t base = index * 0x9E3779B97F4A7C15ULL;  // Golden ratio hash
         
-        for (size_t i = 0; i < sizeof(hash.sha256); ++i) {
+        for (size_t i = 0; i < hash.length; ++i) {
             const uint64_t mixed = base ^ (static_cast<uint64_t>(i) * 0xBF58476D1CE4E5B9ULL);
-            hash.sha256[i] = static_cast<uint8_t>(mixed >> (i % 8 * 8));
+            hash.data[i] = static_cast<uint8_t>(mixed >> (i % 8 * 8));
         }
         
         return hash;
@@ -159,10 +160,11 @@ public:
      */
     [[nodiscard]] HashValue GenerateRandom() {
         HashValue hash{};
-        hash.type = HashType::SHA256;
+        hash.algorithm = HashAlgorithm::SHA256;
+        hash.length = 32;
         
-        for (size_t i = 0; i < sizeof(hash.sha256); ++i) {
-            hash.sha256[i] = static_cast<uint8_t>(m_rng());
+        for (size_t i = 0; i < hash.length; ++i) {
+            hash.data[i] = static_cast<uint8_t>(m_rng());
         }
         
         return hash;
@@ -693,16 +695,19 @@ TEST_F(HashIndexTest, MultipleHashTypes) {
     
     // Create hashes with different types
     HashValue sha256Hash{};
-    sha256Hash.type = HashType::SHA256;
-    sha256Hash.sha256[0] = 0x11;
+    sha256Hash.algorithm = HashAlgorithm::SHA256;
+    sha256Hash.length = 32;
+    sha256Hash.data[0] = 0x11;
     
     HashValue sha1Hash{};
-    sha1Hash.type = HashType::SHA1;
-    sha1Hash.sha1[0] = 0x22;
+    sha1Hash.algorithm = HashAlgorithm::SHA1;
+	sha1Hash.length = 20;
+    sha1Hash.data[0] = 0x22;
     
     HashValue md5Hash{};
-    md5Hash.type = HashType::MD5;
-    md5Hash.md5[0] = 0x33;
+    md5Hash.algorithm = HashAlgorithm::MD5;
+	md5Hash.length = 16;
+    md5Hash.data[0] = 0x33;
     
     EXPECT_TRUE(index.Insert(sha256Hash, 100).IsSuccess());
     EXPECT_TRUE(index.Insert(sha1Hash, 200).IsSuccess());

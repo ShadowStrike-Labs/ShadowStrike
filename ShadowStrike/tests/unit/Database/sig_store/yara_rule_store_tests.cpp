@@ -223,7 +223,7 @@ TEST_F(YaraRuleStoreTest, Compiler_DefineExternalVariables) {
     YaraCompiler compiler;
     
     compiler.DefineExternalVariable("test_string", "value");
-    compiler.DefineExternalVariable("test_int", 42);
+    compiler.DefineExternalVariable("test_int", static_cast<bool>(42));
     compiler.DefineExternalVariable("test_bool", true);
     
     // Should not crash

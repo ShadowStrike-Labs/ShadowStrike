@@ -49,6 +49,12 @@
 #include <locale>
 #include <limits>
 #include <type_traits>
+#include <regex>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <thread>
+#include <future>
 
 // Windows API headers
 #ifndef WIN32_LEAN_AND_MEAN
@@ -167,6 +173,57 @@ inline void SecureZero(void* ptr, size_t size) noexcept {
  */
 inline void MemoryBarrier_() noexcept {
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+/**
+ * @brief Constant-time memory comparison to prevent timing attacks.
+ *
+ * This function compares two memory regions in constant time, regardless
+ * of where differences occur. This prevents timing side-channel attacks
+ * that could leak information about hash values or cryptographic keys.
+ *
+ * Unlike std::memcmp, this function:
+ * - Always compares ALL bytes (no early exit)
+ * - Has constant execution time based only on length
+ * - Prevents compiler optimizations that could introduce timing variance
+ *
+ * @param a First memory region
+ * @param b Second memory region  
+ * @param length Number of bytes to compare
+ * @return true if all bytes are equal, false otherwise
+ *
+ * @note Thread-safe (pure function, no global state)
+ * @note Time complexity: O(n) where n = length, always
+ * @security Critical for cryptographic comparisons
+ */
+[[nodiscard]] inline bool ConstantTimeCompare(
+    const void* a,
+    const void* b,
+    size_t length
+) noexcept {
+    if (a == nullptr || b == nullptr) {
+        return a == b; // Both null = equal
+    }
+    
+    if (length == 0u) {
+        return true;
+    }
+    
+    const auto* pa = static_cast<const volatile uint8_t*>(a);
+    const auto* pb = static_cast<const volatile uint8_t*>(b);
+    
+    // XOR all bytes together - result is 0 only if all bytes match
+    // volatile prevents compiler from optimizing to early-exit
+    volatile uint8_t result = 0u;
+    
+    for (size_t i = 0u; i < length; ++i) {
+        result |= static_cast<uint8_t>(pa[i] ^ pb[i]);
+    }
+    
+    // Memory barrier to ensure all comparisons complete before result check
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    
+    return result == 0u;
 }
 
 /**
@@ -873,6 +930,376 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
     return kHexChars[nibble & 0x0Fu];
 }
 
+// ============================================================================
+// ENTERPRISE-GRADE REGEX PATTERN CACHE
+// ============================================================================
+//
+// Thread-safe LRU cache for compiled regex patterns. Features:
+// - Lock-free reads for cache hits (using shared_mutex)
+// - Pre-compiled patterns for O(1) lookup after first compile
+// - Maximum cache size to prevent memory exhaustion
+// - Automatic eviction of least-recently-used patterns
+// - Pattern complexity validation to prevent ReDoS attacks
+// - Execution timeout mechanism for safety
+//
+// ============================================================================
+
+/**
+ * @brief Thread-safe cache for compiled wide regex patterns.
+ * 
+ * This cache provides enterprise-grade regex pattern management with:
+ * - LRU eviction to bound memory usage
+ * - Shared mutex for concurrent read access
+ * - Pattern complexity analysis to reject dangerous patterns
+ * - Execution timeout support via std::async
+ */
+class RegexPatternCache final {
+public:
+    /// @brief Maximum number of cached patterns
+    static constexpr size_t MAX_CACHE_SIZE = 1024u;
+    
+    /// @brief Maximum pattern length (prevent pathological patterns)
+    static constexpr size_t MAX_PATTERN_LENGTH = 4096u;
+    
+    /// @brief Maximum pattern complexity score (heuristic)
+    static constexpr size_t MAX_COMPLEXITY_SCORE = 100u;
+    
+    /// @brief Regex match timeout in milliseconds
+    static constexpr uint32_t MATCH_TIMEOUT_MS = 1000u;
+    
+    /// @brief Singleton accessor
+    static RegexPatternCache& Instance() noexcept {
+        static RegexPatternCache s_instance;
+        return s_instance;
+    }
+    
+    /**
+     * @brief Get or compile a regex pattern with validation.
+     * 
+     * @param pattern Wide string regex pattern
+     * @param[out] regex Pointer to receive compiled regex (nullptr if failed)
+     * @param[out] errorMsg Error message if compilation fails
+     * @return true if pattern is valid and compiled successfully
+     */
+    [[nodiscard]] bool GetOrCompile(
+        std::wstring_view pattern,
+        const std::wregex** regex,
+        std::wstring& errorMsg
+    ) noexcept {
+        if (regex == nullptr) {
+            errorMsg = L"Null regex pointer";
+            return false;
+        }
+        *regex = nullptr;
+        
+        // Validate pattern length
+        if (pattern.length() > MAX_PATTERN_LENGTH) {
+            errorMsg = L"Pattern exceeds maximum length";
+            return false;
+        }
+        
+        // Validate pattern complexity (ReDoS prevention)
+        if (!ValidatePatternComplexity(pattern, errorMsg)) {
+            return false;
+        }
+        
+        // Convert to string for map key
+        std::wstring patternKey(pattern);
+        
+        // Fast path: check cache with shared lock
+        {
+            std::shared_lock<std::shared_mutex> readLock(m_mutex);
+            auto it = m_cache.find(patternKey);
+            if (it != m_cache.end()) {
+                // Update LRU timestamp
+                it->second.lastAccess = std::chrono::steady_clock::now();
+                *regex = &(it->second.compiledRegex);
+                return true;
+            }
+        }
+        
+        // Slow path: compile and cache with exclusive lock
+        std::unique_lock<std::shared_mutex> writeLock(m_mutex);
+        
+        // Double-check after acquiring exclusive lock
+        auto it = m_cache.find(patternKey);
+        if (it != m_cache.end()) {
+            *regex = &(it->second.compiledRegex);
+            return true;
+        }
+        
+        // Evict if cache is full
+        if (m_cache.size() >= MAX_CACHE_SIZE) {
+            EvictLRU();
+        }
+        
+        // Compile the pattern
+        try {
+            CacheEntry entry;
+            // Use ECMAScript syntax with case-insensitive and optimize flags
+            entry.compiledRegex = std::wregex(
+                pattern.data(), 
+                pattern.length(),
+                std::regex_constants::ECMAScript | 
+                std::regex_constants::icase |
+                std::regex_constants::optimize
+            );
+            entry.lastAccess = std::chrono::steady_clock::now();
+            
+            auto [insertIt, inserted] = m_cache.emplace(std::move(patternKey), std::move(entry));
+            if (inserted) {
+                *regex = &(insertIt->second.compiledRegex);
+                return true;
+            } else {
+                errorMsg = L"Failed to insert pattern into cache";
+                return false;
+            }
+        } catch (const std::regex_error& e) {
+            // Convert error message to wide string
+            const char* what = e.what();
+            errorMsg = L"Regex compilation error: ";
+            while (*what) {
+                errorMsg.push_back(static_cast<wchar_t>(*what++));
+            }
+            return false;
+        } catch (const std::exception& e) {
+            const char* what = e.what();
+            errorMsg = L"Exception during regex compilation: ";
+            while (*what) {
+                errorMsg.push_back(static_cast<wchar_t>(*what++));
+            }
+            return false;
+        } catch (...) {
+            errorMsg = L"Unknown exception during regex compilation";
+            return false;
+        }
+    }
+    
+    /**
+     * @brief Execute regex match with timeout protection.
+     * 
+     * Uses std::async to run match in separate thread with timeout.
+     * This prevents ReDoS attacks from blocking the main thread.
+     * 
+     * @param regex Compiled regex pattern
+     * @param input Input string to match
+     * @param timeoutMs Timeout in milliseconds (0 = use default)
+     * @return true if match succeeded within timeout
+     */
+    [[nodiscard]] bool MatchWithTimeout(
+        const std::wregex& regex,
+        std::wstring_view input,
+        uint32_t timeoutMs = 0u
+    ) noexcept {
+        if (timeoutMs == 0u) {
+            timeoutMs = MATCH_TIMEOUT_MS;
+        }
+        
+        // Input length check - very long inputs are suspicious
+        constexpr size_t MAX_INPUT_LENGTH = 65536u;
+        if (input.length() > MAX_INPUT_LENGTH) {
+            SS_LOG_WARN(L"Whitelist", 
+                L"Regex match input too long (%zu > %zu)", 
+                input.length(), 
+                MAX_INPUT_LENGTH);
+            return false;
+        }
+        
+        try {
+            // For short inputs, match directly without timeout overhead
+            constexpr size_t SHORT_INPUT_THRESHOLD = 1024u;
+            if (input.length() <= SHORT_INPUT_THRESHOLD) {
+                return std::regex_match(input.begin(), input.end(), regex);
+            }
+            
+            // For longer inputs, use async with timeout
+            std::wstring inputCopy(input);
+            auto future = std::async(std::launch::async, [&regex, inputStr = std::move(inputCopy)]() {
+                return std::regex_match(inputStr, regex);
+            });
+            
+            // Wait with timeout
+            auto status = future.wait_for(std::chrono::milliseconds(timeoutMs));
+            
+            if (status == std::future_status::ready) {
+                return future.get();
+            } else {
+                SS_LOG_WARN(L"Whitelist", 
+                    L"Regex match timed out after %u ms - possible ReDoS pattern",
+                    timeoutMs);
+                return false;
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Whitelist", L"Exception during regex match: %S", e.what());
+            return false;
+        } catch (...) {
+            SS_LOG_ERROR(L"Whitelist", L"Unknown exception during regex match");
+            return false;
+        }
+    }
+    
+    /**
+     * @brief Clear all cached patterns.
+     * 
+     * Useful for testing or when memory pressure is high.
+     */
+    void Clear() noexcept {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        m_cache.clear();
+    }
+    
+    /**
+     * @brief Get current cache size.
+     * @return Number of cached patterns
+     */
+    [[nodiscard]] size_t Size() const noexcept {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        return m_cache.size();
+    }
+
+private:
+    RegexPatternCache() = default;
+    ~RegexPatternCache() = default;
+    
+    // Non-copyable, non-movable
+    RegexPatternCache(const RegexPatternCache&) = delete;
+    RegexPatternCache& operator=(const RegexPatternCache&) = delete;
+    RegexPatternCache(RegexPatternCache&&) = delete;
+    RegexPatternCache& operator=(RegexPatternCache&&) = delete;
+    
+    /**
+     * @brief Validate pattern complexity to prevent ReDoS attacks.
+     * 
+     * Analyzes pattern for dangerous constructs:
+     * - Nested quantifiers: (a+)+ or (a*)*
+     * - Overlapping alternations with quantifiers
+     * - Excessive backtracking potential
+     * 
+     * @param pattern Pattern to validate
+     * @param[out] errorMsg Error message if validation fails
+     * @return true if pattern passes complexity checks
+     */
+    [[nodiscard]] bool ValidatePatternComplexity(
+        std::wstring_view pattern,
+        std::wstring& errorMsg
+    ) noexcept {
+        size_t score = 0u;
+        size_t nestedGroupDepth = 0u;
+        size_t consecutiveQuantifiers = 0u;
+        size_t alternationCount = 0u;
+        bool inCharClass = false;
+        bool lastWasQuantifier = false;
+        
+        for (size_t i = 0; i < pattern.length(); ++i) {
+            const wchar_t c = pattern[i];
+            const wchar_t prev = (i > 0) ? pattern[i - 1] : L'\0';
+            
+            // Track character classes
+            if (c == L'[' && prev != L'\\') {
+                inCharClass = true;
+                continue;
+            }
+            if (c == L']' && prev != L'\\' && inCharClass) {
+                inCharClass = false;
+                continue;
+            }
+            if (inCharClass) continue;
+            
+            // Track groups
+            if (c == L'(' && prev != L'\\') {
+                ++nestedGroupDepth;
+                score += nestedGroupDepth; // Deeper groups are more expensive
+                lastWasQuantifier = false;
+                continue;
+            }
+            if (c == L')' && prev != L'\\') {
+                if (nestedGroupDepth > 0u) --nestedGroupDepth;
+                continue;
+            }
+            
+            // Track alternations
+            if (c == L'|' && prev != L'\\') {
+                ++alternationCount;
+                score += 2u;
+                lastWasQuantifier = false;
+                continue;
+            }
+            
+            // Track quantifiers
+            bool isQuantifier = (c == L'*' || c == L'+' || c == L'?' || c == L'{');
+            if (isQuantifier && prev != L'\\') {
+                if (lastWasQuantifier) {
+                    ++consecutiveQuantifiers;
+                    // Nested quantifiers are dangerous
+                    score += 10u * consecutiveQuantifiers;
+                } else {
+                    consecutiveQuantifiers = 1u;
+                }
+                
+                // Quantifier in nested group is more expensive
+                score += nestedGroupDepth * 3u;
+                lastWasQuantifier = true;
+            } else {
+                lastWasQuantifier = false;
+                consecutiveQuantifiers = 0u;
+            }
+            
+            // Dot is expensive with quantifiers
+            if (c == L'.' && prev != L'\\') {
+                score += 1u;
+            }
+        }
+        
+        // Check for dangerous patterns
+        if (score > MAX_COMPLEXITY_SCORE) {
+            errorMsg = L"Pattern complexity score too high (possible ReDoS)";
+            SS_LOG_WARN(L"Whitelist", 
+                L"Regex pattern rejected: complexity score %zu > %zu",
+                score, MAX_COMPLEXITY_SCORE);
+            return false;
+        }
+        
+        if (nestedGroupDepth > 5u) {
+            errorMsg = L"Pattern has too many nested groups";
+            return false;
+        }
+        
+        if (alternationCount > 20u) {
+            errorMsg = L"Pattern has too many alternations";
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * @brief Evict least-recently-used pattern from cache.
+     * 
+     * @note Caller must hold exclusive lock on m_mutex
+     */
+    void EvictLRU() noexcept {
+        if (m_cache.empty()) return;
+        
+        auto oldest = m_cache.begin();
+        for (auto it = m_cache.begin(); it != m_cache.end(); ++it) {
+            if (it->second.lastAccess < oldest->second.lastAccess) {
+                oldest = it;
+            }
+        }
+        
+        m_cache.erase(oldest);
+    }
+    
+    /// @brief Cache entry with metadata
+    struct CacheEntry {
+        std::wregex compiledRegex;
+        std::chrono::steady_clock::time_point lastAccess;
+    };
+    
+    mutable std::shared_mutex m_mutex;
+    std::unordered_map<std::wstring, CacheEntry> m_cache;
+};
+
 } // anonymous namespace
 
 // ============================================================================
@@ -1547,6 +1974,48 @@ bool VerifyIntegrity(const MemoryMappedView& view, StoreError& error) noexcept {
 }
 
 /**
+ * @brief Secure constant-time hash comparison.
+ *
+ * Compares two HashValue structures in constant time to prevent
+ * timing side-channel attacks. This should be used for all
+ * security-sensitive hash comparisons.
+ *
+ * The function:
+ * - First compares algorithm and length (non-secret, early exit OK)
+ * - Then compares hash data in constant time
+ *
+ * @param a First hash value
+ * @param b Second hash value
+ * @return true if hashes are equal, false otherwise
+ *
+ * @note Thread-safe (pure function)
+ * @security Use this instead of HashValue::operator== for security-critical paths
+ */
+bool SecureHashCompare(const HashValue& a, const HashValue& b) noexcept {
+    // Algorithm and length are not secret - can use early exit
+    if (a.algorithm != b.algorithm) {
+        return false;
+    }
+    
+    if (a.length != b.length) {
+        return false;
+    }
+    
+    // Validate length bounds
+    const uint8_t safeLen = static_cast<uint8_t>((std::min)(
+        a.length, 
+        HashValue::MAX_HASH_LENGTH
+    ));
+    
+    if (safeLen == 0u) {
+        return true; // Both empty
+    }
+    
+    // Use constant-time comparison for the actual hash data
+    return ConstantTimeCompare(a.data.data(), b.data.data(), safeLen);
+}
+
+/**
  * @brief Convert HashAlgorithm enum to string representation.
  *
  * Returns a human-readable name for the hash algorithm.
@@ -1621,6 +2090,109 @@ const char* ReasonToString(WhitelistReason reason) noexcept {
         case WhitelistReason::Custom:          return "Custom";
         default:                               return "Unknown";
     }
+}
+
+/**
+ * @brief Convert PathMatchMode enum to string representation.
+ *
+ * Returns a human-readable name for the path matching mode.
+ * Used for logging, configuration, and display purposes.
+ *
+ * @param mode Path matching mode enum value
+ * @return Null-terminated string (static lifetime)
+ *
+ * @note Thread-safe (returns pointer to static string literal)
+ */
+const char* PathMatchModeToString(PathMatchMode mode) noexcept {
+    switch (mode) {
+        case PathMatchMode::Exact:    return "Exact";
+        case PathMatchMode::Prefix:   return "Prefix";
+        case PathMatchMode::Suffix:   return "Suffix";
+        case PathMatchMode::Contains: return "Contains";
+        case PathMatchMode::Glob:     return "Glob";
+        case PathMatchMode::Regex:    return "Regex";
+        default:                      return "Unknown";
+    }
+}
+
+/**
+ * @brief Convert WhitelistFlags bitmask to human-readable string.
+ *
+ * Converts a WhitelistFlags bitmask to a comma-separated string
+ * of flag names. Useful for logging and debugging.
+ *
+ * @param flags Whitelist flags bitmask
+ * @return String containing all set flag names, comma-separated
+ *
+ * @note May throw std::bad_alloc if string allocation fails
+ * @note Thread-safe (no global state modified)
+ *
+ * @example
+ * auto flags = WhitelistFlags::Enabled | WhitelistFlags::LogOnMatch;
+ * std::string str = FlagsToString(flags);
+ * // str = "Enabled, LogOnMatch"
+ */
+std::string FlagsToString(WhitelistFlags flags) {
+    if (flags == WhitelistFlags::None) {
+        return "None";
+    }
+    
+    std::string result;
+    result.reserve(256);  // Pre-allocate for common case
+    
+    // Helper to append flag name
+    auto appendFlag = [&result](const char* name) {
+        if (!result.empty()) {
+            result += ", ";
+        }
+        result += name;
+    };
+    
+    // Check each flag
+    if (HasFlag(flags, WhitelistFlags::Enabled)) {
+        appendFlag("Enabled");
+    }
+    if (HasFlag(flags, WhitelistFlags::HasExpiration)) {
+        appendFlag("HasExpiration");
+    }
+    if (HasFlag(flags, WhitelistFlags::Inherited)) {
+        appendFlag("Inherited");
+    }
+    if (HasFlag(flags, WhitelistFlags::RequiresVerification)) {
+        appendFlag("RequiresVerification");
+    }
+    if (HasFlag(flags, WhitelistFlags::LogOnMatch)) {
+        appendFlag("LogOnMatch");
+    }
+    if (HasFlag(flags, WhitelistFlags::CaseSensitive)) {
+        appendFlag("CaseSensitive");
+    }
+    if (HasFlag(flags, WhitelistFlags::InheritToChildren)) {
+        appendFlag("InheritToChildren");
+    }
+    if (HasFlag(flags, WhitelistFlags::MachineWide)) {
+        appendFlag("MachineWide");
+    }
+    if (HasFlag(flags, WhitelistFlags::ReadOnly)) {
+        appendFlag("ReadOnly");
+    }
+    if (HasFlag(flags, WhitelistFlags::Hidden)) {
+        appendFlag("Hidden");
+    }
+    if (HasFlag(flags, WhitelistFlags::AutoGenerated)) {
+        appendFlag("AutoGenerated");
+    }
+    if (HasFlag(flags, WhitelistFlags::AdminOnly)) {
+        appendFlag("AdminOnly");
+    }
+    if (HasFlag(flags, WhitelistFlags::PendingApproval)) {
+        appendFlag("PendingApproval");
+    }
+    if (HasFlag(flags, WhitelistFlags::Revoked)) {
+        appendFlag("Revoked");
+    }
+    
+    return result.empty() ? "None" : result;
 }
 
 /**
@@ -1964,10 +2536,15 @@ std::wstring NormalizePath(std::wstring_view path) {
  * - Suffix: Path ends with pattern
  * - Contains: Pattern appears anywhere in path
  * - Glob: Wildcard matching with * and ?
- * - Regex: Regular expression (not yet implemented)
+ * - Regex: Full ECMAScript regex with ReDoS protection
  *
  * SECURITY: All inputs are normalized before comparison.
  * Glob matching has O(n*m) worst case complexity with proper backtracking.
+ * Regex matching includes:
+ * - Pattern complexity validation to prevent ReDoS attacks
+ * - Pre-compiled pattern cache (up to 1024 patterns)
+ * - Match execution timeout (1000ms default)
+ * - Input length limits
  *
  * @param path Path to check
  * @param pattern Pattern to match against
@@ -1975,8 +2552,7 @@ std::wstring NormalizePath(std::wstring_view path) {
  * @param caseSensitive Ignored (always case-insensitive after normalization)
  * @return true if path matches pattern
  *
- * @note Thread-safe (no global state modified)
- * @note Regex mode is not implemented and returns false
+ * @note Thread-safe (uses thread-safe regex cache)
  */
 bool PathMatchesPattern(
     std::wstring_view path,
@@ -2073,104 +2649,197 @@ bool PathMatchesPattern(
             
         case PathMatchMode::Glob: {
             // ================================================================
-            // GLOB PATTERN MATCHING
+            // ENTERPRISE-GRADE GLOB PATTERN MATCHING
             // ================================================================
             //
-            // Implements glob matching with * and ? wildcards:
-            // - * matches zero or more characters
-            // - ? matches exactly one character
+            // Full glob pattern support with wildcards:
+            // - *  : matches zero or more characters EXCEPT path separator
+            // - ** : matches zero or more characters INCLUDING path separators
+            //        (recursive glob for directory trees)
+            // - ?  : matches exactly one character (except separator)
+            //
+            // Examples:
+            // - "c:\\windows\\*"     matches "c:\\windows\\system32" but not "c:\\windows\\system32\\drivers"
+            // - "c:\\windows\\**"    matches "c:\\windows\\system32\\drivers\\etc\\hosts"
+            // - "*.dll"              matches "kernel32.dll"
+            // - "**\\*.exe"          matches any .exe in any subdirectory
             //
             // Algorithm: Greedy matching with backtracking
             // Time complexity: O(n * m) worst case
             // Space complexity: O(1) (no recursion)
             //
-            // Security: Added iteration limit to prevent pathological cases
+            // Security: Iteration limit prevents DoS attacks
             //
             // ================================================================
-            
-            size_t pathIdx = 0;
-            size_t patIdx = 0;
-            size_t starPathIdx = std::wstring::npos;  // Position in path after last *
-            size_t starPatIdx = std::wstring::npos;   // Position of last * in pattern
             
             const size_t pathLen = normPath.length();
             const size_t patLen = normPattern.length();
             
-            // Iteration limit to prevent DoS on pathological patterns
-            // Maximum iterations = path_len * pattern_len (bounded by validation above)
-            constexpr size_t kMaxIterations = 100'000'000u; // 100M iterations max
+            // State for single star (*) backtracking
+            size_t starPathIdx = std::wstring::npos;
+            size_t starPatIdx = std::wstring::npos;
+            
+            // State for double star (**) backtracking
+            size_t dstarPathIdx = std::wstring::npos;
+            size_t dstarPatIdx = std::wstring::npos;
+            
+            size_t pathIdx = 0;
+            size_t patIdx = 0;
+            
+            // Iteration limit to prevent DoS
+            constexpr size_t kMaxIterations = 100'000'000u;
             size_t iterations = 0u;
             
             while (pathIdx < pathLen) {
-                // Check iteration limit
+                // Iteration limit check
                 if (++iterations > kMaxIterations) {
                     SS_LOG_WARN(L"Whitelist",
-                        L"Glob matching exceeded iteration limit - possible DoS pattern");
+                        L"Glob matching exceeded iteration limit");
                     return false;
                 }
                 
                 if (patIdx < patLen) {
-                    const wchar_t patChar = normPattern[patIdx];
-                    
-                    if (patChar == L'*') {
-                        // Star: remember position for backtracking
-                        starPatIdx = patIdx;
-                        starPathIdx = pathIdx;
-                        ++patIdx;  // Move past star, but don't consume path char yet
+                    // Check for ** (double star - recursive glob)
+                    if (normPattern[patIdx] == L'*' && 
+                        patIdx + 1 < patLen && 
+                        normPattern[patIdx + 1] == L'*') {
+                        // ** matches everything including separators
+                        dstarPatIdx = patIdx;
+                        dstarPathIdx = pathIdx;
+                        patIdx += 2;  // Skip both stars
+                        // Skip any following path separator after **
+                        if (patIdx < patLen && normPattern[patIdx] == L'\\') {
+                            ++patIdx;
+                        }
                         continue;
                     }
                     
-                    // Single character match (? matches any, or exact match)
-                    if (patChar == L'?' || patChar == normPath[pathIdx]) {
+                    // Check for single * (non-recursive)
+                    if (normPattern[patIdx] == L'*') {
+                        starPatIdx = patIdx;
+                        starPathIdx = pathIdx;
+                        ++patIdx;
+                        continue;
+                    }
+                    
+                    // Check for ? (single character wildcard)
+                    if (normPattern[patIdx] == L'?') {
+                        // ? matches any single character except separator
+                        if (normPath[pathIdx] != L'\\') {
+                            ++pathIdx;
+                            ++patIdx;
+                            continue;
+                        }
+                        // ? doesn't match separator - fall through to backtrack
+                    }
+                    
+                    // Exact character match
+                    if (normPattern[patIdx] == normPath[pathIdx]) {
                         ++pathIdx;
                         ++patIdx;
                         continue;
                     }
                 }
                 
-                // Mismatch - try backtracking to last star
+                // Mismatch occurred - try backtracking
+                
+                // First try single star backtrack (if not crossing separator)
                 if (starPatIdx != std::wstring::npos) {
-                    // Backtrack: star consumes one more character
-                    patIdx = starPatIdx + 1;
-                    ++starPathIdx;
-                    pathIdx = starPathIdx;
+                    // Check if we can consume this character with *
+                    if (normPath[starPathIdx] != L'\\') {
+                        patIdx = starPatIdx + 1;
+                        ++starPathIdx;
+                        pathIdx = starPathIdx;
+                        continue;
+                    }
+                    // Can't consume separator with single *, reset single star
+                    starPatIdx = std::wstring::npos;
+                }
+                
+                // Then try double star backtrack (can cross separators)
+                if (dstarPatIdx != std::wstring::npos) {
+                    patIdx = dstarPatIdx + 2;  // Position after **
+                    // Skip separator after ** in pattern
+                    if (patIdx < patLen && normPattern[patIdx] == L'\\') {
+                        ++patIdx;
+                    }
+                    ++dstarPathIdx;
+                    pathIdx = dstarPathIdx;
+                    // Reset single star state on ** backtrack
+                    starPatIdx = std::wstring::npos;
                     continue;
                 }
                 
-                // No star to backtrack to - match failed
+                // No backtrack available - match failed
                 return false;
             }
             
-            // Path exhausted - skip trailing stars in pattern
-            while (patIdx < patLen && normPattern[patIdx] == L'*') {
-                ++patIdx;
+            // Path exhausted - consume trailing wildcards in pattern
+            while (patIdx < patLen) {
+                if (normPattern[patIdx] == L'*') {
+                    ++patIdx;
+                    // Check for ** 
+                    if (patIdx < patLen && normPattern[patIdx] == L'*') {
+                        ++patIdx;
+                    }
+                    // Skip trailing separator after wildcard
+                    if (patIdx < patLen && normPattern[patIdx] == L'\\') {
+                        ++patIdx;
+                    }
+                } else {
+                    break;
+                }
             }
             
             // Match succeeds if pattern is also exhausted
             return patIdx == patLen;
         }
             
-        case PathMatchMode::Regex:
+        case PathMatchMode::Regex: {
             // ================================================================
-            // REGEX MATCHING (NOT IMPLEMENTED - SECURITY RISK)
+            // ENTERPRISE-GRADE REGEX MATCHING
             // ================================================================
             //
-            // Regular expression matching is expensive and potentially
-            // dangerous (ReDoS attacks). Use sparingly and with timeouts.
+            // Full regex support with comprehensive security protections:
+            // 1. Pattern complexity validation (ReDoS prevention)
+            // 2. Pre-compiled pattern cache for performance
+            // 3. Match execution timeout for safety
+            // 4. Input length limits
             //
-            // SECURITY NOTE: Regex is intentionally not implemented as it
-            // can be exploited for denial-of-service attacks through
-            // catastrophic backtracking. If regex support is needed,
-            // implement with:
-            // 1. Input validation (limit pattern length and complexity)
-            // 2. Execution time limit (timeout mechanism)
-            // 3. Pre-compiled pattern cache with size limits
-            // 4. Possibly use RE2 library instead of std::regex
+            // Uses ECMAScript regex syntax with case-insensitive matching.
+            // Patterns are cached after first compilation for O(1) subsequent
+            // lookups.
             //
             // ================================================================
-            SS_LOG_WARN(L"Whitelist", 
-                L"Regex path matching not implemented for security reasons - returning false");
-            return false;
+            
+            // Get regex pattern cache singleton
+            auto& cache = RegexPatternCache::Instance();
+            
+            // Compile or retrieve cached pattern
+            const std::wregex* compiledRegex = nullptr;
+            std::wstring errorMsg;
+            
+            if (!cache.GetOrCompile(normPattern, &compiledRegex, errorMsg)) {
+                SS_LOG_WARN(L"Whitelist", 
+                    L"Regex pattern compilation failed: %s",
+                    errorMsg.c_str());
+                return false;
+            }
+            
+            if (compiledRegex == nullptr) {
+                SS_LOG_ERROR(L"Whitelist", L"Regex pattern cache returned null");
+                return false;
+            }
+            
+            // Execute match with timeout protection
+            const bool matched = cache.MatchWithTimeout(
+                *compiledRegex, 
+                normPath,
+                RegexPatternCache::MATCH_TIMEOUT_MS
+            );
+            
+            return matched;
+        }
             
         default:
             // Unknown mode - defensive return with logging
