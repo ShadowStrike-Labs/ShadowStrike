@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file WhiteListHashIndex.cpp
  * @brief B+Tree hash index implementation for WhitelistStore

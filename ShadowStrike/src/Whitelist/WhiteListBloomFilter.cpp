@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * ============================================================================
  * ShadowStrike WhitelistStore - BLOOM FILTER IMPLEMENTATION

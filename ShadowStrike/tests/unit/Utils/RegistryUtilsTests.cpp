@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike RegistryUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -22,7 +23,6 @@
  *
  * ============================================================================
  */
-
 #include <gtest/gtest.h>
 #include "../../../src/Utils/RegistryUtils.hpp"
 

@@ -1,5 +1,4 @@
-
-
+#include"pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Database/QuarantineDB.hpp"
 #include <filesystem>

@@ -1,4 +1,5 @@
-﻿/**
+﻿#include"pch.h"
+/**
  * @file Logger.cpp
  * @brief Implementation of the thread-safe asynchronous logging system.
  *

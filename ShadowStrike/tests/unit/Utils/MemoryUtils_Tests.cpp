@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike MemoryUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -16,8 +17,7 @@
  *
  * ============================================================================
  */
-
-#include <gtest/gtest.h>
+#include<gtest/gtest.h>
 #include "../../../src/Utils/MemoryUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"
 #include <Objbase.h>

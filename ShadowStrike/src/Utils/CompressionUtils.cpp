@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file CompressionUtils.cpp
  * @brief Implementation of Windows Compression API utilities.

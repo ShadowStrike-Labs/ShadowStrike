@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike PatternStore - COMPREHENSIVE UNIT TESTS

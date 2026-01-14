@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureIndex - COMPREHENSIVE UNIT TESTS

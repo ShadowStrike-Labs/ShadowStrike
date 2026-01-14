@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ShadowStrike Antivirus - Unit Tests
  * SignatureStore Unified Facade Tests

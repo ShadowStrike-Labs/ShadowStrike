@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file aho_crsck_impl.cpp
  * @brief Aho-Corasick Multi-Pattern String Matching Automaton Implementation

@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike ThreatIntelIndex - Lookup Operations

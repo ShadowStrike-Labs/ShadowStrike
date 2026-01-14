@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file MemoryUtils.cpp
  * @brief Implementation of memory management utilities.

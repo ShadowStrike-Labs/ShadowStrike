@@ -1,4 +1,4 @@
-﻿
+﻿#include"pch.h"
 #include"SignatureIndex.hpp"
 #include"../../src/Utils/Logger.hpp"
 #include<algorithm>

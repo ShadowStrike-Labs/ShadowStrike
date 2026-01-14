@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike NetworkUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -18,7 +19,6 @@
  *
  * ============================================================================
  */
-
 #include <gtest/gtest.h>
 #include "../../../src/Utils/NetworkUtils.hpp"
 

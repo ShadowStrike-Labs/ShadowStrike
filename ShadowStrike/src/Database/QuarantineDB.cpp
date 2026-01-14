@@ -1,4 +1,5 @@
-﻿#include "QuarantineDB.hpp"
+﻿#include"pch.h"
+#include "QuarantineDB.hpp"
 #include"../Utils/CompressionUtils.hpp"
 #include"../Utils/HashUtils.hpp"
 #include"../Utils/JSONUtils.hpp"

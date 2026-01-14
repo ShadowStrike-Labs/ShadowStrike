@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureFormat - COMPREHENSIVE UNIT TESTS

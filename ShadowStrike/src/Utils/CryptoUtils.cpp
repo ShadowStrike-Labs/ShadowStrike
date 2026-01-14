@@ -1,4 +1,5 @@
-﻿/**
+﻿#include"pch.h"
+/**
  * @file CryptoUtils.cpp
  * @brief Enterprise-grade cryptographic utilities implementation
  *

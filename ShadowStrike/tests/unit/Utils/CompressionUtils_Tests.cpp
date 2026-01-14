@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike CompressionUtils Unit Tests
@@ -14,7 +15,6 @@
  *
  * ============================================================================
  */
-
 #include <gtest/gtest.h>
 #include "../../../src/Utils/CompressionUtils.hpp"
 

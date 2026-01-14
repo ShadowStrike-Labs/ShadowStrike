@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file Timer.cpp
  * @brief Implementation of TimerManager for ShadowStrike.
@@ -7,6 +8,8 @@
  */
 
 // Architecture detection for Windows headers
+
+
 #if !defined(_X86_) && !defined(_AMD64_)
 #   ifdef _M_X64
 #       define _AMD64_

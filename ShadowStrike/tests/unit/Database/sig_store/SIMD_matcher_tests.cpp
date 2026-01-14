@@ -1,3 +1,4 @@
+#include"pch.h"
 // ============================================================================
 // SIMD MATCHER UNIT TESTS - PRODUCTION GRADE
 // ============================================================================
@@ -16,7 +17,6 @@
 // 6. Error Handling & Resource Limit Tests
 // 7. Security & Safety Tests
 // ============================================================================
-
 #include <gtest/gtest.h>
 #include "../../../../src/PatternStore/PatternStore.hpp"
 #include <vector>

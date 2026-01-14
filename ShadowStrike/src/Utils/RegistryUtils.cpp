@@ -1,3 +1,4 @@
+#include"pch.h"
 #include "RegistryUtils.hpp"
 
 #include <algorithm>

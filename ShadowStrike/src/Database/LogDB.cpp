@@ -1,4 +1,5 @@
-﻿#include "LogDB.hpp"
+﻿#include"pch.h"
+#include "LogDB.hpp"
 #include "../Utils/FileUtils.hpp"
 
 #include <algorithm>

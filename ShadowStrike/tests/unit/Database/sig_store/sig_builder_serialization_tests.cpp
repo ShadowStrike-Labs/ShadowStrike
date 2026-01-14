@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder Serialization - COMPREHENSIVE UNIT TESTS

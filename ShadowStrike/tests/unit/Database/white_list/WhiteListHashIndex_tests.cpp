@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file WhiteListHashIndex_tests.cpp
  * @brief Enterprise-grade unit tests for HashIndex (B+Tree) implementation

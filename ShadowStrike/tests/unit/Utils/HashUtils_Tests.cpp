@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike HashUtils - ENTERPRISE-GRADE UNIT TESTS

@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file ThreatIntelFeedManager_parsers_tests.cpp
  * @brief Enterprise-grade unit tests for ThreatIntelFeedManager parser implementations

@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file WhiteListPatternIndex.cpp
  * @brief Compressed Trie path index implementation for WhitelistStore

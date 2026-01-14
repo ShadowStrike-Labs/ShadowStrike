@@ -1,4 +1,4 @@
-
+#include"pch.h"
 #include"SignatureStore.hpp"
 
 namespace ShadowStrike {

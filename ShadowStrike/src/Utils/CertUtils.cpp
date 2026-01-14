@@ -1,4 +1,5 @@
-﻿/**
+﻿#include"pch.h"
+/**
  * @file CertUtils.cpp
  * @brief Implementation of X.509 Certificate Utilities.
  *
@@ -980,8 +981,8 @@ bool Certificate::GetInfo(CertificateInfo& info, Error* err) const noexcept {
         }
     }
 
-    // Get SHA-256 thumbprint (ignore errors)
-    GetThumbprint(info.thumbprint, true, nullptr);
+    // Get SHA-256 thumbprint (ignore errors - explicitly discard return value)
+    static_cast<void>(GetThumbprint(info.thumbprint, true, nullptr));
 
     // Validity period
     info.notBefore = m_certContext->pCertInfo->NotBefore;
@@ -2753,41 +2754,5 @@ PCCERT_CONTEXT Certificate::Detach() noexcept {
 #endif
 }
 
-/**
- * @brief Sets the revocation checking mode for chain verification.
- *
- * @param m The revocation mode to use.
- */
-void Certificate::SetRevocationMode(RevocationMode m) noexcept {
-    revocationMode_ = m;
-}
-
-/**
- * @brief Gets the current revocation checking mode.
- *
- * @return The current revocation mode.
- */
-RevocationMode Certificate::GetRevocationMode() const noexcept {
-    return revocationMode_;
-}
-
-/**
- * @brief Sets whether SHA-1 signatures are allowed in chain verification.
- *
- * SHA-1 has known weaknesses but may be required for compatibility
- * with older certificates.
- *
- * @param v true to allow SHA-1, false to reject (default).
- */
-void Certificate::SetAllowSha1Weak(bool v) noexcept {
-    allowSha1Weak_ = v;
-}
-
-/**
- * @brief Gets whether SHA-1 signatures are allowed.
- *
- * @return true if SHA-1 is allowed, false otherwise.
- */
-bool Certificate::GetAllowSha1Weak() const noexcept {
-    return allowSha1Weak_;
-}
+// Note: SetRevocationMode, GetRevocationMode, SetAllowSha1Weak, GetAllowSha1Weak
+// are defined inline in CertUtils.hpp

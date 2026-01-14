@@ -109,11 +109,15 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;_AMD64_;TLSH_BUCKETS=256;TLSH_CHECKSUM_1B=OFF;GTEST_LINKED_AS_SHARED_LIBRARY=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\tlsh\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\ssdeep</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\SQLiteCpp\sqlite3;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\yara_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\tlsh\include;C:\Users\RTX40\source\repos\ShadowStrike\ShadowStrike\external\ssdeep;$(ProjectDir)src</AdditionalIncludeDirectories>
       <CompileAs>Default</CompileAs>
       <StructMemberAlignment>Default</StructMemberAlignment>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -139,21 +143,49 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="external\pugixml\pugixml.cpp" />
-    <ClCompile Include="external\SQLiteCpp\sqlite3\sqlite3.c" />
-    <ClCompile Include="external\SQLiteCpp\src\Backup.cpp" />
-    <ClCompile Include="external\SQLiteCpp\src\Column.cpp" />
-    <ClCompile Include="external\SQLiteCpp\src\Database.cpp" />
-    <ClCompile Include="external\SQLiteCpp\src\Exception.cpp" />
-    <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp" />
+    <ClCompile Include="external\SQLiteCpp\sqlite3\sqlite3.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Backup.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Column.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Database.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Exception.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\SQLiteCpp\src\Savepoint.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="external\SQLiteCpp\src\Statement.cpp" />
-    <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp" />
-    <ClCompile Include="external\ssdeep\edit_dist.c" />
-    <ClCompile Include="external\ssdeep\fuzzy.c" />
-    <ClCompile Include="external\tlsh\src\input_desc.cpp" />
-    <ClCompile Include="external\tlsh\src\shared_file_functions.cpp" />
-    <ClCompile Include="external\tlsh\src\tlsh.cpp" />
-    <ClCompile Include="external\tlsh\src\tlsh_impl.cpp" />
-    <ClCompile Include="external\tlsh\src\tlsh_util.cpp" />
+    <ClCompile Include="external\SQLiteCpp\src\Transaction.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\ssdeep\edit_dist.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\ssdeep\fuzzy.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\tlsh\src\input_desc.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\tlsh\src\shared_file_functions.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\tlsh\src\tlsh.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\tlsh\src\tlsh_impl.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\tlsh\src\tlsh_util.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Database\ConfigurationDB.cpp" />
     <ClCompile Include="src\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\Database\LogDB.cpp" />
@@ -170,6 +202,10 @@
     <ClCompile Include="src\PatternStore\PatternIndex.cpp" />
     <ClCompile Include="src\PatternStore\PatternStore.cpp" />
     <ClCompile Include="src\PatternStore\SIMD_matcher_impl.cpp" />
+    <ClCompile Include="src\pch.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
+      <LanguageStandard Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">stdcpp23</LanguageStandard>
+    </ClCompile>
     <ClCompile Include="src\SignatureStore\batch_sig_builder.cpp" />
     <ClCompile Include="src\SignatureStore\SignatureBuilder.cpp" />
     <ClCompile Include="src\SignatureStore\SignatureFormat.cpp" />
@@ -208,6 +244,7 @@
     <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.cpp" />
     <ClCompile Include="src\Utils\Base64Utils.cpp" />
     <ClCompile Include="src\Utils\CacheManager.cpp" />
+    <ClCompile Include="src\Utils\CertUtils.cpp" />
     <ClCompile Include="src\Utils\CompressionUtils.cpp" />
     <ClCompile Include="src\Utils\CryptoUtils.cpp" />
     <ClCompile Include="src\Utils\CryptoUtilsCommon.cpp" />
@@ -243,7 +280,9 @@
     <ClCompile Include="src\Whitelist\WhiteListHashIndex.cpp" />
     <ClCompile Include="src\Whitelist\WhiteListPatternIndex.cpp" />
     <ClCompile Include="src\Whitelist\WhiteListStore.cpp" />
-    <ClCompile Include="src\Whitelist\WhiteListStringPool.cpp" />
+    <ClCompile Include="src\Whitelist\WhiteListStringPool.cpp">
+      <LanguageStandard Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">stdcpp23</LanguageStandard>
+    </ClCompile>
     <ClCompile Include="tests\unit\Database\configuration_db_tests.cpp" />
     <ClCompile Include="tests\unit\Database\database_manager_tests.cpp" />
     <ClCompile Include="tests\unit\Database\Log_db_tests.cpp" />
@@ -324,6 +363,7 @@
     <ClInclude Include="src\Database\QuarantineDB.hpp" />
     <ClInclude Include="src\HashStore\HashStore.hpp" />
     <ClInclude Include="src\PatternStore\PatternStore.hpp" />
+    <ClInclude Include="src\pch.h" />
     <ClInclude Include="src\SignatureStore\pragma_pack.h" />
     <ClInclude Include="src\SignatureStore\SignatureBuilder.hpp" />
     <ClInclude Include="src\SignatureStore\SignatureFormat.hpp" />
@@ -348,6 +388,7 @@
     <ClInclude Include="src\ThreatIntel\ThreatIntelStore.hpp" />
     <ClInclude Include="src\Utils\Base64Utils.hpp" />
     <ClInclude Include="src\Utils\CacheManager.hpp" />
+    <ClInclude Include="src\Utils\CertUtils.hpp" />
     <ClInclude Include="src\Utils\CompressionUtils.hpp" />
     <ClInclude Include="src\Utils\CryptoUtils.hpp" />
     <ClInclude Include="src\Utils\CryptoUtilsCommon.hpp" />

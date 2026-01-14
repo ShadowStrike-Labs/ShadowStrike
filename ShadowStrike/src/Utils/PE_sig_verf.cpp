@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file PE_sig_verf.cpp
  * @brief Implementation of PE digital signature verification utilities.
@@ -16,7 +17,6 @@
  * @copyright ShadowStrike Security Suite
  * @author ShadowStrike Security Team
  */
-
 #include "PE_sig_verf.hpp"
 #include "StringUtils.hpp"
 

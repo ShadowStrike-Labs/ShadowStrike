@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file BoyerMooreTests.cpp
  * @brief Comprehensive Unit Tests for Boyer-Moore Pattern Matching Algorithm

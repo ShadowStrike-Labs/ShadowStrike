@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file ThreatIntelIOCManager_tests.cpp
  * @brief Enterprise-Grade Unit Tests for ThreatIntelIOCManager

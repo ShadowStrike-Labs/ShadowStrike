@@ -1,4 +1,4 @@
-
+#include"pch.h"
 #include"HashStore.hpp"
 #include <sstream>
 #include <fstream>

@@ -1,4 +1,4 @@
-
+#include"pch.h"
 
 /**
  * @file boyer_moore_impl.cpp

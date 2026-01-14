@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file StringUtils.cpp
  * @brief Implementation of string manipulation utilities for ShadowStrike.

@@ -1,4 +1,5 @@
-﻿/**
+﻿#include"pch.h"
+/**
  * @file ThreatIntelFeedManager.cpp
  * @brief Enterprise-Grade Threat Intelligence Feed Manager Implementation
  *

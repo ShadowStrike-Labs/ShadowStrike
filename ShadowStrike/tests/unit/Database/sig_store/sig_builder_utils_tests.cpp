@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder Utils - COMPREHENSIVE UNIT TESTS

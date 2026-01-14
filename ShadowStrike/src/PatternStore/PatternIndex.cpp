@@ -1,6 +1,4 @@
-
-
-
+#include"pch.h"
 #include "../../src/SignatureStore/SignatureIndex.hpp"
 #include "../Utils/Logger.hpp"
 

@@ -1,6 +1,4 @@
-
-
-
+#include"pch.h"
 #include "PatternStore.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"

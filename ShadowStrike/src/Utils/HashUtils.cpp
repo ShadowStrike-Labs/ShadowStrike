@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file HashUtils.cpp
  * @brief Implementation of cryptographic hashing utilities.

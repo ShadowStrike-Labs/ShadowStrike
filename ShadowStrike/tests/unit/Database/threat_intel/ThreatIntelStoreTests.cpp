@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file ThreatIntelStoreTests.cpp
  * @brief Enterprise-Grade Unit Tests for ThreatIntelStore

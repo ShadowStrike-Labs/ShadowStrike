@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file ThreatIntelFormat_tests.cpp
  * @brief Enterprise-Grade Unit Tests for ThreatIntelFormat

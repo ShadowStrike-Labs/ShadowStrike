@@ -1,5 +1,4 @@
-
-
+#include"pch.h"
 #include"HashStore.hpp"
 #include<map>
 #include<unordered_set>

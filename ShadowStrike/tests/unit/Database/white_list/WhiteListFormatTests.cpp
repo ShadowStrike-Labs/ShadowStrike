@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * ============================================================================
  * ShadowStrike WhitelistFormat - ENTERPRISE-GRADE UNIT TESTS
@@ -28,7 +29,6 @@
  * @copyright 2024-2026 ShadowStrike Project
  * ============================================================================
  */
-
 #include <gtest/gtest.h>
 
 #include "../../../../src/Whitelist/WhiteListFormat.hpp"

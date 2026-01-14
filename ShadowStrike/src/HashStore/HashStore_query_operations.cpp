@@ -1,4 +1,4 @@
-﻿
+﻿#include"pch.h"
 #include "../Utils/StringUtils.hpp"
 #include"HashStore.hpp"
 #include <algorithm>

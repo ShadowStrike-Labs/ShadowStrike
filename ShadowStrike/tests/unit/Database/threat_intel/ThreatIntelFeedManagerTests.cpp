@@ -1,4 +1,5 @@
-﻿/**
+﻿#include"pch.h"
+/**
  * @file ThreatIntelFeedManagerTests.cpp
  * @brief Enterprise-Grade Unit Tests for ThreatIntelFeedManager
  *

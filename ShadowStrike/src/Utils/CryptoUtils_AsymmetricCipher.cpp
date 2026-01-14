@@ -1,4 +1,4 @@
-﻿
+﻿#include"pch.h"
 /**
  * @file CryptoUtils_AsymmetricCipher.cpp
  * @brief Enterprise-grade asymmetric cryptography implementation

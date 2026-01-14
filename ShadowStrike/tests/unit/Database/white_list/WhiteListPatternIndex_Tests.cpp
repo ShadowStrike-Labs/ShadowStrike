@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file WhiteListPatternIndex_Tests.cpp
  * @brief Enterprise-grade unit tests for PathIndex (Compressed Trie) implementation

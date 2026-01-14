@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file ThreatIntelDatabase.cpp
  * @brief Memory-mapped database implementation for Threat Intelligence Store

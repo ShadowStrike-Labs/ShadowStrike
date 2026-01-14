@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder Import Methods - COMPREHENSIVE UNIT TESTS

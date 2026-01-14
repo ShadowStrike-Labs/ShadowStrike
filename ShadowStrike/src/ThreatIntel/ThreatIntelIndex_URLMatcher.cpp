@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike ThreatIntelIndex - URL Pattern Matcher Implementation

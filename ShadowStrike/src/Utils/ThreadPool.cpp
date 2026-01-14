@@ -1,4 +1,5 @@
-﻿/**
+﻿#include"pch.h"
+/**
  * @file ThreadPool.cpp
  * @brief Implementation of enterprise-grade thread pool
  *
@@ -14,7 +15,6 @@
  *
  * @copyright ShadowStrike Security Suite
  */
-
 #include "ThreadPool.hpp"
 
 #include <algorithm>

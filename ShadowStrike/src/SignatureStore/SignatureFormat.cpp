@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureFormat - IMPLEMENTATION
@@ -14,7 +15,6 @@
  *
  * ============================================================================
  */
-
 #include "SignatureFormat.hpp"
 #include "../Utils/Logger.hpp"
 

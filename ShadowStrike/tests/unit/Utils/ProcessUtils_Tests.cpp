@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike ProcessUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -17,7 +18,6 @@
  *
  * ============================================================================
  */
-
 #include <gtest/gtest.h>
 #include "../../../src/Utils/ProcessUtils.hpp"
 

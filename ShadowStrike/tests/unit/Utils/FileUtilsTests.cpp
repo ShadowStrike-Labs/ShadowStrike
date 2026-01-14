@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike FileUtils - ENTERPRISE-GRADE UNIT TESTS

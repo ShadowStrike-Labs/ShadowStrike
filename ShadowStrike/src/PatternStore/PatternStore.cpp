@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike PatternStore - IMPLEMENTATION
@@ -16,7 +17,6 @@
  *
  * ============================================================================
  */
-
 #include "PatternStore.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"

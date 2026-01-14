@@ -1,5 +1,4 @@
-
-
+#include"pch.h"
 #include "ThreatIntelFeedManager.hpp"
 #include"ThreatIntelFeedManager_Util.hpp"
 #include "ThreatIntelDatabase.hpp"

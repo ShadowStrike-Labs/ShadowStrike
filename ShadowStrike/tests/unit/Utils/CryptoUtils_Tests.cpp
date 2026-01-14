@@ -1,4 +1,5 @@
-﻿#include <gtest/gtest.h>
+﻿#include"pch.h"
+#include <gtest/gtest.h>
 #include "../../../src/Utils/CryptoUtils.hpp"
 #include "../../../src/Utils/HashUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"

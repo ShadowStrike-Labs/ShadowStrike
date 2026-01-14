@@ -1,3 +1,4 @@
+#include"pch.h"
 /**
  * @file HashStoreTests.cpp
  * @brief Comprehensive Enterprise-Grade Unit Tests for HashStore System

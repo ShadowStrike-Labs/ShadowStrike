@@ -1,4 +1,4 @@
-
+#include"pch.h"
 
 
 /**
@@ -108,6 +108,59 @@ constexpr uint64_t STRING_POOL_HEADER_SIZE = 32;
 
 StringPool::StringPool() = default;
 StringPool::~StringPool() = default;
+
+StringPool::StringPool(StringPool&& other) noexcept {
+    // Locking is performed to prevent other threads from corrupting the state while the object is being moved.
+    // Per ShadowStrike standards, the integrity of even an expiring object must be preserved.
+    std::unique_lock lockOther(other.m_rwLock);
+
+    m_view = other.m_view;
+    m_baseAddress = other.m_baseAddress;
+    m_poolOffset = other.m_poolOffset;
+    m_totalSize = other.m_totalSize;
+
+    // std::atomic members cannot be moved directly (non-movable); their values are transferred safely.
+    m_usedSize.store(other.m_usedSize.load(std::memory_order_relaxed), std::memory_order_release);
+    m_stringCount.store(other.m_stringCount.load(std::memory_order_relaxed), std::memory_order_release);
+
+    m_deduplicationMap = std::move(other.m_deduplicationMap);
+
+    // The source object (other) is brought to an "uninitialized" state (Zero-out strategy).
+    other.m_view = nullptr;
+    other.m_baseAddress = nullptr;
+    other.m_poolOffset = 0;
+    other.m_totalSize = 0;
+    other.m_usedSize.store(0, std::memory_order_relaxed);
+    other.m_stringCount.store(0, std::memory_order_relaxed);
+}
+
+StringPool& StringPool::operator=(StringPool&& other) noexcept {
+    if (this != &other) {
+        // To prevent deadlock, locks for both objects are acquired simultaneously and in a safe order.
+        std::unique_lock lockThis(m_rwLock, std::defer_lock);
+        std::unique_lock lockOther(other.m_rwLock, std::defer_lock);
+        std::lock(lockThis, lockOther);
+
+        m_view = other.m_view;
+        m_baseAddress = other.m_baseAddress;
+        m_poolOffset = other.m_poolOffset;
+        m_totalSize = other.m_totalSize;
+
+        m_usedSize.store(other.m_usedSize.load(std::memory_order_relaxed), std::memory_order_release);
+        m_stringCount.store(other.m_stringCount.load(std::memory_order_relaxed), std::memory_order_release);
+
+        m_deduplicationMap = std::move(other.m_deduplicationMap);
+
+        // Reset strategy
+        other.m_view = nullptr;
+        other.m_baseAddress = nullptr;
+        other.m_poolOffset = 0;
+        other.m_totalSize = 0;
+        other.m_usedSize.store(0, std::memory_order_relaxed);
+        other.m_stringCount.store(0, std::memory_order_relaxed);
+    }
+    return *this;
+}
 
 /**
  * @brief Initialize string pool from memory-mapped region (read-only mode)

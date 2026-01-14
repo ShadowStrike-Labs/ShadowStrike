@@ -1,4 +1,5 @@
-﻿#include"CryptoUtils.hpp"
+﻿#include"pch.h"
+#include"CryptoUtils.hpp"
 #include"CryptoUtilsCommon.hpp"
 
 namespace ShadowStrike {

@@ -1,3 +1,4 @@
+#include"pch.h"
 #include"CryptoUtils.hpp"
 #include "CryptoUtilsCommon.hpp"
 #include<ntstatus.h>

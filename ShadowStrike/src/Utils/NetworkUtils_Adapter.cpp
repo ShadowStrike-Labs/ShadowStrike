@@ -1,4 +1,4 @@
-﻿
+﻿#include"pch.h"
 #include"NetworkUtils.hpp"
 #include <wbemidl.h>
 #include <comdef.h>  

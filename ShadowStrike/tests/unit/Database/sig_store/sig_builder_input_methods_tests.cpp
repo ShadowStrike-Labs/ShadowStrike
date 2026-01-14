@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder Input Methods - PRODUCTION-GRADE UNIT TESTS

@@ -1,3 +1,4 @@
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureStore - IMPLEMENTATION (COMPLETE)
@@ -17,6 +18,7 @@
  *
  * ============================================================================
  */
+
 #define _CRT_SECURE_NO_WARNINGS
 #include "SignatureStore.hpp"
 #include "../Utils/Logger.hpp"
