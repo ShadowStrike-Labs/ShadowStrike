@@ -1101,7 +1101,7 @@ bool CSVExportWriter::WriteEntry(const IOCEntry& entry, const IStringPoolReader*
     }
     
     if (HasExportField(fields, ExportFields::HitCount)) {
-        addNumericField(entry.hitCount.load(std::memory_order_relaxed));
+        addNumericField(entry.GetHitCount());
     }
     
     if (HasExportField(fields, ExportFields::Flags)) {
@@ -1366,7 +1366,7 @@ void JSONExportWriter::WriteEntryJSON(const IOCEntry& entry, const IStringPoolRe
     
     if (HasExportField(fields, ExportFields::HitCount)) {
         writeField("hit_count", [&]() {
-            m_buffer += std::to_string(entry.hitCount.load(std::memory_order_relaxed));
+            m_buffer += std::to_string(entry.GetHitCount());
         });
     }
     

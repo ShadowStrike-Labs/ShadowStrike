@@ -900,7 +900,8 @@ bool CSVImportReader::ParseField(std::string_view field, CSVColumnType type, IOC
                 if (detectedType == IOCType::IPv4) {
                     uint8_t octets[4] = {0};
                     if (SafeParseIPv4(field, octets)) {
-                        entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                        entry.value.ipv4 = {};
+                        entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                         entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
                     } else {
                         return false;
@@ -910,7 +911,8 @@ bool CSVImportReader::ParseField(std::string_view field, CSVColumnType type, IOC
                     uint8_t bytes[16] = {0};
                     uint8_t prefix = 128;
                     if (SafeParseIPv6(field, bytes, prefix)) {
-                        entry.value.ipv6 = IPv6Address(bytes, prefix);
+                        entry.value.ipv6 = {};
+                        entry.value.ipv6.Set(bytes, prefix);
                         entry.valueType = static_cast<uint8_t>(IOCType::IPv6);
                     } else {
                         return false;
@@ -948,7 +950,8 @@ bool CSVImportReader::ParseField(std::string_view field, CSVColumnType type, IOC
                 entry.type = IOCType::IPv4;
                 uint8_t octets[4] = {0};
                 if (SafeParseIPv4(field, octets)) {
-                    entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                    entry.value.ipv4 = {};
+                    entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                     entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
                     return true;
                 }
@@ -1713,7 +1716,8 @@ bool JSONImportReader::ParseEntryFromJSON(const std::string& jsonStr, IOCEntry& 
         if (type == IOCType::IPv4) {
             uint8_t octets[4] = {0};
             if (SafeParseIPv4(value, octets)) {
-                entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                entry.value.ipv4 = {};
+                entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                 entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
             } else {
                 return false;
@@ -2297,7 +2301,8 @@ bool STIX21ImportReader::ParseSTIXPattern(std::string_view pattern, IOCEntry& en
                         if (type == IOCType::IPv4) {
                             uint8_t octets[4] = {0};
                             if (SafeParseIPv4(value, octets)) {
-                                entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                                entry.value.ipv4 = {};
+                                entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                                 entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
                             } else {
                                 return false;
@@ -2343,7 +2348,8 @@ bool STIX21ImportReader::ParseSTIXPattern(std::string_view pattern, IOCEntry& en
 							uint8_t prefix = 128;
                             uint8_t bytes[16];
                             if (SafeParseIPv6(value, bytes,prefix)) {
-                                entry.value.ipv6 = IPv6Address(bytes,prefix);
+                                entry.value.ipv6 = {};
+                                entry.value.ipv6.Set(bytes, prefix);
                                 entry.valueType = static_cast<uint8_t>(IOCType::IPv6);
                             } else {
                                 return false;
@@ -2715,7 +2721,8 @@ bool MISPImportReader::ParseAttribute(const std::string& attrJson, IOCEntry& ent
         if (type == IOCType::IPv4) {
             uint8_t octets[4] = {0};
             if (SafeParseIPv4(value, octets)) {
-                entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                entry.value.ipv4 = {};
+                entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                 entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
             } else {
                 return false;
@@ -2942,7 +2949,8 @@ bool PlainTextImportReader::ParseLine(std::string_view line, IOCEntry& entry, IS
         if (type == IOCType::IPv4) {
             uint8_t octets[4] = {0};
             if (SafeParseIPv4(line, octets)) {
-                entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                entry.value.ipv4 = {};
+                entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                 entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
             } else {
                 return false;
@@ -3729,7 +3737,8 @@ bool OpenIOCImportReader::ReadNextEntry(IOCEntry& entry, IStringPoolWriter* stri
                                     if (type == IOCType::IPv4) {
                                         uint8_t octets[4] = {0};
                                         if (SafeParseIPv4(value, octets)) {
-                                            entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3]);
+                                            entry.value.ipv4 = {};
+                                            entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                                             entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
                                         } else {
                                             foundStart = false;
@@ -4644,6 +4653,252 @@ IOCType ThreatIntelImporter::DetectIOCType(std::string_view value) {
     } catch (const std::exception&) {
         return IOCType::Reserved;
     }
+}
+
+// ============================================================================
+// TIMESTAMP PARSING FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Parse ISO 8601 timestamp to Unix timestamp
+ * 
+ * Supports formats:
+ * - YYYY-MM-DDTHH:MM:SSZ
+ * - YYYY-MM-DDTHH:MM:SS.sssZ (milliseconds ignored)
+ * - YYYY-MM-DD HH:MM:SS
+ * - YYYY-MM-DDTHH:MM:SS+HH:MM (timezone offset handled)
+ * 
+ * @param timestamp ISO 8601 timestamp string
+ * @return Unix timestamp in seconds, or 0 if parsing failed
+ */
+[[nodiscard]] uint64_t ParseISO8601Timestamp(std::string_view timestamp) {
+    // Validate input bounds
+    if (timestamp.empty() || timestamp.size() > 64) {
+        return 0;
+    }
+    
+    // Check for null characters that could cause issues
+    if (std::find(timestamp.begin(), timestamp.end(), '\0') != timestamp.end()) {
+        return 0;
+    }
+    
+    std::string tsStr(timestamp);
+    
+    // Remove trailing Z for UTC
+    if (!tsStr.empty() && (tsStr.back() == 'Z' || tsStr.back() == 'z')) {
+        tsStr.pop_back();
+    }
+    
+    // Handle milliseconds (.sss)
+    size_t dotPos = tsStr.find('.');
+    if (dotPos != std::string::npos) {
+        // Find where milliseconds end (before Z or +/- timezone)
+        size_t msEnd = tsStr.find_first_of("+-", dotPos);
+        if (msEnd == std::string::npos) {
+            msEnd = tsStr.length();
+        }
+        tsStr = tsStr.substr(0, dotPos) + tsStr.substr(msEnd);
+    }
+    
+    // Handle timezone offset (+HH:MM or -HH:MM)
+    int tzOffsetMinutes = 0;
+    size_t tzPos = tsStr.find_last_of("+-");
+    if (tzPos != std::string::npos && tzPos > 10) {  // After date part
+        std::string_view tzPart = std::string_view(tsStr).substr(tzPos);
+        if (tzPart.size() >= 5) {  // +HH:MM or +HHMM
+            bool positive = (tsStr[tzPos] == '+');
+            int hours = 0, mins = 0;
+            
+            if (tzPart.size() == 6 && tzPart[3] == ':') {  // +HH:MM
+                hours = (tzPart[1] - '0') * 10 + (tzPart[2] - '0');
+                mins = (tzPart[4] - '0') * 10 + (tzPart[5] - '0');
+            } else if (tzPart.size() == 5) {  // +HHMM
+                hours = (tzPart[1] - '0') * 10 + (tzPart[2] - '0');
+                mins = (tzPart[3] - '0') * 10 + (tzPart[4] - '0');
+            }
+            
+            tzOffsetMinutes = (hours * 60 + mins) * (positive ? -1 : 1);  // Convert to UTC
+            tsStr = tsStr.substr(0, tzPos);
+        }
+    }
+    
+    std::tm tm = {};
+    tm.tm_isdst = 0;  // UTC, no DST
+    
+    std::istringstream ss(tsStr);
+    
+    // Try ISO8601 with T separator
+    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    if (ss.fail()) {
+        // Try alternate format with space separator
+        ss.clear();
+        ss.str(tsStr);
+        ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+    }
+    
+    if (ss.fail()) {
+        return 0;
+    }
+    
+    // Validate parsed values
+    if (tm.tm_year < 70 || tm.tm_year > 200 ||  // Years 1970-2100
+        tm.tm_mon < 0 || tm.tm_mon > 11 ||
+        tm.tm_mday < 1 || tm.tm_mday > 31 ||
+        tm.tm_hour < 0 || tm.tm_hour > 23 ||
+        tm.tm_min < 0 || tm.tm_min > 59 ||
+        tm.tm_sec < 0 || tm.tm_sec > 60) {  // 60 for leap second
+        return 0;
+    }
+    
+    // Days in month validation
+    static constexpr int daysInMonth[] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (tm.tm_mday > daysInMonth[tm.tm_mon]) {
+        if (tm.tm_mon == 1 && tm.tm_mday == 29) {
+            const int year = tm.tm_year + 1900;
+            const bool isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if (!isLeapYear) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+    
+    // Convert to Unix timestamp (UTC)
+#ifdef _WIN32
+    const time_t result = _mkgmtime(&tm);
+#else
+    const time_t result = timegm(&tm);
+#endif
+    
+    if (result == static_cast<time_t>(-1) || result < 0) {
+        return 0;
+    }
+    
+    // Apply timezone offset
+    int64_t adjusted = static_cast<int64_t>(result) + (tzOffsetMinutes * 60);
+    if (adjusted < 0) {
+        return 0;
+    }
+    
+    return static_cast<uint64_t>(adjusted);
+}
+
+/**
+ * @brief Parse timestamp in various formats
+ * 
+ * Supports:
+ * - ISO 8601 formats (delegates to ParseISO8601Timestamp)
+ * - Unix timestamp (seconds since epoch)
+ * - RFC 2822 format (limited support)
+ * 
+ * @param timestamp Timestamp string
+ * @return Unix timestamp in seconds, or 0 if parsing failed
+ */
+[[nodiscard]] uint64_t ParseTimestamp(std::string_view timestamp) {
+    if (timestamp.empty()) {
+        return 0;
+    }
+    
+    // Trim whitespace
+    while (!timestamp.empty() && std::isspace(static_cast<unsigned char>(timestamp.front()))) {
+        timestamp.remove_prefix(1);
+    }
+    while (!timestamp.empty() && std::isspace(static_cast<unsigned char>(timestamp.back()))) {
+        timestamp.remove_suffix(1);
+    }
+    
+    if (timestamp.empty()) {
+        return 0;
+    }
+    
+    // Check if it's a pure numeric Unix timestamp
+    bool isNumeric = true;
+    for (char c : timestamp) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            isNumeric = false;
+            break;
+        }
+    }
+    
+    if (isNumeric) {
+        try {
+            uint64_t value = std::stoull(std::string(timestamp));
+            // Sanity check: timestamps should be between 1970 and 2100
+            // 1970-01-01 = 0, 2100-01-01 ≈ 4102444800
+            if (value <= 4102444800ULL) {
+                return value;
+            }
+            // Could be milliseconds
+            if (value > 1000000000000ULL && value <= 4102444800000ULL) {
+                return value / 1000;
+            }
+        } catch (...) {
+            return 0;
+        }
+    }
+    
+    // Try ISO 8601 format
+    return ParseISO8601Timestamp(timestamp);
+}
+
+/**
+ * @brief Calculate CRC32 checksum of import data
+ * 
+ * Uses standard CRC32 polynomial (ISO 3309) for data integrity verification.
+ * Thread-safe and optimized for large inputs.
+ * 
+ * @param data Input data span
+ * @return CRC32 checksum
+ */
+[[nodiscard]] uint32_t CalculateImportChecksum(std::span<const uint8_t> data) {
+    if (data.empty()) {
+        return 0;
+    }
+    
+    // CRC32 lookup table (ISO 3309 polynomial 0xEDB88320)
+    static constexpr uint32_t crc32Table[256] = {
+        0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
+        0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988, 0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
+        0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE, 0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
+        0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC, 0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
+        0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172, 0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
+        0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940, 0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
+        0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116, 0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
+        0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924, 0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
+        0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A, 0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
+        0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818, 0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
+        0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E, 0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
+        0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C, 0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
+        0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2, 0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
+        0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0, 0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
+        0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086, 0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
+        0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4, 0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
+        0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A, 0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
+        0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8, 0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
+        0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE, 0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
+        0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC, 0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
+        0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252, 0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
+        0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60, 0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
+        0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236, 0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
+        0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04, 0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
+        0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A, 0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
+        0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38, 0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
+        0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E, 0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
+        0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C, 0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
+        0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2, 0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
+        0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0, 0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
+        0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6, 0xBAD03605, 0xCDD706B3, 0x54DE5729, 0x23D967BF,
+        0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94, 0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
+    };
+    
+    uint32_t crc = 0xFFFFFFFF;
+    
+    for (uint8_t byte : data) {
+        crc = crc32Table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+    }
+    
+    return crc ^ 0xFFFFFFFF;
 }
 
 } // namespace ThreatIntel

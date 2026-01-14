@@ -16,7 +16,7 @@ namespace ShadowStrike  {
              * @param alg Symmetric algorithm enum
              * @return CNG algorithm name or nullptr if invalid
              */
-            static const wchar_t* AlgName(SymmetricAlgorithm alg) noexcept {
+            const wchar_t* AlgName(SymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case SymmetricAlgorithm::AES_128_CBC:
                 case SymmetricAlgorithm::AES_192_CBC:
@@ -40,7 +40,7 @@ namespace ShadowStrike  {
              * @param alg Symmetric algorithm enum
              * @return CNG chaining mode or nullptr if not applicable
              */
-            static const wchar_t* ChainingMode(SymmetricAlgorithm alg) noexcept {
+            const wchar_t* ChainingMode(SymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case SymmetricAlgorithm::AES_128_CBC:
                 case SymmetricAlgorithm::AES_192_CBC:
@@ -64,7 +64,7 @@ namespace ShadowStrike  {
              * @param alg Symmetric algorithm enum
              * @return Key size in bytes, 0 if invalid
              */
-            static size_t KeySizeForAlg(SymmetricAlgorithm alg) noexcept {
+            size_t KeySizeForAlg(SymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case SymmetricAlgorithm::AES_128_CBC:
                 case SymmetricAlgorithm::AES_128_GCM:
@@ -89,7 +89,7 @@ namespace ShadowStrike  {
              * @param alg Symmetric algorithm enum
              * @return IV size in bytes, 0 if invalid
              */
-            static size_t IVSizeForAlg(SymmetricAlgorithm alg) noexcept {
+            size_t IVSizeForAlg(SymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case SymmetricAlgorithm::AES_128_GCM:
                 case SymmetricAlgorithm::AES_192_GCM:
@@ -113,7 +113,7 @@ namespace ShadowStrike  {
              * @param alg Symmetric algorithm enum
              * @return true if AEAD (provides authenticated encryption)
              */
-            static bool IsAEADAlg(SymmetricAlgorithm alg) noexcept {
+            bool IsAEADAlg(SymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case SymmetricAlgorithm::AES_128_GCM:
                 case SymmetricAlgorithm::AES_192_GCM:
@@ -130,7 +130,7 @@ namespace ShadowStrike  {
              * @param alg Asymmetric algorithm enum
              * @return CNG algorithm name or nullptr if invalid
              */
-            static const wchar_t* RSAAlgName(AsymmetricAlgorithm alg) noexcept {
+            const wchar_t* RSAAlgName(AsymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case AsymmetricAlgorithm::RSA_2048:
                 case AsymmetricAlgorithm::RSA_3072:
@@ -152,7 +152,7 @@ namespace ShadowStrike  {
              * @param alg Asymmetric algorithm enum
              * @return Key size in bits, 0 if invalid
              */
-            static ULONG RSAKeySizeForAlg(AsymmetricAlgorithm alg) noexcept {
+            ULONG RSAKeySizeForAlg(AsymmetricAlgorithm alg) noexcept {
                 switch (alg) {
                 case AsymmetricAlgorithm::RSA_2048: return 2048UL;
                 case AsymmetricAlgorithm::RSA_3072: return 3072UL;
@@ -200,7 +200,7 @@ namespace ShadowStrike  {
              * @brief Safe logging helper - logs to debug output if Logger not initialized
              * @param msg Message to log
              */
-            static void SafeLogError(const wchar_t* msg) noexcept {
+            void SafeLogError(const wchar_t* msg) noexcept {
                 if (msg == nullptr) return;
 
                 try {
@@ -222,7 +222,7 @@ namespace ShadowStrike  {
              * @brief Safe logging helper for info messages
              * @param msg Message to log
              */
-            static void SafeLogInfo(const wchar_t* msg) noexcept {
+            void SafeLogInfo(const wchar_t* msg) noexcept {
                 if (msg == nullptr) return;
 
                 try {

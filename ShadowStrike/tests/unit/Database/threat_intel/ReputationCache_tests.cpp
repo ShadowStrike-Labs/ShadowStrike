@@ -86,7 +86,9 @@ namespace {
 	for (size_t i = 0; i < len && i < buf.size(); ++i) {
 		buf[i] = static_cast<uint8_t>(fillByte + static_cast<uint8_t>(i));
 	}
-	return HashValue(algo, buf.data(), len);
+	HashValue result{};
+	result.Set(algo, buf.data(), len);
+	return result;
 }
 
 } // namespace
@@ -349,17 +351,17 @@ TEST(ReputationCacheTests, InsertLookup_AllSupportedKeyTypes) {
 	const CacheValue v = CacheValue(MakeFoundResult(IOCType::Domain), ttl);
 
 	// IPv4
-	IPv4Address ip4(8, 8, 8, 8);
-	c.Insert(ip4, v);
+	const auto addr_4 = IPv4Address::Create(8, 8, 8, 8);
+	c.Insert(addr_4, v);
 	CacheValue out{};
-	EXPECT_TRUE(c.Lookup(ip4, out));
+	EXPECT_TRUE(c.Lookup(addr_4, out));
 	EXPECT_EQ(out.reputation, v.reputation);
 	EXPECT_TRUE(out.isPositive);
 
 	// IPv6
-	IPv6Address ip6(0x20010DB800000000ULL, 0x0000000000000001ULL);
-	c.Insert(ip6, v);
-	EXPECT_TRUE(c.Lookup(ip6, out));
+	const auto addr_6 = IPv6Address::Create(0x20010DB800000000ULL, 0x0000000000000001ULL);
+	c.Insert(addr_6, v);
+	EXPECT_TRUE(c.Lookup(addr_6, out));
 
 	// Hash
 	HashValue hv = MakeHash(HashAlgorithm::SHA256, 0x11);

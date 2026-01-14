@@ -1167,7 +1167,11 @@ TEST_F(HashIndexTest, RegressionRemoveFromSingleEntryIndex) {
 // MAIN ENTRY POINT
 // ============================================================================
 
+// Only define main when building as standalone test executable
+// When linking with main project, use gtest_main or the project's main
+#if defined(BUILD_TEST_EXECUTABLE) || defined(STANDALONE_TEST)
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
+#endif

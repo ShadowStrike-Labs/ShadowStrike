@@ -24,7 +24,7 @@
  */
 
 #include <gtest/gtest.h>
-#include <gmock/gmock.h>
+#include<gmock/gmock.h>
 
 #include "../../../../src/ThreatIntel/ThreatIntelFeedManager.hpp"
 #include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
@@ -353,7 +353,8 @@ protected:
         
         switch (type) {
             case IOCType::IPv4:
-                entry.value.ipv4 = IPv4Address(192, 168, 1, 100);
+                entry.value.ipv4 = {};
+                entry.value.ipv4.Set(192, 168, 1, 100);
                 break;
             case IOCType::FileHash:
                 entry.value.hash.algorithm = HashAlgorithm::SHA256;

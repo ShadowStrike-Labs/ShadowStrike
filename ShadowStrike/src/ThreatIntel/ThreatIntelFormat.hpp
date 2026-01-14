@@ -717,6 +717,7 @@ enum class HashAlgorithm : uint8_t {
 // ============================================================================
 
 /// @brief IPv4 address with CIDR prefix support (cache-line optimized)
+/// @note All special member functions defaulted for trivially_copyable
 #pragma pack(push, 1)
 struct alignas(4) IPv4Address {
 
@@ -731,25 +732,64 @@ struct alignas(4) IPv4Address {
     /// @brief Reserved for future use
     uint8_t reserved[3];
     
-    /// @brief Default constructor - 0.0.0.0/0
-    IPv4Address() noexcept : address(0), prefixLength(32), reserved{} {}
+    // =========================================================================
+    // SPECIAL MEMBER FUNCTIONS - ALL DEFAULTED FOR TRIVIALLY COPYABLE
+    // =========================================================================
+    IPv4Address() = default;
+    ~IPv4Address() = default;
+    IPv4Address(const IPv4Address&) = default;
+    IPv4Address& operator=(const IPv4Address&) = default;
+    IPv4Address(IPv4Address&&) = default;
+    IPv4Address& operator=(IPv4Address&&) = default;
     
-    /// @brief Construct from 4 octets
-    IPv4Address(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) noexcept
-        : address((static_cast<uint32_t>(a) << 24) |
-            (static_cast<uint32_t>(b) << 16) |
-            (static_cast<uint32_t>(c) << 8) |
-            static_cast<uint32_t>(d)),
-        prefixLength(prefix), reserved{} {}
-
-
-    /// @brief Construct from raw 32-bit value (host byte order)
-    explicit IPv4Address(uint32_t addr, uint8_t prefix = 32) noexcept
-        : address(addr), prefixLength(prefix), reserved{} {}
-
-    /// @brief Updated constructor to initialize union members correctly
-    IPv4Address(std::array<uint8_t, 4> arr, uint8_t prefix = 32) noexcept : 
-        octets(arr), prefixLength(prefix), reserved{} {}
+    // =========================================================================
+    // STATIC FACTORY METHODS - Preferred way to create IPv4Address
+    // =========================================================================
+    
+    /// @brief Create IPv4Address from 4 octets (factory method)
+    [[nodiscard]] static IPv4Address Create(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) noexcept {
+        IPv4Address result{};
+        result.address = (static_cast<uint32_t>(a) << 24) |
+                         (static_cast<uint32_t>(b) << 16) |
+                         (static_cast<uint32_t>(c) << 8) |
+                         static_cast<uint32_t>(d);
+        result.prefixLength = prefix;
+        result.reserved[0] = result.reserved[1] = result.reserved[2] = 0;
+        return result;
+    }
+    
+    /// @brief Create IPv4Address from raw 32-bit value (factory method)
+    [[nodiscard]] static IPv4Address Create(uint32_t addr, uint8_t prefix = 32) noexcept {
+        IPv4Address result{};
+        result.address = addr;
+        result.prefixLength = prefix;
+        result.reserved[0] = result.reserved[1] = result.reserved[2] = 0;
+        return result;
+    }
+    
+    /// @brief Initialize from 4 octets
+    void Set(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) noexcept {
+        address = (static_cast<uint32_t>(a) << 24) |
+                  (static_cast<uint32_t>(b) << 16) |
+                  (static_cast<uint32_t>(c) << 8) |
+                  static_cast<uint32_t>(d);
+        prefixLength = prefix;
+        reserved[0] = reserved[1] = reserved[2] = 0;
+    }
+    
+    /// @brief Initialize from raw 32-bit value (host byte order)
+    void Set(uint32_t addr, uint8_t prefix = 32) noexcept {
+        address = addr;
+        prefixLength = prefix;
+        reserved[0] = reserved[1] = reserved[2] = 0;
+    }
+    
+    /// @brief Initialize from array of octets
+    void Set(std::array<uint8_t, 4> arr, uint8_t prefix = 32) noexcept {
+        octets = arr;
+        prefixLength = prefix;
+        reserved[0] = reserved[1] = reserved[2] = 0;
+    }
     
     /// @brief Get network mask for CIDR prefix
     [[nodiscard]] uint32_t GetNetworkMask() const noexcept {
@@ -845,6 +885,7 @@ static_assert(sizeof(IPv4Address) == 8, "IPv4Address must be exactly 8 bytes");
 // ============================================================================
 
 /// @brief IPv6 address with CIDR prefix support (128-bit optimized)
+/// @note All special member functions defaulted for trivially_copyable
 #pragma pack(push, 1)
 struct alignas(8) IPv6Address {
 
@@ -859,29 +900,72 @@ struct alignas(8) IPv6Address {
     /// @brief Reserved for alignment
     uint8_t reserved[7];
     
-    /// @brief Default constructor - all zeros
-    IPv6Address() noexcept : address{}, prefixLength(128), reserved{} {
-        address.fill(0);
+    // =========================================================================
+    // SPECIAL MEMBER FUNCTIONS - ALL DEFAULTED FOR TRIVIALLY COPYABLE
+    // =========================================================================
+    IPv6Address() = default;
+    ~IPv6Address() = default;
+    IPv6Address(const IPv6Address&) = default;
+    IPv6Address& operator=(const IPv6Address&) = default;
+    IPv6Address(IPv6Address&&) = default;
+    IPv6Address& operator=(IPv6Address&&) = default;
+    
+    // =========================================================================
+    // STATIC FACTORY METHODS - Preferred way to create IPv6Address
+    // =========================================================================
+    
+    /// @brief Create IPv6Address from raw bytes (factory method)
+    [[nodiscard]] static IPv6Address Create(const uint8_t* bytes, uint8_t prefix = 128) noexcept {
+        IPv6Address result{};
+        if (bytes) {
+            std::memcpy(result.address.data(), bytes, 16);
+        } else {
+            std::memset(result.address.data(), 0, 16);
+        }
+        result.prefixLength = prefix;
+        std::memset(result.reserved, 0, sizeof(result.reserved));
+        return result;
     }
     
-    /// @brief Construct from raw bytes
-    IPv6Address(const uint8_t* bytes, uint8_t prefix = 128) noexcept
-        : prefixLength(prefix), reserved{} {
+    /// @brief Create IPv6Address from two 64-bit halves (factory method)
+    [[nodiscard]] static IPv6Address Create(uint64_t high, uint64_t low, uint8_t prefix = 128) noexcept {
+        IPv6Address result{};
+        for (int i = 0; i < 8; ++i) {
+            result.address[i] = static_cast<uint8_t>(high >> (56 - i * 8));
+            result.address[8 + i] = static_cast<uint8_t>(low >> (56 - i * 8));
+        }
+        result.prefixLength = prefix;
+        std::memset(result.reserved, 0, sizeof(result.reserved));
+        return result;
+    }
+    
+    /// @brief Initialize from raw bytes
+    void Set(const uint8_t* bytes, uint8_t prefix = 128) noexcept {
         if (bytes) {
             std::memcpy(address.data(), bytes, 16);
         } else {
-            address.fill(0);
+            std::memset(address.data(), 0, 16);
         }
+        prefixLength = prefix;
+        std::memset(reserved, 0, sizeof(reserved));
     }
     
-    /// @brief Construct from two 64-bit halves (for quick construction)
-    IPv6Address(uint64_t high, uint64_t low, uint8_t prefix = 128) noexcept
-        : prefixLength(prefix), reserved{} {
+    /// @brief Initialize from two 64-bit halves
+    void Set(uint64_t high, uint64_t low, uint8_t prefix = 128) noexcept {
         // Store in network byte order (big-endian)
         for (int i = 0; i < 8; ++i) {
             address[i] = static_cast<uint8_t>(high >> (56 - i * 8));
             address[8 + i] = static_cast<uint8_t>(low >> (56 - i * 8));
         }
+        prefixLength = prefix;
+        std::memset(reserved, 0, sizeof(reserved));
+    }
+    
+    /// @brief Clear address to zeros
+    void Clear() noexcept {
+        std::memset(address.data(), 0, 16);
+        prefixLength = 128;
+        std::memset(reserved, 0, sizeof(reserved));
     }
     
     /// @brief Get high 64 bits as uint64_t (host byte order)
@@ -986,13 +1070,16 @@ struct alignas(8) IPv6Address {
     
     /// @brief Get embedded IPv4 address (if IPv4-mapped)
     [[nodiscard]] IPv4Address ToIPv4() const noexcept {
-        if (!IsIPv4Mapped()) return IPv4Address();
-        return IPv4Address(
-            (static_cast<uint32_t>(address[12]) << 24) |
-            (static_cast<uint32_t>(address[13]) << 16) |
-            (static_cast<uint32_t>(address[14]) << 8) |
-            static_cast<uint32_t>(address[15])
-        );
+        IPv4Address result{};
+        if (IsIPv4Mapped()) {
+            result.Set(
+                (static_cast<uint32_t>(address[12]) << 24) |
+                (static_cast<uint32_t>(address[13]) << 16) |
+                (static_cast<uint32_t>(address[14]) << 8) |
+                static_cast<uint32_t>(address[15])
+            );
+        }
+        return result;
     }
     
     /// @brief Check if address is valid (non-zero)
@@ -1026,18 +1113,54 @@ struct alignas(4) HashValue {
     /// @brief Hash data (max 72 bytes for SSDEEP)
     std::array<uint8_t, 72> data;
     
-    /// @brief Default constructor - initializes to zero
-    HashValue() noexcept : algorithm(HashAlgorithm::SHA256), length(0), reserved{} {
-        data.fill(0);
+    // =========================================================================
+    // SPECIAL MEMBER FUNCTIONS - ALL DEFAULTED FOR TRIVIALLY COPYABLE
+    // =========================================================================
+    HashValue() = default;
+    ~HashValue() = default;
+    HashValue(const HashValue&) = default;
+    HashValue& operator=(const HashValue&) = default;
+    HashValue(HashValue&&) = default;
+    HashValue& operator=(HashValue&&) = default;
+    
+    // =========================================================================
+    // STATIC FACTORY METHOD - Preferred way to create HashValue
+    // =========================================================================
+    
+    /// @brief Create a HashValue from raw bytes (factory method)
+    /// @param algo Hash algorithm type
+    /// @param bytes Pointer to hash bytes (may be nullptr)
+    /// @param len Length of hash in bytes (clamped to 72)
+    /// @return Fully initialized HashValue
+    [[nodiscard]] static HashValue Create(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept {
+        HashValue result{};
+        result.algorithm = algo;
+        result.length = (len <= 72) ? len : 72;
+        result.reserved[0] = result.reserved[1] = 0;
+        std::memset(result.data.data(), 0, result.data.size());
+        if (bytes && result.length > 0) {
+            std::memcpy(result.data.data(), bytes, result.length);
+        }
+        return result;
     }
     
-    /// @brief Construct from raw bytes
-    HashValue(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept
-        : algorithm(algo), length(len), reserved{} {
-        data.fill(0);
-        if (bytes && len > 0 && len <= 72) {
-            std::memcpy(data.data(), bytes, len);
+    /// @brief Initialize hash from raw bytes
+    void Set(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept {
+        algorithm = algo;
+        length = (len <= 72) ? len : 72;
+        reserved[0] = reserved[1] = 0;
+        std::memset(data.data(), 0, data.size());
+        if (bytes && length > 0) {
+            std::memcpy(data.data(), bytes, length);
         }
+    }
+    
+    /// @brief Clear hash to zeros
+    void Clear() noexcept {
+        algorithm = HashAlgorithm::SHA256;
+        length = 0;
+        reserved[0] = reserved[1] = 0;
+        std::memset(data.data(), 0, data.size());
     }
     
     /// @brief Zero-cost hash comparison (inlined, cache-friendly)
@@ -1278,25 +1401,13 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         /// @brief Raw bytes for custom data
         uint8_t raw[76];
         
-        /// @brief Default constructor - zero-initializes the union
-        constexpr IOCValue() noexcept : raw{} {}
-        
-        /// @brief Copy constructor - uses constexpr-compatible element-wise copy
-        constexpr IOCValue(const IOCValue& other) noexcept : raw{} {
-            for (std::size_t i = 0; i < sizeof(raw); ++i) {
-                raw[i] = other.raw[i];
-            }
-        }
-        
-        /// @brief Copy assignment operator - uses constexpr-compatible element-wise copy
-        constexpr IOCValue& operator=(const IOCValue& other) noexcept {
-            if (this != &other) {
-                for (std::size_t i = 0; i < sizeof(raw); ++i) {
-                    raw[i] = other.raw[i];
-                }
-            }
-            return *this;
-        }
+        // Default all special member functions for trivially_copyable
+        IOCValue() = default;
+        ~IOCValue() = default;
+        IOCValue(const IOCValue&) = default;
+        IOCValue& operator=(const IOCValue&) = default;
+        IOCValue(IOCValue&&) = default;
+        IOCValue& operator=(IOCValue&&) = default;
     } value;
     
     /// @brief Value type discriminator (mirrors IOCType for union access)
@@ -1354,20 +1465,25 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     
     // ========================================================================
     // STATISTICS & COUNTERS (16 bytes)
-    // Note: Using uint32_t for better alignment compatibility with std::atomic
+    // Plain uint32_t with Interlocked intrinsics for thread-safe memory-mapped access.
+    // std::atomic is NOT trivially copyable, so we use Windows Interlocked functions.
     // ========================================================================
     
     /// @brief Hit count (how many times this IOC matched)
-    std::atomic<uint32_t> hitCount;
+    /// @note Use GetHitCount()/SetHitCount()/IncrementHitCount() for thread-safe access
+    uint32_t hitCount;
     
-    /// @brief Last hit timestamp
-    std::atomic<uint32_t> lastHitTime;
+    /// @brief Last hit timestamp (Unix epoch seconds, truncated to 32 bits)
+    /// @note Use GetLastHitTime()/SetLastHitTime() for thread-safe access
+    uint32_t lastHitTime;
     
     /// @brief False positive count (user feedback) - use lower 16 bits
-    std::atomic<uint32_t> falsePositiveCount;
+    /// @note Use GetFalsePositiveCount()/IncrementFalsePositive() for thread-safe access
+    uint32_t falsePositiveCount;
     
     /// @brief True positive count (confirmed) - use lower 16 bits
-    std::atomic<uint32_t> truePositiveCount;
+    /// @note Use GetTruePositiveCount()/IncrementTruePositive() for thread-safe access
+    uint32_t truePositiveCount;
     
     // ========================================================================
     // API SOURCE DATA (32 bytes)
@@ -1391,66 +1507,89 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     
     // ========================================================================
     // PADDING TO 256 BYTES
-    // Note: Due to std::atomic alignment requirements, actual byte count
-    // before this padding varies. Use CACHE_LINE_SIZE (64) alignment.
     // ========================================================================
     
     // ========================================================================
-    // CONSTRUCTORS
+    // SPECIAL MEMBER FUNCTIONS - ALL DEFAULTED FOR TRIVIALLY COPYABLE
+    // ========================================================================
+    // 
+    // C++ Standard requires ALL of these to be trivial (defaulted or implicit)
+    // for a type to be trivially copyable:
+    // - Copy constructor
+    // - Copy assignment operator  
+    // - Move constructor
+    // - Move assignment operator
+    // - Destructor
+    //
+    // DO NOT define custom implementations - this breaks trivially_copyable!
+    // Memory-mapped storage requires this property.
+    //
+    // For zero-initialization, use aggregate initialization:
+    //   IOCEntry entry{};  // All members zero-initialized
+    //
+    // For thread-safe counter access, use the helper methods:
+    //   entry.IncrementHitCount();
+    //   entry.GetHitCount();
+    //   entry.SetHitCount(value);
     // ========================================================================
     
-    /// @brief Default constructor - zero-initializes all fields
-    IOCEntry() noexcept {
-        std::memset(this, 0, sizeof(IOCEntry));
-        // Placement-new the atomics to properly initialize them
-        new (&hitCount) std::atomic<uint32_t>(0);
-        new (&lastHitTime) std::atomic<uint32_t>(0);
-        new (&falsePositiveCount) std::atomic<uint32_t>(0);
-        new (&truePositiveCount) std::atomic<uint32_t>(0);
+    IOCEntry() = default;
+    ~IOCEntry() = default;
+    IOCEntry(const IOCEntry&) = default;
+    IOCEntry& operator=(const IOCEntry&) = default;
+    IOCEntry(IOCEntry&&) = default;
+    IOCEntry& operator=(IOCEntry&&) = default;
+    
+    // ========================================================================
+    // THREAD-SAFE COUNTER ACCESS (Windows Interlocked)
+    // ========================================================================
+    
+    /// @brief Get current hit count (thread-safe read)
+    [[nodiscard]] uint32_t GetHitCount() const noexcept {
+        return static_cast<uint32_t>(InterlockedOr(
+            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&hitCount)), 0));
     }
     
-    /// @brief Copy constructor - manually copy atomic members
-    IOCEntry(const IOCEntry& other) noexcept {
-        // Copy non-atomic members
-        std::memcpy(this, &other, offsetof(IOCEntry, hitCount));
-        
-        // Placement-new and initialize atomics with other's values
-        new (&hitCount) std::atomic<uint32_t>(other.hitCount.load(std::memory_order_relaxed));
-        new (&lastHitTime) std::atomic<uint32_t>(other.lastHitTime.load(std::memory_order_relaxed));
-        new (&falsePositiveCount) std::atomic<uint32_t>(other.falsePositiveCount.load(std::memory_order_relaxed));
-        new (&truePositiveCount) std::atomic<uint32_t>(other.truePositiveCount.load(std::memory_order_relaxed));
-        
-        // Copy remaining bytes after atomics
-        constexpr size_t atomicsEnd = offsetof(IOCEntry, hitCount) + 
-            sizeof(hitCount) + sizeof(lastHitTime) + sizeof(falsePositiveCount) + sizeof(truePositiveCount);
-        constexpr size_t remainingSize = sizeof(IOCEntry) - atomicsEnd;
-        std::memcpy(reinterpret_cast<uint8_t*>(this) + atomicsEnd,
-                    reinterpret_cast<const uint8_t*>(&other) + atomicsEnd,
-                    remainingSize);
+    /// @brief Set hit count (thread-safe write)
+    void SetHitCount(uint32_t value) noexcept {
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&hitCount), 
+                           static_cast<LONG>(value));
     }
     
-    /// @brief Copy assignment operator
-    IOCEntry& operator=(const IOCEntry& other) noexcept {
-        if (this != &other) {
-            // Copy non-atomic members
-            std::memcpy(this, &other, offsetof(IOCEntry, hitCount));
-            
-            // Copy atomic values
-            hitCount.store(other.hitCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            lastHitTime.store(other.lastHitTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            falsePositiveCount.store(other.falsePositiveCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            truePositiveCount.store(other.truePositiveCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            
-            // Copy remaining bytes after atomics
-            constexpr size_t atomicsEnd = offsetof(IOCEntry, hitCount) + 
-                sizeof(hitCount) + sizeof(lastHitTime) + sizeof(falsePositiveCount) + sizeof(truePositiveCount);
-            constexpr size_t remainingSize = sizeof(IOCEntry) - atomicsEnd;
-            std::memcpy(reinterpret_cast<uint8_t*>(this) + atomicsEnd,
-                        reinterpret_cast<const uint8_t*>(&other) + atomicsEnd,
-                        remainingSize);
-        }
-        return *this;
+    /// @brief Get last hit time (thread-safe read)
+    [[nodiscard]] uint32_t GetLastHitTime() const noexcept {
+        return static_cast<uint32_t>(InterlockedOr(
+            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&lastHitTime)), 0));
     }
+    
+    /// @brief Set last hit time (thread-safe write)
+    void SetLastHitTime(uint32_t value) noexcept {
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&lastHitTime), 
+                           static_cast<LONG>(value));
+    }
+    
+    /// @brief Get false positive count (thread-safe read)
+    [[nodiscard]] uint32_t GetFalsePositiveCount() const noexcept {
+        return static_cast<uint32_t>(InterlockedOr(
+            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&falsePositiveCount)), 0));
+    }
+    
+    /// @brief Increment false positive count (thread-safe)
+    void IncrementFalsePositive() noexcept {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&falsePositiveCount));
+    }
+    
+    /// @brief Get true positive count (thread-safe read)
+    [[nodiscard]] uint32_t GetTruePositiveCount() const noexcept {
+        return static_cast<uint32_t>(InterlockedOr(
+            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&truePositiveCount)), 0));
+    }
+    
+    /// @brief Increment true positive count (thread-safe)
+    void IncrementTruePositive() noexcept {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&truePositiveCount));
+    }
+    
     // ========================================================================
     // METHODS
     // ========================================================================
@@ -1486,15 +1625,14 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         return IsActive() && HasFlag(flags, IOCFlags::AlertOnMatch);
     }
     
-    /// @brief Increment hit counter (thread-safe)
+    /// @brief Increment hit counter and update last hit time (thread-safe)
     void IncrementHitCount() noexcept {
-        hitCount.fetch_add(1, std::memory_order_relaxed);
-        lastHitTime.store(
-            static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()
-            ).count()),
-            std::memory_order_relaxed
-        );
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&hitCount));
+        const auto now = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count());
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&lastHitTime), 
+                           static_cast<LONG>(now));
     }
     
     /// @brief Get threat score (reputation * confidence / 100)
@@ -1518,6 +1656,8 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
 
 static_assert(sizeof(IOCEntry) == 256, "IOCEntry must be exactly 256 bytes");
 static_assert(alignof(IOCEntry) == CACHE_LINE_SIZE, "IOCEntry must be cache-line aligned");
+static_assert(std::is_trivially_copyable_v<IOCEntry>, 
+              "IOCEntry must be trivially copyable for memory-mapped storage");
 
 // ============================================================================
 // COMPACT IOC ENTRY (For high-density storage)

@@ -86,6 +86,59 @@
 namespace ShadowStrike {
 namespace Whitelist {
 
+
+    // ============================================================================
+    // ERROR STRING CONVERSION (Enterprise-Grade Logging & Testing Support)
+    // ============================================================================
+
+    std::ostream& operator<<(std::ostream& os, WhitelistStoreError error) {
+        switch (error) {
+        case WhitelistStoreError::Success:                return os << "Success";
+        case WhitelistStoreError::FileNotFound:           return os << "FileNotFound";
+        case WhitelistStoreError::FileAccessDenied:       return os << "FileAccessDenied";
+        case WhitelistStoreError::FileLocked:             return os << "FileLocked";
+        case WhitelistStoreError::FileCorrupted:          return os << "FileCorrupted";
+        case WhitelistStoreError::InvalidMagic:           return os << "InvalidMagic";
+        case WhitelistStoreError::InvalidVersion:         return os << "InvalidVersion";
+        case WhitelistStoreError::InvalidHeader:          return os << "InvalidHeader";
+        case WhitelistStoreError::InvalidChecksum:        return os << "InvalidChecksum";
+        case WhitelistStoreError::InvalidSection:         return os << "InvalidSection";
+        case WhitelistStoreError::OutOfMemory:            return os << "OutOfMemory";
+        case WhitelistStoreError::MappingFailed:          return os << "MappingFailed";
+        case WhitelistStoreError::AddressSpaceExhausted:  return os << "AddressSpaceExhausted";
+        case WhitelistStoreError::EntryNotFound:          return os << "EntryNotFound";
+        case WhitelistStoreError::DuplicateEntry:         return os << "DuplicateEntry";
+        case WhitelistStoreError::InvalidEntry:           return os << "InvalidEntry";
+        case WhitelistStoreError::EntryExpired:           return os << "EntryExpired";
+        case WhitelistStoreError::EntryRevoked:           return os << "EntryRevoked";
+        case WhitelistStoreError::IndexCorrupted:         return os << "IndexCorrupted";
+        case WhitelistStoreError::IndexFull:              return os << "IndexFull";
+        case WhitelistStoreError::IndexRebuildRequired:   return os << "IndexRebuildRequired";
+        case WhitelistStoreError::ReadOnlyDatabase:       return os << "ReadOnlyDatabase";
+        case WhitelistStoreError::OperationTimeout:       return os << "OperationTimeout";
+        case WhitelistStoreError::OperationCancelled:     return os << "OperationCancelled";
+        case WhitelistStoreError::ConcurrentModification: return os << "ConcurrentModification";
+        case WhitelistStoreError::DatabaseTooLarge:       return os << "DatabaseTooLarge";
+        case WhitelistStoreError::TooManyEntries:         return os << "TooManyEntries";
+        case WhitelistStoreError::PathTooLong:            return os << "PathTooLong";
+        case WhitelistStoreError::StringTooLong:          return os << "StringTooLong";
+        case WhitelistStoreError::Unknown:                return os << "UnknownError";
+        default:                                          return os << "UnknownCode(" << static_cast<uint32_t>(error) << ")";
+        }
+    }
+
+    std::ostream& operator<<(std::ostream& os, const StoreError& error) {
+        os << "StoreError{ code: " << error.code;
+        if (error.win32Error != 0) {
+            os << ", win32: 0x" << std::hex << error.win32Error << std::dec;
+        }
+        if (!error.message.empty()) {
+            os << ", msg: '" << error.message << "'";
+        }
+        os << " }";
+        return os;
+    }
+
 // ============================================================================
 // RAII HELPER CLASSES (Internal)
 // ============================================================================

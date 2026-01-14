@@ -141,7 +141,8 @@ struct TempDir {
 				prefixLen = static_cast<uint8_t>(std::stoi(value.substr(slashPos + 1)));
 			}
 			
-			entry.value.ipv4 = IPv4Address(octets, prefixLen);
+			entry.value.ipv4 = {};
+			entry.value.ipv4.Set(octets, prefixLen);
 			break;
 		}
 		case IOCType::IPv6: {
@@ -341,7 +342,7 @@ TEST(ThreatIntelIndex_IPv4, Lookup_NotFound) {
 	ThreatIntelIndex index;
 	ASSERT_TRUE(index.Initialize(view, header).IsSuccess());
 	
-	IPv4Address addr(192, 168, 1, 1);
+	const auto addr = IPv4Address::Create(192, 168, 1, 1, 32);
 	IndexQueryOptions queryOptions;
 	IndexLookupResult result = index.LookupIPv4(addr, queryOptions);
 	
@@ -390,7 +391,7 @@ TEST(ThreatIntelIndex_IPv4, Lookup_PrefixMatch) {
 	
 	// Lookup address in that network
 	// Note: Prefix matching is inherent behavior of radix tree for CIDR entries
-	IPv4Address addr(192, 168, 1, 100);
+	const auto addr = IPv4Address::Create(192, 168, 1, 100);
 	IndexQueryOptions queryOptions;
 	
 	IndexLookupResult result = index.LookupIPv4(addr, queryOptions);
@@ -422,7 +423,7 @@ TEST(ThreatIntelIndex_IPv4, BatchLookup) {
 	// Batch lookup
 	std::vector<IPv4Address> addresses;
 	for (int i = 0; i < 10; ++i) {
-		addresses.emplace_back(192, 168, 1, i);
+		addresses.push_back(IPv4Address::Create(192, 168, 1, i, 32));
 	}
 	
 	std::vector<IndexLookupResult> results;
@@ -1106,7 +1107,7 @@ TEST(ThreatIntelIndex_Stats, ResetStatistics) {
 	ASSERT_TRUE(index.Initialize(view, header).IsSuccess());
 	
 	// Do some lookups
-	IPv4Address addr(192, 168, 1, 1);
+	const auto addr = IPv4Address::Create(192, 168, 1, 1, 32);
 	IndexQueryOptions queryOptions;
 	index.LookupIPv4(addr, queryOptions);
 	
@@ -1184,12 +1185,12 @@ TEST(ThreatIntelIndex_ThreadSafety, ConcurrentLookups) {
 	// Concurrent lookups
 	std::atomic<int> successCount{0};
 	std::vector<std::thread> threads;
-	
+
 	for (int t = 0; t < 4; ++t) {
 		threads.emplace_back([&index, &successCount]() {
 			IndexQueryOptions queryOptions;
 			for (int i = 0; i < 100; ++i) {
-				IPv4Address addr(192, 168, 1, i % 256);
+				const auto addr = IPv4Address::Create(192, 168, 1, i % 256);
 				IndexLookupResult result = index.LookupIPv4(addr, queryOptions);
 				if (result.found) {
 					successCount.fetch_add(1, std::memory_order_relaxed);
@@ -1222,12 +1223,15 @@ TEST(ThreatIntelIndex_Performance, IPv4Lookup_LargeScale) {
 	
 	// Insert 10K entries
 	for (int i = 0; i < 10000; ++i) {
-		IPv4Address addr(
+
+		const auto addr = IPv4Address::Create(
 			192,
 			168,
 			(i / 256) % 256,
-			i % 256
+			i % 256,
+			32
 		);
+		
 		IOCEntry entry{};
 		entry.type = IOCType::IPv4;
 		entry.value.ipv4 = addr;
@@ -1239,7 +1243,14 @@ TEST(ThreatIntelIndex_Performance, IPv4Lookup_LargeScale) {
 	
 	IndexQueryOptions queryOptions;
 	for (int i = 0; i < 10000; ++i) {
-		IPv4Address addr(192, 168, (i / 256) % 256, i % 256);
+		const auto addr = IPv4Address::Create(
+			192,
+			168,
+			(i / 256) % 256,
+			i % 256,
+			32
+		);
+		
 		index.LookupIPv4(addr, queryOptions);
 	}
 	
@@ -1314,7 +1325,7 @@ TEST(ThreatIntelIndex_EdgeCase, EmptyDatabase) {
 	ASSERT_TRUE(index.Initialize(view, header).IsSuccess());
 	
 	// Lookup in empty index
-	IPv4Address addr(192, 168, 1, 1);
+	const auto addr = IPv4Address::Create(192, 168, 1, 1, 32);
 	IndexQueryOptions queryOptions;
 	IndexLookupResult result = index.LookupIPv4(addr, queryOptions);
 	

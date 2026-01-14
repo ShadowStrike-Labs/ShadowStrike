@@ -568,7 +568,7 @@ namespace ShadowStrike {
 						err->win32 = ERROR_UNHANDLED_EXCEPTION;
 						err->message = L"Exception in EnableNetworkAdapter";
 						char buffer[256];
-						std::strncpy(buffer, e.what(), sizeof(buffer) - 1);
+						std::snprintf(buffer, sizeof(buffer), "%s", e.what());
 						buffer[sizeof(buffer) - 1] = '\0';
 						// Convert to wstring if needed for context
 					}

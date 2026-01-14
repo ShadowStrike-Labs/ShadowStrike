@@ -95,7 +95,8 @@ struct TempDir {
 					
 				}
 			} else {
-				entry.value.ipv4 = IPv4Address(192, 168, 1, 1);
+				entry.value.ipv4 = {};
+				entry.value.ipv4.Set(192, 168, 1, 1);
 			}
 			break;
 			

@@ -158,7 +158,7 @@ namespace ShadowStrike {
              * @param input Input bytes to encode
              * @return Base64 encoded string, empty on failure
              */
-            [[nodiscard]] std::string Base64Encode(std::string_view input) {
+            [[nodiscard]] inline std::string Base64Encode(std::string_view input) {
                 // Handle empty input
                 if (input.empty()) {
                     return "";
@@ -199,7 +199,7 @@ namespace ShadowStrike {
              * @return Base64 encoded string, empty on failure
              */
 
-            [[nodiscard]] std::string Base64EncodeUrlSafe(std::string_view input) {
+            [[nodiscard]] inline std::string Base64EncodeUrlSafe(std::string_view input) {
                 if (input.empty()) return "";
 
                 std::string output;
@@ -232,7 +232,7 @@ namespace ShadowStrike {
              * @param timestamp ISO8601 formatted timestamp string
              * @return Unix timestamp in seconds, 0 on parse failure
              */
-            [[nodiscard]] uint64_t ParseISO8601(const std::string& timestamp) {
+            [[nodiscard]] inline uint64_t ParseISO8601(const std::string& timestamp) {
                 // Validate input bounds
                 if (timestamp.empty() || timestamp.size() > 64) {
                     return 0;  // Invalid input
@@ -311,7 +311,7 @@ namespace ShadowStrike {
              * @param str String to validate
              * @return true if valid IPv4 address
              */
-            [[nodiscard]] bool IsValidIPv4(std::string_view str) {
+            [[nodiscard]] inline bool IsValidIPv4(std::string_view str) {
                 if (str.empty() || str.size() > 15) {  // Max: "255.255.255.255"
                     return false;
                 }
@@ -356,7 +356,7 @@ namespace ShadowStrike {
              * @param str String to validate
              * @return true if valid IPv6 address
              */
-            [[nodiscard]] bool IsValidIPv6(std::string_view str) {
+            [[nodiscard]] inline bool IsValidIPv6(std::string_view str) {
                 if (str.empty() || str.size() > 45) {  // Max IPv6 length with embedded IPv4
                     return false;
                 }
@@ -412,7 +412,7 @@ namespace ShadowStrike {
              * @param str String to validate
              * @return true if valid domain name
              */
-            [[nodiscard]] bool IsValidDomain(std::string_view str) {
+            [[nodiscard]] inline bool IsValidDomain(std::string_view str) {
                 // RFC 1035: domain name max 253 characters
                 if (str.empty() || str.size() > 253) return false;
 
@@ -479,7 +479,7 @@ namespace ShadowStrike {
              * @param str String to validate
              * @return true if string starts with http://, https://, ftp://, or ftps://
              */
-            [[nodiscard]] bool IsValidUrlString(std::string_view str) {
+            [[nodiscard]] inline bool IsValidUrlString(std::string_view str) {
                 if (str.empty() || str.size() > 2048) {  // RFC 2616 practical limit
                     return false;
                 }
@@ -496,7 +496,7 @@ namespace ShadowStrike {
              * @param str String to validate
              * @return true if basic email format is satisfied
              */
-            [[nodiscard]] bool IsValidEmail(std::string_view str) {
+            [[nodiscard]] inline bool IsValidEmail(std::string_view str) {
                 if (str.empty() || str.size() > 254) {  // RFC 5321 limit
                     return false;
                 }
@@ -526,7 +526,7 @@ namespace ShadowStrike {
              * @param str String to validate
              * @return true if valid hex string of appropriate hash length
              */
-            [[nodiscard]] bool IsValidHash(std::string_view str) {
+            [[nodiscard]] inline bool IsValidHash(std::string_view str) {
                 if (str.size() != 32 && str.size() != 40 && str.size() != 64 && str.size() != 128) {
                     return false;
                 }

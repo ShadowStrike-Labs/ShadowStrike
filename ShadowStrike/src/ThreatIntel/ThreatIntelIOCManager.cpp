@@ -2544,7 +2544,8 @@ bool ThreatIntelIOCManager::ParseIOC(
             if (octetIndex != 4) return false;
             
             // Construct IPv4Address
-            entry.value.ipv4 = IPv4Address(octets[0], octets[1], octets[2], octets[3], prefix);
+            entry.value.ipv4 = {};
+            entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3], prefix);
             
             // Validate
             if (!entry.value.ipv4.IsValid()) {
@@ -2898,19 +2899,18 @@ bool ThreatIntelIOCManager::MergeDuplicates(
     }
     
     // -------------------------------------------------------------------------
-    // Step 3: Merge counters
+    // Step 3: Merge counters (use thread-safe getter/setter methods)
     // -------------------------------------------------------------------------
-    const uint32_t mergedHitCount = keepEntry->hitCount.load(std::memory_order_relaxed) +
-                                    mergeEntry->hitCount.load(std::memory_order_relaxed);
-    keepEntry->hitCount.store(mergedHitCount, std::memory_order_relaxed);
+    const uint32_t mergedHitCount = keepEntry->GetHitCount() + mergeEntry->GetHitCount();
+    keepEntry->SetHitCount(mergedHitCount);
     
-    const uint32_t mergedFP = keepEntry->falsePositiveCount.load(std::memory_order_relaxed) +
-                              mergeEntry->falsePositiveCount.load(std::memory_order_relaxed);
-    keepEntry->falsePositiveCount.store(mergedFP, std::memory_order_relaxed);
+    const uint32_t mergedFP = keepEntry->GetFalsePositiveCount() + mergeEntry->GetFalsePositiveCount();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&keepEntry->falsePositiveCount), 
+                       static_cast<LONG>(mergedFP));
     
-    const uint32_t mergedTP = keepEntry->truePositiveCount.load(std::memory_order_relaxed) +
-                              mergeEntry->truePositiveCount.load(std::memory_order_relaxed);
-    keepEntry->truePositiveCount.store(mergedTP, std::memory_order_relaxed);
+    const uint32_t mergedTP = keepEntry->GetTruePositiveCount() + mergeEntry->GetTruePositiveCount();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&keepEntry->truePositiveCount), 
+                       static_cast<LONG>(mergedTP));
     
     // -------------------------------------------------------------------------
     // Step 4: Merge source counts

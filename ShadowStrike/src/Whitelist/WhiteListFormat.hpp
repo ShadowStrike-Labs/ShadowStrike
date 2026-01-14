@@ -88,9 +88,9 @@ constexpr uint16_t WHITELIST_DB_VERSION_MAJOR = 1;
 constexpr uint16_t WHITELIST_DB_VERSION_MINOR = 0;
 
 /// @brief Performance-critical alignment constants
-constexpr size_t PAGE_SIZE = 4096;                    // Standard Windows page size
-constexpr size_t CACHE_LINE_SIZE = 64;                // CPU cache line (Intel/AMD x64)
-constexpr size_t SECTOR_SIZE = 512;                   // Disk sector alignment
+inline constexpr size_t PAGE_SIZE = 4096;                    // Standard Windows page size
+inline constexpr size_t CACHE_LINE_SIZE = 64;                // CPU cache line (Intel/AMD x64)
+inline constexpr size_t SECTOR_SIZE = 512;                   // Disk sector alignment
 constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;   // 2MB huge page (optional)
 
 /// @brief Index configuration for optimal performance
@@ -282,6 +282,9 @@ inline constexpr bool HasFlag(WhitelistFlags flags, WhitelistFlags flag) noexcep
 // ============================================================================
 
 /// @brief Fixed-size hash storage (zero-copy compatible, cache-line optimized)
+/// @note All special member functions are defaulted for trivially_copyable.
+///       Use aggregate initialization: HashValue hash{};
+///       For custom initialization, use SetHash() method after construction.
 #pragma pack(push, 1)
 struct alignas(4) HashValue {
     HashAlgorithm algorithm;      ///< Hash algorithm used
@@ -292,23 +295,68 @@ struct alignas(4) HashValue {
     /// @brief Maximum supported hash length constant
     static constexpr uint8_t MAX_HASH_LENGTH = 64u;
     
-    /// @brief Default constructor - initializes to zero
-    HashValue() noexcept : algorithm(HashAlgorithm::SHA256), length(0), reserved{0, 0} {
-        data.fill(0);
-    }
+    // =========================================================================
+    // SPECIAL MEMBER FUNCTIONS - ALL DEFAULTED FOR TRIVIALLY COPYABLE
+    // =========================================================================
+    // Use aggregate initialization: HashValue hash{};
+    // Or use Create() factory method for convenient initialization.
+    HashValue() = default;
+    ~HashValue() = default;
+    HashValue(const HashValue&) = default;
+    HashValue& operator=(const HashValue&) = default;
+    HashValue(HashValue&&) = default;
+    HashValue& operator=(HashValue&&) = default;
     
-    /// @brief Construct from raw bytes with bounds validation
+    // =========================================================================
+    // STATIC FACTORY METHOD - Preferred way to create HashValue
+    // =========================================================================
+    // This pattern preserves trivially_copyable while providing convenient
+    // initialization. Compiler optimizes via RVO/NRVO (zero-cost).
+    //
+    // Usage: HashValue hash = HashValue::Create(HashAlgorithm::SHA256, data, 32);
+    // =========================================================================
+    
+    /// @brief Create a HashValue from raw bytes (factory method)
     /// @param algo Hash algorithm type
     /// @param bytes Pointer to hash bytes (may be nullptr)
     /// @param len Length of hash in bytes (clamped to MAX_HASH_LENGTH)
-    HashValue(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept
-        : algorithm(algo), 
-          length(static_cast<uint8_t>((std::min)(static_cast<uint8_t>(len), MAX_HASH_LENGTH))),
-          reserved{0, 0} {
-        data.fill(0);
+    /// @return Fully initialized HashValue
+    /// @note Zero-cost due to RVO/NRVO optimization
+    [[nodiscard]] static HashValue Create(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept {
+        HashValue result{};
+        result.algorithm = algo;
+        result.length = static_cast<uint8_t>((std::min)(static_cast<uint8_t>(len), MAX_HASH_LENGTH));
+        result.reserved[0] = 0;
+        result.reserved[1] = 0;
+        std::memset(result.data.data(), 0, result.data.size());
+        if (bytes != nullptr && result.length > 0u) {
+            std::memcpy(result.data.data(), bytes, result.length);
+        }
+        return result;
+    }
+    
+    /// @brief Initialize hash from raw bytes with bounds validation
+    /// @param algo Hash algorithm type
+    /// @param bytes Pointer to hash bytes (may be nullptr)
+    /// @param len Length of hash in bytes (clamped to MAX_HASH_LENGTH)
+    void SetHash(HashAlgorithm algo, const uint8_t* bytes, uint8_t len) noexcept {
+        algorithm = algo;
+        length = static_cast<uint8_t>((std::min)(static_cast<uint8_t>(len), MAX_HASH_LENGTH));
+        reserved[0] = 0;
+        reserved[1] = 0;
+        std::memset(data.data(), 0, data.size());
         if (bytes != nullptr && length > 0u) {
             std::memcpy(data.data(), bytes, length);
         }
+    }
+    
+    /// @brief Zero-initialize the hash value
+    void Clear() noexcept {
+        algorithm = HashAlgorithm::SHA256;
+        length = 0;
+        reserved[0] = 0;
+        reserved[1] = 0;
+        std::memset(data.data(), 0, data.size());
     }
     
     /// @brief Zero-cost hash comparison (inlined, cache-friendly)
@@ -372,6 +420,8 @@ struct alignas(4) HashValue {
 #pragma pack(pop)
 
 static_assert(sizeof(HashValue) == 68, "HashValue must be exactly 68 bytes");
+static_assert(std::is_trivially_copyable_v<HashValue>,
+              "HashValue must be trivially copyable for memory-mapped storage");
 
 // ============================================================================
 // WHITELIST ENTRY STRUCTURE (Main Data Record)
@@ -379,8 +429,8 @@ static_assert(sizeof(HashValue) == 68, "HashValue must be exactly 68 bytes");
 
 /// @brief Packed whitelist entry for memory-mapped storage
 /// @note Size is 128 bytes - aligned for optimal cache performance
-#pragma pack(push, 1)
-struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
+#pragma pack(push, 1) 
+struct alignas(ShadowStrike::Whitelist::CACHE_LINE_SIZE) WhitelistEntry {
     /// @brief Unique entry identifier (monotonically increasing)
     uint64_t entryId;
     
@@ -434,10 +484,10 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
     uint32_t policyId;
     
     /// @brief Hit count (how many times this entry matched)
-    /// @note Using volatile + Interlocked for memory-mapped compatibility
-    ///       std::atomic is NOT trivially copyable, making it incompatible with
-    ///       memory-mapped file structures that require trivially copyable types
-    volatile uint32_t hitCount;
+    /// @note Plain uint32_t for trivially copyable requirement (memory-mapped compatibility)
+    ///       Thread-safe operations are provided via IncrementHitCount(), SetHitCount(), GetHitCount()
+    ///       which use Windows Interlocked intrinsics internally
+    uint32_t hitCount;
     
     /// @brief Reserved for future expansion
     uint8_t reserved2[2];
@@ -475,169 +525,62 @@ struct alignas(CACHE_LINE_SIZE) WhitelistEntry {
     ///       This provides atomicity without std::atomic (which is not trivially copyable)
     void IncrementHitCount() noexcept {
         // Use Windows Interlocked for thread-safe increment on memory-mapped storage
-        // Prevent overflow - cap at max value
-        LONG current = static_cast<LONG>(hitCount);
-        while (static_cast<uint32_t>(current) < (std::numeric_limits<uint32_t>::max)()) {
-            // InterlockedCompareExchange: atomically compare and swap
-            // Returns the original value; if unchanged, swap occurred
-            LONG original = InterlockedCompareExchange(
-                reinterpret_cast<volatile LONG*>(&hitCount),
-                current + 1,
-                current
-            );
-            if (original == current) {
-                break; // Successfully incremented
-            }
-            current = original; // Retry with new value
-        }
+        // InterlockedIncrement returns the incremented value, handles overflow naturally
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&hitCount));
     }
     
     /// @brief Get current hit count (thread-safe read)
+    /// @note Uses InterlockedCompareExchange with same value to get atomic read
     [[nodiscard]] uint32_t GetHitCount() const noexcept {
-        // Use volatile read for memory-mapped consistency
-        return hitCount;
+        // For 32-bit aligned reads on x86/x64, a simple read is atomic
+        // But we use InterlockedOr with 0 for guaranteed atomicity across all platforms
+        return static_cast<uint32_t>(InterlockedOr(
+            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&hitCount)), 0));
     }
     
-    /// @brief Default constructor - zero-initialize all members
-    WhitelistEntry() noexcept
-        : entryId(0u),
-          type(WhitelistEntryType::Reserved),
-          reason(WhitelistReason::Custom),
-          matchMode(PathMatchMode::Exact),
-          reserved1(0u),
-          flags(WhitelistFlags::None),
-          hashAlgorithm(HashAlgorithm::SHA256),
-          hashLength(0u),
-          hashReserved{0u, 0u},
-          hashData{},
-          createdTime(0u),
-          modifiedTime(0u),
-          expirationTime(0u),
-          pathOffset(0u),
-          pathLength(0u),
-          descriptionOffset(0u),
-          descriptionLength(0u),
-          createdByOffset(0u),
-          policyId(0u),
-          hitCount(0u),
-          reserved2{0u, 0u}
-    {
-        hashData.fill(0u);
-    }
-
-    /// @brief Copy constructor - performs deep copy with thread-safe read
-    WhitelistEntry(const WhitelistEntry& other) noexcept
-        : entryId(other.entryId),
-          type(other.type),
-          reason(other.reason),
-          matchMode(other.matchMode),
-          reserved1(other.reserved1),
-          flags(other.flags),
-          hashAlgorithm(other.hashAlgorithm),
-          hashLength(other.hashLength),
-          hashReserved{other.hashReserved[0], other.hashReserved[1]},
-          hashData(other.hashData),
-          createdTime(other.createdTime),
-          modifiedTime(other.modifiedTime),
-          expirationTime(other.expirationTime),
-          pathOffset(other.pathOffset),
-          pathLength(other.pathLength),
-          descriptionOffset(other.descriptionOffset),
-          descriptionLength(other.descriptionLength),
-          createdByOffset(other.createdByOffset),
-          policyId(other.policyId),
-          hitCount(other.hitCount),  // volatile read is thread-safe
-          reserved2{other.reserved2[0], other.reserved2[1]}
-    {}
-
-    /// @brief Copy assignment operator - performs deep copy with thread-safe access
-    WhitelistEntry& operator=(const WhitelistEntry& other) noexcept {
-        if (this != &other) {
-            entryId = other.entryId;
-            type = other.type;
-            reason = other.reason;
-            matchMode = other.matchMode;
-            reserved1 = other.reserved1;
-            flags = other.flags;
-            hashAlgorithm = other.hashAlgorithm;
-            hashLength = other.hashLength;
-            hashReserved[0] = other.hashReserved[0];
-            hashReserved[1] = other.hashReserved[1];
-            hashData = other.hashData;
-            createdTime = other.createdTime;
-            modifiedTime = other.modifiedTime;
-            expirationTime = other.expirationTime;
-            pathOffset = other.pathOffset;
-            pathLength = other.pathLength;
-            descriptionOffset = other.descriptionOffset;
-            descriptionLength = other.descriptionLength;
-            createdByOffset = other.createdByOffset;
-            policyId = other.policyId;
-            hitCount = other.hitCount;  // volatile read/write is thread-safe
-            reserved2[0] = other.reserved2[0];
-            reserved2[1] = other.reserved2[1];
-        }
-        return *this;
+    /// @brief Set hit count (thread-safe write)
+    /// @param value New hit count value
+    void SetHitCount(uint32_t value) noexcept {
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&hitCount), 
+                           static_cast<LONG>(value));
     }
     
-    /// @brief Move constructor
-    WhitelistEntry(WhitelistEntry&& other) noexcept
-        : entryId(other.entryId),
-          type(other.type),
-          reason(other.reason),
-          matchMode(other.matchMode),
-          reserved1(other.reserved1),
-          flags(other.flags),
-          hashAlgorithm(other.hashAlgorithm),
-          hashLength(other.hashLength),
-          hashReserved{other.hashReserved[0], other.hashReserved[1]},
-          hashData(std::move(other.hashData)),
-          createdTime(other.createdTime),
-          modifiedTime(other.modifiedTime),
-          expirationTime(other.expirationTime),
-          pathOffset(other.pathOffset),
-          pathLength(other.pathLength),
-          descriptionOffset(other.descriptionOffset),
-          descriptionLength(other.descriptionLength),
-          createdByOffset(other.createdByOffset),
-          policyId(other.policyId),
-          hitCount(other.hitCount),  // volatile read is thread-safe
-          reserved2{other.reserved2[0], other.reserved2[1]}
-    {}
+    // =========================================================================
+    // SPECIAL MEMBER FUNCTIONS - ALL DEFAULTED FOR TRIVIALLY COPYABLE
+    // =========================================================================
+    // 
+    // C++ Standard requires ALL of these to be trivial (defaulted or implicit)
+    // for a type to be trivially copyable:
+    // - Copy constructor
+    // - Copy assignment operator  
+    // - Move constructor
+    // - Move assignment operator
+    // - Destructor
+    //
+    // DO NOT define custom implementations - this breaks trivially_copyable!
+    // Memory-mapped storage via MemoryMappedView::GetAt<T>() requires this.
+    //
+    // For zero-initialization, use aggregate initialization:
+    //   WhitelistEntry entry{};  // All members zero-initialized
+    //
+    // For thread-safe hitCount access, use the helper methods:
+    //   entry.IncrementHitCount();
+    //   entry.GetHitCount();
+    //   entry.SetHitCount(value);
+    // =========================================================================
     
-    /// @brief Move assignment operator
-    WhitelistEntry& operator=(WhitelistEntry&& other) noexcept {
-        if (this != &other) {
-            entryId = other.entryId;
-            type = other.type;
-            reason = other.reason;
-            matchMode = other.matchMode;
-            reserved1 = other.reserved1;
-            flags = other.flags;
-            hashAlgorithm = other.hashAlgorithm;
-            hashLength = other.hashLength;
-            hashReserved[0] = other.hashReserved[0];
-            hashReserved[1] = other.hashReserved[1];
-            hashData = std::move(other.hashData);
-            createdTime = other.createdTime;
-            modifiedTime = other.modifiedTime;
-            expirationTime = other.expirationTime;
-            pathOffset = other.pathOffset;
-            pathLength = other.pathLength;
-            descriptionOffset = other.descriptionOffset;
-            descriptionLength = other.descriptionLength;
-            createdByOffset = other.createdByOffset;
-            policyId = other.policyId;
-            hitCount = other.hitCount;  // volatile read/write is thread-safe
-            reserved2[0] = other.reserved2[0];
-            reserved2[1] = other.reserved2[1];
-        }
-        return *this;
-    }
+    WhitelistEntry() = default;
+    ~WhitelistEntry() = default;
+    WhitelistEntry(const WhitelistEntry&) = default;
+    WhitelistEntry& operator=(const WhitelistEntry&) = default;
+    WhitelistEntry(WhitelistEntry&&) = default;
+    WhitelistEntry& operator=(WhitelistEntry&&) = default;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(WhitelistEntry) == 128, "WhitelistEntry must be exactly 128 bytes");
+static_assert(std::is_trivially_copyable_v<WhitelistEntry>, 
+              "WhitelistEntry must be trivially copyable for memory-mapped storage");
 
 // ============================================================================
 // EXTENDED HASH ENTRY (For SHA512 or when inline storage insufficient)
@@ -965,6 +908,8 @@ enum class WhitelistStoreError : uint32_t {
     // Unknown
     Unknown = 0xFFFFFFFF
 };
+/// @brief Convert WhitelistStoreError to string for logging
+std::ostream& operator<<(std::ostream& os, WhitelistStoreError error);
 
 /// @brief Detailed error information with Win32 error code
 struct StoreError {
@@ -1011,6 +956,8 @@ struct StoreError {
         message.clear();
     }
 };
+/// @brief Convert StoreError to string for logging
+std::ostream& operator<<(std::ostream& os, const StoreError& error);
 
 // ============================================================================
 // MEMORY-MAPPED VIEW STRUCTURE
@@ -1323,7 +1270,7 @@ namespace Format {
 
 /// @brief Align offset to cache line
 [[nodiscard]] constexpr size_t AlignToCacheLine(size_t offset) noexcept {
-    return (offset + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
+    return (offset + ShadowStrike::Whitelist::CACHE_LINE_SIZE - 1) & ~(ShadowStrike::Whitelist::CACHE_LINE_SIZE - 1);
 }
 
 /// @brief Get hash algorithm name

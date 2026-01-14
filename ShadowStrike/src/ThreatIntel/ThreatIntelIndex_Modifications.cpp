@@ -67,7 +67,7 @@ namespace ThreatIntel {
      * @brief Convert domain to reverse label format
      * @note Delegates to Format::ReverseDomainLabels for consistency.
      */
-    [[nodiscard]] inline std::string ConvertToReverseDomain(std::string_view domain) noexcept {
+    [[nodiscard]] std::string ConvertToReverseDomain(std::string_view domain) noexcept {
         return Format::ReverseDomainLabels(domain);
     }
 
@@ -76,7 +76,7 @@ namespace ThreatIntel {
      * @note Delegates to Format::NormalizeURL for enterprise-grade URL handling
      *       Handles scheme normalization, host lowercase, port removal, encoding, etc.
      */
-    [[nodiscard]] inline std::string NormalizeURL(std::string_view url) noexcept {
+    [[nodiscard]] std::string NormalizeURL(std::string_view url) noexcept {
         try {
             return Format::NormalizeURL(url);
         } catch (...) {

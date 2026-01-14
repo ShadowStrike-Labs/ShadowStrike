@@ -195,7 +195,7 @@ TEST(HashValue_Construction, FromBytes_SHA256) {
     std::array<uint8_t, 32> testData{};
     std::iota(testData.begin(), testData.end(), 0);
     
-    HashValue hash(HashAlgorithm::SHA256, testData.data(), 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, testData.data(), 32);
     
     EXPECT_EQ(hash.algorithm, HashAlgorithm::SHA256);
     EXPECT_EQ(hash.length, 32u);
@@ -212,7 +212,7 @@ TEST(HashValue_Construction, FromBytes_MD5) {
     std::array<uint8_t, 16> testData{};
     testData.fill(0xAB);
     
-    HashValue hash(HashAlgorithm::MD5, testData.data(), 16);
+    HashValue hash = HashValue::Create(HashAlgorithm::MD5, testData.data(), 16);
     
     EXPECT_EQ(hash.algorithm, HashAlgorithm::MD5);
     EXPECT_EQ(hash.length, 16u);
@@ -224,7 +224,7 @@ TEST(HashValue_Construction, FromBytes_MD5) {
 }
 
 TEST(HashValue_Construction, FromBytes_Nullptr_ZeroLength) {
-    HashValue hash(HashAlgorithm::SHA256, nullptr, 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, nullptr, 32);
     
     EXPECT_EQ(hash.algorithm, HashAlgorithm::SHA256);
     EXPECT_EQ(hash.length, 32u);
@@ -238,7 +238,7 @@ TEST(HashValue_Construction, FromBytes_LengthClamping) {
     std::array<uint8_t, 100> oversized{};
     oversized.fill(0xFF);
     
-    HashValue hash(HashAlgorithm::SHA512, oversized.data(), 100);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA512, oversized.data(), 100);
     
     // Length should be clamped to MAX_HASH_LENGTH (64)
     EXPECT_LE(hash.length, HashValue::MAX_HASH_LENGTH);
@@ -248,8 +248,8 @@ TEST(HashValue_Comparison, Equal_SameHashes) {
     std::array<uint8_t, 32> testData{};
     testData.fill(0x42);
     
-    HashValue hash1(HashAlgorithm::SHA256, testData.data(), 32);
-    HashValue hash2(HashAlgorithm::SHA256, testData.data(), 32);
+    HashValue hash1 = HashValue::Create(HashAlgorithm::SHA256, testData.data(), 32);
+    HashValue hash2 = HashValue::Create(HashAlgorithm::SHA256, testData.data(), 32);
     
     EXPECT_EQ(hash1, hash2);
     EXPECT_FALSE(hash1 != hash2);
@@ -259,8 +259,8 @@ TEST(HashValue_Comparison, NotEqual_DifferentAlgorithm) {
     std::array<uint8_t, 16> testData{};
     testData.fill(0x42);
     
-    HashValue hash1(HashAlgorithm::MD5, testData.data(), 16);
-    HashValue hash2(HashAlgorithm::SHA1, testData.data(), 16);
+    HashValue hash1 = HashValue::Create(HashAlgorithm::MD5, testData.data(), 16);
+    HashValue hash2 = HashValue::Create(HashAlgorithm::SHA1, testData.data(), 16);
     
     EXPECT_NE(hash1, hash2);
 }
@@ -269,8 +269,8 @@ TEST(HashValue_Comparison, NotEqual_DifferentLength) {
     std::array<uint8_t, 32> testData{};
     testData.fill(0x42);
     
-    HashValue hash1(HashAlgorithm::SHA256, testData.data(), 32);
-    HashValue hash2(HashAlgorithm::SHA256, testData.data(), 20);
+    HashValue hash1 = HashValue::Create(HashAlgorithm::SHA256, testData.data(), 32);
+    HashValue hash2 = HashValue::Create(HashAlgorithm::SHA256, testData.data(), 20);
     
     EXPECT_NE(hash1, hash2);
 }
@@ -281,8 +281,8 @@ TEST(HashValue_Comparison, NotEqual_DifferentData) {
     data1.fill(0x42);
     data2.fill(0x43);
     
-    HashValue hash1(HashAlgorithm::SHA256, data1.data(), 32);
-    HashValue hash2(HashAlgorithm::SHA256, data2.data(), 32);
+    HashValue hash1 = HashValue::Create(HashAlgorithm::SHA256, data1.data(), 32);
+    HashValue hash2 = HashValue::Create(HashAlgorithm::SHA256, data2.data(), 32);
     
     EXPECT_NE(hash1, hash2);
 }
@@ -293,8 +293,8 @@ TEST(HashValue_FastHash, DifferentHashesDifferentResults) {
     data1.fill(0x11);
     data2.fill(0x22);
     
-    HashValue hash1(HashAlgorithm::SHA256, data1.data(), 32);
-    HashValue hash2(HashAlgorithm::SHA256, data2.data(), 32);
+    HashValue hash1 = HashValue::Create(HashAlgorithm::SHA256, data1.data(), 32);
+    HashValue hash2 = HashValue::Create(HashAlgorithm::SHA256, data2.data(), 32);
     
     EXPECT_NE(hash1.FastHash(), hash2.FastHash());
 }
@@ -303,7 +303,7 @@ TEST(HashValue_FastHash, SameHashSameResult) {
     std::array<uint8_t, 32> data{};
     data.fill(0x33);
     
-    HashValue hash(HashAlgorithm::SHA256, data.data(), 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, data.data(), 32);
     
     // Same hash should produce same FastHash result
     EXPECT_EQ(hash.FastHash(), hash.FastHash());
@@ -334,7 +334,7 @@ TEST(WhitelistEntry_Construction, DefaultConstruction_ZeroInitialized) {
     EXPECT_EQ(entry.type, WhitelistEntryType::Reserved);
     EXPECT_EQ(entry.reason, WhitelistReason::Custom);
     EXPECT_EQ(entry.flags, WhitelistFlags::None);
-    EXPECT_EQ(entry.hitCount.load(), 0u);
+    EXPECT_EQ(entry.GetHitCount(), 0u);
 }
 
 TEST(WhitelistEntry_SizeCheck, StructureIs128Bytes) {
@@ -418,20 +418,20 @@ TEST(WhitelistEntry_HitCount, IncrementHitCount_ThreadSafe) {
         thread.join();
     }
     
-    EXPECT_EQ(entry.hitCount.load(), numThreads * incrementsPerThread);
+    EXPECT_EQ(entry.GetHitCount(), numThreads * incrementsPerThread);
 }
 
 TEST(WhitelistEntry_Copy, CopyConstructor_DeepCopy) {
     WhitelistEntry original;
     original.entryId = 12345;
     original.type = WhitelistEntryType::FileHash;
-    original.hitCount.store(100);
+    original.SetHitCount(100);
     
     WhitelistEntry copy(original);
     
     EXPECT_EQ(copy.entryId, 12345u);
     EXPECT_EQ(copy.type, WhitelistEntryType::FileHash);
-    EXPECT_EQ(copy.hitCount.load(), 100u);
+    EXPECT_EQ(copy.GetHitCount(), 100u);
 }
 
 // ============================================================================
@@ -603,7 +603,7 @@ TEST(HexFormatting_FormatHashString, ValidSHA256_Lowercase) {
     data[1] = 0xCD;
     data[31] = 0xEF;
     
-    HashValue hash(HashAlgorithm::SHA256, data.data(), 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, data.data(), 32);
     
     const std::string result = Format::FormatHashString(hash);
     
@@ -1234,7 +1234,7 @@ TEST(Performance_PathMatching, GlobThroughputBenchmark) {
 TEST(ThreadSafety_HashValue, ConcurrentFastHash) {
     std::array<uint8_t, 32> data{};
     std::iota(data.begin(), data.end(), 0);
-    HashValue hash(HashAlgorithm::SHA256, data.data(), 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, data.data(), 32);
     
     constexpr int numThreads = 8;
     constexpr int iterationsPerThread = 10000;

@@ -1180,7 +1180,7 @@ private:
  * 
  * @note Aligned to cache line to prevent false sharing
  */
-struct alignas(CACHE_LINE_SIZE) CacheEntry {
+struct alignas(ShadowStrike::Whitelist::CACHE_LINE_SIZE) CacheEntry {
     /// @brief SeqLock: odd = writing, even = valid for reading
     mutable std::atomic<uint64_t> seqlock{0};
     
@@ -1195,6 +1195,62 @@ struct alignas(CACHE_LINE_SIZE) CacheEntry {
     
     /// @brief Padding to ensure cache line alignment
     uint8_t _padding[8]{};
+    
+    // ========================================================================
+    // SPECIAL MEMBER FUNCTIONS
+    // std::atomic is not copy/move constructible, so we need custom implementations
+    // ========================================================================
+    
+    /// @brief Default constructor
+    CacheEntry() noexcept = default;
+    
+    /// @brief Destructor
+    ~CacheEntry() = default;
+    
+    /// @brief Copy constructor - atomics are reset to 0 (fresh entry)
+    CacheEntry(const CacheEntry& other) noexcept
+        : seqlock(0)  // Reset seqlock - new entry starts fresh
+        , hash(other.hash)
+        , result(other.result)
+        , accessTime(other.accessTime)
+        , _padding{} {
+    }
+    
+    /// @brief Move constructor - atomics are reset to 0 (fresh entry)
+    CacheEntry(CacheEntry&& other) noexcept
+        : seqlock(0)  // Reset seqlock - new entry starts fresh
+        , hash(std::move(other.hash))
+        , result(std::move(other.result))
+        , accessTime(other.accessTime)
+        , _padding{} {
+        other.accessTime = 0;  // Clear moved-from entry
+    }
+    
+    /// @brief Copy assignment operator
+    CacheEntry& operator=(const CacheEntry& other) noexcept {
+        if (this != &other) {
+            // Wait for current write to complete, then start new write
+            BeginWrite();
+            hash = other.hash;
+            result = other.result;
+            accessTime = other.accessTime;
+            EndWrite();
+        }
+        return *this;
+    }
+    
+    /// @brief Move assignment operator
+    CacheEntry& operator=(CacheEntry&& other) noexcept {
+        if (this != &other) {
+            BeginWrite();
+            hash = std::move(other.hash);
+            result = std::move(other.result);
+            accessTime = other.accessTime;
+            other.accessTime = 0;
+            EndWrite();
+        }
+        return *this;
+    }
     
     /**
      * @brief Check if entry is valid (not being written)
@@ -1256,7 +1312,7 @@ struct alignas(CACHE_LINE_SIZE) CacheEntry {
 };
 
 // Verify cache entry fits in reasonable cache lines
-static_assert(sizeof(CacheEntry) <= 4 * CACHE_LINE_SIZE, 
+static_assert(sizeof(CacheEntry) <= 4 * ShadowStrike::Whitelist::CACHE_LINE_SIZE,
     "CacheEntry should fit in 4 cache lines or less");
 
 // ============================================================================
@@ -2054,7 +2110,7 @@ public:
                 entry.hashData.size() - copySize
             );
         }
-        
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&entry.hitCount), 0);
         entry.createdTime = currentTime;
         entry.modifiedTime = currentTime;
         entry.expirationTime = m_expirationTime;
@@ -2064,7 +2120,6 @@ public:
         entry.descriptionLength = 0;
         entry.createdByOffset = 0;
         entry.policyId = m_policyId;
-        entry.hitCount.store(0, std::memory_order_release);
         entry.reserved2[0] = 0;
         entry.reserved2[1] = 0;
     }

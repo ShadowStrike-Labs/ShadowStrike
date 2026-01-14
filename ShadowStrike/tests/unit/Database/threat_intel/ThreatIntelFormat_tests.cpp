@@ -262,22 +262,25 @@ TEST(ThreatIntelFormat_IPv4, ParseIPv4_EdgeCases) {
 	// Very long string
 	EXPECT_FALSE(ParseIPv4(std::string(100, '1')).has_value());
 }
-
 TEST(ThreatIntelFormat_IPv4, FormatIPv4_NoPrefix) {
-	IPv4Address addr(192, 168, 1, 1, 32);
+	// Enterprise-grade static factory initialization for trivially copyable structs
+	const auto addr = IPv4Address::Create(192, 168, 1, 1, 32);
 	EXPECT_EQ(FormatIPv4(addr), "192.168.1.1");
 }
 
 TEST(ThreatIntelFormat_IPv4, FormatIPv4_WithPrefix) {
-	IPv4Address addr(192, 168, 0, 0, 24);
+	// Using CIDR prefix via static factory
+	const auto addr = IPv4Address::Create(192, 168, 0, 0, 24);
 	EXPECT_EQ(FormatIPv4(addr), "192.168.0.0/24");
 }
 
 TEST(ThreatIntelFormat_IPv4, FormatIPv4_BoundaryValues) {
-	IPv4Address addr1(0, 0, 0, 0, 32);
+	// Minimum boundary value (0.0.0.0)
+	const auto addr1 = IPv4Address::Create(0, 0, 0, 0, 32);
 	EXPECT_EQ(FormatIPv4(addr1), "0.0.0.0");
 
-	IPv4Address addr2(255, 255, 255, 255, 32);
+	// Maximum boundary value (255.255.255.255)
+	const auto addr2 = IPv4Address::Create(255, 255, 255, 255, 32);
 	EXPECT_EQ(FormatIPv4(addr2), "255.255.255.255");
 }
 

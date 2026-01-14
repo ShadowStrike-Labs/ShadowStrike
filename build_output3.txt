@@ -1,0 +1,1247 @@
+﻿.NET Framework i├ğin MSBuild s├╝r├╝m 18.0.5+e22287bf1
+
+  pugixml.cpp
+  Backup.cpp
+  Column.cpp
+  Database.cpp
+  Exception.cpp
+  Savepoint.cpp
+  Statement.cpp
+  Transaction.cpp
+  input_desc.cpp
+  shared_file_functions.cpp
+  tlsh.cpp
+  tlsh_impl.cpp
+  tlsh_util.cpp
+  ConfigurationDB.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\ConfigurationDB.cpp(45,36): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\ConfigurationDB.cpp(1235,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\ConfigurationDB.cpp(1264,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\ConfigurationDB.cpp(2337,51): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xutility(4924,18): warning C4244: '=': 'wchar_t' - 'char' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Database/ConfigurationDB.cpp')
+      C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xutility(4924,18):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\ConfigurationDB.cpp(1968,57):
+          derlenen ┼şablon i┼şlevi 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _Elem=wchar_t,
+              _Iter=std::_String_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+              _Alloc=std::allocator<char>
+          ]
+              C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\ConfigurationDB.cpp(1968,44):
+              'ShadowStrike::Database::ConfigurationDB::ExportToJson' i├ğinde ilk 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' ba┼şvurusuna bak─▒n
+          C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xstring(862,17):
+          derlenen ┼şablon i┼şlevi 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<wchar_t*,wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _Size_type=unsigned __int64,
+              _Iter=wchar_t *,
+              _Sent=wchar_t *,
+              _Size=unsigned __int64
+          ]
+          C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xstring(1018,18):
+          derlenen ┼şablon i┼şlevi '_OutIt *std::_Copy_n_unchecked4<wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _OutIt=char *,
+              _Size=unsigned __int64,
+              _InIt=wchar_t *,
+              _SizeTy=unsigned __int64
+          ]
+  
+  DatabaseManager.cpp
+  LogDB.cpp
+  QuarantineDB.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Database\QuarantineDB.cpp(2239,41): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  BloomFilter_impl.cpp
+  HashBucket_impl.cpp
+  HashStore.cpp
+  Kod ├£retiliyor...
+  Derleniyor...
+  HashStore_import_export.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\HashStore\HashStore_import_export.cpp(335,29): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  HashStore_mgnmnt.cpp
+  HashStore_query_operations.cpp
+  Main.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Main.cpp(57,43): warning C4566: '\u03BC' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Main.cpp(62,43): warning C4566: '\u03BC' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Main.cpp(93,26): warning C4566: '\u2713' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Main.cpp(95,26): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Main.cpp(97,26): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Main.cpp(121,5): warning C4286: 'const std::system_error &': taban s─▒n─▒f ('const std::exception &') taraf─▒ndan 117. sat─▒rda yakaland─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  aho_crsck_impl.cpp
+  boyer_moore_impl.cpp
+  PatternIndex.cpp
+  PatternStore.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\PatternStore\PatternStore.cpp(210,36): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\PatternStore\PatternStore.cpp(1234,36): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\PatternStore\PatternStore.cpp(2052,36): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\PatternStore\PatternStore.cpp(2133,40): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  SIMD_matcher_impl.cpp
+  batch_sig_builder.cpp
+  SignatureBuilder.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(594,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(595,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(596,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(627,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(688,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(689,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(690,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureBuilder.cpp(1570,24): warning C4018: '>=': i┼şaretli/i┼şaretsiz uyu┼şmazl─▒─ş─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  SignatureFormat.cpp
+  SignatureIndex.cpp
+  SignatureIndex_Cache_mngmnt.cpp
+  SignatureIndex_COW.cpp
+  SignatureIndex_modification.cpp
+  SignatureIndex_Query.cpp
+  SignatureIndex_stat_maintenance.cpp
+  SignatureStore.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureStore.cpp(752,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureStore.cpp(764,45): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureStore.cpp(872,45): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureStore.cpp(884,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\SignatureStore.cpp(917,29): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  SignatureStore_mngmnt.cpp
+  Kod ├£retiliyor...
+  Derleniyor...
+  SignatureStore_Query.cpp
+  SignatureStore_scan.cpp
+  sig_builder_import_methods.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\sig_builder_import_methods.cpp(1844,29): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\sig_builder_import_methods.cpp(1850,37): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_builder_input_methods.cpp
+  sig_builder_serialization.cpp
+  sig_builder_utils.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\sig_builder_utils.cpp(567,27): warning C4244: '=': 'DWORD' - 'uint8_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\SignatureStore\sig_builder_utils.cpp(793,27): warning C4244: '=': 'DWORD' - 'uint8_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_indx_internal_node_mng.cpp
+  YaraRuleStore.cpp
+  ReputationCache.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ReputationCache.cpp(324,17): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelDatabase.cpp
+  ThreatIntelExporter.cpp
+  ThreatIntelFeedManager.cpp
+  ThreatIntelFeedManager_parsers.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelFeedManager_parsers.cpp(416,67): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelFormat.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelFormat.cpp(2931,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelFormat.cpp(2946,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelImporter.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelImporter.cpp(4274,36): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelIndex_Core.cpp
+  ThreatIntelIndex_Lookups.cpp
+  ThreatIntelIndex_Modifications.cpp
+  ThreatIntelIndex_Trees.cpp
+  ThreatIntelIndex_URLMatcher.cpp
+  Kod ├£retiliyor...
+  Derleniyor...
+  ThreatIntelIOCManager.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelIOCManager.cpp(1177,38): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelIOCManager.cpp(3615,38): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelLookup.cpp
+  ThreatIntelStore.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelStore.cpp(1656,34): warning C4101: 'ex': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelStore.cpp(2024,35): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\ThreatIntel\ThreatIntelStore.cpp(3781,24): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntel_bloom_filter.cpp
+  ThreatIntelIndex_DataStructures.cpp
+  Base64Utils.cpp
+  CacheManager.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\CacheManager.cpp(1175,50): warning C4101: 'ex': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\CacheManager.cpp(1238,42): warning C4101: 'ex': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\CacheManager.cpp(2181,43): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\CacheManager.cpp(2202,28): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\CacheManager.cpp(2203,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  CompressionUtils.cpp
+  CryptoUtils.cpp
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(66,9): warning C4005: 'STATUS_WAIT_0': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2611,9):
+      ├Ânceki 'STATUS_WAIT_0' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(227,9): warning C4005: 'STATUS_ABANDONED_WAIT_0': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2612,9):
+      ├Ânceki 'STATUS_ABANDONED_WAIT_0' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(250,9): warning C4005: 'STATUS_USER_APC': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2613,9):
+      ├Ânceki 'STATUS_USER_APC' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(286,9): warning C4005: 'STATUS_TIMEOUT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2614,9):
+      ├Ânceki 'STATUS_TIMEOUT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(295,9): warning C4005: 'STATUS_PENDING': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2615,9):
+      ├Ânceki 'STATUS_PENDING' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(751,9): warning C4005: 'DBG_EXCEPTION_HANDLED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2616,9):
+      ├Ânceki 'DBG_EXCEPTION_HANDLED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(760,9): warning C4005: 'DBG_CONTINUE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2617,9):
+      ├Ânceki 'DBG_CONTINUE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(835,9): warning C4005: 'STATUS_SEGMENT_NOTIFICATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2618,9):
+      ├Ânceki 'STATUS_SEGMENT_NOTIFICATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(998,9): warning C4005: 'STATUS_FATAL_APP_EXIT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2619,9):
+      ├Ânceki 'STATUS_FATAL_APP_EXIT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1345,9): warning C4005: 'DBG_REPLY_LATER': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2620,9):
+      ├Ânceki 'DBG_REPLY_LATER' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1363,9): warning C4005: 'DBG_TERMINATE_THREAD': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2621,9):
+      ├Ânceki 'DBG_TERMINATE_THREAD' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1372,9): warning C4005: 'DBG_TERMINATE_PROCESS': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2622,9):
+      ├Ânceki 'DBG_TERMINATE_PROCESS' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1381,9): warning C4005: 'DBG_CONTROL_C': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2623,9):
+      ├Ânceki 'DBG_CONTROL_C' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1390,9): warning C4005: 'DBG_PRINTEXCEPTION_C': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2624,9):
+      ├Ânceki 'DBG_PRINTEXCEPTION_C' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1399,9): warning C4005: 'DBG_RIPEXCEPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2625,9):
+      ├Ânceki 'DBG_RIPEXCEPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1408,9): warning C4005: 'DBG_CONTROL_BREAK': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2626,9):
+      ├Ânceki 'DBG_CONTROL_BREAK' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1417,9): warning C4005: 'DBG_COMMAND_EXCEPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2627,9):
+      ├Ânceki 'DBG_COMMAND_EXCEPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1426,9): warning C4005: 'DBG_PRINTEXCEPTION_WIDE_C': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2628,9):
+      ├Ânceki 'DBG_PRINTEXCEPTION_WIDE_C' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1458,9): warning C4005: 'STATUS_GUARD_PAGE_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2629,9):
+      ├Ânceki 'STATUS_GUARD_PAGE_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1469,9): warning C4005: 'STATUS_DATATYPE_MISALIGNMENT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2630,9):
+      ├Ânceki 'STATUS_DATATYPE_MISALIGNMENT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1480,9): warning C4005: 'STATUS_BREAKPOINT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2631,9):
+      ├Ânceki 'STATUS_BREAKPOINT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1491,9): warning C4005: 'STATUS_SINGLE_STEP': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2632,9):
+      ├Ânceki 'STATUS_SINGLE_STEP' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1794,9): warning C4005: 'STATUS_LONGJUMP': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2633,9):
+      ├Ânceki 'STATUS_LONGJUMP' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1821,9): warning C4005: 'STATUS_UNWIND_CONSOLIDATE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2634,9):
+      ├Ânceki 'STATUS_UNWIND_CONSOLIDATE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1945,9): warning C4005: 'DBG_EXCEPTION_NOT_HANDLED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2635,9):
+      ├Ânceki 'DBG_EXCEPTION_NOT_HANDLED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2112,9): warning C4005: 'STATUS_ACCESS_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2636,9):
+      ├Ânceki 'STATUS_ACCESS_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2121,9): warning C4005: 'STATUS_IN_PAGE_ERROR': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2637,9):
+      ├Ânceki 'STATUS_IN_PAGE_ERROR' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2139,9): warning C4005: 'STATUS_INVALID_HANDLE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2638,9):
+      ├Ânceki 'STATUS_INVALID_HANDLE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2184,9): warning C4005: 'STATUS_INVALID_PARAMETER': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2639,9):
+      ├Ânceki 'STATUS_INVALID_PARAMETER' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2284,9): warning C4005: 'STATUS_NO_MEMORY': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2640,9):
+      ├Ânceki 'STATUS_NO_MEMORY' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2341,9): warning C4005: 'STATUS_ILLEGAL_INSTRUCTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2641,9):
+      ├Ânceki 'STATUS_ILLEGAL_INSTRUCTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2422,9): warning C4005: 'STATUS_NONCONTINUABLE_EXCEPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2642,9):
+      ├Ânceki 'STATUS_NONCONTINUABLE_EXCEPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2431,9): warning C4005: 'STATUS_INVALID_DISPOSITION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2643,9):
+      ├Ânceki 'STATUS_INVALID_DISPOSITION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3364,9): warning C4005: 'STATUS_ARRAY_BOUNDS_EXCEEDED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2644,9):
+      ├Ânceki 'STATUS_ARRAY_BOUNDS_EXCEEDED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3374,9): warning C4005: 'STATUS_FLOAT_DENORMAL_OPERAND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2645,9):
+      ├Ânceki 'STATUS_FLOAT_DENORMAL_OPERAND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3384,9): warning C4005: 'STATUS_FLOAT_DIVIDE_BY_ZERO': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2646,9):
+      ├Ânceki 'STATUS_FLOAT_DIVIDE_BY_ZERO' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3394,9): warning C4005: 'STATUS_FLOAT_INEXACT_RESULT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2647,9):
+      ├Ânceki 'STATUS_FLOAT_INEXACT_RESULT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3404,9): warning C4005: 'STATUS_FLOAT_INVALID_OPERATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2648,9):
+      ├Ânceki 'STATUS_FLOAT_INVALID_OPERATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3414,9): warning C4005: 'STATUS_FLOAT_OVERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2649,9):
+      ├Ânceki 'STATUS_FLOAT_OVERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3424,9): warning C4005: 'STATUS_FLOAT_STACK_CHECK': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2650,9):
+      ├Ânceki 'STATUS_FLOAT_STACK_CHECK' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3434,9): warning C4005: 'STATUS_FLOAT_UNDERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2651,9):
+      ├Ânceki 'STATUS_FLOAT_UNDERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3444,9): warning C4005: 'STATUS_INTEGER_DIVIDE_BY_ZERO': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2652,9):
+      ├Ânceki 'STATUS_INTEGER_DIVIDE_BY_ZERO' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3454,9): warning C4005: 'STATUS_INTEGER_OVERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2653,9):
+      ├Ânceki 'STATUS_INTEGER_OVERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3464,9): warning C4005: 'STATUS_PRIVILEGED_INSTRUCTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2654,9):
+      ├Ânceki 'STATUS_PRIVILEGED_INSTRUCTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4410,9): warning C4005: 'STATUS_STACK_OVERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2655,9):
+      ├Ânceki 'STATUS_STACK_OVERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4927,9): warning C4005: 'STATUS_DLL_NOT_FOUND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2656,9):
+      ├Ânceki 'STATUS_DLL_NOT_FOUND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4956,9): warning C4005: 'STATUS_ORDINAL_NOT_FOUND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2657,9):
+      ├Ânceki 'STATUS_ORDINAL_NOT_FOUND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4966,9): warning C4005: 'STATUS_ENTRYPOINT_NOT_FOUND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2658,9):
+      ├Ânceki 'STATUS_ENTRYPOINT_NOT_FOUND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4976,9): warning C4005: 'STATUS_CONTROL_C_EXIT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2659,9):
+      ├Ânceki 'STATUS_CONTROL_C_EXIT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(5054,9): warning C4005: 'STATUS_DLL_INIT_FAILED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2660,9):
+      ├Ânceki 'STATUS_DLL_INIT_FAILED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(6051,9): warning C4005: 'STATUS_CONTROL_STACK_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2661,9):
+      ├Ânceki 'STATUS_CONTROL_STACK_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(7645,9): warning C4005: 'STATUS_FLOAT_MULTIPLE_FAULTS': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2662,9):
+      ├Ânceki 'STATUS_FLOAT_MULTIPLE_FAULTS' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(7655,9): warning C4005: 'STATUS_FLOAT_MULTIPLE_TRAPS': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2663,9):
+      ├Ânceki 'STATUS_FLOAT_MULTIPLE_TRAPS' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(7787,9): warning C4005: 'STATUS_REG_NAT_CONSUMPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2664,9):
+      ├Ânceki 'STATUS_REG_NAT_CONSUMPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(8770,9): warning C4005: 'STATUS_HEAP_CORRUPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2665,9):
+      ├Ânceki 'STATUS_HEAP_CORRUPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(8998,9): warning C4005: 'STATUS_STACK_BUFFER_OVERRUN': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2666,9):
+      ├Ânceki 'STATUS_STACK_BUFFER_OVERRUN' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(9125,9): warning C4005: 'STATUS_INVALID_CRUNTIME_PARAMETER': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2667,9):
+      ├Ânceki 'STATUS_INVALID_CRUNTIME_PARAMETER' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(9188,9): warning C4005: 'STATUS_ASSERTION_FAILURE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2668,9):
+      ├Ânceki 'STATUS_ASSERTION_FAILURE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(10097,9): warning C4005: 'STATUS_ENCLAVE_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2669,9):
+      ├Ânceki 'STATUS_ENCLAVE_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(10884,9): warning C4005: 'STATUS_INTERRUPTED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2670,9):
+      ├Ânceki 'STATUS_INTERRUPTED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(10893,9): warning C4005: 'STATUS_THREAD_NOT_RUNNING': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2671,9):
+      ├Ânceki 'STATUS_THREAD_NOT_RUNNING' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(11205,9): warning C4005: 'STATUS_ALREADY_REGISTERED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2672,9):
+      ├Ânceki 'STATUS_ALREADY_REGISTERED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(15332,9): warning C4005: 'STATUS_SXS_EARLY_DEACTIVATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2674,9):
+      ├Ânceki 'STATUS_SXS_EARLY_DEACTIVATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(15341,9): warning C4005: 'STATUS_SXS_INVALID_DEACTIVATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2675,9):
+      ├Ânceki 'STATUS_SXS_INVALID_DEACTIVATION' tan─▒m─▒na bak─▒n
+  
+  CryptoUtilsCommon.cpp
+  CryptoUtils_AsymmetricCipher.cpp
+  CryptoUtils_private_key.cpp
+  CryptoUtils_SecureBuffer.cpp
+  CryptoUtils_Secure_Random.cpp
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(66,9): warning C4005: 'STATUS_WAIT_0': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2611,9):
+      ├Ânceki 'STATUS_WAIT_0' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(227,9): warning C4005: 'STATUS_ABANDONED_WAIT_0': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2612,9):
+      ├Ânceki 'STATUS_ABANDONED_WAIT_0' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(250,9): warning C4005: 'STATUS_USER_APC': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2613,9):
+      ├Ânceki 'STATUS_USER_APC' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(286,9): warning C4005: 'STATUS_TIMEOUT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2614,9):
+      ├Ânceki 'STATUS_TIMEOUT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(295,9): warning C4005: 'STATUS_PENDING': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2615,9):
+      ├Ânceki 'STATUS_PENDING' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(751,9): warning C4005: 'DBG_EXCEPTION_HANDLED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2616,9):
+      ├Ânceki 'DBG_EXCEPTION_HANDLED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(760,9): warning C4005: 'DBG_CONTINUE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2617,9):
+      ├Ânceki 'DBG_CONTINUE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(835,9): warning C4005: 'STATUS_SEGMENT_NOTIFICATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2618,9):
+      ├Ânceki 'STATUS_SEGMENT_NOTIFICATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(998,9): warning C4005: 'STATUS_FATAL_APP_EXIT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2619,9):
+      ├Ânceki 'STATUS_FATAL_APP_EXIT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1345,9): warning C4005: 'DBG_REPLY_LATER': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2620,9):
+      ├Ânceki 'DBG_REPLY_LATER' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1363,9): warning C4005: 'DBG_TERMINATE_THREAD': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2621,9):
+      ├Ânceki 'DBG_TERMINATE_THREAD' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1372,9): warning C4005: 'DBG_TERMINATE_PROCESS': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2622,9):
+      ├Ânceki 'DBG_TERMINATE_PROCESS' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1381,9): warning C4005: 'DBG_CONTROL_C': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2623,9):
+      ├Ânceki 'DBG_CONTROL_C' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1390,9): warning C4005: 'DBG_PRINTEXCEPTION_C': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2624,9):
+      ├Ânceki 'DBG_PRINTEXCEPTION_C' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1399,9): warning C4005: 'DBG_RIPEXCEPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2625,9):
+      ├Ânceki 'DBG_RIPEXCEPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1408,9): warning C4005: 'DBG_CONTROL_BREAK': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2626,9):
+      ├Ânceki 'DBG_CONTROL_BREAK' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1417,9): warning C4005: 'DBG_COMMAND_EXCEPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2627,9):
+      ├Ânceki 'DBG_COMMAND_EXCEPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1426,9): warning C4005: 'DBG_PRINTEXCEPTION_WIDE_C': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2628,9):
+      ├Ânceki 'DBG_PRINTEXCEPTION_WIDE_C' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1458,9): warning C4005: 'STATUS_GUARD_PAGE_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2629,9):
+      ├Ânceki 'STATUS_GUARD_PAGE_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1469,9): warning C4005: 'STATUS_DATATYPE_MISALIGNMENT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2630,9):
+      ├Ânceki 'STATUS_DATATYPE_MISALIGNMENT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1480,9): warning C4005: 'STATUS_BREAKPOINT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2631,9):
+      ├Ânceki 'STATUS_BREAKPOINT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1491,9): warning C4005: 'STATUS_SINGLE_STEP': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2632,9):
+      ├Ânceki 'STATUS_SINGLE_STEP' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1794,9): warning C4005: 'STATUS_LONGJUMP': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2633,9):
+      ├Ânceki 'STATUS_LONGJUMP' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1821,9): warning C4005: 'STATUS_UNWIND_CONSOLIDATE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2634,9):
+      ├Ânceki 'STATUS_UNWIND_CONSOLIDATE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(1945,9): warning C4005: 'DBG_EXCEPTION_NOT_HANDLED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2635,9):
+      ├Ânceki 'DBG_EXCEPTION_NOT_HANDLED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2112,9): warning C4005: 'STATUS_ACCESS_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2636,9):
+      ├Ânceki 'STATUS_ACCESS_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2121,9): warning C4005: 'STATUS_IN_PAGE_ERROR': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2637,9):
+      ├Ânceki 'STATUS_IN_PAGE_ERROR' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2139,9): warning C4005: 'STATUS_INVALID_HANDLE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2638,9):
+      ├Ânceki 'STATUS_INVALID_HANDLE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2184,9): warning C4005: 'STATUS_INVALID_PARAMETER': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2639,9):
+      ├Ânceki 'STATUS_INVALID_PARAMETER' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2284,9): warning C4005: 'STATUS_NO_MEMORY': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2640,9):
+      ├Ânceki 'STATUS_NO_MEMORY' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2341,9): warning C4005: 'STATUS_ILLEGAL_INSTRUCTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2641,9):
+      ├Ânceki 'STATUS_ILLEGAL_INSTRUCTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2422,9): warning C4005: 'STATUS_NONCONTINUABLE_EXCEPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2642,9):
+      ├Ânceki 'STATUS_NONCONTINUABLE_EXCEPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(2431,9): warning C4005: 'STATUS_INVALID_DISPOSITION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2643,9):
+      ├Ânceki 'STATUS_INVALID_DISPOSITION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3364,9): warning C4005: 'STATUS_ARRAY_BOUNDS_EXCEEDED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2644,9):
+      ├Ânceki 'STATUS_ARRAY_BOUNDS_EXCEEDED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3374,9): warning C4005: 'STATUS_FLOAT_DENORMAL_OPERAND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2645,9):
+      ├Ânceki 'STATUS_FLOAT_DENORMAL_OPERAND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3384,9): warning C4005: 'STATUS_FLOAT_DIVIDE_BY_ZERO': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2646,9):
+      ├Ânceki 'STATUS_FLOAT_DIVIDE_BY_ZERO' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3394,9): warning C4005: 'STATUS_FLOAT_INEXACT_RESULT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2647,9):
+      ├Ânceki 'STATUS_FLOAT_INEXACT_RESULT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3404,9): warning C4005: 'STATUS_FLOAT_INVALID_OPERATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2648,9):
+      ├Ânceki 'STATUS_FLOAT_INVALID_OPERATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3414,9): warning C4005: 'STATUS_FLOAT_OVERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2649,9):
+      ├Ânceki 'STATUS_FLOAT_OVERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3424,9): warning C4005: 'STATUS_FLOAT_STACK_CHECK': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2650,9):
+      ├Ânceki 'STATUS_FLOAT_STACK_CHECK' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3434,9): warning C4005: 'STATUS_FLOAT_UNDERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2651,9):
+      ├Ânceki 'STATUS_FLOAT_UNDERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3444,9): warning C4005: 'STATUS_INTEGER_DIVIDE_BY_ZERO': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2652,9):
+      ├Ânceki 'STATUS_INTEGER_DIVIDE_BY_ZERO' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3454,9): warning C4005: 'STATUS_INTEGER_OVERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2653,9):
+      ├Ânceki 'STATUS_INTEGER_OVERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(3464,9): warning C4005: 'STATUS_PRIVILEGED_INSTRUCTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2654,9):
+      ├Ânceki 'STATUS_PRIVILEGED_INSTRUCTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4410,9): warning C4005: 'STATUS_STACK_OVERFLOW': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2655,9):
+      ├Ânceki 'STATUS_STACK_OVERFLOW' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4927,9): warning C4005: 'STATUS_DLL_NOT_FOUND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2656,9):
+      ├Ânceki 'STATUS_DLL_NOT_FOUND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4956,9): warning C4005: 'STATUS_ORDINAL_NOT_FOUND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2657,9):
+      ├Ânceki 'STATUS_ORDINAL_NOT_FOUND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4966,9): warning C4005: 'STATUS_ENTRYPOINT_NOT_FOUND': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2658,9):
+      ├Ânceki 'STATUS_ENTRYPOINT_NOT_FOUND' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(4976,9): warning C4005: 'STATUS_CONTROL_C_EXIT': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2659,9):
+      ├Ânceki 'STATUS_CONTROL_C_EXIT' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(5054,9): warning C4005: 'STATUS_DLL_INIT_FAILED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2660,9):
+      ├Ânceki 'STATUS_DLL_INIT_FAILED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(6051,9): warning C4005: 'STATUS_CONTROL_STACK_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2661,9):
+      ├Ânceki 'STATUS_CONTROL_STACK_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(7645,9): warning C4005: 'STATUS_FLOAT_MULTIPLE_FAULTS': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2662,9):
+      ├Ânceki 'STATUS_FLOAT_MULTIPLE_FAULTS' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(7655,9): warning C4005: 'STATUS_FLOAT_MULTIPLE_TRAPS': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2663,9):
+      ├Ânceki 'STATUS_FLOAT_MULTIPLE_TRAPS' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(7787,9): warning C4005: 'STATUS_REG_NAT_CONSUMPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2664,9):
+      ├Ânceki 'STATUS_REG_NAT_CONSUMPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(8770,9): warning C4005: 'STATUS_HEAP_CORRUPTION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2665,9):
+      ├Ânceki 'STATUS_HEAP_CORRUPTION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(8998,9): warning C4005: 'STATUS_STACK_BUFFER_OVERRUN': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2666,9):
+      ├Ânceki 'STATUS_STACK_BUFFER_OVERRUN' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(9125,9): warning C4005: 'STATUS_INVALID_CRUNTIME_PARAMETER': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2667,9):
+      ├Ânceki 'STATUS_INVALID_CRUNTIME_PARAMETER' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(9188,9): warning C4005: 'STATUS_ASSERTION_FAILURE': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2668,9):
+      ├Ânceki 'STATUS_ASSERTION_FAILURE' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(10097,9): warning C4005: 'STATUS_ENCLAVE_VIOLATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2669,9):
+      ├Ânceki 'STATUS_ENCLAVE_VIOLATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(10884,9): warning C4005: 'STATUS_INTERRUPTED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2670,9):
+      ├Ânceki 'STATUS_INTERRUPTED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(10893,9): warning C4005: 'STATUS_THREAD_NOT_RUNNING': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2671,9):
+      ├Ânceki 'STATUS_THREAD_NOT_RUNNING' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(11205,9): warning C4005: 'STATUS_ALREADY_REGISTERED': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2672,9):
+      ├Ânceki 'STATUS_ALREADY_REGISTERED' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(15332,9): warning C4005: 'STATUS_SXS_EARLY_DEACTIVATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2674,9):
+      ├Ânceki 'STATUS_SXS_EARLY_DEACTIVATION' tan─▒m─▒na bak─▒n
+  
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\ntstatus.h(15341,9): warning C4005: 'STATUS_SXS_INVALID_DEACTIVATION': makro yeniden tan─▒mlama [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'src/Utils/CryptoUtils_Secure_Random.cpp')
+      C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\winnt.h(2675,9):
+      ├Ânceki 'STATUS_SXS_INVALID_DEACTIVATION' tan─▒m─▒na bak─▒n
+  
+  CryptoUtils_SymmetricCipher.cpp
+  FileUtils.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\FileUtils.cpp(675,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\FileUtils.cpp(1730,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  HashUtils.cpp
+  JSONUtils.cpp
+  Logger.cpp
+  MemoryUtils.cpp
+  Kod ├£retiliyor...
+  Derleniyor...
+  NetworkSecurity_SSL_TLS.cpp
+  NetworkUtils.cpp
+  NetworkUtilsIpAddress.cpp
+  NetworkUtilsMacAdress.cpp
+  NetworkUtils_Adapter.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_Adapter.cpp(571,12): error C4996: 'strncpy': This function or variable may be unsafe. Consider using strncpy_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_Adapter.cpp(891,34): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_Adapter.cpp(1017,34): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_Adapter.cpp(1128,34): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  NetworkUtils_DNS.cpp
+  NetworkUtils_http_https.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_http_https.cpp(321,53): warning C4101: 'e': yerel de─şi┼şken ba┼şvurusu kald─▒r─▒ld─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  NetworkUtils_proxy.cpp
+  NetworkUtils_URL.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_URL.cpp(451,24): warning C4267: '+=': 'size_t' - 'uint32_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_URL.cpp(483,46): warning C4267: 'ba─ş─▒ms─▒z de─şi┼şken': 'size_t' - 'uint32_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_URL.cpp(561,50): warning C4267: 'ba─ş─▒ms─▒z de─şi┼şken': 'size_t' - 'uint32_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\NetworkUtils_URL.cpp(562,14): warning C4267: '+=': 'size_t' - 'uint32_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  PE_sig_verf.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(703,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(704,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(705,34): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(906,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(907,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(908,34): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(1193,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(1194,30): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(1195,34): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(1694,34): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(1695,34): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\PE_sig_verf.cpp(1696,38): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ProcessUtils.cpp
+  RegistryUtils.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\RegistryUtils.cpp(1029,38): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\RegistryUtils.cpp(1047,39): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  StringUtils.cpp
+  SystemUtils.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(403,28): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(407,27): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(416,31): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(417,31): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(418,31): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(419,31): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(420,31): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\SystemUtils.cpp(440,27): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreadPool.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1851,72): warning C4566: '\u2713' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1851,80): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1852,70): warning C4566: '\u2713' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1852,78): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1853,113): warning C4566: '\u2713' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1853,121): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1854,62): warning C4566: '\u2713' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1854,70): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1858,42): warning C4566: '\u2713' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\ThreadPool.cpp(1858,50): warning C4566: '\u2717' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  Timer.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\src\Utils\Timer.cpp(548,43): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  XMLUtils.cpp
+  WhiteListBloomFilter.cpp
+  WhiteListFormat.cpp
+  WhiteListHashIndex.cpp
+  Kod ├£retiliyor...
+  Derleniyor...
+  WhiteListPatternIndex.cpp
+  WhiteListStore.cpp
+  WhiteListStringPool.cpp
+  configuration_db_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u6D4B' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u8BD5' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u30AD' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u30FC' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0417' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u043D' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0430' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0447' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0435' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0438' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0442' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\u0441' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(723,1): warning C4566: '\U0001F389' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u6D4B' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u8BD5' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u30AD' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u30FC' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0417' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u043D' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0430' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0447' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0435' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0438' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0442' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\u0441' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\configuration_db_tests.cpp(725,5): warning C4566: '\U0001F389' evrensel karakter ad─▒ ile temsil edilen karakter ┼şu anki kod sayfas─▒nda (1254) temsil g├Âsterilemiyor [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  database_manager_tests.cpp
+C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xutility(4924,18): warning C4244: '=': 'wchar_t' - 'char' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'tests/unit/Database/database_manager_tests.cpp')
+      C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xutility(4924,18):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\database_manager_tests.cpp(141,31):
+          derlenen ┼şablon i┼şlevi 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _Elem=wchar_t,
+              _Iter=std::_String_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+              _Alloc=std::allocator<char>
+          ]
+              C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\database_manager_tests.cpp(140,13):
+              'DatabaseManagerTest::InitializeDb' i├ğinde ilk 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' ba┼şvurusuna bak─▒n
+          C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xstring(862,17):
+          derlenen ┼şablon i┼şlevi 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<wchar_t*,wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _Size_type=unsigned __int64,
+              _Iter=wchar_t *,
+              _Sent=wchar_t *,
+              _Size=unsigned __int64
+          ]
+          C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xstring(1018,18):
+          derlenen ┼şablon i┼şlevi '_OutIt *std::_Copy_n_unchecked4<wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _OutIt=char *,
+              _Size=unsigned __int64,
+              _InIt=wchar_t *,
+              _SizeTy=unsigned __int64
+          ]
+  
+  Log_db_tests.cpp
+  Quarantine_db_tests.cpp
+C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xutility(4924,18): warning C4244: '=': 'wchar_t' - 'char' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'tests/unit/Database/Quarantine_db_tests.cpp')
+      C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xutility(4924,18):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\Quarantine_db_tests.cpp(149,31):
+          derlenen ┼şablon i┼şlevi 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _Elem=wchar_t,
+              _Iter=std::_String_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+              _Alloc=std::allocator<char>
+          ]
+              C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\Quarantine_db_tests.cpp(148,13):
+              'QuarantineDBTest::InitializeQuarantine' i├ğinde ilk 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' ba┼şvurusuna bak─▒n
+          C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xstring(862,17):
+          derlenen ┼şablon i┼şlevi 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<wchar_t*,wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _Size_type=unsigned __int64,
+              _Iter=wchar_t *,
+              _Sent=wchar_t *,
+              _Size=unsigned __int64
+          ]
+          C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include\xstring(1018,18):
+          derlenen ┼şablon i┼şlevi '_OutIt *std::_Copy_n_unchecked4<wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              _OutIt=char *,
+              _Size=unsigned __int64,
+              _InIt=wchar_t *,
+              _SizeTy=unsigned __int64
+          ]
+  
+  AhoCorasick_Tests.cpp
+  BoyerMooreTests.cpp
+  HashStoreTests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(434,12): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(813,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(830,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(867,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(868,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(886,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(902,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(996,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(1048,19): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\HashStoreTests.cpp(1209,15): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  pattern_store_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(766,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(817,22): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(825,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(848,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(874,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(882,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\pattern_store_tests.cpp(966,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_builder_import_methods_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_import_methods_tests.cpp(823,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_import_methods_tests.cpp(828,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_builder_input_methods_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_input_methods_tests.cpp(1439,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_input_methods_tests.cpp(1445,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_input_methods_tests.cpp(1458,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_input_methods_tests.cpp(1464,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_builder_main_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_main_tests.cpp(551,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_main_tests.cpp(563,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_main_tests.cpp(850,38): warning C4267: '=': 'size_t' - 'uint32_t' d├Ân├╝┼ş├╝m├╝; veri kayb─▒ olabilir [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_builder_serialization_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(123,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(137,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(138,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(139,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(154,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(158,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(159,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(203,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(216,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(227,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(241,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(245,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(260,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(272,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(291,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(309,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(321,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(347,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(359,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(360,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(373,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(384,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(385,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(386,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(397,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(404,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(420,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(430,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(441,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(442,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(457,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(474,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(485,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(507,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(519,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(541,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(553,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(554,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(573,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(584,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(594,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(609,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(615,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(639,20): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(643,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(644,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(645,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(646,16): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_builder_serialization_tests.cpp(680,17): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  sig_builder_utils_tests.cpp
+  sig_format_tests.cpp
+C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1480,1): warning C4018: '>': i┼şaretli/i┼şaretsiz uyu┼şmazl─▒─ş─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'tests/unit/Database/sig_store/sig_format_tests.cpp')
+      C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1480,1):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_format_tests.cpp(646,5):
+          derlenen ┼şablon i┼şlevi 'testing::AssertionResult testing::internal::CmpHelperGT<uint32_t,int>(const char *,const char *,const T1 &,const T2 &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              T1=uint32_t,
+              T2=int
+          ]
+  
+C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1476,1): warning C4018: '<': i┼şaretli/i┼şaretsiz uyu┼şmazl─▒─ş─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'tests/unit/Database/sig_store/sig_format_tests.cpp')
+      C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1476,1):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_format_tests.cpp(647,5):
+          derlenen ┼şablon i┼şlevi 'testing::AssertionResult testing::internal::CmpHelperLT<uint32_t,int>(const char *,const char *,const T1 &,const T2 &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              T1=uint32_t,
+              T2=int
+          ]
+  
+  sig_index_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp(787,15): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp(810,15): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp(811,15): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp(882,15): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp(938,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1478,1): warning C4018: '>=': i┼şaretli/i┼şaretsiz uyu┼şmazl─▒─ş─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'tests/unit/Database/sig_store/sig_index_tests.cpp')
+      C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1478,1):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_index_tests.cpp(795,5):
+          derlenen ┼şablon i┼şlevi 'testing::AssertionResult testing::internal::CmpHelperGE<uint32_t,int>(const char *,const char *,const T1 &,const T2 &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              T1=uint32_t,
+              T2=int
+          ]
+  
+  sig_store_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(452,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(453,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(466,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(482,17): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(594,21): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(604,17): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1480,1): warning C4018: '>': i┼şaretli/i┼şaretsiz uyu┼şmazl─▒─ş─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  (compiling source file 'tests/unit/Database/sig_store/sig_store_tests.cpp')
+      C:\Users\RTX40\source\repos\ShadowStrike\vcpkg\vcpkg\packages\gtest_x64-windows\include\gtest\gtest.h(1480,1):
+      ┼şablon ├Ârne─şi olu┼şturma ba─şlam─▒ (├Ânce en eski olan)
+          C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\sig_store_tests.cpp(268,5):
+          derlenen ┼şablon i┼şlevi 'testing::AssertionResult testing::internal::CmpHelperGT<uint32_t,int>(const char *,const char *,const T1 &,const T2 &)' ├Ârne─şi olu┼şturma ba┼şvurusuna bak─▒n
+          with
+          [
+              T1=uint32_t,
+              T2=int
+          ]
+  
+  SIMD_matcher_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\SIMD_matcher_tests.cpp(128,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  Kod ├£retiliyor...
+  Derleniyor...
+  yara_rule_store_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(172,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(512,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(513,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(522,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(534,13): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(551,17): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(563,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(622,22): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(632,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\sig_store\yara_rule_store_tests.cpp(963,22): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ReputationCache_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ReputationCache_tests.cpp(354,17): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ReputationCache_tests.cpp(354,17):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ReputationCache_tests.cpp(362,17): error C2661: 'ShadowStrike::ThreatIntel::IPv6Address::IPv6Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 2 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ReputationCache_tests.cpp(362,17):
+      '(unsigned __int64, unsigned __int64)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+  ThreatIntelDatabase_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(580,21): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(603,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(787,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(801,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(822,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(844,27): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(892,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(986,21): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1032,21): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1102,27): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1157,25): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1227,5): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1248,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1279,22): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1289,33): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1307,22): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1316,33): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1328,32): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1511,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelDatabase_tests.cpp(1633,23): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelExporter_Tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelExporter_Tests.cpp(1308,12): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelFeedManagerTests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp(1648,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp(1652,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp(1656,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp(1753,14): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManagerTests.cpp(1766,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelFeedManager_parsers_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp(309,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp(310,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp(311,18): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+  ThreatIntelFormat_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(267,18): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 5 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(267,18):
+      '(int, int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(272,18): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 5 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(272,18):
+      '(int, int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(277,19): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 5 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(277,19):
+      '(int, int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(280,19): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 5 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelFormat_tests.cpp(280,19):
+      '(int, int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+  ThreatIntelImporter_Tests.cpp
+  ThreatIntelIndex_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(254,8): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(273,8): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(345,18): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(345,18):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(394,18): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(394,18):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1025,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1110,18): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1110,18):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1112,8): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1158,8): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1182,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1193,21): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1193,21):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1226,19): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1226,19):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1235,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1243,19): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1243,19):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1244,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1283,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1292,9): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1318,18): error C2661: 'ShadowStrike::ThreatIntel::IPv4Address::IPv4Address': hi├ğbir a┼ş─▒r─▒ y├╝klenmi┼ş i┼şlev 4 ba─ş─▒ms─▒z de─şi┼şken almaz [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+      C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIndex_tests.cpp(1318,18):
+      '(int, int, int, int)' ba─ş─▒ms─▒z de─şi┼şken listesi e┼şlenmeye ├ğal─▒┼ş─▒l─▒rken
+  
+  ThreatIntelIOCManager_tests.cpp
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(498,10): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(680,10): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(704,10): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(729,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(794,25): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(832,25): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(865,25): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(898,25): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(1079,10): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]
+C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\tests\unit\Database\threat_intel\ThreatIntelIOCManager_tests.cpp(1162,11): warning C4834: [[nodiscard]] ├Âzniteli─şine sahip i┼şlevin d├Ân├╝┼ş de─şerinin at─▒lmas─▒ [C:\Users\RTX40\source\repos\vscode\ShadowStrike\ShadowStrike\ShadowStrike.vcxproj]

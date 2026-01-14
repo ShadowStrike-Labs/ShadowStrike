@@ -681,7 +681,9 @@ std::optional<IPv4Address> ParseIPv4(std::string_view str) noexcept {
         return std::nullopt;
     }
     
-    return IPv4Address(octets[0], octets[1], octets[2], octets[3], prefixLength);
+    IPv4Address result{};
+    result.Set(octets[0], octets[1], octets[2], octets[3], prefixLength);
+    return result;
 }
 
 // ----------------------------------------------------------------------------

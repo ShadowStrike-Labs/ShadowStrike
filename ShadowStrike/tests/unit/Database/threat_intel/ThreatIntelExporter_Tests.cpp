@@ -109,19 +109,21 @@ struct TempDir {
 	e.vtPositives = 10;
 	e.vtTotal = 70;
 	e.abuseIPDBScore = 90;
-	e.hitCount.store(0, std::memory_order_relaxed);
+	e.SetHitCount(0);
 	return e;
 }
 
 [[nodiscard]] IOCEntry MakeIPv4Entry(uint64_t id, uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) {
 	IOCEntry e = MakeActiveBaseEntry(id, IOCType::IPv4);
-	e.value.ipv4 = IPv4Address(a, b, c, d, prefix);
+	e.value.ipv4 = {};
+	e.value.ipv4.Set(a, b, c, d, prefix);
 	return e;
 }
 
 [[nodiscard]] IOCEntry MakeHashEntry(uint64_t id, HashAlgorithm algo, std::span<const uint8_t> bytes) {
 	IOCEntry e = MakeActiveBaseEntry(id, IOCType::FileHash);
-	e.value.hash = HashValue(algo, bytes.data(), static_cast<uint8_t>(bytes.size()));
+	e.value.hash = {};
+	e.value.hash.Set(algo, bytes.data(), static_cast<uint8_t>(bytes.size()));
 	return e;
 }
 

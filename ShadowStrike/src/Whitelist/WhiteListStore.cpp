@@ -1078,7 +1078,7 @@ LookupResult WhitelistStore::IsCertificateWhitelisted(
     const QueryOptions& options
 ) const noexcept {
     // Convert certificate thumbprint to SHA-256 HashValue
-    HashValue hash(HashAlgorithm::SHA256, thumbprint.data(), 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, thumbprint.data(), 32);
     return IsHashWhitelisted(hash, options);
 }
 
@@ -1333,7 +1333,7 @@ StoreError WhitelistStore::AddHash(
     }
     
     entry->policyId = policyId;
-    entry->hitCount.store(0, std::memory_order_relaxed);
+    entry->SetHitCount(0);
     
     // Add description (with validation)
     if (!description.empty() && m_stringPool) {
@@ -1609,7 +1609,7 @@ StoreError WhitelistStore::AddPath(
     }
     
     entry->policyId = policyId;
-    entry->hitCount.store(0, std::memory_order_relaxed);
+    entry->SetHitCount(0);
     
     // Add path to string pool with safe length calculation
     if (m_stringPool) {
@@ -1714,7 +1714,7 @@ StoreError WhitelistStore::AddCertificate(
     uint32_t policyId
 ) noexcept {
     // Create SHA-256 hash from certificate thumbprint
-    HashValue hash(HashAlgorithm::SHA256, thumbprint.data(), 32);
+    HashValue hash = HashValue::Create(HashAlgorithm::SHA256, thumbprint.data(), 32);
     return AddHash(hash, reason, description, expirationTime, policyId);
 }
 
@@ -1838,7 +1838,7 @@ StoreError WhitelistStore::RemoveEntry(uint64_t entryId) noexcept {
     if (foundEntry->type == WhitelistEntryType::FileHash) {
         // Remove from hash index
         if (m_hashIndex) {
-            HashValue hash(foundEntry->hashAlgorithm, 
+            HashValue hash = HashValue::Create(foundEntry->hashAlgorithm, 
                 foundEntry->hashData.data(), 
                 foundEntry->hashLength);
             indexError = m_hashIndex->Remove(hash);
@@ -2044,7 +2044,7 @@ StoreError WhitelistStore::BatchAdd(
             }
             
             if (m_hashIndex) {
-                HashValue hash(sourceEntry.hashAlgorithm,
+                HashValue hash = HashValue::Create(sourceEntry.hashAlgorithm,
                     sourceEntry.hashData.data(),
                     sourceEntry.hashLength);
                 isDuplicate = m_hashIndex->Contains(hash);
@@ -2086,8 +2086,8 @@ StoreError WhitelistStore::BatchAdd(
         // Ensure entry is enabled
         newEntry->flags = newEntry->flags | WhitelistFlags::Enabled;
         
-        // Reset hit count (atomic member requires explicit initialization)
-        newEntry->hitCount.store(0, std::memory_order_relaxed);
+        // Reset hit count
+        newEntry->SetHitCount(0);
         
         // Calculate entry offset with full bounds validation
         if (!m_mappedView.baseAddress || m_mappedView.fileSize == 0) {
@@ -2114,7 +2114,7 @@ StoreError WhitelistStore::BatchAdd(
         if (newEntry->type == WhitelistEntryType::FileHash) {
             // Add to hash index and bloom filter with validated hash length
             if (newEntry->hashLength > 0 && newEntry->hashLength <= newEntry->hashData.size()) {
-                HashValue hash(newEntry->hashAlgorithm,
+                HashValue hash = HashValue::Create(newEntry->hashAlgorithm,
                     newEntry->hashData.data(),
                     newEntry->hashLength);
                 
@@ -2290,7 +2290,7 @@ StoreError WhitelistStore::UpdateEntryFlags(
     if (HasFlag(flags, WhitelistFlags::Revoked) && !HasFlag(oldFlags, WhitelistFlags::Revoked)) {
         // Remove from appropriate index
         if (foundEntry->type == WhitelistEntryType::FileHash && m_hashIndex) {
-            HashValue hash(foundEntry->hashAlgorithm,
+            HashValue hash = HashValue::Create(foundEntry->hashAlgorithm,
                 foundEntry->hashData.data(),
                 foundEntry->hashLength);
             auto removeResult = m_hashIndex->Remove(hash);
@@ -3803,7 +3803,7 @@ StoreError WhitelistStore::PurgeExpired() noexcept {
             
             // Remove from appropriate index before marking deleted
             if (entryType == WhitelistEntryType::FileHash && m_hashIndex) {
-                HashValue hash(entry->hashAlgorithm,
+                HashValue hash = HashValue::Create(entry->hashAlgorithm,
                     entry->hashData.data(),
                     entry->hashLength);
                 auto removeResult = m_hashIndex->Remove(hash);
@@ -4083,13 +4083,13 @@ StoreError WhitelistStore::Compact() noexcept {
             // Re-add to indices
             if (entry.type == WhitelistEntryType::FileHash) {
                 if (m_hashBloomFilter) {
-                    HashValue hash(entry.hashAlgorithm,
+                    HashValue hash = HashValue::Create(entry.hashAlgorithm,
                         entry.hashData.data(),
                         entry.hashLength);
                     m_hashBloomFilter->Add(hash.FastHash());
                 }
                 if (m_hashIndex) {
-                    HashValue hash(entry.hashAlgorithm,
+                    HashValue hash = HashValue::Create(entry.hashAlgorithm,
                         entry.hashData.data(),
                         entry.hashLength);
                     auto insertResult = m_hashIndex->Insert(hash, offset);
@@ -4292,7 +4292,7 @@ StoreError WhitelistStore::RebuildIndices() noexcept {
         try {
             if (entry->type == WhitelistEntryType::FileHash) {
                 // Construct hash value from entry data
-                HashValue hash(entry->hashAlgorithm,
+                HashValue hash = HashValue::Create(entry->hashAlgorithm,
                     entry->hashData.data(),
                     entry->hashLength);
                 
@@ -4357,7 +4357,7 @@ StoreError WhitelistStore::RebuildIndices() noexcept {
                 // Certificate entries are indexed by thumbprint (stored as hash)
                 // SHA-256 thumbprint is stored in hashData field
                 if (m_hashIndex && entry->hashLength > 0) {
-                    HashValue certHash(entry->hashAlgorithm,
+                    HashValue certHash = HashValue::Create(entry->hashAlgorithm,
                         entry->hashData.data(),
                         entry->hashLength);
                     

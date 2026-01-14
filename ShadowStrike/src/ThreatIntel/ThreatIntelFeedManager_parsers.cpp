@@ -394,9 +394,8 @@ namespace ShadowStrike {
                     // Parse IPv4 address using safe parser
                     uint8_t octets[4] = { 0 };
                     if (ShadowStrike::ThreatIntel_Util::SafeParseIPv4(value, octets)) {
-                        entry.value.ipv4 = IPv4Address(
-                            octets[0], octets[1], octets[2], octets[3]
-                        );
+                        entry.value.ipv4 = {};
+                        entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                     }
                     else {
                         return false;  // Invalid IPv4 format
@@ -697,9 +696,8 @@ namespace ShadowStrike {
                     case IOCType::CIDRv4: {
                         uint8_t octets[4] = { 0 };
                         if (ShadowStrike::ThreatIntel_Util::SafeParseIPv4(value, octets)) {
-                            entry.value.ipv4 = IPv4Address(
-                                octets[0], octets[1], octets[2], octets[3]
-                            );
+                            entry.value.ipv4 = {};
+                            entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                         }
                         else {
                             continue;  // Invalid IPv4, skip this entry
@@ -1230,9 +1228,8 @@ namespace ShadowStrike {
             case IOCType::CIDRv4: {
                 uint8_t octets[4] = { 0 };
                 if (ShadowStrike::ThreatIntel_Util::SafeParseIPv4(value, octets)) {
-                    entry.value.ipv4 = IPv4Address(
-                        octets[0], octets[1], octets[2], octets[3]
-                    );
+                    entry.value.ipv4 = {};
+                    entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
                 }
                 else {
                     return false;  // Invalid IPv4 format
