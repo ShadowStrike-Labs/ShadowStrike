@@ -1,4 +1,8 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
+#include"pch.h"
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder - IMPLEMENTATION
@@ -22,9 +26,9 @@
 
 // Windows headers (must be included first for crypto and TlHelp32)
 #include <windows.h>
-#include <wincrypt.h>
+#include <bcrypt.h>      // CNG (Cryptography Next Generation) - modern, thread-safe crypto API
 #include <TlHelp32.h>
-#include <wincrypt.h>
+#pragma comment(lib, "bcrypt.lib")  // CNG library
 #pragma comment(lib, "advapi32.lib")
 
 #include <rpc.h>
@@ -135,58 +139,156 @@ namespace {
         void* m_base;
     };
     
-    // RAII wrapper for crypto provider
-    class CryptoProviderGuard {
+    // ========================================================================
+    // CNG (Cryptography Next Generation) RAII Wrappers
+    // ========================================================================
+    // 
+    // These wrappers provide:
+    // - Thread-safe cryptographic operations (CAPI was NOT thread-safe)
+    // - Modern, supported API (CAPI is deprecated since Windows Vista)
+    // - Better performance with hardware acceleration support
+    // - RAII-based exception-safe resource management
+    //
+    // CRITICAL: All cryptographic operations in enterprise antivirus MUST use
+    // thread-safe primitives for multi-threaded scanning!
+    // ========================================================================
+    
+    /**
+     * @brief RAII wrapper for BCrypt algorithm handle (BCRYPT_ALG_HANDLE).
+     *
+     * Thread-safe algorithm provider for CNG cryptographic operations.
+     * Replaces deprecated CAPI HCRYPTPROV.
+     *
+     * Usage:
+     *   BCryptAlgGuard alg;
+     *   if (alg.Open(BCRYPT_SHA256_ALGORITHM)) {
+     *       // Use alg.Get() for hash operations
+     *   }
+     */
+    class BCryptAlgGuard {
     public:
-        explicit CryptoProviderGuard(HCRYPTPROV prov = 0) noexcept : m_prov(prov) {}
-        ~CryptoProviderGuard() noexcept { Release(); }
+        BCryptAlgGuard() noexcept : m_alg(nullptr) {}
         
-        CryptoProviderGuard(const CryptoProviderGuard&) = delete;
-        CryptoProviderGuard& operator=(const CryptoProviderGuard&) = delete;
+        explicit BCryptAlgGuard(BCRYPT_ALG_HANDLE alg) noexcept : m_alg(alg) {}
         
-        void Reset(HCRYPTPROV prov = 0) noexcept {
-            Release();
-            m_prov = prov;
+        ~BCryptAlgGuard() noexcept { 
+            Close(); 
         }
         
-        [[nodiscard]] HCRYPTPROV Get() const noexcept { return m_prov; }
-        [[nodiscard]] bool IsValid() const noexcept { return m_prov != 0; }
+        // Non-copyable
+        BCryptAlgGuard(const BCryptAlgGuard&) = delete;
+        BCryptAlgGuard& operator=(const BCryptAlgGuard&) = delete;
         
-    private:
-        void Release() noexcept {
-            if (m_prov) {
-                CryptReleaseContext(m_prov, 0);
-                m_prov = 0;
+        // Movable
+        BCryptAlgGuard(BCryptAlgGuard&& other) noexcept : m_alg(other.m_alg) {
+            other.m_alg = nullptr;
+        }
+        
+        BCryptAlgGuard& operator=(BCryptAlgGuard&& other) noexcept {
+            if (this != &other) {
+                Close();
+                m_alg = other.m_alg;
+                other.m_alg = nullptr;
+            }
+            return *this;
+        }
+        
+        /**
+         * @brief Opens a CNG algorithm provider.
+         * @param algId Algorithm identifier (e.g., BCRYPT_SHA256_ALGORITHM)
+         * @param flags Optional flags (e.g., BCRYPT_HASH_REUSABLE_FLAG)
+         * @return true on success, false on failure
+         */
+        [[nodiscard]] bool Open(LPCWSTR algId, ULONG flags = 0) noexcept {
+            Close();
+            NTSTATUS status = BCryptOpenAlgorithmProvider(&m_alg, algId, nullptr, flags);
+            if (!BCRYPT_SUCCESS(status)) {
+                m_alg = nullptr;
+                return false;
+            }
+            return true;
+        }
+        
+        void Close() noexcept {
+            if (m_alg != nullptr) {
+                BCryptCloseAlgorithmProvider(m_alg, 0);
+                m_alg = nullptr;
             }
         }
-        HCRYPTPROV m_prov;
+        
+        void Reset(BCRYPT_ALG_HANDLE alg = nullptr) noexcept {
+            Close();
+            m_alg = alg;
+        }
+        
+        [[nodiscard]] BCRYPT_ALG_HANDLE Get() const noexcept { return m_alg; }
+        [[nodiscard]] BCRYPT_ALG_HANDLE* Ptr() noexcept { return &m_alg; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_alg != nullptr; }
+        explicit operator bool() const noexcept { return IsValid(); }
+        
+    private:
+        BCRYPT_ALG_HANDLE m_alg;
     };
     
-    // RAII wrapper for crypto hash
-    class CryptoHashGuard {
+    /**
+     * @brief RAII wrapper for BCrypt hash handle (BCRYPT_HASH_HANDLE).
+     *
+     * Thread-safe hash object for CNG cryptographic operations.
+     * Replaces deprecated CAPI HCRYPTHASH.
+     *
+     * Usage:
+     *   BCryptHashGuard hash;
+     *   hash.Reset(hHash);
+     *   // Use hash.Get() for operations
+     *   // Auto-destroyed on scope exit
+     */
+    class BCryptHashGuard {
     public:
-        explicit CryptoHashGuard(HCRYPTHASH hash = 0) noexcept : m_hash(hash) {}
-        ~CryptoHashGuard() noexcept { Destroy(); }
+        BCryptHashGuard() noexcept : m_hash(nullptr) {}
         
-        CryptoHashGuard(const CryptoHashGuard&) = delete;
-        CryptoHashGuard& operator=(const CryptoHashGuard&) = delete;
+        explicit BCryptHashGuard(BCRYPT_HASH_HANDLE hash) noexcept : m_hash(hash) {}
         
-        void Reset(HCRYPTHASH hash = 0) noexcept {
+        ~BCryptHashGuard() noexcept { 
+            Destroy(); 
+        }
+        
+        // Non-copyable
+        BCryptHashGuard(const BCryptHashGuard&) = delete;
+        BCryptHashGuard& operator=(const BCryptHashGuard&) = delete;
+        
+        // Movable
+        BCryptHashGuard(BCryptHashGuard&& other) noexcept : m_hash(other.m_hash) {
+            other.m_hash = nullptr;
+        }
+        
+        BCryptHashGuard& operator=(BCryptHashGuard&& other) noexcept {
+            if (this != &other) {
+                Destroy();
+                m_hash = other.m_hash;
+                other.m_hash = nullptr;
+            }
+            return *this;
+        }
+        
+        void Destroy() noexcept {
+            if (m_hash != nullptr) {
+                BCryptDestroyHash(m_hash);
+                m_hash = nullptr;
+            }
+        }
+        
+        void Reset(BCRYPT_HASH_HANDLE hash = nullptr) noexcept {
             Destroy();
             m_hash = hash;
         }
         
-        [[nodiscard]] HCRYPTHASH Get() const noexcept { return m_hash; }
-        [[nodiscard]] bool IsValid() const noexcept { return m_hash != 0; }
+        [[nodiscard]] BCRYPT_HASH_HANDLE Get() const noexcept { return m_hash; }
+        [[nodiscard]] BCRYPT_HASH_HANDLE* Ptr() noexcept { return &m_hash; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_hash != nullptr; }
+        explicit operator bool() const noexcept { return IsValid(); }
         
     private:
-        void Destroy() noexcept {
-            if (m_hash) {
-                CryptDestroyHash(m_hash);
-                m_hash = 0;
-            }
-        }
-        HCRYPTHASH m_hash;
+        BCRYPT_HASH_HANDLE m_hash;
     };
 
 } // anonymous namespace
@@ -283,7 +385,7 @@ bool SignatureBuilder::IsRegexSafe(
      */
 
      // Check for catastrophic backtracking patterns
-    const std::vector<std::string> DANGEROUS_PATTERNS = {
+    const std::array<std::string_view,6> DANGEROUS_PATTERNS = {
         "(a+)+",           // Nested quantifiers
         "(a*)*",
         "(a|a)*",          // Alternation with overlap
@@ -294,7 +396,8 @@ bool SignatureBuilder::IsRegexSafe(
 
     for (const auto& dangerous : DANGEROUS_PATTERNS) {
         if (pattern.find(dangerous) != std::string::npos) {
-            errorMessage = "Pattern contains dangerous construct: " + dangerous;
+
+            errorMessage = "Pattern contains dangerous construct: " + std::string(dangerous);
             return false;
         }
     }
@@ -330,7 +433,7 @@ bool SignatureBuilder::IsYaraRuleSafe(
      */
 
      // Check for dangerous imports (would need whitelist)
-    const std::vector<std::string> DANGEROUS_IMPORTS = {
+    const std::array<std::string_view,6> DANGEROUS_IMPORTS = {
         "import \"cuckoo\"",     // External system calls
         "import \"magic\"",      // File type detection (can be slow)
     };
@@ -383,7 +486,7 @@ bool SignatureBuilder::TestYaraRuleCompilation(
         return true;
     }
     catch (const std::exception& ex) {
-        errors.push_back(std::string(ex.what()));
+        errors.emplace_back(std::string(ex.what()));
         return false;
     }
     catch (...) {
@@ -581,37 +684,128 @@ bool SignatureBuilder::ValidateDatabaseChecksum(const std::wstring& databasePath
     return std::memcmp(computedHash->data.data(), header->sha256Checksum.data(), 32) == 0;
 }
 
+// ============================================================================
+// DEDUPLICATION - ACTUAL RE-VALIDATION LOGIC (ENTERPRISE-GRADE)
+// ============================================================================
+
 StoreError SignatureBuilder::Deduplicate() noexcept {
-    {
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        m_currentStage = "Deduplication";
-    }
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+    m_currentStage = "Deduplication";
 
     if (!m_config.enableDeduplication) {
-        return StoreError{SignatureStoreError::Success};
+        return StoreError{ SignatureStoreError::Success };
     }
 
-    DeduplicateHashes();
-    DeduplicatePatterns();
-    DeduplicateYaraRules();
+    const size_t beforeCount = m_pendingHashes.size() + m_pendingPatterns.size() + m_pendingYaraRules.size();
 
-    Log("Deduplication complete: removed " + std::to_string(m_statistics.duplicatesRemoved));
-    return StoreError{SignatureStoreError::Success};
+    // CRITICAL: Propagate errors from sub-deduplication stages
+    StoreError err = DeduplicateHashes();
+    if (!err.IsSuccess()) return err;
+
+    err = DeduplicatePatterns();
+    if (!err.IsSuccess()) return err;
+
+    err = DeduplicateYaraRules();
+    if (!err.IsSuccess()) return err;
+
+    const size_t afterCount = m_pendingHashes.size() + m_pendingPatterns.size() + m_pendingYaraRules.size();
+
+    // Overflow-safe statistics update
+    const size_t removed = (beforeCount > afterCount) ? (beforeCount - afterCount) : 0;
+    m_statistics.duplicatesRemoved += removed;
+
+    Log("Deduplication complete: removed " + std::to_string(removed) + " redundant signatures");
+    return StoreError{ SignatureStoreError::Success };
 }
 
 StoreError SignatureBuilder::DeduplicateHashes() noexcept {
-    // Already done during AddHash, but verify
-    return StoreError{SignatureStoreError::Success};
+    /*
+     * Final re-deduplication pass for hashes.
+     * Guaranteed uniqueness using parallel sorting for high performance.
+     */
+    if (m_pendingHashes.empty()) return StoreError{ SignatureStoreError::Success };
+
+    try {
+        
+        std::sort(std::execution::par_unseq, m_pendingHashes.begin(), m_pendingHashes.end(),
+            [](const HashSignatureInput& a, const HashSignatureInput& b) {
+                if (a.hash.type != b.hash.type) {
+                    return a.hash.type < b.hash.type;
+                }
+                // Compare hash data bytes up to the actual length
+                return std::lexicographical_compare(
+                    a.hash.data.begin(), a.hash.data.begin() + a.hash.length,
+                    b.hash.data.begin(), b.hash.data.begin() + b.hash.length
+                );
+            });
+
+        // Unique pass for hashes
+        auto last = std::unique(m_pendingHashes.begin(), m_pendingHashes.end(),
+            [](const HashSignatureInput& a, const HashSignatureInput& b) {
+                if (a.hash.type != b.hash.type || a.hash.length != b.hash.length) {
+                    return false;
+                }
+                return std::memcmp(a.hash.data.data(), b.hash.data.data(), a.hash.length) == 0;
+            });
+
+        m_pendingHashes.erase(last, m_pendingHashes.end());
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Hash deduplication failed: %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("Hash deduplication error: ") + e.what() };
+    }
+
+    return StoreError{ SignatureStoreError::Success };
 }
 
 StoreError SignatureBuilder::DeduplicatePatterns() noexcept {
-    // Already done during AddPattern
-    return StoreError{SignatureStoreError::Success};
+    if (m_pendingPatterns.empty()) return StoreError{ SignatureStoreError::Success };
+
+    try {
+        std::sort(std::execution::par_unseq, m_pendingPatterns.begin(), m_pendingPatterns.end(),
+            [](const auto& a, const auto& b) {
+                return a.patternString < b.patternString;
+            });
+
+        auto last = std::unique(m_pendingPatterns.begin(), m_pendingPatterns.end(),
+            [](const auto& a, const auto& b) {
+                return a.patternString == b.patternString;
+            });
+
+        m_pendingPatterns.erase(last, m_pendingPatterns.end());
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Pattern deduplication failed: %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("Pattern deduplication error: ") + e.what() };
+    }
+
+    return StoreError{ SignatureStoreError::Success };
 }
 
 StoreError SignatureBuilder::DeduplicateYaraRules() noexcept {
-    // Already done during AddYaraRule
-    return StoreError{SignatureStoreError::Success};
+    if (m_pendingYaraRules.empty()) return StoreError{ SignatureStoreError::Success };
+
+    try {
+        // YARA rules are unique by namespace and source content
+        std::sort(m_pendingYaraRules.begin(), m_pendingYaraRules.end(),
+            [](const auto& a, const auto& b) {
+                if (a.namespace_ != b.namespace_) return a.namespace_ < b.namespace_;
+                return a.ruleSource < b.ruleSource;
+            });
+
+        auto last = std::unique(m_pendingYaraRules.begin(), m_pendingYaraRules.end(),
+            [](const auto& a, const auto& b) {
+                return a.namespace_ == b.namespace_ && a.ruleSource == b.ruleSource;
+            });
+
+        m_pendingYaraRules.erase(last, m_pendingYaraRules.end());
+    }
+    catch (const std::exception& e) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"YARA deduplication failed: %S", e.what());
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("YARA deduplication error: ") + e.what() };
+    }
+
+    return StoreError{ SignatureStoreError::Success };
 }
 
 StoreError SignatureBuilder::Optimize() noexcept {
@@ -624,7 +818,10 @@ StoreError SignatureBuilder::Optimize() noexcept {
     QueryPerformanceCounter(&startTime);
 
     if (m_config.enableEntropyOptimization) {
-        OptimizePatterns();
+        StoreError err = OptimizePatterns();
+        if (!err.IsSuccess()) {
+            return err;
+        }
     }
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
@@ -685,23 +882,37 @@ StoreError SignatureBuilder::BuildIndices() noexcept {
     LARGE_INTEGER startTime;
     QueryPerformanceCounter(&startTime);
 
-    BuildHashIndex();
-    BuildPatternIndex();
-    BuildYaraIndex();
+    // Build B+Tree Hash Index
+    StoreError err = BuildHashIndex();
+    if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Index construction failed: Hash Index (B+Tree) - %S", err.message.c_str());
+        return err;
+    }
+
+    // Build Trie Pattern Index
+    err = BuildPatternIndex();
+    if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Index construction failed: Pattern Index (Aho-Corasick) - %S", err.message.c_str());
+        return err;
+    }
+
+    // Build YARA Compiled Index
+    err = BuildYaraIndex();
+    if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"SignatureBuilder", L"Index construction failed: YARA Ruleset - %S", err.message.c_str());
+        return err;
+    }
 
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
-    
-    // HARDENED: Division-by-zero protection
+
     if (m_perfFrequency.QuadPart > 0) {
-        m_statistics.indexBuildTimeMilliseconds = 
+        m_statistics.indexBuildTimeMilliseconds =
             ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
-    } else {
-        m_statistics.indexBuildTimeMilliseconds = 0;
     }
 
-    Log("Index construction complete");
-    return StoreError{SignatureStoreError::Success};
+    Log("All indices constructed successfully");
+    return StoreError{ SignatureStoreError::Success };
 }
 
 // ============================================================================
@@ -1632,14 +1843,13 @@ StoreError SignatureBuilder::ValidateOutput(
         uint64_t size;
     };
 
-    std::vector<Section> sections = {
-        { L"Hash Index", header->hashIndexOffset, header->hashIndexSize },
-        { L"Pattern Index", header->patternIndexOffset, header->patternIndexSize },
-        { L"YARA Rules", header->yaraRulesOffset, header->yaraRulesSize },
-        { L"Metadata", header->metadataOffset, header->metadataSize },
-        { L"String Pool", header->stringPoolOffset, header->stringPoolSize }
-    };
-
+    std::array<Section, 5> sections = { {
+    { L"Hash Index",    header->hashIndexOffset,    header->hashIndexSize },
+    { L"Pattern Index", header->patternIndexOffset, header->patternIndexSize },
+    { L"YARA Rules",    header->yaraRulesOffset,    header->yaraRulesSize },
+    { L"Metadata",      header->metadataOffset,     header->metadataSize },
+    { L"String Pool",   header->stringPoolOffset,   header->stringPoolSize }
+} };
     // Filter out empty sections
     std::vector<Section> activeSections;
     for (const auto& sec : sections) {
@@ -1704,7 +1914,7 @@ StoreError SignatureBuilder::ValidateOutput(
         header->totalHashes, header->totalPatterns, header->totalYaraRules);
 
     // ========================================================================
-    // STEP 9: CRYPTOGRAPHIC CHECKSUM VALIDATION (WITH RAII)
+    // STEP 9: CRYPTOGRAPHIC CHECKSUM VALIDATION (CNG - Thread-Safe)
     // ========================================================================
 
     /*
@@ -1712,32 +1922,38 @@ StoreError SignatureBuilder::ValidateOutput(
      * - File corruption (accidental bit flips)
      * - Unauthorized modifications (malicious tampering)
      * - Transfer errors (network corruption)
+     *
+     * Using CNG (BCrypt) API which is:
+     * - Thread-safe (critical for multi-threaded scanning)
+     * - Modern and actively maintained (CAPI deprecated since Vista)
+     * - Hardware-accelerated where available
      */
 
     SS_LOG_INFO(L"SignatureBuilder",
         L"ValidateOutput: Computing SHA-256 checksum (file size: %llu bytes)...",
         static_cast<uint64_t>(fileSize.QuadPart));
 
-    // Create hash object for SHA-256 with RAII
-    HCRYPTPROV hProvRaw = 0;
-    if (!CryptAcquireContextW(&hProvRaw, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+    // Open SHA-256 algorithm provider with RAII
+    BCryptAlgGuard algGuard;
+    if (!algGuard.Open(BCRYPT_SHA256_ALGORITHM)) {
         DWORD err = GetLastError();
         SS_LOG_ERROR(L"SignatureBuilder",
-            L"ValidateOutput: CryptAcquireContextW failed (error: %lu)", err);
+            L"ValidateOutput: BCryptOpenAlgorithmProvider failed (error: %lu)", err);
         return StoreError{ SignatureStoreError::Unknown, err,
-                          "Failed to initialize crypto provider" };
+                          "Failed to open CNG algorithm provider" };
     }
-    CryptoProviderGuard provGuard(hProvRaw);
 
-    HCRYPTHASH hHashRaw = 0;
-    if (!CryptCreateHash(provGuard.Get(), CALG_SHA_256, 0, 0, &hHashRaw)) {
-        DWORD err = GetLastError();
+    // Create hash object with RAII
+    BCRYPT_HASH_HANDLE hHashRaw = nullptr;
+    NTSTATUS status = BCryptCreateHash(algGuard.Get(), &hHashRaw, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
         SS_LOG_ERROR(L"SignatureBuilder",
-            L"ValidateOutput: CryptCreateHash failed (error: %lu)", err);
-        return StoreError{ SignatureStoreError::Unknown, err,
-                          "Failed to create hash object" };
+            L"ValidateOutput: BCryptCreateHash failed (status: 0x%08X)", 
+            static_cast<unsigned int>(status));
+        return StoreError{ SignatureStoreError::Unknown, static_cast<DWORD>(status),
+                          "Failed to create CNG hash object" };
     }
-    CryptoHashGuard hashGuard(hHashRaw);
+    BCryptHashGuard hashGuard(hHashRaw);
 
     // Hash the file in streaming fashion (doesn't load entire file into memory)
     constexpr size_t CHUNK_SIZE = 1024 * 1024; // 1MB chunks
@@ -1775,27 +1991,31 @@ StoreError SignatureBuilder::ValidateOutput(
         uint64_t bytesRemaining = static_cast<uint64_t>(fileSize.QuadPart) - bytesHashed;
         size_t chunkBytes = std::min(CHUNK_SIZE, static_cast<size_t>(bytesRemaining));
 
-        // Hash chunk
-        if (!CryptHashData(hashGuard.Get(), filePtr + bytesHashed, static_cast<DWORD>(chunkBytes), 0)) {
-            DWORD err = GetLastError();
+        // Hash chunk using CNG (thread-safe)
+        status = BCryptHashData(hashGuard.Get(), 
+                                const_cast<PUCHAR>(filePtr + bytesHashed), 
+                                static_cast<ULONG>(chunkBytes), 
+                                0);
+        if (!BCRYPT_SUCCESS(status)) {
             SS_LOG_ERROR(L"SignatureBuilder",
-                L"ValidateOutput: CryptHashData failed (error: %lu)", err);
-            return StoreError{ SignatureStoreError::Unknown, err,
+                L"ValidateOutput: BCryptHashData failed (status: 0x%08X)", 
+                static_cast<unsigned int>(status));
+            return StoreError{ SignatureStoreError::Unknown, static_cast<DWORD>(status),
                               "Failed to compute checksum" };
         }
 
         bytesHashed += chunkBytes;
     }
 
-    // Get computed hash
+    // Finalize and get computed hash
     std::array<uint8_t, 32> computedHash{};
-    DWORD hashLen = 32;
-
-    if (!CryptGetHashParam(hashGuard.Get(), HP_HASHVAL, computedHash.data(), &hashLen, 0)) {
-        DWORD err = GetLastError();
+    status = BCryptFinishHash(hashGuard.Get(), computedHash.data(), 
+                              static_cast<ULONG>(computedHash.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
         SS_LOG_ERROR(L"SignatureBuilder",
-            L"ValidateOutput: CryptGetHashParam failed (error: %lu)", err);
-        return StoreError{ SignatureStoreError::Unknown, err,
+            L"ValidateOutput: BCryptFinishHash failed (status: 0x%08X)", 
+            static_cast<unsigned int>(status));
+        return StoreError{ SignatureStoreError::Unknown, static_cast<DWORD>(status),
                           "Failed to retrieve computed hash" };
     }
 

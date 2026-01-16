@@ -1,4 +1,7 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder - UTILITY FUNCTIONS
@@ -14,13 +17,13 @@
  *
  * ============================================================================
  */
-
+#include"pch.h"
 #include "SignatureBuilder.hpp"
 
-// Windows headers for crypto
+// Windows headers for crypto - Using CNG (modern, thread-safe)
 #include <windows.h>
-#include <wincrypt.h>
-#pragma comment(lib, "advapi32.lib")
+#include <bcrypt.h>      // CNG (Cryptography Next Generation)
+#pragma comment(lib, "bcrypt.lib")
 
 namespace ShadowStrike {
 namespace SignatureStore {
@@ -73,86 +76,140 @@ namespace {
         HANDLE m_handle;
     };
 
-    // RAII wrapper for HCRYPTPROV
-    class CryptoProviderGuard {
+    // ========================================================================
+    // CNG (Cryptography Next Generation) RAII Wrappers
+    // ========================================================================
+    // 
+    // These wrappers provide:
+    // - Thread-safe cryptographic operations (CAPI was NOT thread-safe)
+    // - Modern, supported API (CAPI is deprecated since Windows Vista)
+    // - Better performance with hardware acceleration support
+    // - RAII-based exception-safe resource management
+    //
+    // CRITICAL: All cryptographic operations in enterprise antivirus MUST use
+    // thread-safe primitives for multi-threaded scanning!
+    // ========================================================================
+
+    /**
+     * @brief RAII wrapper for BCrypt algorithm handle (BCRYPT_ALG_HANDLE).
+     *
+     * Thread-safe algorithm provider for CNG cryptographic operations.
+     * Replaces deprecated CAPI HCRYPTPROV.
+     */
+    class BCryptAlgGuard {
     public:
-        explicit CryptoProviderGuard(HCRYPTPROV prov = 0) noexcept : m_prov(prov) {}
-        ~CryptoProviderGuard() noexcept { Release(); }
-
-        CryptoProviderGuard(const CryptoProviderGuard&) = delete;
-        CryptoProviderGuard& operator=(const CryptoProviderGuard&) = delete;
-
-        CryptoProviderGuard(CryptoProviderGuard&& other) noexcept : m_prov(other.m_prov) {
-            other.m_prov = 0;
+        BCryptAlgGuard() noexcept : m_alg(nullptr) {}
+        
+        explicit BCryptAlgGuard(BCRYPT_ALG_HANDLE alg) noexcept : m_alg(alg) {}
+        
+        ~BCryptAlgGuard() noexcept { Close(); }
+        
+        // Non-copyable
+        BCryptAlgGuard(const BCryptAlgGuard&) = delete;
+        BCryptAlgGuard& operator=(const BCryptAlgGuard&) = delete;
+        
+        // Movable
+        BCryptAlgGuard(BCryptAlgGuard&& other) noexcept : m_alg(other.m_alg) {
+            other.m_alg = nullptr;
         }
-
-        CryptoProviderGuard& operator=(CryptoProviderGuard&& other) noexcept {
+        
+        BCryptAlgGuard& operator=(BCryptAlgGuard&& other) noexcept {
             if (this != &other) {
-                Release();
-                m_prov = other.m_prov;
-                other.m_prov = 0;
+                Close();
+                m_alg = other.m_alg;
+                other.m_alg = nullptr;
             }
             return *this;
         }
-
-        void Release() noexcept {
-            if (m_prov != 0) {
-                CryptReleaseContext(m_prov, 0);
-                m_prov = 0;
+        
+        /**
+         * @brief Opens a CNG algorithm provider.
+         * @param algId Algorithm identifier (e.g., BCRYPT_SHA256_ALGORITHM)
+         * @param flags Optional flags
+         * @return true on success, false on failure
+         */
+        [[nodiscard]] bool Open(LPCWSTR algId, ULONG flags = 0) noexcept {
+            Close();
+            NTSTATUS status = BCryptOpenAlgorithmProvider(&m_alg, algId, nullptr, flags);
+            if (!BCRYPT_SUCCESS(status)) {
+                m_alg = nullptr;
+                return false;
+            }
+            return true;
+        }
+        
+        void Close() noexcept {
+            if (m_alg != nullptr) {
+                BCryptCloseAlgorithmProvider(m_alg, 0);
+                m_alg = nullptr;
             }
         }
-
-        void Reset(HCRYPTPROV prov) noexcept {
-            Release();
-            m_prov = prov;
+        
+        void Reset(BCRYPT_ALG_HANDLE alg = nullptr) noexcept {
+            Close();
+            m_alg = alg;
         }
-
-        [[nodiscard]] HCRYPTPROV Get() const noexcept { return m_prov; }
-        [[nodiscard]] bool IsValid() const noexcept { return m_prov != 0; }
-
+        
+        [[nodiscard]] BCRYPT_ALG_HANDLE Get() const noexcept { return m_alg; }
+        [[nodiscard]] BCRYPT_ALG_HANDLE* Ptr() noexcept { return &m_alg; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_alg != nullptr; }
+        explicit operator bool() const noexcept { return IsValid(); }
+        
     private:
-        HCRYPTPROV m_prov;
+        BCRYPT_ALG_HANDLE m_alg;
     };
 
-    // RAII wrapper for HCRYPTHASH
-    class CryptoHashGuard {
+    /**
+     * @brief RAII wrapper for BCrypt hash handle (BCRYPT_HASH_HANDLE).
+     *
+     * Thread-safe hash object for CNG cryptographic operations.
+     * Replaces deprecated CAPI HCRYPTHASH.
+     */
+    class BCryptHashGuard {
     public:
-        explicit CryptoHashGuard(HCRYPTHASH hash = 0) noexcept : m_hash(hash) {}
-        ~CryptoHashGuard() noexcept { Release(); }
-
-        CryptoHashGuard(const CryptoHashGuard&) = delete;
-        CryptoHashGuard& operator=(const CryptoHashGuard&) = delete;
-
-        CryptoHashGuard(CryptoHashGuard&& other) noexcept : m_hash(other.m_hash) {
-            other.m_hash = 0;
+        BCryptHashGuard() noexcept : m_hash(nullptr) {}
+        
+        explicit BCryptHashGuard(BCRYPT_HASH_HANDLE hash) noexcept : m_hash(hash) {}
+        
+        ~BCryptHashGuard() noexcept { Destroy(); }
+        
+        // Non-copyable
+        BCryptHashGuard(const BCryptHashGuard&) = delete;
+        BCryptHashGuard& operator=(const BCryptHashGuard&) = delete;
+        
+        // Movable
+        BCryptHashGuard(BCryptHashGuard&& other) noexcept : m_hash(other.m_hash) {
+            other.m_hash = nullptr;
         }
-
-        CryptoHashGuard& operator=(CryptoHashGuard&& other) noexcept {
+        
+        BCryptHashGuard& operator=(BCryptHashGuard&& other) noexcept {
             if (this != &other) {
-                Release();
+                Destroy();
                 m_hash = other.m_hash;
-                other.m_hash = 0;
+                other.m_hash = nullptr;
             }
             return *this;
         }
-
-        void Release() noexcept {
-            if (m_hash != 0) {
-                CryptDestroyHash(m_hash);
-                m_hash = 0;
+        
+        void Destroy() noexcept {
+            if (m_hash != nullptr) {
+                BCryptDestroyHash(m_hash);
+                m_hash = nullptr;
             }
         }
-
-        void Reset(HCRYPTHASH hash) noexcept {
-            Release();
+        
+        void Reset(BCRYPT_HASH_HANDLE hash = nullptr) noexcept {
+            Destroy();
             m_hash = hash;
         }
-
-        [[nodiscard]] HCRYPTHASH Get() const noexcept { return m_hash; }
-        [[nodiscard]] bool IsValid() const noexcept { return m_hash != 0; }
-
+        
+        [[nodiscard]] BCRYPT_HASH_HANDLE Get() const noexcept { return m_hash; }
+        [[nodiscard]] BCRYPT_HASH_HANDLE* Ptr() noexcept { return &m_hash; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_hash != nullptr; }
+        explicit operator bool() const noexcept { return IsValid(); }
+        
     private:
-        HCRYPTHASH m_hash;
+        BCRYPT_HASH_HANDLE m_hash;
     };
 
     // Aligned buffer for FILE_FLAG_NO_BUFFERING operations
@@ -347,28 +404,29 @@ namespace {
             // STEP 2: ALGORITHM VALIDATION & DEPRECATION WARNINGS
             // ========================================================================
 
-            ALG_ID algId = 0;
+            // CNG algorithm identifiers (thread-safe, modern API)
+            LPCWSTR algId = nullptr;
             DWORD expectedLen = 0;
 
             switch (type) {
             case HashType::MD5:
                 SS_LOG_WARN(L"SignatureBuilder",
                     L"ComputeFileHash: MD5 is cryptographically broken - use SHA256 instead");
-                algId = CALG_MD5;
+                algId = BCRYPT_MD5_ALGORITHM;
                 expectedLen = 16;
                 break;
             case HashType::SHA1:
                 SS_LOG_WARN(L"SignatureBuilder",
                     L"ComputeFileHash: SHA1 is deprecated - use SHA256 instead");
-                algId = CALG_SHA1;
+                algId = BCRYPT_SHA1_ALGORITHM;
                 expectedLen = 20;
                 break;
             case HashType::SHA256:
-                algId = CALG_SHA_256;
+                algId = BCRYPT_SHA256_ALGORITHM;
                 expectedLen = 32;
                 break;
             case HashType::SHA512:
-                algId = CALG_SHA_512;
+                algId = BCRYPT_SHA512_ALGORITHM;
                 expectedLen = 64;
                 break;
             case HashType::IMPHASH:
@@ -442,27 +500,32 @@ namespace {
             }
 
             // ========================================================================
-            // STEP 5: CRYPTOGRAPHIC PROVIDER INITIALIZATION WITH RAII
+            // STEP 5: CNG ALGORITHM PROVIDER INITIALIZATION WITH RAII
+            // ========================================================================
+            // 
+            // Using CNG (BCrypt) API which is:
+            // - Thread-safe (critical for multi-threaded scanning)
+            // - Modern and actively maintained (CAPI deprecated since Vista)
+            // - Hardware-accelerated where available (AES-NI, SHA extensions)
             // ========================================================================
 
-            HCRYPTPROV hProvRaw = 0;
-            if (!CryptAcquireContextW(&hProvRaw, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+            BCryptAlgGuard algGuard;
+            if (!algGuard.Open(algId)) {
                 DWORD lastError = GetLastError();
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: CryptAcquireContextW failed (error: %lu)", lastError);
+                    L"ComputeFileHash: BCryptOpenAlgorithmProvider failed (error: %lu)", lastError);
                 return std::nullopt;
             }
-            CryptoProviderGuard provGuard(hProvRaw);
 
-            HCRYPTHASH hHashRaw = 0;
-            if (!CryptCreateHash(provGuard.Get(), algId, 0, 0, &hHashRaw)) {
-                DWORD lastError = GetLastError();
+            BCRYPT_HASH_HANDLE hHashRaw = nullptr;
+            NTSTATUS status = BCryptCreateHash(algGuard.Get(), &hHashRaw, nullptr, 0, nullptr, 0, 0);
+            if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: CryptCreateHash failed (algorithm: %u, error: %lu)",
-                    algId, lastError);
+                    L"ComputeFileHash: BCryptCreateHash failed (status: 0x%08X)",
+                    static_cast<unsigned int>(status));
                 return std::nullopt;
             }
-            CryptoHashGuard hashGuard(hHashRaw);
+            BCryptHashGuard hashGuard(hHashRaw);
 
             // ========================================================================
             // STEP 6: STREAMING FILE HASH COMPUTATION
@@ -549,18 +612,18 @@ namespace {
                     }
                 }
 
-                // Hash this chunk
-                if (!CryptHashData(hashGuard.Get(), buffer.Data(), bytesRead, 0)) {
-                    DWORD lastError = GetLastError();
+                // Hash this chunk using CNG (thread-safe)
+                status = BCryptHashData(hashGuard.Get(), buffer.Data(), bytesRead, 0);
+                if (!BCRYPT_SUCCESS(status)) {
                     SS_LOG_ERROR(L"SignatureBuilder",
-                        L"ComputeFileHash: CryptHashData failed (error: %lu, bytesRead: %lu)",
-                        lastError, bytesRead);
+                        L"ComputeFileHash: BCryptHashData failed (status: 0x%08X, bytesRead: %lu)",
+                        static_cast<unsigned int>(status), bytesRead);
                     return std::nullopt;
                 }
             }
 
             // ========================================================================
-            // STEP 7: EXTRACT HASH VALUE
+            // STEP 7: EXTRACT HASH VALUE (CNG - BCryptFinishHash)
             // ========================================================================
 
             HashValue hash{};
@@ -575,18 +638,13 @@ namespace {
                 return std::nullopt;
             }
 
-            DWORD hashLen = expectedLen;
-            if (!CryptGetHashParam(hashGuard.Get(), HP_HASHVAL, hash.data.data(), &hashLen, 0)) {
-                DWORD lastError = GetLastError();
+            // Finalize hash and get result using CNG
+            status = BCryptFinishHash(hashGuard.Get(), hash.data.data(), 
+                                      static_cast<ULONG>(expectedLen), 0);
+            if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: CryptGetHashParam failed (error: %lu)", lastError);
-                return std::nullopt;
-            }
-
-            if (hashLen != expectedLen) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: Hash length mismatch (expected: %lu, got: %lu)",
-                    expectedLen, hashLen);
+                    L"ComputeFileHash: BCryptFinishHash failed (status: 0x%08X)", 
+                    static_cast<unsigned int>(status));
                 return std::nullopt;
             }
 
@@ -687,28 +745,29 @@ namespace {
             // STEP 2: ALGORITHM VALIDATION & DEPRECATION WARNINGS
             // ========================================================================
 
-            ALG_ID algId = 0;
+            // CNG algorithm identifiers (thread-safe, modern API)
+            LPCWSTR algId = nullptr;
             DWORD expectedLen = 0;
 
             switch (type) {
             case HashType::MD5:
                 SS_LOG_WARN(L"SignatureBuilder",
                     L"ComputeBufferHash: MD5 is cryptographically broken - use SHA256");
-                algId = CALG_MD5;
+                algId = BCRYPT_MD5_ALGORITHM;
                 expectedLen = 16;
                 break;
             case HashType::SHA1:
                 SS_LOG_WARN(L"SignatureBuilder",
                     L"ComputeBufferHash: SHA1 is deprecated - use SHA256");
-                algId = CALG_SHA1;
+                algId = BCRYPT_SHA1_ALGORITHM;
                 expectedLen = 20;
                 break;
             case HashType::SHA256:
-                algId = CALG_SHA_256;
+                algId = BCRYPT_SHA256_ALGORITHM;
                 expectedLen = 32;
                 break;
             case HashType::SHA512:
-                algId = CALG_SHA_512;
+                algId = BCRYPT_SHA512_ALGORITHM;
                 expectedLen = 64;
                 break;
             case HashType::IMPHASH:
@@ -726,29 +785,35 @@ namespace {
             }
 
             // ========================================================================
-            // STEP 3: CRYPTOGRAPHIC PROVIDER INITIALIZATION WITH RAII
+            // STEP 3: CNG ALGORITHM PROVIDER INITIALIZATION WITH RAII
+            // ========================================================================
+            // 
+            // Using CNG (BCrypt) API which is:
+            // - Thread-safe (critical for multi-threaded scanning)
+            // - Modern and actively maintained (CAPI deprecated since Vista)
+            // - Hardware-accelerated where available
             // ========================================================================
 
-            HCRYPTPROV hProvRaw = 0;
-            if (!CryptAcquireContextW(&hProvRaw, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+            BCryptAlgGuard algGuard;
+            if (!algGuard.Open(algId)) {
                 DWORD lastError = GetLastError();
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: CryptAcquireContextW failed (error: %lu)", lastError);
+                    L"ComputeBufferHash: BCryptOpenAlgorithmProvider failed (error: %lu)", lastError);
                 return std::nullopt;
             }
-            CryptoProviderGuard provGuard(hProvRaw);
 
-            HCRYPTHASH hHashRaw = 0;
-            if (!CryptCreateHash(provGuard.Get(), algId, 0, 0, &hHashRaw)) {
-                DWORD lastError = GetLastError();
+            BCRYPT_HASH_HANDLE hHashRaw = nullptr;
+            NTSTATUS status = BCryptCreateHash(algGuard.Get(), &hHashRaw, nullptr, 0, nullptr, 0, 0);
+            if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: CryptCreateHash failed (error: %lu)", lastError);
+                    L"ComputeBufferHash: BCryptCreateHash failed (status: 0x%08X)",
+                    static_cast<unsigned int>(status));
                 return std::nullopt;
             }
-            CryptoHashGuard hashGuard(hHashRaw);
+            BCryptHashGuard hashGuard(hHashRaw);
 
             // ========================================================================
-            // STEP 4: HASH THE BUFFER
+            // STEP 4: HASH THE BUFFER (CNG - Thread-Safe)
             // ========================================================================
 
             LARGE_INTEGER perfFreq{}, startTime{};
@@ -756,29 +821,26 @@ namespace {
             QueryPerformanceCounter(&startTime);
 
             if (!buffer.empty()) {
-                // Process in chunks to avoid DWORD overflow for large buffers
-                // HARDENED: Use DWORD-safe chunk size to prevent overflow in CryptHashData
+                // Process in chunks to avoid ULONG overflow for large buffers
+                // HARDENED: Use ULONG-safe chunk size to prevent overflow in BCryptHashData
                 constexpr size_t CHUNK_SIZE = 256 * 1024 * 1024;  // 256MB chunks
                 static_assert(CHUNK_SIZE <= static_cast<size_t>(MAXDWORD), 
-                    "CHUNK_SIZE must fit in DWORD for CryptHashData");
+                    "CHUNK_SIZE must fit in ULONG for BCryptHashData");
                 size_t offset = 0;
 
                 while (offset < buffer.size()) {
+
+                  
                     size_t chunkSize = (std::min)(CHUNK_SIZE, buffer.size() - offset);
                     
-                    // HARDENED: Double-check chunk size fits in DWORD before cast
-                    if (chunkSize > static_cast<size_t>(MAXDWORD)) {
+                    status = BCryptHashData(hashGuard.Get(), 
+                                           const_cast<PUCHAR>(buffer.data() + offset), 
+                                           static_cast<ULONG>(chunkSize), 
+                                           0);
+                    if (!BCRYPT_SUCCESS(status)) {
                         SS_LOG_ERROR(L"SignatureBuilder",
-                            L"ComputeBufferHash: Chunk size exceeds DWORD max (%zu)", chunkSize);
-                        return std::nullopt;
-                    }
-                    
-                    if (!CryptHashData(hashGuard.Get(), buffer.data() + offset, 
-                                       static_cast<DWORD>(chunkSize), 0)) {
-                        DWORD lastError = GetLastError();
-                        SS_LOG_ERROR(L"SignatureBuilder",
-                            L"ComputeBufferHash: CryptHashData failed (offset: %zu, size: %zu, error: %lu)",
-                            offset, chunkSize, lastError);
+                            L"ComputeBufferHash: BCryptHashData failed (offset: %zu, size: %zu, status: 0x%08X)",
+                            offset, chunkSize, static_cast<unsigned int>(status));
                         return std::nullopt;
                     }
                     offset += chunkSize;
@@ -786,7 +848,7 @@ namespace {
             }
 
             // ========================================================================
-            // STEP 5: EXTRACT HASH VALUE
+            // STEP 5: EXTRACT HASH VALUE (CNG - BCryptFinishHash)
             // ========================================================================
 
             HashValue hash{};
@@ -801,18 +863,13 @@ namespace {
                 return std::nullopt;
             }
 
-            DWORD hashLen = expectedLen;
-            if (!CryptGetHashParam(hashGuard.Get(), HP_HASHVAL, hash.data.data(), &hashLen, 0)) {
-                DWORD lastError = GetLastError();
+            // Finalize hash and get result using CNG
+            status = BCryptFinishHash(hashGuard.Get(), hash.data.data(), 
+                                      static_cast<ULONG>(expectedLen), 0);
+            if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: CryptGetHashParam failed (error: %lu)", lastError);
-                return std::nullopt;
-            }
-
-            if (hashLen != expectedLen) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: Hash length mismatch (expected: %lu, got: %lu)",
-                    expectedLen, hashLen);
+                    L"ComputeBufferHash: BCryptFinishHash failed (status: 0x%08X)", 
+                    static_cast<unsigned int>(status));
                 return std::nullopt;
             }
 

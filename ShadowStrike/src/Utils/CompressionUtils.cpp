@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /**
  * @file CompressionUtils.cpp
  * @brief Implementation of Windows Compression API utilities.
@@ -6,7 +7,7 @@
  * @copyright Copyright (c) 2025 ShadowStrike Security
  * @license Proprietary - All rights reserved
  */
-
+#include"pch.h"
 #include "CompressionUtils.hpp"
 
 #include <mutex>

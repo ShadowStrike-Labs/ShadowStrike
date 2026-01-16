@@ -1,4 +1,7 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 /**
  * @file HashStoreTests.cpp
  * @brief Comprehensive Enterprise-Grade Unit Tests for HashStore System
@@ -37,6 +40,7 @@
  * Copyright (c) 2026 ShadowStrike Security Suite
  */
 
+#include"pch.h"
 #include <gtest/gtest.h>
 #include"../../src/SignatureStore/SignatureFormat.hpp"
 #include"../../src/HashStore/HashStore.hpp"

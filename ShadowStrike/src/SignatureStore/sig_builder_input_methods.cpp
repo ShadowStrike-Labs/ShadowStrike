@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include"pch.h"
 #include "SignatureBuilder.hpp"
 
@@ -503,9 +507,9 @@ namespace SignatureStore {
             // ========================================================================
 
             // For regex patterns, perform complexity analysis
-            if (input.patternString.find("(") != std::string::npos ||
-                input.patternString.find("[") != std::string::npos ||
-                input.patternString.find("*") != std::string::npos) {
+            if (input.patternString.find('(') != std::string::npos ||
+                input.patternString.find('[') != std::string::npos ||
+                input.patternString.find(' * ') != std::string::npos) {
 
                 if (!IsRegexSafe(input.patternString, validationError)) {
                     SS_LOG_ERROR(L"SignatureBuilder",
@@ -1407,7 +1411,7 @@ namespace SignatureStore {
                         L"AddHashBatch: Invalid hash length at index %zu (%u bytes)",
                         i, input.hash.length);
                     invalidIndices.push_back(i);
-                    validationErrors.push_back("Invalid hash length at index " + std::to_string(i));
+                    validationErrors.emplace_back("Invalid hash length at index " + std::to_string(i));
                     continue;
                 }
 
@@ -1417,7 +1421,7 @@ namespace SignatureStore {
                         L"AddHashBatch: Invalid name at index %zu (length: %zu)",
                         i, input.name.length());
                     invalidIndices.push_back(i);
-                    validationErrors.push_back("Invalid name at index " + std::to_string(i));
+                    validationErrors.emplace_back("Invalid name at index " + std::to_string(i));
                     continue;
                 }
 
@@ -1436,7 +1440,7 @@ namespace SignatureStore {
                         L"AddHashBatch: Description too long at index %zu (%zu > 4096)",
                         i, input.description.length());
                     invalidIndices.push_back(i);
-                    validationErrors.push_back("Description too long at index " + std::to_string(i));
+                    validationErrors.emplace_back("Description too long at index " + std::to_string(i));
                     continue;
                 }
 
@@ -1446,7 +1450,7 @@ namespace SignatureStore {
                         L"AddHashBatch: Too many tags at index %zu (%zu > 32)",
                         i, input.tags.size());
                     invalidIndices.push_back(i);
-                    validationErrors.push_back("Too many tags at index " + std::to_string(i));
+                    validationErrors.emplace_back("Too many tags at index " + std::to_string(i));
                     continue;
                 }
 
@@ -2034,7 +2038,7 @@ namespace SignatureStore {
                         L"AddYaraRuleBatch: Invalid rule size at index %zu",
                         i);
                     invalidIndices.push_back(i);
-                    validationErrors.push_back("Invalid rule size at index " + std::to_string(i));
+                    validationErrors.emplace_back("Invalid rule size at index " + std::to_string(i));
                     continue;
                 }
 
@@ -2045,7 +2049,7 @@ namespace SignatureStore {
                             L"AddYaraRuleBatch: Namespace too long at index %zu",
                             i);
                         invalidIndices.push_back(i);
-                        validationErrors.push_back("Namespace too long at index " + std::to_string(i));
+                        validationErrors.emplace_back("Namespace too long at index " + std::to_string(i));
                         continue;
                     }
 
@@ -2055,7 +2059,7 @@ namespace SignatureStore {
                             L"AddYaraRuleBatch: Invalid namespace at index %zu",
                             i);
                         invalidIndices.push_back(i);
-                        validationErrors.push_back("Invalid namespace format at index " + std::to_string(i));
+                        validationErrors.emplace_back("Invalid namespace format at index " + std::to_string(i));
                         continue;
                     }
                 }
@@ -2067,7 +2071,7 @@ namespace SignatureStore {
                         L"AddYaraRuleBatch: Safety check failed at index %zu",
                         i);
                     invalidIndices.push_back(i);
-                    validationErrors.push_back("Safety check failed at index " + std::to_string(i));
+                    validationErrors.emplace_back("Safety check failed at index " + std::to_string(i));
                     continue;
                 }
 

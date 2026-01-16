@@ -1,4 +1,7 @@
-﻿#include"pch.h"
+﻿
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ============================================================================
  * ShadowStrike HashStore - IMPLEMENTATION
@@ -14,7 +17,7 @@
  *
  * ============================================================================
  */
-
+#include"pch.h"
 #include "HashStore.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -300,8 +303,8 @@ namespace ShadowStrike {
             }
 
             // Calculate bloom filter efficiency with division-by-zero protection
-            const uint64_t totalBloomChecks = stats.bloomFilterSaves + 
-                                              (stats.totalLookups - stats.bloomFilterSaves);
+            const uint64_t totalBloomChecks = stats.totalLookups;
+
             if (totalBloomChecks > 0) {
                 stats.bloomFilterEfficiency = static_cast<double>(stats.bloomFilterSaves) /
                                               static_cast<double>(totalBloomChecks);

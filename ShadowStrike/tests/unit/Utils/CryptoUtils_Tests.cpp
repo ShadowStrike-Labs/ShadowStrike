@@ -1,9 +1,11 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/CryptoUtils.hpp"
 #include "../../../src/Utils/HashUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"
-#include"../../../src/Utils/Logger.hpp"
+#include "../../../src/Utils/Logger.hpp"
 #include <vector>
 #include <string>
 #include <fstream>
@@ -89,6 +91,7 @@ protected:
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, SecureRandom_Generate_BasicFunctionality) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_Generate_BasicFunctionality] Testing...");
     SecureRandom rng;
     
     std::vector<uint8_t> data;
@@ -97,6 +100,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_Generate_BasicFunctionality) {
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_Generate_ZeroSize) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_Generate_ZeroSize] Testing...");
     SecureRandom rng;
     
     std::vector<uint8_t> empty;
@@ -105,6 +109,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_Generate_ZeroSize) {
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_Generate_LargeBuffer) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_Generate_LargeBuffer] Testing...");
     SecureRandom rng;
     
     std::vector<uint8_t> large;
@@ -113,6 +118,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_Generate_LargeBuffer) {
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_NextUInt32_Range) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_NextUInt32_Range] Testing...");
     SecureRandom rng;
     
     // Test 100 samples in range [10, 50)
@@ -124,6 +130,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_NextUInt32_Range) {
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_NextUInt32_BoundaryConditions) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_NextUInt32_BoundaryConditions] Testing...");
     SecureRandom rng;
     
     // Same min/max should return min
@@ -134,6 +141,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_NextUInt32_BoundaryConditions) {
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_GenerateAlphanumeric_CharsetValidation) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_GenerateAlphanumeric_CharsetValidation] Testing...");
     SecureRandom rng;
     
     std::string str = rng.GenerateAlphanumeric(1000, err.get());
@@ -149,6 +157,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_GenerateAlphanumeric_CharsetValidation) {
 }
 
 TEST_F(CryptoUtilsTest, SecureRandom_GenerateHex_Format) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureRandom_GenerateHex_Format] Testing...");
     SecureRandom rng;
     
     std::string hex = rng.GenerateHex(32, err.get());
@@ -166,6 +175,7 @@ TEST_F(CryptoUtilsTest, SecureRandom_GenerateHex_Format) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_BasicEncryptDecrypt) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_AES256GCM_BasicEncryptDecrypt] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
 
     std::vector<uint8_t> key, iv;
@@ -193,6 +203,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_BasicEncryptDecrypt) {
 }
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_WithAAD) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_AES256GCM_WithAAD] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
     
     std::vector<uint8_t> key, iv;
@@ -221,6 +232,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_WithAAD) {
 }
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_AADMismatch) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_AES256GCM_AADMismatch] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
     
     std::vector<uint8_t> key, iv;
@@ -248,6 +260,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_AADMismatch) {
 }
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_TruncatedTag) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_AES256GCM_TruncatedTag] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
     
     std::vector<uint8_t> key, iv;
@@ -276,6 +289,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256GCM_TruncatedTag) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_PKCS7Padding) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_AES256CBC_PKCS7Padding] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
     cipher.SetPaddingMode(PaddingMode::PKCS7);
     
@@ -310,6 +324,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_PKCS7Padding) {
 }
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_StreamingEncryption) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_AES256CBC_StreamingEncryption] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
     
     std::vector<uint8_t> key, iv;
@@ -356,6 +371,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_AES256CBC_StreamingEncryption) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_KeyGeneration) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_RSA2048_KeyGeneration] Testing...");
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
@@ -367,6 +383,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_KeyGeneration) {
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_EncryptDecrypt) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_RSA2048_EncryptDecrypt] Testing...");
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
@@ -392,6 +409,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_EncryptDecrypt) {
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_MaxPlaintextSize) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_RSA2048_MaxPlaintextSize] Testing...");
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
@@ -429,6 +447,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_MaxPlaintextSize) {
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_SignVerify) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_RSA2048_SignVerify] Testing...");
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     KeyPair keyPair;
@@ -456,6 +475,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_RSA2048_SignVerify) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_P256_KeyAgreement) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_ECDH_P256_KeyAgreement] Testing...");
     // Alice generates key pair
     AsymmetricCipher alice(AsymmetricAlgorithm::ECC_P256);
     KeyPair aliceKeys;
@@ -483,6 +503,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_P256_KeyAgreement) {
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_DifferentCurves) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_ECDH_DifferentCurves] Testing...");
     AsymmetricCipher alice(AsymmetricAlgorithm::ECC_P256);
     KeyPair aliceKeys;
     ASSERT_TRUE(alice.GenerateKeyPair(aliceKeys, err.get()));
@@ -502,6 +523,7 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_DifferentCurves) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_Basic) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[KeyDerivation_PBKDF2_Basic] Testing...");
     const std::string password = "password";
     std::vector<uint8_t> salt(16, 0x00);
     std::vector<uint8_t> key1(32), key2(32);
@@ -523,6 +545,7 @@ TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_Basic) {
 }
 
 TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_DifferentIterations) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[KeyDerivation_PBKDF2_DifferentIterations] Testing...");
     const std::string password = "password";
     std::vector<uint8_t> salt(16, 0x00);
     std::vector<uint8_t> key1(32), key2(32);
@@ -543,6 +566,7 @@ TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_DifferentIterations) {
 }
 
 TEST_F(CryptoUtilsTest, KeyDerivation_HKDF_WithInfo) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[KeyDerivation_HKDF_WithInfo] Testing...");
     const std::string ikm = "input";
     const std::string salt = "salt";
     const std::string info1 = "context1";
@@ -572,6 +596,7 @@ TEST_F(CryptoUtilsTest, KeyDerivation_HKDF_WithInfo) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, EncryptFile_DecryptFile_Roundtrip) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[EncryptFile_DecryptFile_Roundtrip] Testing...");
     auto inputPath = testDir / "plain.txt";
     auto encryptedPath = testDir / "encrypted.bin";
     auto decryptedPath = testDir / "decrypted.txt";
@@ -602,6 +627,7 @@ TEST_F(CryptoUtilsTest, EncryptFile_DecryptFile_Roundtrip) {
 }
 
 TEST_F(CryptoUtilsTest, EncryptFileWithPassword_Roundtrip) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[EncryptFileWithPassword_Roundtrip] Testing...");
     auto inputPath = testDir / "data.txt";
     auto encryptedPath = testDir / "data.enc";
     auto decryptedPath = testDir / "data.dec";
@@ -634,6 +660,7 @@ TEST_F(CryptoUtilsTest, EncryptFileWithPassword_Roundtrip) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, EncryptString_DecryptString_Roundtrip) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[EncryptString_DecryptString_Roundtrip] Testing...");
     SecureRandom rng;
     std::vector<uint8_t> key;
     ASSERT_TRUE(rng.Generate(key, 32, err.get()));
@@ -652,6 +679,7 @@ TEST_F(CryptoUtilsTest, EncryptString_DecryptString_Roundtrip) {
 }
 
 TEST_F(CryptoUtilsTest, EncryptString_EmptyString) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[EncryptString_EmptyString] Testing...");
     SecureRandom rng;
     std::vector<uint8_t> key;
     ASSERT_TRUE(rng.Generate(key, 32, err.get()));
@@ -670,6 +698,7 @@ TEST_F(CryptoUtilsTest, EncryptString_EmptyString) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, SecureCompare_TimingSafety) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SecureCompare_TimingSafety] Testing...");
     std::vector<uint8_t> data1(32, 0xAA);
     std::vector<uint8_t> data2(32, 0xAA);
     std::vector<uint8_t> data3(32, 0xBB);
@@ -688,6 +717,7 @@ TEST_F(CryptoUtilsTest, SecureCompare_TimingSafety) {
 // ============================================================================
 
 TEST_F(CryptoUtilsTest, Error_Structure_Functionality) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[Error_Structure_Functionality] Testing...");
     Error error;
     
     EXPECT_FALSE(error.HasError());
@@ -706,6 +736,7 @@ TEST_F(CryptoUtilsTest, Error_Structure_Functionality) {
 }
 
 TEST_F(CryptoUtilsTest, SymmetricCipher_ErrorHandling_KeyNotSet) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[SymmetricCipher_ErrorHandling_KeyNotSet] Testing...");
     SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
     
     const std::string plaintext = "test";
@@ -719,6 +750,7 @@ TEST_F(CryptoUtilsTest, SymmetricCipher_ErrorHandling_KeyNotSet) {
 }
 
 TEST_F(CryptoUtilsTest, AsymmetricCipher_ErrorHandling_KeyNotLoaded) {
+    SS_LOG_INFO(L"CryptoUtils_Tests", L"[AsymmetricCipher_ErrorHandling_KeyNotLoaded] Testing...");
     AsymmetricCipher cipher(AsymmetricAlgorithm::RSA_2048);
     
     const std::string plaintext = "test";

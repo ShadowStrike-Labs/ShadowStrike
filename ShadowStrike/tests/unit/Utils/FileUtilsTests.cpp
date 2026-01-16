@@ -1,4 +1,6 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ============================================================================
  * ShadowStrike FileUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -16,9 +18,10 @@
  *
  * ============================================================================
  */
-
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/FileUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <Objbase.h>
 #include <vector>
@@ -31,17 +34,6 @@
 #include <filesystem>
 
 using namespace ShadowStrike::Utils::FileUtils;
-
-// ============================================================================
-// Logger Safety Macros for Test Environment
-// ============================================================================
-#ifdef SS_LOG_ERROR
-    // Logger already defined
-#else
-    #define SS_LOG_ERROR(...)
-    #define SS_LOG_LAST_ERROR(...)
-    #define SS_LOG_WARN(...)
-#endif
 
 // ============================================================================
 // Test Fixture with Comprehensive Helper Methods
@@ -154,30 +146,36 @@ protected:
 // ============================================================================
 
 TEST_F(FileUtilsTest, AddLongPathPrefix_RegularPath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[AddLongPathPrefix_RegularPath] Testing...");
     EXPECT_EQ(AddLongPathPrefix(L"C:\\Windows\\System32"), 
               L"\\\\?\\C:\\Windows\\System32");
 }
 
 TEST_F(FileUtilsTest, AddLongPathPrefix_UNCPath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[AddLongPathPrefix_UNCPath] Testing...");
     EXPECT_EQ(AddLongPathPrefix(L"\\\\server\\share\\folder"), 
               L"\\\\?\\UNC\\server\\share\\folder");
 }
 
 TEST_F(FileUtilsTest, AddLongPathPrefix_AlreadyPrefixed) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[AddLongPathPrefix_AlreadyPrefixed] Testing...");
     std::wstring already = L"\\\\?\\C:\\Data";
     EXPECT_EQ(AddLongPathPrefix(already), already);
 }
 
 TEST_F(FileUtilsTest, AddLongPathPrefix_EmptyPath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[AddLongPathPrefix_EmptyPath] Testing...");
     EXPECT_TRUE(AddLongPathPrefix(L"").empty());
 }
 
 TEST_F(FileUtilsTest, AddLongPathPrefix_RelativePath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[AddLongPathPrefix_RelativePath] Testing...");
     std::wstring result = AddLongPathPrefix(L"relative\\path");
     EXPECT_EQ(result, L"\\\\?\\relative\\path");
 }
 
 TEST_F(FileUtilsTest, NormalizePath_RelativePath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[NormalizePath_RelativePath] Testing...");
     Error err{};
     std::wstring normalized = NormalizePath(L"..\\Windows", false, &err);
     EXPECT_FALSE(normalized.empty());
@@ -185,6 +183,7 @@ TEST_F(FileUtilsTest, NormalizePath_RelativePath) {
 }
 
 TEST_F(FileUtilsTest, NormalizePath_WithResolve) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[NormalizePath_WithResolve] Testing...");
     auto testFile = WriteText(L"normalize.txt", "test");
     Error err{};
     std::wstring normalized = NormalizePath(testFile, true, &err);
@@ -193,6 +192,7 @@ TEST_F(FileUtilsTest, NormalizePath_WithResolve) {
 }
 
 TEST_F(FileUtilsTest, NormalizePath_EmptyPath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[NormalizePath_EmptyPath] Testing...");
     Error err{};
     std::wstring result = NormalizePath(L"", false, &err);
     EXPECT_TRUE(result.empty());
@@ -200,6 +200,7 @@ TEST_F(FileUtilsTest, NormalizePath_EmptyPath) {
 }
 
 TEST_F(FileUtilsTest, NormalizePath_InvalidCharacters) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[NormalizePath_InvalidCharacters] Testing...");
     Error err{};
     std::wstring result = NormalizePath(L"C:\\invalid<>|?.txt", false, &err);
     // Windows will normalize but may fail on actual file operations
@@ -210,38 +211,45 @@ TEST_F(FileUtilsTest, NormalizePath_InvalidCharacters) {
 // EXISTS & STAT TESTS
 // ============================================================================
 
-TEST_F(FileUtilsTest, Exists_File) { 
+TEST_F(FileUtilsTest, Exists_File) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Exists_File] Testing..."); 
     auto file = WriteText(L"exists_file.txt", "content");
     Error err{};
     EXPECT_TRUE(Exists(file, &err)); }
 
-TEST_F(FileUtilsTest, Exists_Directory) { 
+TEST_F(FileUtilsTest, Exists_Directory) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Exists_Directory] Testing..."); 
     Error err{}; 
     EXPECT_TRUE(Exists(testRoot, &err)); 
 }
 
 TEST_F(FileUtilsTest, Exists_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Exists_NonExistent] Testing...");
 	Error err{};
     EXPECT_FALSE(Exists(Path(L"nonexistent.txt"),&err));
 }
 
 TEST_F(FileUtilsTest, IsDirectory_File) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[IsDirectory_File] Testing...");
 	Error err{};
     auto file = WriteText(L"isdir_file.txt", "data");
     EXPECT_FALSE(IsDirectory(file,&err));
 }
 
 TEST_F(FileUtilsTest, IsDirectory_Directory) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[IsDirectory_Directory] Testing...");
 	Error err{};
     EXPECT_TRUE(IsDirectory(testRoot,&err));
 }
 
 TEST_F(FileUtilsTest, IsDirectory_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[IsDirectory_NonExistent] Testing...");
 	Error err{};
     EXPECT_FALSE(IsDirectory(Path(L"nonexistent_dir"),&err));
 }
 
 TEST_F(FileUtilsTest, Stat_File) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Stat_File] Testing...");
     std::string content = "Stat test data";
     auto file = WriteText(L"stat_file.txt", content);
     
@@ -257,6 +265,7 @@ TEST_F(FileUtilsTest, Stat_File) {
 }
 
 TEST_F(FileUtilsTest, Stat_Directory) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Stat_Directory] Testing...");
     FileStat stat{};
     Error err{};
     ASSERT_TRUE(Stat(testRoot, stat, &err));
@@ -267,6 +276,7 @@ TEST_F(FileUtilsTest, Stat_Directory) {
 }
 
 TEST_F(FileUtilsTest, Stat_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Stat_NonExistent] Testing...");
     FileStat stat{};
     Error err{};
     EXPECT_FALSE(Stat(Path(L"missing.txt"), stat, &err));
@@ -275,6 +285,7 @@ TEST_F(FileUtilsTest, Stat_NonExistent) {
 }
 
 TEST_F(FileUtilsTest, Stat_HiddenFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Stat_HiddenFile] Testing...");
     auto file = WriteText(L"hidden.txt", "hidden content");
     SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_HIDDEN);
     
@@ -289,6 +300,7 @@ TEST_F(FileUtilsTest, Stat_HiddenFile) {
 }
 
 TEST_F(FileUtilsTest, Stat_SystemFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Stat_SystemFile] Testing...");
     auto file = WriteText(L"system.txt", "system content");
     SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_SYSTEM);
     
@@ -306,6 +318,7 @@ TEST_F(FileUtilsTest, Stat_SystemFile) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, ReadAllBytes_SmallFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllBytes_SmallFile] Testing...");
     auto data = RandomBytes(1024);
     auto file = WriteBytes(L"read_small.bin", data);
     
@@ -316,6 +329,7 @@ TEST_F(FileUtilsTest, ReadAllBytes_SmallFile) {
 }
 
 TEST_F(FileUtilsTest, ReadAllBytes_EmptyFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllBytes_EmptyFile] Testing...");
     std::vector<std::byte> empty;
     auto file = WriteBytes(L"read_empty.bin", empty);
     
@@ -326,6 +340,7 @@ TEST_F(FileUtilsTest, ReadAllBytes_EmptyFile) {
 }
 
 TEST_F(FileUtilsTest, ReadAllBytes_LargeFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllBytes_LargeFile] Testing...");
     // 5MB file
     auto data = PatternBytes(5 * 1024 * 1024);
     auto file = WriteBytes(L"read_large.bin", data);
@@ -338,6 +353,7 @@ TEST_F(FileUtilsTest, ReadAllBytes_LargeFile) {
 }
 
 TEST_F(FileUtilsTest, ReadAllBytes_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllBytes_NonExistent] Testing...");
     std::vector<std::byte> read;
     Error err{};
     EXPECT_FALSE(ReadAllBytes(Path(L"nonexistent.bin"), read, &err));
@@ -345,6 +361,7 @@ TEST_F(FileUtilsTest, ReadAllBytes_NonExistent) {
 }
 
 TEST_F(FileUtilsTest, ReadAllTextUtf8_SimpleText) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllTextUtf8_SimpleText] Testing...");
     std::string content = "Hello, ShadowStrike!\nTest line 2.";
     auto file = WriteText(L"read_text.txt", content);
     
@@ -355,6 +372,7 @@ TEST_F(FileUtilsTest, ReadAllTextUtf8_SimpleText) {
 }
 
 TEST_F(FileUtilsTest, ReadAllTextUtf8_EmptyFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllTextUtf8_EmptyFile] Testing...");
     auto file = WriteText(L"read_empty.txt", "");
     
     std::string read;
@@ -364,6 +382,7 @@ TEST_F(FileUtilsTest, ReadAllTextUtf8_EmptyFile) {
 }
 
 TEST_F(FileUtilsTest, ReadAllTextUtf8_MultilineText) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllTextUtf8_MultilineText] Testing...");
     std::string content = "Line 1\nLine 2\r\nLine 3\nLine 4";
     auto file = WriteText(L"read_multiline.txt", content);
     
@@ -374,6 +393,7 @@ TEST_F(FileUtilsTest, ReadAllTextUtf8_MultilineText) {
 }
 
 TEST_F(FileUtilsTest, ReadAllTextUtf8_UTF8Content) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReadAllTextUtf8_UTF8Content] Testing...");
     // UTF-8 encoded strings (Euro sign, Turkish, etc.)
     std::string content = "UTF-8: \xE2\x82\xAC \xC4\x9E\xC3\xBC\xC5\x9F";
     auto file = WriteText(L"read_utf8.txt", content);
@@ -389,6 +409,7 @@ TEST_F(FileUtilsTest, ReadAllTextUtf8_UTF8Content) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, WriteAllBytesAtomic_NewFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllBytesAtomic_NewFile] Testing...");
     auto data = RandomBytes(2048);
     std::wstring path = Path(L"write_new.bin");
     
@@ -399,6 +420,7 @@ TEST_F(FileUtilsTest, WriteAllBytesAtomic_NewFile) {
 }
 
 TEST_F(FileUtilsTest, WriteAllBytesAtomic_Overwrite) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllBytesAtomic_Overwrite] Testing...");
     auto original = RandomBytes(1024);
     auto file = WriteBytes(L"write_overwrite.bin", original);
     
@@ -409,6 +431,7 @@ TEST_F(FileUtilsTest, WriteAllBytesAtomic_Overwrite) {
 }
 
 TEST_F(FileUtilsTest, WriteAllBytesAtomic_EmptyData) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllBytesAtomic_EmptyData] Testing...");
     std::vector<std::byte> empty;
     std::wstring path = Path(L"write_empty.bin");
     
@@ -422,18 +445,21 @@ TEST_F(FileUtilsTest, WriteAllBytesAtomic_EmptyData) {
 }
 
 TEST_F(FileUtilsTest, WriteAllBytesAtomic_NullPointer) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllBytesAtomic_NullPointer] Testing...");
     Error err{};
     EXPECT_FALSE(WriteAllBytesAtomic(Path(L"null.bin"), nullptr, 100, &err));
     EXPECT_NE(err.win32, static_cast<DWORD>(0));
 }
 
 TEST_F(FileUtilsTest, WriteAllBytesAtomic_NullPointerZeroSize) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllBytesAtomic_NullPointerZeroSize] Testing...");
     Error err{};
     // nullptr with size 0 should succeed (empty file)
     EXPECT_TRUE(WriteAllBytesAtomic(Path(L"null_zero.bin"), nullptr, 0, &err));
 }
 
 TEST_F(FileUtilsTest, WriteAllBytesAtomic_VectorOverload) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllBytesAtomic_VectorOverload] Testing...");
     auto data = RandomBytes(4096);
     std::wstring path = Path(L"write_vector.bin");
     
@@ -443,6 +469,7 @@ TEST_F(FileUtilsTest, WriteAllBytesAtomic_VectorOverload) {
 }
 
 TEST_F(FileUtilsTest, WriteAllTextUtf8Atomic_SimpleText) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllTextUtf8Atomic_SimpleText] Testing...");
     std::wstring path = Path(L"write_text.txt");
     std::string content = "Hello, ShadowStrike!";
     
@@ -455,6 +482,7 @@ TEST_F(FileUtilsTest, WriteAllTextUtf8Atomic_SimpleText) {
 }
 
 TEST_F(FileUtilsTest, WriteAllTextUtf8Atomic_MultilineText) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllTextUtf8Atomic_MultilineText] Testing...");
     std::wstring path = Path(L"write_multiline.txt");
     std::string content = "Line 1\nLine 2\r\nLine 3\n";
     
@@ -467,6 +495,7 @@ TEST_F(FileUtilsTest, WriteAllTextUtf8Atomic_MultilineText) {
 }
 
 TEST_F(FileUtilsTest, WriteAllTextUtf8Atomic_UTF8Content) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WriteAllTextUtf8Atomic_UTF8Content] Testing...");
     std::wstring path = Path(L"write_utf8.txt");
     std::string content = "UTF-8 Test: \xE2\x82\xAC \xC3\xA7 \xC4\x9F";
     
@@ -483,6 +512,7 @@ TEST_F(FileUtilsTest, WriteAllTextUtf8Atomic_UTF8Content) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, ReplaceFileAtomic_Basic) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReplaceFileAtomic_Basic] Testing...");
     auto srcData = RandomBytes(1024);
     auto srcFile = WriteBytes(L"replace_src.bin", srcData);
     
@@ -498,6 +528,7 @@ TEST_F(FileUtilsTest, ReplaceFileAtomic_Basic) {
 }
 
 TEST_F(FileUtilsTest, ReplaceFileAtomic_CreateNew) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReplaceFileAtomic_CreateNew] Testing...");
     auto srcData = RandomBytes(1024);
     auto srcFile = WriteBytes(L"replace_src2.bin", srcData);
     
@@ -512,6 +543,7 @@ TEST_F(FileUtilsTest, ReplaceFileAtomic_CreateNew) {
 }
 
 TEST_F(FileUtilsTest, ReplaceFileAtomic_SourceMissing) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ReplaceFileAtomic_SourceMissing] Testing...");
     Error err{};
     EXPECT_FALSE(ReplaceFileAtomic(
         Path(L"nonexistent_src.bin"),
@@ -525,6 +557,7 @@ TEST_F(FileUtilsTest, ReplaceFileAtomic_SourceMissing) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, CreateDirectories_SingleLevel) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_SingleLevel] Testing...");
     std::wstring dirPath = Path(L"single_level");
     Error err{};
     ASSERT_TRUE(CreateDirectories(dirPath, &err));
@@ -532,6 +565,7 @@ TEST_F(FileUtilsTest, CreateDirectories_SingleLevel) {
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_MultipleLevels) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_MultipleLevels] Testing...");
     std::wstring dirPath = Path(L"level1\\level2\\level3");
     Error err{};
     ASSERT_TRUE(CreateDirectories(dirPath, &err));
@@ -539,6 +573,7 @@ TEST_F(FileUtilsTest, CreateDirectories_MultipleLevels) {
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_AlreadyExists) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_AlreadyExists] Testing...");
     Error err{};
     ASSERT_TRUE(CreateDirectories(testRoot, &err));
     // Should succeed when directory already exists
@@ -546,11 +581,13 @@ TEST_F(FileUtilsTest, CreateDirectories_AlreadyExists) {
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_EmptyPath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_EmptyPath] Testing...");
     Error err{};
     EXPECT_TRUE(CreateDirectories(L"", &err));
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_PathTraversal) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_PathTraversal] Testing...");
     std::wstring malicious = Path(L"..\\..\\..\\Windows\\System32\\malicious");
     Error err{};
     EXPECT_FALSE(CreateDirectories(malicious, &err));
@@ -558,18 +595,21 @@ TEST_F(FileUtilsTest, CreateDirectories_PathTraversal) {
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_InvalidCharacters) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_InvalidCharacters] Testing...");
     std::wstring invalid = Path(L"invalid<>|*?.dir");
     Error err{};
     EXPECT_FALSE(CreateDirectories(invalid, &err));
 }
 
 TEST_F(FileUtilsTest, CreateDirectories_InvalidColon) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[CreateDirectories_InvalidColon] Testing...");
     std::wstring invalid = Path(L"sub\\bad:name");
     Error err{};
     EXPECT_FALSE(CreateDirectories(invalid, &err));
 }
 
 TEST_F(FileUtilsTest, RemoveFile_Existing) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveFile_Existing] Testing...");
     auto file = WriteText(L"remove_test.txt", "test");
     
     Error err{};
@@ -578,12 +618,14 @@ TEST_F(FileUtilsTest, RemoveFile_Existing) {
 }
 
 TEST_F(FileUtilsTest, RemoveFile_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveFile_NonExistent] Testing...");
     Error err{};
     // Should succeed for non-existent files
     EXPECT_TRUE(RemoveFile(Path(L"nonexistent.txt"), &err));
 }
 
 TEST_F(FileUtilsTest, RemoveFile_ReadOnly) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveFile_ReadOnly] Testing...");
     auto file = WriteText(L"readonly.txt", "readonly");
     SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_READONLY);
     
@@ -592,22 +634,30 @@ TEST_F(FileUtilsTest, RemoveFile_ReadOnly) {
     
     // Cleanup
     SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL);
-    RemoveFile(file, &err);
+    if (!RemoveFile(file, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to remove file, skipping test.");
+    }
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_Empty) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveDirectoryRecursive_Empty] Testing...");
     std::wstring emptyDir = Path(L"empty_dir");
     Error err{};
-    CreateDirectories(emptyDir, &err);
+    if (!CreateDirectories(emptyDir, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create  directories, skipping test.");
+    }
     
     ASSERT_TRUE(RemoveDirectoryRecursive(emptyDir, &err));
     EXPECT_FALSE(Exists(emptyDir,&err));
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_WithFiles) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveDirectoryRecursive_WithFiles] Testing...");
     std::wstring dirPath = Path(L"dir_with_files");
     Error err{};
-    CreateDirectories(dirPath, &err);
+    if (!CreateDirectories(dirPath, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create  directories, skipping test.");
+    }
     
     WriteText(L"dir_with_files\\file1.txt", "content1");
     WriteText(L"dir_with_files\\file2.txt", "content2");
@@ -617,9 +667,12 @@ TEST_F(FileUtilsTest, RemoveDirectoryRecursive_WithFiles) {
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_Nested) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveDirectoryRecursive_Nested] Testing...");
     std::wstring basePath = Path(L"nested");
     Error err{};
-    CreateDirectories(basePath + L"\\a\\b\\c", &err);
+    if (!CreateDirectories(basePath + L"\\a\\b\\c", &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create nested directories, skipping test.");
+    }
     
     WriteText(L"nested\\file1.txt", "1");
     WriteText(L"nested\\a\\file2.txt", "2");
@@ -631,6 +684,7 @@ TEST_F(FileUtilsTest, RemoveDirectoryRecursive_Nested) {
 }
 
 TEST_F(FileUtilsTest, RemoveDirectoryRecursive_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[RemoveDirectoryRecursive_NonExistent] Testing...");
     Error err{};
     EXPECT_TRUE(RemoveDirectoryRecursive(Path(L"nonexistent_dir"), &err));
 }
@@ -640,9 +694,12 @@ TEST_F(FileUtilsTest, RemoveDirectoryRecursive_NonExistent) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, WalkDirectory_EmptyDirectory) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_EmptyDirectory] Testing...");
     std::wstring emptyDir = Path(L"walk_empty");
     Error err{};
-    CreateDirectories(emptyDir, &err);
+    if (!CreateDirectories(emptyDir, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest",L"Failed to create walk_empty directories, skipping test.");
+    }
     
     int fileCount = 0;
     WalkOptions opts{};
@@ -658,9 +715,12 @@ TEST_F(FileUtilsTest, WalkDirectory_EmptyDirectory) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_SingleLevel) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_SingleLevel] Testing...");
     std::wstring walkDir = Path(L"walk_single");
     Error err{};
-    CreateDirectories(walkDir, &err);
+    if (!CreateDirectories(walkDir, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walk_single directories, skipping test.");
+    }
     
     WriteText(L"walk_single\\file1.txt", "1");
     WriteText(L"walk_single\\file2.txt", "2");
@@ -680,9 +740,12 @@ TEST_F(FileUtilsTest, WalkDirectory_SingleLevel) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_Recursive) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_Recursive] Testing...");
     std::wstring walkDir = Path(L"walk_recursive");
     Error err{};
-    CreateDirectories(walkDir + L"\\sub1\\sub2", &err);
+    if (!CreateDirectories(walkDir + L"\\sub1\\sub2", &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walk_recursive directories,skipping test.");
+    }
     
     WriteText(L"walk_recursive\\root.txt", "root");
     WriteText(L"walk_recursive\\sub1\\file1.txt", "1");
@@ -703,10 +766,16 @@ TEST_F(FileUtilsTest, WalkDirectory_Recursive) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_IncludeDirs) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_IncludeDirs] Testing...");
     std::wstring walkDir = Path(L"walk_dirs");
     Error err{};
-    CreateDirectories(walkDir + L"\\subdir1", &err);
-    CreateDirectories(walkDir + L"\\subdir2", &err);
+    if (!CreateDirectories(walkDir + L"\\subdir1", &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walkDir directory, skipping test");
+    }
+    if (!CreateDirectories(walkDir + L"\\subdir2", &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walkDir directory, skipping test");
+    }
+   
     WriteText(L"walk_dirs\\file.txt", "test");
     
     int dirCount = 0;
@@ -730,9 +799,12 @@ TEST_F(FileUtilsTest, WalkDirectory_IncludeDirs) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_MaxDepth) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_MaxDepth] Testing...");
     std::wstring walkDir = Path(L"walk_depth");
     Error err{};
-    CreateDirectories(walkDir + L"\\l1\\l2\\l3\\l4", &err);
+    if (!CreateDirectories(walkDir + L"\\l1\\l2\\l3\\l4", &err)) {
+		SS_LOG_ERROR(L"FileUtils", L"Failed to create walk_depth directory, skipping test");
+    }
     
     WriteText(L"walk_depth\\f0.txt", "0");
     WriteText(L"walk_depth\\l1\\f1.txt", "1");
@@ -756,9 +828,12 @@ TEST_F(FileUtilsTest, WalkDirectory_MaxDepth) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_SkipHidden) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_SkipHidden] Testing...");
     std::wstring walkDir = Path(L"walk_hidden");
     Error err{};
-    CreateDirectories(walkDir, &err);
+    if (!CreateDirectories(walkDir, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walk_cancel directory, skipping test");
+    }
     
     auto normalFile = WriteText(L"walk_hidden\\normal.txt", "normal");
     auto hiddenFile = WriteText(L"walk_hidden\\hidden.txt", "hidden");
@@ -782,9 +857,12 @@ TEST_F(FileUtilsTest, WalkDirectory_SkipHidden) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_EarlyExit) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_EarlyExit] Testing...");
     std::wstring walkDir = Path(L"walk_exit");
     Error err{};
-    CreateDirectories(walkDir, &err);
+    if (!CreateDirectories(walkDir, &err)) {
+        SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walk_cancel directory, skipping test");
+    }
     
     for (int i = 0; i < 10; i++) {
         std::wstring name = L"walk_exit\\file" + std::to_wstring(i) + L".txt";
@@ -804,9 +882,12 @@ TEST_F(FileUtilsTest, WalkDirectory_EarlyExit) {
 }
 
 TEST_F(FileUtilsTest, WalkDirectory_Cancellation) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[WalkDirectory_Cancellation] Testing...");
     std::wstring walkDir = Path(L"walk_cancel");
     Error err{};
-    CreateDirectories(walkDir, &err);
+    if (!CreateDirectories(walkDir, &err)) {
+		SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create walk_cancel directory, skipping test");
+    }
     
     for (int i = 0; i < 20; i++) {
         std::wstring name = L"walk_cancel\\file" + std::to_wstring(i) + L".txt";
@@ -836,6 +917,7 @@ TEST_F(FileUtilsTest, WalkDirectory_Cancellation) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, ListAlternateStreams_NoStreams) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ListAlternateStreams_NoStreams] Testing...");
     auto testFile = WriteText(L"ads_none.txt", "main content");
     
     std::vector<AlternateStreamInfo> streams;
@@ -845,6 +927,7 @@ TEST_F(FileUtilsTest, ListAlternateStreams_NoStreams) {
 }
 
 TEST_F(FileUtilsTest, ListAlternateStreams_WithStream) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ListAlternateStreams_WithStream] Testing...");
     auto testFile = WriteText(L"ads_test.txt", "main content");
     
     // Create alternate data stream
@@ -875,6 +958,7 @@ TEST_F(FileUtilsTest, ListAlternateStreams_WithStream) {
 }
 
 TEST_F(FileUtilsTest, ListAlternateStreams_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ListAlternateStreams_NonExistent] Testing...");
     std::vector<AlternateStreamInfo> streams;
     Error err{};
     EXPECT_FALSE(ListAlternateStreams(Path(L"nonexistent.txt"), streams, &err));
@@ -886,6 +970,7 @@ TEST_F(FileUtilsTest, ListAlternateStreams_NonExistent) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, ComputeFileSHA256_SmallFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ComputeFileSHA256_SmallFile] Testing...");
     std::string content = "Hello, ShadowStrike!";
     auto testFile = WriteText(L"sha256_small.txt", content);
     
@@ -905,6 +990,7 @@ TEST_F(FileUtilsTest, ComputeFileSHA256_SmallFile) {
 }
 
 TEST_F(FileUtilsTest, ComputeFileSHA256_EmptyFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ComputeFileSHA256_EmptyFile] Testing...");
     auto testFile = WriteText(L"sha256_empty.txt", "");
     
     std::array<uint8_t, 32> hash{};
@@ -920,6 +1006,7 @@ TEST_F(FileUtilsTest, ComputeFileSHA256_EmptyFile) {
 }
 
 TEST_F(FileUtilsTest, ComputeFileSHA256_SameContent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ComputeFileSHA256_SameContent] Testing...");
     std::string content = "Test content for hash verification";
     auto file1 = WriteText(L"sha256_1.txt", content);
     auto file2 = WriteText(L"sha256_2.txt", content);
@@ -933,6 +1020,7 @@ TEST_F(FileUtilsTest, ComputeFileSHA256_SameContent) {
 }
 
 TEST_F(FileUtilsTest, ComputeFileSHA256_DifferentContent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ComputeFileSHA256_DifferentContent] Testing...");
     auto file1 = WriteText(L"sha256_diff1.txt", "Content 1");
     auto file2 = WriteText(L"sha256_diff2.txt", "Content 2");
     
@@ -945,6 +1033,7 @@ TEST_F(FileUtilsTest, ComputeFileSHA256_DifferentContent) {
 }
 
 TEST_F(FileUtilsTest, ComputeFileSHA256_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ComputeFileSHA256_NonExistent] Testing...");
     std::array<uint8_t, 32> hash{};
     Error err{};
     
@@ -953,6 +1042,7 @@ TEST_F(FileUtilsTest, ComputeFileSHA256_NonExistent) {
 }
 
 TEST_F(FileUtilsTest, ComputeFileSHA256_LargeFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[ComputeFileSHA256_LargeFile] Testing...");
     // 2MB file
     auto data = PatternBytes(2 * 1024 * 1024);
     auto testFile = WriteBytes(L"sha256_large.bin", data);
@@ -976,6 +1066,7 @@ TEST_F(FileUtilsTest, ComputeFileSHA256_LargeFile) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, SecureEraseFile_SinglePass) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[SecureEraseFile_SinglePass] Testing...");
     auto data = RandomBytes(4096);
     auto testFile = WriteBytes(L"secure_erase1.bin", data);
     
@@ -985,6 +1076,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_SinglePass) {
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_TriplePass) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[SecureEraseFile_TriplePass] Testing...");
     auto data = RandomBytes(4096);
     auto testFile = WriteBytes(L"secure_erase2.bin", data);
     
@@ -994,6 +1086,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_TriplePass) {
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_SmallFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[SecureEraseFile_SmallFile] Testing...");
     auto testFile = WriteText(L"secure_erase_small.txt", "test");
     
     Error err{};
@@ -1002,9 +1095,12 @@ TEST_F(FileUtilsTest, SecureEraseFile_SmallFile) {
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_Directory) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[SecureEraseFile_Directory] Testing...");
     std::wstring dirPath = Path(L"secure_erase_dir");
     Error err{};
-    CreateDirectories(dirPath, &err);
+    if (!CreateDirectories(dirPath, &err)) {
+		SS_LOG_ERROR(L"FileUtilsTest", L"Failed to create directory for test: %s", dirPath.c_str());
+    }
     
     // Should fail on directory
     EXPECT_FALSE(SecureEraseFile(dirPath, SecureEraseMode::SinglePassZero, &err));
@@ -1012,6 +1108,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_Directory) {
 }
 
 TEST_F(FileUtilsTest, SecureEraseFile_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[SecureEraseFile_NonExistent] Testing...");
     Error err{};
     EXPECT_FALSE(SecureEraseFile(Path(L"nonexistent.bin"), 
                                  SecureEraseMode::SinglePassZero, &err));
@@ -1023,6 +1120,7 @@ TEST_F(FileUtilsTest, SecureEraseFile_NonExistent) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, OpenFileExclusive_Success) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[OpenFileExclusive_Success] Testing...");
     auto testFile = WriteText(L"exclusive.txt", "test");
     
     Error err{};
@@ -1037,6 +1135,7 @@ TEST_F(FileUtilsTest, OpenFileExclusive_Success) {
 }
 
 TEST_F(FileUtilsTest, OpenFileExclusive_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[OpenFileExclusive_NonExistent] Testing...");
     Error err{};
     HANDLE h = OpenFileExclusive(Path(L"nonexistent.txt"), &err);
     EXPECT_EQ(h, INVALID_HANDLE_VALUE);
@@ -1048,6 +1147,7 @@ TEST_F(FileUtilsTest, OpenFileExclusive_NonExistent) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, GetTimes_ValidFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[GetTimes_ValidFile] Testing...");
     auto testFile = WriteText(L"times_test.txt", "test");
     
     FILETIME creation{}, lastAccess{}, lastWrite{};
@@ -1060,6 +1160,7 @@ TEST_F(FileUtilsTest, GetTimes_ValidFile) {
 }
 
 TEST_F(FileUtilsTest, GetTimes_NonExistent) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[GetTimes_NonExistent] Testing...");
     FILETIME creation{}, lastAccess{}, lastWrite{};
     Error err{};
     
@@ -1073,6 +1174,7 @@ TEST_F(FileUtilsTest, GetTimes_NonExistent) {
 // ============================================================================
 
 TEST_F(FileUtilsTest, EdgeCase_VeryLongPath) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[EdgeCase_VeryLongPath] Testing...");
     // Create a path with > 260 characters
     std::wstring longPath = testRoot;
     for (int i = 0; i < 10; i++) {
@@ -1082,7 +1184,7 @@ TEST_F(FileUtilsTest, EdgeCase_VeryLongPath) {
     
     Error err{};
     ASSERT_TRUE(CreateDirectories(
-        longPath.substr(0, longPath.find_last_of(L"\\")), &err));
+        longPath.substr(0, longPath.find_last_of(L'\\')), &err));
     ASSERT_TRUE(WriteAllTextUtf8Atomic(longPath, "long path test", &err));
     
     std::string content;
@@ -1091,6 +1193,7 @@ TEST_F(FileUtilsTest, EdgeCase_VeryLongPath) {
 }
 
 TEST_F(FileUtilsTest, EdgeCase_SpecialCharacters) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[EdgeCase_SpecialCharacters] Testing...");
     // Valid special characters in Windows filenames
     std::wstring filename = L"test_file_!@#$%^&()_+={}[];',~.txt";
     std::wstring path = Path(filename);
@@ -1101,6 +1204,7 @@ TEST_F(FileUtilsTest, EdgeCase_SpecialCharacters) {
 }
 
 TEST_F(FileUtilsTest, Security_PathTraversal) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Security_PathTraversal] Testing...");
     std::wstring traversal = Path(L"..\\..\\..\\Windows\\System32\\test.txt");
     Error err{};
     
@@ -1110,6 +1214,7 @@ TEST_F(FileUtilsTest, Security_PathTraversal) {
 }
 
 TEST_F(FileUtilsTest, Security_InvalidColonPosition) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Security_InvalidColonPosition] Testing...");
     std::wstring invalidPath = Path(L"sub\\file:name.txt");
     Error err{};
     
@@ -1118,6 +1223,7 @@ TEST_F(FileUtilsTest, Security_InvalidColonPosition) {
 }
 
 TEST_F(FileUtilsTest, EdgeCase_ZeroByte) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[EdgeCase_ZeroByte] Testing...");
     std::vector<std::byte> data(1024);
     std::fill(data.begin(), data.end(), std::byte{0});
     
@@ -1130,6 +1236,7 @@ TEST_F(FileUtilsTest, EdgeCase_ZeroByte) {
 }
 
 TEST_F(FileUtilsTest, EdgeCase_AllOnes) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[EdgeCase_AllOnes] Testing...");
     std::vector<std::byte> data(1024);
     std::fill(data.begin(), data.end(), std::byte{0xFF});
     
@@ -1142,6 +1249,7 @@ TEST_F(FileUtilsTest, EdgeCase_AllOnes) {
 }
 
 TEST_F(FileUtilsTest, Boundary_EmptyDirectory) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Boundary_EmptyDirectory] Testing...");
     std::wstring emptyDir = Path(L"empty_boundary");
     Error err{};
     ASSERT_TRUE(CreateDirectories(emptyDir, &err));
@@ -1159,6 +1267,7 @@ TEST_F(FileUtilsTest, Boundary_EmptyDirectory) {
 }
 
 TEST_F(FileUtilsTest, Boundary_SingleFile) {
+    SS_LOG_INFO(L"FileUtilsTests", L"[Boundary_SingleFile] Testing...");
     auto file = WriteText(L"single.txt", "x");
     
     FileStat stat{};

@@ -1,4 +1,6 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /**
  * @file JSONUtils.cpp
  * @brief Implementation of JSON utilities for ShadowStrike.
@@ -8,6 +10,7 @@
  * - Atomic file writes for data integrity
  * - Comprehensive error handling and reporting
  */
+#include"pch.h"
 
 #include "JSONUtils.hpp"
 

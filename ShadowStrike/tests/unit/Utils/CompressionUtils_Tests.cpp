@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ============================================================================
  * ShadowStrike CompressionUtils Unit Tests
@@ -15,8 +16,10 @@
  *
  * ============================================================================
  */
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/CompressionUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <vector>
 #include <string>
@@ -83,12 +86,14 @@ protected:
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, ApiAvailability_CheckAvailable) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[ApiAvailability_CheckAvailable] Testing...");
     // Should return true on Windows 8+ systems
     bool available = IsCompressionApiAvailable();
     EXPECT_TRUE(available) << "Compression API should be available on Windows 8+";
 }
 
 TEST_F(CompressionUtilsTest, ApiAvailability_MultipleCallsConsistent) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[ApiAvailability_MultipleCallsConsistent] Testing...");
     bool first = IsCompressionApiAvailable();
     bool second = IsCompressionApiAvailable();
     bool third = IsCompressionApiAvailable();
@@ -102,22 +107,27 @@ TEST_F(CompressionUtilsTest, ApiAvailability_MultipleCallsConsistent) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Algorithm_MszipSupported) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Algorithm_MszipSupported] Testing...");
     EXPECT_TRUE(IsAlgorithmSupported(Algorithm::Mszip));
 }
 
 TEST_F(CompressionUtilsTest, Algorithm_XpressSupported) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Algorithm_XpressSupported] Testing...");
     EXPECT_TRUE(IsAlgorithmSupported(Algorithm::Xpress));
 }
 
 TEST_F(CompressionUtilsTest, Algorithm_XpressHuffSupported) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Algorithm_XpressHuffSupported] Testing...");
     EXPECT_TRUE(IsAlgorithmSupported(Algorithm::XpressHuff));
 }
 
 TEST_F(CompressionUtilsTest, Algorithm_LzmsSupported) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Algorithm_LzmsSupported] Testing...");
     EXPECT_TRUE(IsAlgorithmSupported(Algorithm::Lzms));
 }
 
 TEST_F(CompressionUtilsTest, Algorithm_InvalidAlgorithm) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Algorithm_InvalidAlgorithm] Testing...");
     Algorithm invalid = static_cast<Algorithm>(0xFFFF);
     EXPECT_FALSE(IsAlgorithmSupported(invalid));
 }
@@ -127,6 +137,7 @@ TEST_F(CompressionUtilsTest, Algorithm_InvalidAlgorithm) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_SimpleString) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_SimpleString] Testing...");
     std::string original = "Hello, ShadowStrike! This is a test string.";
     std::vector<uint8_t> input(original.begin(), original.end());
     
@@ -142,6 +153,7 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_SimpleString) {
 }
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_EmptyData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_EmptyData] Testing...");
     std::vector<uint8_t> empty;
     
     std::vector<uint8_t> compressed;
@@ -154,6 +166,7 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_EmptyData) {
 }
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_SingleByte) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_SingleByte] Testing...");
     std::vector<uint8_t> input = {0x42};
     
     std::vector<uint8_t> compressed;
@@ -166,6 +179,7 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_SingleByte) {
 }
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_CompressibleData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_CompressibleData] Testing...");
     auto input = GenerateCompressibleData(4096);
     
     std::vector<uint8_t> compressed;
@@ -181,6 +195,7 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_CompressibleData) {
 }
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_RandomData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_RandomData] Testing...");
     auto input = GenerateRandomData(1024);
     
     std::vector<uint8_t> compressed;
@@ -194,6 +209,7 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_RandomData) {
 }
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_LargeData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_LargeData] Testing...");
     // ? FIXED: Restored to 1MB - buffer calculation now handles this correctly
     auto input = GenerateCompressibleData(1024 * 1024); // 1MB compressible data
     
@@ -213,6 +229,7 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_LargeData) {
 }
 
 TEST_F(CompressionUtilsTest, Xpress_Decompress_WithExpectedSize) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_Decompress_WithExpectedSize] Testing...");
     std::string original = "Test data with known size";
     std::vector<uint8_t> input(original.begin(), original.end());
     
@@ -231,6 +248,7 @@ TEST_F(CompressionUtilsTest, Xpress_Decompress_WithExpectedSize) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Algorithms_AllAlgorithmsWorkCorrectly) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Algorithms_AllAlgorithmsWorkCorrectly] Testing...");
     auto input = GenerateCompressibleData(4096);
     
     Algorithm algorithms[] = {
@@ -259,6 +277,7 @@ TEST_F(CompressionUtilsTest, Algorithms_AllAlgorithmsWorkCorrectly) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Compressor_OpenClose) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_OpenClose] Testing...");
     Compressor comp;
     EXPECT_FALSE(comp.valid());
     
@@ -271,6 +290,7 @@ TEST_F(CompressionUtilsTest, Compressor_OpenClose) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_MultipleClose) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_MultipleClose] Testing...");
     Compressor comp;
     ASSERT_TRUE(comp.open(Algorithm::Xpress));
     
@@ -280,6 +300,7 @@ TEST_F(CompressionUtilsTest, Compressor_MultipleClose) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_ReopenDifferentAlgorithm) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_ReopenDifferentAlgorithm] Testing...");
     Compressor comp;
     
     ASSERT_TRUE(comp.open(Algorithm::Xpress));
@@ -290,6 +311,7 @@ TEST_F(CompressionUtilsTest, Compressor_ReopenDifferentAlgorithm) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_CompressWithoutOpen) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_CompressWithoutOpen] Testing...");
     Compressor comp;
     std::vector<uint8_t> input = {1, 2, 3};
     std::vector<uint8_t> output;
@@ -298,6 +320,7 @@ TEST_F(CompressionUtilsTest, Compressor_CompressWithoutOpen) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_BasicCompression) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_BasicCompression] Testing...");
     Compressor comp;
     ASSERT_TRUE(comp.open(Algorithm::Xpress));
     
@@ -310,6 +333,7 @@ TEST_F(CompressionUtilsTest, Compressor_BasicCompression) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_MoveConstructor) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_MoveConstructor] Testing...");
     Compressor comp1;
     ASSERT_TRUE(comp1.open(Algorithm::Xpress));
     EXPECT_TRUE(comp1.valid());
@@ -321,6 +345,7 @@ TEST_F(CompressionUtilsTest, Compressor_MoveConstructor) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_MoveAssignment) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_MoveAssignment] Testing...");
     Compressor comp1;
     ASSERT_TRUE(comp1.open(Algorithm::Xpress));
     
@@ -334,6 +359,7 @@ TEST_F(CompressionUtilsTest, Compressor_MoveAssignment) {
 }
 
 TEST_F(CompressionUtilsTest, Compressor_MultipleCompressions) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Compressor_MultipleCompressions] Testing...");
     Compressor comp;
     ASSERT_TRUE(comp.open(Algorithm::Xpress));
     
@@ -352,6 +378,7 @@ TEST_F(CompressionUtilsTest, Compressor_MultipleCompressions) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Decompressor_OpenClose) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_OpenClose] Testing...");
     Decompressor decomp;
     EXPECT_FALSE(decomp.valid());
     
@@ -364,6 +391,7 @@ TEST_F(CompressionUtilsTest, Decompressor_OpenClose) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_MultipleClose) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_MultipleClose] Testing...");
     Decompressor decomp;
     ASSERT_TRUE(decomp.open(Algorithm::Xpress));
     
@@ -373,6 +401,7 @@ TEST_F(CompressionUtilsTest, Decompressor_MultipleClose) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_ReopenDifferentAlgorithm) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_ReopenDifferentAlgorithm] Testing...");
     Decompressor decomp;
     
     ASSERT_TRUE(decomp.open(Algorithm::Xpress));
@@ -383,6 +412,7 @@ TEST_F(CompressionUtilsTest, Decompressor_ReopenDifferentAlgorithm) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_DecompressWithoutOpen) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_DecompressWithoutOpen] Testing...");
     Decompressor decomp;
     std::vector<uint8_t> input = {1, 2, 3};
     std::vector<uint8_t> output;
@@ -391,6 +421,7 @@ TEST_F(CompressionUtilsTest, Decompressor_DecompressWithoutOpen) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_BasicDecompression) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_BasicDecompression] Testing...");
     std::string original = "Test data for RAII decompressor";
     std::vector<uint8_t> input(original.begin(), original.end());
     
@@ -406,6 +437,7 @@ TEST_F(CompressionUtilsTest, Decompressor_BasicDecompression) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_MoveConstructor) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_MoveConstructor] Testing...");
     Decompressor decomp1;
     ASSERT_TRUE(decomp1.open(Algorithm::Xpress));
     EXPECT_TRUE(decomp1.valid());
@@ -417,6 +449,7 @@ TEST_F(CompressionUtilsTest, Decompressor_MoveConstructor) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_MoveAssignment) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_MoveAssignment] Testing...");
     Decompressor decomp1;
     ASSERT_TRUE(decomp1.open(Algorithm::Xpress));
     
@@ -430,6 +463,7 @@ TEST_F(CompressionUtilsTest, Decompressor_MoveAssignment) {
 }
 
 TEST_F(CompressionUtilsTest, Decompressor_MultipleDecompressions) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Decompressor_MultipleDecompressions] Testing...");
     Decompressor decomp;
     ASSERT_TRUE(decomp.open(Algorithm::Xpress));
     
@@ -452,6 +486,7 @@ TEST_F(CompressionUtilsTest, Decompressor_MultipleDecompressions) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, RAII_CompressorDecompressorWorkflow) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[RAII_CompressorDecompressorWorkflow] Testing...");
     Compressor comp;
     Decompressor decomp;
     
@@ -474,28 +509,33 @@ TEST_F(CompressionUtilsTest, RAII_CompressorDecompressorWorkflow) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Error_CompressNullPointerWithSize) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Error_CompressNullPointerWithSize] Testing...");
     std::vector<uint8_t> output;
     EXPECT_FALSE(CompressBuffer(Algorithm::Xpress, nullptr, 100, output));
 }
 
 TEST_F(CompressionUtilsTest, Error_CompressNullPointerZeroSize) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Error_CompressNullPointerZeroSize] Testing...");
     std::vector<uint8_t> output;
     EXPECT_TRUE(CompressBuffer(Algorithm::Xpress, nullptr, 0, output));
     EXPECT_EQ(output.size(), 0u);
 }
 
 TEST_F(CompressionUtilsTest, Error_DecompressNullPointerWithSize) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Error_DecompressNullPointerWithSize] Testing...");
     std::vector<uint8_t> output;
     EXPECT_FALSE(DecompressBuffer(Algorithm::Xpress, nullptr, 100, output));
 }
 
 TEST_F(CompressionUtilsTest, Error_DecompressNullPointerZeroSize) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Error_DecompressNullPointerZeroSize] Testing...");
     std::vector<uint8_t> output;
     EXPECT_TRUE(DecompressBuffer(Algorithm::Xpress, nullptr, 0, output));
     EXPECT_EQ(output.size(), 0u);
 }
 
 TEST_F(CompressionUtilsTest, Error_DecompressCorruptedData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Error_DecompressCorruptedData] Testing...");
     auto corrupted = GenerateRandomData(256);
     std::vector<uint8_t> output;
     
@@ -506,6 +546,7 @@ TEST_F(CompressionUtilsTest, Error_DecompressCorruptedData) {
 }
 
 TEST_F(CompressionUtilsTest, Error_DecompressWrongAlgorithm) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Error_DecompressWrongAlgorithm] Testing...");
     std::string original = "Test data";
     std::vector<uint8_t> input(original.begin(), original.end());
     
@@ -523,6 +564,7 @@ TEST_F(CompressionUtilsTest, Error_DecompressWrongAlgorithm) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Security_MaxCompressedSizeLimit) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Security_MaxCompressedSizeLimit] Testing...");
     // MAX_COMPRESSED_SIZE is 256MB
     size_t oversized = MAX_COMPRESSED_SIZE + 1;
     auto data = GenerateRandomData(std::min(oversized, size_t(1024))); // Don't actually allocate 256MB
@@ -536,16 +578,19 @@ TEST_F(CompressionUtilsTest, Security_MaxCompressedSizeLimit) {
 }
 
 TEST_F(CompressionUtilsTest, Security_MaxDecompressedSizeLimit) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Security_MaxDecompressedSizeLimit] Testing...");
     // MAX_DECOMPRESSED_SIZE is 512MB
     EXPECT_LE(MAX_DECOMPRESSED_SIZE, 512 * 1024 * 1024);
 }
 
 TEST_F(CompressionUtilsTest, Security_CompressionRatioLimit) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Security_CompressionRatioLimit] Testing...");
     // MAX_COMPRESSION_RATIO is 100:1
     EXPECT_EQ(MAX_COMPRESSION_RATIO, 100);
 }
 
 TEST_F(CompressionUtilsTest, Security_DecompressWithExcessiveExpectedSize) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Security_DecompressWithExcessiveExpectedSize] Testing...");
     std::string original = "Small data";
     std::vector<uint8_t> input(original.begin(), original.end());
     
@@ -565,6 +610,7 @@ TEST_F(CompressionUtilsTest, Security_DecompressWithExcessiveExpectedSize) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, EdgeCase_AllZeros) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[EdgeCase_AllZeros] Testing...");
     std::vector<uint8_t> input(1024, 0x00);
     
     std::vector<uint8_t> compressed;
@@ -580,6 +626,7 @@ TEST_F(CompressionUtilsTest, EdgeCase_AllZeros) {
 }
 
 TEST_F(CompressionUtilsTest, EdgeCase_AllOnes) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[EdgeCase_AllOnes] Testing...");
     std::vector<uint8_t> input(1024, 0xFF);
     
     std::vector<uint8_t> compressed;
@@ -594,6 +641,7 @@ TEST_F(CompressionUtilsTest, EdgeCase_AllOnes) {
 }
 
 TEST_F(CompressionUtilsTest, EdgeCase_BinaryData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[EdgeCase_BinaryData] Testing...");
     std::vector<uint8_t> input = {0x00, 0xFF, 0xAA, 0x55, 0xDE, 0xAD, 0xBE, 0xEF};
     
     std::vector<uint8_t> compressed;
@@ -606,6 +654,7 @@ TEST_F(CompressionUtilsTest, EdgeCase_BinaryData) {
 }
 
 TEST_F(CompressionUtilsTest, EdgeCase_UnicodeText) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[EdgeCase_UnicodeText] Testing...");
     std::wstring text = L"Hello ?? ?????? ??? ????? ??";
     std::vector<uint8_t> input(reinterpret_cast<const uint8_t*>(text.data()),
                                reinterpret_cast<const uint8_t*>(text.data()) + text.size() * sizeof(wchar_t));
@@ -620,6 +669,7 @@ TEST_F(CompressionUtilsTest, EdgeCase_UnicodeText) {
 }
 
 TEST_F(CompressionUtilsTest, EdgeCase_PowerOfTwoSizes) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[EdgeCase_PowerOfTwoSizes] Testing...");
     for (size_t size : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
         auto input = GenerateCompressibleData(size);
         
@@ -636,6 +686,7 @@ TEST_F(CompressionUtilsTest, EdgeCase_PowerOfTwoSizes) {
 }
 
 TEST_F(CompressionUtilsTest, EdgeCase_OffByOneSizes) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[EdgeCase_OffByOneSizes] Testing...");
     for (size_t size : {63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025}) {
         auto input = GenerateCompressibleData(size);
         
@@ -656,6 +707,7 @@ TEST_F(CompressionUtilsTest, EdgeCase_OffByOneSizes) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Performance_CompressSmallData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Performance_CompressSmallData] Testing...");
     auto input = GenerateCompressibleData(1024);
     std::vector<uint8_t> output;
     
@@ -674,6 +726,7 @@ TEST_F(CompressionUtilsTest, Performance_CompressSmallData) {
 }
 
 TEST_F(CompressionUtilsTest, Performance_DecompressSmallData) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Performance_DecompressSmallData] Testing...");
     auto input = GenerateCompressibleData(1024);
     
     std::vector<uint8_t> compressed;
@@ -694,6 +747,7 @@ TEST_F(CompressionUtilsTest, Performance_DecompressSmallData) {
 }
 
 TEST_F(CompressionUtilsTest, Performance_RAIIReuse) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Performance_RAIIReuse] Testing...");
     Compressor comp;
     ASSERT_TRUE(comp.open(Algorithm::Xpress));
     
@@ -718,6 +772,7 @@ TEST_F(CompressionUtilsTest, Performance_RAIIReuse) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, CompressionRatio_HighlyCompressible) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[CompressionRatio_HighlyCompressible] Testing...");
     std::vector<uint8_t> input(10000, 'A'); // Very compressible
     
     std::vector<uint8_t> compressed;
@@ -731,6 +786,7 @@ TEST_F(CompressionUtilsTest, CompressionRatio_HighlyCompressible) {
 }
 
 TEST_F(CompressionUtilsTest, CompressionRatio_Random) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[CompressionRatio_Random] Testing...");
     auto input = GenerateRandomData(10000);
     
     std::vector<uint8_t> compressed;
@@ -745,6 +801,7 @@ TEST_F(CompressionUtilsTest, CompressionRatio_Random) {
 }
 
 TEST_F(CompressionUtilsTest, CompressionRatio_AlreadyCompressed) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[CompressionRatio_AlreadyCompressed] Testing...");
     auto original = GenerateCompressibleData(4096);
     
     std::vector<uint8_t> compressed1;
@@ -763,6 +820,7 @@ TEST_F(CompressionUtilsTest, CompressionRatio_AlreadyCompressed) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, Integrity_MultipleRoundTrips) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Integrity_MultipleRoundTrips] Testing...");
     auto original = GenerateCompressibleData(1024);
     std::vector<uint8_t> current = original;
     
@@ -783,6 +841,7 @@ TEST_F(CompressionUtilsTest, Integrity_MultipleRoundTrips) {
 }
 
 TEST_F(CompressionUtilsTest, Integrity_DifferentDataSizes) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[Integrity_DifferentDataSizes] Testing...");
     for (size_t size : {1, 10, 100, 500, 1000, 5000, 10000, 50000}) {
         auto input = GenerateCompressibleData(size);
         
@@ -803,6 +862,7 @@ TEST_F(CompressionUtilsTest, Integrity_DifferentDataSizes) {
 // ============================================================================
 
 TEST_F(CompressionUtilsTest, ThreadSafety_ConcurrentStatelessOperations) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[ThreadSafety_ConcurrentStatelessOperations] Testing...");
     auto input = GenerateCompressibleData(1024);
     std::atomic<int> successCount{0};
     
@@ -831,6 +891,7 @@ TEST_F(CompressionUtilsTest, ThreadSafety_ConcurrentStatelessOperations) {
 }
 
 TEST_F(CompressionUtilsTest, ThreadSafety_MultipleRAIIInstances) {
+    SS_LOG_INFO(L"CompressionUtils_Tests", L"[ThreadSafety_MultipleRAIIInstances] Testing...");
     auto input = GenerateCompressibleData(1024);
     std::atomic<int> successCount{0};
     

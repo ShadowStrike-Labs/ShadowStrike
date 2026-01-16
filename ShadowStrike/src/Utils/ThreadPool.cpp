@@ -1,4 +1,8 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
+#include"pch.h"
 /**
  * @file ThreadPool.cpp
  * @brief Implementation of enterprise-grade thread pool

@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ============================================================================
  * ShadowStrike MemoryUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -17,9 +18,11 @@
  *
  * ============================================================================
  */
-#include<gtest/gtest.h>
+#include "pch.h"
+#include <gtest/gtest.h>
 #include "../../../src/Utils/MemoryUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 #include <Objbase.h>
 
 #include <vector>
@@ -55,7 +58,11 @@ protected:
         testRoot = std::wstring(tempPath) + L"ShadowStrike_MemUtils_UT_" + guidStr;
         
         Error err{};
-        CreateDirectories(testRoot, &err);
+        if (!CreateDirectories(testRoot, &err)) {
+            SS_LOG_ERROR(L"MemoryUtilsTest",
+                L"SetUp: Failed to create test directory: %s (error: %lu)",
+				testRoot.c_str(), err.win32);
+        }
     }
     
     void TearDown() override {
@@ -74,12 +81,14 @@ protected:
 // SYSTEM INFO TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, PageSize_ReturnsValidSize) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[PageSize_ReturnsValidSize] Testing...");
     size_t ps = PageSize();
     EXPECT_GT(ps, 0u);
     EXPECT_TRUE(ps == 4096 || ps == 8192 || ps == 16384 || ps == 65536);
 }
 
 TEST_F(MemoryUtilsTest, AllocationGranularity_ReturnsValidSize) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[AllocationGranularity_ReturnsValidSize] Testing...");
     size_t ag = AllocationGranularity();
     EXPECT_GT(ag, 0u);
     EXPECT_GE(ag, PageSize());
@@ -87,6 +96,7 @@ TEST_F(MemoryUtilsTest, AllocationGranularity_ReturnsValidSize) {
 }
 
 TEST_F(MemoryUtilsTest, LargePageMinimum_ValidOrZero) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[LargePageMinimum_ValidOrZero] Testing...");
     size_t lp = LargePageMinimum();
     if (lp > 0) {
         EXPECT_GE(lp, 2 * 1024 * 1024);
@@ -95,6 +105,7 @@ TEST_F(MemoryUtilsTest, LargePageMinimum_ValidOrZero) {
 }
 
 TEST_F(MemoryUtilsTest, IsLargePagesSupported_ConsistentWithMinimum) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[IsLargePagesSupported_ConsistentWithMinimum] Testing...");
     bool supported = IsLargePagesSupported();
     size_t minimum = LargePageMinimum();
     EXPECT_EQ(supported, minimum > 0);
@@ -104,6 +115,7 @@ TEST_F(MemoryUtilsTest, IsLargePagesSupported_ConsistentWithMinimum) {
 // BASIC ALLOC/FREE TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, Alloc_BasicAllocation) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Alloc_BasicAllocation] Testing...");
     void* p = Alloc(4096);
     ASSERT_NE(p, nullptr);
     
@@ -115,11 +127,13 @@ TEST_F(MemoryUtilsTest, Alloc_BasicAllocation) {
 }
 
 TEST_F(MemoryUtilsTest, Alloc_ZeroSize_ReturnsNull) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Alloc_ZeroSize_ReturnsNull] Testing...");
     void* p = Alloc(0);
     EXPECT_EQ(p, nullptr);
 }
 
 TEST_F(MemoryUtilsTest, Alloc_LargeAllocation) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Alloc_LargeAllocation] Testing...");
     size_t size = 10 * 1024 * 1024;
     void* p = Alloc(size);
     ASSERT_NE(p, nullptr);
@@ -134,10 +148,12 @@ TEST_F(MemoryUtilsTest, Alloc_LargeAllocation) {
 }
 
 TEST_F(MemoryUtilsTest, Free_NullPointer_ReturnsTrue) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Free_NullPointer_ReturnsTrue] Testing...");
     EXPECT_TRUE(Free(nullptr));
 }
 
 TEST_F(MemoryUtilsTest, Free_DECOMMIT_ValidSize) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Free_DECOMMIT_ValidSize] Testing...");
     size_t ps = PageSize();
     void* p = Alloc(ps * 4);
     ASSERT_NE(p, nullptr);
@@ -155,6 +171,7 @@ TEST_F(MemoryUtilsTest, Free_DECOMMIT_ValidSize) {
 // PROTECTION TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, Protect_ChangeProtection) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Protect_ChangeProtection] Testing...");
     void* p = Alloc(4096, PAGE_READWRITE);
     ASSERT_NE(p, nullptr);
     
@@ -171,6 +188,7 @@ TEST_F(MemoryUtilsTest, Protect_ChangeProtection) {
 }
 
 TEST_F(MemoryUtilsTest, Lock_BasicLocking) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Lock_BasicLocking] Testing...");
     void* p = Alloc(4096);
     ASSERT_NE(p, nullptr);
     
@@ -184,6 +202,7 @@ TEST_F(MemoryUtilsTest, Lock_BasicLocking) {
 // QUERY TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, QueryRegion_ValidAllocation) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[QueryRegion_ValidAllocation] Testing...");
     void* p = Alloc(8192);
     ASSERT_NE(p, nullptr);
     
@@ -201,6 +220,7 @@ TEST_F(MemoryUtilsTest, QueryRegion_ValidAllocation) {
 // GUARDED ALLOC TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, GuardedAlloc_BasicAllocation) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[GuardedAlloc_BasicAllocation] Testing...");
     GuardedAlloc ga;
     ASSERT_TRUE(AllocateWithGuards(4096, ga, false));
     
@@ -218,6 +238,7 @@ TEST_F(MemoryUtilsTest, GuardedAlloc_BasicAllocation) {
 }
 
 TEST_F(MemoryUtilsTest, GuardedAlloc_ZeroSize) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[GuardedAlloc_ZeroSize] Testing...");
     GuardedAlloc ga;
     EXPECT_TRUE(AllocateWithGuards(0, ga, false));
     
@@ -229,6 +250,7 @@ TEST_F(MemoryUtilsTest, GuardedAlloc_ZeroSize) {
 // WRITE-WATCH TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, DISABLED_WriteWatch_BasicTracking) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[DISABLED_WriteWatch_BasicTracking] Testing...");
     
     size_t size = 64 * 1024;
     void* p = AllocWriteWatch(size);
@@ -269,6 +291,7 @@ TEST_F(MemoryUtilsTest, DISABLED_WriteWatch_BasicTracking) {
 // WORKING SET TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, WorkingSet_GetCurrentValues) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[WorkingSet_GetCurrentValues] Testing...");
     size_t minWS = 0, maxWS = 0;
     EXPECT_TRUE(GetProcessWorkingSet(minWS, maxWS));
     
@@ -281,6 +304,7 @@ TEST_F(MemoryUtilsTest, WorkingSet_GetCurrentValues) {
 // MAPPED VIEW TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, MappedView_ReadOnlyFile) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[MappedView_ReadOnlyFile] Testing...");
     std::wstring path = Path(L"readonly_test.txt");
     std::string content = "Hello, MappedView!";
     
@@ -297,6 +321,7 @@ TEST_F(MemoryUtilsTest, MappedView_ReadOnlyFile) {
 }
 
 TEST_F(MemoryUtilsTest, MappedView_EmptyFile_ReadOnly) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[MappedView_EmptyFile_ReadOnly] Testing...");
     std::wstring path = Path(L"empty_readonly.txt");
     
     Error err{};
@@ -309,6 +334,7 @@ TEST_F(MemoryUtilsTest, MappedView_EmptyFile_ReadOnly) {
 }
 
 TEST_F(MemoryUtilsTest, MappedView_MoveConstructor) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[MappedView_MoveConstructor] Testing...");
     std::wstring path = Path(L"move_test.txt");
     std::string content = "Move test data";
     
@@ -330,6 +356,7 @@ TEST_F(MemoryUtilsTest, MappedView_MoveConstructor) {
 // SECURE ZERO TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, SecureZero_BasicZeroing) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[SecureZero_BasicZeroing] Testing...");
     char buffer[256];
     memset(buffer, 0xAA, sizeof(buffer));
     
@@ -341,6 +368,7 @@ TEST_F(MemoryUtilsTest, SecureZero_BasicZeroing) {
 }
 
 TEST_F(MemoryUtilsTest, SecureZero_NullPointer) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[SecureZero_NullPointer] Testing...");
     SecureZero(nullptr, 100);
 }
 
@@ -348,6 +376,7 @@ TEST_F(MemoryUtilsTest, SecureZero_NullPointer) {
 // ALIGNED ALLOC TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, AlignedAlloc_BasicAlignment) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[AlignedAlloc_BasicAlignment] Testing...");
     void* p = AlignedAlloc(1024, 64);
     ASSERT_NE(p, nullptr);
     
@@ -360,11 +389,13 @@ TEST_F(MemoryUtilsTest, AlignedAlloc_BasicAlignment) {
 }
 
 TEST_F(MemoryUtilsTest, AlignedAlloc_ZeroSize_ReturnsNull) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[AlignedAlloc_ZeroSize_ReturnsNull] Testing...");
     void* p = AlignedAlloc(0, 16);
     EXPECT_EQ(p, nullptr);
 }
 
 TEST_F(MemoryUtilsTest, AlignedFree_NullPointer) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[AlignedFree_NullPointer] Testing...");
     AlignedFree(nullptr);
 }
 
@@ -372,6 +403,7 @@ TEST_F(MemoryUtilsTest, AlignedFree_NullPointer) {
 // EDGE CASES & STRESS TESTS
 // ============================================================================
 TEST_F(MemoryUtilsTest, EdgeCase_MultipleAllocFree) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[EdgeCase_MultipleAllocFree] Testing...");
     for (int i = 0; i < 100; ++i) {
         void* p = Alloc(4096);
         ASSERT_NE(p, nullptr);
@@ -381,6 +413,7 @@ TEST_F(MemoryUtilsTest, EdgeCase_MultipleAllocFree) {
 }
 
 TEST_F(MemoryUtilsTest, Concurrency_ParallelAllocations) {
+    SS_LOG_INFO(L"MemoryUtils_Tests", L"[Concurrency_ParallelAllocations] Testing...");
     constexpr int NUM_THREADS = 4;
     constexpr int ALLOCS_PER_THREAD = 50;
     

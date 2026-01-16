@@ -1,4 +1,7 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 /*
  * ============================================================================
  * ShadowStrike JSONUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -17,10 +20,11 @@
  *
  * ============================================================================
  */
-
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/JSONUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 #include <Objbase.h>
 #include <filesystem>
 #include <fstream>
@@ -69,6 +73,7 @@ protected:
 // PARSE TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, Parse_ValidSimpleObject) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_ValidSimpleObject] Testing...");
     std::string jsonText = R"({"name":"test","value":123})";
     Json j;
     Error err;
@@ -80,6 +85,7 @@ TEST_F(JSONUtilsTest, Parse_ValidSimpleObject) {
 }
 
 TEST_F(JSONUtilsTest, Parse_ValidArray) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_ValidArray] Testing...");
     std::string jsonText = R"([1, 2, 3, "four", true, null])";
     Json j;
     
@@ -93,6 +99,7 @@ TEST_F(JSONUtilsTest, Parse_ValidArray) {
 }
 
 TEST_F(JSONUtilsTest, Parse_WithComments) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_WithComments] Testing...");
     std::string jsonText = R"(
         {
             // This is a comment
@@ -110,6 +117,7 @@ TEST_F(JSONUtilsTest, Parse_WithComments) {
 }
 
 TEST_F(JSONUtilsTest, Parse_InvalidJSON_SyntaxError) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_InvalidJSON_SyntaxError] Testing...");
     std::string jsonText = R"({"invalid": })";
     Json j;
     Error err;
@@ -119,6 +127,7 @@ TEST_F(JSONUtilsTest, Parse_InvalidJSON_SyntaxError) {
 }
 
 TEST_F(JSONUtilsTest, Parse_EmptyString) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_EmptyString] Testing...");
     Json j;
     Error err;
     
@@ -126,6 +135,7 @@ TEST_F(JSONUtilsTest, Parse_EmptyString) {
 }
 
 TEST_F(JSONUtilsTest, Parse_NestedDepthLimit) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_NestedDepthLimit] Testing...");
     std::string deeply_nested;
     for (int i = 0; i < 1100; ++i) {
         deeply_nested += "{\"a\":";
@@ -144,6 +154,7 @@ TEST_F(JSONUtilsTest, Parse_NestedDepthLimit) {
 }
 
 TEST_F(JSONUtilsTest, Parse_Unicode) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_Unicode] Testing...");
     std::string jsonText = R"({"text":"Hello 世界 🌍"})";
     Json j;
     
@@ -155,6 +166,7 @@ TEST_F(JSONUtilsTest, Parse_Unicode) {
 // STRINGIFY TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, Stringify_SimpleObject) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Stringify_SimpleObject] Testing...");
     Json j;
     j["name"] = "test";
     j["value"] = 123;
@@ -167,6 +179,7 @@ TEST_F(JSONUtilsTest, Stringify_SimpleObject) {
 }
 
 TEST_F(JSONUtilsTest, Stringify_PrettyFormat) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Stringify_PrettyFormat] Testing...");
     Json j;
     j["a"] = 1;
     j["b"] = Json::object();
@@ -177,11 +190,12 @@ TEST_F(JSONUtilsTest, Stringify_PrettyFormat) {
     opt.indentSpaces = 4;
     
     ASSERT_TRUE(Stringify(j, out, opt));
-    EXPECT_NE(out.find("\n"), std::string::npos);
+    EXPECT_NE(out.find('\n'), std::string::npos);
     EXPECT_NE(out.find("    "), std::string::npos);
 }
 
 TEST_F(JSONUtilsTest, Stringify_Minified) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Stringify_Minified] Testing...");
     Json j;
     j["key"] = "value";
     j["num"] = 42;
@@ -190,13 +204,14 @@ TEST_F(JSONUtilsTest, Stringify_Minified) {
     opt.pretty = false;
     
     ASSERT_TRUE(Stringify(j, out, opt));
-    EXPECT_EQ(out.find("\n"), std::string::npos);
+    EXPECT_EQ(out.find('\n'), std::string::npos);
 }
 
 // ============================================================================
 // MINIFY/PRETTIFY TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, Minify_ValidJSON) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Minify_ValidJSON] Testing...");
     std::string jsonText = R"(
         {
             "key": "value",
@@ -206,22 +221,24 @@ TEST_F(JSONUtilsTest, Minify_ValidJSON) {
     std::string out;
     
     ASSERT_TRUE(Minify(jsonText, out));
-    EXPECT_EQ(out.find("\n"), std::string::npos);
+    EXPECT_EQ(out.find('\n'), std::string::npos);
     EXPECT_EQ(out.find("  "), std::string::npos);
 }
 
 TEST_F(JSONUtilsTest, Prettify_ValidJSON) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Prettify_ValidJSON] Testing...");
     std::string jsonText = R"({"a":1,"b":{"c":2}})";
     std::string out;
     
     ASSERT_TRUE(Prettify(jsonText, out, 2));
-    EXPECT_NE(out.find("\n"), std::string::npos);
+    EXPECT_NE(out.find('\n'), std::string::npos);
 }
 
 // ============================================================================
 // FILE I/O TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, LoadFromFile_ValidFile) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[LoadFromFile_ValidFile] Testing...");
     auto path = TestPath(L"test.json");
     std::ofstream ofs(path);
     ofs << R"({"test": true, "value": 42})";
@@ -238,6 +255,7 @@ TEST_F(JSONUtilsTest, LoadFromFile_ValidFile) {
 }
 
 TEST_F(JSONUtilsTest, LoadFromFile_NonExistentFile) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[LoadFromFile_NonExistentFile] Testing...");
     auto path = TestPath(L"nonexistent.json");
     Json j;
     Error err;
@@ -247,6 +265,7 @@ TEST_F(JSONUtilsTest, LoadFromFile_NonExistentFile) {
 }
 
 TEST_F(JSONUtilsTest, LoadFromFile_EmptyFile) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[LoadFromFile_EmptyFile] Testing...");
     auto path = TestPath(L"empty.json");
     std::ofstream ofs(path);
     ofs.close();
@@ -258,6 +277,7 @@ TEST_F(JSONUtilsTest, LoadFromFile_EmptyFile) {
 }
 
 TEST_F(JSONUtilsTest, LoadFromFile_WithBOM) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[LoadFromFile_WithBOM] Testing...");
     auto path = TestPath(L"bom.json");
     std::ofstream ofs(path, std::ios::binary);
     ofs << "\xEF\xBB\xBF" << R"({"key": "value"})";
@@ -270,6 +290,7 @@ TEST_F(JSONUtilsTest, LoadFromFile_WithBOM) {
 }
 
 TEST_F(JSONUtilsTest, LoadFromFile_TooLarge) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[LoadFromFile_TooLarge] Testing...");
     auto path = TestPath(L"large.json");
     Json j;
     Error err;
@@ -279,6 +300,7 @@ TEST_F(JSONUtilsTest, LoadFromFile_TooLarge) {
 }
 
 TEST_F(JSONUtilsTest, SaveToFile_BasicSave) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[SaveToFile_BasicSave] Testing...");
     auto path = TestPath(L"output.json");
     Json j;
     j["key"] = "value";
@@ -296,6 +318,7 @@ TEST_F(JSONUtilsTest, SaveToFile_BasicSave) {
 }
 
 TEST_F(JSONUtilsTest, SaveToFile_WithBOM) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[SaveToFile_WithBOM] Testing...");
     auto path = TestPath(L"bom_output.json");
     Json j;
     j["test"] = true;
@@ -313,6 +336,7 @@ TEST_F(JSONUtilsTest, SaveToFile_WithBOM) {
 }
 
 TEST_F(JSONUtilsTest, SaveToFile_AtomicReplace) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[SaveToFile_AtomicReplace] Testing...");
     auto path = TestPath(L"atomic.json");
     Json j1;
     j1["version"] = 1;
@@ -331,6 +355,7 @@ TEST_F(JSONUtilsTest, SaveToFile_AtomicReplace) {
 }
 
 TEST_F(JSONUtilsTest, SaveToFile_PrettyFormat) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[SaveToFile_PrettyFormat] Testing...");
     auto path = TestPath(L"pretty.json");
     Json j;
     j["a"] = 1;
@@ -344,39 +369,45 @@ TEST_F(JSONUtilsTest, SaveToFile_PrettyFormat) {
     
     std::ifstream ifs(path);
     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    EXPECT_NE(content.find("\n"), std::string::npos);
+    EXPECT_NE(content.find('\n'), std::string::npos);
 }
 
 // ============================================================================
 // JSON POINTER TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, ToJsonPointer_AlreadyPointer) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ToJsonPointer_AlreadyPointer] Testing...");
     std::string result = ToJsonPointer("/a/b/c");
     EXPECT_EQ(result, "/a/b/c");
 }
 
 TEST_F(JSONUtilsTest, ToJsonPointer_DotNotation) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ToJsonPointer_DotNotation] Testing...");
     std::string result = ToJsonPointer("a.b.c");
     EXPECT_EQ(result, "/a/b/c");
 }
 
 TEST_F(JSONUtilsTest, ToJsonPointer_BracketNotation) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ToJsonPointer_BracketNotation] Testing...");
     std::string result = ToJsonPointer("a[0].b[1]");
     EXPECT_EQ(result, "/a/0/b/1");
 }
 
 TEST_F(JSONUtilsTest, ToJsonPointer_Mixed) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ToJsonPointer_Mixed] Testing...");
     std::string result = ToJsonPointer("root.items[0].name");
     EXPECT_EQ(result, "/root/items/0/name");
 }
 
 TEST_F(JSONUtilsTest, ToJsonPointer_EscapeSpecialChars) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ToJsonPointer_EscapeSpecialChars] Testing...");
     std::string result = ToJsonPointer("a~b/c");
     EXPECT_NE(result.find("~0"), std::string::npos); // ~ escaped
     EXPECT_NE(result.find("~1"), std::string::npos); // / escaped
 }
 
 TEST_F(JSONUtilsTest, ToJsonPointer_EmptyString) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ToJsonPointer_EmptyString] Testing...");
     std::string result = ToJsonPointer("");
     EXPECT_EQ(result, "/");
 }
@@ -385,6 +416,7 @@ TEST_F(JSONUtilsTest, ToJsonPointer_EmptyString) {
 // CONTAINS TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, Contains_ExistingPath) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Contains_ExistingPath] Testing...");
     std::string jsonText = R"({"a": {"b": {"c": 42}}})";
     Json j;
     ASSERT_TRUE(Parse(jsonText, j));
@@ -394,6 +426,7 @@ TEST_F(JSONUtilsTest, Contains_ExistingPath) {
 }
 
 TEST_F(JSONUtilsTest, Contains_NonExistingPath) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Contains_NonExistingPath] Testing...");
     std::string jsonText = R"({"a": {"b": 1}})";
     Json j;
     ASSERT_TRUE(Parse(jsonText, j));
@@ -403,6 +436,7 @@ TEST_F(JSONUtilsTest, Contains_NonExistingPath) {
 }
 
 TEST_F(JSONUtilsTest, Contains_ArrayIndex) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Contains_ArrayIndex] Testing...");
     std::string jsonText = R"({"items": [1, 2, 3]})";
     Json j;
     ASSERT_TRUE(Parse(jsonText, j));
@@ -416,6 +450,7 @@ TEST_F(JSONUtilsTest, Contains_ArrayIndex) {
 // GET/SET TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, Get_ValidPath_String) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Get_ValidPath_String] Testing...");
     std::string jsonText = R"({"user": {"name": "Alice"}})";
     Json j;
     ASSERT_TRUE(Parse(jsonText, j));
@@ -426,6 +461,7 @@ TEST_F(JSONUtilsTest, Get_ValidPath_String) {
 }
 
 TEST_F(JSONUtilsTest, Get_ValidPath_Int) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Get_ValidPath_Int] Testing...");
     std::string jsonText = R"({"config": {"port": 8080}})";
     Json j;
     ASSERT_TRUE(Parse(jsonText, j));
@@ -436,6 +472,7 @@ TEST_F(JSONUtilsTest, Get_ValidPath_Int) {
 }
 
 TEST_F(JSONUtilsTest, Get_InvalidPath) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Get_InvalidPath] Testing...");
     Json j;
     j["a"] = 1;
     std::string value;
@@ -444,6 +481,7 @@ TEST_F(JSONUtilsTest, Get_InvalidPath) {
 }
 
 TEST_F(JSONUtilsTest, Get_TypeMismatch) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Get_TypeMismatch] Testing...");
     Json j;
     j["value"] = "string";
     int num;
@@ -452,6 +490,7 @@ TEST_F(JSONUtilsTest, Get_TypeMismatch) {
 }
 
 TEST_F(JSONUtilsTest, GetOr_ExistingValue) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[GetOr_ExistingValue] Testing...");
     Json j;
     j["timeout"] = 30;
     
@@ -460,6 +499,7 @@ TEST_F(JSONUtilsTest, GetOr_ExistingValue) {
 }
 
 TEST_F(JSONUtilsTest, GetOr_DefaultValue) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[GetOr_DefaultValue] Testing...");
     Json j;
     j["a"] = 1;
     
@@ -468,6 +508,7 @@ TEST_F(JSONUtilsTest, GetOr_DefaultValue) {
 }
 
 TEST_F(JSONUtilsTest, Set_NewPath) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Set_NewPath] Testing...");
     Json j;
     
     ASSERT_TRUE(Set(j, "user.name", std::string("Bob")));
@@ -475,6 +516,7 @@ TEST_F(JSONUtilsTest, Set_NewPath) {
 }
 
 TEST_F(JSONUtilsTest, Set_OverwriteExisting) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Set_OverwriteExisting] Testing...");
     Json j;
     j["key"] = "old";
     
@@ -483,6 +525,7 @@ TEST_F(JSONUtilsTest, Set_OverwriteExisting) {
 }
 
 TEST_F(JSONUtilsTest, Set_NestedPath) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Set_NestedPath] Testing...");
     Json j;
     
     ASSERT_TRUE(Set(j, "a.b.c.d", 42));
@@ -490,6 +533,7 @@ TEST_F(JSONUtilsTest, Set_NestedPath) {
 }
 
 TEST_F(JSONUtilsTest, Set_ArrayIndex) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Set_ArrayIndex] Testing...");
     Json j = Json::array();
     
     ASSERT_TRUE(Set(j, "[0]", std::string("first")));
@@ -502,6 +546,7 @@ TEST_F(JSONUtilsTest, Set_ArrayIndex) {
 // MERGE PATCH TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, MergePatch_AddNewKeys) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[MergePatch_AddNewKeys] Testing...");
     Json target;
     target["a"] = 1;
     Json patch;
@@ -514,6 +559,7 @@ TEST_F(JSONUtilsTest, MergePatch_AddNewKeys) {
 }
 
 TEST_F(JSONUtilsTest, MergePatch_OverwriteKeys) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[MergePatch_OverwriteKeys] Testing...");
     Json target;
     target["a"] = 1;
     target["b"] = 2;
@@ -527,6 +573,7 @@ TEST_F(JSONUtilsTest, MergePatch_OverwriteKeys) {
 }
 
 TEST_F(JSONUtilsTest, MergePatch_DeleteKeys) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[MergePatch_DeleteKeys] Testing...");
     Json target;
     target["a"] = 1;
     target["b"] = 2;
@@ -540,6 +587,7 @@ TEST_F(JSONUtilsTest, MergePatch_DeleteKeys) {
 }
 
 TEST_F(JSONUtilsTest, MergePatch_NestedObjects) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[MergePatch_NestedObjects] Testing...");
     std::string targetText = R"({"user": {"name": "Alice", "age": 30}})";
     std::string patchText = R"({"user": {"age": 31, "city": "NYC"}})";
     Json target, patch;
@@ -557,6 +605,7 @@ TEST_F(JSONUtilsTest, MergePatch_NestedObjects) {
 // REQUIRE KEYS TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, RequireKeys_AllPresent) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[RequireKeys_AllPresent] Testing...");
     Json j;
     j["test"] = true;
     j["name"] = "test";
@@ -568,6 +617,7 @@ TEST_F(JSONUtilsTest, RequireKeys_AllPresent) {
 }
 
 TEST_F(JSONUtilsTest, RequireKeys_MissingKey) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[RequireKeys_MissingKey] Testing...");
     Json j;
     j["name"] = "test";
     Error err;
@@ -578,6 +628,7 @@ TEST_F(JSONUtilsTest, RequireKeys_MissingKey) {
 }
 
 TEST_F(JSONUtilsTest, RequireKeys_NestedObject) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[RequireKeys_NestedObject] Testing...");
     std::string jsonText = R"({"config": {"host": "localhost", "port": 8080}})";
     Json j;
     ASSERT_TRUE(Parse(jsonText, j));
@@ -587,6 +638,7 @@ TEST_F(JSONUtilsTest, RequireKeys_NestedObject) {
 }
 
 TEST_F(JSONUtilsTest, RequireKeys_PathNotFound) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[RequireKeys_PathNotFound] Testing...");
     Json j;
     j["a"] = 1;
     Error err;
@@ -595,6 +647,7 @@ TEST_F(JSONUtilsTest, RequireKeys_PathNotFound) {
 }
 
 TEST_F(JSONUtilsTest, RequireKeys_NotAnObject) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[RequireKeys_NotAnObject] Testing...");
     Json j;
     j["value"] = 123;
     Error err;
@@ -606,6 +659,7 @@ TEST_F(JSONUtilsTest, RequireKeys_NotAnObject) {
 // EDGE CASES & SECURITY TESTS
 // ============================================================================
 TEST_F(JSONUtilsTest, EdgeCase_VeryLargeNumber) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[EdgeCase_VeryLargeNumber] Testing...");
     Json j;
     j["big"] = static_cast<Json::number_unsigned_t>(9007199254740992ULL);
     std::string out;
@@ -618,6 +672,7 @@ TEST_F(JSONUtilsTest, EdgeCase_VeryLargeNumber) {
 }
 
 TEST_F(JSONUtilsTest, EdgeCase_SpecialFloats) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[EdgeCase_SpecialFloats] Testing...");
     Json j;
     j["inf"] = std::numeric_limits<double>::infinity();
     j["ninf"] = -std::numeric_limits<double>::infinity();
@@ -628,6 +683,7 @@ TEST_F(JSONUtilsTest, EdgeCase_SpecialFloats) {
 }
 
 TEST_F(JSONUtilsTest, EdgeCase_EmptyObject) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[EdgeCase_EmptyObject] Testing...");
     Json j = Json::object();
     std::string out;
     
@@ -636,6 +692,7 @@ TEST_F(JSONUtilsTest, EdgeCase_EmptyObject) {
 }
 
 TEST_F(JSONUtilsTest, EdgeCase_EmptyArray) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[EdgeCase_EmptyArray] Testing...");
     Json j = Json::array();
     std::string out;
     
@@ -644,6 +701,7 @@ TEST_F(JSONUtilsTest, EdgeCase_EmptyArray) {
 }
 
 TEST_F(JSONUtilsTest, Security_MaxDepthProtection) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Security_MaxDepthProtection] Testing...");
     ParseOptions opt;
     opt.maxDepth = 10;
     
@@ -655,6 +713,7 @@ TEST_F(JSONUtilsTest, Security_MaxDepthProtection) {
 }
 
 TEST_F(JSONUtilsTest, EdgeCase_ComplexNestedStructure) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[EdgeCase_ComplexNestedStructure] Testing...");
     Json j;
     j["users"] = Json::array();
     j["users"].push_back(Json::object());
@@ -683,6 +742,7 @@ TEST_F(JSONUtilsTest, EdgeCase_ComplexNestedStructure) {
 }
 
 TEST_F(JSONUtilsTest, EdgeCase_UnicodeEscape) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[EdgeCase_UnicodeEscape] Testing...");
     std::string jsonText = R"({"emoji": "\uD83D\uDE00"})";
     Json j;
     
@@ -694,6 +754,7 @@ TEST_F(JSONUtilsTest, EdgeCase_UnicodeEscape) {
 }
 
 TEST_F(JSONUtilsTest, Stress_ManyKeys) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Stress_ManyKeys] Testing...");
     Json j;
     for (int i = 0; i < 1000; ++i) {
         j["key_" + std::to_string(i)] = i;
@@ -708,6 +769,7 @@ TEST_F(JSONUtilsTest, Stress_ManyKeys) {
 }
 
 TEST_F(JSONUtilsTest, Stress_LargeArray) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[Stress_LargeArray] Testing...");
     Json j = Json::array();
     for (int i = 0; i < 10000; ++i) {
         j.push_back(i);

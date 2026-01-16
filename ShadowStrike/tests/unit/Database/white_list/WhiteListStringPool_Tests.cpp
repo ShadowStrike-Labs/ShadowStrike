@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include"pch.h"
 /**
  * ============================================================================
@@ -21,7 +25,7 @@
  */
 
 #include <gtest/gtest.h>
-
+#include"Utils/Logger.hpp"
 #include "../../../../src/Whitelist/WhiteListStore.hpp"
 #include "../../../../src/Whitelist/WhiteListFormat.hpp"
 
@@ -74,7 +78,9 @@ protected:
         {
             StringPool tempPool;
             uint64_t used = 0;
-            tempPool.CreateNew(poolBaseAddress, poolSize, used);
+            if (!tempPool.CreateNew(poolBaseAddress, poolSize, used)) {
+				SS_LOG_ERROR(L"StringPoolTest", L"Failed to setup read-only pool header");
+            }
         } // tempPool adds data to buffer
 
         // Create a view structure pointing to our buffer
@@ -288,9 +294,15 @@ TEST_F(StringPoolTest, ReadOnlyView_CanReadIsCorrect) {
     {
         StringPool writer;
         uint64_t used = 0;
-        writer.CreateNew(poolBaseAddress, poolSize, used);
-        writer.AddString("PersistMe");
-        writer.AddWideString(L"PersistMeWide");
+        if (!writer.CreateNew(poolBaseAddress, poolSize, used)) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to create writable pool for read-only view test.");
+        }
+        if (!writer.AddString("PersistMe")) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to add string in read-only view test.");
+        }
+        if (!writer.AddWideString(L"PersistMeWide")) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to add wide string in read-only view test.");
+        }
     }
     
     // 2. Initialize new pool instance in read-only mode over the same memory
@@ -425,10 +437,14 @@ TEST_F(StringPoolTest, ConcurrentAccess_Safe) {
             
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 std::string s = "Thread" + std::to_string(i) + "_Str" + std::to_string(j);
-                pool->AddString(s);
+                if (!pool->AddString(s)) {
+					SS_LOG_ERROR(L"StringPoolTest", L"Failed to add string in concurrent access test.");
+                }
                 
                 std::wstring ws = L"Thread" + std::to_wstring(i) + L"_WStr" + std::to_wstring(j);
-                pool->AddWideString(ws);
+                if (!pool->AddWideString(ws)) {
+					SS_LOG_ERROR(L"StringPoolTest", L"Failed to add wide string in concurrent access test.");
+                }
             }
         }));
     }
@@ -482,8 +498,12 @@ TEST_F(StringPoolTest, Initialize_CorruptUsedSize_Resets) {
     {
         StringPool temp;
         uint64_t used = 0;
-        temp.CreateNew(poolBaseAddress, poolSize, used);
-        temp.AddString("ValidData");
+        if (!temp.CreateNew(poolBaseAddress, poolSize, used)) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to create new pool in Initialize_CorruptUsedSize_Resets test.");
+        }
+        if (!temp.AddString("ValidData")) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to add 'ValidData' string in Initialize_CorruptUsedSize_Resets test.");
+        }
     }
 
     // 2. Corrupt the usedSize (first 8 bytes) to be larger than poolSize
@@ -509,7 +529,9 @@ TEST_F(StringPoolTest, Initialize_SuspicousStringCount_Resets) {
     {
         StringPool temp;
         uint64_t used = 0;
-        temp.CreateNew(poolBaseAddress, poolSize, used);
+        if (!temp.CreateNew(poolBaseAddress, poolSize, used)) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to create new pool in Initialize_SuspicousStringCount_Resets test.");
+        }
     }
 
     // 2. Corrupt string count (bytes 8-15)
@@ -558,15 +580,21 @@ TEST_F(StringPoolTest, MoveConstructor_TransfersOwnership) {
 TEST_F(StringPoolTest, MoveAssignment_TransfersOwnership) {
     InitializeWritable();
     
-    pool->AddString("Original");
+    if (pool->AddString("Original")) {
+		SS_LOG_ERROR(L"StringPoolTest", L"Failed to add 'Original' string in MoveAssignment_TransfersOwnership test.");
+    }
     uint64_t originalCount = pool->GetStringCount();
     
     // Create another pool
     std::vector<uint8_t> buf2(poolSize, 0);
     StringPool pool2;
     uint64_t used = 0;
-    pool2.CreateNew(buf2.data(), poolSize, used);
-    pool2.AddString("Pool2Data");
+    if (!pool2.CreateNew(buf2.data(), poolSize, used)) {
+		SS_LOG_ERROR(L"StringPoolTest", L"Failed to create second pool in MoveAssignment_TransfersOwnership test.");
+    }
+    if(!pool2.AddString("Pool2Data")) {
+        SS_LOG_ERROR(L"StringPoolTest", L"Failed to add 'Pool2Data' string in MoveAssignment_TransfersOwnership test.");
+	}
     
     // Move assign
     pool2 = std::move(*pool);
@@ -592,7 +620,9 @@ TEST_F(StringPoolTest, GetFreeSpace_CalculatesCorrectly) {
     uint64_t initialFree = pool->GetfreeSpace();
     EXPECT_EQ(initialFree, poolSize - 32); // Total - Header
     
-    pool->AddString("SomeData");
+    if (!pool->AddString("SomeData")) {
+        SS_LOG_ERROR(L"StringPoolTest", L"Failed to add 'SomeData' string in GetFreeSpace_CalculatesCorrectly test.");
+        }
     
     uint64_t afterAddFree = pool->GetfreeSpace();
     EXPECT_LT(afterAddFree, initialFree);
@@ -604,12 +634,16 @@ TEST_F(StringPoolTest, GetUsedSize_TracksAccurately) {
     EXPECT_EQ(pool->GetUsedSize(), 32); // Header only
     
     std::string str1 = "Hello";
-    pool->AddString(str1);
+    if (!pool->AddString(str1)) {
+        SS_LOG_ERROR(L"StringPoolTest", L"Failed to add 'Hello' string in GetUsedSize_TracksAccurately test.");
+    }
     // Used = Header(32) + "Hello"(5) + null(1) = 38
     EXPECT_EQ(pool->GetUsedSize(), 38);
     
     std::string str2 = "World";
-    pool->AddString(str2);
+    if (!pool->AddString(str2)) {
+		SS_LOG_ERROR(L"StringPoolTest", L"Failed to add 'World' string in GetUsedSize_TracksAccurately test.");
+    }
     // Used = 38 + "World"(5) + null(1) = 44
     EXPECT_EQ(pool->GetUsedSize(), 44);
 }
@@ -777,7 +811,9 @@ TEST_F(StringPoolTest, ReadOnlyMode_AddString_ReturnsNullopt) {
     {
         StringPool temp;
         uint64_t used = 0;
-        temp.CreateNew(poolBaseAddress, poolSize, used);
+        if (!temp.CreateNew(poolBaseAddress, poolSize, used)) {
+			SS_LOG_ERROR(L"StringPoolTest", L"Failed to create temp pool for read-only test");
+        }
     }
     
     view.baseAddress = poolBaseAddress;
@@ -796,7 +832,9 @@ TEST_F(StringPoolTest, ReadOnlyMode_AddWideString_ReturnsNullopt) {
     {
         StringPool temp;
         uint64_t used = 0;
-        temp.CreateNew(poolBaseAddress, poolSize, used);
+        if (!temp.CreateNew(poolBaseAddress, poolSize, used)) {
+			SS_LOG_ERROR(L"StringPool", L"Failed to create temporary pool for read-only test.");
+        }
     }
     
     view.baseAddress = poolBaseAddress;

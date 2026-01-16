@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ============================================================================
  * ShadowStrike ProcessUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -18,14 +19,16 @@
  *
  * ============================================================================
  */
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/ProcessUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>
 #include <thread>
 #include <chrono>
-#include<algorithm>
+#include <algorithm>
 
 using namespace ShadowStrike::Utils::ProcessUtils;
 
@@ -50,6 +53,7 @@ protected:
 // BASIC PROCESS UTILITIES
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetCurrentProcessId_ValidPid) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetCurrentProcessId_ValidPid] Testing...");
     ProcessId pid = ShadowStrike::Utils::ProcessUtils::GetCurrentProcessId();
     
     EXPECT_GT(pid, 0u);
@@ -57,6 +61,7 @@ TEST_F(ProcessUtilsTest, GetCurrentProcessId_ValidPid) {
 }
 
 TEST_F(ProcessUtilsTest, EnumerateProcesses_ReturnsNonEmpty) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EnumerateProcesses_ReturnsNonEmpty] Testing...");
     std::vector<ProcessId> pids;
     Error err;
     
@@ -75,6 +80,7 @@ TEST_F(ProcessUtilsTest, EnumerateProcesses_ReturnsNonEmpty) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessBasicInfo_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessBasicInfo_CurrentProcess] Testing...");
     ProcessBasicInfo info;
     Error err;
     
@@ -87,6 +93,7 @@ TEST_F(ProcessUtilsTest, GetProcessBasicInfo_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessBasicInfo_InvalidPid) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessBasicInfo_InvalidPid] Testing...");
     ProcessBasicInfo info;
     Error err;
     
@@ -96,6 +103,7 @@ TEST_F(ProcessUtilsTest, GetProcessBasicInfo_InvalidPid) {
 }
 
 TEST_F(ProcessUtilsTest, EnumerateProcesses_WithOptions) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EnumerateProcesses_WithOptions] Testing...");
     std::vector<ProcessBasicInfo> processes;
     EnumerationOptions options;
     options.includeIdleProcess = false;
@@ -115,6 +123,7 @@ TEST_F(ProcessUtilsTest, EnumerateProcesses_WithOptions) {
 // PROCESS PATH & IDENTITY
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessPath_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessPath_CurrentProcess] Testing...");
     Error err;
     auto path = GetProcessPath(m_currentPid, &err);
     
@@ -124,6 +133,7 @@ TEST_F(ProcessUtilsTest, GetProcessPath_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessName_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessName_CurrentProcess] Testing...");
     Error err;
     auto name = GetProcessName(m_currentPid, &err);
     
@@ -132,6 +142,7 @@ TEST_F(ProcessUtilsTest, GetProcessName_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessCommandLine_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessCommandLine_CurrentProcess] Testing...");
     Error err;
     auto cmdLine = GetProcessCommandLine(m_currentPid, &err);
     
@@ -143,6 +154,7 @@ TEST_F(ProcessUtilsTest, GetProcessCommandLine_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessPath_InvalidPid) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessPath_InvalidPid] Testing...");
     Error err;
     auto path = GetProcessPath(99999, &err);
     
@@ -153,14 +165,17 @@ TEST_F(ProcessUtilsTest, GetProcessPath_InvalidPid) {
 // PROCESS STATE CHECKS
 // ============================================================================
 TEST_F(ProcessUtilsTest, IsProcessRunning_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[IsProcessRunning_CurrentProcess] Testing...");
     EXPECT_TRUE(IsProcessRunning(m_currentPid));
 }
 
 TEST_F(ProcessUtilsTest, IsProcessRunning_InvalidPid) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[IsProcessRunning_InvalidPid] Testing...");
     EXPECT_FALSE(IsProcessRunning(99999));
 }
 
 TEST_F(ProcessUtilsTest, IsProcess64Bit_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[IsProcess64Bit_CurrentProcess] Testing...");
     Error err;
     bool is64Bit = IsProcess64Bit(m_currentPid, &err);
     
@@ -172,6 +187,7 @@ TEST_F(ProcessUtilsTest, IsProcess64Bit_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, IsProcessElevated_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[IsProcessElevated_CurrentProcess] Testing...");
     Error err;
     bool elevated = IsProcessElevated(m_currentPid, &err);
     
@@ -183,6 +199,7 @@ TEST_F(ProcessUtilsTest, IsProcessElevated_CurrentProcess) {
 // MEMORY OPERATIONS
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessMemoryInfo_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessMemoryInfo_CurrentProcess] Testing...");
     ProcessMemoryInfo info;
     Error err;
     
@@ -193,6 +210,7 @@ TEST_F(ProcessUtilsTest, GetProcessMemoryInfo_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessMemoryInfo_InvalidPid) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessMemoryInfo_InvalidPid] Testing...");
     ProcessMemoryInfo info;
     Error err;
     
@@ -200,6 +218,7 @@ TEST_F(ProcessUtilsTest, GetProcessMemoryInfo_InvalidPid) {
 }
 
 TEST_F(ProcessUtilsTest, ReadProcessMemory_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[ReadProcessMemory_CurrentProcess] Testing...");
     // Read a known value from current process
     int testValue = 0x12345678;
     int readValue = 0;
@@ -217,6 +236,7 @@ TEST_F(ProcessUtilsTest, ReadProcessMemory_CurrentProcess) {
 // CPU OPERATIONS
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessCpuInfo_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessCpuInfo_CurrentProcess] Testing...");
     ProcessCpuInfo info;
     Error err;
     
@@ -228,6 +248,7 @@ TEST_F(ProcessUtilsTest, GetProcessCpuInfo_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessCpuInfo_MultipleCallsForUsage) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessCpuInfo_MultipleCallsForUsage] Testing...");
     ProcessCpuInfo info1, info2;
     Error err;
     
@@ -247,6 +268,7 @@ TEST_F(ProcessUtilsTest, GetProcessCpuInfo_MultipleCallsForUsage) {
 // IO OPERATIONS
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessIOCounters_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessIOCounters_CurrentProcess] Testing...");
     ProcessIOCounters io;
     Error err;
     
@@ -261,6 +283,7 @@ TEST_F(ProcessUtilsTest, GetProcessIOCounters_CurrentProcess) {
 // MODULE OPERATIONS
 // ============================================================================
 TEST_F(ProcessUtilsTest, EnumerateProcessModules_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EnumerateProcessModules_CurrentProcess] Testing...");
     std::vector<ProcessModuleInfo> modules;
     Error err;
     
@@ -286,6 +309,7 @@ TEST_F(ProcessUtilsTest, EnumerateProcessModules_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetModuleInfo_Kernel32) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetModuleInfo_Kernel32] Testing...");
     Error err;
     auto modInfo = GetModuleInfo(m_currentPid, L"kernel32.dll", &err);
     
@@ -296,6 +320,7 @@ TEST_F(ProcessUtilsTest, GetModuleInfo_Kernel32) {
 }
 
 TEST_F(ProcessUtilsTest, GetModuleBaseAddress_Kernel32) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetModuleBaseAddress_Kernel32] Testing...");
     Error err;
     auto baseAddr = GetModuleBaseAddress(m_currentPid, L"kernel32.dll", &err);
     
@@ -307,6 +332,7 @@ TEST_F(ProcessUtilsTest, GetModuleBaseAddress_Kernel32) {
 // THREAD OPERATIONS
 // ============================================================================
 TEST_F(ProcessUtilsTest, EnumerateProcessThreads_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EnumerateProcessThreads_CurrentProcess] Testing...");
     std::vector<ProcessThreadInfo> threads;
     Error err;
     
@@ -321,6 +347,7 @@ TEST_F(ProcessUtilsTest, EnumerateProcessThreads_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetThreadInfo_CurrentThread) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetThreadInfo_CurrentThread] Testing...");
     ThreadId currentTid = ::GetCurrentThreadId();
     Error err;
     
@@ -334,6 +361,7 @@ TEST_F(ProcessUtilsTest, GetThreadInfo_CurrentThread) {
 // SECURITY OPERATIONS
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessSecurityInfo_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessSecurityInfo_CurrentProcess] Testing...");
     ProcessSecurityInfo sec;
     Error err;
     
@@ -345,6 +373,7 @@ TEST_F(ProcessUtilsTest, GetProcessSecurityInfo_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessPrivileges_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessPrivileges_CurrentProcess] Testing...");
     std::vector<std::wstring> privileges;
     Error err;
     
@@ -355,6 +384,7 @@ TEST_F(ProcessUtilsTest, GetProcessPrivileges_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, HasProcessPrivilege_SeDebugPrivilege) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[HasProcessPrivilege_SeDebugPrivilege] Testing...");
     Error err;
     bool hasDebug = HasProcessPrivilege(m_currentPid, L"SeDebugPrivilege", &err);
     
@@ -366,6 +396,7 @@ TEST_F(ProcessUtilsTest, HasProcessPrivilege_SeDebugPrivilege) {
 // PROCESS TREE & RELATIONSHIPS
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetParentProcessId_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetParentProcessId_CurrentProcess] Testing...");
     Error err;
     auto parentPid = GetParentProcessId(m_currentPid, &err);
     
@@ -374,6 +405,7 @@ TEST_F(ProcessUtilsTest, GetParentProcessId_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetChildProcesses_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetChildProcesses_CurrentProcess] Testing...");
     std::vector<ProcessId> children;
     Error err;
     
@@ -387,6 +419,7 @@ TEST_F(ProcessUtilsTest, GetChildProcesses_CurrentProcess) {
 // PROCESS UTILITIES
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessIdByName_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessIdByName_CurrentProcess] Testing...");
     Error err;
     auto name = GetProcessName(m_currentPid, &err);
     ASSERT_TRUE(name.has_value());
@@ -398,6 +431,7 @@ TEST_F(ProcessUtilsTest, GetProcessIdByName_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessIdsByName_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessIdsByName_CurrentProcess] Testing...");
     Error err;
     auto name = GetProcessName(m_currentPid, &err);
     ASSERT_TRUE(name.has_value());
@@ -418,6 +452,7 @@ TEST_F(ProcessUtilsTest, GetProcessIdsByName_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessOwner_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessOwner_CurrentProcess] Testing...");
     Error err;
     auto owner = GetProcessOwner(m_currentPid, &err);
     
@@ -426,6 +461,7 @@ TEST_F(ProcessUtilsTest, GetProcessOwner_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessSID_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessSID_CurrentProcess] Testing...");
     Error err;
     auto sid = GetProcessSID(m_currentPid, &err);
     
@@ -434,6 +470,7 @@ TEST_F(ProcessUtilsTest, GetProcessSID_CurrentProcess) {
 }
 
 TEST_F(ProcessUtilsTest, GetProcessSessionId_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessSessionId_CurrentProcess] Testing...");
     Error err;
     auto sessionId = GetProcessSessionId(m_currentPid, &err);
     
@@ -445,6 +482,7 @@ TEST_F(ProcessUtilsTest, GetProcessSessionId_CurrentProcess) {
 // COMPREHENSIVE PROCESS INFO
 // ============================================================================
 TEST_F(ProcessUtilsTest, GetProcessInfo_CurrentProcess) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[GetProcessInfo_CurrentProcess] Testing...");
     ProcessInfo info;
     Error err;
     
@@ -463,6 +501,7 @@ TEST_F(ProcessUtilsTest, GetProcessInfo_CurrentProcess) {
 // PROCESS HANDLE RAII
 // ============================================================================
 TEST_F(ProcessUtilsTest, ProcessHandle_OpenClose) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[ProcessHandle_OpenClose] Testing...");
     ProcessHandle handle;
     Error err;
     
@@ -475,6 +514,7 @@ TEST_F(ProcessUtilsTest, ProcessHandle_OpenClose) {
 }
 
 TEST_F(ProcessUtilsTest, ProcessHandle_MoveConstructor) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[ProcessHandle_MoveConstructor] Testing...");
     ProcessHandle handle1;
     Error err;
     
@@ -492,6 +532,7 @@ TEST_F(ProcessUtilsTest, ProcessHandle_MoveConstructor) {
 // EDGE CASES & ERROR HANDLING
 // ============================================================================
 TEST_F(ProcessUtilsTest, EdgeCase_InvalidPid_Zero) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EdgeCase_InvalidPid_Zero] Testing...");
     ProcessBasicInfo info;
     Error err;
     
@@ -502,6 +543,7 @@ TEST_F(ProcessUtilsTest, EdgeCase_InvalidPid_Zero) {
 }
 
 TEST_F(ProcessUtilsTest, EdgeCase_InvalidPid_Negative) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EdgeCase_InvalidPid_Negative] Testing...");
     ProcessBasicInfo info;
     Error err;
     
@@ -510,6 +552,7 @@ TEST_F(ProcessUtilsTest, EdgeCase_InvalidPid_Negative) {
 }
 
 TEST_F(ProcessUtilsTest, EdgeCase_NullError_NoThrow) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EdgeCase_NullError_NoThrow] Testing...");
     ProcessBasicInfo info;
     
     // Should not throw even with null error
@@ -519,6 +562,7 @@ TEST_F(ProcessUtilsTest, EdgeCase_NullError_NoThrow) {
 }
 
 TEST_F(ProcessUtilsTest, EdgeCase_EmptyProcessName) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EdgeCase_EmptyProcessName] Testing...");
     Error err;
     ProcessId pid = GetProcessIdByName(L"", &err);
     
@@ -526,6 +570,7 @@ TEST_F(ProcessUtilsTest, EdgeCase_EmptyProcessName) {
 }
 
 TEST_F(ProcessUtilsTest, EdgeCase_NonExistentProcessName) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[EdgeCase_NonExistentProcessName] Testing...");
     Error err;
     ProcessId pid = GetProcessIdByName(L"ThisProcessDoesNotExist123456", &err);
     
@@ -536,6 +581,7 @@ TEST_F(ProcessUtilsTest, EdgeCase_NonExistentProcessName) {
 // PROCESS SNAPSHOT
 // ============================================================================
 TEST_F(ProcessUtilsTest, CreateProcessSnapshot) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[CreateProcessSnapshot] Testing...");
     std::vector<ProcessInfo> snapshot;
     Error err;
     
@@ -558,6 +604,7 @@ TEST_F(ProcessUtilsTest, CreateProcessSnapshot) {
 // STRESS TESTS
 // ============================================================================
 TEST_F(ProcessUtilsTest, Stress_MultipleEnumerations) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[Stress_MultipleEnumerations] Testing...");
     for (int i = 0; i < 5; ++i) {
         std::vector<ProcessId> pids;
         ASSERT_TRUE(EnumerateProcesses(pids));
@@ -566,6 +613,7 @@ TEST_F(ProcessUtilsTest, Stress_MultipleEnumerations) {
 }
 
 TEST_F(ProcessUtilsTest, Stress_MultipleInfoQueries) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[Stress_MultipleInfoQueries] Testing...");
     for (int i = 0; i < 10; ++i) {
         ProcessBasicInfo info;
         ASSERT_TRUE(GetProcessBasicInfo(m_currentPid, info));
@@ -574,6 +622,7 @@ TEST_F(ProcessUtilsTest, Stress_MultipleInfoQueries) {
 }
 
 TEST_F(ProcessUtilsTest, Stress_ModuleEnumeration) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[Stress_ModuleEnumeration] Testing...");
     for (int i = 0; i < 3; ++i) {
         std::vector<ProcessModuleInfo> modules;
         ASSERT_TRUE(EnumerateProcessModules(m_currentPid, modules));

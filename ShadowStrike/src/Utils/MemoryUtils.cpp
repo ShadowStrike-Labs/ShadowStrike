@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /**
  * @file MemoryUtils.cpp
  * @brief Implementation of memory management utilities.
@@ -13,7 +14,7 @@
  *
  * @note Windows-specific implementation with stub fallbacks for other platforms.
  */
-
+#include"pch.h"
 #include "MemoryUtils.hpp"
 
 #include <algorithm>

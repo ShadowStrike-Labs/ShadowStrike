@@ -1,4 +1,6 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ============================================================================
  * ShadowStrike NetworkUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -19,8 +21,10 @@
  *
  * ============================================================================
  */
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/NetworkUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>
@@ -49,6 +53,7 @@ protected:
 // IPv4 ADDRESS TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, IPv4Address_Construction) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_Construction] Testing...");
     std::array<uint8_t, 4> bytes = {192, 168, 1, 1};
     IPv4Address ipv4(bytes);
     
@@ -59,6 +64,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_Construction) {
 }
 
 TEST_F(NetworkUtilsTest, IPv4Address_ToString) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_ToString] Testing...");
     std::array<uint8_t, 4> bytes = {127, 0, 0, 1};
     IPv4Address ipv4(bytes);
     
@@ -66,6 +72,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_ToString) {
 }
 
 TEST_F(NetworkUtilsTest, IPv4Address_Loopback) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_Loopback] Testing...");
     IPv4Address loopback({127, 0, 0, 1});
     IPv4Address normal({192, 168, 1, 1});
     
@@ -74,6 +81,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_Loopback) {
 }
 
 TEST_F(NetworkUtilsTest, IPv4Address_Private) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_Private] Testing...");
     IPv4Address private10({10, 0, 0, 1});
     IPv4Address private172({172, 16, 0, 1});
     IPv4Address private192({192, 168, 0, 1});
@@ -86,6 +94,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_Private) {
 }
 
 TEST_F(NetworkUtilsTest, IPv4Address_Multicast) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_Multicast] Testing...");
     IPv4Address multicast({224, 0, 0, 1});
     IPv4Address normal({192, 168, 1, 1});
     
@@ -94,6 +103,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_Multicast) {
 }
 
 TEST_F(NetworkUtilsTest, IPv4Address_Broadcast) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_Broadcast] Testing...");
     IPv4Address broadcast({255, 255, 255, 255});
     IPv4Address normal({192, 168, 1, 1});
     
@@ -102,6 +112,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_Broadcast) {
 }
 
 TEST_F(NetworkUtilsTest, IPv4Address_LinkLocal) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv4Address_LinkLocal] Testing...");
     IPv4Address linkLocal({169, 254, 0, 1});
     IPv4Address normal({192, 168, 1, 1});
     
@@ -113,6 +124,7 @@ TEST_F(NetworkUtilsTest, IPv4Address_LinkLocal) {
 // IPv6 ADDRESS TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, IPv6Address_Construction) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv6Address_Construction] Testing...");
     std::array<uint8_t, 16> bytes = {
         0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
@@ -124,6 +136,7 @@ TEST_F(NetworkUtilsTest, IPv6Address_Construction) {
 }
 
 TEST_F(NetworkUtilsTest, IPv6Address_Loopback) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv6Address_Loopback] Testing...");
     std::array<uint8_t, 16> loopbackBytes = {};
     loopbackBytes[15] = 1; // ::1
     
@@ -132,6 +145,7 @@ TEST_F(NetworkUtilsTest, IPv6Address_Loopback) {
 }
 
 TEST_F(NetworkUtilsTest, IPv6Address_LinkLocal) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IPv6Address_LinkLocal] Testing...");
     std::array<uint8_t, 16> bytes = {};
     bytes[0] = 0xFE;
     bytes[1] = 0x80;
@@ -144,6 +158,7 @@ TEST_F(NetworkUtilsTest, IPv6Address_LinkLocal) {
 // IP ADDRESS PARSING TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, ParseIPv4_ValidAddress) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseIPv4_ValidAddress] Testing...");
     IPv4Address ipv4;
     Error err;
     
@@ -155,6 +170,7 @@ TEST_F(NetworkUtilsTest, ParseIPv4_ValidAddress) {
 }
 
 TEST_F(NetworkUtilsTest, ParseIPv4_InvalidAddress) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseIPv4_InvalidAddress] Testing...");
     IPv4Address ipv4;
     Error err;
     
@@ -165,6 +181,7 @@ TEST_F(NetworkUtilsTest, ParseIPv4_InvalidAddress) {
 }
 
 TEST_F(NetworkUtilsTest, ParseIPv6_ValidAddress) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseIPv6_ValidAddress] Testing...");
     IPv6Address ipv6;
     Error err;
     
@@ -173,6 +190,7 @@ TEST_F(NetworkUtilsTest, ParseIPv6_ValidAddress) {
 }
 
 TEST_F(NetworkUtilsTest, ParseIPv6_InvalidAddress) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseIPv6_InvalidAddress] Testing...");
     IPv6Address ipv6;
     Error err;
     
@@ -181,6 +199,7 @@ TEST_F(NetworkUtilsTest, ParseIPv6_InvalidAddress) {
 }
 
 TEST_F(NetworkUtilsTest, ParseIpAddress_IPv4) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseIpAddress_IPv4] Testing...");
     IpAddress ip;
     Error err;
     
@@ -190,6 +209,7 @@ TEST_F(NetworkUtilsTest, ParseIpAddress_IPv4) {
 }
 
 TEST_F(NetworkUtilsTest, ParseIpAddress_IPv6) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseIpAddress_IPv6] Testing...");
     IpAddress ip;
     Error err;
     
@@ -199,6 +219,7 @@ TEST_F(NetworkUtilsTest, ParseIpAddress_IPv6) {
 }
 
 TEST_F(NetworkUtilsTest, IsValidIPv4) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IsValidIPv4] Testing...");
     EXPECT_TRUE(IsValidIPv4(L"127.0.0.1"));
     EXPECT_TRUE(IsValidIPv4(L"192.168.1.1"));
     EXPECT_TRUE(IsValidIPv4(L"8.8.8.8"));
@@ -209,6 +230,7 @@ TEST_F(NetworkUtilsTest, IsValidIPv4) {
 }
 
 TEST_F(NetworkUtilsTest, IsValidIPv6) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IsValidIPv6] Testing...");
     EXPECT_TRUE(IsValidIPv6(L"::1"));
     EXPECT_TRUE(IsValidIPv6(L"fe80::1"));
     EXPECT_TRUE(IsValidIPv6(L"2001:db8::1"));
@@ -221,6 +243,7 @@ TEST_F(NetworkUtilsTest, IsValidIPv6) {
 // IP NETWORK CALCULATIONS
 // ============================================================================
 TEST_F(NetworkUtilsTest, IsInSubnet_IPv4) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IsInSubnet_IPv4] Testing...");
     IpAddress addr(IPv4Address({192, 168, 1, 100}));
     IpAddress subnet(IPv4Address({192, 168, 1, 0}));
     
@@ -229,6 +252,7 @@ TEST_F(NetworkUtilsTest, IsInSubnet_IPv4) {
 }
 
 TEST_F(NetworkUtilsTest, GetNetworkAddress_IPv4) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetNetworkAddress_IPv4] Testing...");
     IpAddress addr(IPv4Address({192, 168, 1, 100}));
     
     auto network = GetNetworkAddress(addr, 24);
@@ -240,6 +264,7 @@ TEST_F(NetworkUtilsTest, GetNetworkAddress_IPv4) {
 }
 
 TEST_F(NetworkUtilsTest, GetBroadcastAddress_IPv4) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetBroadcastAddress_IPv4] Testing...");
     IPv4Address network({192, 168, 1, 0});
     
     auto broadcast = GetBroadcastAddress(network, 24);
@@ -251,6 +276,7 @@ TEST_F(NetworkUtilsTest, GetBroadcastAddress_IPv4) {
 }
 
 TEST_F(NetworkUtilsTest, GetAddressCount) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetAddressCount] Testing...");
     EXPECT_EQ(GetAddressCount(24, IpVersion::IPv4), 256u);
     EXPECT_EQ(GetAddressCount(30, IpVersion::IPv4), 4u);
     EXPECT_EQ(GetAddressCount(32, IpVersion::IPv4), 1u);
@@ -260,6 +286,7 @@ TEST_F(NetworkUtilsTest, GetAddressCount) {
 // MAC ADDRESS TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, MacAddress_ToString) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[MacAddress_ToString] Testing...");
     std::array<uint8_t, 6> bytes = {0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E};
     MacAddress mac(bytes);
     
@@ -268,6 +295,7 @@ TEST_F(NetworkUtilsTest, MacAddress_ToString) {
 }
 
 TEST_F(NetworkUtilsTest, MacAddress_IsValid) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[MacAddress_IsValid] Testing...");
     MacAddress valid({0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E});
     MacAddress allZero({0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
     MacAddress allFF({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF});
@@ -278,6 +306,7 @@ TEST_F(NetworkUtilsTest, MacAddress_IsValid) {
 }
 
 TEST_F(NetworkUtilsTest, MacAddress_IsBroadcast) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[MacAddress_IsBroadcast] Testing...");
     MacAddress broadcast({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF});
     MacAddress normal({0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E});
     
@@ -286,6 +315,7 @@ TEST_F(NetworkUtilsTest, MacAddress_IsBroadcast) {
 }
 
 TEST_F(NetworkUtilsTest, MacAddress_IsMulticast) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[MacAddress_IsMulticast] Testing...");
     MacAddress multicast({0x01, 0x00, 0x5E, 0x00, 0x00, 0x01});
     MacAddress unicast({0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E});
     
@@ -294,6 +324,7 @@ TEST_F(NetworkUtilsTest, MacAddress_IsMulticast) {
 }
 
 TEST_F(NetworkUtilsTest, ParseMacAddress_Valid) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseMacAddress_Valid] Testing...");
     MacAddress mac;
     Error err;
     
@@ -304,6 +335,7 @@ TEST_F(NetworkUtilsTest, ParseMacAddress_Valid) {
 }
 
 TEST_F(NetworkUtilsTest, ParseMacAddress_ColonSeparator) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseMacAddress_ColonSeparator] Testing...");
     MacAddress mac;
     Error err;
     
@@ -312,6 +344,7 @@ TEST_F(NetworkUtilsTest, ParseMacAddress_ColonSeparator) {
 }
 
 TEST_F(NetworkUtilsTest, ParseMacAddress_Invalid) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseMacAddress_Invalid] Testing...");
     MacAddress mac;
     Error err;
     
@@ -324,6 +357,7 @@ TEST_F(NetworkUtilsTest, ParseMacAddress_Invalid) {
 // HOSTNAME RESOLUTION (Localhost only)
 // ============================================================================
 TEST_F(NetworkUtilsTest, ResolveHostname_Localhost) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ResolveHostname_Localhost] Testing...");
     std::vector<IpAddress> addresses;
     Error err;
     
@@ -341,6 +375,7 @@ TEST_F(NetworkUtilsTest, ResolveHostname_Localhost) {
 }
 
 TEST_F(NetworkUtilsTest, ResolveHostnameIPv4_Localhost) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ResolveHostnameIPv4_Localhost] Testing...");
     std::vector<IPv4Address> addresses;
     Error err;
     
@@ -353,6 +388,7 @@ TEST_F(NetworkUtilsTest, ResolveHostnameIPv4_Localhost) {
 // REVERSE DNS LOOKUP (Localhost)
 // ============================================================================
 TEST_F(NetworkUtilsTest, ReverseLookup_Loopback) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ReverseLookup_Loopback] Testing...");
     IpAddress loopback(IPv4Address({127, 0, 0, 1}));
     std::wstring hostname;
     Error err;
@@ -367,6 +403,7 @@ TEST_F(NetworkUtilsTest, ReverseLookup_Loopback) {
 // NETWORK ADAPTER ENUMERATION
 // ============================================================================
 TEST_F(NetworkUtilsTest, GetNetworkAdapters) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetNetworkAdapters] Testing...");
     std::vector<NetworkAdapterInfo> adapters;
     Error err;
     
@@ -386,6 +423,7 @@ TEST_F(NetworkUtilsTest, GetNetworkAdapters) {
 }
 
 TEST_F(NetworkUtilsTest, GetLocalIpAddresses) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetLocalIpAddresses] Testing...");
     std::vector<IpAddress> addresses;
     Error err;
     
@@ -403,6 +441,7 @@ TEST_F(NetworkUtilsTest, GetLocalIpAddresses) {
 }
 
 TEST_F(NetworkUtilsTest, GetLocalIpAddresses_ExcludeLoopback) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetLocalIpAddresses_ExcludeLoopback] Testing...");
     std::vector<IpAddress> addresses;
     Error err;
     
@@ -417,6 +456,7 @@ TEST_F(NetworkUtilsTest, GetLocalIpAddresses_ExcludeLoopback) {
 // PING TESTS (Localhost only)
 // ============================================================================
 TEST_F(NetworkUtilsTest, Ping_LoopbackIPv4) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[Ping_LoopbackIPv4] Testing...");
     IpAddress loopback(IPv4Address({127, 0, 0, 1}));
     PingResult result;
     PingOptions options;
@@ -430,6 +470,7 @@ TEST_F(NetworkUtilsTest, Ping_LoopbackIPv4) {
 }
 
 TEST_F(NetworkUtilsTest, Ping_LocalhostHostname) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[Ping_LocalhostHostname] Testing...");
     PingResult result;
     PingOptions options;
     options.timeoutMs = 2000;
@@ -443,6 +484,7 @@ TEST_F(NetworkUtilsTest, Ping_LocalhostHostname) {
 // PORT SCANNING & CONNECTION INFO
 // ============================================================================
 TEST_F(NetworkUtilsTest, GetActiveConnections_TCP) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetActiveConnections_TCP] Testing...");
     std::vector<ConnectionInfo> connections;
     Error err;
     
@@ -450,6 +492,7 @@ TEST_F(NetworkUtilsTest, GetActiveConnections_TCP) {
 }
 
 TEST_F(NetworkUtilsTest, GetActiveConnections_UDP) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetActiveConnections_UDP] Testing...");
     std::vector<ConnectionInfo> connections;
     Error err;
     
@@ -457,6 +500,7 @@ TEST_F(NetworkUtilsTest, GetActiveConnections_UDP) {
 }
 
 TEST_F(NetworkUtilsTest, GetPortsInUse_TCP) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetPortsInUse_TCP] Testing...");
     std::vector<uint16_t> ports;
     Error err;
     
@@ -472,6 +516,7 @@ TEST_F(NetworkUtilsTest, GetPortsInUse_TCP) {
 // URL PARSING TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, ParseUrl_HttpUrl) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseUrl_HttpUrl] Testing...");
     UrlComponents components;
     Error err;
     
@@ -483,6 +528,7 @@ TEST_F(NetworkUtilsTest, ParseUrl_HttpUrl) {
 }
 
 TEST_F(NetworkUtilsTest, ParseUrl_HttpsUrl) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ParseUrl_HttpsUrl] Testing...");
     UrlComponents components;
     Error err;
     
@@ -493,21 +539,25 @@ TEST_F(NetworkUtilsTest, ParseUrl_HttpsUrl) {
 }
 
 TEST_F(NetworkUtilsTest, UrlEncode_SpecialCharacters) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[UrlEncode_SpecialCharacters] Testing...");
     std::wstring encoded = UrlEncode(L"hello world");
     EXPECT_EQ(encoded, L"hello+world");
 }
 
 TEST_F(NetworkUtilsTest, UrlDecode_SpecialCharacters) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[UrlDecode_SpecialCharacters] Testing...");
     std::wstring decoded = UrlDecode(L"hello+world");
     EXPECT_EQ(decoded, L"hello world");
 }
 
 TEST_F(NetworkUtilsTest, ExtractDomain_ValidUrl) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[ExtractDomain_ValidUrl] Testing...");
     std::wstring domain = ExtractDomain(L"https://www.example.com:8080/path");
     EXPECT_EQ(domain, L"www.example.com");
 }
 
 TEST_F(NetworkUtilsTest, IsValidUrl) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IsValidUrl] Testing...");
     EXPECT_TRUE(IsValidUrl(L"http://localhost"));
     EXPECT_TRUE(IsValidUrl(L"https://example.com/path"));
     
@@ -518,6 +568,7 @@ TEST_F(NetworkUtilsTest, IsValidUrl) {
 // DOMAIN VALIDATION TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, IsValidDomain) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IsValidDomain] Testing...");
     EXPECT_TRUE(IsValidDomain(L"example.com"));
     EXPECT_TRUE(IsValidDomain(L"www.example.com"));
     
@@ -526,6 +577,7 @@ TEST_F(NetworkUtilsTest, IsValidDomain) {
 }
 
 TEST_F(NetworkUtilsTest, IsValidHostname) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[IsValidHostname] Testing...");
     EXPECT_TRUE(IsValidHostname(L"localhost"));
     EXPECT_TRUE(IsValidHostname(L"my-server"));
     
@@ -536,6 +588,7 @@ TEST_F(NetworkUtilsTest, IsValidHostname) {
 // PROTOCOL DETECTION TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, DetectProtocol_HTTP) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[DetectProtocol_HTTP] Testing...");
     std::vector<uint8_t> httpData = {'G', 'E', 'T', ' '};
     
     std::wstring protocol;
@@ -544,6 +597,7 @@ TEST_F(NetworkUtilsTest, DetectProtocol_HTTP) {
 }
 
 TEST_F(NetworkUtilsTest, DetectProtocol_HTTPS) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[DetectProtocol_HTTPS] Testing...");
     std::vector<uint8_t> tlsData = {0x16, 0x03, 0x03, 0x00, 0x00};
     
     std::wstring protocol;
@@ -552,6 +606,7 @@ TEST_F(NetworkUtilsTest, DetectProtocol_HTTPS) {
 }
 
 TEST_F(NetworkUtilsTest, DetectProtocol_DNS) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[DetectProtocol_DNS] Testing...");
     std::vector<uint8_t> dnsData = {
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
@@ -565,6 +620,7 @@ TEST_F(NetworkUtilsTest, DetectProtocol_DNS) {
 // NETWORK STATISTICS TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, GetNetworkStatistics) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetNetworkStatistics] Testing...");
     NetworkStatistics stats;
     Error err;
     
@@ -573,6 +629,7 @@ TEST_F(NetworkUtilsTest, GetNetworkStatistics) {
 }
 
 TEST_F(NetworkUtilsTest, CalculateBandwidth) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[CalculateBandwidth] Testing...");
     NetworkStatistics prev, current;
     prev.timestamp = std::chrono::system_clock::now() - std::chrono::seconds(1);
     prev.bytesReceived = 1000;
@@ -593,6 +650,7 @@ TEST_F(NetworkUtilsTest, CalculateBandwidth) {
 // ROUTING TABLE TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, GetRoutingTable) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetRoutingTable] Testing...");
     std::vector<RouteEntry> routes;
     Error err;
     
@@ -608,6 +666,7 @@ TEST_F(NetworkUtilsTest, GetRoutingTable) {
 // PROXY TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, GetSystemProxySettings) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetSystemProxySettings] Testing...");
     ProxyInfo proxy;
     Error err;
     
@@ -618,16 +677,19 @@ TEST_F(NetworkUtilsTest, GetSystemProxySettings) {
 // UTILITY FUNCTIONS TESTS
 // ============================================================================
 TEST_F(NetworkUtilsTest, GetProtocolName) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[GetProtocolName] Testing...");
     EXPECT_EQ(GetProtocolName(ProtocolType::TCP), L"TCP");
     EXPECT_EQ(GetProtocolName(ProtocolType::UDP), L"UDP");
 }
 
 TEST_F(NetworkUtilsTest, FormatBytes) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[FormatBytes] Testing...");
     EXPECT_EQ(FormatBytes(1024), L"1.00 KB");
     EXPECT_EQ(FormatBytes(1024 * 1024), L"1.00 MB");
 }
 
 TEST_F(NetworkUtilsTest, FormatWsaError) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[FormatWsaError] Testing...");
     std::wstring err = FormatWsaError(WSAECONNREFUSED);
     EXPECT_FALSE(err.empty());
 }
@@ -636,6 +698,7 @@ TEST_F(NetworkUtilsTest, FormatWsaError) {
 // EDGE CASES
 // ============================================================================
 TEST_F(NetworkUtilsTest, EdgeCase_EmptyInput) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[EdgeCase_EmptyInput] Testing...");
     IPv4Address ipv4;
     Error err;
     
@@ -644,6 +707,7 @@ TEST_F(NetworkUtilsTest, EdgeCase_EmptyInput) {
 }
 
 TEST_F(NetworkUtilsTest, Stress_MultipleAdapterQueries) {
+    SS_LOG_INFO(L"NetworkUtils_Tests", L"[Stress_MultipleAdapterQueries] Testing...");
     for (int i = 0; i < 5; ++i) {
         std::vector<NetworkAdapterInfo> adapters;
         ASSERT_TRUE(GetNetworkAdapters(adapters));

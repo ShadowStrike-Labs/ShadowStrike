@@ -1,4 +1,5 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ============================================================================
  * ShadowStrike Cache Manager Implementation
@@ -21,6 +22,7 @@
  * ============================================================================
  */
 
+#include"pch.h"
 #include "CacheManager.hpp"
 
 #include <cwchar>
@@ -34,6 +36,7 @@
 #endif
 #include <Windows.h>
 #include <bcrypt.h>
+
 
 // Link against bcrypt.lib for BCryptGenRandom
 #pragma comment(lib, "bcrypt.lib")
@@ -210,11 +213,7 @@ namespace ShadowStrike {
                 }
             }
 
-            ~BcryptApi() noexcept {
-                // Note: We intentionally don't unload bcrypt.dll on shutdown
-                // to avoid issues with static destruction order. The OS will
-                // clean up when the process exits.
-            }
+			~BcryptApi() noexcept = default; // Library freed automatically on process exit
 
             // Non-copyable, non-movable
             BcryptApi(const BcryptApi&) = delete;
@@ -2017,12 +2016,7 @@ namespace ShadowStrike {
             }
 
             if (fileHeader.valueBytes > 0) {
-                // Validate value size fits in DWORD for ReadFile
-                if (fileHeader.valueBytes > UINT32_MAX) {
-                    SS_LOG_ERROR(L"CacheManager", L"Value size exceeds DWORD maximum");
-                    return false;
-                }
-
+              
                 const DWORD valueBytesToRead = static_cast<DWORD>(fileHeader.valueBytes);
                 bytesRead = 0;
 
@@ -2102,118 +2096,96 @@ namespace ShadowStrike {
         }
 
         /**
-         * @brief Generates a cryptographic hash of the key for disk storage.
-         *
-         * Uses HMAC-SHA256 with a session-generated key for high-quality hashes.
-         * Falls back to FNV-1a if BCrypt is unavailable.
-         *
-         * @param key The key to hash.
-         * @return Lowercase hex string of the hash (16 chars for FNV-1a, 64 for SHA256).
-         */
+ * @brief Generates a cryptographic hash of the key for disk storage.
+ *
+ * Uses HMAC-SHA256 with a session-generated key for high-quality hashes.
+ * Falls back to FNV-1a if BCrypt is unavailable or fails at any step.
+ *
+ * @param key The key to hash.
+ * @return Lowercase hex string of the hash (16 chars for FNV-1a, 64 for SHA256).
+ */
         std::wstring CacheManager::hashKeyToHex(const std::wstring& key) const {
-            // Get raw bytes
             const uint8_t* bytes = reinterpret_cast<const uint8_t*>(key.data());
             const size_t byteCount = key.size() * sizeof(wchar_t);
 
-            // Validate input
+            // VALIDATION: Basic input check
             if (byteCount == 0) {
                 return L"";
             }
 
-            // Validate byte count fits in ULONG for BCrypt
-            if (byteCount > ULONG_MAX) {
-                // Key too large - use FNV-1a fallback
-                const uint64_t hash = Fnv1a64(bytes, byteCount);
-                uint8_t hashBytes[8];
-                for (int i = 0; i < 8; ++i) {
-                    hashBytes[i] = static_cast<uint8_t>((hash >> (i * 8)) & 0xFF);
-                }
-                return ToHex(hashBytes, sizeof(hashBytes));
-            }
-
-            const ULONG cb = static_cast<ULONG>(byteCount);
-
-            // Check BCrypt availability
-            const auto& api = BcryptApi::Instance();
-            if (!api.IsAvailable() || m_hmacKey.empty()) {
-                // Fall back to FNV-1a
-                const uint64_t hash = Fnv1a64(bytes, byteCount);
-                uint8_t hashBytes[8];
-                for (int i = 0; i < 8; ++i) {
-                    hashBytes[i] = static_cast<uint8_t>((hash >> (i * 8)) & 0xFF);
-                }
-                return ToHex(hashBytes, sizeof(hashBytes));
-            }
-
-            // Use BCrypt HMAC-SHA256
+            // STATE MANAGEMENT
             BCRYPT_ALG_HANDLE hAlg = nullptr;
             BCRYPT_HASH_HANDLE hHash = nullptr;
-
-            // Open algorithm with HMAC flag
-            NTSTATUS status = api.OpenAlgorithmProvider(
-                &hAlg,
-                BCRYPT_SHA256_ALGORITHM,
-                nullptr,
-                BCRYPT_ALG_HANDLE_HMAC_FLAG
-            );
-
-            if (status != 0 || hAlg == nullptr) {
-                // BCrypt failed - fallback to FNV-1a
-                const uint64_t hash = Fnv1a64(bytes, byteCount);
-                uint8_t hashBytes[8];
-                for (int i = 0; i < 8; ++i) {
-                    hashBytes[i] = static_cast<uint8_t>((hash >> (i * 8)) & 0xFF);
-                }
-                return ToHex(hashBytes, sizeof(hashBytes));
-            }
-
-            // Create HMAC hash object
-            status = api.CreateHash(
-                hAlg,
-                &hHash,
-                nullptr,
-                0,
-                const_cast<PUCHAR>(m_hmacKey.data()),
-                static_cast<ULONG>(m_hmacKey.size()),
-                0
-            );
-
-            if (status != 0 || hHash == nullptr) {
-                api.CloseAlgorithmProvider(hAlg, 0);
-                const uint64_t hash = Fnv1a64(bytes, byteCount);
-                uint8_t hashBytes[8];
-                for (int i = 0; i < 8; ++i) {
-                    hashBytes[i] = static_cast<uint8_t>((hash >> (i * 8)) & 0xFF);
-                }
-                return ToHex(hashBytes, sizeof(hashBytes));
-            }
-
-            // Hash the data
-            if (cb > 0) {
-                status = api.HashData(hHash, const_cast<PUCHAR>(bytes), cb, 0);
-            }
-
-            // Finalize hash
+            NTSTATUS status = -1; // Default to error until success is proven
             uint8_t digest[32] = {};
-            if (status == 0) {
-                status = api.FinishHash(hHash, digest, sizeof(digest), 0);
+            const auto& api = BcryptApi::Instance();
+
+            // STRATEGY: Attempt BCrypt if available and key size is within ULONG limits
+            if (byteCount <= ULONG_MAX && api.IsAvailable() && !m_hmacKey.empty()) {
+
+                // 1. Open Algorithm Provider
+                status = api.OpenAlgorithmProvider(
+                    &hAlg,
+                    BCRYPT_SHA256_ALGORITHM,
+                    nullptr,
+                    BCRYPT_ALG_HANDLE_HMAC_FLAG
+                );
+
+                if (status == 0) {
+                    // 2. Create HMAC Hash Object
+                    status = api.CreateHash(
+                        hAlg,
+                        &hHash,
+                        nullptr,
+                        0,
+                        const_cast<PUCHAR>(m_hmacKey.data()),
+                        static_cast<ULONG>(m_hmacKey.size()),
+                        0
+                    );
+
+                    if (status == 0) {
+                        // 3. Process Data
+                        status = api.HashData(hHash, const_cast<PUCHAR>(bytes), static_cast<ULONG>(byteCount), 0);
+
+                        if (status == 0) {
+                            // 4. Finalize Hash to Digest
+                            status = api.FinishHash(hHash, digest, sizeof(digest), 0);
+                        }
+                    }
+                }
             }
 
-            // Cleanup BCrypt resources
-            api.DestroyHash(hHash);
-            api.CloseAlgorithmProvider(hAlg, 0);
+            // CLEANUP: Ensure resources are released regardless of status
+            // We use temporary status variables for cleanup to avoid overwriting the hashing result status
+            if (hHash) {
+                NTSTATUS destroyStatus = api.DestroyHash(hHash);
+                if (destroyStatus != 0) {
+                    SS_LOG_ERROR(L"CacheManager", L"BCrypt DestroyHash failed: 0x%08X", destroyStatus);
+                }
+            }
 
-            // Check for errors during hashing
-            if (status != 0) {
+            if (hAlg) {
+                NTSTATUS closeStatus = api.CloseAlgorithmProvider(hAlg, 0);
+                if (closeStatus != 0) {
+                    SS_LOG_ERROR(L"CacheManager", L"BCrypt CloseAlgorithmProvider failed: 0x%08X", closeStatus);
+                }
+            }
+
+            // FINAL DECISION: Return SHA256 hex on success, or FNV-1a hex on any failure
+            if (status == 0) {
+                return ToHex(digest, sizeof(digest));
+            }
+            else {
+                // FALLBACK: Compute 64-bit FNV-1a hash
                 const uint64_t hash = Fnv1a64(bytes, byteCount);
                 uint8_t hashBytes[8];
                 for (int i = 0; i < 8; ++i) {
                     hashBytes[i] = static_cast<uint8_t>((hash >> (i * 8)) & 0xFF);
                 }
+
+                SS_LOG_DEBUG(L"CacheManager", L"BCrypt hashing failed or bypassed. Using FNV-1a fallback.");
                 return ToHex(hashBytes, sizeof(hashBytes));
             }
-
-            return ToHex(digest, sizeof(digest));
         }
 
         /**
@@ -2437,11 +2409,7 @@ namespace ShadowStrike {
                         }
 
                         if (fileHeader.valueBytes > 0) {
-                            // Check value size fits in DWORD for ReadFile
-                            if (fileHeader.valueBytes > UINT32_MAX) {
-                                continue;
-                            }
-
+                          
                             const DWORD valueBytesToRead = static_cast<DWORD>(fileHeader.valueBytes);
                             bytesRead = 0;
 

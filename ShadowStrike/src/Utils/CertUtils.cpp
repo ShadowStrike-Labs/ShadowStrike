@@ -1,4 +1,5 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /**
  * @file CertUtils.cpp
  * @brief Implementation of X.509 Certificate Utilities.
@@ -7,6 +8,7 @@
  * @license Proprietary - All rights reserved
  */
 
+#include"pch.h"
 #include "CertUtils.hpp"
 
 #include <algorithm>

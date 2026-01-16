@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include"pch.h"
 /*
  * ============================================================================
@@ -65,7 +69,7 @@
 #  define NOMINMAX
 #endif
 #include <windows.h>
-#include <wincrypt.h>
+#include <bcrypt.h>      // CNG (Cryptography Next Generation) - modern, thread-safe crypto API
 #include <objbase.h>  // For CoCreateGuid
 
 // SIMD intrinsics for hardware-accelerated CRC32
@@ -81,7 +85,7 @@
 #  include <xmmintrin.h>  // _mm_prefetch
 #endif
 
-#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")  // CNG library
 #pragma comment(lib, "ole32.lib")  // For CoCreateGuid
 
 namespace ShadowStrike {
@@ -590,164 +594,203 @@ private:
     void* m_address;  ///< Base address of the mapped view
 };
 
+// ============================================================================
+// CNG (Cryptography Next Generation) RAII Wrappers
+// ============================================================================
+// 
+// These wrappers provide:
+// - Thread-safe cryptographic operations (CAPI was NOT thread-safe)
+// - Modern, supported API (CAPI is deprecated since Windows Vista)
+// - Better performance with hardware acceleration support
+// - RAII-based exception-safe resource management
+//
+// CRITICAL: All cryptographic operations in enterprise antivirus MUST use
+// thread-safe primitives for multi-threaded scanning!
+// ============================================================================
+
 /**
- * @brief RAII wrapper for HCRYPTPROV crypto context.
+ * @brief RAII wrapper for BCrypt algorithm handle (BCRYPT_ALG_HANDLE).
  *
- * Automatically releases the crypto context on destruction.
+ * Thread-safe algorithm provider for CNG cryptographic operations.
+ * Replaces deprecated CAPI HCRYPTPROV.
  *
- * Thread Safety: Not thread-safe. Each instance should be owned by one thread.
+ * Thread Safety: Thread-safe. CNG handles can be used from multiple threads.
  */
-class CryptoContextGuard final {
+class BCryptAlgGuard final {
 public:
     /**
-     * @brief Construct with optional provider handle.
-     * @param prov Crypto provider handle (default: 0)
+     * @brief Default constructor - creates invalid handle.
      */
-    explicit CryptoContextGuard(HCRYPTPROV prov = 0) noexcept 
-        : m_provider(prov) 
-    {}
+    BCryptAlgGuard() noexcept : m_alg(nullptr) {}
     
     /**
-     * @brief Destructor - releases context if valid.
+     * @brief Construct with existing handle.
+     * @param alg BCrypt algorithm handle
      */
-    ~CryptoContextGuard() noexcept {
-        ReleaseContext();
+    explicit BCryptAlgGuard(BCRYPT_ALG_HANDLE alg) noexcept : m_alg(alg) {}
+    
+    /**
+     * @brief Destructor - closes algorithm provider if valid.
+     */
+    ~BCryptAlgGuard() noexcept {
+        Close();
     }
     
-    // Disable copy
-    CryptoContextGuard(const CryptoContextGuard&) = delete;
-    CryptoContextGuard& operator=(const CryptoContextGuard&) = delete;
+    // Non-copyable
+    BCryptAlgGuard(const BCryptAlgGuard&) = delete;
+    BCryptAlgGuard& operator=(const BCryptAlgGuard&) = delete;
     
-    // Disable move - crypto contexts should not be transferred
-    CryptoContextGuard(CryptoContextGuard&&) = delete;
-    CryptoContextGuard& operator=(CryptoContextGuard&&) = delete;
+    // Movable
+    BCryptAlgGuard(BCryptAlgGuard&& other) noexcept : m_alg(other.m_alg) {
+        other.m_alg = nullptr;
+    }
+    
+    BCryptAlgGuard& operator=(BCryptAlgGuard&& other) noexcept {
+        if (this != &other) {
+            Close();
+            m_alg = other.m_alg;
+            other.m_alg = nullptr;
+        }
+        return *this;
+    }
     
     /**
-     * @brief Explicitly release the crypto context.
-     *
-     * Safe to call multiple times. Sets provider to 0 after releasing.
+     * @brief Opens a CNG algorithm provider.
+     * @param algId Algorithm identifier (e.g., BCRYPT_SHA256_ALGORITHM)
+     * @param flags Optional flags
+     * @return true on success, false on failure
      */
-    void ReleaseContext() noexcept {
-        if (m_provider != 0) {
-            (void)::CryptReleaseContext(m_provider, 0);
-            m_provider = 0;
+    [[nodiscard]] bool Open(LPCWSTR algId, ULONG flags = 0) noexcept {
+        Close();
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&m_alg, algId, nullptr, flags);
+        if (!BCRYPT_SUCCESS(status)) {
+            m_alg = nullptr;
+            return false;
+        }
+        return true;
+    }
+    
+    /**
+     * @brief Explicitly close the algorithm provider.
+     */
+    void Close() noexcept {
+        if (m_alg != nullptr) {
+            BCryptCloseAlgorithmProvider(m_alg, 0);
+            m_alg = nullptr;
         }
     }
     
     /**
-     * @brief Get the provider handle.
-     * @return The underlying HCRYPTPROV
+     * @brief Get the algorithm handle.
+     * @return The underlying BCRYPT_ALG_HANDLE
      */
-    [[nodiscard]] HCRYPTPROV Get() const noexcept { 
-        return m_provider; 
-    }
+    [[nodiscard]] BCRYPT_ALG_HANDLE Get() const noexcept { return m_alg; }
     
     /**
-     * @brief Get pointer to provider handle (for CryptAcquireContext).
-     * @return Pointer to the underlying HCRYPTPROV
+     * @brief Get pointer to algorithm handle.
+     * @return Pointer to the underlying BCRYPT_ALG_HANDLE
      */
-    [[nodiscard]] HCRYPTPROV* Ptr() noexcept { 
-        return &m_provider; 
-    }
+    [[nodiscard]] BCRYPT_ALG_HANDLE* Ptr() noexcept { return &m_alg; }
     
     /**
-     * @brief Check if context is valid.
-     * @return true if provider is not 0
+     * @brief Check if handle is valid.
+     * @return true if handle is not nullptr
      */
-    [[nodiscard]] bool IsValid() const noexcept { 
-        return m_provider != 0; 
-    }
+    [[nodiscard]] bool IsValid() const noexcept { return m_alg != nullptr; }
     
     /**
      * @brief Implicit bool conversion for if-checks.
-     * @return true if context is valid
+     * @return true if handle is valid
      */
-    [[nodiscard]] explicit operator bool() const noexcept {
-        return IsValid();
-    }
+    [[nodiscard]] explicit operator bool() const noexcept { return IsValid(); }
 
 private:
-    HCRYPTPROV m_provider;  ///< The underlying crypto provider handle
+    BCRYPT_ALG_HANDLE m_alg;  ///< The underlying algorithm handle
 };
 
 /**
- * @brief RAII wrapper for HCRYPTHASH crypto hash object.
+ * @brief RAII wrapper for BCrypt hash handle (BCRYPT_HASH_HANDLE).
  *
- * Automatically destroys the hash object on destruction.
+ * Thread-safe hash object for CNG cryptographic operations.
+ * Replaces deprecated CAPI HCRYPTHASH.
  *
- * Thread Safety: Not thread-safe. Each instance should be owned by one thread.
+ * Thread Safety: Single hash instance should not be used from multiple threads
+ * simultaneously, but CNG hash operations themselves are thread-safe.
  */
-class CryptoHashGuard final {
+class BCryptHashGuard final {
 public:
     /**
-     * @brief Construct with optional hash handle.
-     * @param hash Crypto hash handle (default: 0)
+     * @brief Default constructor - creates invalid handle.
      */
-    explicit CryptoHashGuard(HCRYPTHASH hash = 0) noexcept 
-        : m_hash(hash) 
-    {}
+    BCryptHashGuard() noexcept : m_hash(nullptr) {}
+    
+    /**
+     * @brief Construct with existing hash handle.
+     * @param hash BCrypt hash handle
+     */
+    explicit BCryptHashGuard(BCRYPT_HASH_HANDLE hash) noexcept : m_hash(hash) {}
     
     /**
      * @brief Destructor - destroys hash if valid.
      */
-    ~CryptoHashGuard() noexcept {
+    ~BCryptHashGuard() noexcept {
         Destroy();
     }
     
-    // Disable copy
-    CryptoHashGuard(const CryptoHashGuard&) = delete;
-    CryptoHashGuard& operator=(const CryptoHashGuard&) = delete;
+    // Non-copyable
+    BCryptHashGuard(const BCryptHashGuard&) = delete;
+    BCryptHashGuard& operator=(const BCryptHashGuard&) = delete;
     
-    // Disable move - crypto hashes should not be transferred mid-computation
-    CryptoHashGuard(CryptoHashGuard&&) = delete;
-    CryptoHashGuard& operator=(CryptoHashGuard&&) = delete;
+    // Movable
+    BCryptHashGuard(BCryptHashGuard&& other) noexcept : m_hash(other.m_hash) {
+        other.m_hash = nullptr;
+    }
+    
+    BCryptHashGuard& operator=(BCryptHashGuard&& other) noexcept {
+        if (this != &other) {
+            Destroy();
+            m_hash = other.m_hash;
+            other.m_hash = nullptr;
+        }
+        return *this;
+    }
     
     /**
      * @brief Explicitly destroy the hash object.
-     *
-     * Safe to call multiple times. Sets hash to 0 after destroying.
      */
     void Destroy() noexcept {
-        if (m_hash != 0) {
-            (void)::CryptDestroyHash(m_hash);
-            m_hash = 0;
+        if (m_hash != nullptr) {
+            BCryptDestroyHash(m_hash);
+            m_hash = nullptr;
         }
     }
     
     /**
      * @brief Get the hash handle.
-     * @return The underlying HCRYPTHASH
+     * @return The underlying BCRYPT_HASH_HANDLE
      */
-    [[nodiscard]] HCRYPTHASH Get() const noexcept { 
-        return m_hash; 
-    }
+    [[nodiscard]] BCRYPT_HASH_HANDLE Get() const noexcept { return m_hash; }
     
     /**
-     * @brief Get pointer to hash handle (for CryptCreateHash).
-     * @return Pointer to the underlying HCRYPTHASH
+     * @brief Get pointer to hash handle.
+     * @return Pointer to the underlying BCRYPT_HASH_HANDLE
      */
-    [[nodiscard]] HCRYPTHASH* Ptr() noexcept { 
-        return &m_hash; 
-    }
+    [[nodiscard]] BCRYPT_HASH_HANDLE* Ptr() noexcept { return &m_hash; }
     
     /**
      * @brief Check if hash is valid.
-     * @return true if hash is not 0
+     * @return true if hash is not nullptr
      */
-    [[nodiscard]] bool IsValid() const noexcept { 
-        return m_hash != 0; 
-    }
+    [[nodiscard]] bool IsValid() const noexcept { return m_hash != nullptr; }
     
     /**
      * @brief Implicit bool conversion for if-checks.
      * @return true if hash is valid
      */
-    [[nodiscard]] explicit operator bool() const noexcept {
-        return IsValid();
-    }
+    [[nodiscard]] explicit operator bool() const noexcept { return IsValid(); }
 
 private:
-    HCRYPTHASH m_hash;  ///< The underlying crypto hash handle
+    BCRYPT_HASH_HANDLE m_hash;  ///< The underlying hash handle
 };
 
 // ============================================================================
@@ -1730,7 +1773,7 @@ uint32_t ComputeHeaderCRC32(const WhitelistDatabaseHeader* header) noexcept {
  * Computes SHA-256 hash of the database, excluding the sha256Checksum field
  * in the header. This allows the checksum to be stored within the file.
  *
- * Uses Windows CryptoAPI for FIPS 140-2 compliant implementation.
+ * Uses Windows CNG (BCrypt) API for FIPS 140-2 compliant, thread-safe implementation.
  * Processes large files in 1MB chunks to avoid memory pressure.
  *
  * @param view Memory-mapped view of the database
@@ -1765,39 +1808,32 @@ bool ComputeDatabaseChecksum(
     outChecksum.fill(0);
     
     // ========================================================================
-    // ACQUIRE CRYPTO CONTEXT
+    // OPEN CNG ALGORITHM PROVIDER (Thread-Safe)
     // ========================================================================
     //
-    // Use PROV_RSA_AES provider for SHA-256 support.
-    // CRYPT_VERIFYCONTEXT avoids key container creation.
+    // CNG (BCrypt) API is thread-safe and modern, replacing deprecated CAPI.
+    // This is critical for multi-threaded antivirus scanning!
     //
     // ========================================================================
     
-    CryptoContextGuard cryptProv;
-    if (!::CryptAcquireContextW(
-            cryptProv.Ptr(), 
-            nullptr,           // No key container
-            nullptr,           // Default provider
-            PROV_RSA_AES,      // Provider with SHA-256
-            CRYPT_VERIFYCONTEXT)) {
-        SS_LOG_LAST_ERROR(L"Whitelist", L"CryptAcquireContext failed");
+    BCryptAlgGuard algGuard;
+    if (!algGuard.Open(BCRYPT_SHA256_ALGORITHM)) {
+        SS_LOG_ERROR(L"Whitelist", L"BCryptOpenAlgorithmProvider failed");
         return false;
     }
     
     // ========================================================================
-    // CREATE HASH OBJECT
+    // CREATE HASH OBJECT (CNG)
     // ========================================================================
     
-    CryptoHashGuard cryptHash;
-    if (!::CryptCreateHash(
-            cryptProv.Get(), 
-            CALG_SHA_256, 
-            0,      // No key for hash
-            0,      // Reserved
-            cryptHash.Ptr())) {
-        SS_LOG_LAST_ERROR(L"Whitelist", L"CryptCreateHash failed");
+    BCRYPT_HASH_HANDLE hHashRaw = nullptr;
+    NTSTATUS status = BCryptCreateHash(algGuard.Get(), &hHashRaw, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        SS_LOG_ERROR(L"Whitelist", L"BCryptCreateHash failed (status: 0x%08X)", 
+                     static_cast<unsigned int>(status));
         return false;
     }
+    BCryptHashGuard hashGuard(hHashRaw);
     
     // ========================================================================
     // HASH DATABASE CONTENTS
@@ -1824,12 +1860,13 @@ bool ComputeDatabaseChecksum(
             return false;
         }
         
-        if (!::CryptHashData(
-                cryptHash.Get(), 
-                data, 
-                static_cast<DWORD>(kChecksumOffset), 
-                0)) {
-            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (header prefix) failed");
+        status = BCryptHashData(hashGuard.Get(), 
+                               const_cast<PUCHAR>(data), 
+                               static_cast<ULONG>(kChecksumOffset), 
+                               0);
+        if (!BCRYPT_SUCCESS(status)) {
+            SS_LOG_ERROR(L"Whitelist", L"BCryptHashData (header prefix) failed (status: 0x%08X)",
+                         static_cast<unsigned int>(status));
             return false;
         }
     }
@@ -1841,12 +1878,13 @@ bool ComputeDatabaseChecksum(
                   "Invalid header layout calculation");
     
     if (kRemainingHeader > 0u) {
-        if (!::CryptHashData(
-                cryptHash.Get(), 
-                data + kPostChecksumOffset, 
-                static_cast<DWORD>(kRemainingHeader), 
-                0)) {
-            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (header suffix) failed");
+        status = BCryptHashData(hashGuard.Get(), 
+                               const_cast<PUCHAR>(data + kPostChecksumOffset), 
+                               static_cast<ULONG>(kRemainingHeader), 
+                               0);
+        if (!BCRYPT_SUCCESS(status)) {
+            SS_LOG_ERROR(L"Whitelist", L"BCryptHashData (header suffix) failed (status: 0x%08X)",
+                         static_cast<unsigned int>(status));
             return false;
         }
     }
@@ -1869,18 +1907,19 @@ bool ComputeDatabaseChecksum(
             PrefetchRead(data + offset + chunkSize);
         }
         
-        // Validate chunk size fits in DWORD
-        if (chunkSize > static_cast<size_t>((std::numeric_limits<DWORD>::max)())) [[unlikely]] {
-            SS_LOG_ERROR(L"Whitelist", L"Chunk size exceeds DWORD maximum");
+        // Validate chunk size fits in ULONG
+        if (chunkSize > static_cast<size_t>((std::numeric_limits<ULONG>::max)())) [[unlikely]] {
+            SS_LOG_ERROR(L"Whitelist", L"Chunk size exceeds ULONG maximum");
             return false;
         }
         
-        if (!::CryptHashData(
-                cryptHash.Get(), 
-                data + offset, 
-                static_cast<DWORD>(chunkSize), 
-                0)) {
-            SS_LOG_LAST_ERROR(L"Whitelist", L"CryptHashData (data chunk at 0x%zX) failed", offset);
+        status = BCryptHashData(hashGuard.Get(), 
+                               const_cast<PUCHAR>(data + offset), 
+                               static_cast<ULONG>(chunkSize), 
+                               0);
+        if (!BCRYPT_SUCCESS(status)) {
+            SS_LOG_ERROR(L"Whitelist", L"BCryptHashData (data chunk at 0x%zX) failed (status: 0x%08X)", 
+                         offset, static_cast<unsigned int>(status));
             return false;
         }
         
@@ -1888,25 +1927,14 @@ bool ComputeDatabaseChecksum(
     }
     
     // ========================================================================
-    // RETRIEVE HASH VALUE
+    // FINALIZE AND RETRIEVE HASH VALUE (CNG)
     // ========================================================================
     
-    DWORD hashLen = static_cast<DWORD>(outChecksum.size());
-    if (!::CryptGetHashParam(
-            cryptHash.Get(), 
-            HP_HASHVAL, 
-            outChecksum.data(), 
-            &hashLen, 
-            0)) {
-        SS_LOG_LAST_ERROR(L"Whitelist", L"CryptGetHashParam failed");
-        return false;
-    }
-    
-    // Verify we got the expected hash length
-    if (hashLen != 32u) {
-        SS_LOG_ERROR(L"Whitelist", 
-            L"Unexpected hash length: expected 32, got %lu", 
-            static_cast<unsigned long>(hashLen));
+    status = BCryptFinishHash(hashGuard.Get(), outChecksum.data(), 
+                              static_cast<ULONG>(outChecksum.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        SS_LOG_ERROR(L"Whitelist", L"BCryptFinishHash failed (status: 0x%08X)",
+                     static_cast<unsigned int>(status));
         return false;
     }
     
@@ -3590,15 +3618,23 @@ bool CreateDatabase(
         ::CoUninitialize();
     }
     
-    // Fallback: use CryptoAPI for random bytes
+    // Fallback: use BCrypt for secure random bytes (CNG API - modern and thread-safe)
     if (!uuidGenerated) {
-        CryptoContextGuard cryptProv;
-        if (::CryptAcquireContextW(
-                cryptProv.Ptr(), nullptr, nullptr, 
-                PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-            (void)::CryptGenRandom(cryptProv.Get(), 16, header->databaseUuid.data());
-        } else {
+        // BCryptGenRandom is the modern replacement for CryptGenRandom
+        // It's thread-safe and uses the system's cryptographic random number generator
+        NTSTATUS status = ::BCryptGenRandom(
+            nullptr,                          // Use default RNG algorithm provider
+            header->databaseUuid.data(),      // Output buffer
+            static_cast<ULONG>(header->databaseUuid.size()), // Buffer size
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG   // Use system preferred RNG
+        );
+        
+        if (!BCRYPT_SUCCESS(status)) {
             // Last resort: use timestamp-based pseudo-random
+            // This should rarely happen as BCryptGenRandom is highly reliable
+            SS_LOG_WARN(L"Whitelist", 
+                L"BCryptGenRandom failed (status: 0x%08X), using timestamp fallback", 
+                status);
             const auto now = std::chrono::high_resolution_clock::now()
                                 .time_since_epoch().count();
             std::memcpy(header->databaseUuid.data(), &now, 

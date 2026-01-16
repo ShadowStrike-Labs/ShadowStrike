@@ -1,3 +1,88 @@
+/**
+ * ============================================================================
+ * ShadowStrike ConfigurationDB - HEADER
+ * ============================================================================
+ *
+ * @file ConfigurationDB.hpp
+ * @brief Enterprise-grade SQLite-backed configuration management system.
+ *
+ * This module provides a comprehensive configuration storage and management
+ * system designed for enterprise antivirus deployments. It serves as the
+ * persistence layer for user preferences, policies, and system settings.
+ *
+ * Architecture Position:
+ * ----------------------
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │                    GUI / Management API                      │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                                 │
+ *                                 ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │              ConfigurationDB (SQLite Layer)                  │ ◄── YOU ARE HERE
+ *   │  - User preferences, policies, audit logs                    │
+ *   │  - Versioned configurations with rollback                    │
+ *   │  - Change notifications for hot-reload                       │
+ *   │  - DPAPI encryption for sensitive values                     │
+ *   └─────────────────────────────────────────────────────────────┘
+ *                                 │
+ *                                 ▼
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │           Memory-Mapped Stores (High-Performance)            │
+ *   │  - SignatureIndex, HashStore, PatternStore                   │
+ *   │  - Sub-microsecond query latency                             │
+ *   │  - Lock-free concurrent access                               │
+ *   └─────────────────────────────────────────────────────────────┘
+ *
+ * Key Features:
+ * -------------
+ * - HIERARCHICAL KEYS: Dot-notation (e.g., "network.proxy.host")
+ * - MULTI-TYPE VALUES: String, Integer, Real, Boolean, JSON, Binary
+ * - ENCRYPTION: Windows DPAPI for sensitive values
+ * - VERSION CONTROL: Full history with rollback capability
+ * - AUDIT LOG: Complete change tracking with reasons
+ * - HOT-RELOAD: Background delta-sync with change notifications
+ * - VALIDATION: Regex, bounds, custom validators
+ * - IMPORT/EXPORT: JSON and XML support
+ *
+ * Thread Safety:
+ * --------------
+ * All public methods are thread-safe. The class uses reader-writer locks
+ * for cache access and mutex protection for state modifications.
+ *
+ * Usage Example:
+ * --------------
+ * @code
+ * // Initialize
+ * ConfigurationDB::Config cfg;
+ * cfg.dbPath = L"C:\\ProgramData\\ShadowStrike\\config.db";
+ * cfg.enableEncryption = true;
+ * cfg.masterKey = generateSecureKey();
+ * 
+ * auto& db = ConfigurationDB::Instance();
+ * db.Initialize(cfg);
+ * 
+ * // Set configuration values
+ * db.SetString(L"network.proxy.host", L"proxy.example.com");
+ * db.SetInt(L"scan.max_threads", 8);
+ * db.SetBool(L"ui.dark_mode", true);
+ * 
+ * // Get with defaults
+ * auto host = db.GetString(L"network.proxy.host", L"localhost");
+ * auto threads = db.GetInt(L"scan.max_threads", 4);
+ * 
+ * // Register for change notifications
+ * db.RegisterChangeListener(L"scan.*", [](auto key, auto oldVal, auto newVal) {
+ *     // Handle scan configuration changes
+ * });
+ * @endcode
+ *
+ * @author ShadowStrike Security Team
+ * @copyright 2026 ShadowStrike Security Suite
+ * @version 1.0.0
+ *
+ * ============================================================================
+ */
+
 #pragma once
 
 #include "DatabaseManager.hpp"
@@ -21,170 +106,308 @@ namespace ShadowStrike {
     namespace Database {
 
         // ============================================================================
-        // ConfigurationDB - Secure Configuration Management System
+        // ConfigurationDB - ENTERPRISE CONFIGURATION MANAGEMENT
         // ============================================================================
 
         /**
-         * @brief Enterprise-grade configuration management with encryption, validation,
-         *        versioning, change tracking, and centralized policy management.
+         * @class ConfigurationDB
+         * @brief Thread-safe singleton for enterprise configuration management.
          * 
-         * Features:
-         * - Hierarchical configuration keys (e.g., "network.proxy.host")
-         * - Multiple data types (string, int, double, bool, JSON, binary)
-         * - Encryption for sensitive values (passwords, keys, tokens)
-         * - Configuration versioning and rollback
-         * - Change tracking and audit trail
-         * - Configuration validation and schema enforcement
-         * - Hot-reload and change notifications
-         * - Import/Export (JSON, XML)
-         * - Group-based configurations (per-agent, per-group, global)
-         * - Read-only system configs vs user-modifiable configs
+         * Provides a complete configuration management solution with support for:
+         * 
+         * @par Hierarchical Key Organization
+         * Keys use dot-notation for logical grouping:
+         * - `network.proxy.host` - Network proxy hostname
+         * - `network.proxy.port` - Network proxy port
+         * - `scan.realtime.enabled` - Real-time scanning toggle
+         * 
+         * @par Multi-Type Value Storage
+         * Values are stored as a variant supporting:
+         * - String (std::wstring)
+         * - Integer (int64_t)
+         * - Real (double)
+         * - Boolean (bool)
+         * - JSON (nlohmann::json)
+         * - Binary (std::vector<uint8_t>)
+         * 
+         * @par Scope-Based Access Control
+         * - System: Read-only after deployment
+         * - Global: Admin-modifiable settings
+         * - Group: Team/department specific
+         * - Agent: Per-machine settings
+         * - User: User preferences
+         * 
+         * @par Security Features
+         * - DPAPI encryption for sensitive values
+         * - Read-only protection for system configs
+         * - Validation rules with custom validators
+         * - Complete audit trail
+         * 
+         * @note This class is a singleton. Use Instance() to access.
+         * @see Initialize() for setup requirements
+         * @see Shutdown() for cleanup
          */
         class ConfigurationDB {
         public:
             // ============================================================================
-            // Types & Structures
+            // TYPE DEFINITIONS
             // ============================================================================
 
+            /**
+             * @enum ValueType
+             * @brief Identifies the type of a configuration value for serialization.
+             */
             enum class ValueType : uint8_t {
-                String,
-                Integer,
-                Real,
-                Boolean,
-                Json,
-                Binary,
-                Encrypted
+                String,     ///< UTF-16 string (std::wstring)
+                Integer,    ///< 64-bit signed integer
+                Real,       ///< Double-precision floating point
+                Boolean,    ///< Boolean value
+                Json,       ///< JSON object (nlohmann::json)
+                Binary,     ///< Raw binary data
+                Encrypted   ///< DPAPI-encrypted binary data
             };
 
+            /**
+             * @enum ConfigScope
+             * @brief Defines the access scope and override priority of a configuration.
+             * 
+             * Scopes form a hierarchy where more specific scopes can override
+             * more general ones (User > Agent > Group > Global > System).
+             */
             enum class ConfigScope : uint8_t {
-                System,     // System-wide, read-only after deployment
-                Global,     // Global settings (admin-modifiable)
-                Group,      // Group-specific settings
-                Agent,      // Agent-specific settings
-                User        // User-specific settings
+                System,     ///< System-wide, read-only after deployment
+                Global,     ///< Global settings (admin-modifiable)
+                Group,      ///< Group-specific settings
+                Agent,      ///< Agent-specific settings
+                User        ///< User-specific settings (highest priority)
             };
 
+            /**
+             * @enum ChangeAction
+             * @brief Types of changes recorded in the audit log.
+             */
             enum class ChangeAction : uint8_t {
-                Created,
-                Modified,
-                Deleted,
-                Encrypted,
-                Decrypted
+                Created,    ///< New configuration key created
+                Modified,   ///< Existing value changed
+                Deleted,    ///< Configuration key removed
+                Encrypted,  ///< Value was encrypted
+                Decrypted   ///< Value was decrypted
             };
 
-            // Configuration value (variant)
+            /**
+             * @typedef ConfigValue
+             * @brief Type-safe variant for configuration values.
+             * 
+             * Supports all value types that can be stored in the configuration
+             * database. Use std::get_if<T> or std::holds_alternative<T> to
+             * access the underlying value.
+             */
             using ConfigValue = std::variant<
-                std::wstring,           // String
-                int64_t,                // Integer
-                double,                 // Real
-                bool,                   // Boolean
-                Utils::JSON::Json,      // JSON object
-                std::vector<uint8_t>    // Binary/Encrypted
+                std::wstring,           ///< String values
+                int64_t,                ///< Integer values
+                double,                 ///< Real (floating point) values
+                bool,                   ///< Boolean values
+                Utils::JSON::Json,      ///< JSON objects
+                std::vector<uint8_t>    ///< Binary/Encrypted data
             >;
 
+            /**
+             * @struct ConfigEntry
+             * @brief Complete configuration entry with metadata.
+             * 
+             * Contains the configuration value along with all associated
+             * metadata including type, scope, encryption status, timestamps,
+             * and version information.
+             */
             struct ConfigEntry {
-                std::wstring key;
-                ConfigValue value;
-                ValueType type;
-                ConfigScope scope;
-                bool isEncrypted = false;
-                bool isReadOnly = false;
-                std::wstring description;
-                std::chrono::system_clock::time_point createdAt;
-                std::chrono::system_clock::time_point modifiedAt;
-                std::wstring modifiedBy;
-                int version = 1;
+                std::wstring key;                               ///< Hierarchical key (dot-notation)
+                ConfigValue value;                              ///< The configuration value
+                ValueType type;                                 ///< Value type for serialization
+                ConfigScope scope;                              ///< Access scope
+                bool isEncrypted = false;                       ///< Whether value is DPAPI-encrypted
+                bool isReadOnly = false;                        ///< Prevents modification
+                std::wstring description;                       ///< Human-readable description
+                std::chrono::system_clock::time_point createdAt;   ///< Creation timestamp
+                std::chrono::system_clock::time_point modifiedAt;  ///< Last modification timestamp
+                std::wstring modifiedBy;                        ///< User/system that made last change
+                int version = 1;                                ///< Version number for history
             };
 
+            /**
+             * @struct ChangeRecord
+             * @brief Audit log entry for a configuration change.
+             */
             struct ChangeRecord {
                 int64_t changeId = 0;
                 std::wstring key;
                 ChangeAction action;
                 ConfigValue oldValue;
-                ConfigValue newValue;
-                std::wstring changedBy;
-                std::chrono::system_clock::time_point timestamp;
-                std::wstring reason;
+                ConfigValue newValue;                               ///< Value after change
+                std::wstring changedBy;                             ///< Who made the change
+                std::chrono::system_clock::time_point timestamp;    ///< When the change occurred
+                std::wstring reason;                                ///< Optional reason for the change
             };
 
+            /**
+             * @struct ValidationRule
+             * @brief Defines validation constraints for a configuration key.
+             * 
+             * Validation rules can enforce:
+             * - Expected data type
+             * - Required presence
+             * - String patterns (regex)
+             * - Numeric bounds (min/max)
+             * - Allowed value lists
+             * - Custom validation logic
+             */
             struct ValidationRule {
-                std::wstring key;
-                ValueType expectedType;
-                bool required = false;
-                std::wstring pattern;           // Regex for string validation
-                std::optional<int64_t> minInt;
-                std::optional<int64_t> maxInt;
-                std::optional<double> minReal;
-                std::optional<double> maxReal;
-                std::vector<std::wstring> allowedValues;
-                std::function<bool(const ConfigValue&)> customValidator;
+                std::wstring key;                               ///< Key to validate
+                ValueType expectedType;                         ///< Required value type
+                bool required = false;                          ///< Whether key must exist
+                std::wstring pattern;                           ///< Regex pattern for string validation
+                std::optional<int64_t> minInt;                  ///< Minimum value for integers
+                std::optional<int64_t> maxInt;                  ///< Maximum value for integers
+                std::optional<double> minReal;                  ///< Minimum value for reals
+                std::optional<double> maxReal;                  ///< Maximum value for reals
+                std::vector<std::wstring> allowedValues;        ///< List of permitted string values
+                std::function<bool(const ConfigValue&)> customValidator; ///< Custom validation function
             };
 
+            /**
+             * @struct Config
+             * @brief Configuration settings for the ConfigurationDB instance.
+             * 
+             * These settings control security, performance, and behavior
+             * of the configuration database system.
+             */
             struct Config {
-                std::wstring dbPath = L"C:\\ProgramData\\Bitdefender\\ShadowStrike\\config.db";
+                /// @name Database Location
+                /// @{
+                std::wstring dbPath = L"C:\\ProgramData\\ShadowStrike\\config.db";
+                /// @}
                 
-                // Security
-                bool enableEncryption = true;
-                std::vector<uint8_t> masterKey;     // AES-256 key for encryption
-                bool requireStrongKeys = true;       // Enforce key strength
+                /// @name Security Settings
+                /// @{
+                bool enableEncryption = true;           ///< Enable DPAPI encryption
+                std::vector<uint8_t> masterKey;         ///< Entropy for DPAPI (256-bit recommended)
+                bool requireStrongKeys = true;          ///< Enforce minimum key length (32 bytes)
+                /// @}
                 
-                // Audit
-                bool enableAuditLog = true;
-                bool trackAllChanges = true;
-                size_t maxAuditRecords = 100000;
+                /// @name Audit Settings
+                /// @{
+                bool enableAuditLog = true;             ///< Track all configuration changes
+                bool trackAllChanges = true;            ///< Include old/new values in audit log
+                size_t maxAuditRecords = 100000;        ///< Maximum audit records to retain
+                /// @}
                 
-                // Versioning
-                bool enableVersioning = true;
-                size_t maxVersionsPerKey = 10;
+                /// @name Versioning Settings
+                /// @{
+                bool enableVersioning = true;           ///< Keep version history
+                size_t maxVersionsPerKey = 10;          ///< Maximum versions to retain per key
+                /// @}
                 
-                // Validation
-                bool enforceValidation = true;
-                bool allowUnknownKeys = false;
+                /// @name Validation Settings
+                /// @{
+                bool enforceValidation = true;          ///< Validate values before writing
+                bool allowUnknownKeys = false;          ///< Allow keys without validation rules
+                /// @}
                 
-                // Performance
-                bool enableCaching = true;
-                size_t maxCacheEntries = 10000;
+                /// @name Performance Settings
+                /// @{
+                bool enableCaching = true;              ///< Enable in-memory cache
+                size_t maxCacheEntries = 10000;         ///< Maximum cached entries
                 std::chrono::milliseconds cacheRefreshInterval = std::chrono::minutes(5);
+                /// @}
                 
-                // Hot-reload
-                bool enableHotReload = true;
+                /// @name Hot-Reload Settings
+                /// @{
+                bool enableHotReload = true;            ///< Enable background sync
                 std::chrono::milliseconds hotReloadInterval = std::chrono::seconds(30);
+                /// @}
             };
 
+            /**
+             * @struct Statistics
+             * @brief Runtime statistics for monitoring and diagnostics.
+             * 
+             * Provides insight into database usage patterns and cache
+             * performance for capacity planning and optimization.
+             */
             struct Statistics {
-                size_t totalKeys = 0;
-                size_t systemKeys = 0;
-                size_t globalKeys = 0;
-                size_t groupKeys = 0;
-                size_t agentKeys = 0;
-                size_t encryptedKeys = 0;
-                size_t readOnlyKeys = 0;
+                /// @name Key Counts
+                /// @{
+                size_t totalKeys = 0;                   ///< Total configuration keys
+                size_t systemKeys = 0;                  ///< System-scope keys
+                size_t globalKeys = 0;                  ///< Global-scope keys
+                size_t groupKeys = 0;                   ///< Group-scope keys
+                size_t agentKeys = 0;                   ///< Agent-scope keys
+                size_t encryptedKeys = 0;               ///< Keys with encrypted values
+                size_t readOnlyKeys = 0;                ///< Read-only keys
+                /// @}
                 
-                uint64_t totalReads = 0;
-                uint64_t totalWrites = 0;
-                uint64_t totalDeletes = 0;
-                uint64_t cacheHits = 0;
-                uint64_t cacheMisses = 0;
+                /// @name Operation Counters
+                /// @{
+                uint64_t totalReads = 0;                ///< Total read operations
+                uint64_t totalWrites = 0;               ///< Total write operations
+                uint64_t totalDeletes = 0;              ///< Total delete operations
+                /// @}
                 
-                size_t totalChanges = 0;
-                std::chrono::system_clock::time_point lastChange;
+                /// @name Cache Statistics
+                /// @{
+                uint64_t cacheHits = 0;                 ///< Cache hit count
+                uint64_t cacheMisses = 0;               ///< Cache miss count
+                /// @}
+                
+                /// @name Change Tracking
+                /// @{
+                size_t totalChanges = 0;                ///< Total changes recorded
+                std::chrono::system_clock::time_point lastChange; ///< Time of last change
+                /// @}
             };
 
             // ============================================================================
-            // Lifecycle
+            // LIFECYCLE MANAGEMENT
             // ============================================================================
 
+            /**
+             * @brief Returns the singleton instance.
+             * @return Reference to the ConfigurationDB singleton
+             */
             static ConfigurationDB& Instance();
 
+            /**
+             * @brief Initializes the configuration database.
+             * @param config Configuration settings
+             * @param err Optional error output
+             * @return true if initialization succeeded
+             */
             bool Initialize(const Config& config, DatabaseError* err = nullptr);
+            
+            /**
+             * @brief Gracefully shuts down the database.
+             */
             void Shutdown();
+            
+            /**
+             * @brief Checks if the database is initialized.
+             * @return true if Initialize() was called successfully
+             */
             bool IsInitialized() const noexcept { return m_initialized.load(); }
 
             // ============================================================================
-            // Basic Operations
+            // BASIC OPERATIONS
             // ============================================================================
 
-            // Set configuration value
+            /**
+             * @brief Sets a configuration value.
+             * @param key Hierarchical key (dot-notation)
+             * @param value The value to store
+             * @param scope Access scope for the key
+             * @param changedBy Identifier for audit log
+             * @param reason Optional reason for the change
+             * @param err Optional error output
+             * @return true if the value was set successfully
+             */
             bool Set(std::wstring_view key,
                     const ConfigValue& value,
                     ConfigScope scope = ConfigScope::Global,

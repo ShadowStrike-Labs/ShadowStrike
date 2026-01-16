@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /**
  * @file PE_sig_verf.cpp
  * @brief Implementation of PE digital signature verification utilities.
@@ -17,6 +18,7 @@
  * @copyright ShadowStrike Security Suite
  * @author ShadowStrike Security Team
  */
+#include"pch.h"
 #include "PE_sig_verf.hpp"
 #include "StringUtils.hpp"
 

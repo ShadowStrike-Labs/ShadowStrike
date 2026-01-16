@@ -1,4 +1,6 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /**
  * @file Logger.cpp
  * @brief Implementation of the thread-safe asynchronous logging system.
@@ -11,6 +13,7 @@
  * - Source location tracking and timing measurements
  */
 
+#include"pch.h"
 #include "Logger.hpp"
 
 #include <algorithm>

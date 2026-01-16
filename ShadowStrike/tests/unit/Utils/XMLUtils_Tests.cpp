@@ -1,4 +1,8 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
+#include "pch.h"
 /*
  * ============================================================================
  * ShadowStrike XMLUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -21,6 +25,7 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/Utils/XMLUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <string>
 #include <filesystem>
@@ -71,6 +76,7 @@ protected:
 // PARSE TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Parse_ValidXML_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_ValidXML_Success] Testing...");
     std::string xml = R"(<?xml version="1.0"?>
 <root>
     <item id="1">Value</item>
@@ -85,6 +91,7 @@ TEST_F(XMLUtilsTest, Parse_ValidXML_Success) {
 }
 
 TEST_F(XMLUtilsTest, Parse_InvalidXML_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_InvalidXML_Fails] Testing...");
     std::string xml = R"(<root><item>Unclosed)";
     
     Document doc;
@@ -96,6 +103,7 @@ TEST_F(XMLUtilsTest, Parse_InvalidXML_Fails) {
 }
 
 TEST_F(XMLUtilsTest, Parse_EmptyXML_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_EmptyXML_Fails] Testing...");
     std::string xml = "";
     
     Document doc;
@@ -106,6 +114,7 @@ TEST_F(XMLUtilsTest, Parse_EmptyXML_Fails) {
 }
 
 TEST_F(XMLUtilsTest, Parse_UTF8BOM_Stripped) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_UTF8BOM_Stripped] Testing...");
     // XML with UTF-8 BOM (not directly tested by Parse, but via LoadFromFile)
     std::string xml = "<?xml version=\"1.0\"?><root/>";
     
@@ -117,6 +126,7 @@ TEST_F(XMLUtilsTest, Parse_UTF8BOM_Stripped) {
 }
 
 TEST_F(XMLUtilsTest, Parse_WithComments_Allowed) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_WithComments_Allowed] Testing...");
     std::string xml = R"(<?xml version="1.0"?>
 <root>
     <!-- This is a comment -->
@@ -133,6 +143,7 @@ TEST_F(XMLUtilsTest, Parse_WithComments_Allowed) {
 }
 
 TEST_F(XMLUtilsTest, Parse_WithComments_Disallowed) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_WithComments_Disallowed] Testing...");
     std::string xml = R"(<?xml version="1.0"?>
 <root>
     <!-- This is a comment -->
@@ -152,6 +163,7 @@ TEST_F(XMLUtilsTest, Parse_WithComments_Disallowed) {
 // SECURITY TEST: BUG #3 - XML BOMB (ENTITY EXPANSION)
 // ============================================================================
 TEST_F(XMLUtilsTest, Security_XMLBomb_EntityExpansion_Blocked) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_XMLBomb_EntityExpansion_Blocked] Testing...");
     // Classic "Billion Laughs" XML bomb
     std::string xmlBomb = R"(<?xml version="1.0"?>
 <!DOCTYPE lolz [
@@ -190,6 +202,7 @@ TEST_F(XMLUtilsTest, Security_XMLBomb_EntityExpansion_Blocked) {
 // STRINGIFY TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Stringify_ValidDocument_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Stringify_ValidDocument_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Value";
@@ -206,6 +219,7 @@ TEST_F(XMLUtilsTest, Stringify_ValidDocument_Success) {
 }
 
 TEST_F(XMLUtilsTest, Stringify_PrettyPrint_Formatted) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Stringify_PrettyPrint_Formatted] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Value";
@@ -222,6 +236,7 @@ TEST_F(XMLUtilsTest, Stringify_PrettyPrint_Formatted) {
 }
 
 TEST_F(XMLUtilsTest, Stringify_EmptyDocument_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Stringify_EmptyDocument_Success] Testing...");
     Document doc;
     
     std::string out;
@@ -240,6 +255,7 @@ TEST_F(XMLUtilsTest, Stringify_EmptyDocument_Success) {
 // MINIFY / PRETTIFY TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Minify_RemovesWhitespace) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Minify_RemovesWhitespace] Testing...");
     std::string xml = R"(<?xml version="1.0"?>
 <root>
     <item>
@@ -260,6 +276,7 @@ TEST_F(XMLUtilsTest, Minify_RemovesWhitespace) {
 }
 
 TEST_F(XMLUtilsTest, Prettify_AddsFormatting) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Prettify_AddsFormatting] Testing...");
     std::string xml = "<?xml version=\"1.0\"?><root><item>Value</item></root>";
     
     std::string out;
@@ -282,6 +299,7 @@ TEST_F(XMLUtilsTest, Prettify_AddsFormatting) {
 }
 
 TEST_F(XMLUtilsTest, MinifyThenPrettify_RoundTrip) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[MinifyThenPrettify_RoundTrip] Testing...");
     std::string originalXml = R"(<?xml version="1.0"?>
 <root>
     <item id="1">Value1</item>
@@ -304,6 +322,7 @@ TEST_F(XMLUtilsTest, MinifyThenPrettify_RoundTrip) {
 // FILE I/O TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, LoadFromFile_ValidFile_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_ValidFile_Success] Testing...");
     std::string xml = R"(<?xml version="1.0"?>
 <root>
     <item>Value</item>
@@ -320,6 +339,7 @@ TEST_F(XMLUtilsTest, LoadFromFile_ValidFile_Success) {
 }
 
 TEST_F(XMLUtilsTest, LoadFromFile_NonExistent_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_NonExistent_Fails] Testing...");
     Document doc;
     Error err;
     
@@ -329,6 +349,7 @@ TEST_F(XMLUtilsTest, LoadFromFile_NonExistent_Fails) {
 }
 
 TEST_F(XMLUtilsTest, LoadFromFile_EmptyFile_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_EmptyFile_Fails] Testing...");
     createTestFile("empty.xml", "");
     
     Document doc;
@@ -339,6 +360,7 @@ TEST_F(XMLUtilsTest, LoadFromFile_EmptyFile_Fails) {
 }
 
 TEST_F(XMLUtilsTest, LoadFromFile_UTF8BOM_Handled) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_UTF8BOM_Handled] Testing...");
     std::string xml = "\xEF\xBB\xBF<?xml version=\"1.0\"?><root/>";
     createTestFile("bom.xml", xml);
     
@@ -350,6 +372,7 @@ TEST_F(XMLUtilsTest, LoadFromFile_UTF8BOM_Handled) {
 }
 
 TEST_F(XMLUtilsTest, SaveToFile_ValidDocument_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[SaveToFile_ValidDocument_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Value";
@@ -367,6 +390,7 @@ TEST_F(XMLUtilsTest, SaveToFile_ValidDocument_Success) {
 }
 
 TEST_F(XMLUtilsTest, SaveToFile_AtomicReplace_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[SaveToFile_AtomicReplace_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Value";
@@ -382,6 +406,7 @@ TEST_F(XMLUtilsTest, SaveToFile_AtomicReplace_Success) {
 }
 
 TEST_F(XMLUtilsTest, SaveToFile_WithBOM_Written) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[SaveToFile_WithBOM_Written] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -404,6 +429,7 @@ TEST_F(XMLUtilsTest, SaveToFile_WithBOM_Written) {
 // SECURITY TEST: BUG #1, #4, #9 - PATH TRAVERSAL / RACE CONDITION / SYMLINK
 // ============================================================================
 TEST_F(XMLUtilsTest, Security_TempFileGeneration_Secure) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_TempFileGeneration_Secure] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -431,6 +457,7 @@ TEST_F(XMLUtilsTest, Security_TempFileGeneration_Secure) {
 // XPATH CONVERSION TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, ToXPath_SimplePath_Converted) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_SimplePath_Converted] Testing...");
     std::string pathLike = "root.item";
     std::string xpath = ToXPath(pathLike);
     
@@ -438,6 +465,7 @@ TEST_F(XMLUtilsTest, ToXPath_SimplePath_Converted) {
 }
 
 TEST_F(XMLUtilsTest, ToXPath_WithAttribute_Converted) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_WithAttribute_Converted] Testing...");
     std::string pathLike = "root.item.@id";
     std::string xpath = ToXPath(pathLike);
     
@@ -445,6 +473,7 @@ TEST_F(XMLUtilsTest, ToXPath_WithAttribute_Converted) {
 }
 
 TEST_F(XMLUtilsTest, ToXPath_WithIndex_Converted) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_WithIndex_Converted] Testing...");
     std::string pathLike = "root.item[2]";
     std::string xpath = ToXPath(pathLike);
     
@@ -453,6 +482,7 @@ TEST_F(XMLUtilsTest, ToXPath_WithIndex_Converted) {
 }
 
 TEST_F(XMLUtilsTest, ToXPath_AlreadyXPath_Unchanged) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_AlreadyXPath_Unchanged] Testing...");
     std::string xpath = "/root/item";
     std::string result = ToXPath(xpath);
     
@@ -460,6 +490,7 @@ TEST_F(XMLUtilsTest, ToXPath_AlreadyXPath_Unchanged) {
 }
 
 TEST_F(XMLUtilsTest, ToXPath_EmptyPath_ReturnsRoot) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_EmptyPath_ReturnsRoot] Testing...");
     std::string pathLike = "";
     std::string xpath = ToXPath(pathLike);
     
@@ -470,6 +501,7 @@ TEST_F(XMLUtilsTest, ToXPath_EmptyPath_ReturnsRoot) {
 // SECURITY TEST: BUG #2 - INTEGER OVERFLOW (INDEX PARSING)
 // ============================================================================
 TEST_F(XMLUtilsTest, Security_IntegerOverflow_IndexParsing_Protected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_IntegerOverflow_IndexParsing_Protected] Testing...");
     // Test with extremely large index
     std::string pathLike = "root.item[999999999999999999999]";
     std::string xpath = ToXPath(pathLike);
@@ -480,6 +512,7 @@ TEST_F(XMLUtilsTest, Security_IntegerOverflow_IndexParsing_Protected) {
 }
 
 TEST_F(XMLUtilsTest, Security_IntegerOverflow_MaxIndex_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_IntegerOverflow_MaxIndex_Rejected] Testing...");
     // Test with index exceeding MAX_INDEX (100000)
     std::string pathLike = "root.item[200000]";
     std::string xpath = ToXPath(pathLike);
@@ -492,6 +525,7 @@ TEST_F(XMLUtilsTest, Security_IntegerOverflow_MaxIndex_Rejected) {
 // CONTAINS TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Contains_ExistingElement_ReturnsTrue) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Contains_ExistingElement_ReturnsTrue] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Value";
@@ -500,6 +534,7 @@ TEST_F(XMLUtilsTest, Contains_ExistingElement_ReturnsTrue) {
 }
 
 TEST_F(XMLUtilsTest, Contains_NonExistingElement_ReturnsFalse) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Contains_NonExistingElement_ReturnsFalse] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     
@@ -507,6 +542,7 @@ TEST_F(XMLUtilsTest, Contains_NonExistingElement_ReturnsFalse) {
 }
 
 TEST_F(XMLUtilsTest, Contains_Attribute_ReturnsTrue) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Contains_Attribute_ReturnsTrue] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     auto item = root.append_child("item");
@@ -516,6 +552,7 @@ TEST_F(XMLUtilsTest, Contains_Attribute_ReturnsTrue) {
 }
 
 TEST_F(XMLUtilsTest, Contains_NonExistingAttribute_ReturnsFalse) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Contains_NonExistingAttribute_ReturnsFalse] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item");
@@ -527,6 +564,7 @@ TEST_F(XMLUtilsTest, Contains_NonExistingAttribute_ReturnsFalse) {
 // SECURITY TEST: BUG #5 - XPATH INJECTION
 // ============================================================================
 TEST_F(XMLUtilsTest, Security_XPathInjection_Blocked) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_XPathInjection_Blocked] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("secret").text() = "Sensitive";
@@ -542,6 +580,7 @@ TEST_F(XMLUtilsTest, Security_XPathInjection_Blocked) {
 }
 
 TEST_F(XMLUtilsTest, Security_XPathInjection_SpecialChars_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_XPathInjection_SpecialChars_Rejected] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -552,6 +591,7 @@ TEST_F(XMLUtilsTest, Security_XPathInjection_SpecialChars_Rejected) {
 }
 
 TEST_F(XMLUtilsTest, Security_XPathInjection_LongPath_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_XPathInjection_LongPath_Rejected] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -571,6 +611,7 @@ TEST_F(XMLUtilsTest, Security_XPathInjection_LongPath_Rejected) {
 // GET TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, GetText_ValidElement_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetText_ValidElement_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "TestValue";
@@ -581,6 +622,7 @@ TEST_F(XMLUtilsTest, GetText_ValidElement_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetText_Attribute_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetText_Attribute_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     auto item = root.append_child("item");
@@ -592,6 +634,7 @@ TEST_F(XMLUtilsTest, GetText_Attribute_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetText_NonExisting_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetText_NonExisting_Fails] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -600,6 +643,7 @@ TEST_F(XMLUtilsTest, GetText_NonExisting_Fails) {
 }
 
 TEST_F(XMLUtilsTest, GetBool_TrueValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_TrueValue_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("flag").text() = "true";
@@ -610,6 +654,7 @@ TEST_F(XMLUtilsTest, GetBool_TrueValue_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetBool_FalseValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_FalseValue_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("flag").text() = "0";
@@ -620,6 +665,7 @@ TEST_F(XMLUtilsTest, GetBool_FalseValue_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetBool_InvalidValue_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_InvalidValue_Fails] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("flag").text() = "invalid";
@@ -629,6 +675,7 @@ TEST_F(XMLUtilsTest, GetBool_InvalidValue_Fails) {
 }
 
 TEST_F(XMLUtilsTest, GetInt64_ValidValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_ValidValue_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("number").text() = "12345";
@@ -639,6 +686,7 @@ TEST_F(XMLUtilsTest, GetInt64_ValidValue_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetInt64_NegativeValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_NegativeValue_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("number").text() = "-9876";
@@ -649,6 +697,7 @@ TEST_F(XMLUtilsTest, GetInt64_NegativeValue_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetInt64_InvalidValue_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_InvalidValue_Fails] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("number").text() = "not_a_number";
@@ -658,6 +707,7 @@ TEST_F(XMLUtilsTest, GetInt64_InvalidValue_Fails) {
 }
 
 TEST_F(XMLUtilsTest, GetUInt64_ValidValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetUInt64_ValidValue_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("number").text() = "98765";
@@ -668,6 +718,7 @@ TEST_F(XMLUtilsTest, GetUInt64_ValidValue_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetDouble_ValidValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_ValidValue_Success] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("number").text() = "3.14159";
@@ -678,6 +729,7 @@ TEST_F(XMLUtilsTest, GetDouble_ValidValue_Success) {
 }
 
 TEST_F(XMLUtilsTest, GetDouble_InvalidValue_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_InvalidValue_Fails] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("number").text() = "not_a_double";
@@ -690,6 +742,7 @@ TEST_F(XMLUtilsTest, GetDouble_InvalidValue_Fails) {
 // SET TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Set_NewElement_Created) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_NewElement_Created] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -701,6 +754,7 @@ TEST_F(XMLUtilsTest, Set_NewElement_Created) {
 }
 
 TEST_F(XMLUtilsTest, Set_ExistingElement_Updated) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_ExistingElement_Updated] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "OldValue";
@@ -713,6 +767,7 @@ TEST_F(XMLUtilsTest, Set_ExistingElement_Updated) {
 }
 
 TEST_F(XMLUtilsTest, Set_Attribute_Created) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_Attribute_Created] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item");
@@ -725,6 +780,7 @@ TEST_F(XMLUtilsTest, Set_Attribute_Created) {
 }
 
 TEST_F(XMLUtilsTest, Set_NestedPath_Created) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_NestedPath_Created] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -736,6 +792,7 @@ TEST_F(XMLUtilsTest, Set_NestedPath_Created) {
 }
 
 TEST_F(XMLUtilsTest, Set_WithIndex_CreatesMultiple) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_WithIndex_CreatesMultiple] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -764,6 +821,7 @@ TEST_F(XMLUtilsTest, Set_WithIndex_CreatesMultiple) {
 // SECURITY TEST: BUG #6 - UNCONTROLLED RECURSION
 // ============================================================================
 TEST_F(XMLUtilsTest, Security_UncontrolledRecursion_DeepPath_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_UncontrolledRecursion_DeepPath_Rejected] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -780,6 +838,7 @@ TEST_F(XMLUtilsTest, Security_UncontrolledRecursion_DeepPath_Rejected) {
 }
 
 TEST_F(XMLUtilsTest, Security_UncontrolledRecursion_LargeIndex_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_UncontrolledRecursion_LargeIndex_Rejected] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -791,6 +850,7 @@ TEST_F(XMLUtilsTest, Security_UncontrolledRecursion_LargeIndex_Rejected) {
 }
 
 TEST_F(XMLUtilsTest, Security_UncontrolledRecursion_TotalNodes_Limited) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_UncontrolledRecursion_TotalNodes_Limited] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -805,6 +865,7 @@ TEST_F(XMLUtilsTest, Security_UncontrolledRecursion_TotalNodes_Limited) {
 // ERASE TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Erase_ExistingElement_Removed) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Erase_ExistingElement_Removed] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Value";
@@ -815,6 +876,7 @@ TEST_F(XMLUtilsTest, Erase_ExistingElement_Removed) {
 }
 
 TEST_F(XMLUtilsTest, Erase_Attribute_Removed) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Erase_Attribute_Removed] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     auto item = root.append_child("item");
@@ -827,6 +889,7 @@ TEST_F(XMLUtilsTest, Erase_Attribute_Removed) {
 }
 
 TEST_F(XMLUtilsTest, Erase_NonExisting_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Erase_NonExisting_Fails] Testing...");
     Document doc;
     doc.append_child("root");
     
@@ -837,6 +900,7 @@ TEST_F(XMLUtilsTest, Erase_NonExisting_Fails) {
 // EDGE CASES & ERROR HANDLING
 // ============================================================================
 TEST_F(XMLUtilsTest, EdgeCase_LargeXMLFile_Handled) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[EdgeCase_LargeXMLFile_Handled] Testing...");
     // Generate large XML (1MB)
     std::ostringstream oss;
     oss << "<?xml version=\"1.0\"?><root>";
@@ -855,6 +919,7 @@ TEST_F(XMLUtilsTest, EdgeCase_LargeXMLFile_Handled) {
 }
 
 TEST_F(XMLUtilsTest, EdgeCase_SpecialCharacters_Escaped) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[EdgeCase_SpecialCharacters_Escaped] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "<>&\"'";
@@ -869,6 +934,7 @@ TEST_F(XMLUtilsTest, EdgeCase_SpecialCharacters_Escaped) {
 }
 
 TEST_F(XMLUtilsTest, EdgeCase_UnicodeContent_Preserved) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[EdgeCase_UnicodeContent_Preserved] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("item").text() = "Hello World";
@@ -887,6 +953,7 @@ TEST_F(XMLUtilsTest, EdgeCase_UnicodeContent_Preserved) {
 }
 
 TEST_F(XMLUtilsTest, EdgeCase_EmptyElements_Handled) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[EdgeCase_EmptyElements_Handled] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     root.append_child("empty1");
@@ -906,6 +973,7 @@ TEST_F(XMLUtilsTest, EdgeCase_EmptyElements_Handled) {
 // STRESS TESTS
 // ============================================================================
 TEST_F(XMLUtilsTest, Stress_RapidParseOperations) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Stress_RapidParseOperations] Testing...");
     std::string xml = "<?xml version=\"1.0\"?><root><item>Value</item></root>";
     
     for (int i = 0; i < 100; ++i) {
@@ -916,6 +984,7 @@ TEST_F(XMLUtilsTest, Stress_RapidParseOperations) {
 }
 
 TEST_F(XMLUtilsTest, Stress_RapidFileOperations) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Stress_RapidFileOperations] Testing...");
     Document doc;
     doc.append_child("root").append_child("item").text() = "Value";
     
@@ -930,6 +999,7 @@ TEST_F(XMLUtilsTest, Stress_RapidFileOperations) {
 }
 
 TEST_F(XMLUtilsTest, Stress_ManyXPathQueries) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Stress_ManyXPathQueries] Testing...");
     Document doc;
     auto root = doc.append_child("root");
     for (int i = 0; i < 100; ++i) {

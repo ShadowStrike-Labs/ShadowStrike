@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include"pch.h"
 /*
  * ============================================================================
@@ -751,7 +755,12 @@ StoreError SignatureStore::Compact() noexcept {
     uint32_t failCount = 0;
 
     try {
-        if (m_hashStore) m_hashStore->Compact();
+        if (m_hashStore) {
+            StoreError err = m_hashStore->Compact();
+            if (!err.IsSuccess()) {
+                return err;
+            }
+        }
     }
     catch (const std::exception& e) {
         SS_LOG_WARN(L"SignatureStore", L"HashStore compact exception: %S", e.what());
@@ -763,7 +772,12 @@ StoreError SignatureStore::Compact() noexcept {
     }
 
     try {
-        if (m_patternStore) m_patternStore->Compact();
+        if (m_patternStore) {
+            StoreError err = m_patternStore->Compact();
+            if (!err.IsSuccess()) {
+             return err;
+            }
+        }
     }
     catch (const std::exception& e) {
         SS_LOG_WARN(L"SignatureStore", L"PatternStore compact exception: %S", e.what());
@@ -859,7 +873,13 @@ StoreError SignatureStore::Flush() noexcept {
     uint32_t failCount = 0;
 
     try {
-        if (m_hashStore) m_hashStore->Flush();
+        if (m_hashStore) {
+         StoreError err =m_hashStore->Flush();
+         if (!err.IsSuccess()) {
+             return err;
+         }
+
+        }
     }
     catch (const std::exception& e) {
         SS_LOG_WARN(L"SignatureStore", L"HashStore flush exception: %S", e.what());
@@ -871,7 +891,12 @@ StoreError SignatureStore::Flush() noexcept {
     }
 
     try {
-        if (m_patternStore) m_patternStore->Flush();
+        if (m_patternStore) {
+            StoreError err = m_patternStore->Flush();
+            if (!err.IsSuccess()) {
+                return err;
+            }
+        }
     }
     catch (const std::exception& e) {
         SS_LOG_WARN(L"SignatureStore", L"PatternStore flush exception: %S", e.what());
@@ -883,7 +908,13 @@ StoreError SignatureStore::Flush() noexcept {
     }
 
     try {
-        if (m_yaraStore) m_yaraStore->Flush();
+        if (m_yaraStore)
+        {
+           StoreError err =  m_yaraStore->Flush();
+            if (!err.IsSuccess()) {
+                return err;
+            }
+        }
     }
     catch (const std::exception& e) {
         SS_LOG_WARN(L"SignatureStore", L"YaraStore flush exception: %S", e.what());
@@ -900,7 +931,6 @@ StoreError SignatureStore::Flush() noexcept {
 
     return StoreError{SignatureStoreError::Success};
 }
-
 StoreError SignatureStore::OptimizeByUsage() noexcept {
     SS_LOG_INFO(L"SignatureStore", L"Optimizing by usage patterns");
 
@@ -908,28 +938,31 @@ StoreError SignatureStore::OptimizeByUsage() noexcept {
     std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
     if (!lock.owns_lock()) {
         SS_LOG_WARN(L"SignatureStore", L"OptimizeByUsage: Could not acquire lock");
-        return StoreError{SignatureStoreError::AccessDenied, 0, "Could not acquire exclusive lock"};
+        return StoreError{ SignatureStoreError::AccessDenied, 0, "Could not acquire exclusive lock" };
     }
 
     try {
-        // Get heatmaps and optimize pattern ordering
+        // FIXED: Removed unused 'heatmap' object (V808)
+        // The pattern ordering optimization is now handled internally by OptimizeByHitRate.
         if (m_patternStore) {
-            auto heatmap = m_patternStore->GetHeatmap();
-            // Would reorder patterns based on frequency
-            m_patternStore->OptimizeByHitRate();
+            StoreError err = m_patternStore->OptimizeByHitRate();
+            if (!err.IsSuccess()) {
+                SS_LOG_WARN(L"SignatureStore", L"Pattern optimization failed: %S", err.message.c_str());
+                return err;
+            }
             SS_LOG_DEBUG(L"SignatureStore", L"Pattern optimization completed");
         }
     }
     catch (const std::exception& e) {
         SS_LOG_WARN(L"SignatureStore", L"OptimizeByUsage exception: %S", e.what());
-        return StoreError{SignatureStoreError::Unknown, 0, std::string("Optimization error: ") + e.what()};
+        return StoreError{ SignatureStoreError::Unknown, 0, std::string("Optimization error: ") + e.what() };
     }
     catch (...) {
         SS_LOG_WARN(L"SignatureStore", L"OptimizeByUsage unknown exception");
-        return StoreError{SignatureStoreError::Unknown, 0, "Unknown optimization error"};
+        return StoreError{ SignatureStoreError::Unknown, 0, "Unknown optimization error" };
     }
 
-    return StoreError{SignatureStoreError::Success};
+    return StoreError{ SignatureStoreError::Success };
 }
 
 // ============================================================================
@@ -990,16 +1023,17 @@ void SignatureStore::SetQueryCacheSize(size_t entries) noexcept {
     }
 
     // ========================================================================
-    // RESIZE OPERATION
-    // ========================================================================
+       // RESIZE OPERATION
+       // ========================================================================
     try {
-        // Store current cache entries (for potential restoration if needed)
-        std::vector<QueryCacheEntry> oldEntries(m_queryCache.begin(), m_queryCache.end());
+        // FIXED: Removed 'oldEntries' object (V808). 
+        // Copying the entire cache vector is a heavy O(N) operation and was not utilized.
+        // Since resize invalidates hash-based mapping, a clean flush is the correct approach.
 
         // Resize vector to new size
         m_queryCache.resize(entries);
 
-        // Clear all entries in the resized cache
+        // Clear all entries in the resized cache to maintain deterministic state
         for (auto& entry : m_queryCache) {
             entry.bufferHash.fill(0);
             entry.result = ScanResult{};
@@ -1024,8 +1058,6 @@ void SignatureStore::SetQueryCacheSize(size_t entries) noexcept {
     catch (...) {
         SS_LOG_ERROR(L"SignatureStore", L"SetQueryCacheSize: Unknown exception during resize");
     }
-
-    // Lock automatically released here
 }
 
 

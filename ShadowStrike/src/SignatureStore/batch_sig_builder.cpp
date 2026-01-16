@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /**
  * @file batch_sig_builder.cpp
  * @brief Batch Signature Builder - Enterprise-Grade Parallel Processing
@@ -33,7 +34,7 @@
  *
  * Copyright (c) 2026 ShadowStrike Security Suite
  */
-
+#include"pch.h"
 #include "SignatureBuilder.hpp"
 
 #include <unordered_set>
@@ -301,7 +302,7 @@ StoreError BatchSignatureBuilder::AddSourceFiles(
         }
 
         // Reject paths with home directory reference (Unix-style, but be safe)
-        if (filePath.find(L"~") != std::wstring::npos) {
+        if (filePath.find(L'~') != std::wstring::npos) {
             SS_LOG_WARN(L"BatchSignatureBuilder",
                 L"AddSourceFiles: Path contains '~' (home directory) - skipping");
             continue;
@@ -1055,7 +1056,7 @@ StoreError BatchSignatureBuilder::BuildParallel() noexcept {
                 std::lock_guard<std::mutex> errLock(errorMutex);
                 // Limit error collection to prevent memory bloat
                 if (collectedErrors.size() < MAX_COLLECTED_ERRORS) {
-                    collectedErrors.push_back({ filePath, err.message });
+                    collectedErrors.emplace_back( filePath, err.message );
                 }
             }
 

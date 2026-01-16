@@ -1,4 +1,6 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ShadowStrike Antivirus - Unit Tests
  * SignatureStore Unified Facade Tests
@@ -9,7 +11,7 @@
  * 
  * Copyright (c) 2024 ShadowStrike Team
  */
-
+#include"pch.h"
 #include <gtest/gtest.h>
 #include "../../src/SignatureStore/SignatureStore.hpp"
 #include "../../src/SignatureStore/SignatureFormat.hpp"
@@ -368,7 +370,7 @@ TEST_F(SignatureStoreTest, ScanDirectory_NonexistentDirectory) {
     auto results = sig_store_->ScanDirectory(L"nonexistent_directory", false, options);
     
     // Should handle gracefully
-    EXPECT_TRUE(results.empty() || !results.empty());
+    EXPECT_TRUE(results.empty());
 }
 
 TEST_F(SignatureStoreTest, ScanDirectory_EmptyDirectory) {
@@ -450,21 +452,33 @@ TEST_F(SignatureStoreTest, StreamScanner_FeedAndFinalize) {
     std::vector<uint8_t> chunk1 = {0x4D, 0x5A};
     std::vector<uint8_t> chunk2 = {0x90, 0x00};
     
-    scanner.FeedChunk(chunk1);
-    scanner.FeedChunk(chunk2);
+    ScanResult result_1 = scanner.FeedChunk(chunk1);
+
+    if (!result_1.IsSuccessful()) {
+        SS_LOG_ERROR(L"SignatureStoreTest-StreamScanner_FeedAndFinalize", L"FeedChunk failed during large stream test.");
+    }
+    ScanResult result_2 = scanner.FeedChunk(chunk2);
+
+    if (!result_2.IsSuccessful()) {
+        SS_LOG_ERROR(L"SignatureStoreTest-StreamScanner_FeedAndFinalize", L"FeedChunk failed during large stream test.");
+    }
     
     EXPECT_EQ(scanner.GetBytesProcessed(), 4);
     
-    auto result = scanner.Finalize();
+    auto result_3 = scanner.Finalize();
     
-    EXPECT_EQ(result.totalBytesScanned, 4);
+    EXPECT_EQ(result_3.totalBytesScanned, 4);
 }
 
 TEST_F(SignatureStoreTest, StreamScanner_Reset) {
     auto scanner = sig_store_->CreateStreamScanner();
     
     std::vector<uint8_t> chunk = {0x00, 0x01, 0x02};
-    scanner.FeedChunk(chunk);
+    ScanResult result = scanner.FeedChunk(chunk);
+
+    if (!result.IsSuccessful()) {
+        SS_LOG_ERROR(L"SignatureStoreTest-StreamScanner_Reset", L"FeedChunk failed during large stream test.");
+    }
     
     scanner.Reset();
     
@@ -480,7 +494,11 @@ TEST_F(SignatureStoreTest, StreamScanner_LargeStream) {
     
     for (size_t i = 0; i < total_size / chunk_size; ++i) {
         std::vector<uint8_t> chunk(chunk_size, static_cast<uint8_t>(i % 256));
-        scanner.FeedChunk(chunk);
+        ScanResult result = scanner.FeedChunk(chunk);
+
+        if (!result.IsSuccessful()) {
+			SS_LOG_ERROR(L"SignatureStoreTest-StreamScanner_LargeStream", L"FeedChunk failed during large stream test.");
+        }
     }
     
     auto result = scanner.Finalize();
@@ -508,7 +526,7 @@ TEST_F(SignatureStoreTest, LookupHashString_ValidFormat) {
     auto result = sig_store_->LookupHashString(hash_str, HashType::MD5);
     
     // Should not crash, may or may not find match
-    EXPECT_TRUE(result.has_value() || !result.has_value());
+    EXPECT_TRUE(result.has_value());
 }
 
 TEST_F(SignatureStoreTest, LookupHashString_InvalidFormat) {
@@ -592,7 +610,11 @@ TEST_F(SignatureStoreTest, GetGlobalStatistics_AfterScans) {
     
     // Perform multiple scans
     for (int i = 0; i < 5; ++i) {
-        sig_store_->ScanBuffer(test_data);
+        ScanResult result = sig_store_->ScanBuffer(test_data);
+
+        if (!result.IsSuccessful()) {
+            SS_LOG_ERROR(L"SignatureStoreTest-ResetStatistics", L"Scan failed during statistics test setup.");
+        }
     }
     
     auto stats = sig_store_->GetGlobalStatistics();
@@ -602,7 +624,11 @@ TEST_F(SignatureStoreTest, GetGlobalStatistics_AfterScans) {
 
 TEST_F(SignatureStoreTest, ResetStatistics) {
     std::vector<uint8_t> test_data = {0x00};
-    sig_store_->ScanBuffer(test_data);
+   ScanResult result =  sig_store_->ScanBuffer(test_data);
+
+   if (!result.IsSuccessful()) {
+	   SS_LOG_ERROR(L"SignatureStoreTest-ResetStatistics",L"Scan failed during statistics test setup.");
+   }
     
     sig_store_->ResetStatistics();
     
@@ -801,13 +827,13 @@ TEST_F(SignatureStoreTest, Store_GetSupportedHashTypes) {
 
 TEST_F(SignatureStoreTest, Store_IsYaraAvailable) {
     bool yara_available = Store::IsYaraAvailable();
-    EXPECT_TRUE(yara_available || !yara_available); // Tautology but tests execution
+    EXPECT_TRUE(yara_available); // Tautology but tests execution
 }
 
 TEST_F(SignatureStoreTest, Store_GetYaraVersion) {
     auto yara_version = Store::GetYaraVersion();
     // May be empty if YARA not available
-    EXPECT_TRUE(yara_version.empty() || !yara_version.empty());
+    EXPECT_TRUE(yara_version.empty());
 }
 
 // ============================================================================
@@ -880,7 +906,7 @@ TEST_F(SignatureStoreTest, EdgeCase_PerformanceMetrics) {
 // ============================================================================
 
 TEST_F(SignatureStoreTest, ThreadSafety_ConcurrentScans) {
-    std::vector<uint8_t> test_data = {0x4D, 0x5A, 0x90, 0x00};
+    std::array<uint8_t,4> test_data = {0x4D, 0x5A, 0x90, 0x00};
     
     std::vector<std::thread> threads;
     std::atomic<int> success_count{0};

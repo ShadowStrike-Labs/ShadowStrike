@@ -1,7 +1,11 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 
+
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/ThreadPool.hpp"
+#include "../../../src/Utils/Logger.hpp"
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -38,17 +42,20 @@ protected:
 // ============================================================================
 
 TEST(ThreadPoolConfigTest, DefaultConfigurationIsValid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DefaultConfigurationIsValid] Testing...");
     ThreadPoolConfig config;
     EXPECT_TRUE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, MinThreadsZeroIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[MinThreadsZeroIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.minThreads = 0;
     EXPECT_FALSE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, MinThreadsGreaterThanMaxIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[MinThreadsGreaterThanMaxIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.minThreads = 10;
     config.maxThreads = 5;
@@ -56,30 +63,35 @@ TEST(ThreadPoolConfigTest, MinThreadsGreaterThanMaxIsInvalid) {
 }
 
 TEST(ThreadPoolConfigTest, MaxThreadsZeroIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[MaxThreadsZeroIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.maxThreads = 0;
     EXPECT_FALSE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, MaxThreadsAboveLimitIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[MaxThreadsAboveLimitIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.maxThreads = 2000;  // Above 1024 limit
     EXPECT_FALSE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, MaxQueueSizeZeroIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[MaxQueueSizeZeroIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.maxQueueSize = 0;
     EXPECT_FALSE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, MaxQueueSizeAboveLimitIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[MaxQueueSizeAboveLimitIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.maxQueueSize = 2000000;  // Above 1000000 limit
     EXPECT_FALSE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, NegativeTimeoutsAreInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[NegativeTimeoutsAreInvalid] Testing...");
     ThreadPoolConfig config;
     config.threadIdleTimeout = std::chrono::milliseconds(-1);
     EXPECT_FALSE(config.Validate());
@@ -90,12 +102,14 @@ TEST(ThreadPoolConfigTest, NegativeTimeoutsAreInvalid) {
 }
 
 TEST(ThreadPoolConfigTest, EmptyThreadNamePrefixIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[EmptyThreadNamePrefixIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.threadNamePrefix = L"";
     EXPECT_FALSE(config.Validate());
 }
 
 TEST(ThreadPoolConfigTest, DeadlockDetectionWithZeroIntervalIsInvalid) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DeadlockDetectionWithZeroIntervalIsInvalid] Testing...");
     ThreadPoolConfig config;
     config.enableDeadlockDetection = true;
     config.deadlockCheckInterval = std::chrono::milliseconds(0);
@@ -107,6 +121,7 @@ TEST(ThreadPoolConfigTest, DeadlockDetectionWithZeroIntervalIsInvalid) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, ConstructorWithInvalidConfigThrows) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ConstructorWithInvalidConfigThrows] Testing...");
     ThreadPoolConfig invalidConfig;
     invalidConfig.minThreads = 0;
 
@@ -116,6 +131,7 @@ TEST_F(ThreadPoolTest, ConstructorWithInvalidConfigThrows) {
 }
 
 TEST_F(ThreadPoolTest, InitializeSucceeds) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[InitializeSucceeds] Testing...");
     ThreadPool pool(config_);
     EXPECT_TRUE(pool.Initialize());
     EXPECT_TRUE(pool.IsInitialized());
@@ -123,19 +139,24 @@ TEST_F(ThreadPoolTest, InitializeSucceeds) {
 }
 
 TEST_F(ThreadPoolTest, DoubleInitializeReturnsTrueWithoutError) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DoubleInitializeReturnsTrueWithoutError] Testing...");
     ThreadPool pool(config_);
     EXPECT_TRUE(pool.Initialize());
     EXPECT_TRUE(pool.Initialize());  // Second call should return true
 }
 
 TEST_F(ThreadPoolTest, ShutdownWithoutInitializeIsNoop) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ShutdownWithoutInitializeIsNoop] Testing...");
     ThreadPool pool(config_);
     EXPECT_NO_THROW(pool.Shutdown());
 }
 
 TEST_F(ThreadPoolTest, ShutdownSetsFlags) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ShutdownSetsFlags] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Shutdown();
 
@@ -144,17 +165,23 @@ TEST_F(ThreadPoolTest, ShutdownSetsFlags) {
 }
 
 TEST_F(ThreadPoolTest, DoubleShutdownIsNoop) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DoubleShutdownIsNoop] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Shutdown();
     EXPECT_NO_THROW(pool.Shutdown());  // Second call should not throw
 }
 
 TEST_F(ThreadPoolTest, DestructorShutsDownPool) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DestructorShutsDownPool] Testing...");
     {
         ThreadPool pool(config_);
-        pool.Initialize();
+        if (!pool.Initialize()) {
+            SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+        }
         // Pool will be destroyed at end of scope
     }
     // If we get here without hanging or crashing, test passes
@@ -162,8 +189,11 @@ TEST_F(ThreadPoolTest, DestructorShutsDownPool) {
 }
 
 TEST_F(ThreadPoolTest, PauseAndResumeWork) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[PauseAndResumeWork] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     EXPECT_FALSE(pool.IsPaused());
 
@@ -175,8 +205,11 @@ TEST_F(ThreadPoolTest, PauseAndResumeWork) {
 }
 
 TEST_F(ThreadPoolTest, DoublePauseIsNoop) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DoublePauseIsNoop] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Pause();
     EXPECT_NO_THROW(pool.Pause());
@@ -184,8 +217,11 @@ TEST_F(ThreadPoolTest, DoublePauseIsNoop) {
 }
 
 TEST_F(ThreadPoolTest, DoubleResumeIsNoop) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DoubleResumeIsNoop] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Pause();
     pool.Resume();
@@ -198,8 +234,11 @@ TEST_F(ThreadPoolTest, DoubleResumeIsNoop) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, SubmitSimpleVoidTask) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitSimpleVoidTask] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::atomic<bool> executed{ false };
 
@@ -212,8 +251,11 @@ TEST_F(ThreadPoolTest, SubmitSimpleVoidTask) {
 }
 
 TEST_F(ThreadPoolTest, SubmitTaskReturningValue) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitTaskReturningValue] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto future = pool.Submit([](const TaskContext&) -> int {
         return 42;
@@ -223,8 +265,11 @@ TEST_F(ThreadPoolTest, SubmitTaskReturningValue) {
 }
 
 TEST_F(ThreadPoolTest, SubmitTaskWithArguments) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitTaskWithArguments] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
  
     auto future = pool.Submit(
@@ -238,8 +283,11 @@ TEST_F(ThreadPoolTest, SubmitTaskWithArguments) {
 
 
 TEST_F(ThreadPoolTest, SubmitMultipleTasks) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitMultipleTasks] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::atomic<int> counter{ 0 };
     std::vector<std::shared_future<void>> futures;
@@ -258,8 +306,11 @@ TEST_F(ThreadPoolTest, SubmitMultipleTasks) {
 }
 
 TEST_F(ThreadPoolTest, SubmitToShutdownPoolThrows) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitToShutdownPoolThrows] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
     pool.Shutdown();
 
     EXPECT_THROW({
@@ -268,8 +319,11 @@ TEST_F(ThreadPoolTest, SubmitToShutdownPoolThrows) {
 }
 
 TEST_F(ThreadPoolTest, SubmitWithPriority) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitWithPriority] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto future = pool.Submit(
         [](const TaskContext& ctx) {
@@ -280,8 +334,11 @@ TEST_F(ThreadPoolTest, SubmitWithPriority) {
     EXPECT_EQ(future.get(), 1);
 }
 TEST_F(ThreadPoolTest, TaskContextReceivesCorrectInformation) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[TaskContextReceivesCorrectInformation] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     bool hasTaskId = false;
     bool hasPriority = false;
@@ -306,8 +363,11 @@ TEST_F(ThreadPoolTest, TaskContextReceivesCorrectInformation) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, SubmitWithTimeoutDoesNotTimeout) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitWithTimeoutDoesNotTimeout] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto future = pool.SubmitWithTimeout(
         1000ms,
@@ -318,8 +378,11 @@ TEST_F(ThreadPoolTest, SubmitWithTimeoutDoesNotTimeout) {
 }
 
 TEST_F(ThreadPoolTest, SubmitWithTimeoutThrowsOnTimeout) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitWithTimeoutThrowsOnTimeout] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto future = pool.SubmitWithTimeout(
         10ms,  // Very short timeout
@@ -337,6 +400,7 @@ TEST_F(ThreadPoolTest, SubmitWithTimeoutThrowsOnTimeout) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, CreateCancellationToken) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[CreateCancellationToken] Testing...");
     auto token = ThreadPool::CreateCancellationToken();
 
     ASSERT_NE(token, nullptr);
@@ -344,8 +408,11 @@ TEST_F(ThreadPoolTest, CreateCancellationToken) {
 }
 
 TEST_F(ThreadPoolTest, SubmitCancellableTaskNotCancelled) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitCancellableTaskNotCancelled] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto token = ThreadPool::CreateCancellationToken();
 
@@ -358,8 +425,11 @@ TEST_F(ThreadPoolTest, SubmitCancellableTaskNotCancelled) {
 }
 
 TEST_F(ThreadPoolTest, SubmitCancellableTaskCancelled) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitCancellableTaskCancelled] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto token = ThreadPool::CreateCancellationToken();
     token->store(true);  // Cancel before submission
@@ -373,8 +443,11 @@ TEST_F(ThreadPoolTest, SubmitCancellableTaskCancelled) {
 }
 
 TEST_F(ThreadPoolTest, TaskContextCanCheckCancellation) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[TaskContextCanCheckCancellation] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto token = ThreadPool::CreateCancellationToken();
     bool wasCancelled = false;
@@ -395,8 +468,11 @@ TEST_F(ThreadPoolTest, TaskContextCanCheckCancellation) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, SubmitBatchWithVector) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitBatchWithVector] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::vector<int> inputs = { 1, 2, 3, 4, 5 };
 
@@ -417,8 +493,11 @@ TEST_F(ThreadPoolTest, SubmitBatchWithVector) {
 }
 
 TEST_F(ThreadPoolTest, SubmitBatchWithEmptyRange) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitBatchWithEmptyRange] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::vector<int> inputs;
 
@@ -435,8 +514,11 @@ TEST_F(ThreadPoolTest, SubmitBatchWithEmptyRange) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, ParallelForExecutesAllIterations) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ParallelForExecutesAllIterations] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::atomic<int> counter{ 0 };
 
@@ -448,8 +530,11 @@ TEST_F(ThreadPoolTest, ParallelForExecutesAllIterations) {
 }
 
 TEST_F(ThreadPoolTest, ParallelForWithEmptyRange) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ParallelForWithEmptyRange] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::atomic<int> counter{ 0 };
 
@@ -461,8 +546,11 @@ TEST_F(ThreadPoolTest, ParallelForWithEmptyRange) {
 }
 
 TEST_F(ThreadPoolTest, ParallelForWithNegativeRange) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ParallelForWithNegativeRange] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::atomic<int> counter{ 0 };
 
@@ -474,8 +562,11 @@ TEST_F(ThreadPoolTest, ParallelForWithNegativeRange) {
 }
 
 TEST_F(ThreadPoolTest, ParallelForRespectsParameters) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ParallelForRespectsParameters] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::vector<int> values(10, 0);
     std::mutex mutex;
@@ -495,15 +586,21 @@ TEST_F(ThreadPoolTest, ParallelForRespectsParameters) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, GetThreadCountReturnsCorrectValue) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetThreadCountReturnsCorrectValue] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     EXPECT_EQ(pool.GetThreadCount(), config_.minThreads);
 }
 
 TEST_F(ThreadPoolTest, IncreaseThreadCount) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[IncreaseThreadCount] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     size_t initialCount = pool.GetThreadCount();
     pool.IncreaseThreadCount(2);
@@ -512,8 +609,11 @@ TEST_F(ThreadPoolTest, IncreaseThreadCount) {
 }
 
 TEST_F(ThreadPoolTest, IncreaseThreadCountRespectsMaxLimit) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[IncreaseThreadCountRespectsMaxLimit] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.IncreaseThreadCount(1000);  // Try to exceed max
 
@@ -521,10 +621,13 @@ TEST_F(ThreadPoolTest, IncreaseThreadCountRespectsMaxLimit) {
 }
 
 TEST_F(ThreadPoolTest, DecreaseThreadCount) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DecreaseThreadCount] Testing...");
     config_.minThreads = 2;  
     config_.maxThreads = 8;
     ThreadPool pool(config_);
-    pool.Initialize(); 
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     
     pool.IncreaseThreadCount(2);  
@@ -537,17 +640,22 @@ TEST_F(ThreadPoolTest, DecreaseThreadCount) {
 }
 
 TEST_F(ThreadPoolTest, DecreaseThreadCountRespectsMinLimit) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DecreaseThreadCountRespectsMinLimit] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
-
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
     pool.DecreaseThreadCount(1000);  // Try to go below min
 
     EXPECT_GE(pool.GetThreadCount(), config_.minThreads);
 }
 
 TEST_F(ThreadPoolTest, SetThreadCount) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SetThreadCount] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.SetThreadCount(5);
 
@@ -555,8 +663,11 @@ TEST_F(ThreadPoolTest, SetThreadCount) {
 }
 
 TEST_F(ThreadPoolTest, SetThreadCountClampsToLimits) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SetThreadCountClampsToLimits] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.SetThreadCount(1);  // Below min
     EXPECT_GE(pool.GetThreadCount(), config_.minThreads);
@@ -570,23 +681,32 @@ TEST_F(ThreadPoolTest, SetThreadCountClampsToLimits) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, GetQueueSizeInitiallyZero) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetQueueSizeInitiallyZero] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     EXPECT_EQ(pool.GetQueueSize(), 0);
     EXPECT_TRUE(pool.IsQueueEmpty());
 }
 
 TEST_F(ThreadPoolTest, GetQueueCapacity) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetQueueCapacity] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     EXPECT_EQ(pool.GetQueueCapacity(), config_.maxQueueSize);
 }
 
 TEST_F(ThreadPoolTest, SetQueueCapacity) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SetQueueCapacity] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.SetQueueCapacity(200);
 
@@ -594,8 +714,11 @@ TEST_F(ThreadPoolTest, SetQueueCapacity) {
 }
 
 TEST_F(ThreadPoolTest, ClearQueue) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ClearQueue] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     // Submit some tasks
     for (int i = 0; i < 5; ++i) {
@@ -616,8 +739,11 @@ TEST_F(ThreadPoolTest, ClearQueue) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, TaskStatisticsInitiallyZero) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[TaskStatisticsInitiallyZero] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     const auto& stats = pool.GetTaskStatistics();
 
@@ -627,8 +753,11 @@ TEST_F(ThreadPoolTest, TaskStatisticsInitiallyZero) {
 }
 
 TEST_F(ThreadPoolTest, TaskStatisticsTrackEnqueuedTasks) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[TaskStatisticsTrackEnqueuedTasks] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Submit([](const TaskContext&) {}).wait();
 
@@ -637,8 +766,11 @@ TEST_F(ThreadPoolTest, TaskStatisticsTrackEnqueuedTasks) {
 }
 
 TEST_F(ThreadPoolTest, ThreadStatisticsShowCurrentThreadCount) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ThreadStatisticsShowCurrentThreadCount] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     const auto& stats = pool.GetThreadStatistics();
 
@@ -646,8 +778,11 @@ TEST_F(ThreadPoolTest, ThreadStatisticsShowCurrentThreadCount) {
 }
 
 TEST_F(ThreadPoolTest, ResetStatistics) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ResetStatistics] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Submit([](const TaskContext&) {}).wait();
 
@@ -658,8 +793,11 @@ TEST_F(ThreadPoolTest, ResetStatistics) {
 }
 
 TEST_F(ThreadPoolTest, GetStatisticsReportReturnsNonEmptyString) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetStatisticsReportReturnsNonEmptyString] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::string report = pool.GetStatisticsReport();
 
@@ -668,8 +806,11 @@ TEST_F(ThreadPoolTest, GetStatisticsReportReturnsNonEmptyString) {
 }
 
 TEST_F(ThreadPoolTest, GetHealthReportReturnsNonEmptyString) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetHealthReportReturnsNonEmptyString] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::string report = pool.GetHealthReport();
 
@@ -682,8 +823,11 @@ TEST_F(ThreadPoolTest, GetHealthReportReturnsNonEmptyString) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, GetConfigReturnsCorrectConfig) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetConfigReturnsCorrectConfig] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     const auto& cfg = pool.GetConfig();
 
@@ -692,8 +836,11 @@ TEST_F(ThreadPoolTest, GetConfigReturnsCorrectConfig) {
 }
 
 TEST_F(ThreadPoolTest, UpdateConfigWithValidConfig) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[UpdateConfigWithValidConfig] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     ThreadPoolConfig newConfig = config_;
     newConfig.minThreads = 4;
@@ -705,8 +852,11 @@ TEST_F(ThreadPoolTest, UpdateConfigWithValidConfig) {
 }
 
 TEST_F(ThreadPoolTest, UpdateConfigWithInvalidConfigThrows) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[UpdateConfigWithInvalidConfigThrows] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     ThreadPoolConfig invalidConfig = config_;
     invalidConfig.minThreads = 0;
@@ -719,8 +869,11 @@ TEST_F(ThreadPoolTest, UpdateConfigWithInvalidConfigThrows) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, WaitForAllWaitsForTaskCompletion) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[WaitForAllWaitsForTaskCompletion] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     std::atomic<bool> taskCompleted{ false };
 
@@ -735,8 +888,11 @@ TEST_F(ThreadPoolTest, WaitForAllWaitsForTaskCompletion) {
 }
 
 TEST_F(ThreadPoolTest, WaitForAllWithTimeoutReturnsTrue) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[WaitForAllWithTimeoutReturnsTrue] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Submit([](const TaskContext&) {
         std::this_thread::sleep_for(10ms);
@@ -746,8 +902,11 @@ TEST_F(ThreadPoolTest, WaitForAllWithTimeoutReturnsTrue) {
 }
 
 TEST_F(ThreadPoolTest, WaitForAllWithTimeoutReturnsFalseOnTimeout) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[WaitForAllWithTimeoutReturnsFalseOnTimeout] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     pool.Submit([](const TaskContext&) {
         std::this_thread::sleep_for(500ms);
@@ -761,8 +920,12 @@ TEST_F(ThreadPoolTest, WaitForAllWithTimeoutReturnsFalseOnTimeout) {
 // ============================================================================
 
 TEST_F(ThreadPoolTest, TaskExceptionIsPropagated) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[TaskExceptionIsPropagated] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+        SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
+
 
     auto future = pool.Submit([](const TaskContext&) -> int {
         throw std::runtime_error("Test exception");
@@ -772,8 +935,11 @@ TEST_F(ThreadPoolTest, TaskExceptionIsPropagated) {
 }
 
 TEST_F(ThreadPoolTest, GetLastExceptionReturnsNullOptWhenNoException) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetLastExceptionReturnsNullOptWhenNoException] Testing...");
     ThreadPool pool(config_);
-    pool.Initialize();
+    if (!pool.Initialize()) {
+		SS_LOG_ERROR(L"ThreadPool_Tests", L"Failed to initialize ThreadPool in GetLastException test.");
+    }
 
     auto lastEx = pool.GetLastException();
 
@@ -785,6 +951,7 @@ TEST_F(ThreadPoolTest, GetLastExceptionReturnsNullOptWhenNoException) {
 // ============================================================================
 
 TEST(PriorityTaskQueueTest, ConstructorSetsMaxSize) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ConstructorSetsMaxSize] Testing...");
     PriorityTaskQueue queue(50);
 
     EXPECT_EQ(queue.GetMaxSize(), 50);
@@ -792,6 +959,7 @@ TEST(PriorityTaskQueueTest, ConstructorSetsMaxSize) {
 }
 
 TEST(PriorityTaskQueueTest, PushAndPopTask) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[PushAndPopTask] Testing...");
     PriorityTaskQueue queue(10);
 
     TaskContext ctx(TaskPriority::Normal, "Test");
@@ -808,6 +976,7 @@ TEST(PriorityTaskQueueTest, PushAndPopTask) {
 }
 
 TEST(PriorityTaskQueueTest, PushRespectsMaxSize) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[PushRespectsMaxSize] Testing...");
     PriorityTaskQueue queue(2);
 
     for (int i = 0; i < 2; ++i) {
@@ -824,6 +993,7 @@ TEST(PriorityTaskQueueTest, PushRespectsMaxSize) {
 }
 
 TEST(PriorityTaskQueueTest, PopFromEmptyReturnsNullopt) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[PopFromEmptyReturnsNullopt] Testing...");
     PriorityTaskQueue queue(10);
 
     auto popped = queue.Pop();
@@ -831,6 +1001,7 @@ TEST(PriorityTaskQueueTest, PopFromEmptyReturnsNullopt) {
 }
 
 TEST(PriorityTaskQueueTest, TryPopFromEmptyReturnsNullopt) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[TryPopFromEmptyReturnsNullopt] Testing...");
     PriorityTaskQueue queue(10);
 
     auto popped = queue.TryPop();
@@ -838,6 +1009,7 @@ TEST(PriorityTaskQueueTest, TryPopFromEmptyReturnsNullopt) {
 }
 
 TEST(PriorityTaskQueueTest, ClearEmptiesQueue) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ClearEmptiesQueue] Testing...");
     PriorityTaskQueue queue(10);
 
     for (int i = 0; i < 5; ++i) {
@@ -853,6 +1025,7 @@ TEST(PriorityTaskQueueTest, ClearEmptiesQueue) {
 }
 
 TEST(PriorityTaskQueueTest, SetMaxSizeChangesCapacity) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SetMaxSizeChangesCapacity] Testing...");
     PriorityTaskQueue queue(10);
 
     queue.SetMaxSize(20);
@@ -865,6 +1038,7 @@ TEST(PriorityTaskQueueTest, SetMaxSizeChangesCapacity) {
 // ============================================================================
 
 TEST(TaskContextTest, DefaultConstructorInitializesFields) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[DefaultConstructorInitializesFields] Testing...");
     TaskContext ctx;
 
     EXPECT_EQ(ctx.taskId, 0);
@@ -875,6 +1049,7 @@ TEST(TaskContextTest, DefaultConstructorInitializesFields) {
 }
 
 TEST(TaskContextTest, ParametricConstructorSetsFields) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ParametricConstructorSetsFields] Testing...");
     TaskContext ctx(TaskPriority::High, "Test task");
 
     EXPECT_EQ(ctx.priority, TaskPriority::High);
@@ -882,12 +1057,14 @@ TEST(TaskContextTest, ParametricConstructorSetsFields) {
 }
 
 TEST(TaskContextTest, IsCancelledReturnsFalseWithoutToken) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[IsCancelledReturnsFalseWithoutToken] Testing...");
     TaskContext ctx;
 
     EXPECT_FALSE(ctx.IsCancelled());
 }
 
 TEST(TaskContextTest, IsCancelledReturnsTrueWhenTokenSet) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[IsCancelledReturnsTrueWhenTokenSet] Testing...");
     TaskContext ctx;
     ctx.cancellationToken = std::make_shared<std::atomic<bool>>(true);
 
@@ -895,6 +1072,7 @@ TEST(TaskContextTest, IsCancelledReturnsTrueWhenTokenSet) {
 }
 
 TEST(TaskContextTest, CancelSetsToken) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[CancelSetsToken] Testing...");
     TaskContext ctx;
     ctx.cancellationToken = std::make_shared<std::atomic<bool>>(false);
 
@@ -904,12 +1082,14 @@ TEST(TaskContextTest, CancelSetsToken) {
 }
 
 TEST(TaskContextTest, CancelWithoutTokenIsNoop) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[CancelWithoutTokenIsNoop] Testing...");
     TaskContext ctx;
 
     EXPECT_NO_THROW(ctx.Cancel());
 }
 
 TEST(TaskContextTest, GetWaitTimeReturnsPositiveDuration) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetWaitTimeReturnsPositiveDuration] Testing...");
     TaskContext ctx;
 
     std::this_thread::sleep_for(10ms);
@@ -923,6 +1103,7 @@ TEST(TaskContextTest, GetWaitTimeReturnsPositiveDuration) {
 // ============================================================================
 
 TEST(TaskStatisticsTest, ResetClearsAllCounters) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ResetClearsAllCounters] Testing...");
     TaskStatistics stats;
 
     stats.enqueuedCount = 10;
@@ -937,12 +1118,14 @@ TEST(TaskStatisticsTest, ResetClearsAllCounters) {
 }
 
 TEST(TaskStatisticsTest, GetAverageExecutionTimeWithZeroCompleted) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetAverageExecutionTimeWithZeroCompleted] Testing...");
     TaskStatistics stats;
 
     EXPECT_EQ(stats.GetAverageExecutionTimeMs(), 0.0);
 }
 
 TEST(TaskStatisticsTest, GetAverageExecutionTimeCalculatesCorrectly) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetAverageExecutionTimeCalculatesCorrectly] Testing...");
     TaskStatistics stats;
 
     stats.completedCount = 4;
@@ -952,12 +1135,14 @@ TEST(TaskStatisticsTest, GetAverageExecutionTimeCalculatesCorrectly) {
 }
 
 TEST(TaskStatisticsTest, GetSuccessRateWithZeroEnqueued) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetSuccessRateWithZeroEnqueued] Testing...");
     TaskStatistics stats;
 
     EXPECT_EQ(stats.GetSuccessRate(), 0.0);
 }
 
 TEST(TaskStatisticsTest, GetSuccessRateCalculatesCorrectly) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[GetSuccessRateCalculatesCorrectly] Testing...");
     TaskStatistics stats;
 
     stats.enqueuedCount = 10;
@@ -971,6 +1156,7 @@ TEST(TaskStatisticsTest, GetSuccessRateCalculatesCorrectly) {
 // ============================================================================
 
 TEST(ThreadStatisticsTest, ResetPreservesCurrentThreadCount) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ResetPreservesCurrentThreadCount] Testing...");
     ThreadStatistics stats;
 
     stats.currentThreadCount = 5;
@@ -987,6 +1173,7 @@ TEST(ThreadStatisticsTest, ResetPreservesCurrentThreadCount) {
 // ============================================================================
 
 TEST(PerformanceMetricsTest, ResetInitializesAllFields) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[ResetInitializesAllFields] Testing...");
     PerformanceMetrics metrics;
 
     metrics.currentQueueSize = 10;
@@ -999,6 +1186,7 @@ TEST(PerformanceMetricsTest, ResetInitializesAllFields) {
 }
 
 TEST(PerformanceMetricsTest, UpdateThroughputWithZeroElapsed) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[UpdateThroughputWithZeroElapsed] Testing...");
     PerformanceMetrics metrics;
 
     metrics.UpdateThroughput(100, 0ms);
@@ -1007,6 +1195,7 @@ TEST(PerformanceMetricsTest, UpdateThroughputWithZeroElapsed) {
 }
 
 TEST(PerformanceMetricsTest, UpdateThroughputCalculatesCorrectly) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[UpdateThroughputCalculatesCorrectly] Testing...");
     PerformanceMetrics metrics;
 
     metrics.UpdateThroughput(100, 1000ms);  // 100 tasks in 1 second

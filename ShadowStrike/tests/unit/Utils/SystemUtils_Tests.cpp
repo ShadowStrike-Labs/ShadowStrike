@@ -1,4 +1,8 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
+#include "pch.h"
 /*
  * ============================================================================
  * ShadowStrike SystemUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -21,13 +25,14 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/Utils/SystemUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>
 #include <thread>
 #include <chrono>
-#include <algorithm>  // ? FIX: Added for std::transform
-#include <cctype>     // ? FIX: Added for ::towlower
+#include <algorithm>  // For std::transform
+#include <cctype>     // For ::towlower
 
 using namespace ShadowStrike::Utils::SystemUtils;
 
@@ -49,6 +54,7 @@ protected:
 // TIME & UPTIME TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, NowFileTime100nsUTC_ReturnsValidTime) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[NowFileTime100nsUTC_ReturnsValidTime] Testing...");
     uint64_t now = NowFileTime100nsUTC();
     
     EXPECT_GT(now, 0ull);
@@ -59,6 +65,7 @@ TEST_F(SystemUtilsTest, NowFileTime100nsUTC_ReturnsValidTime) {
 }
 
 TEST_F(SystemUtilsTest, UptimeMilliseconds_ReturnsNonZero) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[UptimeMilliseconds_ReturnsNonZero] Testing...");
     uint64_t uptime = UptimeMilliseconds();
     
     EXPECT_GT(uptime, 0ull);
@@ -66,6 +73,7 @@ TEST_F(SystemUtilsTest, UptimeMilliseconds_ReturnsNonZero) {
 }
 
 TEST_F(SystemUtilsTest, UptimeMilliseconds_Monotonic) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[UptimeMilliseconds_Monotonic] Testing...");
     uint64_t uptime1 = UptimeMilliseconds();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     uint64_t uptime2 = UptimeMilliseconds();
@@ -77,6 +85,7 @@ TEST_F(SystemUtilsTest, UptimeMilliseconds_Monotonic) {
 // OS VERSION TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, QueryOSVersion_ReturnsValidInfo) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryOSVersion_ReturnsValidInfo] Testing...");
     OSVersion os;
     
     ASSERT_TRUE(QueryOSVersion(os));
@@ -93,6 +102,7 @@ TEST_F(SystemUtilsTest, QueryOSVersion_ReturnsValidInfo) {
 }
 
 TEST_F(SystemUtilsTest, QueryOSVersion_64BitCheck) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryOSVersion_64BitCheck] Testing...");
     OSVersion os;
     
     ASSERT_TRUE(QueryOSVersion(os));
@@ -110,6 +120,7 @@ TEST_F(SystemUtilsTest, QueryOSVersion_64BitCheck) {
 }
 
 TEST_F(SystemUtilsTest, QueryOSVersion_EditionInfo) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryOSVersion_EditionInfo] Testing...");
     OSVersion os;
     
     ASSERT_TRUE(QueryOSVersion(os));
@@ -127,6 +138,7 @@ TEST_F(SystemUtilsTest, QueryOSVersion_EditionInfo) {
 // CPU INFO TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, QueryCpuInfo_ReturnsValidInfo) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryCpuInfo_ReturnsValidInfo] Testing...");
     CpuInfo cpu;
     
     ASSERT_TRUE(QueryCpuInfo(cpu));
@@ -140,6 +152,7 @@ TEST_F(SystemUtilsTest, QueryCpuInfo_ReturnsValidInfo) {
 }
 
 TEST_F(SystemUtilsTest, QueryCpuInfo_Architecture) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryCpuInfo_Architecture] Testing...");
     CpuInfo cpu;
     
     ASSERT_TRUE(QueryCpuInfo(cpu));
@@ -156,6 +169,7 @@ TEST_F(SystemUtilsTest, QueryCpuInfo_Architecture) {
 }
 
 TEST_F(SystemUtilsTest, QueryCpuInfo_BrandString) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryCpuInfo_BrandString] Testing...");
     CpuInfo cpu;
     
     ASSERT_TRUE(QueryCpuInfo(cpu));
@@ -167,6 +181,7 @@ TEST_F(SystemUtilsTest, QueryCpuInfo_BrandString) {
 }
 
 TEST_F(SystemUtilsTest, QueryCpuInfo_Features) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryCpuInfo_Features] Testing...");
     CpuInfo cpu;
     
     ASSERT_TRUE(QueryCpuInfo(cpu));
@@ -181,6 +196,7 @@ TEST_F(SystemUtilsTest, QueryCpuInfo_Features) {
 // MEMORY INFO TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, QueryMemoryInfo_ReturnsValidInfo) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryMemoryInfo_ReturnsValidInfo] Testing...");
     MemoryInfo mem;
     
     ASSERT_TRUE(QueryMemoryInfo(mem));
@@ -194,6 +210,7 @@ TEST_F(SystemUtilsTest, QueryMemoryInfo_ReturnsValidInfo) {
 }
 
 TEST_F(SystemUtilsTest, QueryMemoryInfo_PhysicalRAMCheck) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryMemoryInfo_PhysicalRAMCheck] Testing...");
     MemoryInfo mem;
     
     ASSERT_TRUE(QueryMemoryInfo(mem));
@@ -203,6 +220,7 @@ TEST_F(SystemUtilsTest, QueryMemoryInfo_PhysicalRAMCheck) {
 }
 
 TEST_F(SystemUtilsTest, QueryMemoryInfo_InstalledMemory) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryMemoryInfo_InstalledMemory] Testing...");
     MemoryInfo mem;
     
     ASSERT_TRUE(QueryMemoryInfo(mem));
@@ -218,6 +236,7 @@ TEST_F(SystemUtilsTest, QueryMemoryInfo_InstalledMemory) {
 // SECURITY INFO TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, GetSecurityInfo_ReturnsValidInfo) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetSecurityInfo_ReturnsValidInfo] Testing...");
     SecurityInfo sec;
     
     ASSERT_TRUE(GetSecurityInfo(sec));
@@ -229,6 +248,7 @@ TEST_F(SystemUtilsTest, GetSecurityInfo_ReturnsValidInfo) {
 }
 
 TEST_F(SystemUtilsTest, GetSecurityInfo_IntegrityLevelMapping) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetSecurityInfo_IntegrityLevelMapping] Testing...");
     SecurityInfo sec;
     
     ASSERT_TRUE(GetSecurityInfo(sec));
@@ -249,6 +269,7 @@ TEST_F(SystemUtilsTest, GetSecurityInfo_IntegrityLevelMapping) {
 // PRIVILEGE TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, EnablePrivilege_InvalidPrivilege) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[EnablePrivilege_InvalidPrivilege] Testing...");
     // Non-existent privilege should fail
     bool result = EnablePrivilege(L"SeInvalidPrivilege", true);
     
@@ -256,6 +277,7 @@ TEST_F(SystemUtilsTest, EnablePrivilege_InvalidPrivilege) {
 }
 
 TEST_F(SystemUtilsTest, EnablePrivilege_NullInput) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[EnablePrivilege_NullInput] Testing...");
     // Null privilege name should fail gracefully
     bool result = EnablePrivilege(nullptr, true);
     
@@ -263,6 +285,7 @@ TEST_F(SystemUtilsTest, EnablePrivilege_NullInput) {
 }
 
 TEST_F(SystemUtilsTest, EnablePrivilege_EmptyInput) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[EnablePrivilege_EmptyInput] Testing...");
     // Empty privilege name should fail
     bool result = EnablePrivilege(L"", true);
     
@@ -273,6 +296,7 @@ TEST_F(SystemUtilsTest, EnablePrivilege_EmptyInput) {
 // DEBUGGER DETECTION TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, IsDebuggerPresentSafe_NoThrow) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[IsDebuggerPresentSafe_NoThrow] Testing...");
     // Should not throw regardless of debugger presence
     EXPECT_NO_THROW({
         bool debugged = IsDebuggerPresentSafe();
@@ -284,6 +308,7 @@ TEST_F(SystemUtilsTest, IsDebuggerPresentSafe_NoThrow) {
 // PROCESS ID TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, CurrentProcessId_ReturnsValidPid) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[CurrentProcessId_ReturnsValidPid] Testing...");
     DWORD pid = CurrentProcessId();
     
     EXPECT_GT(pid, 0u);
@@ -291,6 +316,7 @@ TEST_F(SystemUtilsTest, CurrentProcessId_ReturnsValidPid) {
 }
 
 TEST_F(SystemUtilsTest, GetParentProcessId_CurrentProcess) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetParentProcessId_CurrentProcess] Testing...");
     auto parentPid = GetParentProcessId(0); // 0 = current process
     
     ASSERT_TRUE(parentPid.has_value());
@@ -298,6 +324,7 @@ TEST_F(SystemUtilsTest, GetParentProcessId_CurrentProcess) {
 }
 
 TEST_F(SystemUtilsTest, GetParentProcessId_InvalidPid) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetParentProcessId_InvalidPid] Testing...");
     auto parentPid = GetParentProcessId(99999); // Non-existent PID
     
     EXPECT_FALSE(parentPid.has_value());
@@ -307,6 +334,7 @@ TEST_F(SystemUtilsTest, GetParentProcessId_InvalidPid) {
 // PATH QUERY TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, GetExecutablePath_ReturnsValidPath) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetExecutablePath_ReturnsValidPath] Testing...");
     std::wstring path = GetExecutablePath();
     
     EXPECT_FALSE(path.empty());
@@ -314,6 +342,7 @@ TEST_F(SystemUtilsTest, GetExecutablePath_ReturnsValidPath) {
 }
 
 TEST_F(SystemUtilsTest, GetModulePath_Kernel32) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetModulePath_Kernel32] Testing...");
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     ASSERT_NE(hKernel32, nullptr);
     
@@ -328,6 +357,7 @@ TEST_F(SystemUtilsTest, GetModulePath_Kernel32) {
 }
 
 TEST_F(SystemUtilsTest, GetSystemDirectoryPath_ReturnsValidPath) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetSystemDirectoryPath_ReturnsValidPath] Testing...");
     std::wstring sysDir = GetSystemDirectoryPath();
     
     EXPECT_FALSE(sysDir.empty());
@@ -339,6 +369,7 @@ TEST_F(SystemUtilsTest, GetSystemDirectoryPath_ReturnsValidPath) {
 }
 
 TEST_F(SystemUtilsTest, GetWindowsDirectoryPath_ReturnsValidPath) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetWindowsDirectoryPath_ReturnsValidPath] Testing...");
     std::wstring winDir = GetWindowsDirectoryPath();
     
     EXPECT_FALSE(winDir.empty());
@@ -353,6 +384,7 @@ TEST_F(SystemUtilsTest, GetWindowsDirectoryPath_ReturnsValidPath) {
 // ENVIRONMENT VARIABLE TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, ExpandEnv_ValidVariable) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[ExpandEnv_ValidVariable] Testing...");
     std::wstring expanded = ExpandEnv(L"%WINDIR%\\System32");
     
     EXPECT_FALSE(expanded.empty());
@@ -361,12 +393,14 @@ TEST_F(SystemUtilsTest, ExpandEnv_ValidVariable) {
 }
 
 TEST_F(SystemUtilsTest, ExpandEnv_EmptyString) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[ExpandEnv_EmptyString] Testing...");
     std::wstring expanded = ExpandEnv(L"");
     
     EXPECT_TRUE(expanded.empty());
 }
 
 TEST_F(SystemUtilsTest, ExpandEnv_NoVariables) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[ExpandEnv_NoVariables] Testing...");
     std::wstring input = L"C:\\Test\\Path";
     std::wstring expanded = ExpandEnv(input);
     
@@ -377,6 +411,7 @@ TEST_F(SystemUtilsTest, ExpandEnv_NoVariables) {
 // COMPUTER NAME TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, GetComputerNameDnsHostname_ReturnsNonEmpty) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetComputerNameDnsHostname_ReturnsNonEmpty] Testing...");
     std::wstring hostname = GetComputerNameDnsHostname();
     
     // May be empty on systems without DNS configuration, but shouldn't crash
@@ -387,6 +422,7 @@ TEST_F(SystemUtilsTest, GetComputerNameDnsHostname_ReturnsNonEmpty) {
 }
 
 TEST_F(SystemUtilsTest, GetComputerNameDnsFullyQualified_NoThrow) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetComputerNameDnsFullyQualified_NoThrow] Testing...");
     EXPECT_NO_THROW({
         std::wstring fqdn = GetComputerNameDnsFullyQualified();
         // Result may be empty on non-domain systems, just verify no crash
@@ -397,6 +433,7 @@ TEST_F(SystemUtilsTest, GetComputerNameDnsFullyQualified_NoThrow) {
 // DPI AWARENESS TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, SetProcessDpiAwarePerMonitorV2_NoThrow) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[SetProcessDpiAwarePerMonitorV2_NoThrow] Testing...");
     // DPI awareness can only be set once per process
     // Just verify it doesn't crash
     EXPECT_NO_THROW({
@@ -408,6 +445,7 @@ TEST_F(SystemUtilsTest, SetProcessDpiAwarePerMonitorV2_NoThrow) {
 // PRIORITY TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, SetProcessPriorityHigh_NoThrow) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[SetProcessPriorityHigh_NoThrow] Testing...");
     // Should not throw (may fail if not elevated)
     EXPECT_NO_THROW({
         bool result = SetProcessPriorityHigh();
@@ -419,6 +457,7 @@ TEST_F(SystemUtilsTest, SetProcessPriorityHigh_NoThrow) {
 }
 
 TEST_F(SystemUtilsTest, SetCurrentThreadPriority_ValidPriority) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[SetCurrentThreadPriority_ValidPriority] Testing...");
     // Should succeed with valid priority
     bool result = SetCurrentThreadPriority(THREAD_PRIORITY_NORMAL);
     EXPECT_TRUE(result);
@@ -428,6 +467,7 @@ TEST_F(SystemUtilsTest, SetCurrentThreadPriority_ValidPriority) {
 }
 
 TEST_F(SystemUtilsTest, SetCurrentThreadPriority_InvalidPriority) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[SetCurrentThreadPriority_InvalidPriority] Testing...");
     // Invalid priority value
     bool result = SetCurrentThreadPriority(999);
     EXPECT_FALSE(result);
@@ -437,6 +477,7 @@ TEST_F(SystemUtilsTest, SetCurrentThreadPriority_InvalidPriority) {
 // BOOT TIME TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, QueryBootTime_ReturnsValidTime) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[QueryBootTime_ReturnsValidTime] Testing...");
     FILETIME bootTime{};
     
     ASSERT_TRUE(QueryBootTime(bootTime));
@@ -462,6 +503,7 @@ TEST_F(SystemUtilsTest, QueryBootTime_ReturnsValidTime) {
 // SYSTEM INFO TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, GetBasicSystemInfo_ReturnsValidInfo) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[GetBasicSystemInfo_ReturnsValidInfo] Testing...");
     SYSTEM_INFO si{};
     
     ASSERT_TRUE(GetBasicSystemInfo(si));
@@ -476,6 +518,7 @@ TEST_F(SystemUtilsTest, GetBasicSystemInfo_ReturnsValidInfo) {
 // EDGE CASES & ERROR HANDLING
 // ============================================================================
 TEST_F(SystemUtilsTest, EdgeCase_MultipleOSVersionQueries) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[EdgeCase_MultipleOSVersionQueries] Testing...");
     // Should handle multiple queries without issues
     for (int i = 0; i < 5; ++i) {
         OSVersion os;
@@ -485,6 +528,7 @@ TEST_F(SystemUtilsTest, EdgeCase_MultipleOSVersionQueries) {
 }
 
 TEST_F(SystemUtilsTest, EdgeCase_MultipleCpuInfoQueries) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[EdgeCase_MultipleCpuInfoQueries] Testing...");
     // Should handle multiple queries without issues
     for (int i = 0; i < 5; ++i) {
         CpuInfo cpu;
@@ -494,6 +538,7 @@ TEST_F(SystemUtilsTest, EdgeCase_MultipleCpuInfoQueries) {
 }
 
 TEST_F(SystemUtilsTest, EdgeCase_MultipleMemoryInfoQueries) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[EdgeCase_MultipleMemoryInfoQueries] Testing...");
     // Should handle multiple queries without issues
     for (int i = 0; i < 5; ++i) {
         MemoryInfo mem;
@@ -506,6 +551,7 @@ TEST_F(SystemUtilsTest, EdgeCase_MultipleMemoryInfoQueries) {
 // STRESS TESTS
 // ============================================================================
 TEST_F(SystemUtilsTest, Stress_RapidQueryOSVersion) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[Stress_RapidQueryOSVersion] Testing...");
     for (int i = 0; i < 100; ++i) {
         OSVersion os;
         ASSERT_TRUE(QueryOSVersion(os));
@@ -513,6 +559,7 @@ TEST_F(SystemUtilsTest, Stress_RapidQueryOSVersion) {
 }
 
 TEST_F(SystemUtilsTest, Stress_RapidPathQueries) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[Stress_RapidPathQueries] Testing...");
     for (int i = 0; i < 50; ++i) {
         std::wstring exe = GetExecutablePath();
         std::wstring sys = GetSystemDirectoryPath();
@@ -525,6 +572,7 @@ TEST_F(SystemUtilsTest, Stress_RapidPathQueries) {
 }
 
 TEST_F(SystemUtilsTest, Stress_RapidEnvironmentExpansion) {
+    SS_LOG_INFO(L"SystemUtils_Tests", L"[Stress_RapidEnvironmentExpansion] Testing...");
     for (int i = 0; i < 100; ++i) {
         std::wstring expanded = ExpandEnv(L"%WINDIR%");
         EXPECT_FALSE(expanded.empty());

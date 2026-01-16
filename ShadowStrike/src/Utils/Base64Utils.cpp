@@ -1,4 +1,6 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ============================================================================
  * ShadowStrike Base64 Implementation
@@ -27,7 +29,7 @@
  *
  * ============================================================================
  */
-
+#include"pch.h"
 #include "Base64Utils.hpp"
 
 #include <cstring>

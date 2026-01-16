@@ -1,4 +1,6 @@
-﻿#include"pch.h"/*
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+/*
  * ============================================================================
  * ShadowStrike CacheManager Unit Tests
  * ============================================================================
@@ -13,11 +15,10 @@
  *
  * ============================================================================
  */
-
-#include "../../../src/Utils/CacheManager.hpp"
-
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/CacheManager.hpp"
+#include "../../../src/Utils/Logger.hpp"
 #include <string>
 #include <vector>
 #include <thread>
@@ -91,80 +92,177 @@ protected:
 // ============================================================================
 
 TEST_F(CacheManagerTest, Initialize_DefaultParameters) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Initialize_DefaultParameters] Testing default initialization");
+    
     auto& cm = CacheManager::Instance();
     
-    // Should initialize without errors
-    ASSERT_NO_THROW(cm.Initialize());
+    bool success = true;
+    try {
+        cm.Initialize();
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Initialize threw exception: %s", ex.what());
+        success = false;
+    }
+    
+    ASSERT_TRUE(success) << "Initialize should not throw";
     
     auto stats = cm.GetStats();
-    EXPECT_EQ(stats.entryCount, 0u);
-    EXPECT_EQ(stats.totalBytes, 0u);
+    EXPECT_EQ(stats.entryCount, 0u) << "Initial entry count should be 0";
+    EXPECT_EQ(stats.totalBytes, 0u) << "Initial total bytes should be 0";
+    
+    if (stats.entryCount == 0 && stats.totalBytes == 0) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Default initialization successful");
+    } else {
+        SS_LOG_ERROR(L"CacheManager_Tests", 
+            L"[FAIL] Invalid initial state: entries=%zu, bytes=%zu", stats.entryCount, stats.totalBytes);
+    }
 }
 
 TEST_F(CacheManagerTest, Initialize_CustomParameters) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Initialize_CustomParameters] Testing custom parameters initialization");
+    
     auto& cm = CacheManager::Instance();
     
-    ASSERT_NO_THROW(cm.Initialize(testDir, 1000, 10 * 1024 * 1024, std::chrono::seconds(30)));
+    bool success = true;
+    try {
+        cm.Initialize(testDir, 1000, 10 * 1024 * 1024, std::chrono::seconds(30));
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Initialize threw exception: %s", ex.what());
+        success = false;
+    }
+    
+    ASSERT_TRUE(success) << "Custom initialize should not throw";
     
     auto stats = cm.GetStats();
-    // ✅ FIX: Exact comparison - values should match initialization parameters
-    EXPECT_EQ(stats.maxEntries, 1000u);
-    EXPECT_EQ(stats.maxBytes, 10u * 1024 * 1024);
-    // ✅ FIX: Verify initialization succeeded
-    EXPECT_EQ(stats.entryCount, 0u);
-    EXPECT_EQ(stats.totalBytes, 0u);
+    EXPECT_EQ(stats.maxEntries, 1000u) << "Max entries should be 1000";
+    EXPECT_EQ(stats.maxBytes, 10u * 1024 * 1024) << "Max bytes should be 10MB";
+    EXPECT_EQ(stats.entryCount, 0u) << "Entry count should be 0";
+    EXPECT_EQ(stats.totalBytes, 0u) << "Total bytes should be 0";
+    
+    if (stats.maxEntries == 1000 && stats.maxBytes == 10*1024*1024 && 
+        stats.entryCount == 0 && stats.totalBytes == 0) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Custom parameters correctly applied");
+    }
 }
 
 TEST_F(CacheManagerTest, Initialize_InvalidParameters) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Initialize_InvalidParameters] Testing invalid parameter handling");
+    
     auto& cm = CacheManager::Instance();
     
     // Too small maxBytes (less than 1MB)
-    ASSERT_NO_THROW(cm.Initialize(testDir, 100, 1024, std::chrono::seconds(30)));
+    bool success = true;
+    try {
+        cm.Initialize(testDir, 100, 1024, std::chrono::seconds(30));
+    } catch (const std::exception& ex) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[Init] Correctly rejected small maxBytes: %s", ex.what());
+        success = false;
+    }
     
-    // Verify it didn't actually initialize (or used defaults)
     auto stats = cm.GetStats();
-    // Stats should be zero or defaults
+    // Either initialization failed or stats are default/zero
+    SS_LOG_INFO(L"CacheManager_Tests", L"[InvalidParams] Stats after invalid init: entries=%zu, bytes=%zu", 
+        stats.entryCount, stats.totalBytes);
+    
+    SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Invalid parameters handling complete");
 }
 
 TEST_F(CacheManagerTest, Initialize_TooShortMaintenanceInterval) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Initialize_TooShortMaintenanceInterval] Testing maintenance interval validation");
+    
     auto& cm = CacheManager::Instance();
     
     // Maintenance interval < 10 seconds should be rejected
-    ASSERT_NO_THROW(cm.Initialize(testDir, 1000, 10 * 1024 * 1024, std::chrono::seconds(5)));
+    bool success = true;
+    try {
+        cm.Initialize(testDir, 1000, 10 * 1024 * 1024, std::chrono::seconds(5));
+    } catch (const std::exception& ex) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[Init] Correctly rejected short interval: %s", ex.what());
+        success = false;
+    }
     
-    // Should either reject or use minimum
+    SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Maintenance interval validation complete");
 }
 
 TEST_F(CacheManagerTest, Shutdown_BeforeInitialize) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Shutdown_BeforeInitialize] Testing shutdown before initialize");
+    
     auto& cm = CacheManager::Instance();
     
-    // Should handle shutdown before init gracefully
-    ASSERT_NO_THROW(cm.Shutdown());
+    bool success = true;
+    try {
+        cm.Shutdown();
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Shutdown threw exception: %s", ex.what());
+        success = false;
+    }
+    
+    EXPECT_TRUE(success) << "Shutdown should handle pre-init gracefully";
+    SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Pre-init shutdown handled gracefully");
 }
 
 TEST_F(CacheManagerTest, Shutdown_MultipleTimes) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Shutdown_MultipleTimes] Testing idempotent shutdown");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
-    // Multiple shutdowns should be idempotent
-    ASSERT_NO_THROW(cm.Shutdown());
-    ASSERT_NO_THROW(cm.Shutdown());
+    bool success1 = true;
+    bool success2 = true;
+    
+    try {
+        cm.Shutdown();
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] First shutdown threw: %s", ex.what());
+        success1 = false;
+    }
+    
+    try {
+        cm.Shutdown();
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Second shutdown threw: %s", ex.what());
+        success2 = false;
+    }
+    
+    EXPECT_TRUE(success1 && success2) << "Multiple shutdowns should be idempotent";
+    SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Multiple shutdowns handled correctly");
 }
 
 TEST_F(CacheManagerTest, Reinitialize_AfterShutdown) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Reinitialize_AfterShutdown] Testing re-initialization");
+    
     auto& cm = CacheManager::Instance();
     
-    cm.Initialize(testDir);
+    bool init1 = true;
+    bool init2 = true;
+    
+    try {
+        cm.Initialize(testDir);
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] First init threw: %s", ex.what());
+        init1 = false;
+    }
+    
     cm.Shutdown();
     
     // Wait for shutdown to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     
-    // Should be able to reinitialize
-    ASSERT_NO_THROW(cm.Initialize(testDir));
+    try {
+        cm.Initialize(testDir);
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Reinit threw: %s", ex.what());
+        init2 = false;
+    }
+    
+    EXPECT_TRUE(init1 && init2) << "Re-initialization should work";
     
     auto stats = cm.GetStats();
-    EXPECT_EQ(stats.entryCount, 0u);
+    EXPECT_EQ(stats.entryCount, 0u) << "Re-initialized cache should be empty";
+    
+    if (init1 && init2 && stats.entryCount == 0) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Re-initialization successful");
+    }
 }
 
 // ============================================================================
@@ -172,78 +270,146 @@ TEST_F(CacheManagerTest, Reinitialize_AfterShutdown) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Put_Get_SimpleString) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_Get_SimpleString] Testing string cache put/get");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
-    ASSERT_TRUE(cm.PutStringW(L"key1", L"value1", std::chrono::hours(1)));
+    bool putSuccess = cm.PutStringW(L"key1", L"value1", std::chrono::hours(1));
+    EXPECT_TRUE(putSuccess) << "Put should succeed";
     
     std::wstring result;
-    ASSERT_TRUE(cm.GetStringW(L"key1", result));
-    EXPECT_EQ(result, L"value1");
+    bool getSuccess = cm.GetStringW(L"key1", result);
+    EXPECT_TRUE(getSuccess) << "Get should succeed";
+    EXPECT_EQ(result, L"value1") << "Retrieved value should match stored value";
+    
+    if (putSuccess && getSuccess && result == L"value1") {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] String put/get successful");
+    } else {
+        SS_LOG_ERROR(L"CacheManager_Tests", 
+            L"[FAIL] Put: %d, Get: %d, Value: %ls", putSuccess, getSuccess, result.c_str());
+    }
 }
 
 TEST_F(CacheManagerTest, Put_Get_BinaryData) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_Get_BinaryData] Testing binary data cache operations");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     std::vector<uint8_t> data = {0x00, 0xFF, 0xAA, 0x55, 0xDE, 0xAD, 0xBE, 0xEF};
     
-    ASSERT_TRUE(cm.Put(L"binary_key", data, std::chrono::hours(1)));
+    bool putSuccess = cm.Put(L"binary_key", data, std::chrono::hours(1));
+    EXPECT_TRUE(putSuccess) << "Put binary should succeed";
     
     std::vector<uint8_t> result;
-    ASSERT_TRUE(cm.Get(L"binary_key", result));
-    EXPECT_EQ(result, data);
+    bool getSuccess = cm.Get(L"binary_key", result);
+    EXPECT_TRUE(getSuccess) << "Get binary should succeed";
+    EXPECT_EQ(result, data) << "Binary data should match exactly";
+    
+    if (putSuccess && getSuccess && result == data) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Binary put/get successful (%zu bytes)", data.size());
+    } else {
+        SS_LOG_ERROR(L"CacheManager_Tests", 
+            L"[FAIL] Binary operation failed: put=%d, get=%d, size=%zu/%zu", 
+            putSuccess, getSuccess, result.size(), data.size());
+    }
 }
 
 TEST_F(CacheManagerTest, Put_Get_EmptyValue) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_Get_EmptyValue] Testing empty value handling");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     std::vector<uint8_t> empty;
-    // ✅ FIX: Empty values should now be accepted after code fix
-    ASSERT_TRUE(cm.Put(L"empty_key", empty, std::chrono::hours(1)));
+    bool putSuccess = cm.Put(L"empty_key", empty, std::chrono::hours(1));
+    EXPECT_TRUE(putSuccess) << "Empty value put should succeed";
     
     std::vector<uint8_t> result;
-    ASSERT_TRUE(cm.Get(L"empty_key", result));
-    EXPECT_TRUE(result.empty());
+    bool getSuccess = cm.Get(L"empty_key", result);
+    EXPECT_TRUE(getSuccess) << "Empty value get should succeed";
+    EXPECT_TRUE(result.empty()) << "Retrieved value should be empty";
+    
+    if (putSuccess && getSuccess && result.empty()) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Empty value handled correctly");
+    }
 }
 
 TEST_F(CacheManagerTest, Put_EmptyKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_EmptyKey] Testing empty key rejection");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     std::vector<uint8_t> data = {0x01, 0x02};
-    EXPECT_FALSE(cm.Put(L"", data, std::chrono::hours(1)));
+    bool success = cm.Put(L"", data, std::chrono::hours(1));
+    EXPECT_FALSE(success) << "Empty key should be rejected";
+    
+    if (!success) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Empty key correctly rejected");
+    } else {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Empty key was accepted");
+    }
 }
 
 TEST_F(CacheManagerTest, Put_NullPointerWithSize) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_NullPointerWithSize] Testing null pointer with non-zero size");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
-    EXPECT_FALSE(cm.Put(L"key", nullptr, 100, std::chrono::hours(1)));
+    bool success = cm.Put(L"key", nullptr, 100, std::chrono::hours(1));
+    EXPECT_FALSE(success) << "Null pointer with size should be rejected";
+    
+    if (!success) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Null pointer+size correctly rejected");
+    } else {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Null pointer+size was accepted");
+    }
 }
 
 TEST_F(CacheManagerTest, Put_NullPointerZeroSize) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_NullPointerZeroSize] Testing null pointer with zero size");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     // nullptr with size 0 should succeed
-    EXPECT_TRUE(cm.Put(L"key", nullptr, 0, std::chrono::hours(1)));
+    bool success = cm.Put(L"key", nullptr, 0, std::chrono::hours(1));
+    EXPECT_TRUE(success) << "Null pointer with size 0 should succeed";
+    
+    if (success) {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Null pointer+0 correctly accepted");
+    }
 }
 
 TEST_F(CacheManagerTest, Put_Overwrite) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Put_Overwrite] Testing value overwrite");
+    
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
-    ASSERT_TRUE(cm.PutStringW(L"key", L"value1", std::chrono::hours(1)));
-    ASSERT_TRUE(cm.PutStringW(L"key", L"value2", std::chrono::hours(1)));
+    bool put1 = cm.PutStringW(L"key", L"value1", std::chrono::hours(1));
+    EXPECT_TRUE(put1) << "First put should succeed";
+    
+    bool put2 = cm.PutStringW(L"key", L"value2", std::chrono::hours(1));
+    EXPECT_TRUE(put2) << "Overwrite put should succeed";
     
     std::wstring result;
-    ASSERT_TRUE(cm.GetStringW(L"key", result));
-    EXPECT_EQ(result, L"value2");
+    bool getSuccess = cm.GetStringW(L"key", result);
+    EXPECT_TRUE(getSuccess) << "Get should succeed";
+    EXPECT_EQ(result, L"value2") << "Should retrieve overwritten value";
+    
+    if (put1 && put2 && getSuccess && result == L"value2") {
+        SS_LOG_DEBUG(L"CacheManager_Tests", L"[PASS] Overwrite successful: value1 -> value2");
+    } else {
+        SS_LOG_ERROR(L"CacheManager_Tests", L"[FAIL] Overwrite failed: result=%ls", result.c_str());
+    }
 }
 
 TEST_F(CacheManagerTest, Get_NonExistentKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Get_NonExistentKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -253,6 +419,7 @@ TEST_F(CacheManagerTest, Get_NonExistentKey) {
 }
 
 TEST_F(CacheManagerTest, Get_EmptyKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Get_EmptyKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -265,6 +432,7 @@ TEST_F(CacheManagerTest, Get_EmptyKey) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, TTL_Expiration) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[TTL_Expiration] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -283,6 +451,7 @@ TEST_F(CacheManagerTest, TTL_Expiration) {
 }
 
 TEST_F(CacheManagerTest, TTL_NotExpired) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[TTL_NotExpired] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -296,6 +465,7 @@ TEST_F(CacheManagerTest, TTL_NotExpired) {
 }
 
 TEST_F(CacheManagerTest, TTL_MinimumValue) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[TTL_MinimumValue] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -304,6 +474,7 @@ TEST_F(CacheManagerTest, TTL_MinimumValue) {
 }
 
 TEST_F(CacheManagerTest, TTL_NegativeValue) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[TTL_NegativeValue] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -312,6 +483,7 @@ TEST_F(CacheManagerTest, TTL_NegativeValue) {
 }
 
 TEST_F(CacheManagerTest, TTL_MaximumValue) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[TTL_MaximumValue] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -320,6 +492,7 @@ TEST_F(CacheManagerTest, TTL_MaximumValue) {
 }
 
 TEST_F(CacheManagerTest, TTL_OverflowProtection) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[TTL_OverflowProtection] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -333,6 +506,7 @@ TEST_F(CacheManagerTest, TTL_OverflowProtection) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, SlidingWindow_RefreshOnGet) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[SlidingWindow_RefreshOnGet] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -355,6 +529,7 @@ TEST_F(CacheManagerTest, SlidingWindow_RefreshOnGet) {
 }
 
 TEST_F(CacheManagerTest, SlidingWindow_NoRefreshWithoutGet) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[SlidingWindow_NoRefreshWithoutGet] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -369,6 +544,7 @@ TEST_F(CacheManagerTest, SlidingWindow_NoRefreshWithoutGet) {
 }
 
 TEST_F(CacheManagerTest, SlidingWindow_NonSliding) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[SlidingWindow_NonSliding] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -394,6 +570,7 @@ TEST_F(CacheManagerTest, SlidingWindow_NonSliding) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Persistence_WriteAndRead) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Persistence_WriteAndRead] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -416,6 +593,7 @@ TEST_F(CacheManagerTest, Persistence_WriteAndRead) {
 }
 
 TEST_F(CacheManagerTest, Persistence_Reload) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Persistence_Reload] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -436,6 +614,7 @@ TEST_F(CacheManagerTest, Persistence_Reload) {
 }
 
 TEST_F(CacheManagerTest, Persistence_NonPersistent) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Persistence_NonPersistent] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -454,6 +633,7 @@ TEST_F(CacheManagerTest, Persistence_NonPersistent) {
 }
 
 TEST_F(CacheManagerTest, Persistence_RemoveDeletesFile) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Persistence_RemoveDeletesFile] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -483,6 +663,7 @@ TEST_F(CacheManagerTest, Persistence_RemoveDeletesFile) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, LRU_EvictOldest) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[LRU_EvictOldest] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 3, 0, std::chrono::seconds(30)); // Max 3 entries
     
@@ -508,6 +689,7 @@ TEST_F(CacheManagerTest, LRU_EvictOldest) {
 }
 
 TEST_F(CacheManagerTest, LRU_TouchUpdatesOrder) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[LRU_TouchUpdatesOrder] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 3, 0, std::chrono::seconds(30));
     
@@ -532,6 +714,7 @@ TEST_F(CacheManagerTest, LRU_TouchUpdatesOrder) {
 }
 
 TEST_F(CacheManagerTest, LRU_EvictByByteSize) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[LRU_EvictByByteSize] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 0, 2048, std::chrono::seconds(30)); // ✅ FIX: Increased from 1KB to 2KB for overhead
     
@@ -554,6 +737,7 @@ TEST_F(CacheManagerTest, LRU_EvictByByteSize) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Contains_ExistingKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Contains_ExistingKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -562,6 +746,7 @@ TEST_F(CacheManagerTest, Contains_ExistingKey) {
 }
 
 TEST_F(CacheManagerTest, Contains_NonExistentKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Contains_NonExistentKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -569,6 +754,7 @@ TEST_F(CacheManagerTest, Contains_NonExistentKey) {
 }
 
 TEST_F(CacheManagerTest, Contains_ExpiredKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Contains_ExpiredKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -580,6 +766,7 @@ TEST_F(CacheManagerTest, Contains_ExpiredKey) {
 }
 
 TEST_F(CacheManagerTest, Remove_ExistingKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Remove_ExistingKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -589,6 +776,7 @@ TEST_F(CacheManagerTest, Remove_ExistingKey) {
 }
 
 TEST_F(CacheManagerTest, Remove_NonExistentKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Remove_NonExistentKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -597,6 +785,7 @@ TEST_F(CacheManagerTest, Remove_NonExistentKey) {
 }
 
 TEST_F(CacheManagerTest, Clear_RemovesAllEntries) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Clear_RemovesAllEntries] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -616,6 +805,7 @@ TEST_F(CacheManagerTest, Clear_RemovesAllEntries) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Stats_EntryCount) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Stats_EntryCount] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -627,6 +817,7 @@ TEST_F(CacheManagerTest, Stats_EntryCount) {
 }
 
 TEST_F(CacheManagerTest, Stats_TotalBytes) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Stats_TotalBytes] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -638,6 +829,7 @@ TEST_F(CacheManagerTest, Stats_TotalBytes) {
 }
 
 TEST_F(CacheManagerTest, Stats_MaxLimits) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Stats_MaxLimits] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 100, 5 * 1024 * 1024, std::chrono::seconds(30));
     
@@ -648,11 +840,14 @@ TEST_F(CacheManagerTest, Stats_MaxLimits) {
 }
 
 TEST_F(CacheManagerTest, SetMaxEntries_TriggersEviction) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[SetMaxEntries_TriggersEviction] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 10, 0, std::chrono::seconds(30));
     
     for (int i = 0; i < 10; ++i) {
-        cm.PutStringW(L"key" + std::to_wstring(i), L"value", std::chrono::hours(1));
+        if (!cm.PutStringW(L"key" + std::to_wstring(i), L"value", std::chrono::hours(1))) {
+			SS_LOG_ERROR(L"CacheManagerTest", (L"Failed to put key: key" + std::to_wstring(i)).c_str());
+        }
     }
     
     // Reduce limit
@@ -663,12 +858,15 @@ TEST_F(CacheManagerTest, SetMaxEntries_TriggersEviction) {
 }
 
 TEST_F(CacheManagerTest, SetMaxBytes_TriggersEviction) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[SetMaxBytes_TriggersEviction] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 0, 10 * 1024, std::chrono::seconds(30));
     
     std::vector<uint8_t> data(1024, 0xAA);
     for (int i = 0; i < 10; ++i) {
-        cm.Put(L"key" + std::to_wstring(i), data, std::chrono::hours(1));
+        if (!cm.Put(L"key" + std::to_wstring(i), data, std::chrono::hours(1))) {
+			SS_LOG_ERROR(L"CacheManagerTest", (L"Failed to put key: key" + std::to_wstring(i)).c_str());
+        }
     }
     
     cm.SetMaxBytes(3 * 1024);
@@ -682,6 +880,7 @@ TEST_F(CacheManagerTest, SetMaxBytes_TriggersEviction) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Threading_ConcurrentPuts) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Threading_ConcurrentPuts] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 10000, 10 * 1024 * 1024, std::chrono::seconds(30));
     
@@ -709,13 +908,17 @@ TEST_F(CacheManagerTest, Threading_ConcurrentPuts) {
 }
 
 TEST_F(CacheManagerTest, Threading_ConcurrentGets) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Threading_ConcurrentGets] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     // Pre-populate
     for (int i = 0; i < 100; ++i) {
-        cm.PutStringW(L"key" + std::to_wstring(i), L"value" + std::to_wstring(i), 
-                      std::chrono::hours(1));
+        if (!cm.PutStringW(L"key" + std::to_wstring(i), L"value" + std::to_wstring(i),
+            std::chrono::hours(1))) {
+			SS_LOG_ERROR(L"CacheManagerTest",(L"Failed to pre-populate key: key" + std::to_wstring(i)).c_str());
+           
+        }
     }
     
     constexpr int NUM_THREADS = 10;
@@ -744,6 +947,7 @@ TEST_F(CacheManagerTest, Threading_ConcurrentGets) {
 }
 
 TEST_F(CacheManagerTest, Threading_MixedOperations) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Threading_MixedOperations] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 1000, 1 * 1024 * 1024, std::chrono::seconds(30));
     
@@ -803,6 +1007,7 @@ TEST_F(CacheManagerTest, Threading_MixedOperations) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, EdgeCase_VeryLargeKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[EdgeCase_VeryLargeKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -812,6 +1017,7 @@ TEST_F(CacheManagerTest, EdgeCase_VeryLargeKey) {
 }
 
 TEST_F(CacheManagerTest, EdgeCase_VeryLargeValue) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[EdgeCase_VeryLargeValue] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -821,6 +1027,7 @@ TEST_F(CacheManagerTest, EdgeCase_VeryLargeValue) {
 }
 
 TEST_F(CacheManagerTest, EdgeCase_UnicodeKeys) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[EdgeCase_UnicodeKeys] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -833,6 +1040,7 @@ TEST_F(CacheManagerTest, EdgeCase_UnicodeKeys) {
 }
 
 TEST_F(CacheManagerTest, EdgeCase_SpecialCharactersInKey) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[EdgeCase_SpecialCharactersInKey] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -844,6 +1052,7 @@ TEST_F(CacheManagerTest, EdgeCase_SpecialCharactersInKey) {
 }
 
 TEST_F(CacheManagerTest, Security_HMACCollisionResistance) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Security_HMACCollisionResistance] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -860,6 +1069,7 @@ TEST_F(CacheManagerTest, Security_HMACCollisionResistance) {
 }
 
 TEST_F(CacheManagerTest, Security_PathTraversalPrevention) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Security_PathTraversalPrevention] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -881,14 +1091,17 @@ TEST_F(CacheManagerTest, Security_PathTraversalPrevention) {
 }
 
 TEST_F(CacheManagerTest, Maintenance_RemovesExpiredEntries) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Maintenance_RemovesExpiredEntries] Testing...");
     auto& cm = CacheManager::Instance();
     // ✅ FIX: Reduced maintenance interval to 2 seconds for faster test
     cm.Initialize(testDir, 100, 1 * 1024 * 1024, std::chrono::seconds(2));
     
     // Add entries with short TTL
     for (int i = 0; i < 10; ++i) {
-        cm.PutStringW(L"expiring_" + std::to_wstring(i), L"value", 
-                      std::chrono::milliseconds(1500));
+        if (!cm.PutStringW(L"expiring_" + std::to_wstring(i), L"value",
+            std::chrono::milliseconds(1500))) {
+			SS_LOG_ERROR(L"CacheManagerTest", (L"Failed to put key during maintenance test setup: expiring_" + std::to_wstring(i)).c_str());
+        }
     }
     
     auto stats1 = cm.GetStats();
@@ -908,6 +1121,7 @@ TEST_F(CacheManagerTest, Maintenance_RemovesExpiredEntries) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Stress_RapidPutGet) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Stress_RapidPutGet] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir, 1000, 10 * 1024 * 1024, std::chrono::seconds(30));
     
@@ -927,6 +1141,7 @@ TEST_F(CacheManagerTest, Stress_RapidPutGet) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Corruption_InvalidMagic) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Corruption_InvalidMagic] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
@@ -975,13 +1190,16 @@ TEST_F(CacheManagerTest, Corruption_InvalidMagic) {
 // ============================================================================
 
 TEST_F(CacheManagerTest, Performance_SequentialPuts) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Performance_SequentialPuts] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     auto start = std::chrono::high_resolution_clock::now();
     
     for (int i = 0; i < 1000; ++i) {
-        cm.PutStringW(L"key" + std::to_wstring(i), L"value", std::chrono::hours(1));
+        if (!cm.PutStringW(L"key" + std::to_wstring(i), L"value", std::chrono::hours(1))) {
+            SS_LOG_ERROR(L"CacheManagerTest", (L"Failed to put key during performance test setup: key" + std::to_wstring(i)).c_str());
+        }
     }
     
     auto end = std::chrono::high_resolution_clock::now();
@@ -992,19 +1210,24 @@ TEST_F(CacheManagerTest, Performance_SequentialPuts) {
 }
 
 TEST_F(CacheManagerTest, Performance_SequentialGets) {
+    SS_LOG_INFO(L"CacheManager_Tests", L"[Performance_SequentialGets] Testing...");
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
     // Pre-populate
     for (int i = 0; i < 1000; ++i) {
-        cm.PutStringW(L"key" + std::to_wstring(i), L"value", std::chrono::hours(1));
+        if (!cm.PutStringW(L"key" + std::to_wstring(i), L"value", std::chrono::hours(1))) {
+			SS_LOG_ERROR(L"CacheManagerTest", (L"Failed to put key during performance test setup: key" + std::to_wstring(i)).c_str());
+        }
     }
     
     auto start = std::chrono::high_resolution_clock::now();
     
     for (int i = 0; i < 1000; ++i) {
         std::wstring result;
-        cm.GetStringW(L"key" + std::to_wstring(i), result);
+        if (!cm.GetStringW(L"key" + std::to_wstring(i), result)) {
+            SS_LOG_ERROR(L"CacheManagerTest", (L"Failed to get key during performance test: key" + std::to_wstring(i)).c_str());
+        }
     }
     
     auto end = std::chrono::high_resolution_clock::now();

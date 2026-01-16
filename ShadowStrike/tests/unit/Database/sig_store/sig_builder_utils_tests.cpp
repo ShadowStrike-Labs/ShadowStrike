@@ -1,4 +1,7 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder Utils - COMPREHENSIVE UNIT TESTS
@@ -22,7 +25,7 @@
  *
  * ============================================================================
  */
-
+#include"pch.h"
 #include <gtest/gtest.h>
 #include "../../src/SignatureStore/SignatureBuilder.hpp"
 #include "../../src/SignatureStore/SignatureFormat.hpp"

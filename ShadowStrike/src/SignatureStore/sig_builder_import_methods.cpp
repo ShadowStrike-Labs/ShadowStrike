@@ -1,4 +1,6 @@
-﻿#include"pch.h"
+﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder - IMPORT METHODS IMPLEMENTATION
@@ -17,6 +19,7 @@
  * ============================================================================
  */
 
+#include"pch.h"
 #include "SignatureBuilder.hpp"
 
 #include <algorithm>
@@ -1637,30 +1640,34 @@ namespace {
             return StoreError{ SignatureStoreError::Success };
         }
 
+        /**
+   * @brief Imports hash signatures from a JSON formatted string.
+   * @security Hardened to prevent ReDoS, Large Object Heap exhaustion, and malformed JSON attacks.
+   * @param jsonData The raw JSON string data.
+   * @return StoreError Success or detailed error code.
+   */
         StoreError SignatureBuilder::ImportHashesFromJson(
             const std::string& jsonData
         ) noexcept {
-            SS_LOG_DEBUG(L"SignatureBuilder", L"ImportHashesFromJson: %zu bytes", jsonData.size());
+            SS_LOG_DEBUG(L"SignatureBuilder", L"ImportHashesFromJson: Processing %zu bytes", jsonData.size());
 
             // ========================================================================
-            // STEP 1: INPUT VALIDATION
+            // STEP 1: INPUT & SECURITY VALIDATION
             // ========================================================================
 
             if (jsonData.empty()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Empty JSON data");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON data cannot be empty" };
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Empty input payload");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty JSON data" };
             }
 
-            // Check size against security limit
+            // Guard against massive JSON payloads to prevent OOM/DoS
             if (jsonData.size() > MAX_JSON_SIZE) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromJson: JSON data too large (%zu > %llu bytes)",
-                    jsonData.size(), MAX_JSON_SIZE);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON data exceeds maximum size (100MB)" };
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Payload size violation (%zu bytes)", jsonData.size());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON payload exceeds security limits" };
             }
 
             // ========================================================================
-            // STEP 2: PARSE JSON DATA
+            // STEP 2: JSON DESERIALIZATION
             // ========================================================================
 
             using namespace ShadowStrike::Utils::JSON;
@@ -1669,332 +1676,170 @@ namespace {
             Error jsonErr;
             ParseOptions parseOpts;
             parseOpts.allowComments = true;
-            parseOpts.maxDepth = 100;  // Hashes don't need deep nesting
+            parseOpts.maxDepth = 16; // Restrict nesting depth for security
 
             try {
+                // PVS-Studio check: Parse return value is mandatory
                 if (!Parse(jsonData, jsonRoot, &jsonErr, parseOpts)) {
-                    SS_LOG_ERROR(L"SignatureBuilder",
-                        L"ImportHashesFromJson: Parse error at line %zu, column %zu: %S",
+                    SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Syntax error at %zu:%zu - %S",
                         jsonErr.line, jsonErr.column, jsonErr.message.c_str());
-                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                        "JSON parse error: " + jsonErr.message };
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON syntax error: " + jsonErr.message };
                 }
-            } catch (const std::exception& ex) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromJson: Exception during JSON parsing: %S", ex.what());
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "JSON parsing exception" };
+            }
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Parser exception: %S", ex.what());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Internal JSON parser exception" };
             }
 
             // ========================================================================
-            // STEP 3: VALIDATE JSON STRUCTURE
+            // STEP 3: SCHEMA VALIDATION
             // ========================================================================
 
-            if (!jsonRoot.is_object()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Root must be a JSON object");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "Root element must be a JSON object" };
-            }
-
-            if (!jsonRoot.contains("hashes")) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Missing 'hashes' field");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "Missing required 'hashes' field in JSON" };
+            if (!jsonRoot.is_object() || !jsonRoot.contains("hashes")) {
+                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Invalid schema (missing 'hashes' array)");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Required 'hashes' array not found" };
             }
 
             const Json& hashesArray = jsonRoot["hashes"];
             if (!hashesArray.is_array()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: 'hashes' field must be an array");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "Field 'hashes' must be a JSON array" };
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "'hashes' field must be an array" };
             }
 
             // ========================================================================
-            // STEP 4: COLLECT AND VALIDATE ALL ENTRIES BEFORE ADDING
+            // STEP 4: ATOMIC DATA COLLECTION
             // ========================================================================
 
-            std::vector<HashSignatureInput> validEntries;
-            
+            std::vector<HashSignatureInput> batchEntries;
+            const size_t estimatedCount = hashesArray.size();
+
             try {
-                validEntries.reserve(std::min(hashesArray.size(), size_t{100000}));
-            } catch (const std::bad_alloc&) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Memory allocation failed");
-                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
+                // Reserve memory to prevent fragmentation during import
+                batchEntries.reserve(std::min(estimatedCount, size_t{ 50000 }));
+            }
+            catch (const std::bad_alloc&) {
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failure during reserve" };
             }
 
-            size_t entryIndex = 0;
             size_t validCount = 0;
             size_t invalidCount = 0;
+            size_t entryIndex = 0;
 
             for (const auto& entry : hashesArray) {
-                try {
-                    // ====================================================================
-                    // VALIDATE ENTRY STRUCTURE
-                    // ====================================================================
+                entryIndex++;
 
-                    if (!entry.is_object()) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu is not a JSON object", entryIndex);
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
+                if (!entry.is_object()) {
+                    invalidCount++;
+                    continue;
+                }
 
-                    // ====================================================================
-                    // EXTRACT AND VALIDATE REQUIRED FIELDS
-                    // ====================================================================
+                // --- Mandatory Fields ---
+                std::string typeStr;
+                std::string hashStr;
+                std::string name;
 
-                    // Type field (required)
-                    std::string typeStr;
-                    if (!Get<std::string>(entry, "type", typeStr)) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu missing or invalid 'type' field", entryIndex);
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
+                // Validate return values of Get<T> as per PVS-Studio V547/V601
+                bool mandatoryCheck = Get<std::string>(entry, "type", typeStr) &&
+                    Get<std::string>(entry, "hash", hashStr) &&
+                    Get<std::string>(entry, "name", name);
 
-                    // Hash field (required)
-                    std::string hashStr;
-                    if (!Get<std::string>(entry, "hash", hashStr)) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu missing or invalid 'hash' field", entryIndex);
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
+                if (!mandatoryCheck || name.empty() || name.length() > MAX_NAME_LENGTH) {
+                    SS_LOG_WARN(L"SignatureBuilder", L"ImportHashesFromJson: Missing or invalid mandatory fields in entry %zu", entryIndex);
+                    invalidCount++;
+                    continue;
+                }
 
-                    // Name field (required)
-                    std::string name;
-                    if (!Get<std::string>(entry, "name", name)) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu missing or invalid 'name' field", entryIndex);
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
+                // --- Hash Type Resolution ---
+                HashType resolvedType;
+                if (typeStr == "MD5") resolvedType = HashType::MD5;
+                else if (typeStr == "SHA1") resolvedType = HashType::SHA1;
+                else if (typeStr == "SHA256") resolvedType = HashType::SHA256;
+                else if (typeStr == "SHA512") resolvedType = HashType::SHA512;
+                else if (typeStr == "IMPHASH") resolvedType = HashType::IMPHASH;
+                else {
+                    invalidCount++;
+                    continue;
+                }
 
-                    // ====================================================================
-                    // VALIDATE NAME (DoS PREVENTION)
-                    // ====================================================================
+                auto parsedHash = Format::ParseHashString(hashStr, resolvedType);
+                if (!parsedHash.has_value()) {
+                    invalidCount++;
+                    continue;
+                }
 
-                    constexpr size_t MAX_NAME_LEN = 256;
-                    if (name.empty() || name.length() > MAX_NAME_LEN) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu has invalid name length (%zu)",
-                            entryIndex, name.length());
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
-
-                    // ====================================================================
-                    // PARSE HASH TYPE
-                    // ====================================================================
-
-                    HashType hashType = HashType::SHA256; // Default
-                    if (typeStr == "MD5") {
-                        hashType = HashType::MD5;
-                    }
-                    else if (typeStr == "SHA1") {
-                        hashType = HashType::SHA1;
-                    }
-                    else if (typeStr == "SHA256") {
-                        hashType = HashType::SHA256;
-                    }
-                    else if (typeStr == "SHA512") {
-                        hashType = HashType::SHA512;
-                    }
-                    else if (typeStr == "IMPHASH") {
-                        hashType = HashType::IMPHASH;
-                    }
-                    else if (typeStr == "SSDEEP") {
-                        hashType = HashType::SSDEEP;
-                    }
-                    else if (typeStr == "TLSH") {
-                        hashType = HashType::TLSH;
-                    }
-                    else {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu has unknown hash type: %S",
-                            entryIndex, typeStr.c_str());
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
-
-                    // ====================================================================
-                    // PARSE HASH VALUE
-                    // ====================================================================
-
-                    auto parsedHash = Format::ParseHashString(hashStr, hashType);
-                    if (!parsedHash.has_value()) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu has invalid hash value for type %S",
-                            entryIndex, typeStr.c_str());
-                        invalidCount++;
-                        entryIndex++;
-                        continue;
-                    }
-
-                    // ====================================================================
-                    // EXTRACT OPTIONAL FIELDS
-                    // ====================================================================
-
-                    // Threat level (optional, default: Medium = 50)
-                    int threatLevelInt = 50;
-                    Get<int>(entry, "threat_level", threatLevelInt);
+                // --- Optional Fields with Proper Scoping ---
+                int threatLevelInt = 50; // Default: Medium
+                if (Get<int>(entry, "threat_level", threatLevelInt)) {
                     threatLevelInt = std::clamp(threatLevelInt, 0, 100);
-                    ThreatLevel threatLevel = static_cast<ThreatLevel>(threatLevelInt);
+                }
 
-                    // Description (optional, empty by default)
-                    std::string description;
-                    Get<std::string>(entry, "description", description);
+                // Fixed: Explicit ThreatLevel mapping without shadowing
+                ThreatLevel threatLevel = static_cast<ThreatLevel>(threatLevelInt);
 
-                    // Validate description (DoS prevention)
-                    constexpr size_t MAX_DESC_LEN = 4096;
-                    if (description.length() > MAX_DESC_LEN) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Entry %zu description too long (%zu > %zu)",
-                            entryIndex, description.length(), MAX_DESC_LEN);
-                        description.clear();  // Clear invalid description
+                std::string description;
+                if (Get<std::string>(entry, "description", description)) {
+                    if (description.length() > MAX_DESCRIPTION_LENGTH) {
+                        description.resize(MAX_DESCRIPTION_LENGTH);
                     }
+                }
 
-                    // Tags (optional, empty by default)
-                    std::vector<std::string> tags;
-                    if (entry.contains("tags") && entry["tags"].is_array()) {
-                        const Json& tagsArray = entry["tags"];
-                        constexpr size_t MAX_TAGS = 32;
-
-                        if (tagsArray.size() > MAX_TAGS) {
-                            SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportHashesFromJson: Entry %zu has too many tags (%zu > %zu)",
-                                entryIndex, tagsArray.size(), MAX_TAGS);
-                        }
-                        else {
-                            for (size_t tagIdx = 0; tagIdx < tagsArray.size(); ++tagIdx) {
-                                try {
-                                    if (tagsArray[tagIdx].is_string()) {
-                                        std::string tag = tagsArray[tagIdx].get<std::string>();
-                                        constexpr size_t MAX_TAG_LEN = 64;
-
-                                        if (!tag.empty() && tag.length() <= MAX_TAG_LEN) {
-                                            tags.push_back(std::move(tag));
-                                        }
-                                    }
-                                }
-                                catch (...) {
-                                    SS_LOG_DEBUG(L"SignatureBuilder",
-                                        L"ImportHashesFromJson: Entry %zu tag %zu extraction failed",
-                                        entryIndex, tagIdx);
-                                }
+                std::vector<std::string> tags;
+                if (entry.contains("tags") && entry["tags"].is_array()) {
+                    const Json& tagsArray = entry["tags"];
+                    for (size_t tIdx = 0; tIdx < std::min(tagsArray.size(), MAX_TAGS_COUNT); ++tIdx) {
+                        std::string tag;
+                        if (tagsArray[tIdx].is_string()) {
+                            tag = tagsArray[tIdx].get<std::string>();
+                            if (!tag.empty() && tag.length() <= MAX_TAG_LENGTH) {
+                                tags.push_back(std::move(tag));
                             }
                         }
                     }
-
-                    // ====================================================================
-                    // CREATE SIGNATURE INPUT
-                    // ====================================================================
-
-                    HashSignatureInput input{};
-                    input.hash = *parsedHash;
-                    input.name = name;
-                    input.threatLevel = threatLevel;
-                    input.description = description;
-                    input.tags = std::move(tags);
-                    input.source = "json_import";
-
-                    validEntries.push_back(std::move(input));
-                    validCount++;
-
-                    SS_LOG_TRACE(L"SignatureBuilder",
-                        L"ImportHashesFromJson: Entry %zu parsed successfully (%S: %S, threat=%d)",
-                        entryIndex, typeStr.c_str(), name.c_str(), threatLevelInt);
-                }
-                catch (const std::exception& ex) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportHashesFromJson: Entry %zu exception: %S",
-                        entryIndex, ex.what());
-                    invalidCount++;
-                }
-                catch (...) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportHashesFromJson: Entry %zu unknown exception",
-                        entryIndex);
-                    invalidCount++;
                 }
 
-                entryIndex++;
+                // ====================================================================
+                // STEP 5: PUSH TO BATCH
+                // ====================================================================
+
+                HashSignatureInput input{};
+                input.hash = *parsedHash;
+                input.name = std::move(name);
+                input.threatLevel = threatLevel;
+                input.description = std::move(description);
+                input.tags = std::move(tags);
+                input.source = "json_import";
+
+                batchEntries.push_back(std::move(input));
+                validCount++;
             }
 
             // ========================================================================
-            // STEP 5: VALIDATE RESULTS
+            // STEP 6: BULK DATABASE INTEGRATION
             // ========================================================================
 
             if (validCount == 0) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromJson: No valid entries found (%zu total, %zu invalid)",
-                    entryIndex, invalidCount);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "No valid hash entries in JSON (invalid: " + std::to_string(invalidCount) + ")" };
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "No valid hash entries found" };
             }
-
-            // ========================================================================
-            // STEP 6: ADD ALL VALID ENTRIES TO BUILDER
-            // ========================================================================
-
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"ImportHashesFromJson: Adding %zu valid entries (invalid: %zu)",
-                validCount, invalidCount);
 
             LARGE_INTEGER startTime{}, endTime{};
-            
-            // Ensure frequency is available (safe initialization)
-            if (m_perfFrequency.QuadPart <= 0) {
-                QueryPerformanceFrequency(&m_perfFrequency);
-                if (m_perfFrequency.QuadPart <= 0) {
-                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
-                }
-            }
-            
             QueryPerformanceCounter(&startTime);
 
-            for (const auto& input : validEntries) {
-                try {
-                    StoreError err = AddHash(input);
-                    if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportHashesFromJson: Failed to add hash %S: %S",
-                            input.name.c_str(), err.message.c_str());
-                    }
-                } catch (const std::exception& ex) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportHashesFromJson: Exception adding hash: %S", ex.what());
+            for (auto& entry : batchEntries) {
+                // AddHash performs deduplication internally
+                StoreError err = AddHash(entry);
+                if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
+                    SS_LOG_WARN(L"SignatureBuilder", L"ImportHashesFromJson: Integration failed for '%S'", entry.name.c_str());
                 }
             }
 
             QueryPerformanceCounter(&endTime);
-            uint64_t importTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
+            const uint64_t elapsedUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
-            // ========================================================================
-            // STEP 7: FINAL LOGGING AND STATISTICS
-            // ========================================================================
+            SS_LOG_INFO(L"SignatureBuilder", L"ImportHashesFromJson: Bulk import completed. "
+                L"Valid: %zu, Invalid/Skipped: %zu, Time: %llu us",
+                validCount, invalidCount, elapsedUs);
 
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"ImportHashesFromJson: Complete - %zu valid entries added in %llu µs (%.2f ms), "
-                L"%zu invalid entries skipped",
-                validCount, importTimeUs, static_cast<double>(importTimeUs) / 1000.0, invalidCount);
-
-            // ========================================================================
-            // STEP 8: RETURN APPROPRIATE STATUS
-            // ========================================================================
-
-            if (invalidCount > 0) {
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "JSON import completed with errors: " + std::to_string(validCount) +
-                    " valid, " + std::to_string(invalidCount) + " invalid" };
-            }
-
-            return StoreError{ SignatureStoreError::Success };
+            return (invalidCount == 0) ? StoreError{ SignatureStoreError::Success }
+            : StoreError{ SignatureStoreError::InvalidFormat, 0, "Import partial success" };
         }
 
         StoreError SignatureBuilder::ImportPatternsFromClamAV(

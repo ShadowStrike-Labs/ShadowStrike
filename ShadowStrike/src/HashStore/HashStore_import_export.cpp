@@ -1,3 +1,6 @@
+
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 #include"pch.h"
 #include"HashStore.hpp"
 #include <sstream>
@@ -332,9 +335,9 @@ namespace ShadowStrike {
                     }
 
                     int threatLevelInt = 50;
-                    Get<int>(entry, "threat_level", threatLevelInt);
-                    threatLevelInt = std::clamp(threatLevelInt, 0, 100);
-
+                    if (Get<int>(entry, "threat_level", threatLevelInt) == true) {
+                        threatLevelInt = std::clamp(threatLevelInt, 0, 100);
+                    }
                     HashType hashType = HashType::SHA256;
                     if (typeStr == "MD5") hashType = HashType::MD5;
                     else if (typeStr == "SHA1") hashType = HashType::SHA1;

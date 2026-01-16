@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include "pch.h"
 /**
  * ============================================================================
@@ -22,6 +26,7 @@
  */
 
 #include <gtest/gtest.h>
+#include"Utils/Logger.hpp"
 
 #include "../../../../src/Whitelist/WhiteListStore.hpp"
 #include "../../../../src/Whitelist/WhiteListFormat.hpp"
@@ -1093,16 +1098,34 @@ TEST_F(WhitelistStoreTest, MatchCallback_InvokedOnMatch) {
 
 TEST_F(WhitelistStoreTest, GetStatistics_ReturnsAccurateData) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
-    
+    LookupResult res;
+    StoreError err;
     // Add entries of various types
-    store->AddHash(CreateHash("Stat1"), WhitelistReason::UserApproved);
-    store->AddHash(CreateHash("Stat2"), WhitelistReason::PolicyBased);
-    store->AddPath(L"C:\\Test", PathMatchMode::Prefix, WhitelistReason::SystemFile);
-    
+    err = store->AddHash(CreateHash("Stat1"), WhitelistReason::UserApproved);
+    if (!err.IsSuccess()) {
+		SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to add hash.");
+    }
+    err = store->AddHash(CreateHash("Stat2"), WhitelistReason::PolicyBased);
+    if (!err.IsSuccess()) {
+		SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to add hash.");
+    }
+    err = store->AddPath(L"C:\\Test", PathMatchMode::Prefix, WhitelistReason::SystemFile);
+    if (!err.IsSuccess()) {
+		SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to add path.");
+    }
     // Perform lookups
-    store->IsHashWhitelisted(CreateHash("Stat1"));
-    store->IsHashWhitelisted(CreateHash("Stat2"));
-    store->IsHashWhitelisted(CreateHash("Missing"));
+    res = store->IsHashWhitelisted(CreateHash("Stat1"));
+    if (!res.found) {
+		SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to find Stat1 hash.");
+    }
+    res = store->IsHashWhitelisted(CreateHash("Stat2"));
+    if (!res.found) {
+		SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to find Stat2 hash.");
+    }
+    res = store->IsHashWhitelisted(CreateHash("Missing"));
+    if (!res.found) {
+        SS_LOG_ERROR(L"WhitelistStoreTest", L"Correctly did not find missing");
+    }
     
     auto stats = store->GetStatistics();
     
@@ -1130,13 +1153,20 @@ TEST_F(WhitelistStoreTest, SetCachingEnabled_AffectsPerformance) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     HashValue hash = CreateHash("CacheConfig");
-    store->AddHash(hash, WhitelistReason::UserApproved);
+    StoreError err = store->AddHash(hash, WhitelistReason::UserApproved);
     
+    if (!err.IsSuccess()) {
+                SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to add hash.");
+    }
+
     // With caching enabled
     store->SetCachingEnabled(true);
     auto start1 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i) {
-        store->IsHashWhitelisted(hash);
+        LookupResult res = store->IsHashWhitelisted(hash);
+        if (!res.found) {
+            SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to find hash during no-cache test.");
+        }
     }
     auto duration1 = std::chrono::high_resolution_clock::now() - start1;
     
@@ -1145,7 +1175,10 @@ TEST_F(WhitelistStoreTest, SetCachingEnabled_AffectsPerformance) {
     store->ClearCache();
     auto start2 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i) {
-        store->IsHashWhitelisted(hash);
+        LookupResult res = store->IsHashWhitelisted(hash);
+        if (!res.found) {
+			SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to find hash during no-cache test.");
+        }
     }
     auto duration2 = std::chrono::high_resolution_clock::now() - start2;
     
@@ -1157,7 +1190,11 @@ TEST_F(WhitelistStoreTest, SetCachingEnabled_AffectsPerformance) {
 TEST_F(WhitelistStoreTest, SetBloomFilterEnabled_TogglesFilter) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("BloomToggle"), WhitelistReason::UserApproved);
+    StoreError err = store->AddHash(CreateHash("BloomToggle"), WhitelistReason::UserApproved);
+
+    if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"WhitelistStoreTest", L"Failed to add hash.");
+    }
     
     store->SetBloomFilterEnabled(false);
     auto res1 = store->IsHashWhitelisted(CreateHash("BloomToggle"));

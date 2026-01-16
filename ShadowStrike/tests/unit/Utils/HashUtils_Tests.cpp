@@ -1,4 +1,5 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 /*
  * ============================================================================
  * ShadowStrike HashUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -17,10 +18,11 @@
  *
  * ============================================================================
  */
-
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/HashUtils.hpp"
 #include "../../../src/Utils/FileUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 #include <Objbase.h>
 #include <filesystem>
 #include <fstream>
@@ -70,6 +72,7 @@ protected:
 // DIGEST SIZE TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, DigestSize_AllAlgorithms) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[DigestSize_AllAlgorithms] Testing...");
     EXPECT_EQ(DigestSize(Algorithm::SHA1), 20u);
     EXPECT_EQ(DigestSize(Algorithm::SHA256), 32u);
     EXPECT_EQ(DigestSize(Algorithm::SHA384), 48u);
@@ -81,6 +84,7 @@ TEST_F(HashUtilsTest, DigestSize_AllAlgorithms) {
 // EQUAL TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, Equal_IdenticalArrays) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Equal_IdenticalArrays] Testing...");
     uint8_t a[] = {0x01, 0x02, 0x03, 0x04};
     uint8_t b[] = {0x01, 0x02, 0x03, 0x04};
     
@@ -88,6 +92,7 @@ TEST_F(HashUtilsTest, Equal_IdenticalArrays) {
 }
 
 TEST_F(HashUtilsTest, Equal_DifferentArrays) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Equal_DifferentArrays] Testing...");
     uint8_t a[] = {0x01, 0x02, 0x03, 0x04};
     uint8_t b[] = {0x01, 0x02, 0x03, 0xFF};
     
@@ -95,17 +100,20 @@ TEST_F(HashUtilsTest, Equal_DifferentArrays) {
 }
 
 TEST_F(HashUtilsTest, Equal_SamePointer) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Equal_SamePointer] Testing...");
     uint8_t data[] = {0xAA, 0xBB};
     
     EXPECT_TRUE(Equal(data, data, 2));
 }
 
 TEST_F(HashUtilsTest, Equal_NullPointers) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Equal_NullPointers] Testing...");
     EXPECT_FALSE(Equal(nullptr, (uint8_t*)0x1234, 4));
     EXPECT_FALSE(Equal((uint8_t*)0x1234, nullptr, 4));
 }
 
 TEST_F(HashUtilsTest, Equal_ZeroLength) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Equal_ZeroLength] Testing...");
     uint8_t a[] = {0x01};
     uint8_t b[] = {0xFF};
     
@@ -116,6 +124,7 @@ TEST_F(HashUtilsTest, Equal_ZeroLength) {
 // HEX CONVERSION TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, ToHexLower_BasicConversion) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ToHexLower_BasicConversion] Testing...");
     uint8_t data[] = {0xDE, 0xAD, 0xBE, 0xEF};
     
     std::string hex = ToHexLower(data, 4);
@@ -123,6 +132,7 @@ TEST_F(HashUtilsTest, ToHexLower_BasicConversion) {
 }
 
 TEST_F(HashUtilsTest, ToHexUpper_BasicConversion) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ToHexUpper_BasicConversion] Testing...");
     uint8_t data[] = {0xCA, 0xFE, 0xBA, 0xBE};
     
     std::string hex = ToHexUpper(data, 4);
@@ -130,12 +140,14 @@ TEST_F(HashUtilsTest, ToHexUpper_BasicConversion) {
 }
 
 TEST_F(HashUtilsTest, ToHexLower_EmptyData) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ToHexLower_EmptyData] Testing...");
     std::array<uint8_t, 0> data{};
     std::string hex = ToHexLower(data.data(), data.size());
     EXPECT_TRUE(hex.empty());
 }
 
 TEST_F(HashUtilsTest, ToHexLower_AllBytes) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ToHexLower_AllBytes] Testing...");
     std::vector<uint8_t> data(256);
     for (int i = 0; i < 256; ++i) {
         data[i] = static_cast<uint8_t>(i);
@@ -146,6 +158,7 @@ TEST_F(HashUtilsTest, ToHexLower_AllBytes) {
 }
 
 TEST_F(HashUtilsTest, FromHex_ValidLowercase) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_ValidLowercase] Testing...");
     std::vector<uint8_t> out;
     
     ASSERT_TRUE(FromHex("deadbeef", out));
@@ -157,6 +170,7 @@ TEST_F(HashUtilsTest, FromHex_ValidLowercase) {
 }
 
 TEST_F(HashUtilsTest, FromHex_ValidUppercase) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_ValidUppercase] Testing...");
     std::vector<uint8_t> out;
     
     ASSERT_TRUE(FromHex("CAFEBABE", out));
@@ -168,6 +182,7 @@ TEST_F(HashUtilsTest, FromHex_ValidUppercase) {
 }
 
 TEST_F(HashUtilsTest, FromHex_MixedCase) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_MixedCase] Testing...");
     std::vector<uint8_t> out;
     
     ASSERT_TRUE(FromHex("DeAdBeEf", out));
@@ -175,6 +190,7 @@ TEST_F(HashUtilsTest, FromHex_MixedCase) {
 }
 
 TEST_F(HashUtilsTest, FromHex_InvalidCharacters) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_InvalidCharacters] Testing...");
     std::vector<uint8_t> out;
     
     EXPECT_FALSE(FromHex("GGHHII", out));
@@ -182,12 +198,14 @@ TEST_F(HashUtilsTest, FromHex_InvalidCharacters) {
 }
 
 TEST_F(HashUtilsTest, FromHex_OddLength) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_OddLength] Testing...");
     std::vector<uint8_t> out;
     
     EXPECT_FALSE(FromHex("ABC", out));
 }
 
 TEST_F(HashUtilsTest, FromHex_EmptyString) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_EmptyString] Testing...");
     std::vector<uint8_t> out;
     
     ASSERT_TRUE(FromHex("", out));
@@ -195,6 +213,7 @@ TEST_F(HashUtilsTest, FromHex_EmptyString) {
 }
 
 TEST_F(HashUtilsTest, FromHex_TooLarge) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[FromHex_TooLarge] Testing...");
     std::string huge(50 * 1024 * 1024, 'A');
     std::vector<uint8_t> out;
     
@@ -205,6 +224,7 @@ TEST_F(HashUtilsTest, FromHex_TooLarge) {
 // FNV HASH TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, Fnv1a32_KnownVector) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Fnv1a32_KnownVector] Testing...");
     const char* data = "hello";
     uint32_t hash = Fnv1a32(data, strlen(data));
     
@@ -212,11 +232,13 @@ TEST_F(HashUtilsTest, Fnv1a32_KnownVector) {
 }
 
 TEST_F(HashUtilsTest, Fnv1a32_EmptyData) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Fnv1a32_EmptyData] Testing...");
     uint32_t hash = Fnv1a32("", 0);
     EXPECT_EQ(hash, 2166136261u); // FNV-1a offset basis
 }
 
 TEST_F(HashUtilsTest, Fnv1a32_DifferentInputs) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Fnv1a32_DifferentInputs] Testing...");
     uint32_t h1 = Fnv1a32("test1", 5);
     uint32_t h2 = Fnv1a32("test2", 5);
     
@@ -224,6 +246,7 @@ TEST_F(HashUtilsTest, Fnv1a32_DifferentInputs) {
 }
 
 TEST_F(HashUtilsTest, Fnv1a64_KnownVector) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Fnv1a64_KnownVector] Testing...");
     const char* data = "world";
     uint64_t hash = Fnv1a64(data, strlen(data));
     
@@ -231,6 +254,7 @@ TEST_F(HashUtilsTest, Fnv1a64_KnownVector) {
 }
 
 TEST_F(HashUtilsTest, Fnv1a64_EmptyData) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Fnv1a64_EmptyData] Testing...");
     uint64_t hash = Fnv1a64("", 0);
     EXPECT_EQ(hash, 14695981039346656037ull); // FNV-1a 64-bit offset basis
 }
@@ -239,6 +263,7 @@ TEST_F(HashUtilsTest, Fnv1a64_EmptyData) {
 // SHA256 TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, Compute_SHA256_EmptyString) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Compute_SHA256_EmptyString] Testing...");
     std::vector<uint8_t> hash;
     ShadowStrike::Utils::HashUtils::Error err;
     
@@ -251,6 +276,7 @@ TEST_F(HashUtilsTest, Compute_SHA256_EmptyString) {
 }
 
 TEST_F(HashUtilsTest, Compute_SHA256_ABC) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Compute_SHA256_ABC] Testing...");
     std::vector<uint8_t> hash;
     
     ASSERT_TRUE(Compute(Algorithm::SHA256, "abc", 3, hash));
@@ -262,6 +288,7 @@ TEST_F(HashUtilsTest, Compute_SHA256_ABC) {
 }
 
 TEST_F(HashUtilsTest, ComputeHex_SHA256) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHex_SHA256] Testing...");
     std::string hexHash;
     
     ASSERT_TRUE(ComputeHex(Algorithm::SHA256, "test", 4, hexHash, false));
@@ -272,6 +299,7 @@ TEST_F(HashUtilsTest, ComputeHex_SHA256) {
 }
 
 TEST_F(HashUtilsTest, ComputeHex_SHA256_Uppercase) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHex_SHA256_Uppercase] Testing...");
     std::string hexHash;
     
     ASSERT_TRUE(ComputeHex(Algorithm::SHA256, "TEST", 4, hexHash, true));
@@ -285,6 +313,7 @@ TEST_F(HashUtilsTest, ComputeHex_SHA256_Uppercase) {
 // HASHER STREAMING API TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, Hasher_StreamingSHA256) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hasher_StreamingSHA256] Testing...");
     Hasher h(Algorithm::SHA256);
     ShadowStrike::Utils::HashUtils::Error err;
     
@@ -304,6 +333,7 @@ TEST_F(HashUtilsTest, Hasher_StreamingSHA256) {
 }
 
 TEST_F(HashUtilsTest, Hasher_MultipleInit) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hasher_MultipleInit] Testing...");
     Hasher h(Algorithm::SHA256);
     
     ASSERT_TRUE(h.Init());
@@ -321,6 +351,7 @@ TEST_F(HashUtilsTest, Hasher_MultipleInit) {
 }
 
 TEST_F(HashUtilsTest, Hasher_UpdateWithoutInit) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hasher_UpdateWithoutInit] Testing...");
     Hasher h(Algorithm::SHA256);
     ShadowStrike::Utils::HashUtils::Error err;
     
@@ -329,6 +360,7 @@ TEST_F(HashUtilsTest, Hasher_UpdateWithoutInit) {
 }
 
 TEST_F(HashUtilsTest, Hasher_FinalHex) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hasher_FinalHex] Testing...");
     Hasher h(Algorithm::SHA256);
     
     ASSERT_TRUE(h.Init());
@@ -340,6 +372,7 @@ TEST_F(HashUtilsTest, Hasher_FinalHex) {
 }
 
 TEST_F(HashUtilsTest, Hasher_GetDigestSize) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hasher_GetDigestSize] Testing...");
     Hasher h256(Algorithm::SHA256);
     Hasher h512(Algorithm::SHA512);
     
@@ -351,6 +384,7 @@ TEST_F(HashUtilsTest, Hasher_GetDigestSize) {
 // ALL ALGORITHMS TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, Compute_SHA1) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Compute_SHA1] Testing...");
     std::vector<uint8_t> hash;
     
     ASSERT_TRUE(Compute(Algorithm::SHA1, "abc", 3, hash));
@@ -362,6 +396,7 @@ TEST_F(HashUtilsTest, Compute_SHA1) {
 }
 
 TEST_F(HashUtilsTest, Compute_SHA384) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Compute_SHA384] Testing...");
     std::vector<uint8_t> hash;
     
     ASSERT_TRUE(Compute(Algorithm::SHA384, "test", 4, hash));
@@ -369,6 +404,7 @@ TEST_F(HashUtilsTest, Compute_SHA384) {
 }
 
 TEST_F(HashUtilsTest, Compute_SHA512) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Compute_SHA512] Testing...");
     std::vector<uint8_t> hash;
     
     ASSERT_TRUE(Compute(Algorithm::SHA512, "test", 4, hash));
@@ -376,6 +412,7 @@ TEST_F(HashUtilsTest, Compute_SHA512) {
 }
 
 TEST_F(HashUtilsTest, Compute_MD5) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Compute_MD5] Testing...");
     std::vector<uint8_t> hash;
     
     ASSERT_TRUE(Compute(Algorithm::MD5, "test", 4, hash));
@@ -390,6 +427,7 @@ TEST_F(HashUtilsTest, Compute_MD5) {
 // HMAC TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, ComputeHmac_SHA256_BasicKey) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHmac_SHA256_BasicKey] Testing...");
     const char* key = "secret";
     const char* data = "message";
     std::vector<uint8_t> hmac;
@@ -399,6 +437,7 @@ TEST_F(HashUtilsTest, ComputeHmac_SHA256_BasicKey) {
 }
 
 TEST_F(HashUtilsTest, ComputeHmac_SHA256_EmptyKey) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHmac_SHA256_EmptyKey] Testing...");
     const char* data = "message";
     std::vector<uint8_t> hmac;
     
@@ -407,6 +446,7 @@ TEST_F(HashUtilsTest, ComputeHmac_SHA256_EmptyKey) {
 }
 
 TEST_F(HashUtilsTest, ComputeHmac_SHA256_EmptyData) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHmac_SHA256_EmptyData] Testing...");
     const char* key = "key";
     std::vector<uint8_t> hmac;
     
@@ -415,6 +455,7 @@ TEST_F(HashUtilsTest, ComputeHmac_SHA256_EmptyData) {
 }
 
 TEST_F(HashUtilsTest, ComputeHmac_DifferentKeys) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHmac_DifferentKeys] Testing...");
     const char* data = "data";
     std::vector<uint8_t> h1, h2;
     
@@ -425,6 +466,7 @@ TEST_F(HashUtilsTest, ComputeHmac_DifferentKeys) {
 }
 
 TEST_F(HashUtilsTest, ComputeHmacHex_SHA256) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeHmacHex_SHA256] Testing...");
     const char* key = "mykey";
     const char* data = "mydata";
     std::string hexHmac;
@@ -434,6 +476,7 @@ TEST_F(HashUtilsTest, ComputeHmacHex_SHA256) {
 }
 
 TEST_F(HashUtilsTest, Hmac_StreamingAPI) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hmac_StreamingAPI] Testing...");
     Hmac h(Algorithm::SHA256);
     const char* key = "testkey";
     
@@ -447,6 +490,7 @@ TEST_F(HashUtilsTest, Hmac_StreamingAPI) {
 }
 
 TEST_F(HashUtilsTest, Hmac_FinalHex) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hmac_FinalHex] Testing...");
     Hmac h(Algorithm::SHA256);
     const char* key = "key";
     
@@ -459,6 +503,7 @@ TEST_F(HashUtilsTest, Hmac_FinalHex) {
 }
 
 TEST_F(HashUtilsTest, Hmac_UpdateWithoutInit) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Hmac_UpdateWithoutInit] Testing...");
     Hmac h(Algorithm::SHA256);
     ShadowStrike::Utils::HashUtils::Error err;
     
@@ -470,6 +515,7 @@ TEST_F(HashUtilsTest, Hmac_UpdateWithoutInit) {
 // FILE HASHING TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, ComputeFile_SmallFile) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeFile_SmallFile] Testing...");
     auto path = TestPath(L"small.txt");
     std::ofstream ofs(path, std::ios::binary);
     ofs << "Hello, World!";
@@ -488,6 +534,7 @@ TEST_F(HashUtilsTest, ComputeFile_SmallFile) {
 }
 
 TEST_F(HashUtilsTest, ComputeFile_LargeFile) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeFile_LargeFile] Testing...");
     auto path = TestPath(L"large.bin");
     std::ofstream ofs(path, std::ios::binary);
     
@@ -505,6 +552,7 @@ TEST_F(HashUtilsTest, ComputeFile_LargeFile) {
 }
 
 TEST_F(HashUtilsTest, ComputeFile_NonExistent) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeFile_NonExistent] Testing...");
     auto path = TestPath(L"nonexistent.txt");
     std::vector<uint8_t> hash;
     ShadowStrike::Utils::HashUtils::Error err;
@@ -514,6 +562,7 @@ TEST_F(HashUtilsTest, ComputeFile_NonExistent) {
 }
 
 TEST_F(HashUtilsTest, ComputeFile_EmptyFile) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[ComputeFile_EmptyFile] Testing...");
     auto path = TestPath(L"empty.txt");
     std::ofstream ofs(path);
     ofs.close();
@@ -532,6 +581,7 @@ TEST_F(HashUtilsTest, ComputeFile_EmptyFile) {
 // EDGE CASES & SECURITY TESTS
 // ============================================================================
 TEST_F(HashUtilsTest, EdgeCase_VeryLargeUpdate) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[EdgeCase_VeryLargeUpdate] Testing...");
     Hasher h(Algorithm::SHA256);
     ASSERT_TRUE(h.Init());
     
@@ -544,6 +594,7 @@ TEST_F(HashUtilsTest, EdgeCase_VeryLargeUpdate) {
 }
 
 TEST_F(HashUtilsTest, EdgeCase_ManySmallUpdates) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[EdgeCase_ManySmallUpdates] Testing...");
     Hasher h(Algorithm::SHA256);
     ASSERT_TRUE(h.Init());
     
@@ -557,6 +608,7 @@ TEST_F(HashUtilsTest, EdgeCase_ManySmallUpdates) {
 }
 
 TEST_F(HashUtilsTest, EdgeCase_BinaryData) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[EdgeCase_BinaryData] Testing...");
     std::vector<uint8_t> binaryData(256);
     for (int i = 0; i < 256; ++i) {
         binaryData[i] = static_cast<uint8_t>(i);
@@ -568,6 +620,7 @@ TEST_F(HashUtilsTest, EdgeCase_BinaryData) {
 }
 
 TEST_F(HashUtilsTest, Stress_MultipleHashers) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Stress_MultipleHashers] Testing...");
     std::vector<Hasher> hashers;
     for (int i = 0; i < 100; ++i) {
         hashers.emplace_back(Algorithm::SHA256);
@@ -583,6 +636,7 @@ TEST_F(HashUtilsTest, Stress_MultipleHashers) {
 }
 
 TEST_F(HashUtilsTest, Stress_ConcurrentHashing) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Stress_ConcurrentHashing] Testing...");
     std::vector<std::thread> threads;
     std::atomic<int> successCount{0};
     
@@ -605,6 +659,7 @@ TEST_F(HashUtilsTest, Stress_ConcurrentHashing) {
 }
 
 TEST_F(HashUtilsTest, Security_HexRoundTrip) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Security_HexRoundTrip] Testing...");
     uint8_t original[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
     
     std::string hex = ToHexLower(original, 6);
@@ -616,6 +671,7 @@ TEST_F(HashUtilsTest, Security_HexRoundTrip) {
 }
 
 TEST_F(HashUtilsTest, Consistency_SameInputSameOutput) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Consistency_SameInputSameOutput] Testing...");
     const char* data = "consistency_test";
     std::vector<uint8_t> h1, h2, h3;
     
@@ -628,6 +684,7 @@ TEST_F(HashUtilsTest, Consistency_SameInputSameOutput) {
 }
 
 TEST_F(HashUtilsTest, Consistency_DifferentInputDifferentOutput) {
+    SS_LOG_INFO(L"HashUtils_Tests", L"[Consistency_DifferentInputDifferentOutput] Testing...");
     std::vector<uint8_t> h1, h2;
     
     ASSERT_TRUE(Compute(Algorithm::SHA256, "test1", 5, h1));

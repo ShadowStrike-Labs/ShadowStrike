@@ -1,4 +1,6 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /*
  * ============================================================================
  * ShadowStrike RegistryUtils - ENTERPRISE-GRADE UNIT TESTS
@@ -23,8 +25,11 @@
  *
  * ============================================================================
  */
+
+#include "pch.h"
 #include <gtest/gtest.h>
 #include "../../../src/Utils/RegistryUtils.hpp"
+#include "../../../src/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>
@@ -80,6 +85,7 @@ protected:
 // BASIC OPERATIONS
 // ============================================================================
 TEST_F(RegistryUtilsTest, OpenCreate_ValidKey_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[OpenCreate_ValidKey_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -90,6 +96,7 @@ TEST_F(RegistryUtilsTest, OpenCreate_ValidKey_Success) {
 }
 
 TEST_F(RegistryUtilsTest, OpenCreate_InvalidKey_Fails) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[OpenCreate_InvalidKey_Fails] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -101,6 +108,7 @@ TEST_F(RegistryUtilsTest, OpenCreate_InvalidKey_Fails) {
 }
 
 TEST_F(RegistryUtilsTest, WriteReadString_BasicValue_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WriteReadString_BasicValue_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -116,6 +124,7 @@ TEST_F(RegistryUtilsTest, WriteReadString_BasicValue_Success) {
 }
 
 TEST_F(RegistryUtilsTest, WriteReadDWord_ValidValue_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WriteReadDWord_ValidValue_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -131,6 +140,7 @@ TEST_F(RegistryUtilsTest, WriteReadDWord_ValidValue_Success) {
 }
 
 TEST_F(RegistryUtilsTest, WriteReadQWord_ValidValue_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WriteReadQWord_ValidValue_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -147,6 +157,7 @@ TEST_F(RegistryUtilsTest, WriteReadQWord_ValidValue_Success) {
 }
 
 TEST_F(RegistryUtilsTest, WriteReadBinary_ValidData_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WriteReadBinary_ValidData_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -166,6 +177,7 @@ TEST_F(RegistryUtilsTest, WriteReadBinary_ValidData_Success) {
 // MULTISTRING TESTS
 // ============================================================================
 TEST_F(RegistryUtilsTest, WriteReadMultiString_ValidStrings_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WriteReadMultiString_ValidStrings_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -188,6 +200,7 @@ TEST_F(RegistryUtilsTest, WriteReadMultiString_ValidStrings_Success) {
 // SECURITY TEST: WriteMultiString Embedded Null Check
 // ============================================================================
 TEST_F(RegistryUtilsTest, Security_WriteMultiString_EmbeddedNull_Rejected) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Security_WriteMultiString_EmbeddedNull_Rejected] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -206,6 +219,7 @@ TEST_F(RegistryUtilsTest, Security_WriteMultiString_EmbeddedNull_Rejected) {
 // SECURITY TEST: WriteBinary Size Overflow Protection
 // ============================================================================
 TEST_F(RegistryUtilsTest, Security_WriteBinary_OversizeData_Rejected) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Security_WriteBinary_OversizeData_Rejected] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -229,6 +243,7 @@ TEST_F(RegistryUtilsTest, Security_WriteBinary_OversizeData_Rejected) {
 // ENUMERATION TESTS
 // ============================================================================
 TEST_F(RegistryUtilsTest, EnumKeys_MultipleSubKeys_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EnumKeys_MultipleSubKeys_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -250,6 +265,7 @@ TEST_F(RegistryUtilsTest, EnumKeys_MultipleSubKeys_Success) {
 }
 
 TEST_F(RegistryUtilsTest, EnumValues_MultipleValues_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EnumValues_MultipleValues_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -271,6 +287,7 @@ TEST_F(RegistryUtilsTest, EnumValues_MultipleValues_Success) {
 // DELETE TESTS
 // ============================================================================
 TEST_F(RegistryUtilsTest, DeleteValue_ExistingValue_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[DeleteValue_ExistingValue_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -286,6 +303,7 @@ TEST_F(RegistryUtilsTest, DeleteValue_ExistingValue_Success) {
 }
 
 TEST_F(RegistryUtilsTest, DeleteSubKey_EmptyKey_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[DeleteSubKey_EmptyKey_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -306,6 +324,7 @@ TEST_F(RegistryUtilsTest, DeleteSubKey_EmptyKey_Success) {
 // QUICK HELPERS
 // ============================================================================
 TEST_F(RegistryUtilsTest, QuickReadWriteString_ValidData_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[QuickReadWriteString_ValidData_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -318,6 +337,7 @@ TEST_F(RegistryUtilsTest, QuickReadWriteString_ValidData_Success) {
 }
 
 TEST_F(RegistryUtilsTest, QuickReadWriteDWord_ValidData_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[QuickReadWriteDWord_ValidData_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -333,6 +353,7 @@ TEST_F(RegistryUtilsTest, QuickReadWriteDWord_ValidData_Success) {
 // KEY EXISTS
 // ============================================================================
 TEST_F(RegistryUtilsTest, KeyExists_ExistingKey_ReturnsTrue) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[KeyExists_ExistingKey_ReturnsTrue] Testing...");
     OpenOptions opt;
     opt.access = KEY_READ;
     
@@ -340,6 +361,7 @@ TEST_F(RegistryUtilsTest, KeyExists_ExistingKey_ReturnsTrue) {
 }
 
 TEST_F(RegistryUtilsTest, KeyExists_NonExistingKey_ReturnsFalse) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[KeyExists_NonExistingKey_ReturnsFalse] Testing...");
     OpenOptions opt;
     opt.access = KEY_READ;
     
@@ -350,6 +372,7 @@ TEST_F(RegistryUtilsTest, KeyExists_NonExistingKey_ReturnsFalse) {
 // EXPAND STRING
 // ============================================================================
 TEST_F(RegistryUtilsTest, ReadExpandString_WithEnvVar_Expands) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[ReadExpandString_WithEnvVar_Expands] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -373,6 +396,7 @@ TEST_F(RegistryUtilsTest, ReadExpandString_WithEnvVar_Expands) {
 // EDGE CASES
 // ============================================================================
 TEST_F(RegistryUtilsTest, EdgeCase_EmptyStringValue_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EdgeCase_EmptyStringValue_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -388,6 +412,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_EmptyStringValue_Success) {
 }
 
 TEST_F(RegistryUtilsTest, EdgeCase_ZeroDWord_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EdgeCase_ZeroDWord_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -403,6 +428,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_ZeroDWord_Success) {
 }
 
 TEST_F(RegistryUtilsTest, EdgeCase_LargeMultiString_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EdgeCase_LargeMultiString_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -427,6 +453,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_LargeMultiString_Success) {
 // ERROR HANDLING
 // ============================================================================
 TEST_F(RegistryUtilsTest, ReadNonExistentValue_Fails) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[ReadNonExistentValue_Fails] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -440,6 +467,7 @@ TEST_F(RegistryUtilsTest, ReadNonExistentValue_Fails) {
 }
 
 TEST_F(RegistryUtilsTest, WriteWithoutPermission_Fails) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WriteWithoutPermission_Fails] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -455,6 +483,7 @@ TEST_F(RegistryUtilsTest, WriteWithoutPermission_Fails) {
 // HELPER FUNCTIONS
 // ============================================================================
 TEST_F(RegistryUtilsTest, ParseRootKey_ValidNames_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[ParseRootKey_ValidNames_Success] Testing...");
     EXPECT_EQ(ParseRootKey(L"HKEY_CURRENT_USER"), HKEY_CURRENT_USER);
     EXPECT_EQ(ParseRootKey(L"HKCU"), HKEY_CURRENT_USER);
     EXPECT_EQ(ParseRootKey(L"HKEY_LOCAL_MACHINE"), HKEY_LOCAL_MACHINE);
@@ -464,16 +493,19 @@ TEST_F(RegistryUtilsTest, ParseRootKey_ValidNames_Success) {
 }
 
 TEST_F(RegistryUtilsTest, ParseRootKey_InvalidName_ReturnsNull) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[ParseRootKey_InvalidName_ReturnsNull] Testing...");
     EXPECT_EQ(ParseRootKey(L"INVALID_ROOT"), nullptr);
 }
 
 TEST_F(RegistryUtilsTest, RootKeyToString_ValidKeys_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[RootKeyToString_ValidKeys_Success] Testing...");
     EXPECT_EQ(RootKeyToString(HKEY_CURRENT_USER), L"HKEY_CURRENT_USER");
     EXPECT_EQ(RootKeyToString(HKEY_LOCAL_MACHINE), L"HKEY_LOCAL_MACHINE");
     EXPECT_EQ(RootKeyToString(HKEY_CLASSES_ROOT), L"HKEY_CLASSES_ROOT");
 }
 
 TEST_F(RegistryUtilsTest, SplitPath_ValidPath_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[SplitPath_ValidPath_Success] Testing...");
     HKEY rootKey = nullptr;
     std::wstring subKey;
     
@@ -483,6 +515,7 @@ TEST_F(RegistryUtilsTest, SplitPath_ValidPath_Success) {
 }
 
 TEST_F(RegistryUtilsTest, SplitPath_RootOnly_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[SplitPath_RootOnly_Success] Testing...");
     HKEY rootKey = nullptr;
     std::wstring subKey;
     
@@ -495,6 +528,7 @@ TEST_F(RegistryUtilsTest, SplitPath_RootOnly_Success) {
 // ADVANCED SECURITY TESTS
 // ============================================================================
 TEST_F(RegistryUtilsTest, Security_ReadValue_LargeData_Protected) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Security_ReadValue_LargeData_Protected] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -516,6 +550,7 @@ TEST_F(RegistryUtilsTest, Security_ReadValue_LargeData_Protected) {
 }
 
 TEST_F(RegistryUtilsTest, Security_ReadMultiString_MalformedData_Protected) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Security_ReadMultiString_MalformedData_Protected] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -540,6 +575,7 @@ TEST_F(RegistryUtilsTest, Security_ReadMultiString_MalformedData_Protected) {
 // ADVANCED OPERATIONS
 // ============================================================================
 TEST_F(RegistryUtilsTest, Flush_ValidKey_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Flush_ValidKey_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -555,6 +591,7 @@ TEST_F(RegistryUtilsTest, Flush_ValidKey_Success) {
 }
 
 TEST_F(RegistryUtilsTest, DeleteSubKeyTree_WithSubKeys_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[DeleteSubKeyTree_WithSubKeys_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -578,6 +615,7 @@ TEST_F(RegistryUtilsTest, DeleteSubKeyTree_WithSubKeys_Success) {
 }
 
 TEST_F(RegistryUtilsTest, QuickWriteReadQWord_ValidData_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[QuickWriteReadQWord_ValidData_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -594,6 +632,7 @@ TEST_F(RegistryUtilsTest, QuickWriteReadQWord_ValidData_Success) {
 // UNICODE & SPECIAL CHARACTERS
 // ============================================================================
 TEST_F(RegistryUtilsTest, EdgeCase_UnicodeString_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EdgeCase_UnicodeString_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -611,6 +650,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_UnicodeString_Success) {
 }
 
 TEST_F(RegistryUtilsTest, EdgeCase_LongValueName_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EdgeCase_LongValueName_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -629,6 +669,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_LongValueName_Success) {
 }
 
 TEST_F(RegistryUtilsTest, EdgeCase_SpecialCharsInPath_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[EdgeCase_SpecialCharsInPath_Success] Testing...");
     Error err;
     OpenOptions opt;
     opt.access = KEY_ALL_ACCESS;
@@ -645,6 +686,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_SpecialCharsInPath_Success) {
 // ============================================================================
 #ifdef _WIN64
 TEST_F(RegistryUtilsTest, WOW64_64BitView_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WOW64_64BitView_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -662,6 +704,7 @@ TEST_F(RegistryUtilsTest, WOW64_64BitView_Success) {
 }
 
 TEST_F(RegistryUtilsTest, WOW64_32BitView_Success) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[WOW64_32BitView_Success] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -683,6 +726,7 @@ TEST_F(RegistryUtilsTest, WOW64_32BitView_Success) {
 // COMPREHENSIVE ERROR SCENARIOS
 // ============================================================================
 TEST_F(RegistryUtilsTest, Error_TypeMismatch_Fails) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Error_TypeMismatch_Fails] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;
@@ -700,6 +744,7 @@ TEST_F(RegistryUtilsTest, Error_TypeMismatch_Fails) {
 }
 
 TEST_F(RegistryUtilsTest, Error_InvalidHandle_AllOperationsFail) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Error_InvalidHandle_AllOperationsFail] Testing...");
     RegistryKey key;  // Not opened
     Error err;
     std::wstring str;
@@ -719,6 +764,7 @@ TEST_F(RegistryUtilsTest, Error_InvalidHandle_AllOperationsFail) {
 }
 
 TEST_F(RegistryUtilsTest, Error_KeyNotFound_ProperError) {
+    SS_LOG_INFO(L"RegistryUtilsTests", L"[Error_KeyNotFound_ProperError] Testing...");
     RegistryKey key;
     Error err;
     OpenOptions opt;

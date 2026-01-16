@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include"pch.h"
 #include"SignatureStore.hpp"
 
@@ -321,7 +325,7 @@ namespace ShadowStrike {
                 }
                 catch (const std::exception& e) {
                     SS_LOG_WARN(L"SignatureStore", L"ScanFiles: Error scanning file %zu: %S", i, e.what());
-                    results.push_back(ScanResult{}); // Push empty result to maintain index alignment
+                    results.emplace_back(ScanResult{}); // Push empty result to maintain index alignment
                 }
 
                 // TITANIUM: Wrap callback in try-catch - user callback might throw
@@ -614,92 +618,72 @@ namespace ShadowStrike {
             // TITANIUM VALIDATION LAYER - STREAM SCANNER
             // ========================================================================
 
-            // VALIDATION 1: Check for null store pointer (use-after-free protection)
-            if (!m_store) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Store pointer is null");
+            if (!m_store || !m_store->IsInitialized()) {
+                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Store invalid");
                 return ScanResult{};
             }
 
-            // VALIDATION 2: Check if store is still initialized (lifetime protection)
-            if (!m_store->IsInitialized()) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Store is no longer initialized");
+            if (chunk.empty() || chunk.data() == nullptr) {
                 return ScanResult{};
             }
 
-            // VALIDATION 3: Check for empty chunk to avoid unnecessary processing
-            if (chunk.empty()) {
-                return ScanResult{};
-            }
-
-            // VALIDATION 4: Check chunk pointer validity
-            if (chunk.data() == nullptr) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Null chunk pointer with non-zero size");
-                return ScanResult{};
-            }
-
-            // VALIDATION 5: Check for maximum single chunk size
-            constexpr size_t MAX_SINGLE_CHUNK_SIZE = 50 * 1024 * 1024; // 50MB max per chunk
-            if (chunk.size() > MAX_SINGLE_CHUNK_SIZE) {
-                SS_LOG_WARN(L"SignatureStore", L"StreamScanner::FeedChunk: Chunk too large (%zu bytes), max is %zu",
-                    chunk.size(), MAX_SINGLE_CHUNK_SIZE);
-                // Scan the chunk directly without buffering
+            // 1. LARGE CHUNK BYPASS (50MB+)
+            // Scan very large chunks directly without buffering.
+            // Eliminates memory allocation and memcpy overhead.
+            constexpr size_t DIRECT_SCAN_LIMIT = 50 * 1024 * 1024;
+            if (chunk.size() > DIRECT_SCAN_LIMIT) {
+                SS_LOG_DEBUG(L"SignatureStore", L"StreamScanner: Direct scan for large chunk (%zu bytes)", chunk.size());
                 return m_store->ScanBuffer(chunk, m_options);
             }
 
-            // VALIDATION 6: Check for potential overflow before adding to buffer
-            constexpr size_t MAX_BUFFER_SIZE = 100 * 1024 * 1024; // 100MB max
+            // 2. BUFFER MANAGEMENT & THRESHOLD SCAN (10MB)
+            // If the new chunk combined with the buffer exceeds 10MB,
+            // scan and clear the current buffer first, then add the new chunk.
+            constexpr size_t SCAN_THRESHOLD = 10 * 1024 * 1024;
 
-            // Overflow-safe size check
-            if (chunk.size() > MAX_BUFFER_SIZE || m_buffer.size() > MAX_BUFFER_SIZE - chunk.size()) {
-                SS_LOG_WARN(L"SignatureStore", L"StreamScanner: Buffer would exceed max size (%zu + %zu), scanning now",
-                    m_buffer.size(), chunk.size());
-                auto result = m_store->ScanBuffer(m_buffer, m_options);
-                m_buffer.clear();
+            if (m_buffer.size() + chunk.size() > SCAN_THRESHOLD) {
+                // Scan existing accumulated data (if buffer is not empty)
+                ScanResult result{};
+                if (!m_buffer.empty()) {
+                    result = m_store->ScanBuffer(m_buffer, m_options);
+                    m_buffer.clear();
+                }
 
-                // Don't add the new chunk if it alone exceeds limit
-                if (chunk.size() <= MAX_BUFFER_SIZE) {
-                    try {
-                        m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-                    }
-                    catch (const std::bad_alloc& e) {
-                        SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Memory allocation failed: %S", e.what());
-                        return result;
+                // Add the new chunk to the cleared buffer
+                try {
+                    m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+
+                    // Update statistics (Safe-math)
+                    if (m_bytesProcessed <= SIZE_MAX - chunk.size()) {
+                        m_bytesProcessed += chunk.size();
                     }
                 }
-                return result;
+                catch (const std::bad_alloc&) {
+                    SS_LOG_ERROR(L"SignatureStore", L"StreamScanner: Allocation failed");
+                }
+
+                // If the newly added chunk itself exceeds 10MB, scan it immediately
+                if (m_buffer.size() >= SCAN_THRESHOLD) {
+                    auto chunkResult = m_store->ScanBuffer(m_buffer, m_options);
+                    m_buffer.clear();
+                    return chunkResult;
+                }
+
+                return result; // Return scan result of the previous accumulation
             }
 
-            // ========================================================================
-            // BUFFER ACCUMULATION
-            // ========================================================================
+            // 3. ACCUMULATION (Standard data buffering)
             try {
                 m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+                if (m_bytesProcessed <= SIZE_MAX - chunk.size()) {
+                    m_bytesProcessed += chunk.size();
+                }
             }
-            catch (const std::bad_alloc& e) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Buffer append failed: %S", e.what());
-                // Emergency: scan what we have and clear
-                auto result = m_store->ScanBuffer(m_buffer, m_options);
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner: Buffer append failed");
+                auto res = m_store->ScanBuffer(m_buffer, m_options);
                 m_buffer.clear();
-                return result;
-            }
-
-            // VALIDATION 7: Overflow-safe bytes processed update
-            if (m_bytesProcessed > SIZE_MAX - chunk.size()) {
-                SS_LOG_WARN(L"SignatureStore", L"StreamScanner: Bytes processed counter overflow, resetting");
-                m_bytesProcessed = chunk.size();
-            }
-            else {
-                m_bytesProcessed += chunk.size();
-            }
-
-            // ========================================================================
-            // THRESHOLD SCAN (10MB)
-            // ========================================================================
-            constexpr size_t SCAN_THRESHOLD = 10 * 1024 * 1024;
-            if (m_buffer.size() >= SCAN_THRESHOLD) {
-                auto result = m_store->ScanBuffer(m_buffer, m_options);
-                m_buffer.clear();
-                return result;
+                return res;
             }
 
             return ScanResult{};

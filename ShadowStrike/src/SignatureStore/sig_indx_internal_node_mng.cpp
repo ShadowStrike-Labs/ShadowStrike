@@ -1,3 +1,7 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
+
 #include"pch.h"
 #include "SignatureIndex.hpp"
 #include "../Utils/Logger.hpp"
@@ -1102,15 +1106,6 @@ StoreError SignatureIndex::MergeNodes(
                 left->keyCount);
             return StoreError{ SignatureStoreError::IndexCorrupted, 0,
                               "Left node overflowed during merge" };
-        }
-
-        // HARDENED: Bounds check on right node before read
-        if (i >= BPlusTreeNode::MAX_KEYS) {
-            SS_LOG_ERROR(L"SignatureIndex",
-                L"MergeNodes: Right source index %u out of bounds (max=%zu)",
-                i, BPlusTreeNode::MAX_KEYS);
-            return StoreError{ SignatureStoreError::IndexCorrupted, 0,
-                              "Right node index out of bounds" };
         }
 
         // HARDENED: Bounds check on children array (may differ from keys)

@@ -18,6 +18,7 @@ Some rules when i want a bugfix or a vulnerability fix, crash fix,etc. or even a
 5)Always try to write clean code.
 6)Always try to write well-documented code.
 7)Always write comments in the code in english language to explain complex parts of the code.
-
+8) ALWAYS Give me the most professional code possible.
+9) ALWAYS FOLLOW ENTERPRISE-LEVEL CODING STANDARDS THIS IS IMPORTANT!
 
 Thank you for your help!

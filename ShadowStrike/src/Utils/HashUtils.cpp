@@ -1,4 +1,6 @@
-#include"pch.h"
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+
 /**
  * @file HashUtils.cpp
  * @brief Implementation of cryptographic hashing utilities.
@@ -6,7 +8,7 @@
  * Uses Windows BCrypt API for FIPS-compliant hash operations.
  * Provider handles are cached per-algorithm for performance.
  */
-
+#include"pch.h"
 #include "HashUtils.hpp"
 
 #include <algorithm>
