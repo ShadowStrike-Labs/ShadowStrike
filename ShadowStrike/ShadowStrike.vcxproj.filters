@@ -489,6 +489,9 @@
     <ClCompile Include="tests\unit\Utils\Base64UtilsTests.cpp">
       <Filter>Kaynak Dosyalar</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\Utils\CertUtilsTests.cpp">
+      <Filter>Kaynak Dosyalar</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Utils\Logger.hpp">

@@ -352,6 +352,7 @@
     <ClCompile Include="tests\unit\Database\white_list\WhiteListStringPool_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\Base64UtilsTests.cpp" />
     <ClCompile Include="tests\unit\Utils\CacheManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\CertUtilsTests.cpp" />
     <ClCompile Include="tests\unit\Utils\CompressionUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\CryptoUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\Utils\FileUtilsTests.cpp" />

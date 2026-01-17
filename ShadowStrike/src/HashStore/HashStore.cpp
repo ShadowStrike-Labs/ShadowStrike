@@ -27,6 +27,7 @@
 #include <tlsh.h>
 #include <format>
 #include <chrono>
+#include <random>
 #include <limits>
 #include <ctime>
 #include <cctype>
@@ -109,8 +110,8 @@ namespace ShadowStrike {
 
             // Check for double initialization
             if (m_initialized.load(std::memory_order_acquire)) {
-                SS_LOG_WARN(L"HashStore", L"Already initialized, call Close() first");
-                return StoreError{ SignatureStoreError::Success };
+                SS_LOG_ERROR(L"HashStore", L"Already initialized, call Close() first");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Already initialized" };
             }
 
             // Acquire exclusive lock for initialization
@@ -118,8 +119,8 @@ namespace ShadowStrike {
 
             // Double-check after acquiring lock
             if (m_initialized.load(std::memory_order_relaxed)) {
-                SS_LOG_WARN(L"HashStore", L"Already initialized (race condition avoided)");
-                return StoreError{ SignatureStoreError::Success };
+                SS_LOG_ERROR(L"HashStore", L"Already initialized (race condition avoided)");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Already initialized" };
             }
 
             m_databasePath = databasePath;
@@ -212,6 +213,91 @@ namespace ShadowStrike {
                 SS_LOG_LAST_ERROR(L"HashStore", L"Failed to set file size");
                 return StoreError{ SignatureStoreError::Unknown, err, "Failed to set file size" };
             }
+
+            // ====================================================================
+            // CRITICAL: Write database header BEFORE calling Initialize()
+            // Initialize() expects a valid header with magic number 0x53535344
+            // ====================================================================
+
+            // Reset file pointer to beginning for header write
+            LARGE_INTEGER headerPos{};
+            headerPos.QuadPart = 0;
+            if (!SetFilePointerEx(hFile, headerPos, nullptr, FILE_BEGIN)) {
+                DWORD err = GetLastError();
+                SS_LOG_LAST_ERROR(L"HashStore", L"Failed to reset file pointer for header");
+                return StoreError{ SignatureStoreError::Unknown, err, "Failed to reset file pointer" };
+            }
+
+            // Initialize header with valid values
+            SignatureDatabaseHeader header{};
+            std::memset(&header, 0, sizeof(header));
+
+            // Set magic number and version - CRITICAL for validation
+            header.magic = SIGNATURE_DB_MAGIC;                      // 0x53535344 = 'SSSD'
+            header.versionMajor = SIGNATURE_DB_VERSION_MAJOR;       // 1
+            header.versionMinor = SIGNATURE_DB_VERSION_MINOR;       // 0
+
+            // Generate UUID for database identification (using crypto-random if available)
+            // For now, use simple random + timestamp-based UUID
+            const uint64_t timestamp = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()
+                ).count()
+            );
+            header.creationTime = timestamp;
+            header.lastUpdateTime = timestamp;
+            header.buildNumber = 1;
+
+            // Generate simple UUID using timestamp and random
+            std::random_device rd;
+            std::mt19937_64 gen(rd());
+            const uint64_t uuidPart1 = gen();
+            const uint64_t uuidPart2 = gen() ^ timestamp;
+            std::memcpy(header.databaseUuid.data(), &uuidPart1, sizeof(uuidPart1));
+            std::memcpy(header.databaseUuid.data() + 8, &uuidPart2, sizeof(uuidPart2));
+
+            // ====================================================================
+            // CRITICAL: Set hash index offset and size for bucket initialization
+            // Hash index starts immediately after the header (4096 bytes)
+            // Hash index size = total file size - header size
+            // ====================================================================
+            constexpr uint64_t HEADER_SIZE = sizeof(SignatureDatabaseHeader);  // 4096 bytes
+            static_assert(HEADER_SIZE == 4096, "Header size must be 4096 bytes");
+
+            header.hashIndexOffset = HEADER_SIZE;                               // Start after header
+            header.hashIndexSize = initialSizeBytes - HEADER_SIZE;              // Rest of the file
+
+            // Other sections are not used by HashStore - leave at 0
+            // patternIndexOffset, yaraRulesOffset, metadataOffset, stringPoolOffset = 0
+
+            // Performance hints
+            header.recommendedCacheSize = 64;  // 64 MB default cache recommendation
+
+            // Checksum will be computed on first flush
+
+            // Write header to file
+            DWORD bytesWritten = 0;
+            if (!WriteFile(hFile, &header, sizeof(header), &bytesWritten, nullptr)) {
+                DWORD err = GetLastError();
+                SS_LOG_LAST_ERROR(L"HashStore", L"Failed to write database header");
+                return StoreError{ SignatureStoreError::Unknown, err, "Failed to write header" };
+            }
+
+            if (bytesWritten != sizeof(header)) {
+                SS_LOG_ERROR(L"HashStore", 
+                    L"Header write incomplete: wrote %u of %zu bytes",
+                    bytesWritten, sizeof(header));
+                return StoreError{ SignatureStoreError::Unknown, 0, "Incomplete header write" };
+            }
+
+            // Flush to ensure header is on disk before reopening
+            if (!FlushFileBuffers(hFile)) {
+                SS_LOG_WARN(L"HashStore", L"Failed to flush file buffers (non-fatal)");
+            }
+
+            SS_LOG_INFO(L"HashStore", 
+                L"Database header written successfully (magic=0x%08X, ver=%u.%u)",
+                header.magic, header.versionMajor, header.versionMinor);
 
             // Close handle before Initialize opens it again
             CloseHandle(hFile);

@@ -418,7 +418,7 @@ TEST_F(HashStoreTestFixture, BloomFilter_StressTest) {
 TEST_F(HashStoreTestFixture, HashBucket_Construction) {
     HashBucket bucket(HashType::MD5);
     
-    EXPECT_TRUE(bucket.m_index == nullptr);  // Not initialized yet
+    EXPECT_TRUE(bucket.m_index != nullptr);  // Index is pre-allocated by constructor
     EXPECT_TRUE(bucket.m_bloomFilter == nullptr);
 }
 
@@ -436,7 +436,7 @@ TEST_F(HashStoreTestFixture, HashBucket_ResetStatistics) {
     HashBucket bucket(HashType::MD5);
     
     // Simulate some activity by calling GetStatistics
-    bucket.GetStatistics();
+    bucket.GetStatistics();//-V530
     
     bucket.ResetStatistics();
     
@@ -707,6 +707,7 @@ TEST_F(HashStoreTestFixture, HashStore_BatchLookup_MultipleHashes) {
     ASSERT_TRUE(store.CreateNew(dbPath).IsSuccess());
     
     std::vector<HashValue> hashes;
+	hashes.reserve(3);
     hashes.push_back(MakeMD5("d41d8cd98f00b204e9800998ecf8427e"));
     hashes.push_back(MakeMD5("5d41402abc4b2a76b9719d911017c592"));
     hashes.push_back(MakeMD5("7d793037a0760186574b0282f2f435e7"));
@@ -815,7 +816,7 @@ TEST_F(HashStoreTestFixture, HashStore_GetStatistics_AfterLookup) {
     ASSERT_TRUE(store.CreateNew(dbPath).IsSuccess());
     
     auto hash = MakeMD5("d41d8cd98f00b204e9800998ecf8427e");
-    store.LookupHash(hash);
+    store.LookupHash(hash);//-V530
     
     auto stats = store.GetStatistics();
     
@@ -832,7 +833,7 @@ TEST_F(HashStoreTestFixture, HashStore_ResetStatistics) {
     
     // Perform lookups
     auto hash = MakeMD5("d41d8cd98f00b204e9800998ecf8427e");
-    store.LookupHash(hash);
+    store.LookupHash(hash);//-V530
     
     store.ResetStatistics();
     
@@ -869,8 +870,8 @@ TEST_F(HashStoreTestFixture, HashStore_CacheEnabled_Default) {
     // Verify by checking statistics after repeated lookups
     auto hash = MakeMD5("d41d8cd98f00b204e9800998ecf8427e");
     
-    store.LookupHash(hash);
-    store.LookupHash(hash);  // Second lookup might hit cache
+    store.LookupHash(hash);//-V530
+    store.LookupHash(hash);//-V530  // Second lookup might hit cache
     
     auto stats = store.GetStatistics();
     // Can't guarantee cache hit, but lookups should increment
@@ -888,7 +889,7 @@ TEST_F(HashStoreTestFixture, HashStore_SetCachingDisabled) {
     store.SetCachingEnabled(false);
     
     auto hash = MakeMD5("d41d8cd98f00b204e9800998ecf8427e");
-    store.LookupHash(hash);
+    store.LookupHash(hash);//-V530
     
     auto stats = store.GetStatistics();
     EXPECT_EQ(stats.cacheHits, 0);  // No cache when disabled
@@ -904,7 +905,7 @@ TEST_F(HashStoreTestFixture, HashStore_ClearCache) {
     
     // Perform lookups
     auto hash = MakeMD5("d41d8cd98f00b204e9800998ecf8427e");
-    store.LookupHash(hash);
+    store.LookupHash(hash);//-V530
     
     store.ClearCache();
     
@@ -998,7 +999,7 @@ TEST_F(HashStoreTestFixture, HashStore_ConcurrentLookups) {
     for (int i = 0; i < 10; ++i) {
         futures.push_back(std::async(std::launch::async, [&]() {
             for (int j = 0; j < 100; ++j) {
-                store.LookupHash(hash);
+                store.LookupHash(hash);//-V530
             }
             return true;
         }));
@@ -1050,7 +1051,7 @@ TEST_F(HashStoreTestFixture, HashStore_ConcurrentStatistics) {
     std::vector<std::future<void>> futures;
     for (int i = 0; i < 20; ++i) {
         futures.push_back(std::async(std::launch::async, [&]() {
-            store.GetStatistics();
+            store.GetStatistics();//-V530
         }));
     }
     
@@ -1211,7 +1212,7 @@ TEST_F(HashStoreTestFixture, Performance_ManyLookups) {
     auto start = std::chrono::high_resolution_clock::now();
     
     for (int i = 0; i < 10000; ++i) {
-        store.LookupHash(hash);
+        store.LookupHash(hash);//-V530
     }
     
     auto end = std::chrono::high_resolution_clock::now();

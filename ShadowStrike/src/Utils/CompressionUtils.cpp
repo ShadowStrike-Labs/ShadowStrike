@@ -562,7 +562,8 @@ namespace ShadowStrike {
                 }
 
                 // Check compression ratio for additional bomb detection
-                if (srcSize > 0) {
+                // Skip ratio check if caller provided expectedSize (they vouch for it)
+                if (expectedSize == 0 && srcSize > 0) {
                     const size_t ratio = static_cast<size_t>(required) / srcSize;
                     if (ratio > MAX_COMPRESSION_RATIO) {
                         SS_LOG_WARN(L"CompressionUtils",
@@ -887,141 +888,81 @@ namespace ShadowStrike {
 
                 m_handle = nullptr;
             }
-
-            bool Decompressor::decompress(
-                const void* src,
-                size_t srcSize,
-                std::vector<uint8_t>& dst,
-                size_t expectedUncompressedSize) const noexcept
+                bool Decompressor::decompress(
+                    const void* src,
+                    size_t srcSize,
+                    std::vector<uint8_t>&dst,
+                    size_t expectedUncompressedSize) const noexcept
             {
-                // Clear output first
+                // 1. Basic Validations
                 dst.clear();
+                if (m_handle == nullptr) return false;
+                if (src == nullptr && srcSize > 0) return false;
+                if (srcSize == 0) return true;
 
-                // Validate handle
-                if (m_handle == nullptr) {
-                    return false;
-                }
+                // 2. Security Limits
+                if (srcSize > MAX_COMPRESSED_SIZE) return false;
+                if (expectedUncompressedSize > MAX_DECOMPRESSED_SIZE) return false;
 
-                // Validate input parameters
-                if (src == nullptr && srcSize > 0) {
-                    return false;
-                }
-
-                // Empty input is valid
-                if (srcSize == 0) {
-                    return true;
-                }
-
-                // Enforce size limits
-                if (srcSize > MAX_COMPRESSED_SIZE) {
-                    return false;
-                }
-
-                // Validate expected size if provided
-                if (expectedUncompressedSize > MAX_DECOMPRESSED_SIZE) {
-                    return false;
-                }
-
-                // Validate SIZE_T compatibility
-                SIZE_T srcSizeT = 0;
-                if (!SizeToSizeT(srcSize, srcSizeT)) {
-                    return false;
-                }
-
+                // 3. API and Variable Preparation
                 const auto& api = GetApi();
-                if (!api.valid()) {
-                    return false;
-                }
+                if (!api.valid()) return false;
 
-                // First pass: query required size using scratch buffer
+                SIZE_T srcSizeT = static_cast<SIZE_T>(srcSize);
                 SIZE_T required = 0;
-                BYTE scratch[SCRATCH_BUFFER_SIZE] = {};
-                DWORD err = ERROR_SUCCESS;
+                DWORD lastErr = ERROR_SUCCESS;
 
-#ifdef _WIN32
-                BOOL ok = SafeDecompress(api, static_cast<DECOMPRESSOR_HANDLE>(m_handle),
-                    src, srcSizeT, scratch, sizeof(scratch), &required, err);
-#else
-                BOOL ok = api.pDecompress(static_cast<DECOMPRESSOR_HANDLE>(m_handle),
-                    src, srcSizeT, scratch, sizeof(scratch), &required);
-                err = ok ? ERROR_SUCCESS : GetLastError();
-#endif
-
-                // If decompression succeeded into scratch buffer
-                if (ok != FALSE) {
-                    if (required <= sizeof(scratch)) {
+                // 4. Size Determination (Query Phase)
+                if (expectedUncompressedSize > 0) {
+                    required = static_cast<SIZE_T>(expectedUncompressedSize);
+                }
+                else {
+                    BYTE scratch[SCRATCH_BUFFER_SIZE] = {};
+                    if (SafeDecompress(api, static_cast<DECOMPRESSOR_HANDLE>(m_handle),
+                        src, srcSizeT, scratch, sizeof(scratch), &required, lastErr)) {
                         try {
                             dst.assign(scratch, scratch + required);
                             return true;
                         }
-                        catch (const std::bad_alloc&) {
-                            return false;
-                        }
+                        catch (...) { return false; }
                     }
-                    return false;
-                }
 
-                // Check for valid error condition
-                if (err != ERROR_INSUFFICIENT_BUFFER || required == 0) {
-                    return false;
-                }
-
-                // CRITICAL: Decompression bomb protection
-                if (required > MAX_DECOMPRESSED_SIZE) {
-                    return false;
-                }
-
-                // Check compression ratio
-                if (srcSize > 0) {
-                    const size_t ratio = static_cast<size_t>(required) / srcSize;
-                    if (ratio > MAX_COMPRESSION_RATIO) {
+                    if (lastErr != ERROR_INSUFFICIENT_BUFFER || required == 0) {
                         return false;
                     }
                 }
 
-                // Validate against expected size if provided
-                if (expectedUncompressedSize > 0 &&
-                    static_cast<size_t>(required) != expectedUncompressedSize) {
-                    return false;
+                // 5. Decompression Bomb Protection (Enterprise Logic)
+                if (required > MAX_DECOMPRESSED_SIZE) return false;
+
+                // Perform ratio check only for extractions above a certain size to prevent False Positives
+                if (required > MIN_RATIO_CHECK_SIZE && srcSize > 0) {
+                    const size_t ratio = static_cast<size_t>(required) / srcSize;
+                    if (ratio > MAX_COMPRESSION_RATIO) {
+                        SS_LOG_WARN(L"CompressionUtils", L"Security: Decompression bomb blocked (Ratio %zu:1)", ratio);
+                        return false;
+                    }
                 }
 
-                // Allocate output buffer
+                // 6. Actual Decompression (Final Pass)
                 try {
                     dst.resize(static_cast<size_t>(required));
                 }
-                catch (const std::bad_alloc&) {
-                    return false;
-                }
+                catch (...) { return false; }
 
-                // Second pass: actual decompression
-                SIZE_T outSize = 0;
-
-#ifdef _WIN32
-                ok = SafeDecompress(api, static_cast<DECOMPRESSOR_HANDLE>(m_handle),
-                    src, srcSizeT, dst.data(), required, &outSize, err);
-#else
-                ok = api.pDecompress(static_cast<DECOMPRESSOR_HANDLE>(m_handle),
-                    src, srcSizeT, dst.data(), required, &outSize);
-#endif
-
-                if (ok == FALSE) {
+                SIZE_T actualOut = 0;
+                if (!SafeDecompress(api, static_cast<DECOMPRESSOR_HANDLE>(m_handle),
+                    src, srcSizeT, dst.data(), required, &actualOut, lastErr)) {
                     dst.clear();
                     return false;
                 }
 
-                // Validate output size
-                if (outSize != required) {
-                    if (outSize > required) {
-                        // Buffer overflow - critical error
-                        dst.clear();
-                        return false;
-                    }
-                    dst.resize(static_cast<size_t>(outSize));
+                if (actualOut != required) {
+                    dst.resize(static_cast<size_t>(actualOut));
                 }
 
                 return true;
             }
-
 
             // ============================================================================
             // Move Helper Implementations

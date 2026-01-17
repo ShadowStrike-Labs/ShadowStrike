@@ -419,10 +419,19 @@ namespace ShadowStrike {
                 // Note: Using header constant MAX_READ_FILE_SIZE would be better for consistency
                 constexpr uint64_t MAX_FILE_SIZE = 64ULL * 1024 * 1024 * 1024;  // 64 GB max
                 
-                if (fileSize > SIZE_MAX || fileSize > MAX_FILE_SIZE) {
+                if (fileSize > (std::numeric_limits<uint64_t>::max)()) {
+					//It is impossible to reach that point but just in case
+                    if (err) {
+                        err->win32 = ERROR_ARITHMETIC_OVERFLOW;
+                        err->message = "Physical type limit exceeded";
+                    }
+                    return false;
+                }
+
+                if (fileSize > MAX_FILE_SIZE) {
                     if (err) {
                         err->win32 = ERROR_FILE_TOO_LARGE;
-                        err->message = "File exceeds maximum allowed size";
+                        err->message = "File exceeds maximum allowed size for scanning";
                     }
                     return false;
                 }
@@ -676,7 +685,9 @@ namespace ShadowStrike {
                             h = INVALID_HANDLE_VALUE;
                         }
                         if (!success) {
-                            RemoveFile(tmp);
+                            if (!RemoveFile(tmp)) {
+                                SS_LOG_LAST_ERROR(L"FileUtils", L"TempFileGuard: Failed to remove temp file: %s", tmp.c_str());
+                            }
                         }
                     }
                 } guard{ h, tmp, success };
@@ -1731,7 +1742,7 @@ namespace ShadowStrike {
                     return false;
                 }
 
-                WalkDirectory(dir, opts,
+                if (!WalkDirectory(dir, opts,
                     [&dirs](const std::wstring& path, const WIN32_FIND_DATAW& fd) -> bool {
                         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                             try {
@@ -1742,7 +1753,9 @@ namespace ShadowStrike {
                             }
                         }
                         return true;
-                    }, nullptr);
+                    }, nullptr)) {
+					if (err) err->win32 = ERROR_NOT_ENOUGH_MEMORY;
+                }
 
                 // Sort by path length descending (deepest first)
                 std::sort(dirs.begin(), dirs.end(),

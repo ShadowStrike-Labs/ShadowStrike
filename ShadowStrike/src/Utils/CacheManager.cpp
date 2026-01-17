@@ -1092,24 +1092,19 @@ namespace ShadowStrike {
         }
 
         void CacheManager::SetMaxEntries(size_t maxEntries) {
-            // Enforce minimum reasonable limit
-            constexpr size_t kMinEntries = 16;
-            const size_t effectiveMax = (maxEntries < kMinEntries) ? kMinEntries : maxEntries;
-
+          
             SRWExclusive guard(m_lock);
-            m_maxEntries = effectiveMax;
+            m_maxEntries = maxEntries;
+
 
             // Evict entries if we now exceed the new limit
             evictIfNeeded_NoLock();
         }
 
         void CacheManager::SetMaxBytes(size_t maxBytes) {
-            // Enforce minimum reasonable limit (1 KB)
-            constexpr size_t kMinBytes = 1024;
-            const size_t effectiveMax = (maxBytes < kMinBytes) ? kMinBytes : maxBytes;
-
+          
             SRWExclusive guard(m_lock);
-            m_maxBytes = effectiveMax;
+            m_maxBytes = maxBytes;
 
             // Evict entries if we now exceed the new limit
             evictIfNeeded_NoLock();

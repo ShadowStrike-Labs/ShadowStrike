@@ -535,17 +535,23 @@ TEST_F(AhoCorasickTest, LargeBuffer_ManyMatches) {
 }
 
 TEST_F(AhoCorasickTest, ManyPatterns_LargeTrie) {
-    // Add 1000 unique patterns
+    // Add 1000 unique patterns (pattern_0 through pattern_999)
+    // Note: Aho-Corasick finds ALL patterns that appear as substrings in the search text.
+    // Since all patterns share the "pattern_" prefix, searching for "pattern_XYZ" will
+    // also find any patterns that are prefixes of "pattern_XYZ".
     for (int i = 0; i < 1000; ++i) {
         std::string pattern = "pattern_" + std::to_string(i);
         ASSERT_TRUE(AddStringPattern(pattern, i));
     }
     ASSERT_TRUE(automaton.Compile());
     
-    // Search should still work efficiently
-    EXPECT_EQ(CountMatchesInString("pattern_500"), 1);
-    EXPECT_EQ(CountMatchesInString("pattern_999"), 1);
-    EXPECT_EQ(CountMatchesInString("pattern_1000"), 0);
+    // Aho-Corasick finds ALL matching patterns in a text:
+    // "pattern_500" contains: pattern_5, pattern_50, pattern_500 = 3 matches
+    // "pattern_999" contains: pattern_9, pattern_99, pattern_999 = 3 matches  
+    // "pattern_1000" contains: pattern_1, pattern_10, pattern_100 = 3 matches (1000 itself not added)
+    EXPECT_EQ(CountMatchesInString("pattern_500"), 3);  // pattern_5, pattern_50, pattern_500
+    EXPECT_EQ(CountMatchesInString("pattern_999"), 3);  // pattern_9, pattern_99, pattern_999
+    EXPECT_EQ(CountMatchesInString("pattern_1000"), 3); // pattern_1, pattern_10, pattern_100
 }
 
 TEST_F(AhoCorasickTest, DeepTrie_LongPatterns) {
@@ -933,16 +939,23 @@ TEST_F(AhoCorasickTest, Regression_SelfLoop) {
 
 TEST_F(AhoCorasickTest, Regression_NodeReallocation) {
     // Add many patterns to force vector reallocation
+    // Note: Aho-Corasick matches ALL patterns that occur as substrings
+    // e.g., searching "p250" will match patterns: "p2", "p25", "p250"
     for (int i = 0; i < 500; ++i) {
         std::string pattern = "p" + std::to_string(i);
         ASSERT_TRUE(AddStringPattern(pattern, i));
     }
     ASSERT_TRUE(automaton.Compile());
     
-    // Verify all patterns still work after potential reallocations
+    // Verify patterns work after vector reallocations
+    // "p0" is unique (no prefixes match)
     EXPECT_EQ(CountMatchesInString("p0"), 1);
-    EXPECT_EQ(CountMatchesInString("p250"), 1);
-    EXPECT_EQ(CountMatchesInString("p499"), 1);
+    
+    // "p250" matches: p2 (at pos 0), p25 (at pos 0), p250 (at pos 0) = 3 matches
+    EXPECT_EQ(CountMatchesInString("p250"), 3);
+    
+    // "p499" matches: p4 (at pos 0), p49 (at pos 0), p499 (at pos 0) = 3 matches
+    EXPECT_EQ(CountMatchesInString("p499"), 3);
 }
 
 // ============================================================================

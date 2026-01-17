@@ -230,7 +230,7 @@ namespace ShadowStrike {
 
 					// Query certificate info
 					PCCERT_CONTEXT pCertContext = nullptr;
-					DWORD certSize = sizeof(pCertContext);
+					DWORD certSize = static_cast<DWORD>(sizeof(PCCERT_CONTEXT));
 
 					if (!::WinHttpQueryOption(hRequest,
 						WINHTTP_OPTION_SERVER_CERT_CONTEXT,

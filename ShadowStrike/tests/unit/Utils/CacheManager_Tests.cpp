@@ -852,7 +852,6 @@ TEST_F(CacheManagerTest, SetMaxEntries_TriggersEviction) {
     
     // Reduce limit
     cm.SetMaxEntries(5);
-    
     auto stats = cm.GetStats();
     EXPECT_LE(stats.entryCount, 5u);
 }

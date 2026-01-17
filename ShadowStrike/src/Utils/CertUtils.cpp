@@ -10,7 +10,7 @@
 
 #include"pch.h"
 #include "CertUtils.hpp"
-
+#include<wincrypt.h>
 #include <algorithm>
 #include <cwchar>
 #include <cstring>
@@ -19,6 +19,22 @@
 using namespace ShadowStrike::Utils::CertUtils;
 
 #ifdef _WIN32
+
+// ============================================================================
+// RAII Type Definitions for Windows Crypto API
+// ============================================================================
+
+// Custom deleter for HCERTSTORE
+struct CertStoreDeleter {
+    void operator()(HCERTSTORE h) const { if (h) CertCloseStore(h, 0); }
+};
+using ScopedCertStore = std::unique_ptr<void, CertStoreDeleter>;
+
+// Custom deleter for PCCERT_CONTEXT
+struct CertContextDeleter {
+    void operator()(PCCERT_CONTEXT p) const { if (p) CertFreeCertificateContext(p); }
+};
+using ScopedCertContext = std::unique_ptr<const CERT_CONTEXT, CertContextDeleter>;
 
 // ============================================================================
 // Internal Helper Functions
@@ -205,104 +221,86 @@ void Certificate::cleanup() noexcept {
 #endif
 }
 
-// ============================================================================
-// Certificate Loading Methods
-// ============================================================================
-
 /**
  * @brief Loads a certificate from a file.
- *
- * Supports DER, PEM, and PKCS#7 container formats. The function
- * automatically detects the format and extracts the first certificate.
- *
- * @param path Path to the certificate file.
- * @param err Optional error output.
- * @return true on success, false on failure.
+ * Supports DER, PEM, and PKCS#7 container formats with modern RAII management.
  */
 bool Certificate::LoadFromFile(std::wstring_view path, Error* err) noexcept {
 #ifdef _WIN32
-    // Release any existing certificate
-    cleanup();
+    // 1. Preparation & Cleanup
+    cleanup(); // Release any existing certificate
 
-    // Validate path
     if (path.empty()) {
         set_err(err, L"LoadFromFile: empty path", ERROR_INVALID_PARAMETER);
         return false;
     }
 
-    // Convert to null-terminated string (wstring_view may not be null-terminated)
+    // Ensure null-termination for Windows API
     std::wstring pathStr(path);
     if (!file_exists_w(pathStr)) {
         set_err(err, L"LoadFromFile: file not found", ERROR_FILE_NOT_FOUND);
         return false;
     }
 
-    // Variables for CryptQueryObject
-    HCERTSTORE hStore = nullptr;
-    DWORD dwEncoding = 0;
-    DWORD dwContentType = 0;
-    DWORD dwFormatType = 0;
+    // 2. Helper Lambda for CryptQueryObject (to avoid code duplication)
+    auto QueryStore = [&](DWORD contentFlags) -> ScopedCertStore {
+        DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
+        HCERTSTORE hTemp = nullptr;
 
-    // Try CryptQueryObject for DER/PEM X.509 certificate
-    BOOL ok = CryptQueryObject(
-        CERT_QUERY_OBJECT_FILE,
-        pathStr.c_str(),
-        CERT_QUERY_CONTENT_FLAG_CERT,
-        CERT_QUERY_FORMAT_FLAG_ALL,
-        0,
-        &dwEncoding,
-        &dwContentType,
-        &dwFormatType,
-        &hStore,
-        nullptr,
-        nullptr
-    );
-
-    if (!ok || hStore == nullptr) {
-        // Fallback: try PKCS#7 container formats
-        ok = CryptQueryObject(
+        BOOL ok = CryptQueryObject(
             CERT_QUERY_OBJECT_FILE,
             pathStr.c_str(),
-            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED |
-            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED |
-            CERT_QUERY_CONTENT_FLAG_PKCS7_UNSIGNED,
+            contentFlags,
             CERT_QUERY_FORMAT_FLAG_ALL,
             0,
             &dwEncoding,
             &dwContentType,
             &dwFormatType,
-            &hStore,
+            &hTemp,
             nullptr,
             nullptr
         );
 
-        if (!ok || hStore == nullptr) {
-            set_err(err, L"LoadFromFile: CryptQueryObject failed", GetLastError());
-            return false;
-        }
+        return ScopedCertStore(ok ? hTemp : nullptr);
+        };
+
+    // 3. Attempt to load: Try X.509 first, then fallback to PKCS#7
+    ScopedCertStore hStore = QueryStore(CERT_QUERY_CONTENT_FLAG_CERT);
+
+    if (!hStore) {
+        constexpr DWORD pkcs7Flags = CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED |
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED |
+            CERT_QUERY_CONTENT_FLAG_PKCS7_UNSIGNED;
+
+        hStore = QueryStore(pkcs7Flags);
     }
 
-    // Extract the first certificate from the store
-    PCCERT_CONTEXT ctx = CertEnumCertificatesInStore(hStore, nullptr);
-    if (ctx == nullptr) {
-        const DWORD lastError = GetLastError();
-        CertCloseStore(hStore, 0);
-        set_err(err, L"LoadFromFile: no certificate found in container", lastError);
+    if (!hStore) {
+        set_err(err, L"LoadFromFile: CryptQueryObject failed for all supported formats", GetLastError());
         return false;
     }
 
-    // Duplicate to own context (increments reference count)
-    m_certContext = CertDuplicateCertificateContext(ctx);
+    // 4. Extract Certificate Context
+    // CertEnumCertificatesInStore handles its own internal cursor, 
+    // we wrap the result in ScopedCertContext for safety.
+    PCCERT_CONTEXT rawCtx = CertEnumCertificatesInStore(hStore.get(), nullptr);
+    ScopedCertContext ctx(rawCtx);
 
-    // Release enumerated context and close store
-    CertFreeCertificateContext(ctx);
-    CertCloseStore(hStore, 0);
+    if (!ctx) {
+        set_err(err, L"LoadFromFile: no certificate found in container", GetLastError());
+        return false;
+    }
 
-    if (m_certContext == nullptr) {
+    // 5. Duplicate and Ownership Transfer
+    // We duplicate the context so the class instance owns it independently of the store
+    m_certContext = CertDuplicateCertificateContext(ctx.get());
+
+    if (!m_certContext) {
         set_err(err, L"LoadFromFile: CertDuplicateCertificateContext failed", GetLastError());
         return false;
     }
 
+    // hStore and ctx (ScopedCertContext) will be automatically released here.
     return true;
 #else
     (void)path;
@@ -310,6 +308,8 @@ bool Certificate::LoadFromFile(std::wstring_view path, Error* err) noexcept {
     return false;
 #endif
 }
+
+
 
 /**
  * @brief Loads a certificate from memory (DER or PEM format).

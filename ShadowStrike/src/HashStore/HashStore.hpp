@@ -433,7 +433,9 @@ private:
     std::unordered_map<HashType, std::unique_ptr<HashBucket>> m_buckets;
 
     // Query result cache (LRU)
-    static constexpr size_t CACHE_SIZE = 10000;
+    // Note: Reduced from 10000 to 1024 for faster initialization while still
+    // providing effective caching for hot lookups
+    static constexpr size_t CACHE_SIZE = 1024;
     mutable std::array<CacheEntry, CACHE_SIZE> m_queryCache{};
     mutable std::atomic<uint64_t> m_cacheAccessCounter{0};
     std::atomic<bool> m_cachingEnabled{true};

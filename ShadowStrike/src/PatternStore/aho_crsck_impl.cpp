@@ -182,9 +182,10 @@ bool AhoCorasickAutomaton::AddPattern(
             return false;
         }
         
-        uint32_t& childRef = m_nodes[currentNode].children[byte];
+        // Read current child index (NOT by reference - vector may reallocate!)
+        uint32_t childIndex = m_nodes[currentNode].children[byte];
         
-        if (childRef == 0) {
+        if (childIndex == 0) {
             // Need to create new node
             
             // Check node limit before allocation
@@ -201,25 +202,30 @@ bool AhoCorasickAutomaton::AddPattern(
             }
             
             try {
-                // Allocate new node with exception safety
+                // Calculate new node index BEFORE allocation (size before push)
                 const uint32_t newNodeIndex = static_cast<uint32_t>(m_nodes.size());
+                
+                // Get parent depth before potential reallocation
+                const uint16_t parentDepth = m_nodes[currentNode].depth;
+                
+                // Allocate new node - THIS MAY REALLOCATE THE VECTOR!
                 m_nodes.emplace_back();
                 
-                // Set depth with overflow protection
-                const uint16_t parentDepth = m_nodes[currentNode].depth;
+                // Set depth with overflow protection (use newNodeIndex to access)
                 if (parentDepth < UINT16_MAX) {
-                    m_nodes.back().depth = parentDepth + 1;
+                    m_nodes[newNodeIndex].depth = parentDepth + 1;
                 } else {
-                    m_nodes.back().depth = UINT16_MAX; // Saturate at max
+                    m_nodes[newNodeIndex].depth = UINT16_MAX; // Saturate at max
                 }
                 
-                // Update child pointer and count AFTER successful allocation
-                childRef = newNodeIndex;
+                // Update child pointer AFTER allocation using index (not reference!)
+                // This is critical: we must re-access currentNode after reallocation
+                m_nodes[currentNode].children[byte] = newNodeIndex;
+                childIndex = newNodeIndex;
                 ++m_nodeCount;
                 
             } catch (const std::bad_alloc&) {
                 SS_LOG_ERROR(L"AhoCorasick", L"Memory allocation failed at byte %zu", i);
-                // childRef remains 0 (invalid) - safe state
                 return false;
             } catch (...) {
                 SS_LOG_ERROR(L"AhoCorasick", L"Unexpected exception during node allocation");
@@ -227,11 +233,12 @@ bool AhoCorasickAutomaton::AddPattern(
             }
         }
         
-        // Move to child node (re-read in case of reallocation)
-        currentNode = m_nodes[currentNode].children[byte];
+        // Move to child node using the index we tracked
+        currentNode = childIndex;
         
-        // Validate the transition
-        if (currentNode == 0 || currentNode >= m_nodes.size()) {
+        // Validate the transition (currentNode can be 0 only if this is root,
+        // but we just created a child so it should be >= 1)
+        if (currentNode >= m_nodes.size()) {
             SS_LOG_ERROR(L"AhoCorasick", 
                 L"Invalid child node %u after insertion at byte %zu", currentNode, i);
             return false;

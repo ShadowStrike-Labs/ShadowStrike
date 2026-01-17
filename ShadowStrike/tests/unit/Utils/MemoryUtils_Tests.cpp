@@ -68,7 +68,7 @@ protected:
     void TearDown() override {
         if (!testRoot.empty()) {
             Error err{};
-            RemoveDirectoryRecursive(testRoot, &err);
+            RemoveDirectoryRecursive(testRoot, &err);//-V530
         }
     }
     

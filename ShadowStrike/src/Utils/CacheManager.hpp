@@ -374,16 +374,12 @@ namespace ShadowStrike {
             void performMaintenance();
 
             // ================================================================
-            // Eviction and Expiration (called with m_lock held)
-            // ================================================================
+           // Eviction and Expiration (called with m_lock held)
+           // ================================================================
 
             void evictIfNeeded_NoLock() noexcept;
             void removeExpired_NoLock(std::vector<std::wstring>& removedKeys) noexcept;
             [[nodiscard]] bool isExpired_NoLock(const Entry& e, const FILETIME& now) const noexcept;
-
-            // ================================================================
-            // LRU Management (called with m_lock held)
-            // ================================================================
 
             void touchLRU_NoLock(const std::wstring& key, std::shared_ptr<Entry>& e) noexcept;
 

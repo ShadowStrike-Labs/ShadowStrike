@@ -79,7 +79,11 @@ protected:
         if (!testRoot.empty()) {
             try {
                 Error err{};
-                RemoveDirectoryRecursive(testRoot, &err);
+                if (!RemoveDirectoryRecursive(testRoot, &err)) {
+                    SS_LOG_ERROR(L"FileUtilsTests", 
+                        L"TearDown - Failed to remove test root: %s, error: %lu", 
+						testRoot.c_str(), err.win32);
+                }
             }
             catch (...) {
                 // Ignore cleanup errors

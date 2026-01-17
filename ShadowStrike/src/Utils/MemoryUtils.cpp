@@ -141,8 +141,10 @@ namespace ShadowStrike {
 				// VirtualFree preconditions per WinAPI documentation
 				if (freeType == MEM_RELEASE) {
 					// For MEM_RELEASE: size must be 0
+
+					const void* const releasedAddr = base;
 					if (!::VirtualFree(base, 0, MEM_RELEASE)) {
-						SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_RELEASE) failed (base=%p)", base);
+						SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_RELEASE) failed (base=%p)", releasedAddr);
 						return false;
 					}
 					return true;
@@ -170,9 +172,12 @@ namespace ShadowStrike {
 						return false;
 					}
 
+					const void* const logBase = base;
+					const unsigned long long logSize = static_cast<unsigned long long>(size);
+
 					if (!::VirtualFree(base, size, MEM_DECOMMIT)) {
 						SS_LOG_LAST_ERROR(L"MemoryUtils", L"VirtualFree(MEM_DECOMMIT) failed (base=%p, size=%llu)",
-							base, static_cast<unsigned long long>(size));
+							logBase, logSize);
 						return false;
 					}
 					return true;

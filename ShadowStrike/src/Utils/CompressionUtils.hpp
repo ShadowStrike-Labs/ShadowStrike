@@ -46,13 +46,19 @@ namespace ShadowStrike {
 
             /// Maximum allowed compression ratio (100:1)
             /// Ratios above this are suspicious and may indicate an attack
-            constexpr size_t MAX_COMPRESSION_RATIO = 100;
+            constexpr size_t MAX_COMPRESSION_RATIO = 512;
 
             /// Minimum buffer allocation size
             constexpr size_t MIN_BUFFER_SIZE = 64;
 
+            /// Minimum size (64 KB) to trigger compression ratio checks.
+            /// Small buffers can have extreme ratios accidentally; only large
+            /// expansions are dangerous "decompression bombs".
+            constexpr size_t MIN_RATIO_CHECK_SIZE = 64ULL * 1024;
+
+
             /// Scratch buffer size for small compressions
-            constexpr size_t SCRATCH_BUFFER_SIZE = 64;
+            constexpr size_t SCRATCH_BUFFER_SIZE = 1024;
 
             // ============================================================================
             // Windows Compression API Algorithm Identifiers

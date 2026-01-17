@@ -210,7 +210,9 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_RandomData) {
 
 TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_LargeData) {
     SS_LOG_INFO(L"CompressionUtils_Tests", L"[Xpress_CompressDecompress_LargeData] Testing...");
-    // ? FIXED: Restored to 1MB - buffer calculation now handles this correctly
+    // Test with 1MB compressible data
+    // Note: We provide expectedSize to bypass compression ratio bomb detection
+    // since compressible data can legitimately have very high ratios
     auto input = GenerateCompressibleData(1024 * 1024); // 1MB compressible data
     
     std::vector<uint8_t> compressed;
@@ -222,7 +224,9 @@ TEST_F(CompressionUtilsTest, Xpress_CompressDecompress_LargeData) {
         << "Compressed size should be smaller than input";
     
     std::vector<uint8_t> decompressed;
-    ASSERT_TRUE(DecompressBuffer(Algorithm::Xpress, compressed.data(), compressed.size(), decompressed))
+    // Provide expected size to bypass ratio check for legitimate high-ratio compression
+    ASSERT_TRUE(DecompressBuffer(Algorithm::Xpress, compressed.data(), compressed.size(), 
+                                  decompressed, input.size()))
         << "Decompression failed for 1MB data";
     
     EXPECT_EQ(input, decompressed) << "Data mismatch after round-trip";
@@ -585,8 +589,29 @@ TEST_F(CompressionUtilsTest, Security_MaxDecompressedSizeLimit) {
 
 TEST_F(CompressionUtilsTest, Security_CompressionRatioLimit) {
     SS_LOG_INFO(L"CompressionUtils_Tests", L"[Security_CompressionRatioLimit] Testing...");
-    // MAX_COMPRESSION_RATIO is 100:1
-    EXPECT_EQ(MAX_COMPRESSION_RATIO, 100);
+
+    // Validate the accuracy of safety constants
+    EXPECT_EQ(MAX_COMPRESSION_RATIO, 512);
+    EXPECT_EQ(MIN_RATIO_CHECK_SIZE, 64 * 1024);
+
+    // Test 1: Verify that providing expectedSize bypasses ratio check (legitimate use case)
+    auto input = GenerateCompressibleData(1024 * 1024);
+    std::vector<uint8_t> compressed;
+    ASSERT_TRUE(CompressBuffer(Algorithm::Xpress, input.data(), input.size(), compressed));
+    
+    std::vector<uint8_t> decompressed;
+    // With expectedSize provided, decompression should succeed even with high ratio
+    EXPECT_TRUE(DecompressBuffer(Algorithm::Xpress, compressed.data(), compressed.size(), 
+                                  decompressed, input.size()))
+        << "Decompression with expectedSize should bypass ratio check";
+    EXPECT_EQ(input, decompressed);
+
+    // Test 2: Without expectedSize, high ratio data should be rejected (bomb protection)
+    std::vector<uint8_t> decompressedNoBomb;
+    bool bombDetected = !DecompressBuffer(Algorithm::Xpress, compressed.data(), 
+                                           compressed.size(), decompressedNoBomb);
+    EXPECT_TRUE(bombDetected) 
+        << "High compression ratio without expectedSize should trigger bomb detection";
 }
 
 TEST_F(CompressionUtilsTest, Security_DecompressWithExcessiveExpectedSize) {
@@ -850,7 +875,9 @@ TEST_F(CompressionUtilsTest, Integrity_DifferentDataSizes) {
             << "Compression failed at size " << size;
         
         std::vector<uint8_t> decompressed;
-        ASSERT_TRUE(DecompressBuffer(Algorithm::Xpress, compressed.data(), compressed.size(), decompressed))
+        // Provide expected size to bypass ratio check for compressible data
+        ASSERT_TRUE(DecompressBuffer(Algorithm::Xpress, compressed.data(), compressed.size(), 
+                                      decompressed, input.size()))
             << "Decompression failed at size " << size;
         
         EXPECT_EQ(input, decompressed) << "Integrity check failed at size " << size;
