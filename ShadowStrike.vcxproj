@@ -1,0 +1,532 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{7E511BF5-F27B-BF5E-7FE3-AF087A6A05F1}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LinkIncremental>true</LinkIncremental>
+    <IntDir>$(ProjectDir)build\$(Configuration)\</IntDir>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>true</LinkIncremental>
+    <IntDir>$(ProjectDir)build\$(Configuration)\</IntDir>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Windows</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>GTEST_LINKED_AS_SHARED_LIBRARY=1
+;GMOCK_LINKED_AS_SHARED_LIBRARY=1</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)$pch.pch</PrecompiledHeaderOutputFile>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Console</SubSystem>
+      <AdditionalDependencies>gtest.lib;gtest_main.lib;gmock.lib;gmock_main.lib;advapi32.lib;ws2_32.lib;libcrypto.lib;libssl.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)vendor;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>GTEST_LINKED_AS_SHARED_LIBRARY=1
+;GMOCK_LINKED_AS_SHARED_LIBRARY=1</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)$pch.pch</PrecompiledHeaderOutputFile>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>gtest.lib;gtest_main.lib;gmock.lib;gmock_main.lib;advapi32.lib;ws2_32.lib;libcrypto.lib;libssl.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)vendor;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\database\ConfigurationDB.cpp" />
+    <ClCompile Include="src\database\DatabaseManager.cpp" />
+    <ClCompile Include="src\database\LogDB.cpp" />
+    <ClCompile Include="src\database\QuarantineDB.cpp" />
+    <ClCompile Include="src\external\pugixml\pugixml.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Backup.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Column.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Database.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Exception.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Savepoint.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\sqlite3.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Statement.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\sqlitecpp\Transaction.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\ssdeep\edit_dist.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\ssdeep\fuzzy.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\tlsh\input_desc.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\tlsh\shared_file_functions.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\tlsh\tlsh.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\tlsh\tlsh_impl.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\external\tlsh\tlsh_util.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\hashstore\BloomFilter_impl.cpp" />
+    <ClCompile Include="src\hashstore\HashBucket_impl.cpp" />
+    <ClCompile Include="src\hashstore\HashStore.cpp" />
+    <ClCompile Include="src\hashstore\HashStore_import_export.cpp" />
+    <ClCompile Include="src\hashstore\HashStore_mgnmnt.cpp" />
+    <ClCompile Include="src\hashstore\HashStore_query_operations.cpp" />
+    <ClCompile Include="src\Main.cpp" />
+    <ClCompile Include="src\patternstore\aho_crsck_impl.cpp" />
+    <ClCompile Include="src\patternstore\boyer_moore_impl.cpp" />
+    <ClCompile Include="src\patternstore\PatternIndex.cpp" />
+    <ClCompile Include="src\patternstore\PatternStore.cpp" />
+    <ClCompile Include="src\patternstore\SIMD_matcher_impl.cpp" />
+    <ClCompile Include="src\pch.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\signaturestore\batch_sig_builder.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureBuilder.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureFormat.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex_Cache_mngmnt.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex_COW.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex_modification.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex_Query.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex_stat_maintenance.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureStore.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureStore_mngmnt.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureStore_Query.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureStore_scan.cpp" />
+    <ClCompile Include="src\signaturestore\sig_builder_import_methods.cpp" />
+    <ClCompile Include="src\signaturestore\sig_builder_input_methods.cpp" />
+    <ClCompile Include="src\signaturestore\sig_builder_serialization.cpp" />
+    <ClCompile Include="src\signaturestore\sig_builder_utils.cpp" />
+    <ClCompile Include="src\signaturestore\sig_indx_internal_node_mng.cpp" />
+    <ClCompile Include="src\signaturestore\YaraRuleStore.cpp" />
+    <ClCompile Include="src\ThreatIntel\ReputationCache.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelDatabase.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelExporter.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelFeedManager_parsers.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelFormat.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelImporter.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Core.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Lookups.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Modifications.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_Trees.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelIOCManager.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelLookup.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntelStore.cpp" />
+    <ClCompile Include="src\ThreatIntel\ThreatIntel_bloom_filter.cpp" />
+    <ClCompile Include="src\Utils\NetworkUtilsIpAddress.cpp" />
+    <ClCompile Include="src\utils\Base64Utils.cpp" />
+    <ClCompile Include="src\utils\CacheManager.cpp" />
+    <ClCompile Include="src\utils\CertUtils.cpp" />
+    <ClCompile Include="src\utils\CompressionUtils.cpp" />
+    <ClCompile Include="src\utils\CryptoUtils.cpp" />
+    <ClCompile Include="src\utils\CryptoUtilsCommon.cpp" />
+    <ClCompile Include="src\utils\CryptoUtils_AsymmetricCipher.cpp" />
+    <ClCompile Include="src\utils\CryptoUtils_private_key.cpp" />
+    <ClCompile Include="src\utils\CryptoUtils_SecureBuffer.cpp" />
+    <ClCompile Include="src\utils\CryptoUtils_Secure_Random.cpp" />
+    <ClCompile Include="src\utils\CryptoUtils_SymmetricCipher.cpp" />
+    <ClCompile Include="src\utils\FileUtils.cpp" />
+    <ClCompile Include="src\utils\HashUtils.cpp" />
+    <ClCompile Include="src\utils\JSONUtils.cpp" />
+    <ClCompile Include="src\utils\Logger.cpp" />
+    <ClCompile Include="src\utils\MemoryUtils.cpp" />
+    <ClCompile Include="src\utils\NetworkSecurity_SSL_TLS.cpp" />
+    <ClCompile Include="src\utils\NetworkUtils.cpp" />
+    <ClCompile Include="src\utils\NetworkUtilsMacAdress.cpp" />
+    <ClCompile Include="src\utils\NetworkUtils_Adapter.cpp" />
+    <ClCompile Include="src\utils\NetworkUtils_DNS.cpp" />
+    <ClCompile Include="src\utils\NetworkUtils_http_https.cpp" />
+    <ClCompile Include="src\utils\NetworkUtils_proxy.cpp" />
+    <ClCompile Include="src\utils\NetworkUtils_URL.cpp" />
+    <ClCompile Include="src\utils\PE_sig_verf.cpp" />
+    <ClCompile Include="src\utils\ProcessUtils.cpp" />
+    <ClCompile Include="src\utils\RegistryUtils.cpp" />
+    <ClCompile Include="src\utils\StringUtils.cpp" />
+    <ClCompile Include="src\utils\SystemUtils.cpp" />
+    <ClCompile Include="src\utils\ThreadPool.cpp" />
+    <ClCompile Include="src\utils\Timer.cpp" />
+    <ClCompile Include="src\utils\XMLUtils.cpp" />
+    <ClCompile Include="src\whitelist\WhiteListBloomFilter.cpp" />
+    <ClCompile Include="src\whitelist\WhiteListFormat.cpp" />
+    <ClCompile Include="src\whitelist\WhiteListHashIndex.cpp" />
+    <ClCompile Include="src\whitelist\WhiteListPatternIndex.cpp" />
+    <ClCompile Include="src\whitelist\WhiteListStore.cpp" />
+    <ClCompile Include="src\whitelist\WhiteListStringPool.cpp" />
+    <ClCompile Include="tests\unit\database_systems\configuration_db_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\database_manager_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\Log_db_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\Quarantine_db_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\AhoCorasick_Tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\BoyerMooreTests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\HashStoreTests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\pattern_store_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_import_methods_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_input_methods_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_main_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_serialization_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_builder_utils_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_format_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_index_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\sig_store_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\SIMD_matcher_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\sig_store\yara_rule_store_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ReputationCache_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelDatabase_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelExporter_Tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelFeedManagerTests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelFormat_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelImporter_Tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelIndex_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelIOCManager_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelLookup_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntel_bloom_filter_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListBloomFilter_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListFormatTests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListHashIndex_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListPatternIndex_Tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListStore_tests.cpp" />
+    <ClCompile Include="tests\unit\database_systems\white_list\WhiteListStringPool_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\Base64UtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils\CacheManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\CertUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils\CompressionUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\CryptoUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\FileUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils\HashUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\JSONUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\MemoryUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\NetworkUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\ProcessUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\RegistryUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils\SystemUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\ThreadPool_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils\XMLUtils_Tests.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\gmock\gmock-actions.h" />
+    <ClInclude Include="include\gmock\gmock-cardinalities.h" />
+    <ClInclude Include="include\gmock\gmock-function-mocker.h" />
+    <ClInclude Include="include\gmock\gmock-matchers.h" />
+    <ClInclude Include="include\gmock\gmock-more-actions.h" />
+    <ClInclude Include="include\gmock\gmock-more-matchers.h" />
+    <ClInclude Include="include\gmock\gmock-nice-strict.h" />
+    <ClInclude Include="include\gmock\gmock-spec-builders.h" />
+    <ClInclude Include="include\gmock\gmock.h" />
+    <ClInclude Include="include\gmock\internal\custom\gmock-generated-actions.h" />
+    <ClInclude Include="include\gmock\internal\custom\gmock-matchers.h" />
+    <ClInclude Include="include\gmock\internal\custom\gmock-port.h" />
+    <ClInclude Include="include\gmock\internal\gmock-internal-utils.h" />
+    <ClInclude Include="include\gmock\internal\gmock-port.h" />
+    <ClInclude Include="include\gmock\internal\gmock-pp.h" />
+    <ClInclude Include="include\gtest\gtest-assertion-result.h" />
+    <ClInclude Include="include\gtest\gtest-death-test.h" />
+    <ClInclude Include="include\gtest\gtest-matchers.h" />
+    <ClInclude Include="include\gtest\gtest-message.h" />
+    <ClInclude Include="include\gtest\gtest-param-test.h" />
+    <ClInclude Include="include\gtest\gtest-printers.h" />
+    <ClInclude Include="include\gtest\gtest-spi.h" />
+    <ClInclude Include="include\gtest\gtest-test-part.h" />
+    <ClInclude Include="include\gtest\gtest-typed-test.h" />
+    <ClInclude Include="include\gtest\gtest.h" />
+    <ClInclude Include="include\gtest\gtest_pred_impl.h" />
+    <ClInclude Include="include\gtest\gtest_prod.h" />
+    <ClInclude Include="include\gtest\internal\custom\gtest-port.h" />
+    <ClInclude Include="include\gtest\internal\custom\gtest-printers.h" />
+    <ClInclude Include="include\gtest\internal\custom\gtest.h" />
+    <ClInclude Include="include\gtest\internal\gtest-death-test-internal.h" />
+    <ClInclude Include="include\gtest\internal\gtest-filepath.h" />
+    <ClInclude Include="include\gtest\internal\gtest-internal.h" />
+    <ClInclude Include="include\gtest\internal\gtest-param-util.h" />
+    <ClInclude Include="include\gtest\internal\gtest-port-arch.h" />
+    <ClInclude Include="include\gtest\internal\gtest-port.h" />
+    <ClInclude Include="include\gtest\internal\gtest-string.h" />
+    <ClInclude Include="include\gtest\internal\gtest-type-util.h" />
+    <ClInclude Include="include\nlohmann\json.hpp" />
+    <ClInclude Include="include\pugixml\pugiconfig.hpp" />
+    <ClInclude Include="include\pugixml\pugixml.hpp" />
+    <ClInclude Include="include\sqlitecpp\Assertion.h" />
+    <ClInclude Include="include\sqlitecpp\Backup.h" />
+    <ClInclude Include="include\sqlitecpp\Column.h" />
+    <ClInclude Include="include\sqlitecpp\Database.h" />
+    <ClInclude Include="include\sqlitecpp\Exception.h" />
+    <ClInclude Include="include\sqlitecpp\ExecuteMany.h" />
+    <ClInclude Include="include\sqlitecpp\Savepoint.h" />
+    <ClInclude Include="include\sqlitecpp\sqlite3.h" />
+    <ClInclude Include="include\sqlitecpp\SQLiteCpp.h" />
+    <ClInclude Include="include\sqlitecpp\SQLiteCppExport.h" />
+    <ClInclude Include="include\sqlitecpp\Statement.h" />
+    <ClInclude Include="include\sqlitecpp\Transaction.h" />
+    <ClInclude Include="include\sqlitecpp\Utils.h" />
+    <ClInclude Include="include\sqlitecpp\VariadicBind.h" />
+    <ClInclude Include="include\ssdeep\edit_dist.h" />
+    <ClInclude Include="include\ssdeep\fuzzy.h" />
+    <ClInclude Include="include\ssdeep\sum_table.h" />
+    <ClInclude Include="include\tlsh\input_desc.h" />
+    <ClInclude Include="include\tlsh\shared_file_functions.h" />
+    <ClInclude Include="include\tlsh\tlsh.h" />
+    <ClInclude Include="include\tlsh\tlsh_compat.h" />
+    <ClInclude Include="include\tlsh\tlsh_impl.h" />
+    <ClInclude Include="include\tlsh\tlsh_util.h" />
+    <ClInclude Include="include\tlsh\tlsh_win_version.h" />
+    <ClInclude Include="include\yara\authenticode-parser\authenticode.h" />
+    <ClInclude Include="include\yara\tlshc\tlsh.h" />
+    <ClInclude Include="include\yara\yara.h" />
+    <ClInclude Include="include\yara\yara\ahocorasick.h" />
+    <ClInclude Include="include\yara\yara\arena.h" />
+    <ClInclude Include="include\yara\yara\atoms.h" />
+    <ClInclude Include="include\yara\yara\base64.h" />
+    <ClInclude Include="include\yara\yara\bitmask.h" />
+    <ClInclude Include="include\yara\yara\compiler.h" />
+    <ClInclude Include="include\yara\yara\dex.h" />
+    <ClInclude Include="include\yara\yara\dotnet.h" />
+    <ClInclude Include="include\yara\yara\elf.h" />
+    <ClInclude Include="include\yara\yara\elf_utils.h" />
+    <ClInclude Include="include\yara\yara\endian.h" />
+    <ClInclude Include="include\yara\yara\error.h" />
+    <ClInclude Include="include\yara\yara\exec.h" />
+    <ClInclude Include="include\yara\yara\exefiles.h" />
+    <ClInclude Include="include\yara\yara\filemap.h" />
+    <ClInclude Include="include\yara\yara\globals.h" />
+    <ClInclude Include="include\yara\yara\hash.h" />
+    <ClInclude Include="include\yara\yara\hex_lexer.h" />
+    <ClInclude Include="include\yara\yara\integers.h" />
+    <ClInclude Include="include\yara\yara\lexer.h" />
+    <ClInclude Include="include\yara\yara\libyara.h" />
+    <ClInclude Include="include\yara\yara\limits.h" />
+    <ClInclude Include="include\yara\yara\macho.h" />
+    <ClInclude Include="include\yara\yara\mem.h" />
+    <ClInclude Include="include\yara\yara\modules.h" />
+    <ClInclude Include="include\yara\yara\notebook.h" />
+    <ClInclude Include="include\yara\yara\object.h" />
+    <ClInclude Include="include\yara\yara\parser.h" />
+    <ClInclude Include="include\yara\yara\pe.h" />
+    <ClInclude Include="include\yara\yara\pe_utils.h" />
+    <ClInclude Include="include\yara\yara\proc.h" />
+    <ClInclude Include="include\yara\yara\re.h" />
+    <ClInclude Include="include\yara\yara\re_lexer.h" />
+    <ClInclude Include="include\yara\yara\rules.h" />
+    <ClInclude Include="include\yara\yara\scan.h" />
+    <ClInclude Include="include\yara\yara\scanner.h" />
+    <ClInclude Include="include\yara\yara\simple_str.h" />
+    <ClInclude Include="include\yara\yara\sizedstr.h" />
+    <ClInclude Include="include\yara\yara\stack.h" />
+    <ClInclude Include="include\yara\yara\stopwatch.h" />
+    <ClInclude Include="include\yara\yara\stream.h" />
+    <ClInclude Include="include\yara\yara\strutils.h" />
+    <ClInclude Include="include\yara\yara\threading.h" />
+    <ClInclude Include="include\yara\yara\types.h" />
+    <ClInclude Include="include\yara\yara\unaligned.h" />
+    <ClInclude Include="include\yara\yara\utils.h" />
+    <ClInclude Include="src\database\ConfigurationDB.hpp" />
+    <ClInclude Include="src\database\DatabaseManager.hpp" />
+    <ClInclude Include="src\database\LogDB.hpp" />
+    <ClInclude Include="src\database\QuarantineDB.hpp" />
+    <ClInclude Include="src\hashstore\HashStore.hpp" />
+    <ClInclude Include="src\patternstore\PatternStore.hpp" />
+    <ClInclude Include="src\pch.h" />
+    <ClInclude Include="src\signaturestore\pragma_pack.h" />
+    <ClInclude Include="src\signaturestore\SignatureBuilder.hpp" />
+    <ClInclude Include="src\signaturestore\SignatureFormat.hpp" />
+    <ClInclude Include="src\signaturestore\SignatureIndex.hpp" />
+    <ClInclude Include="src\signaturestore\SignatureStore.hpp" />
+    <ClInclude Include="src\signaturestore\YaraRuleStore.hpp" />
+    <ClInclude Include="src\ThreatIntel\ReputationCache.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelDatabase.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelExporter.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelFeedManager_Util.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelFormat.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelImporter.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_DataStructures.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Internal.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_LRU.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_Trees.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIndex_URLMatcher.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelIOCManager.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelLookup.hpp" />
+    <ClInclude Include="src\ThreatIntel\ThreatIntelStore.hpp" />
+    <ClInclude Include="src\utils\Base64Utils.hpp" />
+    <ClInclude Include="src\utils\CacheManager.hpp" />
+    <ClInclude Include="src\utils\CertUtils.hpp" />
+    <ClInclude Include="src\utils\CompressionUtils.hpp" />
+    <ClInclude Include="src\utils\CryptoUtils.hpp" />
+    <ClInclude Include="src\utils\CryptoUtilsCommon.hpp" />
+    <ClInclude Include="src\utils\FileUtils.hpp" />
+    <ClInclude Include="src\utils\HashUtils.hpp" />
+    <ClInclude Include="src\utils\JSONUtils.hpp" />
+    <ClInclude Include="src\utils\Logger.hpp" />
+    <ClInclude Include="src\utils\MemoryUtils.hpp" />
+    <ClInclude Include="src\utils\NetworkUtils.hpp" />
+    <ClInclude Include="src\utils\PE_sig_verf.hpp" />
+    <ClInclude Include="src\utils\ProcessUtils.hpp" />
+    <ClInclude Include="src\utils\RegistryUtils.hpp" />
+    <ClInclude Include="src\utils\StringUtils.hpp" />
+    <ClInclude Include="src\utils\SystemUtils.hpp" />
+    <ClInclude Include="src\utils\ThreadPool.hpp" />
+    <ClInclude Include="src\utils\ThreadPoolEvents.h" />
+    <ClInclude Include="src\utils\Timer.hpp" />
+    <ClInclude Include="src\utils\XMLUtils.hpp" />
+    <ClInclude Include="src\whitelist\WhiteListFormat.hpp" />
+    <ClInclude Include="src\whitelist\WhiteListStore.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include=".gitignore" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
