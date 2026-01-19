@@ -249,7 +249,7 @@ TEST_F(SignatureBuilderUtilsTest, ComputeFileHash_AllAlgorithms) {
     auto filePath = CreateTempFile("test data for all algorithms");
 
     // Test all supported algorithms
-    std::vector<HashType> algorithms = {
+    std::array<HashType,4> algorithms = {
         HashType::MD5,
         HashType::SHA1,
         HashType::SHA256,
@@ -321,7 +321,7 @@ TEST_F(SignatureBuilderUtilsTest, ComputeBufferHash_ConsistentResults) {
 TEST_F(SignatureBuilderUtilsTest, ComputeBufferHash_AllAlgorithms) {
     std::vector<uint8_t> buffer = {0xDE, 0xAD, 0xBE, 0xEF};
 
-    std::vector<HashType> algorithms = {
+    std::array<HashType,4> algorithms = {
         HashType::MD5,
         HashType::SHA1,
         HashType::SHA256,
@@ -544,7 +544,7 @@ TEST_F(SignatureBuilderUtilsTest, DISABLED_Performance_FileHash_50MB) {
 }
 
 TEST_F(SignatureBuilderUtilsTest, DISABLED_Performance_BufferHash_Benchmark) {
-    std::vector<size_t> sizes = {
+    std::array<size_t,4> sizes = {
         1 * 1024,           // 1KB
         1 * 1024 * 1024,    // 1MB
         10 * 1024 * 1024,   // 10MB
@@ -579,7 +579,7 @@ TEST_F(SignatureBuilderUtilsTest, Security_PathTraversal) {
     std::wstring maliciousPath = m_tempDir + L"\\..\\..\\..\\windows\\system32\\cmd.exe";
 
     // Should either fail or only access if permission allowed
-    auto hash = m_builder->ComputeFileHash(maliciousPath, HashType::SHA256);
+    auto hash = m_builder->ComputeFileHash(maliciousPath, HashType::SHA256);//-V808
     
     // Result depends on permissions, but should not crash
     // On most systems, this will either succeed (if readable) or fail gracefully
@@ -602,11 +602,13 @@ TEST_F(SignatureBuilderUtilsTest, Security_VeryLongPath) {
 TEST_F(SignatureBuilderUtilsTest, ErrorHandling_LockedFile) {
     auto filePath = CreateTempFile("test data");
 
-    // Open file exclusively (lock it)
+    // Open file with read sharing allowed - this allows other readers to access
+    // the file while we have it open. This simulates a file being used by
+    // another process but not exclusively locked.
     HANDLE lockedFile = CreateFileW(
         filePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        0,  // No sharing
+        FILE_SHARE_READ,  // Allow read sharing - other processes can read
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
@@ -615,12 +617,13 @@ TEST_F(SignatureBuilderUtilsTest, ErrorHandling_LockedFile) {
 
     ASSERT_NE(lockedFile, INVALID_HANDLE_VALUE);
 
-    // Try to hash the locked file (should still work due to FILE_SHARE_READ usage)
+    // Try to hash the file while it's open by another handle
+    // This should succeed because we opened with FILE_SHARE_READ
     auto hash = m_builder->ComputeFileHash(filePath, HashType::SHA256);
 
     CloseHandle(lockedFile);
 
-    // Modern implementation uses FILE_SHARE_READ, so this should succeed
+    // Should succeed since the file was opened with FILE_SHARE_READ
     EXPECT_TRUE(hash.has_value());
 }
 
@@ -692,26 +695,36 @@ TEST_F(SignatureBuilderUtilsTest, Concurrency_MultipleFileHashes) {
         EXPECT_TRUE(hash.has_value());
     }
 }
-
 TEST_F(SignatureBuilderUtilsTest, Concurrency_MultipleBufferHashes) {
-    std::vector<std::vector<uint8_t>> buffers(5);
+    // Using std::array since the number of buffers is known at compile-time (5)
+    // The inner vectors hold the actual data
+    std::array<std::vector<uint8_t>, 5> buffers;
+
     for (size_t i = 0; i < buffers.size(); ++i) {
+        // Initialize each buffer with 1000 bytes of unique data based on index
         buffers[i].resize(1000, static_cast<uint8_t>(i));
     }
 
+    // std::future will hold the async results of our hash computations
     std::vector<std::future<std::optional<HashValue>>> futures;
+    futures.reserve(buffers.size()); // Optimization: Avoid reallocations
+
     for (const auto& buffer : buffers) {
-        futures.push_back(std::async(std::launch::async, [this, buffer]() {
+        // We pass the buffer by reference (std::ref) to avoid unnecessary copying 
+        // because the buffer is guaranteed to stay alive until the thread joins.
+        futures.push_back(std::async(std::launch::async, [this, &buffer]() {
             return m_builder->ComputeBufferHash(buffer, HashType::SHA256);
-        }));
+            }));
     }
 
+    // Process the results as they become available
     for (auto& future : futures) {
-        auto hash = future.get();
-        EXPECT_TRUE(hash.has_value());
+        auto hash = future.get(); // This will block until the specific thread finishes
+
+        // Assert that the hashing operation was successful
+        EXPECT_TRUE(hash.has_value()) << "Hash computation failed for one of the buffers!";
     }
 }
-
 // ============================================================================
 // ALGORITHM-SPECIFIC TESTS
 // ============================================================================

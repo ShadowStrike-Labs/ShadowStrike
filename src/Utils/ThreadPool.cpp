@@ -518,7 +518,7 @@ void ETWTracingManager::LogEvent(
     }
     
     // Add additional data if provided
-    if (!additionalData.empty() && descriptorCount < 2) {
+    if (!additionalData.empty()) {
         if (additionalData.size() <= std::numeric_limits<ULONG>::max()) {
             ::EventDataDescCreate(
                 &dataDescriptors[descriptorCount],

@@ -142,18 +142,20 @@ namespace SignatureStore {
 
             // Validate exact length for fixed-size hashes
             if (expectedLen != 0 && input.hash.length != expectedLen) {
-                SS_LOG_WARN(L"SignatureBuilder",
+                SS_LOG_ERROR(L"SignatureBuilder",
                     L"AddHash: Hash length mismatch (expected: %u, got: %u)",
                     expectedLen, input.hash.length);
-                // Log warning but don't fail - might be valid variant
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                  "Hash length does not match hash type" };
             }
 
             // Validate threat level (must be 0-100)
             if (static_cast<uint8_t>(input.threatLevel) > 100) {
-                SS_LOG_WARN(L"SignatureBuilder",
-                    L"AddHash: Invalid threat level %u, clamping to 100",
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddHash: Invalid threat level %u (must be 0-100)",
                     static_cast<uint8_t>(input.threatLevel));
-                // Continue - will be clamped in storage
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                  "Threat level must be 0-100" };
             }
 
             // Validate description length (DoS prevention)
@@ -293,8 +295,9 @@ namespace SignatureStore {
                                 m_consecutiveDuplicates.load());
                         }
 
-                        return StoreError{ SignatureStoreError::DuplicateEntry, 0,
-                                          "Hash already exists in database" };
+                        // Return success - duplicate is handled gracefully by not adding
+                        // The statistics track that it was a duplicate
+                        return StoreError{ SignatureStoreError::Success };
                     }
                     else {
                         SS_LOG_DEBUG(L"SignatureBuilder",
@@ -339,10 +342,24 @@ namespace SignatureStore {
                     }
 
                     // Entropy should be between 0.5 and 8.0 for valid hashes
-                    // Values outside this range are suspicious but not necessarily invalid
-                    if (entropy < 0.1 || entropy > 8.1) {
+                    // Low entropy (< 1.0) indicates trivial/weak hashes that should be rejected
+                    // - All zeros: entropy = 0.0
+                    // - All same byte: entropy = 0.0
+                    // - Two alternating bytes: entropy ~ 1.0
+                    constexpr double MIN_ENTROPY_THRESHOLD = 1.0;
+                    
+                    if (entropy < MIN_ENTROPY_THRESHOLD) {
+                        SS_LOG_ERROR(L"SignatureBuilder",
+                            L"AddHash: Low entropy %.2f for hash (name: %S) - rejected",
+                            entropy, input.name.c_str());
+                        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                          "Hash has insufficient entropy (trivial/weak hash)" };
+                    }
+                    
+                    // Very high entropy (> 8.0) is suspicious but allowed
+                    if (entropy > 8.1) {
                         SS_LOG_WARN(L"SignatureBuilder",
-                            L"AddHash: Suspicious entropy %.2f for hash (name: %S)",
+                            L"AddHash: Suspicious high entropy %.2f for hash (name: %S)",
                             entropy, input.name.c_str());
                         // Log warning but don't fail - might be intentional
                     }
@@ -509,7 +526,7 @@ namespace SignatureStore {
             // For regex patterns, perform complexity analysis
             if (input.patternString.find('(') != std::string::npos ||
                 input.patternString.find('[') != std::string::npos ||
-                input.patternString.find(' * ') != std::string::npos) {
+                input.patternString.find('*') != std::string::npos) {
 
                 if (!IsRegexSafe(input.patternString, validationError)) {
                     SS_LOG_ERROR(L"SignatureBuilder",
@@ -557,8 +574,9 @@ namespace SignatureStore {
                     SS_LOG_DEBUG(L"SignatureBuilder",
                         L"AddPattern: Duplicate pattern: %S", input.name.c_str());
                     m_statistics.duplicatesRemoved++;
-                    return StoreError{ SignatureStoreError::DuplicateEntry, 0,
-                                      "Pattern already exists" };
+                    // Return success - duplicate is handled gracefully by not adding
+                    // The statistics track that it was a duplicate
+                    return StoreError{ SignatureStoreError::Success };
                 }
             }
 
@@ -813,8 +831,9 @@ namespace SignatureStore {
                     SS_LOG_DEBUG(L"SignatureBuilder",
                         L"AddYaraRule: Duplicate rule: %S", fullName.c_str());
                     m_statistics.duplicatesRemoved++;
-                    return StoreError{ SignatureStoreError::DuplicateEntry, 0,
-                                      "Rule already exists" };
+                    // Return success - duplicate is handled gracefully by not adding
+                    // The statistics track that it was a duplicate
+                    return StoreError{ SignatureStoreError::Success };
                 }
             }
 
@@ -1375,10 +1394,12 @@ namespace SignatureStore {
             // STEP 1: INPUT VALIDATION - BASIC CHECKS
             // ========================================================================
 
-            // Check for empty batch
+            // Check for empty batch - reject as invalid input
+            // An empty batch is considered an API misuse (why call batch add with nothing?)
             if (inputs.empty()) {
-                SS_LOG_WARN(L"SignatureBuilder", L"AddHashBatch: Empty batch provided");
-                return StoreError{ SignatureStoreError::Success }; // Empty batch is not an error
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddHashBatch: Empty batch provided - rejected");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                  "Empty batch is not allowed" };
             }
 
             // DoS protection: enforce maximum batch size
@@ -1769,9 +1790,11 @@ namespace SignatureStore {
             // STEP 1: BASIC VALIDATION
             // ========================================================================
 
+            // Reject empty batches as invalid input
             if (inputs.empty()) {
-                SS_LOG_WARN(L"SignatureBuilder", L"AddPatternBatch: Empty batch");
-                return StoreError{ SignatureStoreError::Success };
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddPatternBatch: Empty batch - rejected");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                  "Empty batch is not allowed" };
             }
 
             constexpr size_t MAX_BATCH_SIZE = 100'000; // 100K patterns per batch
@@ -2004,9 +2027,11 @@ namespace SignatureStore {
             // STEP 1: BASIC VALIDATION
             // ========================================================================
 
+            // Reject empty batches as invalid input
             if (inputs.empty()) {
-                SS_LOG_WARN(L"SignatureBuilder", L"AddYaraRuleBatch: Empty batch");
-                return StoreError{ SignatureStoreError::Success };
+                SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRuleBatch: Empty batch - rejected");
+                return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                  "Empty batch is not allowed" };
             }
 
             constexpr size_t MAX_BATCH_SIZE = 10'000; // 10K rules per batch

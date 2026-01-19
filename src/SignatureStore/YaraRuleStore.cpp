@@ -3924,6 +3924,15 @@ bool ValidateRuleSyntax(
         return false;
     }
     
+    // ========================================================================
+    // YARA INITIALIZATION - CRITICAL: Must initialize before using compiler
+    // ========================================================================
+    StoreError initResult = YaraRuleStore::InitializeYara();
+    if (!initResult.IsSuccess()) {
+        errors.push_back("Failed to initialize YARA library");
+        return false;
+    }
+    
     // Compile with YARA to validate
     YaraCompiler compiler;
     StoreError err = compiler.AddString(ruleSource, "validate");

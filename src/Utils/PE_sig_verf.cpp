@@ -573,7 +573,7 @@ namespace ShadowStrike {
                 HCRYPTMSG hMsg = nullptr;
                 DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
                 
-                if (!CryptQueryObject(
+                if (!CryptQueryObject(//-V1109
                     CERT_QUERY_OBJECT_FILE,
                     pathCopy.c_str(),
                     CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -702,9 +702,15 @@ namespace ShadowStrike {
                 info.isRevocationChecked = true;
 
                 // Populate additional info fields
-                GetSignerName(leaf.p, info.signerName, nullptr);
-                GetIssuerName(leaf.p, info.issuerName, nullptr);
-                GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true);
+                if (!GetSignerName(leaf.p, info.signerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer's name");
+                }
+                else if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get ıssuer's name");
+                }
+                else if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get certificate thumbprint");
+                }
                 
                 info.isVerified = true;
 
@@ -810,7 +816,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    BOOL qok = CryptQueryObject(
+                    BOOL qok = CryptQueryObject(//-V1109
                         CERT_QUERY_OBJECT_FILE,
                         catPathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -905,9 +911,15 @@ namespace ShadowStrike {
                 info.isRevocationChecked = true;
 
                 // Populate additional info fields
-                GetSignerName(leaf.p, info.signerName, nullptr);
-                GetIssuerName(leaf.p, info.issuerName, nullptr);
-                GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true);
+                if (!GetSignerName(leaf.p, info.signerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer's name");
+                }
+                else if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get ıssuer's name");
+                }
+                else if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get certificate thumbprint");
+                }
 
                 info.isVerified = true;
                 return true;
@@ -1096,7 +1108,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    if (!CryptQueryObject(
+                    if (!CryptQueryObject(//-V1109
                         CERT_QUERY_OBJECT_FILE,
                         pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1192,9 +1204,15 @@ namespace ShadowStrike {
                 info.isRevocationChecked = true;
 
                 // Populate additional info fields
-                GetSignerName(leaf.p, info.signerName, nullptr);
-                GetIssuerName(leaf.p, info.issuerName, nullptr);
-                GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true);
+                if (!GetSignerName(leaf.p, info.signerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get signer's name");
+                }
+                else if (!GetIssuerName(leaf.p, info.issuerName, nullptr)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get ıssuer's name");
+                }
+                else if (!GetCertThumbprint(leaf.p, info.thumbprint, nullptr, true)) {
+                    SS_LOG_WARN(L"PE_sig_verification", L"Failed to get certificate thumbprint");
+                }
 
                 info.isVerified = true;
                 return true;
@@ -1222,7 +1240,7 @@ namespace ShadowStrike {
                         HCERTSTORE hStoreTmp = nullptr;
                         HCRYPTMSG hMsgTmp = nullptr;
                         
-                        if (!CryptQueryObject(
+                        if (!CryptQueryObject(//-V1109
                             CERT_QUERY_OBJECT_FILE,
                             std::wstring(catalogPath).c_str(),
                             CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1299,32 +1317,58 @@ namespace ShadowStrike {
                 std::wstring& outName,
                 Error* err) noexcept {
                 outName.clear();
-                if (!cert) { set_err(err, "GetSignerName: null cert"); return false; }
+                if (!cert) { 
+                    set_err(err, "GetSignerName: null cert"); 
+                    return false; 
+                }
 
+                // First call to determine required buffer size
                 DWORD charsNeeded = CertGetNameStringW(
                     cert,
                     CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                    0, // subject name
+                    0, // subject name (signer)
                     nullptr,
                     nullptr,
                     0
                 );
 
                 if (charsNeeded <= 1) {
-                    set_err(err, "CertGetNameString failed (signer)");
+                    // A return of 1 means only null terminator - no actual name
+                    set_err(err, "CertGetNameString failed or returned empty name (signer)");
                     return false;
                 }
 
-                outName.resize(charsNeeded - 1);
-                if (CertGetNameStringW(
+                // Allocate buffer with exception safety
+                std::vector<wchar_t> buffer;
+                try {
+                    buffer.resize(charsNeeded);
+                }
+                catch (const std::bad_alloc&) {
+                    set_err(err, "Memory allocation failed for signer name buffer");
+                    return false;
+                }
+
+                // Second call to retrieve the actual name
+                DWORD result = CertGetNameStringW(
                     cert,
                     CERT_NAME_SIMPLE_DISPLAY_TYPE,
                     0,
                     nullptr,
-                    outName.data(),
-                    charsNeeded) <= 1) {
-                    outName.clear();
+                    buffer.data(),
+                    charsNeeded
+                );
+
+                if (result <= 1) {
                     set_err(err, "CertGetNameString failed to copy (signer)");
+                    return false;
+                }
+
+                // Copy to output string (excluding null terminator)
+                try {
+                    outName.assign(buffer.data(), result - 1);
+                }
+                catch (const std::bad_alloc&) {
+                    set_err(err, "Memory allocation failed for signer name output");
                     return false;
                 }
 
@@ -1336,8 +1380,12 @@ namespace ShadowStrike {
                 std::wstring& outIssuer,
                 Error* err) noexcept {
                 outIssuer.clear();
-                if (!cert) { set_err(err, "GetIssuerName: null cert"); return false; }
+                if (!cert) { 
+                    set_err(err, "GetIssuerName: null cert"); 
+                    return false; 
+                }
 
+                // First call to determine required buffer size
                 DWORD charsNeeded = CertGetNameStringW(
                     cert,
                     CERT_NAME_SIMPLE_DISPLAY_TYPE,
@@ -1348,20 +1396,42 @@ namespace ShadowStrike {
                 );
 
                 if (charsNeeded <= 1) {
-                    set_err(err, "CertGetNameString failed (issuer)");
+                    // A return of 1 means only null terminator - no actual name
+                    set_err(err, "CertGetNameString failed or returned empty name (issuer)");
                     return false;
                 }
 
-                outIssuer.resize(charsNeeded - 1);
-                if (CertGetNameStringW(
+                // Allocate buffer with exception safety
+                std::vector<wchar_t> buffer;
+                try {
+                    buffer.resize(charsNeeded);
+                }
+                catch (const std::bad_alloc&) {
+                    set_err(err, "Memory allocation failed for issuer name buffer");
+                    return false;
+                }
+
+                // Second call to retrieve the actual name
+                DWORD result = CertGetNameStringW(
                     cert,
                     CERT_NAME_SIMPLE_DISPLAY_TYPE,
                     CERT_NAME_ISSUER_FLAG,
                     nullptr,
-                    outIssuer.data(),
-                    charsNeeded) <= 1) {
-                    outIssuer.clear();
+                    buffer.data(),
+                    charsNeeded
+                );
+
+                if (result <= 1) {
                     set_err(err, "CertGetNameString failed to copy (issuer)");
+                    return false;
+                }
+
+                // Copy to output string (excluding null terminator)
+                try {
+                    outIssuer.assign(buffer.data(), result - 1);
+                }
+                catch (const std::bad_alloc&) {
+                    set_err(err, "Memory allocation failed for issuer name output");
                     return false;
                 }
 
@@ -1369,34 +1439,106 @@ namespace ShadowStrike {
             }
 
             // Compute SHA-1/256 thumbprint (hex) of cert for allowlisting/logging
+            // Uses BCrypt for modern, secure hashing (preferred over legacy CAPI)
             bool PEFileSignatureVerifier::GetCertThumbprint(PCCERT_CONTEXT cert,
                 std::wstring& outHex,
                 Error* err,
                 bool useSha256) noexcept {
                 outHex.clear();
-                if (!cert) { set_err(err, "GetCertThumbprint: null cert"); return false; }
+                if (!cert) { 
+                    set_err(err, "GetCertThumbprint: null cert"); 
+                    return false; 
+                }
 
-                DWORD propId = useSha256 ? CERT_SHA256_HASH_PROP_ID : CERT_HASH_PROP_ID;
-
-                DWORD cb = 0;
-                if (!CertGetCertificateContextProperty(cert, propId, nullptr, &cb) || cb == 0) {
-                    set_err(err, "CertGetCertificateContextProperty size query failed");
+                // Validate certificate has encoded data
+                if (!cert->pbCertEncoded || cert->cbCertEncoded == 0) {
+                    set_err(err, "GetCertThumbprint: certificate has no encoded data");
                     return false;
                 }
 
-                std::vector<BYTE> hash(cb);
-                if (!CertGetCertificateContextProperty(cert, propId, hash.data(), &cb)) {
-                    set_err(err, "CertGetCertificateContextProperty failed");
+                // Use BCrypt for modern, secure hashing
+                BCRYPT_ALG_HANDLE hAlg = nullptr;
+                BCRYPT_HASH_HANDLE hHash = nullptr;
+                const DWORD hashSize = useSha256 ? 32 : 20; // SHA-256 = 32 bytes, SHA-1 = 20 bytes
+                
+                // Select algorithm
+                LPCWSTR algId = useSha256 ? BCRYPT_SHA256_ALGORITHM : BCRYPT_SHA1_ALGORITHM;
+                
+                NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, 0);
+                if (!BCRYPT_SUCCESS(status)) {
+                    set_err(err, "BCryptOpenAlgorithmProvider failed", static_cast<DWORD>(status));
                     return false;
                 }
 
-                // Convert to uppercase hex
-                static const wchar_t* HEX = L"0123456789ABCDEF";
-                outHex.resize(cb * 2);
-                for (DWORD i = 0; i < cb; ++i) {
-                    BYTE b = hash[i];
-                    outHex[i * 2 + 0] = HEX[(b >> 4) & 0x0F];
-                    outHex[i * 2 + 1] = HEX[b & 0x0F];
+                // RAII cleanup for algorithm handle
+                auto cleanupAlg = [&hAlg]() noexcept {
+                    if (hAlg) {
+                        BCryptCloseAlgorithmProvider(hAlg, 0);
+                        hAlg = nullptr;
+                    }
+                };
+
+                status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+                if (!BCRYPT_SUCCESS(status)) {
+                    cleanupAlg();
+                    set_err(err, "BCryptCreateHash failed", static_cast<DWORD>(status));
+                    return false;
+                }
+
+                // RAII cleanup for hash handle
+                auto cleanupHash = [&hHash]() noexcept {
+                    if (hHash) {
+                        BCryptDestroyHash(hHash);
+                        hHash = nullptr;
+                    }
+                };
+
+                // Hash the certificate's DER-encoded data
+                status = BCryptHashData(hHash, cert->pbCertEncoded, cert->cbCertEncoded, 0);
+                if (!BCRYPT_SUCCESS(status)) {
+                    cleanupHash();
+                    cleanupAlg();
+                    set_err(err, "BCryptHashData failed", static_cast<DWORD>(status));
+                    return false;
+                }
+
+                // Allocate hash output buffer with exception safety
+                std::vector<BYTE> hashBuffer;
+                try {
+                    hashBuffer.resize(hashSize);
+                }
+                catch (const std::bad_alloc&) {
+                    cleanupHash();
+                    cleanupAlg();
+                    set_err(err, "Memory allocation failed for hash buffer");
+                    return false;
+                }
+
+                // Finalize hash
+                status = BCryptFinishHash(hHash, hashBuffer.data(), hashSize, 0);
+                cleanupHash();
+                cleanupAlg();
+
+                if (!BCRYPT_SUCCESS(status)) {
+                    set_err(err, "BCryptFinishHash failed", static_cast<DWORD>(status));
+                    return false;
+                }
+
+                // Convert to uppercase hex string
+                static constexpr wchar_t kHexDigits[] = L"0123456789ABCDEF";
+                
+                try {
+                    outHex.reserve(hashSize * 2);
+                    for (DWORD i = 0; i < hashSize; ++i) {
+                        const BYTE b = hashBuffer[i];
+                        outHex.push_back(kHexDigits[(b >> 4) & 0x0F]);
+                        outHex.push_back(kHexDigits[b & 0x0F]);
+                    }
+                }
+                catch (const std::bad_alloc&) {
+                    outHex.clear();
+                    set_err(err, "Memory allocation failed for hex string");
+                    return false;
                 }
 
                 return true;
@@ -1416,7 +1558,7 @@ namespace ShadowStrike {
                 HCERTSTORE hStore = nullptr;
                 HCRYPTMSG hMsg = nullptr;
                 DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
-                BOOL qok = CryptQueryObject(
+                BOOL qok = CryptQueryObject(//-V1109
                     CERT_QUERY_OBJECT_FILE,
                     std::wstring(filePath).c_str(),
                     CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1489,44 +1631,42 @@ namespace ShadowStrike {
 
                     CertCtxRAII leafGuard{ leaf };
                     if (!leafGuard.p) {
-                        // signer without matching cert in store � skip
+                        // signer without matching cert in store - skip
                         continue;
                     }
 
-                    // Build SignatureInfo (depends on your struct definition)
+                    // Build SignatureInfo with all available metadata
                     SignatureInfo meta{};
+                    meta.isSigned = true;
 
-                    // Try to fill common fields if they exist in your struct
-                    // Signer name
-                    std::wstring signerName;
-                    if (GetSignerName(leafGuard.p, signerName, nullptr)) {
-                        // meta.signerName = signerName; // uncomment if field exists
+                    // Extract signer name
+                    if (!GetSignerName(leafGuard.p, meta.signerName, nullptr)) {
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get signer's name.");
                     }
 
-                    // Issuer name
-                    std::wstring issuerName;
-                    if (GetIssuerName(leafGuard.p, issuerName, nullptr)) {
-                        // meta.issuer = issuerName; // uncomment if field exists
+                    // Extract issuer name
+                    if (!GetIssuerName(leafGuard.p, meta.issuerName, nullptr)) {
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get signer's name.");
                     }
 
-                    // Thumbprint (SHA-256 preferred)
-                    std::wstring thumbHex;
-                    if (GetCertThumbprint(leafGuard.p, thumbHex, nullptr, /*useSha256*/ true)) {
-                        // meta.thumbprint = thumbHex; // uncomment if field exists
+                    // Extract thumbprint (SHA-256 preferred)
+                    if (!GetCertThumbprint(leafGuard.p, meta.thumbprint, nullptr, /*useSha256*/ true)) {
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get signer's name.");
                     }
 
-                    // Timestamp (best effort: if RFC3161 countersign present, you�d parse signed attributes;
-                    // here we fall back to current time to avoid leaving it empty)
-                    SYSTEMTIME stNow{}; GetSystemTime(&stNow);
-                    FILETIME ftNow{}; SystemTimeToFileTime(&stNow, &ftNow);
-                    // meta.signingTime = ftNow; // if field exists
-                    // meta.isTimestampValid = ValidateTimestamp(ftNow, leafGuard.p, nullptr);
+                    // Extract signing time (best effort - use current time as fallback)
+                    SYSTEMTIME stNow{}; 
+                    GetSystemTime(&stNow);
+                    FILETIME ftNow{}; 
+                    if (SystemTimeToFileTime(&stNow, &ftNow)) {
+                        meta.signTime = ftNow;
+                    }
 
-                    // EKU flag
-                    // meta.isEKUValid = CheckCodeSigningEKU(leafGuard.p, nullptr);
+                    // Check EKU (informational - doesn't affect inclusion in results)
+                    meta.isEKUValid = CheckCodeSigningEKU(leafGuard.p, nullptr);
 
-                    // Chain trust (no revocation decision here; telemetry only; if desired, call ValidateCertificateChain)
-                    // meta.isChainTrusted = true; // optional, set only after ValidateCertificateChain if you choose to call it
+                    // Note: For telemetry/inventory purposes, we don't validate chain/revocation here
+                    // as this is just metadata extraction, not trust verification
 
                     result.push_back(std::move(meta));
                 }
@@ -1573,7 +1713,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    if (!CryptQueryObject(
+                    if (!CryptQueryObject(//-V1109
                         CERT_QUERY_OBJECT_FILE,
                         pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1693,10 +1833,20 @@ namespace ShadowStrike {
                     meta.signTime = ts;
 
                     // Extract certificate metadata
-                    GetSignerName(leafGuard.p, meta.signerName, nullptr);
-                    GetIssuerName(leafGuard.p, meta.issuerName, nullptr);
-                    GetCertThumbprint(leafGuard.p, meta.thumbprint, nullptr, true);
-
+                    if (!GetSignerName(leafGuard.p, meta.signerName, nullptr)) {
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get Signer's name.");
+                        
+                    }
+                    if (!GetIssuerName(leafGuard.p, meta.issuerName, nullptr)) {
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get Issuer's name.");
+                       
+                    }
+                    if (!GetCertThumbprint(leafGuard.p, meta.thumbprint, nullptr, true)) {
+                        SS_LOG_ERROR(L"PE_sig_verification", L"Failed to get Certificate Thumbprint.");
+                       
+                     }
+                       
+                 
                     // Add to results with exception safety
                     try {
                         infos.push_back(std::move(meta));
@@ -1769,7 +1919,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    if (!CryptQueryObject(
+                    if (!CryptQueryObject(//-V1109
                         CERT_QUERY_OBJECT_FILE,
                         pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1920,7 +2070,7 @@ namespace ShadowStrike {
                             continue;
                         }
 
-                        // Look for signingTime in TST signer�s authenticated attributes (some TSAs include it)
+                        // Look for signingTime in TST signer's authenticated attributes (some TSAs include it)
                         const CRYPT_ATTRIBUTES& tsAuth = tsSI->AuthAttrs;
                         for (DWORD j = 0; j < tsAuth.cAttr && !gotTime; ++j) {
                             const CRYPT_ATTRIBUTE& a2 = tsAuth.rgAttr[j];
@@ -1932,7 +2082,7 @@ namespace ShadowStrike {
                                     a2.rgValue[0].pbData, a2.rgValue[0].cbData, decoded)) {
                                     if (decoded.size() >= sizeof(FILETIME)) {
                                         auto* pFileTime = reinterpret_cast<FILETIME*>(decoded.data());
-                                        outSignTime = *pFileTime;
+                                        tsFT = *pFileTime;  // Store in tsFT for consistency
                                         gotTime = true;
                                     }
                                 }
@@ -1942,10 +2092,10 @@ namespace ShadowStrike {
                         // Alternative: extract genTime from RFC3161 TSTInfo (requires full ASN.1 parse)
                         // Using CryptMsgGetParam(CMSG_CONTENT_PARAM) gives SignedData content
                         DWORD cbContent = 0;
-                        if (CryptMsgGetParam(hTsMsg, CMSG_CONTENT_PARAM, 0, nullptr, &cbContent) && cbContent) {
+                        if (!gotTime && CryptMsgGetParam(hTsMsg, CMSG_CONTENT_PARAM, 0, nullptr, &cbContent) && cbContent) {
                             std::vector<BYTE> content(cbContent);
                             if (CryptMsgGetParam(hTsMsg, CMSG_CONTENT_PARAM, 0, content.data(), &cbContent)) {
-                                // content contains SignedData � look for TSTInfo
+                                // content contains SignedData - look for TSTInfo
                                 // Full ASN.1 parse required; if signingTime not found, fallback to legacy
                             }
                         }
@@ -2069,7 +2219,7 @@ namespace ShadowStrike {
                     HCERTSTORE hStoreTmp = nullptr;
                     HCRYPTMSG hMsgTmp = nullptr;
 
-                    if (!CryptQueryObject(
+                    if (!CryptQueryObject(//-V1109
                         CERT_QUERY_OBJECT_FILE,
                         std::wstring(filePath).c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,

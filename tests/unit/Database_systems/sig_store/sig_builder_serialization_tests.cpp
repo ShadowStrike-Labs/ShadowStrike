@@ -59,6 +59,7 @@ protected:
         m_config.overwriteExisting = true;
         m_config.enableDeduplication = true;
         m_config.strictValidation = true;
+        m_config.initialDatabaseSize = 1024 * 1024;  // 1MB - reasonable for unit tests
 
         m_builder = std::make_unique<SignatureBuilder>(m_config);
     }
@@ -95,13 +96,19 @@ protected:
         }
     }
 
-    // Helper: Create sample hash value
+    // Helper: Create sample hash value with high entropy (passes validation)
     HashValue CreateSampleHash(uint8_t seed = 0x42) {
         HashValue hash{};
         hash.type = HashType::SHA256;
         hash.length = 32;
+        
+        // Use a more complex pattern that produces high-entropy hashes
+        // Mix operations to ensure good distribution of bits
         for (size_t i = 0; i < 32; ++i) {
-            hash.data[i] = static_cast<uint8_t>((seed + i) % 256);
+            // Combine seed, index, and XOR with primes for better distribution
+            uint8_t val = static_cast<uint8_t>((seed ^ (i * 17 + 31)) * 37 + (i << 3));
+            val ^= static_cast<uint8_t>((seed + i) * 251);
+            hash.data[i] = val;
         }
         return hash;
     }
@@ -124,7 +131,7 @@ TEST_F(SignatureBuilderSerializationTest, Serialize_WithHashes) {
     // Add some hashes
     for (int i = 0; i < 10; ++i) {
         auto hash = CreateSampleHash(static_cast<uint8_t>(i));
-        m_builder->AddHash(hash, "TestHash_" + std::to_string(i), ThreatLevel::Medium);
+        m_builder->AddHash(hash, "TestHash_" + std::to_string(i), ThreatLevel::Medium);//-V530
     }
 
     auto err = m_builder->Build();
@@ -138,9 +145,9 @@ TEST_F(SignatureBuilderSerializationTest, Serialize_WithHashes) {
 
 TEST_F(SignatureBuilderSerializationTest, Serialize_WithPatterns) {
     // Add some patterns
-    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);
-    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);
-    m_builder->AddPattern("90 90 90", "Pattern3", ThreatLevel::Low);
+    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);//-V530
+    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);//-V530
+    m_builder->AddPattern("90 90 90", "Pattern3", ThreatLevel::Low);//-V530
 
     auto err = m_builder->Build();
 
@@ -155,12 +162,12 @@ TEST_F(SignatureBuilderSerializationTest, Serialize_MixedSignatures) {
     // Add hashes
     for (int i = 0; i < 5; ++i) {
         auto hash = CreateSampleHash(static_cast<uint8_t>(i));
-        m_builder->AddHash(hash, "Hash_" + std::to_string(i), ThreatLevel::Medium);
+        m_builder->AddHash(hash, "Hash_" + std::to_string(i), ThreatLevel::Medium);//-V530
     }
 
     // Add patterns
-    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);
-    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);
+    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);//-V530
+    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);//-V530
 
     auto err = m_builder->Build();
 
@@ -204,7 +211,7 @@ TEST_F(SignatureBuilderSerializationTest, Serialize_FileAlreadyExists_Overwrite)
     m_config.overwriteExisting = true;
     m_builder = std::make_unique<SignatureBuilder>(m_config);
     
-    m_builder->AddPattern("48 8B 05", "Test", ThreatLevel::High);
+    m_builder->AddPattern("48 8B 05", "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
 
@@ -217,7 +224,7 @@ TEST_F(SignatureBuilderSerializationTest, Serialize_FileAlreadyExists_Overwrite)
 // ============================================================================
 
 TEST_F(SignatureBuilderSerializationTest, Header_MagicNumber) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);//-V530
     ASSERT_TRUE(m_builder->Build().IsSuccess());
 
     std::ifstream file(m_outputPath, std::ios::binary);
@@ -228,7 +235,7 @@ TEST_F(SignatureBuilderSerializationTest, Header_MagicNumber) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, Header_Version) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);//-V530
     ASSERT_TRUE(m_builder->Build().IsSuccess());
 
     std::ifstream file(m_outputPath, std::ios::binary);
@@ -242,11 +249,11 @@ TEST_F(SignatureBuilderSerializationTest, Header_Version) {
 TEST_F(SignatureBuilderSerializationTest, Header_Counts) {
     // Add specific counts
     for (int i = 0; i < 7; ++i) {
-        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);
+        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);//-V530
     }
     
     for (int i = 0; i < 3; ++i) {
-        m_builder->AddPattern("48 8B 0" + std::to_string(i), "Pattern" + std::to_string(i), 
+        m_builder->AddPattern("48 8B 0" + std::to_string(i), "Pattern" + std::to_string(i), //-V530
                              ThreatLevel::Medium);
     }
 
@@ -261,7 +268,7 @@ TEST_F(SignatureBuilderSerializationTest, Header_Counts) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, Header_Timestamps) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);//-V530
     ASSERT_TRUE(m_builder->Build().IsSuccess());
 
     std::ifstream file(m_outputPath, std::ios::binary);
@@ -273,7 +280,7 @@ TEST_F(SignatureBuilderSerializationTest, Header_Timestamps) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, Header_UUID) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);//-V530
     ASSERT_TRUE(m_builder->Build().IsSuccess());
 
     std::ifstream file(m_outputPath, std::ios::binary);
@@ -292,7 +299,7 @@ TEST_F(SignatureBuilderSerializationTest, Header_UUID) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, Header_SectionOffsets) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::Low);//-V530
     ASSERT_TRUE(m_builder->Build().IsSuccess());
 
     std::ifstream file(m_outputPath, std::ios::binary);
@@ -310,19 +317,19 @@ TEST_F(SignatureBuilderSerializationTest, Header_SectionOffsets) {
 
 TEST_F(SignatureBuilderSerializationTest, HashSerialization_SingleHash) {
     auto hash = CreateSampleHash(0x42);
-    m_builder->AddHash(hash, "SingleHash", ThreatLevel::High);
+    m_builder->AddHash(hash, "SingleHash", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
-    auto stats = m_builder->GetStatistics();
+    const auto& stats = m_builder->GetStatistics();
     EXPECT_GT(stats.hashIndexSize, 0);
 }
 
 TEST_F(SignatureBuilderSerializationTest, HashSerialization_MultipleHashes) {
     for (int i = 0; i < 100; ++i) {
         auto hash = CreateSampleHash(i);
-        m_builder->AddHash(hash, "Hash_" + std::to_string(i), ThreatLevel::Medium);
+        m_builder->AddHash(hash, "Hash_" + std::to_string(i), ThreatLevel::Medium);//-V530
     }
 
     auto err = m_builder->Build();
@@ -335,7 +342,7 @@ TEST_F(SignatureBuilderSerializationTest, HashSerialization_MultipleHashes) {
 
 TEST_F(SignatureBuilderSerializationTest, HashSerialization_DifferentTypes) {
     // Create hashes of different types
-    std::vector<HashType> types = {
+    std::array<HashType,4> types = {
         HashType::MD5,
         HashType::SHA1,
         HashType::SHA256,
@@ -348,7 +355,7 @@ TEST_F(SignatureBuilderSerializationTest, HashSerialization_DifferentTypes) {
         hash.length = GetHashLengthForType(type);
         std::fill(hash.data.begin(), hash.data.begin() + hash.length, 0xAA);
 
-        m_builder->AddHash(hash, "Hash_" + std::string(Format::HashTypeToString(type)), 
+        m_builder->AddHash(hash, "Hash_" + std::string(Format::HashTypeToString(type)), //-V530
                           ThreatLevel::Medium);
     }
 
@@ -360,8 +367,8 @@ TEST_F(SignatureBuilderSerializationTest, HashSerialization_Deduplication) {
     auto hash = CreateSampleHash(0x42);
 
     // Add same hash twice
-    m_builder->AddHash(hash, "Hash1", ThreatLevel::High);
-    m_builder->AddHash(hash, "Hash2", ThreatLevel::High);
+    m_builder->AddHash(hash, "Hash1", ThreatLevel::High);//-V530
+    m_builder->AddHash(hash, "Hash2", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -374,7 +381,7 @@ TEST_F(SignatureBuilderSerializationTest, HashSerialization_LongNames) {
     auto hash = CreateSampleHash();
     std::string longName(1000, 'A');  // 1000 character name
 
-    m_builder->AddHash(hash, longName, ThreatLevel::Low);
+    m_builder->AddHash(hash, longName, ThreatLevel::Low);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -385,9 +392,9 @@ TEST_F(SignatureBuilderSerializationTest, HashSerialization_LongNames) {
 // ============================================================================
 
 TEST_F(SignatureBuilderSerializationTest, PatternSerialization_BasicPatterns) {
-    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);
-    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);
-    m_builder->AddPattern("90 90 90", "Pattern3", ThreatLevel::Low);
+    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);//-V530
+    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);//-V530
+    m_builder->AddPattern("90 90 90", "Pattern3", ThreatLevel::Low);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -398,20 +405,24 @@ TEST_F(SignatureBuilderSerializationTest, PatternSerialization_BasicPatterns) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, PatternSerialization_WildcardPatterns) {
-    m_builder->AddPattern("48 ?? 05", "WildcardPattern", ThreatLevel::High);
+    m_builder->AddPattern("48 ?? 05", "WildcardPattern", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 }
 
 TEST_F(SignatureBuilderSerializationTest, PatternSerialization_InvalidPattern) {
-    m_builder->AddPattern("INVALID HEX", "BadPattern", ThreatLevel::High);
+    // Invalid pattern should be rejected by AddPattern
+    auto addErr = m_builder->AddPattern("INVALID HEX", "BadPattern", ThreatLevel::High);
+    EXPECT_FALSE(addErr.IsSuccess());  // Should fail validation
 
+    // Build should still succeed even if no patterns were added
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
-    auto stats = m_builder->GetStatistics();
-    EXPECT_GT(stats.invalidSignaturesSkipped, 0);
+    // No patterns should be in the database
+    const auto& stats = m_builder->GetStatistics();
+    EXPECT_EQ(stats.totalPatternsAdded, 0);
 }
 
 TEST_F(SignatureBuilderSerializationTest, PatternSerialization_LargePattern) {
@@ -421,7 +432,7 @@ TEST_F(SignatureBuilderSerializationTest, PatternSerialization_LargePattern) {
         largePattern += "AA ";
     }
 
-    m_builder->AddPattern(largePattern, "LargePattern", ThreatLevel::Medium);
+    m_builder->AddPattern(largePattern, "LargePattern", ThreatLevel::Medium);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -431,25 +442,25 @@ TEST_F(SignatureBuilderSerializationTest, PatternSerialization_ManyPatterns) {
     // Add 1000 patterns
     for (int i = 0; i < 1000; ++i) {
         std::string pattern = "48 8B " + std::to_string(i % 256);
-        m_builder->AddPattern(pattern, "Pattern_" + std::to_string(i), ThreatLevel::Low);
+        m_builder->AddPattern(pattern, "Pattern_" + std::to_string(i), ThreatLevel::Low);//-V530
     }
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
-    auto stats = m_builder->GetStatistics();
+    const auto& stats = m_builder->GetStatistics();
     EXPECT_GT(stats.totalPatternsAdded, 0);
 }
 
 TEST_F(SignatureBuilderSerializationTest, PatternSerialization_AhoCorasickBuilt) {
-    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);
-    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);
+    m_builder->AddPattern("48 8B 05", "Pattern1", ThreatLevel::High);//-V530
+    m_builder->AddPattern("FF D0", "Pattern2", ThreatLevel::Medium);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
     // Verify pattern index was created
-    auto stats = m_builder->GetStatistics();
+    const auto& stats = m_builder->GetStatistics();
     EXPECT_GT(stats.patternIndexSize, 0);
 }
 
@@ -458,12 +469,12 @@ TEST_F(SignatureBuilderSerializationTest, PatternSerialization_AhoCorasickBuilt)
 // ============================================================================
 
 TEST_F(SignatureBuilderSerializationTest, Metadata_Serialization) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
-    auto stats = m_builder->GetStatistics();
+    const auto& stats = m_builder->GetStatistics();
     EXPECT_GT(stats.metadataSize, 0);
 }
 
@@ -475,7 +486,7 @@ TEST_F(SignatureBuilderSerializationTest, Metadata_WithDescriptions) {
     input.description = "This is a test hash with a description";
     input.tags = {"malware", "trojan", "test"};
 
-    m_builder->AddHash(input);
+    m_builder->AddHash(input);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -486,7 +497,7 @@ TEST_F(SignatureBuilderSerializationTest, Metadata_WithDescriptions) {
 // ============================================================================
 
 TEST_F(SignatureBuilderSerializationTest, Checksum_Validation) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -508,7 +519,7 @@ TEST_F(SignatureBuilderSerializationTest, Checksum_Validation) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, Integrity_FileSize) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -520,7 +531,7 @@ TEST_F(SignatureBuilderSerializationTest, Integrity_FileSize) {
 }
 
 TEST_F(SignatureBuilderSerializationTest, Integrity_PageAlignment) {
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
@@ -542,25 +553,25 @@ TEST_F(SignatureBuilderSerializationTest, Integrity_PageAlignment) {
 
 TEST_F(SignatureBuilderSerializationTest, Statistics_BuildTime) {
     for (int i = 0; i < 100; ++i) {
-        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);
+        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);//-V530
     }
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
-    auto stats = m_builder->GetStatistics();
+    const auto& stats = m_builder->GetStatistics();
     EXPECT_GT(stats.totalBuildTimeMilliseconds, 0);
     EXPECT_GT(stats.serializationTimeMilliseconds, 0);
 }
 
 TEST_F(SignatureBuilderSerializationTest, Statistics_SectionSizes) {
-    m_builder->AddHash(CreateSampleHash(), "Hash", ThreatLevel::High);
-    m_builder->AddPattern("48 8B 05", "Pattern", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Hash", ThreatLevel::High);//-V530
+    m_builder->AddPattern("48 8B 05", "Pattern", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     ASSERT_TRUE(err.IsSuccess());
 
-    auto stats = m_builder->GetStatistics();
+   const auto& stats = m_builder->GetStatistics();
     EXPECT_GT(stats.hashIndexSize, 0);
     EXPECT_GT(stats.patternIndexSize, 0);
     EXPECT_GT(stats.finalDatabaseSize, 0);
@@ -574,7 +585,7 @@ TEST_F(SignatureBuilderSerializationTest, Error_InvalidOutputPath) {
     m_config.outputPath = L"Z:\\invalid\\path\\database.sdb";
     m_builder = std::make_unique<SignatureBuilder>(m_config);
     
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     EXPECT_FALSE(err.IsSuccess());
@@ -585,7 +596,7 @@ TEST_F(SignatureBuilderSerializationTest, Error_ReadOnlyDirectory) {
     m_config.outputPath = L"C:\\Windows\\test_signatures.sdb";
     m_builder = std::make_unique<SignatureBuilder>(m_config);
     
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     EXPECT_FALSE(err.IsSuccess());
@@ -595,7 +606,7 @@ TEST_F(SignatureBuilderSerializationTest, Recovery_CleanupOnFailure) {
     m_config.outputPath = L"";  // Invalid path
     m_builder = std::make_unique<SignatureBuilder>(m_config);
     
-    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);
+    m_builder->AddHash(CreateSampleHash(), "Test", ThreatLevel::High);//-V530
 
     auto err = m_builder->Build();
     EXPECT_FALSE(err.IsSuccess());
@@ -610,13 +621,13 @@ TEST_F(SignatureBuilderSerializationTest, Recovery_CleanupOnFailure) {
 TEST_F(SignatureBuilderSerializationTest, DISABLED_Performance_LargeDatabase) {
     // Add 10,000 hashes
     for (int i = 0; i < 10000; ++i) {
-        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);
+        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);//-V530
     }
 
     // Add 1,000 patterns
     for (int i = 0; i < 1000; ++i) {
         std::string pattern = "48 8B " + std::to_string(i % 256);
-        m_builder->AddPattern(pattern, "Pattern" + std::to_string(i), ThreatLevel::Medium);
+        m_builder->AddPattern(pattern, "Pattern" + std::to_string(i), ThreatLevel::Medium);//-V530
     }
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -629,7 +640,7 @@ TEST_F(SignatureBuilderSerializationTest, DISABLED_Performance_LargeDatabase) {
     std::cout << "Built database with 10k hashes + 1k patterns in " 
               << duration.count() << " ms\n";
 
-    auto stats = m_builder->GetStatistics();
+    const auto& stats = m_builder->GetStatistics();
     std::cout << "Database size: " << (stats.finalDatabaseSize / (1024.0 * 1024.0)) 
               << " MB\n";
 
@@ -640,14 +651,14 @@ TEST_F(SignatureBuilderSerializationTest, DISABLED_Performance_LargeDatabase) {
 TEST_F(SignatureBuilderSerializationTest, DISABLED_Performance_SerializationSpeed) {
     // Add 1000 signatures
     for (int i = 0; i < 1000; ++i) {
-        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);
+        m_builder->AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);//-V530
     }
 
     // Measure serialization time specifically
-    m_builder->ValidateInputs();
-    m_builder->Deduplicate();
-    m_builder->Optimize();
-    m_builder->BuildIndices();
+    m_builder->ValidateInputs();//-V530
+    m_builder->Deduplicate();//-V530
+    m_builder->Optimize();//-V530
+    m_builder->BuildIndices();//-V530
 
     auto start = std::chrono::high_resolution_clock::now();
     auto err = m_builder->Serialize();
@@ -658,7 +669,7 @@ TEST_F(SignatureBuilderSerializationTest, DISABLED_Performance_SerializationSpee
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     std::cout << "Serialization time: " << duration.count() << " ms\n";
 
-    auto stats = m_builder->GetStatistics();
+   const auto& stats = m_builder->GetStatistics();
     std::cout << "Serialization throughput: " 
               << (stats.finalDatabaseSize / (duration.count() / 1000.0)) / (1024.0 * 1024.0)
               << " MB/s\n";
@@ -679,9 +690,10 @@ TEST_F(SignatureBuilderSerializationTest, Concurrency_MultipleBuildersSequential
         BuildConfiguration config;
         config.outputPath = path;
         config.overwriteExisting = true;
+        config.initialDatabaseSize = 1024 * 1024;  // 1MB - reasonable for unit tests
 
         SignatureBuilder builder(config);
-        builder.AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);
+        builder.AddHash(CreateSampleHash(i), "Hash" + std::to_string(i), ThreatLevel::Low);//-V530
         
         auto err = builder.Build();
         EXPECT_TRUE(err.IsSuccess());

@@ -31,6 +31,7 @@
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <unordered_map>
 
 namespace ShadowStrike {
 namespace SignatureStore {
@@ -200,10 +201,17 @@ private:
         uint64_t lastAccessTime{0};                       // QueryPerformanceCounter
     };
 
-    // Find leaf node containing hash
+    // Find leaf node containing hash (reads from file, used for lookups)
     [[nodiscard]] const BPlusTreeNode* FindLeaf(
         uint64_t fastHash
     ) const noexcept;
+    
+    // Find leaf node for COW modification
+    // During COW transaction, traverses m_cowRootNode if set, using COW node pointers
+    // This ensures subsequent inserts after a split see the new tree structure
+    [[nodiscard]] BPlusTreeNode* FindLeafForCOW(
+        uint64_t fastHash
+    ) noexcept;
 
     // Find insertion point in node
     [[nodiscard]] uint32_t FindInsertionPoint(
@@ -259,6 +267,10 @@ private:
     // Commit COW transaction
     [[nodiscard]] StoreError CommitCOW() noexcept;
 
+    // Internal commit for batch operations - keeps transaction open for subsequent operations
+    // Used by BatchInsert to commit each insert while allowing more inserts in the same transaction
+    [[nodiscard]] StoreError CommitCOWInternal(bool keepTransactionOpen) noexcept;
+
     // Rollback COW transaction
     void RollbackCOW() noexcept;
 
@@ -271,6 +283,12 @@ private:
         uint64_t fastHash
     ) const noexcept;
 
+    // Internal validation without acquiring lock (for use when lock already held)
+    // Caller must hold shared or exclusive lock on m_rwLock
+    [[nodiscard]] bool ValidateInvariantsInternal(
+        std::string& errorMessage
+    ) const noexcept;
+
     // ========================================================================
     // INTERNAL MODIFICATION (no lock - caller must hold exclusive lock)
     // ========================================================================
@@ -281,6 +299,30 @@ private:
         const HashValue& hash,
         uint64_t signatureOffset
     ) noexcept;
+
+    // Internal insert with raw fastHash (for Rebuild - avoids re-hashing)
+    // Caller must hold exclusive lock (m_rwLock) before calling
+    [[nodiscard]] StoreError InsertInternalRaw(
+        uint64_t fastHash,
+        uint64_t signatureOffset
+    ) noexcept;
+
+    // Insert split key into parent node (recursive propagation)
+    [[nodiscard]] StoreError InsertIntoParent(
+        BPlusTreeNode* leftChild,
+        uint64_t splitKey,
+        BPlusTreeNode* rightChild
+    ) noexcept;
+
+    // ========================================================================
+    // INTERNAL TRAVERSAL (no lock - caller must hold lock)
+    // ========================================================================
+
+    // Internal ForEach without acquiring lock (for Rebuild - avoids deadlock)
+    // Caller must hold lock (shared or exclusive) before calling
+    void ForEachInternalNoLock(
+        std::function<bool(uint64_t fastHash, uint64_t signatureOffset)> callback
+    ) const noexcept;
 
     // ========================================================================
     // INTERNAL STATE
@@ -325,6 +367,18 @@ private:
     // COW state for updates
     std::vector<std::unique_ptr<BPlusTreeNode>> m_cowNodes;
     std::atomic<bool> m_inCOWTransaction{false};          // Atomic for thread safety
+    BPlusTreeNode* m_cowRootNode{nullptr};                // Tracks cloned root node (nullptr if root wasn't cloned)
+    
+    // Maps file offset → COW node pointer (for updating parent children after clone)
+    // When we clone a node from file offset X, we record m_fileOffsetToCOWNode[X] = cowNode
+    // When we clone a parent, we can update its children[] to point to existing COW nodes
+    std::unordered_map<uint32_t, BPlusTreeNode*> m_fileOffsetToCOWNode;
+    
+    // Maps truncated memory address → COW node pointer (for COW tree traversal)
+    // When we create a COW node and store its truncated address in children[],
+    // we need to resolve it back to the actual node during traversal.
+    // This is necessary because children[] is uint32_t but pointers are 64-bit.
+    std::unordered_map<uint32_t, BPlusTreeNode*> m_truncatedAddrToCOWNode;
 
     // Performance monitoring
     mutable LARGE_INTEGER m_perfFrequency{};

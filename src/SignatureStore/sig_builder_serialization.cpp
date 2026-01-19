@@ -257,6 +257,12 @@ namespace SignatureStore {
                 return result;
             }
 
+            // Compute checksum while memory mapping is still active
+            result = ComputeChecksum();
+            if (result.code != SignatureStoreError::Success) {
+                return result;
+            }
+
             // Flush with error checking
             if (!FlushViewOfFile(m_outputBase, static_cast<SIZE_T>(m_outputSize))) {
                 Log("Warning: FlushViewOfFile failed, data may be cached");

@@ -432,11 +432,17 @@ bool SignatureBuilder::IsYaraRuleSafe(
      * Detects potentially dangerous YARA constructs
      */
 
-     // Check for dangerous imports (would need whitelist)
-    const std::array<std::string_view,6> DANGEROUS_IMPORTS = {
+    // Empty rules are considered safe (will fail syntax validation later)
+    if (ruleSource.empty()) {
+        return true;
+    }
+
+    // Check for dangerous imports (would need whitelist)
+    // Using std::array with exactly the number of elements initialized
+    constexpr std::array<std::string_view, 2> DANGEROUS_IMPORTS = {{
         "import \"cuckoo\"",     // External system calls
         "import \"magic\"",      // File type detection (can be slow)
-    };
+    }};
 
     for (const auto& dangerous : DANGEROUS_IMPORTS) {
         if (ruleSource.find(dangerous) != std::string::npos) {
@@ -541,7 +547,7 @@ StoreError SignatureBuilder::Build() noexcept {
         return err;
     }
 
-    // Stage 5: Serialize
+    // Stage 5: Serialize (includes checksum computation before file cleanup)
     ReportProgress("Serialization", 4, 7);
     err = Serialize();
     if (!err.IsSuccess()) {
@@ -549,13 +555,9 @@ StoreError SignatureBuilder::Build() noexcept {
         return err;
     }
 
-    // Stage 6: Compute checksum
+    // Stage 6: Integrity verification is now done within Serialize()
+    // to ensure checksum is computed before memory mapping cleanup
     ReportProgress("Integrity Check", 5, 7);
-    err = ComputeChecksum();
-    if (!err.IsSuccess()) {
-        m_buildInProgress.store(false);
-        return err;
-    }
 
     ReportProgress("Complete", 7, 7);
 
@@ -1475,7 +1477,12 @@ void SignatureBuilder::Log(const std::string& message) const noexcept {
 }
 
 uint64_t SignatureBuilder::GetCurrentTimestamp() noexcept {
-    return static_cast<uint64_t>(std::time(nullptr));
+    // Use high-resolution clock for millisecond precision timestamps
+    // This ensures that sequential calls (even with short delays) return different values
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()).count();
+    return static_cast<uint64_t>(ms);
 }
 
 // ============================================================================

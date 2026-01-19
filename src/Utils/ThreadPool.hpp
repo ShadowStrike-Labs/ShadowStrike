@@ -185,12 +185,17 @@ struct ThreadPoolConfig {
     // Core Thread Pool Settings
     //-------------------------------------------------------------------------
     
-    /** Minimum number of worker threads (always maintained) */
-    size_t minThreads = 4;
-    
-    /** Maximum number of worker threads (hard limit) */
-    size_t maxThreads = std::max(static_cast<size_t>(4), 
-                                  static_cast<size_t>(std::thread::hardware_concurrency() * 2));
+    /** Absolute floor for the minimum number of threads */
+    static constexpr size_t ABSOLUTE_MIN_THREADS = 2;
+
+    /** Minimum allowed capacity for max threads */
+    static constexpr size_t MIN_THREAD_LIMIT = 4;
+
+	/** Minimum number of worker threads */
+    size_t minThreads = std::max<size_t>(ABSOLUTE_MIN_THREADS, std::thread::hardware_concurrency());
+
+	/** Maximum number of worker threads */
+    size_t maxThreads = std::max(MIN_THREAD_LIMIT, static_cast<size_t>(std::thread::hardware_concurrency() * 2));
     
     /** Maximum number of tasks in the queue */
     size_t maxQueueSize = 10000;

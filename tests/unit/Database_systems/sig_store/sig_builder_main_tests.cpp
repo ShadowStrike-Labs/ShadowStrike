@@ -67,6 +67,8 @@ protected:
 
         // Setup default configuration with callbacks
         m_config.outputPath = m_tempDir + L"\\test_db.sdb";
+        m_config.overwriteExisting = true;  // Allow overwriting for repeated test runs
+        m_config.initialDatabaseSize = 1024 * 1024;  // 1MB - reasonable for unit tests
         m_config.enableDeduplication = true;
         m_config.enableEntropyOptimization = true;
         m_config.enableCacheAlignment = true;
@@ -94,15 +96,20 @@ protected:
         CleanupTempFiles();
     }
 
-    // Helper: Create test hash value
+    // Helper: Create test hash value with high entropy (passes validation)
     HashValue CreateTestHash(HashType type, const std::string& data = "test") {
         HashValue hash{};
         hash.type = type;
         hash.length = GetHashLengthForType(type);
         
-        // Fill with test data (simplified - not cryptographic)
-        for (size_t i = 0; i < hash.length && i < data.length(); ++i) {
-            hash.data[i] = static_cast<uint8_t>(data[i]);
+        // Use a more complex pattern that produces high-entropy hashes
+        // Mix operations to ensure good distribution of bits
+        uint8_t seed = static_cast<uint8_t>(data.length() > 0 ? data[0] : 0x42);
+        for (size_t i = 0; i < hash.length; ++i) {
+            // Combine seed, index, and XOR with primes for better distribution
+            uint8_t val = static_cast<uint8_t>((seed ^ (i * 17 + 31)) * 37 + (i << 3));
+            val ^= static_cast<uint8_t>((seed + i) * 251);
+            hash.data[i] = val;
         }
         
         return hash;
@@ -578,13 +585,14 @@ TEST_F(SignatureBuilderTest, SetBuildPriority) {
 
 TEST_F(SignatureBuilderTest, BuildWithInvalidConfiguration) {
     BuildConfiguration config;
-    config.outputPath = L"";  // Invalid path
+    config.outputPath = L"";  // Invalid path - empty output path
     m_builder->SetConfiguration(config);
     
-    // Build should handle gracefully
+    // Build should fail gracefully with appropriate error
     StoreError err = m_builder->Build();
-    // May fail or succeed depending on implementation
-    EXPECT_NE(err.code, SignatureStoreError::InvalidFormat);
+    // Empty output path should return InvalidFormat error
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
 }
 
 TEST_F(SignatureBuilderTest, ResetMultipleTimes) {

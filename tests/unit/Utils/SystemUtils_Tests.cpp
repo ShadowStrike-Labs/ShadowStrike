@@ -351,7 +351,7 @@ TEST_F(SystemUtilsTest, GetModulePath_Kernel32) {
     EXPECT_FALSE(path.empty());
     
     // ? FIX: Use case-insensitive search (Windows paths may be uppercase)
-    std::wstring pathLower = path;
+    std::wstring pathLower = std::move(path);
     std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::towlower);
     EXPECT_NE(pathLower.find(L"kernel32.dll"), std::wstring::npos);
 }
@@ -363,7 +363,7 @@ TEST_F(SystemUtilsTest, GetSystemDirectoryPath_ReturnsValidPath) {
     EXPECT_FALSE(sysDir.empty());
     
     // ? FIX: Use case-insensitive search
-    std::wstring sysDirLower = sysDir;
+    std::wstring sysDirLower = std::move(sysDir);
     std::transform(sysDirLower.begin(), sysDirLower.end(), sysDirLower.begin(), ::towlower);
     EXPECT_NE(sysDirLower.find(L"system32"), std::wstring::npos);
 }
@@ -375,7 +375,7 @@ TEST_F(SystemUtilsTest, GetWindowsDirectoryPath_ReturnsValidPath) {
     EXPECT_FALSE(winDir.empty());
     
     // ? FIX: Use case-insensitive search
-    std::wstring winDirLower = winDir;
+    std::wstring winDirLower = std::move(winDir);
     std::transform(winDirLower.begin(), winDirLower.end(), winDirLower.begin(), ::towlower);
     EXPECT_NE(winDirLower.find(L"windows"), std::wstring::npos);
 }

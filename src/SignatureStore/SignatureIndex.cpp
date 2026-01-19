@@ -308,9 +308,12 @@ StoreError SignatureIndex::Verify() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_rwLock);
 
     // SECURITY: Validate memory state
-    if (!m_view || !m_view->IsValid()) {
-        SS_LOG_ERROR(L"SignatureIndex", L"Verify: Invalid or null view");
-        return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid view"};
+    // Support both memory-mapped views (m_view set) and raw buffer mode (CreateNew)
+    if (m_view) {
+        if (!m_view->IsValid()) {
+            SS_LOG_ERROR(L"SignatureIndex", L"Verify: Invalid view");
+            return StoreError{SignatureStoreError::InvalidFormat, 0, "Invalid view"};
+        }
     }
 
     if (!m_baseAddress) {
@@ -534,6 +537,173 @@ void SignatureIndex::ForEach(
 }
 
 /**
+ * @brief Internal ForEach implementation without lock acquisition.
+ *
+ * CRITICAL: This method assumes the caller already holds m_rwLock (shared or exclusive).
+ * Used by Rebuild() which holds exclusive lock and cannot call ForEach() (deadlock).
+ *
+ * @param callback Function to call for each entry. Return false to stop iteration.
+ *
+ * SECURITY:
+ * - NO LOCK ACQUIRED - caller must hold appropriate lock
+ * - Same validation and cycle detection as ForEach()
+ */
+void SignatureIndex::ForEachInternalNoLock(
+    std::function<bool(uint64_t fastHash, uint64_t signatureOffset)> callback
+) const noexcept {
+    // SECURITY: Validate callback
+    if (!callback) {
+        SS_LOG_WARN(L"SignatureIndex", L"ForEachInternalNoLock: Null callback provided");
+        return;
+    }
+
+    // NOTE: No lock acquisition - caller must hold m_rwLock
+
+    // SECURITY: Validate index state
+    if (!m_baseAddress || m_indexSize == 0) {
+        SS_LOG_WARN(L"SignatureIndex", L"ForEachInternalNoLock: Index not initialized");
+        return;
+    }
+
+    // Find leftmost leaf
+    uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+    
+    // SECURITY: Validate root offset
+    if (rootOffset >= m_indexSize) {
+        SS_LOG_ERROR(L"SignatureIndex", 
+            L"ForEachInternalNoLock: Invalid root offset 0x%X", rootOffset);
+        return;
+    }
+    
+    const BPlusTreeNode* node = GetNode(rootOffset);
+    if (!node) {
+        SS_LOG_DEBUG(L"SignatureIndex", L"ForEachInternalNoLock: Empty tree");
+        return;
+    }
+
+    // SECURITY: Track depth to prevent infinite loop during navigation
+    constexpr uint32_t MAX_DEPTH = 64;
+    uint32_t depth = 0;
+    
+    // Track visited offsets for cycle detection
+    std::unordered_set<uint32_t> visitedOffsets;
+    visitedOffsets.insert(rootOffset);
+
+    // Navigate to leftmost leaf
+    while (!node->isLeaf && depth < MAX_DEPTH) {
+        // SECURITY: Validate keyCount before accessing children
+        if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Invalid keyCount %u during descent", node->keyCount);
+            return;
+        }
+        
+        // For navigation to leftmost leaf, we take child[0]
+        uint32_t childOffset = node->children[0];
+        
+        // SECURITY: Validate child offset
+        if (childOffset == 0 || childOffset >= m_indexSize) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Invalid child[0] offset 0x%X at depth %u", childOffset, depth);
+            return;
+        }
+        
+        // SECURITY: Cycle detection
+        if (visitedOffsets.count(childOffset) > 0) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Cycle detected during descent at offset 0x%X", childOffset);
+            return;
+        }
+        visitedOffsets.insert(childOffset);
+        
+        node = GetNode(childOffset);
+        if (!node) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Failed to load node at offset 0x%X", childOffset);
+            return;
+        }
+        depth++;
+    }
+
+    if (depth >= MAX_DEPTH) {
+        SS_LOG_ERROR(L"SignatureIndex", 
+            L"ForEachInternalNoLock: Max depth %u exceeded during navigation", MAX_DEPTH);
+        return;
+    }
+
+    // SECURITY: Track iterations to prevent infinite loop in leaf linked list
+    constexpr size_t MAX_ITERATIONS = 10000000; // 10M leaves max
+    size_t iterations = 0;
+    size_t entriesProcessed = 0;
+
+    // Clear visited set for leaf traversal (reuse memory)
+    visitedOffsets.clear();
+
+    // Traverse linked list of leaves
+    while (node && iterations < MAX_ITERATIONS) {
+        // SECURITY: Validate keyCount
+        if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Invalid keyCount %u in leaf at iteration %zu", 
+                node->keyCount, iterations);
+            return;
+        }
+        
+        // Process all entries in this leaf
+        for (uint32_t i = 0; i < node->keyCount; ++i) {
+            try {
+                if (!callback(node->keys[i], static_cast<uint64_t>(node->children[i]))) {
+                    // Early exit requested by callback
+                    SS_LOG_TRACE(L"SignatureIndex", 
+                        L"ForEachInternalNoLock: Early exit after %zu entries", entriesProcessed);
+                    return;
+                }
+                entriesProcessed++;
+            }
+            catch (...) {
+                // Callback threw exception - stop iteration for safety
+                SS_LOG_ERROR(L"SignatureIndex", 
+                    L"ForEachInternalNoLock: Callback threw exception after %zu entries", entriesProcessed);
+                return;
+            }
+        }
+
+        // Check for end of list
+        if (node->nextLeaf == 0) {
+            break;
+        }
+        
+        // SECURITY: Validate nextLeaf offset
+        if (node->nextLeaf >= m_indexSize) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Invalid nextLeaf offset 0x%X at iteration %zu", 
+                node->nextLeaf, iterations);
+            return;
+        }
+        
+        // SECURITY: Cycle detection in leaf list
+        if (visitedOffsets.count(node->nextLeaf) > 0) {
+            SS_LOG_ERROR(L"SignatureIndex", 
+                L"ForEachInternalNoLock: Cycle detected in leaf list at offset 0x%X", node->nextLeaf);
+            return;
+        }
+        visitedOffsets.insert(node->nextLeaf);
+        
+        node = GetNode(node->nextLeaf);
+        iterations++;
+    }
+
+    if (iterations >= MAX_ITERATIONS) {
+        SS_LOG_WARN(L"SignatureIndex", 
+            L"ForEachInternalNoLock: Iteration limit reached (%zu iterations, %zu entries)", 
+            iterations, entriesProcessed);
+    }
+    
+    SS_LOG_TRACE(L"SignatureIndex", 
+        L"ForEachInternalNoLock: Processed %zu entries across %zu leaves", entriesProcessed, iterations + 1);
+}
+
+/**
  * @brief Iterate over entries matching a predicate.
  * @param predicate Function to test each hash (return true to include)
  * @param callback Function to call for matching entries (return false to stop)
@@ -674,7 +844,7 @@ uint64_t SignatureIndex::GetCurrentTimeNs() noexcept {
 size_t SignatureIndex::HashNodeOffset(uint32_t offset) noexcept {
     // Knuth's multiplicative hash - provides good distribution
     constexpr uint32_t KNUTH_MULTIPLIER = 2654435761u;
-    return static_cast<size_t>(offset * KNUTH_MULTIPLIER);
+    return static_cast<size_t>(offset) * KNUTH_MULTIPLIER;
 }
 
 // ============================================================================
@@ -752,7 +922,14 @@ void SignatureIndex::DumpTree(std::function<void(const std::string&)> output) co
  */
 bool SignatureIndex::ValidateInvariants(std::string& errorMessage) const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_rwLock);
+    return ValidateInvariantsInternal(errorMessage);
+}
 
+/**
+ * Internal validation without lock acquisition.
+ * Caller must hold shared or exclusive lock on m_rwLock.
+ */
+bool SignatureIndex::ValidateInvariantsInternal(std::string& errorMessage) const noexcept {
     try {
         errorMessage.clear();
 

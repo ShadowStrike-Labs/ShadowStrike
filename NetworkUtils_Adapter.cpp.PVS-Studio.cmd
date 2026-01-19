@@ -1,1 +1,0 @@
-@call "C:\Program Files (x86)\PVS-Studio\x64\PVS-Studio.exe" --cfg "C:\ShadowStrike\ShadowStrike\NetworkUtils_Adapter.cpp.PVS-Studio.cfg"

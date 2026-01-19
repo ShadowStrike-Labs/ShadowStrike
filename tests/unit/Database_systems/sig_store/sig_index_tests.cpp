@@ -522,39 +522,43 @@ TEST_F(SignatureIndexTestFixture, BatchInsertEmptyFails) {
     // Empty batch should succeed (no-op)
     EXPECT_TRUE(err.IsSuccess());
 }
-
 TEST_F(SignatureIndexTestFixture, BatchInsertWithDuplicatesPartialSuccess) {
     SignatureIndex index;
 
+    // Allocate 20MB for the index buffer
     constexpr size_t indexSize = 20 * 1024 * 1024;
     auto buffer = std::make_unique<uint8_t[]>(indexSize);
-    
+
     uint64_t usedSize = 0;
     ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
 
-    // Create batch with duplicates
+    // Prepare batch data. 
+    // We use reserve(3) to prevent multiple memory reallocations (PVS-Studio V827 fix).
     std::vector<std::pair<HashValue, uint64_t>> entries;
-    
-    HashValue hash1 = CreateTestHash(100);
-    HashValue hash2 = CreateTestHash(200);
-    
+    entries.reserve(3);
+
+    const HashValue hash1 = CreateTestHash(100);
+    const HashValue hash2 = CreateTestHash(200);
+
+    // Inserting unique and duplicate entries to test collision handling
     entries.emplace_back(hash1, 1000);
     entries.emplace_back(hash2, 2000);
-    entries.emplace_back(hash1, 3000); // Duplicate
+    entries.emplace_back(hash1, 3000); // Intentionally duplicated HashValue
 
+    // Execute batch insertion
     StoreError err = index.BatchInsert(entries);
 
-    // Should report partial success
-    EXPECT_FALSE(err.IsSuccess());
+    // The operation should NOT be fully successful due to the duplicate entry.
+    // We expect a partial success or a specific error code indicating duplicates.
+    EXPECT_FALSE(err.IsSuccess()) << "BatchInsert should have failed or reported duplicates.";
 
-    // But unique entries should be inserted
-    auto result1 = index.Lookup(hash1);
-    auto result2 = index.Lookup(hash2);
+    // Verification: Even if the batch had duplicates, the unique hashes should still be stored.
+    const auto result1 = index.Lookup(hash1);
+    const auto result2 = index.Lookup(hash2);
 
-    EXPECT_TRUE(result1.has_value());
-    EXPECT_TRUE(result2.has_value());
+    EXPECT_TRUE(result1.has_value()) << "Hash1 should exist in the index despite being duplicated in batch.";
+    EXPECT_TRUE(result2.has_value()) << "Hash2 should exist in the index as it was a unique entry.";
 }
-
 // ============================================================================
 // REMOVAL OPERATION TESTS
 // ============================================================================
@@ -788,7 +792,7 @@ TEST_F(SignatureIndexTestFixture, GetStatistics) {
     // Perform lookups
     for (size_t i = 0; i < 10; ++i) {
         HashValue hash = CreateTestHash(i);
-        index.Lookup(hash);
+        index.Lookup(hash);//-V530
     }
 
     auto stats = index.GetStatistics();
@@ -811,8 +815,8 @@ TEST_F(SignatureIndexTestFixture, ResetStatistics) {
     // Perform operations
     for (size_t i = 0; i < 20; ++i) {
         HashValue hash = CreateTestHash(i);
-        index.Insert(hash, i);
-        index.Lookup(hash);
+        index.Insert(hash, i);//-V530
+        index.Lookup(hash);//-V530
     }
 
     auto statsBefore = index.GetStatistics();
@@ -883,7 +887,7 @@ TEST_F(SignatureIndexTestFixture, CompactIndex) {
     // Remove half the entries
     for (size_t i = 0; i < 100; i += 2) {
         HashValue hash = CreateTestHash(i);
-        index.Remove(hash);
+        index.Remove(hash);//-V530
     }
 
     auto statsBefore = index.GetStatistics();
@@ -939,7 +943,7 @@ TEST_F(SignatureIndexTestFixture, ClearCacheInvalidatesEntries) {
     ASSERT_TRUE(index.Insert(hash, 5000).IsSuccess());
 
     // Populate cache
-    index.Lookup(hash);
+    index.Lookup(hash);//-V530
 
     // Reset statistics (this will indirectly test cache behavior)
     index.ResetStatistics();
@@ -1011,16 +1015,21 @@ TEST_F(SignatureIndexTestFixture, LookupPerformanceBenchmark) {
     uint64_t usedSize = 0;
     ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
 
-    // Insert 10,000 entries
+    // Insert 10,000 entries (batch insert yields stable ordering for benchmarking)
     constexpr size_t numEntries = 10000;
     std::vector<HashValue> hashes;
     hashes.reserve(numEntries);
 
+    std::vector<std::pair<HashValue, uint64_t>> entries;
+    entries.reserve(numEntries);
+
     for (size_t i = 0; i < numEntries; ++i) {
         HashValue hash = CreateTestHash(i);
         hashes.push_back(hash);
-        ASSERT_TRUE(index.Insert(hash, i * 10).IsSuccess());
+        entries.emplace_back(hash, i * 10);
     }
+
+    ASSERT_TRUE(index.BatchInsert(entries).IsSuccess());
 
     // Benchmark lookups
     LARGE_INTEGER startTime, endTime;

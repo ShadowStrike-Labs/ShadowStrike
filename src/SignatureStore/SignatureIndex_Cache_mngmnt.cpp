@@ -184,14 +184,24 @@ namespace ShadowStrike {
              * - Partial flush failures are fatal
              *
              * Thread Safety:
-             * - May be called from write-locked context
-             * - Readers are unaffected (continue using cached data)
-             * - Safe with concurrent reads
+             * - Acquires exclusive lock to ensure no concurrent modifications
+             * - Readers must wait during flush
+             * - Prevents race conditions with COW operations
              *
              * ========================================================================
              */
 
             SS_LOG_INFO(L"SignatureIndex", L"Flush: Starting disk synchronization");
+
+            // ========================================================================
+            // STEP 0: ACQUIRE EXCLUSIVE LOCK
+            // ========================================================================
+            // CRITICAL FIX: We must hold an exclusive lock during Flush to prevent:
+            // 1. Race conditions with concurrent Insert/Remove operations
+            // 2. COW transaction corruption during commit
+            // 3. Inconsistent state between memory mapping and disk
+            // ========================================================================
+            std::unique_lock<std::shared_mutex> lock(m_rwLock);
 
             // ========================================================================
             // STEP 1: VALIDATION
@@ -325,13 +335,13 @@ namespace ShadowStrike {
 
             SS_LOG_INFO(L"SignatureIndex",
                 L"Flush: Successfully flushed to disk "
-                L"(time=%llu µs, size=0x%llX)",
+                L"(time=%llu ï¿½s, size=0x%llX)",
                 flushTimeUs, m_view->fileSize);
 
             // Warn if flush took unusually long (indicates disk/system issues)
             if (flushTimeUs > 1'000'000) {  // > 1 second
                 SS_LOG_WARN(L"SignatureIndex",
-                    L"Flush: Disk flush took longer than expected (%llu µs) "
+                    L"Flush: Disk flush took longer than expected (%llu ï¿½s) "
                     L"- system performance may be degraded",
                     flushTimeUs);
             }

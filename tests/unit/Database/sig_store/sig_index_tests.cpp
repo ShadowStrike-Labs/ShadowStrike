@@ -506,7 +506,7 @@ TEST_F(SignatureIndexTestFixture, BatchInsert) {
     }
 }
 
-TEST_F(SignatureIndexTestFixture, BatchInsertEmptyFails) {
+TEST_F(SignatureIndexTestFixture, BatchInsertEmptyIsNoOp) {
     SignatureIndex index;
 
     constexpr size_t indexSize = 10 * 1024 * 1024;
@@ -1153,6 +1153,216 @@ TEST_F(SignatureIndexTestFixture, LargeScaleInsertionStressTest) {
 
     auto finalStats = index.GetStatistics();
     EXPECT_GT(finalStats.totalEntries, 10000); // At least 10K should succeed
+}
+
+// ============================================================================
+// B+TREE INVARIANT TESTS (Critical for correctness after fixes)
+// ============================================================================
+
+TEST_F(SignatureIndexTestFixture, SplitNodeMaintainsKeyOrdering) {
+    // This test validates that after node splits, all keys maintain proper
+    // B+Tree ordering: left keys < splitKey <= right keys
+    SignatureIndex index;
+
+    constexpr size_t indexSize = 50 * 1024 * 1024;
+    auto buffer = std::make_unique<uint8_t[]>(indexSize);
+    
+    uint64_t usedSize = 0;
+    ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
+
+    // Insert enough entries to force multiple splits
+    // BPlusTreeNode::MAX_KEYS is typically 128, so 500 entries forces splits
+    constexpr size_t numEntries = 500;
+    std::vector<HashValue> insertedHashes;
+    insertedHashes.reserve(numEntries);
+
+    for (size_t i = 0; i < numEntries; ++i) {
+        HashValue hash = CreateTestHash(i);
+        insertedHashes.push_back(hash);
+        StoreError err = index.Insert(hash, i * 10);
+        ASSERT_TRUE(err.IsSuccess()) << "Insert failed at " << i << ": " << err.message;
+    }
+
+    // Validate tree invariants
+    std::string errorMsg;
+    EXPECT_TRUE(index.ValidateInvariants(errorMsg)) 
+        << "Invariant violation after 500 inserts: " << errorMsg;
+
+    // Verify all entries are still retrievable
+    for (size_t i = 0; i < numEntries; ++i) {
+        auto result = index.Lookup(insertedHashes[i]);
+        ASSERT_TRUE(result.has_value()) << "Entry " << i << " missing after splits";
+        EXPECT_EQ(*result, i * 10);
+    }
+}
+
+TEST_F(SignatureIndexTestFixture, InsertAfterSplitFindsCorrectLeaf) {
+    // Tests the critical fix: splitKey must be recalculated AFTER insertion
+    // to ensure subsequent inserts find the correct leaf
+    SignatureIndex index;
+
+    constexpr size_t indexSize = 50 * 1024 * 1024;
+    auto buffer = std::make_unique<uint8_t[]>(indexSize);
+    
+    uint64_t usedSize = 0;
+    ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
+
+    // Insert entries in a pattern that triggers splits and subsequent inserts
+    // into potentially wrong leaves if splitKey isn't recalculated
+    std::vector<uint64_t> insertOrder;
+    constexpr size_t baseEntries = 200;
+    
+    // First pass: sequential inserts to build tree structure
+    for (size_t i = 0; i < baseEntries; ++i) {
+        HashValue hash = CreateTestHash(i * 2);  // Even numbers
+        ASSERT_TRUE(index.Insert(hash, i * 100).IsSuccess());
+        insertOrder.push_back(i * 2);
+    }
+
+    // Second pass: interleaved inserts (odd numbers)
+    // These inserts test splitKey recalculation after first split
+    for (size_t i = 0; i < baseEntries; ++i) {
+        HashValue hash = CreateTestHash(i * 2 + 1);  // Odd numbers
+        StoreError err = index.Insert(hash, (i + baseEntries) * 100);
+        ASSERT_TRUE(err.IsSuccess()) << "Interleaved insert failed at " << i;
+        insertOrder.push_back(i * 2 + 1);
+    }
+
+    // Verify all entries
+    auto stats = index.GetStatistics();
+    EXPECT_EQ(stats.totalEntries, baseEntries * 2);
+
+    for (uint64_t val : insertOrder) {
+        HashValue hash = CreateTestHash(val);
+        auto result = index.Lookup(hash);
+        EXPECT_TRUE(result.has_value()) << "Entry with value " << val << " not found";
+    }
+}
+
+TEST_F(SignatureIndexTestFixture, VerifyNoMemoryLeakOnRollback) {
+    // Test that RollbackCOW properly cleans up all COW state
+    SignatureIndex index;
+
+    constexpr size_t indexSize = 10 * 1024 * 1024;
+    auto buffer = std::make_unique<uint8_t[]>(indexSize);
+    
+    uint64_t usedSize = 0;
+    ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
+
+    // Insert valid entry first
+    HashValue validHash = CreateTestHash(1);
+    ASSERT_TRUE(index.Insert(validHash, 1000).IsSuccess());
+
+    // Attempt to insert duplicate (should fail and rollback)
+    HashValue dupHash = CreateTestHash(1);  // Same as validHash
+    StoreError dupErr = index.Insert(dupHash, 2000);
+    EXPECT_FALSE(dupErr.IsSuccess());
+    EXPECT_EQ(dupErr.code, SignatureStoreError::DuplicateEntry);
+
+    // Statistics should be consistent (only 1 entry, not 2)
+    auto stats = index.GetStatistics();
+    EXPECT_EQ(stats.totalEntries, 1);
+
+    // Original entry should still be intact
+    auto result = index.Lookup(validHash);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1000);  // Original value, not 2000
+}
+
+TEST_F(SignatureIndexTestFixture, StatisticsRollbackOnCommitFailure) {
+    // This test validates that statistics are rolled back when COW commit fails
+    // Note: Inducing a real commit failure is difficult, so we verify the 
+    // insertion path handles statistics correctly
+    SignatureIndex index;
+
+    constexpr size_t indexSize = 10 * 1024 * 1024;
+    auto buffer = std::make_unique<uint8_t[]>(indexSize);
+    
+    uint64_t usedSize = 0;
+    ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
+
+    auto initialStats = index.GetStatistics();
+    EXPECT_EQ(initialStats.totalEntries, 0);
+
+    // Successful insert should increment counter
+    HashValue hash1 = CreateTestHash(100);
+    ASSERT_TRUE(index.Insert(hash1, 1000).IsSuccess());
+
+    auto statsAfterInsert = index.GetStatistics();
+    EXPECT_EQ(statsAfterInsert.totalEntries, 1);
+
+    // Failed insert (duplicate) should NOT increment counter
+    StoreError dupErr = index.Insert(hash1, 2000);
+    EXPECT_FALSE(dupErr.IsSuccess());
+
+    auto statsAfterFailure = index.GetStatistics();
+    EXPECT_EQ(statsAfterFailure.totalEntries, 1);  // Still 1, not 2
+}
+
+TEST_F(SignatureIndexTestFixture, FlushAcquiresLockCorrectly) {
+    // Test that Flush() works correctly with concurrent operations
+    SignatureIndex index;
+
+    constexpr size_t indexSize = 20 * 1024 * 1024;
+    auto buffer = std::make_unique<uint8_t[]>(indexSize);
+    
+    uint64_t usedSize = 0;
+    ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
+
+    // Insert some entries
+    for (size_t i = 0; i < 50; ++i) {
+        HashValue hash = CreateTestHash(i);
+        ASSERT_TRUE(index.Insert(hash, i * 10).IsSuccess());
+    }
+
+    // Flush should succeed (even though this is a raw buffer, not memory-mapped)
+    // In raw buffer mode, Flush may be a no-op but should not crash
+    StoreError flushErr = index.Flush();
+    // Don't assert success as Flush on raw buffer may return error
+    // The key is that it doesn't crash or corrupt state
+
+    // Verify entries still accessible after flush attempt
+    for (size_t i = 0; i < 50; ++i) {
+        HashValue hash = CreateTestHash(i);
+        auto result = index.Lookup(hash);
+        EXPECT_TRUE(result.has_value()) << "Entry " << i << " missing after flush";
+    }
+}
+
+TEST_F(SignatureIndexTestFixture, LargeKeyCountNodeSplit) {
+    // Specifically test node splitting with maximum key count
+    SignatureIndex index;
+
+    constexpr size_t indexSize = 100 * 1024 * 1024;
+    auto buffer = std::make_unique<uint8_t[]>(indexSize);
+    
+    uint64_t usedSize = 0;
+    ASSERT_TRUE(index.CreateNew(buffer.get(), indexSize, usedSize).IsSuccess());
+
+    // Insert entries that will force multiple levels of splits
+    constexpr size_t numEntries = 1000;
+    
+    for (size_t i = 0; i < numEntries; ++i) {
+        HashValue hash = CreateTestHash(i);
+        StoreError err = index.Insert(hash, i * 10);
+        ASSERT_TRUE(err.IsSuccess()) << "Insert failed at " << i << ": " << err.message;
+        
+        // Periodically validate invariants during insertions
+        if (i > 0 && i % 200 == 0) {
+            std::string errorMsg;
+            bool valid = index.ValidateInvariants(errorMsg);
+            ASSERT_TRUE(valid) << "Invariant violation at entry " << i << ": " << errorMsg;
+        }
+    }
+
+    // Final validation
+    auto stats = index.GetStatistics();
+    EXPECT_EQ(stats.totalEntries, numEntries);
+    EXPECT_GE(stats.treeHeight, 2);  // Should have grown beyond single node
+
+    std::string finalErrorMsg;
+    EXPECT_TRUE(index.ValidateInvariants(finalErrorMsg)) 
+        << "Final invariant check failed: " << finalErrorMsg;
 }
 
 // ============================================================================

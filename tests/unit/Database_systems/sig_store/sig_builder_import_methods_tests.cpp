@@ -220,7 +220,7 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromFileWithNullBytes) {
     
     StoreError err = m_builder->ImportHashesFromFile(filePath);
     // Should handle gracefully
-    EXPECT_TRUE(err.IsSuccess() || !err.IsSuccess());
+    EXPECT_TRUE(err.IsSuccess());
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromFileLongLine) {
@@ -408,20 +408,26 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonLargeArray) {
     std::stringstream ss;
     ss << "{ \"hashes\": [";
     
-    for (int i = 0; i < 100000; ++i) {
+    // Test with 1,000 entries - reasonable for unit test performance.
+    // Note: Using correct field names as expected by ImportHashesFromJson:
+    // - "hash" (not "value")
+    // - "threat_level" (not "level") - optional, defaults to 50
+    constexpr int ENTRY_COUNT = 1000;
+    for (int i = 0; i < ENTRY_COUNT; ++i) {
         if (i > 0) ss << ",";
         ss << R"({
             "type": "MD5",
-            "value": "5d41402abc4b2a76b9719d911017c592",
+            "hash": "5d41402abc4b2a76b9719d911017c592",
             "name": "hash)" << i << R"(",
-            "level": 50
+            "threat_level": 50
         })";
     }
     
     ss << "]}";
     
     StoreError err = m_builder->ImportHashesFromJson(ss.str());
-    // Should handle large arrays
+    // Should handle arrays - expect success or partial success
+    // since all entries have the same hash value (duplicates after first)
 }
 
 // ============================================================================
@@ -655,13 +661,17 @@ TEST_F(SignatureBuilderImportTest, ImportYaraRulesFromDirectoryWithRules) {
     CreateTempFile(rule2, L"yara_rules\\rule2.yar");
     
     StoreError err = m_builder->ImportYaraRulesFromDirectory(dirPath);
-    EXPECT_TRUE(err.IsSuccess() || !err.IsSuccess());  // Either outcome is valid
+    EXPECT_TRUE(err.IsSuccess());  // Either outcome is valid
 }
 
 TEST_F(SignatureBuilderImportTest, ImportYaraRulesFromDirectoryRecursive) {
     auto dirPath = CreateTempDirectory(L"recursive_yara");
     auto subDirPath = CreateTempDirectory(L"recursive_yara\\subdir");
 
+	if (subDirPath.empty()) {
+        GTEST_SKIP() << "Failed to create subdirectory for recursive test.";
+    }
+    
     std::string rule = R"(rule test_rule {
     strings:
         $a = "test"
@@ -732,7 +742,7 @@ TEST_F(SignatureBuilderImportTest, ImportWithSpecialCharactersInPath) {
     auto filePath = CreateTempFile(content, L"hashes_with_special_chars_!@#$.txt");
     
     StoreError err = m_builder->ImportHashesFromFile(filePath);
-    EXPECT_TRUE(err.IsSuccess() || !err.IsSuccess());
+    EXPECT_TRUE(err.IsSuccess());
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPermissionDenied) {
@@ -745,7 +755,7 @@ TEST_F(SignatureBuilderImportTest, ImportPermissionDenied) {
     SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_READONLY);
     
     StoreError err = m_builder->ImportHashesFromFile(filePath);
-    EXPECT_TRUE(err.IsSuccess() || !err.IsSuccess());
+    EXPECT_TRUE(err.IsSuccess());
     
     // Restore permissions for cleanup
     SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_NORMAL);
@@ -760,7 +770,7 @@ TEST_F(SignatureBuilderImportTest, ImportFileLocked) {
     
     // Try to import while file is locked
     StoreError err = m_builder->ImportHashesFromFile(filePath);
-    EXPECT_TRUE(err.IsSuccess() || !err.IsSuccess());
+    EXPECT_TRUE(err.IsSuccess());
     
     lockedFile.close();
 }
@@ -790,7 +800,7 @@ TEST_F(SignatureBuilderImportTest, ConcurrentHashImports) {
     
     // Verify all imports completed
     for (const auto& err : errors) {
-        EXPECT_TRUE(err.IsSuccess() || !err.IsSuccess());
+        EXPECT_TRUE(err.IsSuccess());
     }
 }
 
@@ -821,17 +831,19 @@ TEST_F(SignatureBuilderImportTest, MixedConcurrentImports) {
     std::string patternContent = "48:8B:05:pattern1:50\n";
     auto patternFile = CreateTempFile(patternContent, L"concurrent_mixed_patterns.txt");
     
-    std::vector<std::thread> threads;
+    std::array<std::thread,2> threads;
     
     // Import hashes in one thread
-    threads.emplace_back([this, &hashFile]() {
-        m_builder->ImportHashesFromFile(hashFile);
-    });
+    threads[0] = std::thread([this, &hashFile]() {
+        StoreError err = m_builder->ImportHashesFromFile(hashFile);
+        EXPECT_TRUE(err.IsSuccess()) << "Hash import failed: " << err.message;
+        });
     
     // Import patterns in another
-    threads.emplace_back([this, &patternFile]() {
-        m_builder->ImportPatternsFromFile(patternFile);
-    });
+    threads[1] = std::thread([this, &patternFile]() {
+        StoreError err = m_builder->ImportPatternsFromFile(patternFile); 
+        EXPECT_TRUE(err.IsSuccess()) << "Pattern import failed: " << err.message;
+        });
     
     for (auto& t : threads) {
         t.join();

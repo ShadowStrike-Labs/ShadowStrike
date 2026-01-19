@@ -67,7 +67,7 @@
     <LinkIncremental>true</LinkIncremental>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <LinkIncremental>true</LinkIncremental>
+    <LinkIncremental>false</LinkIncremental>
     <IntDir>$(ProjectDir)build\$(Configuration)\</IntDir>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
   </PropertyGroup>
@@ -75,7 +75,7 @@
     <LinkIncremental>true</LinkIncremental>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <LinkIncremental>true</LinkIncremental>
+    <LinkIncremental>false</LinkIncremental>
     <IntDir>$(ProjectDir)build\$(Configuration)\</IntDir>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
   </PropertyGroup>
@@ -223,7 +223,7 @@
     <ClCompile Include="src\patternstore\boyer_moore_impl.cpp" />
     <ClCompile Include="src\patternstore\PatternIndex.cpp" />
     <ClCompile Include="src\patternstore\PatternStore.cpp" />
-    <ClCompile Include="src\patternstore\SIMD_matcher_impl.cpp" />
+    <ClCompile Include="src\patternstore\SIMD_Matcher_Impl.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
@@ -234,7 +234,7 @@
     <ClCompile Include="src\signaturestore\SignatureIndex.cpp" />
     <ClCompile Include="src\signaturestore\SignatureIndex_Cache_mngmnt.cpp" />
     <ClCompile Include="src\signaturestore\SignatureIndex_COW.cpp" />
-    <ClCompile Include="src\signaturestore\SignatureIndex_modification.cpp" />
+    <ClCompile Include="src\signaturestore\SignatureIndex_Modification.cpp" />
     <ClCompile Include="src\signaturestore\SignatureIndex_Query.cpp" />
     <ClCompile Include="src\signaturestore\SignatureIndex_stat_maintenance.cpp" />
     <ClCompile Include="src\signaturestore\SignatureStore.cpp" />
@@ -319,7 +319,7 @@
     <ClCompile Include="tests\unit\database_systems\sig_store\sig_format_tests.cpp" />
     <ClCompile Include="tests\unit\database_systems\sig_store\sig_index_tests.cpp" />
     <ClCompile Include="tests\unit\database_systems\sig_store\sig_store_tests.cpp" />
-    <ClCompile Include="tests\unit\database_systems\sig_store\SIMD_matcher_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems\sig_store\SIMD_Matcher_Tests.cpp" />
     <ClCompile Include="tests\unit\database_systems\sig_store\yara_rule_store_tests.cpp" />
     <ClCompile Include="tests\unit\database_systems\threat_intel\ReputationCache_tests.cpp" />
     <ClCompile Include="tests\unit\database_systems\threat_intel\ThreatIntelDatabase_tests.cpp" />
@@ -349,6 +349,7 @@
     <ClCompile Include="tests\unit\utils\JSONUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils\MemoryUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils\NetworkUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\Utils\PE_sig_verf_tests.cpp" />
     <ClCompile Include="tests\unit\utils\ProcessUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils\RegistryUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils\SystemUtils_Tests.cpp" />

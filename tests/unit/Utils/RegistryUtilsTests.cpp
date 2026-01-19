@@ -52,7 +52,9 @@ protected:
         opt.access = KEY_ALL_ACCESS;
         
         // Clean up if exists
-        DeleteKey(HKEY_CURRENT_USER, TEST_ROOT_KEY, opt, nullptr);
+        if (!DeleteKey(HKEY_CURRENT_USER, TEST_ROOT_KEY, opt, nullptr)) {
+			SS_LOG_INFO(L"RegistryUtilsTests", L"Test root key existed, deleted for fresh start.");
+         }
         
         // Create fresh
         ASSERT_TRUE(key.Create(HKEY_CURRENT_USER, TEST_ROOT_KEY, opt, nullptr, &err))
@@ -64,7 +66,9 @@ protected:
         Error err;
         OpenOptions opt;
         opt.access = KEY_ALL_ACCESS;
-        DeleteKeyTree(HKEY_CURRENT_USER, TEST_ROOT_KEY, opt, &err);
+        if (!DeleteKeyTree(HKEY_CURRENT_USER, TEST_ROOT_KEY, opt, &err)) {
+			SS_LOG_ERROR(L"RegistryUtilsTests", (L"Failed to delete test root key: " + err.message).c_str());
+        }
     }
     
     std::wstring GetTestKeyPath(const std::wstring& subpath = L"") const {
@@ -274,9 +278,9 @@ TEST_F(RegistryUtilsTest, EnumValues_MultipleValues_Success) {
     ASSERT_TRUE(key.Open(HKEY_CURRENT_USER, TEST_ROOT_KEY, opt, &err));
     
     // Write multiple values
-    key.WriteString(L"Value1", L"Data1", nullptr);
-    key.WriteDWord(L"Value2", 123, nullptr);
-    key.WriteQWord(L"Value3", 456, nullptr);
+    key.WriteString(L"Value1", L"Data1", nullptr);//-V530
+    key.WriteDWord(L"Value2", 123, nullptr);//-V530
+    key.WriteQWord(L"Value3", 456, nullptr);//-V530
     
     std::vector<ValueInfo> values;
     ASSERT_TRUE(key.EnumValues(values, &err));
@@ -439,7 +443,7 @@ TEST_F(RegistryUtilsTest, EdgeCase_LargeMultiString_Success) {
     // Create 100 strings
     std::vector<std::wstring> strings;
     for (int i = 0; i < 100; ++i) {
-        strings.push_back(L"String_" + std::to_wstring(i));
+        strings.emplace_back(L"String_" + std::to_wstring(i));
     }
     
     ASSERT_TRUE(key.WriteMultiString(L"LargeMulti", strings, &err));
@@ -561,7 +565,7 @@ TEST_F(RegistryUtilsTest, Security_ReadMultiString_MalformedData_Protected) {
     // Write valid multi-string first
     std::vector<std::wstring> strings;
     for (int i = 0; i < 10; ++i) {
-        strings.push_back(L"String_" + std::to_wstring(i));
+        strings.emplace_back(L"String_" + std::to_wstring(i));
     }
     ASSERT_TRUE(key.WriteMultiString(L"TestMalformed", strings, &err));
     

@@ -52,13 +52,15 @@ namespace ShadowStrike {
          * Thread-safe via atomic stores.
          */
         void SignatureIndex::ResetStatistics() noexcept {
+            // Reset counters
             m_totalLookups.store(0, std::memory_order_release);
             m_cacheHits.store(0, std::memory_order_release);
             m_cacheMisses.store(0, std::memory_order_release);
 
-            SS_LOG_DEBUG(L"SignatureIndex", L"Statistics reset");
-            m_cacheHits.store(0, std::memory_order_release);
-            m_cacheMisses.store(0, std::memory_order_release);
+            // Clear cache so subsequent measurements start from a cold state
+            ClearCache();
+
+            SS_LOG_DEBUG(L"SignatureIndex", L"Statistics reset (counters and cache cleared)");
         }
 
         // ============================================================================
@@ -115,9 +117,13 @@ namespace ShadowStrike {
             // STEP 1: VALIDATION & PRECONDITIONS
             // ========================================================================
 
-            if (!m_view || !m_view->IsValid()) {
-                SS_LOG_ERROR(L"SignatureIndex", L"Rebuild: Memory mapping is invalid");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Memory mapping not valid" };
+            // Supports both memory-mapped and raw buffer modes
+            const bool hasValidView = m_view && m_view->IsValid();
+            const bool hasRawBuffer = m_baseAddress != nullptr && m_indexSize > 0;
+            
+            if (!hasValidView && !hasRawBuffer) {
+                SS_LOG_ERROR(L"SignatureIndex", L"Rebuild: Index not initialized (no valid view or raw buffer)");
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Index not initialized" };
             }
 
             // ========================================================================
@@ -150,9 +156,11 @@ namespace ShadowStrike {
             std::vector<std::pair<uint64_t, uint64_t>> allEntries;
             allEntries.reserve(originalEntries);
 
-            // Use ForEach to enumerate all entries (maintains sorted order from B+Tree)
+            // Use ForEachInternalNoLock to enumerate all entries (we already hold the lock)
+            // CRITICAL FIX: Cannot use ForEach() - it tries to acquire shared_lock on m_rwLock
+            // but we already hold unique_lock, causing deadlock (std::shared_mutex is NOT recursive)
             try {
-                ForEach([&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
+                ForEachInternalNoLock([&](uint64_t fastHash, uint64_t signatureOffset) -> bool {
                     allEntries.emplace_back(fastHash, signatureOffset);
                     entriesProcessed++;
 
@@ -214,8 +222,11 @@ namespace ShadowStrike {
 
             SS_LOG_DEBUG(L"SignatureIndex", L"Rebuild: Clearing existing tree structures");
 
-            // Clear COW nodes
+            // Clear COW nodes and tracking maps
             m_cowNodes.clear();
+            m_fileOffsetToCOWNode.clear();
+            m_truncatedAddrToCOWNode.clear();
+            m_cowRootNode = nullptr;
 
             // Clear node cache
             ClearCache();
@@ -224,6 +235,10 @@ namespace ShadowStrike {
             m_rootOffset.store(0, std::memory_order_release);
             m_treeHeight.store(1, std::memory_order_release);
             m_totalEntries.store(0, std::memory_order_release);
+            
+            // CRITICAL: Reset allocation offset so new nodes start from beginning
+            // This allows the rebuilt tree to reuse the same space
+            m_currentOffset = 0;
 
             SS_LOG_TRACE(L"SignatureIndex", L"Rebuild: Tree structures cleared");
 
@@ -245,7 +260,11 @@ namespace ShadowStrike {
             newRoot->nextLeaf = 0;
             newRoot->prevLeaf = 0;
 
-            m_rootOffset.store(0, std::memory_order_release); // Root is first allocated node
+            // CRITICAL FIX: Set m_cowRootNode so that FindLeafForCOW uses this new root
+            // instead of trying to clone from the old file root offset.
+            // The COW transaction will write this node and update m_rootOffset on commit.
+            m_cowRootNode = newRoot;
+            m_rootOffset.store(0, std::memory_order_release); // Placeholder, will be updated on commit
             m_treeHeight.store(1, std::memory_order_release);
 
             // ========================================================================
@@ -255,30 +274,39 @@ namespace ShadowStrike {
             SS_LOG_INFO(L"SignatureIndex",
                 L"Rebuild: Rebuilding B+Tree with %llu entries", allEntries.size());
 
-            // Re-insert all entries using InsertInternal (we already hold the lock)
-            // FIX: CRITICAL DEADLOCK FIX - Cannot call BatchInsert() while holding lock
-            // because BatchInsert() also tries to acquire the same non-recursive lock.
-            // Use InsertInternal() directly since we already hold exclusive lock.
+            // Re-insert all entries using InsertInternalRaw (we already hold the lock)
+            // CRITICAL: Use InsertInternalRaw instead of InsertInternal because we have
+            // the raw fastHash keys from enumeration. InsertInternal would call FastHash()
+            // on the HashValue which re-hashes the data and produces different keys!
             if (!allEntries.empty()) {
                 m_inCOWTransaction.store(true, std::memory_order_release);
 
                 size_t successCount = 0;
+                size_t duplicateCount = 0;
                 StoreError lastError{ SignatureStoreError::Success };
 
                 for (size_t i = 0; i < allEntries.size(); ++i) {
                     const auto& [fastHash, offset] = allEntries[i];
 
-                    // Create HashValue from fastHash for InsertInternal
-                    HashValue hash{};
-                    hash.type = HashType::SHA256; // Placeholder type (actual type info lost in rebuild)
-                    hash.length = 8; // Placeholder
-                    // Store fastHash in data for FastHash() to return correctly
-                    std::memcpy(hash.data.data(), &fastHash, sizeof(fastHash));
-
-                    // Insert using internal method (no lock - we already hold it)
-                    StoreError err = InsertInternal(hash, offset);
+                    // Insert using raw fastHash method (no lock - we already hold it)
+                    // This preserves the original fastHash without re-hashing
+                    StoreError err = InsertInternalRaw(fastHash, offset);
 
                     if (err.IsSuccess()) {
+                        // CRITICAL FIX: Commit after each insert to ensure subsequent inserts
+                        // see the updated tree structure. This is the same pattern as BatchInsert.
+                        // The COW pool only holds in-memory modifications that FindLeaf cannot see,
+                        // so we must persist each modification before the next insert can correctly
+                        // traverse the tree.
+                        StoreError commitErr = CommitCOWInternal(true); // Keep transaction open
+                        if (!commitErr.IsSuccess()) {
+                            SS_LOG_ERROR(L"SignatureIndex",
+                                L"Rebuild: Intermediate commit failed at entry %zu: %S",
+                                i, commitErr.message.c_str());
+                            lastError = commitErr;
+                            break;
+                        }
+                        
                         successCount++;
 
                         if ((i + 1) % 10000 == 0) {
@@ -288,9 +316,11 @@ namespace ShadowStrike {
                         }
                     }
                     else if (err.code == SignatureStoreError::DuplicateEntry) {
-                        // Skip duplicates
-                        SS_LOG_DEBUG(L"SignatureIndex",
-                            L"Rebuild: Entry %zu is duplicate, skipping", i);
+                        // Skip duplicates - but log for debugging
+                        duplicateCount++;
+                        SS_LOG_WARN(L"SignatureIndex",
+                            L"Rebuild: Entry %zu (fastHash=0x%llX) is duplicate #%zu, skipping",
+                            i, fastHash, duplicateCount);
                         continue;
                     }
                     else {
@@ -302,18 +332,17 @@ namespace ShadowStrike {
                         break;
                     }
                 }
+                
+                if (duplicateCount > 0) {
+                    SS_LOG_WARN(L"SignatureIndex",
+                        L"Rebuild: %zu entries were skipped as duplicates (success=%zu, total=%zu)",
+                        duplicateCount, successCount, allEntries.size());
+                }
 
-                // Commit COW transaction
+                // Final commit (close the transaction)
                 if (lastError.IsSuccess() && successCount > 0) {
-                    StoreError commitErr = CommitCOW();
-                    if (!commitErr.IsSuccess()) {
-                        SS_LOG_ERROR(L"SignatureIndex",
-                            L"Rebuild: Failed to commit COW: %S",
-                            commitErr.message.c_str());
-                        RollbackCOW();
-                        m_inCOWTransaction.store(false, std::memory_order_release);
-                        return commitErr;
-                    }
+                    // Set keepTransactionOpen = false to close the transaction
+                    m_inCOWTransaction.store(false, std::memory_order_release);
                 }
                 else if (!lastError.IsSuccess()) {
                     RollbackCOW();
@@ -361,7 +390,8 @@ namespace ShadowStrike {
             SS_LOG_DEBUG(L"SignatureIndex", L"Rebuild: Validating tree invariants");
 
             std::string invariantErrors;
-            if (!ValidateInvariants(invariantErrors)) {
+            // Use internal version to avoid deadlock - we already hold m_rwLock
+            if (!ValidateInvariantsInternal(invariantErrors)) {
                 SS_LOG_ERROR(L"SignatureIndex",
                     L"Rebuild: Tree invariant validation failed: %S",
                     invariantErrors.c_str());
@@ -486,10 +516,14 @@ namespace ShadowStrike {
             // STEP 1: VALIDATION & PRECONDITIONS
             // ========================================================================
 
-            if (!m_view || !m_view->IsValid()) {
-                SS_LOG_ERROR(L"SignatureIndex", L"Compact: Memory mapping is invalid");
+            // Supports both memory-mapped and raw buffer modes
+            const bool hasValidView = m_view && m_view->IsValid();
+            const bool hasRawBuffer = m_baseAddress != nullptr && m_indexSize > 0;
+            
+            if (!hasValidView && !hasRawBuffer) {
+                SS_LOG_ERROR(L"SignatureIndex", L"Compact: Index not initialized (no valid view or raw buffer)");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                                  "Memory mapping not valid" };
+                                  "Index not initialized" };
             }
 
             // ========================================================================
@@ -800,7 +834,8 @@ namespace ShadowStrike {
             SS_LOG_DEBUG(L"SignatureIndex", L"Compact: Verifying tree invariants");
 
             std::string invariantErrors;
-            if (!ValidateInvariants(invariantErrors)) {
+            // Use internal version to avoid deadlock - we already hold m_rwLock
+            if (!ValidateInvariantsInternal(invariantErrors)) {
                 SS_LOG_WARN(L"SignatureIndex",
                     L"Compact: Invariant validation reported issues: %S",
                     invariantErrors.c_str());

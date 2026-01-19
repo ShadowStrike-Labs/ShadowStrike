@@ -4712,7 +4712,7 @@ bool EnumerateProcessesWMI(std::vector<ProcessBasicInfo>& processes, Error* err)
     IWbemClassObject* pclsObj = nullptr;
     ULONG uReturn = 0;
 
-    while (pEnumerator) {
+    while (true) {
         hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
         if (FAILED(hr) || uReturn == 0 || !pclsObj) break;
 

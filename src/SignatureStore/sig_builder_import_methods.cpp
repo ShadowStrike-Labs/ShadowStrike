@@ -531,10 +531,12 @@ namespace {
                 L"ImportHashesFromFile: Complete - %zu valid, %zu invalid from %zu lines in %llu µs",
                 validCount, invalidCount, lineNum, elapsedUs);
 
+            // For partial imports (some valid, some invalid), we consider it a success
+            // but log a warning. The caller can check statistics for details.
             if (invalidCount > 0) {
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "Import completed with errors: " + std::to_string(validCount) + " valid, " +
-                    std::to_string(invalidCount) + " invalid" };
+                SS_LOG_WARN(L"SignatureBuilder",
+                    L"ImportHashesFromFile: Partial import - %zu valid, %zu invalid entries",
+                    validCount, invalidCount);
             }
 
             return StoreError{ SignatureStoreError::Success };
@@ -1813,7 +1815,16 @@ namespace {
             }
 
             // ========================================================================
-            // STEP 6: BULK DATABASE INTEGRATION
+            // STEP 6: BULK DATABASE INTEGRATION (using AddHashBatch for efficiency)
+            // ========================================================================
+            // 
+            // PERFORMANCE OPTIMIZATION:
+            // Using AddHashBatch instead of individual AddHash calls to:
+            // - Acquire lock only ONCE for entire batch (vs N times)
+            // - Avoid lock contention and sleep delays with large imports
+            // - Enable batch-level duplicate detection
+            // - Dramatically reduce import time for large JSON arrays
+            //
             // ========================================================================
 
             if (validCount == 0) {
@@ -1823,13 +1834,8 @@ namespace {
             LARGE_INTEGER startTime{}, endTime{};
             QueryPerformanceCounter(&startTime);
 
-            for (auto& entry : batchEntries) {
-                // AddHash performs deduplication internally
-                StoreError err = AddHash(entry);
-                if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
-                    SS_LOG_WARN(L"SignatureBuilder", L"ImportHashesFromJson: Integration failed for '%S'", entry.name.c_str());
-                }
-            }
+            // Use AddHashBatch for efficient bulk insertion (single lock acquisition)
+            StoreError batchResult = AddHashBatch(batchEntries);
 
             QueryPerformanceCounter(&endTime);
             const uint64_t elapsedUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
@@ -1838,8 +1844,20 @@ namespace {
                 L"Valid: %zu, Invalid/Skipped: %zu, Time: %llu us",
                 validCount, invalidCount, elapsedUs);
 
-            return (invalidCount == 0) ? StoreError{ SignatureStoreError::Success }
-            : StoreError{ SignatureStoreError::InvalidFormat, 0, "Import partial success" };
+            // Handle batch result:
+            // - Success: all entries added successfully
+            // - DuplicateEntry: some/all entries were duplicates (still a partial success)
+            // - Other errors: propagate the error
+            if (batchResult.IsSuccess() || batchResult.code == SignatureStoreError::DuplicateEntry) {
+                // Partial success if there were invalid entries during parsing
+                return (invalidCount == 0) ? StoreError{ SignatureStoreError::Success }
+                    : StoreError{ SignatureStoreError::Success, 0, "Import completed with some invalid entries skipped" };
+            }
+
+            // Propagate batch error
+            SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromJson: Batch insert failed: %S", 
+                batchResult.message.c_str());
+            return batchResult;
         }
 
         StoreError SignatureBuilder::ImportPatternsFromClamAV(

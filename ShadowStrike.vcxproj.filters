@@ -111,7 +111,7 @@
     <ClCompile Include="src\patternstore\PatternStore.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\patternstore\SIMD_matcher_impl.cpp">
+    <ClCompile Include="src\patternstore\SIMD_Matcher_Impl.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\signaturestore\batch_sig_builder.cpp">
@@ -132,7 +132,7 @@
     <ClCompile Include="src\signaturestore\SignatureIndex_COW.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\signaturestore\SignatureIndex_modification.cpp">
+    <ClCompile Include="src\signaturestore\SignatureIndex_Modification.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\signaturestore\SignatureIndex_Query.cpp">
@@ -333,7 +333,7 @@
     <ClCompile Include="tests\unit\database_systems\sig_store\sig_store_tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\SIMD_matcher_tests.cpp">
+    <ClCompile Include="tests\unit\database_systems\sig_store\b.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\database_systems\sig_store\yara_rule_store_tests.cpp">
@@ -490,6 +490,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\ThreatIntel\ThreatIntelStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Utils\PE_sig_verf_tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

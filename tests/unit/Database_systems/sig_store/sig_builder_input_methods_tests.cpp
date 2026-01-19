@@ -66,30 +66,46 @@ protected:
         builder.reset();
     }
 
-    // Helper: Create valid MD5 hash
-    HashValue CreateValidMD5(uint8_t fillByte = 0xAB) {
+    // Helper: Create valid MD5 hash with sufficient entropy
+    HashValue CreateValidMD5(uint8_t baseByte = 0xAB) {
         HashValue hash{};
         hash.type = HashType::MD5;
         hash.length = 16;
-        std::fill_n(hash.data.begin(), hash.length, fillByte);
+        // Use deterministic pseudo-random data based on baseByte for sufficient entropy
+        // This ensures each byte is different, providing good entropy
+        std::mt19937 rng(static_cast<unsigned int>(baseByte) * 1000 + 12345);
+        std::uniform_int_distribution<uint32_t> dist(0, 255);
+        for (uint8_t i = 0; i < hash.length; ++i) {
+            hash.data[i] = static_cast<uint8_t>(dist(rng));
+        }
         return hash;
     }
 
-    // Helper: Create valid SHA256 hash
-    HashValue CreateValidSHA256(uint8_t fillByte = 0xCD) {
+    // Helper: Create valid SHA256 hash with sufficient entropy
+    HashValue CreateValidSHA256(uint8_t baseByte = 0xCD) {
         HashValue hash{};
         hash.type = HashType::SHA256;
         hash.length = 32;
-        std::fill_n(hash.data.begin(), hash.length, fillByte);
+        // Use deterministic pseudo-random data based on baseByte for sufficient entropy
+        std::mt19937 rng(static_cast<unsigned int>(baseByte) * 2000 + 54321);
+        std::uniform_int_distribution<uint32_t> dist(0, 255);
+        for (uint8_t i = 0; i < hash.length; ++i) {
+            hash.data[i] = static_cast<uint8_t>(dist(rng));
+        }
         return hash;
     }
 
-    // Helper: Create valid SHA512 hash
-    HashValue CreateValidSHA512(uint8_t fillByte = 0xEF) {
+    // Helper: Create valid SHA512 hash with sufficient entropy
+    HashValue CreateValidSHA512(uint8_t baseByte = 0xEF) {
         HashValue hash{};
         hash.type = HashType::SHA512;
         hash.length = 64;
-        std::fill_n(hash.data.begin(), hash.length, fillByte);
+        // Use deterministic pseudo-random data based on baseByte for sufficient entropy
+        std::mt19937 rng(static_cast<unsigned int>(baseByte) * 3000 + 98765);
+        std::uniform_int_distribution<uint32_t> dist(0, 255);
+        for (uint8_t i = 0; i < hash.length; ++i) {
+            hash.data[i] = static_cast<uint8_t>(dist(rng));
+        }
         return hash;
     }
 
@@ -382,7 +398,7 @@ TEST_F(SignatureBuilderInputTest, AddHash_TooManyTags_ShouldFail) {
     
     // INVALID: 33 tags (max is 32)
     for (int i = 0; i < 33; ++i) {
-        input.tags.push_back("tag" + std::to_string(i));
+        input.tags.emplace_back("tag" + std::to_string(i));
     }
 
     // ACT
@@ -402,7 +418,7 @@ TEST_F(SignatureBuilderInputTest, AddHash_MaxTags_ShouldSucceed) {
     
     // VALID: exactly 32 tags
     for (int i = 0; i < 32; ++i) {
-        input.tags.push_back("tag" + std::to_string(i));
+        input.tags.emplace_back("tag" + std::to_string(i));
     }
 
     // ACT
@@ -434,7 +450,7 @@ TEST_F(SignatureBuilderInputTest, AddHash_TagTooLong_ShouldFail) {
     input.hash = CreateValidMD5();
     input.name = "ValidName";
     input.threatLevel = ThreatLevel::High;
-    input.tags.push_back(std::string(129, 'T'));  // INVALID: tag too long (max 128)
+    input.tags.emplace_back(std::string(129, 'T'));  // INVALID: tag too long (max 128)
 
     // ACT
     StoreError result = builder->AddHash(input);
@@ -450,7 +466,7 @@ TEST_F(SignatureBuilderInputTest, AddHash_TagWithNullByte_ShouldFail) {
     input.hash = CreateValidMD5();
     input.name = "ValidName";
     input.threatLevel = ThreatLevel::High;
-    input.tags.push_back(std::string("tag\0injection", 13));  // INVALID: null byte
+    input.tags.emplace_back(std::string("tag\0injection", 13));  // INVALID: null byte
 
     // ACT
     StoreError result = builder->AddHash(input);
@@ -806,7 +822,7 @@ TEST_F(SignatureBuilderInputTest, AddPattern_TooManyTags_ShouldFail) {
     input.threatLevel = ThreatLevel::High;
     
     for (int i = 0; i < 33; ++i) {  // INVALID: 33 tags
-        input.tags.push_back("tag" + std::to_string(i));
+        input.tags.emplace_back("tag" + std::to_string(i));
     }
 
     // ACT
@@ -1195,7 +1211,7 @@ TEST_F(SignatureBuilderInputTest, AddHashBatch_ValidInputs_ShouldSucceed) {
 
 TEST_F(SignatureBuilderInputTest, AddHashBatch_WithInvalidInput_ShouldPartiallySucceed) {
     // ARRANGE
-    std::vector<HashSignatureInput> inputs;
+    std::vector<HashSignatureInput> inputs;//-V826
     
     // Add valid hash
     HashSignatureInput valid{};
@@ -1225,7 +1241,7 @@ TEST_F(SignatureBuilderInputTest, AddHashBatch_WithInvalidInput_ShouldPartiallyS
 
 TEST_F(SignatureBuilderInputTest, AddHashBatch_WithDuplicates_ShouldDetect) {
     // ARRANGE
-    std::vector<HashSignatureInput> inputs;
+    std::vector<HashSignatureInput> inputs;//-V826
     
     HashSignatureInput input1{};
     input1.hash = CreateValidMD5(0xCC);
@@ -1441,13 +1457,13 @@ TEST_F(SignatureBuilderInputTest, AddHash_Statistics_ShouldBeAccurate) {
     input1.hash = CreateValidMD5(0x11);
     input1.name = "Hash1";
     input1.threatLevel = ThreatLevel::High;
-    builder->AddHash(input1);
+    builder->AddHash(input1);//-V530
 
     HashSignatureInput input2{};
     input2.hash = CreateValidMD5(0x22);
     input2.name = "Hash2";
     input2.threatLevel = ThreatLevel::High;
-    builder->AddHash(input2);
+    builder->AddHash(input2);//-V530
 
     // ASSERT
     BuildStatistics stats = builder->GetStatistics();
@@ -1460,13 +1476,13 @@ TEST_F(SignatureBuilderInputTest, AddPattern_Statistics_ShouldBeAccurate) {
     input1.patternString = "4D 5A 90 00";
     input1.name = "Pattern1";
     input1.threatLevel = ThreatLevel::High;
-    builder->AddPattern(input1);
+    builder->AddPattern(input1);//-V530
 
     PatternSignatureInput input2{};
     input2.patternString = "50 45 00 00";
     input2.name = "Pattern2";
     input2.threatLevel = ThreatLevel::Medium;
-    builder->AddPattern(input2);
+    builder->AddPattern(input2);//-V530
 
     // ASSERT
     BuildStatistics stats = builder->GetStatistics();
@@ -1521,12 +1537,17 @@ TEST_F(SignatureBuilderInputTest, AddPattern_SingleBytePattern_ShouldSucceed) {
 
 TEST_F(SignatureBuilderInputTest, AddHash_AllHashTypes_ShouldSucceed) {
     // Test all hash types with correct lengths
+    // Using high-entropy data to pass entropy validation
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<uint32_t> dist(0, 255);
     
     // MD5
     HashSignatureInput md5{};
     md5.hash.type = HashType::MD5;
     md5.hash.length = 16;
-    std::fill_n(md5.hash.data.begin(),  md5.hash.length, 0xAA);
+    for (uint8_t i = 0; i < md5.hash.length; ++i) {
+        md5.hash.data[i] = static_cast<uint8_t>(dist(rng));
+    }
     md5.name = "MD5_Test";
     md5.threatLevel = ThreatLevel::High;
     EXPECT_TRUE(builder->AddHash(md5).IsSuccess());
@@ -1535,7 +1556,9 @@ TEST_F(SignatureBuilderInputTest, AddHash_AllHashTypes_ShouldSucceed) {
     HashSignatureInput sha1{};
     sha1.hash.type = HashType::SHA1;
     sha1.hash.length = 20;
-    std::fill_n(sha1.hash.data.begin(), sha1.hash.length, 0xBB);
+    for (uint8_t i = 0; i < sha1.hash.length; ++i) {
+        sha1.hash.data[i] = static_cast<uint8_t>(dist(rng));
+    }
     sha1.name = "SHA1_Test";
     sha1.threatLevel = ThreatLevel::High;
     EXPECT_TRUE(builder->AddHash(sha1).IsSuccess());
@@ -1544,7 +1567,9 @@ TEST_F(SignatureBuilderInputTest, AddHash_AllHashTypes_ShouldSucceed) {
     HashSignatureInput sha256{};
     sha256.hash.type = HashType::SHA256;
     sha256.hash.length = 32;
-    std::fill_n(sha256.hash.data.begin(), sha256.hash.length, 0xCC);
+    for (uint8_t i = 0; i < sha256.hash.length; ++i) {
+        sha256.hash.data[i] = static_cast<uint8_t>(dist(rng));
+    }
     sha256.name = "SHA256_Test";
     sha256.threatLevel = ThreatLevel::High;
     EXPECT_TRUE(builder->AddHash(sha256).IsSuccess());
@@ -1553,7 +1578,9 @@ TEST_F(SignatureBuilderInputTest, AddHash_AllHashTypes_ShouldSucceed) {
     HashSignatureInput sha512{};
     sha512.hash.type = HashType::SHA512;
     sha512.hash.length = 64;
-    std::fill_n(sha512.hash.data.begin(),  sha512.hash.length, 0xDD);
+    for (uint8_t i = 0; i < sha512.hash.length; ++i) {
+        sha512.hash.data[i] = static_cast<uint8_t>(dist(rng));
+    }
     sha512.name = "SHA512_Test";
     sha512.threatLevel = ThreatLevel::High;
     EXPECT_TRUE(builder->AddHash(sha512).IsSuccess());

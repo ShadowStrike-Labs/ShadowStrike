@@ -405,7 +405,10 @@ namespace SystemUtils {
         // Determine 64-bit OS and WOW64 status
         bool isWow64 = false;
         USHORT processMachine = 0;
-        IsWow64Process2Safe(isWow64, processMachine);
+        if(!IsWow64Process2Safe(isWow64, processMachine)){
+            SS_LOG_ERROR(L"SystemUtils", L"IsWow64Process2Safe failed");
+            return false;
+		}
         out.isWow64Process = isWow64;
 
         SYSTEM_INFO sysInfo{};
@@ -418,11 +421,21 @@ namespace SystemUtils {
         ScopedRegKey regKey;
         if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, kWindowsVersionRegKey,
                            0, KEY_READ | KEY_WOW64_64KEY, regKey.GetAddressOf()) == ERROR_SUCCESS) {
-            ReadRegistryString(regKey.Get(), L"ProductName", out.productName);
-            ReadRegistryString(regKey.Get(), L"ReleaseId", out.releaseId);
-            ReadRegistryString(regKey.Get(), L"DisplayVersion", out.displayVersion);
-            ReadRegistryString(regKey.Get(), L"EditionID", out.editionId);
-            ReadRegistryString(regKey.Get(), L"CurrentBuild", out.currentBuild);
+            if (!ReadRegistryString(regKey.Get(), L"ProductName", out.productName)) {
+				SS_LOG_ERROR(L"SystemUtils", L"Failed to read ProductName from registry");
+            }
+            if (!ReadRegistryString(regKey.Get(), L"ReleaseId", out.releaseId)) {
+                SS_LOG_ERROR(L"SystemUtils", L"Failed to read ReleaseId from registry");
+            }
+            if (!ReadRegistryString(regKey.Get(), L"DisplayVersion", out.displayVersion)) {
+                SS_LOG_ERROR(L"SystemUtils", L"Failed to read DisplayVersion from registry");
+            }
+            if (!ReadRegistryString(regKey.Get(), L"EditionID", out.editionId)) {
+                SS_LOG_ERROR(L"SystemUtils", L"Failed to read EditionID from registry");
+            }
+            if (!ReadRegistryString(regKey.Get(), L"CurrentBuild", out.currentBuild)) {
+                SS_LOG_ERROR(L"SystemUtils", L"Failed to read CurrentBuild from registry");
+            }
         }
 
         // Check if Windows Server

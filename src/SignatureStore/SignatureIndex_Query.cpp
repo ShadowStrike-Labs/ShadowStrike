@@ -53,6 +53,17 @@ namespace ShadowStrike {
                 return offset;
             }
 
+            // TRACE: Log when key is not found (not INFO - would flood logs)
+            SS_LOG_TRACE(L"SignatureIndex",
+                L"LookupByFastHashInternal: Key 0x%llX NOT FOUND in leaf (pos=%u, keyCount=%u)",
+                fastHash, pos, leaf->keyCount);
+            if (leaf->keyCount > 0) {
+                SS_LOG_TRACE(L"SignatureIndex",
+                    L"LookupByFastHashInternal: Leaf key[0]=0x%llX, key[last]=0x%llX, key[pos]=0x%llX",
+                    leaf->keys[0], leaf->keys[leaf->keyCount - 1],
+                    pos < leaf->keyCount ? leaf->keys[pos] : 0ULL);
+            }
+
             return std::nullopt;
         }
 
