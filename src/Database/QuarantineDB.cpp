@@ -839,7 +839,6 @@ namespace ShadowStrike {
             }
 
             // Calculate hashes
-            // std::byte -> uint8_t dönüşümü açık cast gerektirir; doğrudan iterator ctor çalışmaz.
             std::vector<uint8_t> rawData;
             rawData.resize(fileData.size());
             std::transform(fileData.begin(), fileData.end(), rawData.begin(),

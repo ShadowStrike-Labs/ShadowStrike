@@ -15,7 +15,7 @@ namespace ShadowStrike {
         // MODIFICATION OPERATIONS
         // ============================================================================
 
-        // Internal insert helper - CALLER MUST HOLD EXCLUSIVE LOCK
+         // Internal insert helper - CALLER MUST HOLD EXCLUSIVE LOCK
         StoreError SignatureIndex::InsertInternal(
             const HashValue& hash,
             uint64_t signatureOffset
@@ -36,11 +36,17 @@ namespace ShadowStrike {
             uint64_t fastHash = hash.FastHash();
 
             // ================================================================
-            // FIND LEAF FOR INSERTION (COW-AWARE)
+            // CRITICAL FIX: Use FindLeafForCOW instead of FindLeaf
             // ================================================================
-            // Use FindLeafForCOW which properly traverses COW tree structure
-            // when splits have occurred in this transaction. This ensures we
-            // insert into the correct leaf after the tree has been modified.
+            // FindLeafForCOW performs path-copying: it clones all nodes from
+            // root to leaf, updating parent-child pointers along the way.
+            // This ensures that when we modify the leaf, the entire path
+            // is COW-safe and the parent points to the cloned leaf.
+            //
+            // Previously, we used FindLeaf + CloneNode which only cloned
+            // the leaf itself, leaving the parent pointing to the old leaf.
+            // This caused data loss because the modified leaf was orphaned.
+            // ================================================================
             BPlusTreeNode* leaf = FindLeafForCOW(fastHash);
             if (!leaf) {
                 SS_LOG_ERROR(L"SignatureIndex", L"InsertInternal: Leaf not found for hash");
@@ -66,6 +72,8 @@ namespace ShadowStrike {
                     L"InsertInternal: Duplicate hash 0x%llX", fastHash);
                 return StoreError{ SignatureStoreError::DuplicateEntry, 0, "Hash already exists" };
             }
+
+            // NOTE: No need to clone here - FindLeafForCOW already returns a COW node
 
             // Check if node has space for insertion
             if (leaf->keyCount < BPlusTreeNode::MAX_KEYS) {
@@ -120,7 +128,6 @@ namespace ShadowStrike {
                 uint64_t splitKey = 0;
 
                 StoreError err = SplitNode(leaf, splitKey, &newLeaf);
-                
                 if (!err.IsSuccess()) {
                     SS_LOG_ERROR(L"SignatureIndex",
                         L"InsertInternal: SplitNode failed: %S", err.message.c_str());
@@ -132,16 +139,7 @@ namespace ShadowStrike {
                     return StoreError{ SignatureStoreError::OutOfMemory, 0, "Split produced null node" };
                 }
 
-                // ================================================================
-                // CRITICAL B+TREE INVARIANT: Determine target leaf for insertion
-                // ================================================================
-                // The splitKey from SplitNode is the first key of the new (right) leaf.
-                // B+Tree invariant: all keys in left < splitKey <= all keys in right
-                // 
-                // We must insert FIRST, then recalculate splitKey if needed.
-                // The splitKey should always be the minimum key of the right leaf.
-                // ================================================================
-                
+                // Insert into appropriate leaf based on split key
                 BPlusTreeNode* targetLeaf = (fastHash < splitKey) ? leaf : newLeaf;
 
                 // SECURITY: Validate target leaf state after split
@@ -181,109 +179,47 @@ namespace ShadowStrike {
                 targetLeaf->children[insertPos] = static_cast<uint32_t>(signatureOffset);
                 targetLeaf->keyCount++;
 
-                // ================================================================
-                // CRITICAL FIX: Update splitKey to reflect the actual minimum key
-                // of the right (new) leaf AFTER insertion.
-                // 
-                // This is necessary because:
-                // 1. If we inserted into the right leaf at position 0, the new key
-                //    becomes the minimum and must be the splitKey.
-                // 2. If we inserted elsewhere, the original splitKey is still valid.
-                //
-                // The splitKey determines parent routing: keys < splitKey go left,
-                // keys >= splitKey go right. Getting this wrong corrupts the tree.
-                // ================================================================
-                if (newLeaf && newLeaf->keyCount > 0) {
-                    // The splitKey MUST be the minimum key of the right leaf
-                    splitKey = newLeaf->keys[0];
-                    
-                    SS_LOG_TRACE(L"SignatureIndex",
-                        L"InsertInternal: Updated splitKey to 0x%llX (first key of right leaf)",
-                        splitKey);
-                }
-
-                // ================================================================
-                // B+TREE SPLIT PROPAGATION: CREATE NEW ROOT OR PROPAGATE TO PARENT
-                // ================================================================
-                // When a leaf splits, we must:
-                // 1. If the split leaf was the root, create a new internal root node
-                // 2. Otherwise, propagate the split key up to the parent
-                // 
-                // For COW semantics, we track the new root via m_cowRootNode
-                // ================================================================
-
-                // Check if the split leaf was the root (parentOffset == 0)
-                // Note: After cloning, leaf->parentOffset still reflects the original
-                if (leaf->parentOffset == 0) {
-                    // Split occurred at root - create new internal root
-                    SS_LOG_INFO(L"SignatureIndex",
-                        L"InsertInternal: Root split occurred - creating new internal root");
-
-                    BPlusTreeNode* newRoot = AllocateNode(false); // isLeaf = false
-                    if (!newRoot) {
-                        SS_LOG_ERROR(L"SignatureIndex",
-                            L"InsertInternal: Failed to allocate new root after split");
-                        return StoreError{ SignatureStoreError::OutOfMemory, 0, 
-                            "Failed to allocate new root" };
-                    }
-
-                    // Set up new root: [child0] splitKey [child1]
-                    // child0 = left leaf (leaf), child1 = right leaf (newLeaf)
-                    newRoot->isLeaf = false;
-                    newRoot->keyCount = 1;
-                    newRoot->keys[0] = splitKey;
-                    
-                    // Store memory pointers temporarily - will be converted to file offsets on commit
-                    // These are COW nodes, so we store their addresses as placeholder offsets
-                    newRoot->children[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leaf));
-                    newRoot->children[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newLeaf));
-                    newRoot->parentOffset = 0; // Root has no parent
-
-                    // Update children's parent pointers
-                    leaf->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-                    newLeaf->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-
-                    // Track new root for CommitCOW
-                    m_cowRootNode = newRoot;
-                    
-                    // CRITICAL: Increment tree height when a new root is created
-                    // This maintains the B+Tree height invariant
-                    uint32_t currentHeight = m_treeHeight.load(std::memory_order_acquire);
-                    m_treeHeight.store(currentHeight + 1, std::memory_order_release);
-
-                    SS_LOG_DEBUG(L"SignatureIndex",
-                        L"InsertInternal: New root created with splitKey=0x%llX, height=%u", 
-                        splitKey, currentHeight + 1);
-                }
-                else {
-                    // Propagate split to parent
-                    SS_LOG_DEBUG(L"SignatureIndex",
-                        L"InsertInternal: Propagating split to parent (splitKey=0x%llX)", splitKey);
-
-                    StoreError propErr = InsertIntoParent(leaf, splitKey, newLeaf);
-                    if (!propErr.IsSuccess()) {
-                        SS_LOG_ERROR(L"SignatureIndex",
-                            L"InsertInternal: Parent propagation failed: %S", propErr.message.c_str());
-                        return propErr;
-                    }
-                }
-
                 m_totalEntries.fetch_add(1, std::memory_order_release);
 
                 SS_LOG_TRACE(L"SignatureIndex",
                     L"InsertInternal: Inserted after split at pos %u", insertPos);
+
+                // ============================================================
+                // CRITICAL: Propagate split to parent
+                // ============================================================
+                // After a leaf split, we must insert the split key into the parent
+                // to maintain B+Tree structure. If the parent doesn't exist (root
+                // split), a new root is created.
+                // ============================================================
+                StoreError parentErr = InsertIntoParent(leaf, splitKey, newLeaf);
+                if (!parentErr.IsSuccess()) {
+                    SS_LOG_ERROR(L"SignatureIndex",
+                        L"InsertInternal: InsertIntoParent failed: %S", parentErr.message.c_str());
+                    return parentErr;
+                }
 
                 return StoreError{ SignatureStoreError::Success };
             }
         }
 
         // ============================================================================
-        // InsertInternalRaw - Insert with raw fastHash (for Rebuild operation)
+        // INSERTINTERNALRAW - RAW FASTHASH INSERTION FOR REBUILD
         // ============================================================================
-        // This variant takes a pre-computed fastHash instead of a HashValue.
-        // Used during Rebuild() when we enumerate entries by their fastHash keys
-        // and need to re-insert without re-hashing (which would produce different keys).
-        // ============================================================================
+
+        /**
+         * @brief Internal insert using pre-computed fastHash.
+         * 
+         * This function is specifically designed for the Rebuild() operation where
+         * we already have the fastHash value from ForEach enumeration. Computing
+         * FastHash() from a reconstructed HashValue would produce incorrect results
+         * since we only store the fastHash, not the original hash data.
+         * 
+         * CALLER MUST HOLD EXCLUSIVE LOCK (m_rwLock) before calling.
+         * 
+         * @param fastHash        Pre-computed fast hash value
+         * @param signatureOffset Offset to signature data
+         * @return StoreError indicating success or failure
+         */
         StoreError SignatureIndex::InsertInternalRaw(
             uint64_t fastHash,
             uint64_t signatureOffset
@@ -295,7 +231,7 @@ namespace ShadowStrike {
             }
 
             // ================================================================
-            // FIND LEAF FOR INSERTION (COW-AWARE)
+            // Use FindLeafForCOW for proper path-copying COW semantics
             // ================================================================
             BPlusTreeNode* leaf = FindLeafForCOW(fastHash);
             if (!leaf) {
@@ -318,19 +254,8 @@ namespace ShadowStrike {
             // Check for duplicate
             uint32_t pos = BinarySearch(leaf->keys, leaf->keyCount, fastHash);
             if (pos < leaf->keyCount && leaf->keys[pos] == fastHash) {
-                SS_LOG_WARN(L"SignatureIndex",
-                    L"InsertInternalRaw: Duplicate hash 0x%llX found at pos %u (leaf keyCount=%u, leaf ptr=0x%p)",
-                    fastHash, pos, leaf->keyCount, static_cast<void*>(leaf));
-                
-                // DEBUG: Log first few keys in this leaf for diagnosis
-                SS_LOG_WARN(L"SignatureIndex",
-                    L"InsertInternalRaw: Leaf keys[0..4]: 0x%llX, 0x%llX, 0x%llX, 0x%llX, 0x%llX",
-                    leaf->keyCount > 0 ? leaf->keys[0] : 0,
-                    leaf->keyCount > 1 ? leaf->keys[1] : 0,
-                    leaf->keyCount > 2 ? leaf->keys[2] : 0,
-                    leaf->keyCount > 3 ? leaf->keys[3] : 0,
-                    leaf->keyCount > 4 ? leaf->keys[4] : 0);
-                    
+                SS_LOG_DEBUG(L"SignatureIndex",
+                    L"InsertInternalRaw: Duplicate hash 0x%llX", fastHash);
                 return StoreError{ SignatureStoreError::DuplicateEntry, 0, "Hash already exists" };
             }
 
@@ -343,7 +268,7 @@ namespace ShadowStrike {
                     pos = leaf->keyCount;
                 }
 
-                // Shift elements to make space
+                // Shift elements to make space (working backwards to avoid overwrites)
                 for (uint32_t i = leaf->keyCount; i > pos; --i) {
                     if (i >= BPlusTreeNode::MAX_KEYS || (i - 1) >= BPlusTreeNode::MAX_KEYS) {
                         SS_LOG_ERROR(L"SignatureIndex",
@@ -361,7 +286,7 @@ namespace ShadowStrike {
                     return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Insert position out of bounds" };
                 }
 
-                // SECURITY: Validate signatureOffset fits in uint32_t if needed
+                // SECURITY: Validate signatureOffset fits in uint32_t
                 if (signatureOffset > UINT32_MAX) {
                     SS_LOG_WARN(L"SignatureIndex",
                         L"InsertInternalRaw: signatureOffset 0x%llX truncated to uint32_t", signatureOffset);
@@ -436,319 +361,353 @@ namespace ShadowStrike {
                 targetLeaf->children[insertPos] = static_cast<uint32_t>(signatureOffset);
                 targetLeaf->keyCount++;
 
-                // ================================================================
-                // CRITICAL FIX: Update splitKey after insertion (same as InsertInternal)
-                // The splitKey MUST be the minimum key of the right leaf for correct
-                // parent routing. See InsertInternal for detailed explanation.
-                // ================================================================
-                if (newLeaf && newLeaf->keyCount > 0) {
-                    splitKey = newLeaf->keys[0];
-                    
-                    SS_LOG_TRACE(L"SignatureIndex",
-                        L"InsertInternalRaw: Updated splitKey to 0x%llX (first key of right leaf)",
-                        splitKey);
-                }
-
-                // ================================================================
-                // B+TREE SPLIT PROPAGATION: CREATE NEW ROOT OR PROPAGATE TO PARENT
-                // ================================================================
-
-                // Check if the split leaf was the root (parentOffset == 0)
-                if (leaf->parentOffset == 0) {
-                    // Split occurred at root - create new internal root
-                    SS_LOG_INFO(L"SignatureIndex",
-                        L"InsertInternalRaw: Root split occurred - creating new internal root");
-
-                    BPlusTreeNode* newRoot = AllocateNode(false); // isLeaf = false
-                    if (!newRoot) {
-                        SS_LOG_ERROR(L"SignatureIndex",
-                            L"InsertInternalRaw: Failed to allocate new root after split");
-                        return StoreError{ SignatureStoreError::OutOfMemory, 0, 
-                            "Failed to allocate new root" };
-                    }
-
-                    // Set up new root: [child0] splitKey [child1]
-                    newRoot->isLeaf = false;
-                    newRoot->keyCount = 1;
-                    newRoot->keys[0] = splitKey;
-                    
-                    // Store memory pointers temporarily
-                    newRoot->children[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leaf));
-                    newRoot->children[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newLeaf));
-                    newRoot->parentOffset = 0; // Root has no parent
-
-                    // Update children's parent pointers
-                    leaf->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-                    newLeaf->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-
-                    // Track new root for CommitCOW
-                    m_cowRootNode = newRoot;
-                    
-                    // CRITICAL: Increment tree height when a new root is created
-                    uint32_t currentHeight = m_treeHeight.load(std::memory_order_acquire);
-                    m_treeHeight.store(currentHeight + 1, std::memory_order_release);
-
-                    SS_LOG_DEBUG(L"SignatureIndex",
-                        L"InsertInternalRaw: New root created with splitKey=0x%llX, height=%u", 
-                        splitKey, currentHeight + 1);
-                }
-                else {
-                    // Propagate split to parent
-                    SS_LOG_DEBUG(L"SignatureIndex",
-                        L"InsertInternalRaw: Propagating split to parent (splitKey=0x%llX)", splitKey);
-
-                    StoreError propErr = InsertIntoParent(leaf, splitKey, newLeaf);
-                    if (!propErr.IsSuccess()) {
-                        SS_LOG_ERROR(L"SignatureIndex",
-                            L"InsertInternalRaw: Parent propagation failed: %S", propErr.message.c_str());
-                        return propErr;
-                    }
-                }
-
                 m_totalEntries.fetch_add(1, std::memory_order_release);
 
                 SS_LOG_TRACE(L"SignatureIndex",
                     L"InsertInternalRaw: Inserted after split at pos %u", insertPos);
+
+                // Propagate split to parent
+                StoreError parentErr = InsertIntoParent(leaf, splitKey, newLeaf);
+                if (!parentErr.IsSuccess()) {
+                    SS_LOG_ERROR(L"SignatureIndex",
+                        L"InsertInternalRaw: InsertIntoParent failed: %S", parentErr.message.c_str());
+                    return parentErr;
+                }
 
                 return StoreError{ SignatureStoreError::Success };
             }
         }
 
         // ============================================================================
-        // InsertIntoParent - Insert split key into parent node (recursive)
+        // INSERTINTOPARENT - ENTERPRISE-GRADE IMPLEMENTATION
         // ============================================================================
+
+        /**
+         * @brief Insert split key into parent node after child split.
+         *
+         * When a node splits, the split key must be propagated to the parent.
+         * If the parent doesn't exist (root node split), a new root is created.
+         * If the parent becomes full, it is recursively split.
+         *
+         * @param leftChild  The original (left) child node after split
+         * @param splitKey   The key that separates leftChild and rightChild
+         * @param rightChild The new (right) child node created by split
+         * @return StoreError indicating success or failure
+         *
+         * Algorithm:
+         * 1. If leftChild is root (no parent), create new root
+         * 2. Find parent's child index pointing to leftChild
+         * 3. Insert splitKey and rightChild pointer into parent
+         * 4. If parent is full, recursively split parent
+         *
+         * Thread Safety:
+         * - Must be called under exclusive lock (precondition)
+         * - All modifications are COW-safe
+         */
         StoreError SignatureIndex::InsertIntoParent(
             BPlusTreeNode* leftChild,
             uint64_t splitKey,
             BPlusTreeNode* rightChild
         ) noexcept {
-            /*
-             * ========================================================================
-             * B+TREE PARENT INSERTION WITH RECURSIVE SPLIT PROPAGATION
-             * ========================================================================
-             *
-             * When a child node splits, the split key must be inserted into the parent.
-             * If the parent is full, it too must split, propagating up to the root.
-             *
-             * Parameters:
-             * - leftChild: The original (modified) child node after split
-             * - splitKey: The key that separates leftChild from rightChild
-             * - rightChild: The newly created child node from split
-             *
-             * ========================================================================
-             */
+            // ========================================================================
+            // STEP 1: VALIDATION
+            // ========================================================================
 
-            // Get parent offset from the left child (both children have same parent)
-            uint32_t parentOffset = leftChild->parentOffset;
-
-            // If parent is 0, we need a new root (shouldn't happen - caller handles this)
-            if (parentOffset == 0) {
+            if (!leftChild || !rightChild) {
                 SS_LOG_ERROR(L"SignatureIndex",
-                    L"InsertIntoParent: Called with root node (parentOffset=0)");
-                return StoreError{ SignatureStoreError::IndexCorrupted, 0, 
-                    "InsertIntoParent called on root" };
+                    L"InsertIntoParent: Null child pointer (left=%p, right=%p)",
+                    static_cast<void*>(leftChild), static_cast<void*>(rightChild));
+                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Null child pointer" };
             }
 
-            // Check if parent offset is a COW node pointer (in truncated form)
-            // or a real file offset
-            BPlusTreeNode* parent = nullptr;
-            bool parentWasCOWNode = false;
+            SS_LOG_DEBUG(L"SignatureIndex",
+                L"InsertIntoParent: splitKey=0x%llX", splitKey);
 
-            // First, try to find parent in COW pool (it might already be cloned)
-            for (auto& cowNode : m_cowNodes) {
-                uint32_t truncatedAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cowNode.get()));
-                if (truncatedAddr == parentOffset) {
-                    parent = cowNode.get();
-                    parentWasCOWNode = true;
-                    break;
-                }
-            }
+            // ========================================================================
+            // STEP 2: CHECK IF ROOT SPLIT (CREATE NEW ROOT)
+            // ========================================================================
 
-            // If not found in COW pool, it's a file offset - clone from buffer
-            if (!parent) {
-                const BPlusTreeNode* parentConst = GetNode(parentOffset);
-                if (!parentConst) {
-                    SS_LOG_ERROR(L"SignatureIndex",
-                        L"InsertIntoParent: Failed to get parent at offset 0x%X", parentOffset);
-                    return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Failed to get parent" };
-                }
-
-                parent = CloneNode(parentConst);
-                if (!parent) {
-                    SS_LOG_ERROR(L"SignatureIndex",
-                        L"InsertIntoParent: Failed to clone parent");
-                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "Failed to clone parent" };
-                }
-                
-                // Track this parent clone for offset mapping
-                m_fileOffsetToCOWNode[parentOffset] = parent;
-
-                // CRITICAL: Update parent's children[] to point to existing COW nodes
-                // The parent's children[] array contains file offsets from the committed file
-                // We need to replace any file offset that has a corresponding COW node
-                for (uint32_t i = 0; i <= parent->keyCount; ++i) {
-                    uint32_t childFileOffset = parent->children[i];
-                    if (childFileOffset != 0) {
-                        auto it = m_fileOffsetToCOWNode.find(childFileOffset);
-                        if (it != m_fileOffsetToCOWNode.end()) {
-                            // This child has been cloned - update to point to COW node
-                            uint32_t cowPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(it->second));
-                            parent->children[i] = cowPtr;
-                            SS_LOG_TRACE(L"SignatureIndex",
-                                L"InsertIntoParent: Updated parent children[%u] from file offset 0x%X to COW ptr 0x%X",
-                                i, childFileOffset, cowPtr);
-                        }
-                    }
-                }
-
-                // Update children's parent pointer to the cloned parent
-                leftChild->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent));
-                rightChild->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent));
-            }
-
-            // Find the position of leftChild in parent's children array
-            uint32_t leftChildTruncated = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leftChild));
-            int32_t childPos = -1;
-
-            for (uint32_t i = 0; i <= parent->keyCount; ++i) {
-                if (parent->children[i] == leftChildTruncated) {
-                    childPos = static_cast<int32_t>(i);
-                    break;
-                }
-            }
-
-            // If leftChild not found, search for original file offset
-            if (childPos < 0) {
-                // The parent's children array still has file offsets, not COW pointers
-                // We need to update the pointer for leftChild
-                // For now, find by comparing keys - the key just below splitKey should be leftChild
-
-                // Use binary search to find insertion position
-                uint32_t insertPos = BinarySearch(parent->keys, parent->keyCount, splitKey);
-
-                // insertPos is where splitKey should go
-                // Children before insertPos should include leftChild
-                childPos = static_cast<int32_t>(insertPos);
-            }
-
-            if (childPos < 0 || static_cast<uint32_t>(childPos) > parent->keyCount) {
-                SS_LOG_ERROR(L"SignatureIndex",
-                    L"InsertIntoParent: Could not find child position");
-                return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Child not found in parent" };
-            }
-
-            // Check if parent has space
-            if (parent->keyCount < BPlusTreeNode::MAX_KEYS) {
-                // Parent has space - insert key and child pointer
-                uint32_t insertPos = static_cast<uint32_t>(childPos);
-
-                // Shift keys and children to make room
-                for (uint32_t i = parent->keyCount; i > insertPos; --i) {
-                    parent->keys[i] = parent->keys[i - 1];
-                    parent->children[i + 1] = parent->children[i];
-                }
-
-                // Insert split key and right child pointer
-                parent->keys[insertPos] = splitKey;
-                parent->children[insertPos + 1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
-                parent->keyCount++;
-
-                // Update leftChild pointer (in case it was a file offset)
-                parent->children[insertPos] = leftChildTruncated;
-
-                // If parent was the root (parentOffset == 0), track as new COW root
-                if (parent->parentOffset == 0 && !parentWasCOWNode) {
-                    m_cowRootNode = parent;
-                }
-
+            // If leftChild has no parent, it was the root - create new root
+            if (leftChild->parentOffset == 0) {
                 SS_LOG_DEBUG(L"SignatureIndex",
-                    L"InsertIntoParent: Inserted at pos %u (parent keyCount=%u)",
-                    insertPos, parent->keyCount);
+                    L"InsertIntoParent: Root split - creating new root");
+
+                // Allocate new root (internal node)
+                BPlusTreeNode* newRoot = AllocateNode(false);  // isLeaf = false
+                if (!newRoot) {
+                    SS_LOG_ERROR(L"SignatureIndex",
+                        L"InsertIntoParent: Failed to allocate new root");
+                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "New root allocation failed" };
+                }
+
+                // Set up new root: [leftChild] <-- splitKey --> [rightChild]
+                newRoot->keyCount = 1;
+                newRoot->keys[0] = splitKey;
+
+                // Store truncated addresses as child pointers (converted to file offsets on commit)
+                newRoot->children[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leftChild));
+                newRoot->children[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
+
+                // Update children's parent pointers
+                uint32_t newRootTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
+                leftChild->parentOffset = newRootTruncAddr;
+                rightChild->parentOffset = newRootTruncAddr;
+
+                // Mark new root as COW root for this transaction
+                m_cowRootNode = newRoot;
+
+                // Update tree height
+                m_treeHeight.fetch_add(1, std::memory_order_release);
+
+                SS_LOG_INFO(L"SignatureIndex",
+                    L"InsertIntoParent: Created new root (height now %u)",
+                    m_treeHeight.load(std::memory_order_acquire));
 
                 return StoreError{ SignatureStoreError::Success };
             }
+
+            // ========================================================================
+            // STEP 3: FIND/CLONE PARENT NODE
+            // ========================================================================
+
+            // Get parent (may be file offset or truncated COW address)
+            uint32_t parentAddr = leftChild->parentOffset;
+            BPlusTreeNode* parent = nullptr;
+
+            // Check if parent is a COW node (truncated address)
+            auto cowIt = m_truncatedAddrToCOWNode.find(parentAddr);
+            if (cowIt != m_truncatedAddrToCOWNode.end()) {
+                parent = cowIt->second;
+                SS_LOG_TRACE(L"SignatureIndex",
+                    L"InsertIntoParent: Found parent in COW pool (truncAddr=0x%X)", parentAddr);
+            }
             else {
-                // Parent is full - need to split it too
-                SS_LOG_DEBUG(L"SignatureIndex",
-                    L"InsertIntoParent: Parent full, splitting internal node");
-
-                BPlusTreeNode* newParent = nullptr;
-                uint64_t parentSplitKey = 0;
-
-                StoreError splitErr = SplitNode(parent, parentSplitKey, &newParent);
-                if (!splitErr.IsSuccess()) {
-                    SS_LOG_ERROR(L"SignatureIndex",
-                        L"InsertIntoParent: Parent split failed: %S", splitErr.message.c_str());
-                    return splitErr;
+                // Parent is a file offset - check if already cloned
+                auto fileIt = m_fileOffsetToCOWNode.find(parentAddr);
+                if (fileIt != m_fileOffsetToCOWNode.end()) {
+                    parent = fileIt->second;
+                    SS_LOG_TRACE(L"SignatureIndex",
+                        L"InsertIntoParent: Found existing parent clone (fileOffset=0x%X)", parentAddr);
                 }
+                else {
+                    // Clone parent from file
+                    if (parentAddr >= m_indexSize) {
+                        SS_LOG_ERROR(L"SignatureIndex",
+                            L"InsertIntoParent: Parent offset 0x%X out of bounds", parentAddr);
+                        return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Parent offset out of bounds" };
+                    }
 
-                // Insert the new key into appropriate half
-                BPlusTreeNode* targetParent = (splitKey < parentSplitKey) ? parent : newParent;
+                    const BPlusTreeNode* fileParent = GetNode(parentAddr);
+                    if (!fileParent) {
+                        SS_LOG_ERROR(L"SignatureIndex",
+                            L"InsertIntoParent: Failed to get parent node at offset 0x%X", parentAddr);
+                        return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Parent node not found" };
+                    }
 
-                // Find position in target parent
-                uint32_t insertPos = BinarySearch(targetParent->keys, targetParent->keyCount, splitKey);
+                    parent = CloneNode(fileParent);
+                    if (!parent) {
+                        SS_LOG_ERROR(L"SignatureIndex",
+                            L"InsertIntoParent: Failed to clone parent node");
+                        return StoreError{ SignatureStoreError::OutOfMemory, 0, "Parent clone failed" };
+                    }
 
-                // Shift and insert
-                for (uint32_t i = targetParent->keyCount; i > insertPos; --i) {
-                    targetParent->keys[i] = targetParent->keys[i - 1];
-                    targetParent->children[i + 1] = targetParent->children[i];
+                    // Register clone
+                    m_fileOffsetToCOWNode[parentAddr] = parent;
+                    
+                    SS_LOG_TRACE(L"SignatureIndex",
+                        L"InsertIntoParent: Cloned parent from file offset 0x%X", parentAddr);
                 }
+            }
 
-                targetParent->keys[insertPos] = splitKey;
-                targetParent->children[insertPos] = leftChildTruncated;
-                targetParent->children[insertPos + 1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
-                targetParent->keyCount++;
+            // ========================================================================
+            // STEP 4: FIND INSERTION POSITION IN PARENT
+            // ========================================================================
 
-                // Ensure the split children point to the correct (possibly new) parent
-                leftChild->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(targetParent));
-                rightChild->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(targetParent));
+            // Find the index where leftChild's pointer is stored
+            uint32_t leftChildTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leftChild));
+            uint32_t childIdx = UINT32_MAX;
 
-                // Update children's parent pointers for newParent's children
-                for (uint32_t i = 0; i <= newParent->keyCount; ++i) {
-                    // Find the child node in COW pool and update its parent
-                    for (auto& cowNode : m_cowNodes) {
-                        uint32_t truncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cowNode.get()));
-                        if (truncAddr == newParent->children[i]) {
-                            cowNode->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newParent));
+            for (uint32_t i = 0; i <= parent->keyCount; ++i) {
+                if (parent->children[i] == leftChildTruncAddr ||
+                    parent->children[i] == leftChild->parentOffset) {
+                    // Note: parent->children[i] might still have the old file offset
+                    // We also check if it matches the original parent offset
+                    childIdx = i;
+                    break;
+                }
+            }
+
+            // If not found by truncated address, search by file offset in tracking map
+            if (childIdx == UINT32_MAX) {
+                for (uint32_t i = 0; i <= parent->keyCount; ++i) {
+                    auto fileIt = m_fileOffsetToCOWNode.find(parent->children[i]);
+                    if (fileIt != m_fileOffsetToCOWNode.end()) {
+                        if (fileIt->second == leftChild) {
+                            childIdx = i;
                             break;
                         }
                     }
                 }
+            }
 
-                // Recursively propagate the parent split up
+            if (childIdx == UINT32_MAX) {
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"InsertIntoParent: Failed to find leftChild in parent's children array");
+                return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Child not found in parent" };
+            }
+
+            SS_LOG_TRACE(L"SignatureIndex",
+                L"InsertIntoParent: Found leftChild at parent index %u", childIdx);
+
+            // ========================================================================
+            // STEP 5: INSERT INTO PARENT (IF SPACE AVAILABLE)
+            // ========================================================================
+
+            if (parent->keyCount < BPlusTreeNode::MAX_KEYS) {
+                // Parent has space - insert directly
+
+                // Shift keys and children to make space
+                // Insert position for key is at childIdx, new child pointer at childIdx+1
+                for (uint32_t i = parent->keyCount; i > childIdx; --i) {
+                    if (i >= BPlusTreeNode::MAX_KEYS) continue;
+                    parent->keys[i] = parent->keys[i - 1];
+                }
+
+                for (uint32_t i = parent->keyCount + 1; i > childIdx + 1; --i) {
+                    if (i >= BPlusTreeNode::MAX_CHILDREN) continue;
+                    parent->children[i] = parent->children[i - 1];
+                }
+
+                // Insert split key and right child pointer
+                parent->keys[childIdx] = splitKey;
+                parent->children[childIdx + 1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
+                parent->keyCount++;
+
+                // Update leftChild's pointer in parent (in case it was a file offset)
+                parent->children[childIdx] = leftChildTruncAddr;
+
+                // Update rightChild's parent pointer
+                uint32_t parentTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent));
+                rightChild->parentOffset = parentTruncAddr;
+
+                // If parent was root, update COW root
                 if (parent->parentOffset == 0) {
-                    // Parent was root - create new root
-                    BPlusTreeNode* newRoot = AllocateNode(false);
-                    if (!newRoot) {
-                        return StoreError{ SignatureStoreError::OutOfMemory, 0, "Failed to allocate new root" };
-                    }
-
-                    newRoot->isLeaf = false;
-                    newRoot->keyCount = 1;
-                    newRoot->keys[0] = parentSplitKey;
-                    newRoot->children[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent));
-                    newRoot->children[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newParent));
-                    newRoot->parentOffset = 0;
-
-                    parent->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-                    newParent->parentOffset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-
-                    m_cowRootNode = newRoot;
-                    
-                    // CRITICAL: Increment tree height when parent split creates new root
-                    uint32_t currentHeight = m_treeHeight.load(std::memory_order_acquire);
-                    m_treeHeight.store(currentHeight + 1, std::memory_order_release);
-
-                    SS_LOG_INFO(L"SignatureIndex",
-                        L"InsertIntoParent: Created new root (tree height now %u)", currentHeight + 1);
+                    m_cowRootNode = parent;
                 }
-                else {
-                    // Recursive propagation
-                    return InsertIntoParent(parent, parentSplitKey, newParent);
-                }
+
+                SS_LOG_DEBUG(L"SignatureIndex",
+                    L"InsertIntoParent: Inserted at index %u (parent keyCount now %u)",
+                    childIdx, parent->keyCount);
 
                 return StoreError{ SignatureStoreError::Success };
             }
+
+            // ========================================================================
+            // STEP 6: PARENT IS FULL - NEED TO SPLIT PARENT
+            // ========================================================================
+
+            SS_LOG_DEBUG(L"SignatureIndex",
+                L"InsertIntoParent: Parent is full - splitting parent");
+
+            // First, insert the key/pointer into parent (temporarily overfull)
+            // Then split the parent
+
+            // Create temporary arrays to hold keys and children including new entry
+            std::array<uint64_t, BPlusTreeNode::MAX_KEYS + 1> tempKeys{};
+            std::array<uint32_t, BPlusTreeNode::MAX_CHILDREN + 1> tempChildren{};
+
+            // Copy existing keys with new key inserted at correct position
+            uint32_t keyInsertPos = childIdx;
+            for (uint32_t i = 0, j = 0; j <= parent->keyCount; ++i, ++j) {
+                if (i == keyInsertPos) {
+                    tempKeys[i] = splitKey;
+                    j--;  // Don't advance source index
+                }
+                else if (j < parent->keyCount) {
+                    tempKeys[i] = parent->keys[j];
+                }
+            }
+
+            // Copy existing children with new child inserted
+            uint32_t childInsertPos = childIdx + 1;
+            for (uint32_t i = 0, j = 0; j <= parent->keyCount + 1; ++i, ++j) {
+                if (i == childInsertPos) {
+                    tempChildren[i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
+                    j--;  // Don't advance source index
+                }
+                else if (i == childIdx) {
+                    // Update leftChild pointer
+                    tempChildren[i] = leftChildTruncAddr;
+                }
+                else if (j <= parent->keyCount) {
+                    tempChildren[i] = parent->children[j];
+                }
+            }
+
+            // Now split the overfull parent
+            uint32_t totalKeys = parent->keyCount + 1;  // Original + 1 new
+            uint32_t midPoint = totalKeys / 2;
+            uint64_t parentSplitKey = tempKeys[midPoint];
+
+            // Allocate new parent sibling (internal node)
+            BPlusTreeNode* newParent = AllocateNode(false);
+            if (!newParent) {
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"InsertIntoParent: Failed to allocate new parent sibling");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "New parent allocation failed" };
+            }
+
+            // Left parent keeps keys [0, midPoint)
+            parent->keyCount = midPoint;
+            for (uint32_t i = 0; i < midPoint; ++i) {
+                parent->keys[i] = tempKeys[i];
+            }
+            for (uint32_t i = 0; i <= midPoint; ++i) {
+                parent->children[i] = tempChildren[i];
+            }
+
+            // Right parent gets keys [midPoint+1, totalKeys)
+            // Note: midPoint key is promoted to grandparent
+            newParent->keyCount = totalKeys - midPoint - 1;
+            for (uint32_t i = 0; i < newParent->keyCount; ++i) {
+                newParent->keys[i] = tempKeys[midPoint + 1 + i];
+            }
+            for (uint32_t i = 0; i <= newParent->keyCount; ++i) {
+                newParent->children[i] = tempChildren[midPoint + 1 + i];
+            }
+
+            // Set new parent's parent pointer
+            newParent->parentOffset = parent->parentOffset;
+
+            // Update children's parent pointers for newParent's children
+            uint32_t newParentTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newParent));
+            for (uint32_t i = 0; i <= newParent->keyCount; ++i) {
+                uint32_t childAddr = newParent->children[i];
+                // Find the child node (may be COW or file node)
+                auto cowIt = m_truncatedAddrToCOWNode.find(childAddr);
+                if (cowIt != m_truncatedAddrToCOWNode.end()) {
+                    cowIt->second->parentOffset = newParentTruncAddr;
+                }
+            }
+
+            // Also update rightChild's parent since it may have moved
+            rightChild->parentOffset = (childInsertPos <= midPoint) ?
+                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent)) : newParentTruncAddr;
+
+            // Clear remaining slots in original parent (for cleanliness)
+            for (uint32_t i = midPoint; i < BPlusTreeNode::MAX_KEYS; ++i) {
+                parent->keys[i] = 0;
+            }
+            for (uint32_t i = midPoint + 1; i < BPlusTreeNode::MAX_CHILDREN; ++i) {
+                parent->children[i] = 0;
+            }
+
+            SS_LOG_DEBUG(L"SignatureIndex",
+                L"InsertIntoParent: Split parent - left keyCount=%u, right keyCount=%u, promote key=0x%llX",
+                parent->keyCount, newParent->keyCount, parentSplitKey);
+
+            // Recursively insert into grandparent
+            return InsertIntoParent(parent, parentSplitKey, newParent);
         }
 
         StoreError SignatureIndex::Insert(

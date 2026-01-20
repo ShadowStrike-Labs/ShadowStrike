@@ -429,10 +429,38 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                 );
                 node->children[pos] = clonedTruncAddr;
                 
+                // CRITICAL FIX: Update cloned node's parentOffset to point to current parent
+                // The parentOffset copied from file may be stale (pointing to old root location).
+                // We need to update it to point to the current COW parent (node).
+                uint32_t parentTruncAddr = static_cast<uint32_t>(
+                    reinterpret_cast<uintptr_t>(node)
+                );
+                clonedNode->parentOffset = parentTruncAddr;
+                
                 // CRITICAL FIX: Register truncated address for child pointer resolution
                 // Without this, subsequent traversals won't find this COW node when
                 // following child pointers that store truncated addresses.
                 m_truncatedAddrToCOWNode[clonedTruncAddr] = clonedNode;
+                
+                // ================================================================
+                // CRITICAL FIX: Update previous leaf's nextLeaf pointer
+                // ================================================================
+                // When we clone a leaf node, its file location will change after
+                // CommitCOW. The previous leaf (if any) has nextLeaf pointing to
+                // the OLD location. If we don't update it, the linked list will
+                // be broken - ForEach traversal will read stale/wrong data.
+                //
+                // DESIGN DECISION: Instead of maintaining the linked list during
+                // COW operations (which would require cloning adjacent leaves and
+                // potentially cascading changes up the tree), we use tree-based
+                // traversal in ForEachInternalNoLock. The children[] pointers ARE
+                // properly maintained during COW commits, making tree traversal
+                // reliable while linked list traversal is not.
+                //
+                // The nextLeaf/prevLeaf pointers remain for potential future use
+                // in range queries, but enumeration uses tree traversal for
+                // correctness and robustness.
+                // ================================================================
                 
                 node = clonedNode;
                 SS_LOG_TRACE(L"SignatureIndex",

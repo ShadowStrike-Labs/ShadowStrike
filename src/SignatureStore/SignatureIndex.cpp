@@ -565,7 +565,7 @@ void SignatureIndex::ForEachInternalNoLock(
         return;
     }
 
-    // Find leftmost leaf
+    // Find root
     uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
     
     // SECURITY: Validate root offset
@@ -575,132 +575,103 @@ void SignatureIndex::ForEachInternalNoLock(
         return;
     }
     
-    const BPlusTreeNode* node = GetNode(rootOffset);
-    if (!node) {
+    const BPlusTreeNode* root = GetNode(rootOffset);
+    if (!root) {
         SS_LOG_DEBUG(L"SignatureIndex", L"ForEachInternalNoLock: Empty tree");
         return;
     }
 
-    // SECURITY: Track depth to prevent infinite loop during navigation
-    constexpr uint32_t MAX_DEPTH = 64;
-    uint32_t depth = 0;
+    // ========================================================================
+    // USE RECURSIVE TREE TRAVERSAL INSTEAD OF LINKED LIST
+    // ========================================================================
+    // The linked list (nextLeaf/prevLeaf) can become inconsistent during
+    // COW operations when leaves are cloned and written to new locations.
+    // Recursive tree traversal through children[] pointers is more robust
+    // because those pointers ARE properly maintained during COW commits.
+    // ========================================================================
+
+    size_t entriesProcessed = 0;
+    size_t leavesProcessed = 0;
+    bool stopRequested = false;
     
-    // Track visited offsets for cycle detection
     std::unordered_set<uint32_t> visitedOffsets;
     visitedOffsets.insert(rootOffset);
-
-    // Navigate to leftmost leaf
-    while (!node->isLeaf && depth < MAX_DEPTH) {
-        // SECURITY: Validate keyCount before accessing children
-        if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Invalid keyCount %u during descent", node->keyCount);
-            return;
-        }
+    
+    // Use stack-based traversal to avoid recursion depth issues
+    struct TraversalFrame {
+        const BPlusTreeNode* node;
+        uint32_t childIndex;  // Next child to visit for internal nodes
+    };
+    
+    std::vector<TraversalFrame> stack;
+    stack.reserve(64); // Max tree depth
+    stack.push_back({root, 0});
+    
+    while (!stack.empty() && !stopRequested) {
+        TraversalFrame& frame = stack.back();
+        const BPlusTreeNode* node = frame.node;
         
-        // For navigation to leftmost leaf, we take child[0]
-        uint32_t childOffset = node->children[0];
-        
-        // SECURITY: Validate child offset
-        if (childOffset == 0 || childOffset >= m_indexSize) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Invalid child[0] offset 0x%X at depth %u", childOffset, depth);
-            return;
-        }
-        
-        // SECURITY: Cycle detection
-        if (visitedOffsets.count(childOffset) > 0) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Cycle detected during descent at offset 0x%X", childOffset);
-            return;
-        }
-        visitedOffsets.insert(childOffset);
-        
-        node = GetNode(childOffset);
         if (!node) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Failed to load node at offset 0x%X", childOffset);
-            return;
+            stack.pop_back();
+            continue;
         }
-        depth++;
-    }
-
-    if (depth >= MAX_DEPTH) {
-        SS_LOG_ERROR(L"SignatureIndex", 
-            L"ForEachInternalNoLock: Max depth %u exceeded during navigation", MAX_DEPTH);
-        return;
-    }
-
-    // SECURITY: Track iterations to prevent infinite loop in leaf linked list
-    constexpr size_t MAX_ITERATIONS = 10000000; // 10M leaves max
-    size_t iterations = 0;
-    size_t entriesProcessed = 0;
-
-    // Clear visited set for leaf traversal (reuse memory)
-    visitedOffsets.clear();
-
-    // Traverse linked list of leaves
-    while (node && iterations < MAX_ITERATIONS) {
-        // SECURITY: Validate keyCount
+        
+        // Validate keyCount
         if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
             SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Invalid keyCount %u in leaf at iteration %zu", 
-                node->keyCount, iterations);
-            return;
+                L"ForEachInternalNoLock: Invalid keyCount %u", node->keyCount);
+            stack.pop_back();
+            continue;
         }
         
-        // Process all entries in this leaf
-        for (uint32_t i = 0; i < node->keyCount; ++i) {
-            try {
-                if (!callback(node->keys[i], static_cast<uint64_t>(node->children[i]))) {
-                    // Early exit requested by callback
-                    SS_LOG_TRACE(L"SignatureIndex", 
-                        L"ForEachInternalNoLock: Early exit after %zu entries", entriesProcessed);
-                    return;
+        if (node->isLeaf) {
+            // Process all entries in this leaf
+            leavesProcessed++;
+            for (uint32_t i = 0; i < node->keyCount && !stopRequested; ++i) {
+                try {
+                    if (!callback(node->keys[i], static_cast<uint64_t>(node->children[i]))) {
+                        stopRequested = true;
+                        break;
+                    }
+                    entriesProcessed++;
                 }
-                entriesProcessed++;
+                catch (...) {
+                    SS_LOG_ERROR(L"SignatureIndex", 
+                        L"ForEachInternalNoLock: Callback threw exception");
+                    stopRequested = true;
+                    break;
+                }
             }
-            catch (...) {
-                // Callback threw exception - stop iteration for safety
-                SS_LOG_ERROR(L"SignatureIndex", 
-                    L"ForEachInternalNoLock: Callback threw exception after %zu entries", entriesProcessed);
-                return;
+            stack.pop_back();
+        }
+        else {
+            // Internal node - visit children in order (left to right)
+            if (frame.childIndex <= node->keyCount) {
+                uint32_t childOffset = node->children[frame.childIndex];
+                frame.childIndex++; // Move to next child for when we return
+                
+                // Validate child offset
+                if (childOffset != 0 && childOffset < m_indexSize) {
+                    // Cycle detection
+                    if (visitedOffsets.count(childOffset) == 0) {
+                        visitedOffsets.insert(childOffset);
+                        const BPlusTreeNode* childNode = GetNode(childOffset);
+                        if (childNode) {
+                            stack.push_back({childNode, 0});
+                        }
+                    }
+                }
+            }
+            else {
+                // All children visited, pop this frame
+                stack.pop_back();
             }
         }
-
-        // Check for end of list
-        if (node->nextLeaf == 0) {
-            break;
-        }
-        
-        // SECURITY: Validate nextLeaf offset
-        if (node->nextLeaf >= m_indexSize) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Invalid nextLeaf offset 0x%X at iteration %zu", 
-                node->nextLeaf, iterations);
-            return;
-        }
-        
-        // SECURITY: Cycle detection in leaf list
-        if (visitedOffsets.count(node->nextLeaf) > 0) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEachInternalNoLock: Cycle detected in leaf list at offset 0x%X", node->nextLeaf);
-            return;
-        }
-        visitedOffsets.insert(node->nextLeaf);
-        
-        node = GetNode(node->nextLeaf);
-        iterations++;
-    }
-
-    if (iterations >= MAX_ITERATIONS) {
-        SS_LOG_WARN(L"SignatureIndex", 
-            L"ForEachInternalNoLock: Iteration limit reached (%zu iterations, %zu entries)", 
-            iterations, entriesProcessed);
     }
     
     SS_LOG_TRACE(L"SignatureIndex", 
-        L"ForEachInternalNoLock: Processed %zu entries across %zu leaves", entriesProcessed, iterations + 1);
+        L"ForEachInternalNoLock: Processed %zu entries across %zu leaves", 
+        entriesProcessed, leavesProcessed);
 }
 
 /**
