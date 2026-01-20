@@ -174,7 +174,7 @@ TEST_F(YaraRuleStoreTest, Compiler_AddNonexistentFile) {
 TEST_F(YaraRuleStoreTest, Compiler_GetErrors) {
     YaraCompiler compiler;
     
-    compiler.AddString("invalid rule", "default");
+    compiler.AddString("invalid rule", "default");//-V530
     
     auto errors = compiler.GetErrors();
     EXPECT_FALSE(errors.empty());
@@ -275,7 +275,7 @@ TEST_F(YaraRuleStoreTest, AddRulesFromSource_SimpleRule) {
     auto error = yara_store_->AddRulesFromSource(rule, "default");
     
     // May succeed or fail depending on initialization
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 TEST_F(YaraRuleStoreTest, AddRulesFromFile_ValidFile) {
@@ -284,7 +284,7 @@ TEST_F(YaraRuleStoreTest, AddRulesFromFile_ValidFile) {
     
     auto error = yara_store_->AddRulesFromFile(rule_file, "default");
     
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 TEST_F(YaraRuleStoreTest, AddRulesFromDirectory_EmptyDirectory) {
@@ -294,7 +294,7 @@ TEST_F(YaraRuleStoreTest, AddRulesFromDirectory_EmptyDirectory) {
     auto error = yara_store_->AddRulesFromDirectory(empty_dir.wstring(), "default");
     
     // Should handle gracefully
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 TEST_F(YaraRuleStoreTest, AddRulesFromDirectory_WithRules) {
@@ -373,7 +373,7 @@ TEST_F(YaraRuleStoreTest, ScanBuffer_WithTimeout) {
     auto matches = yara_store_->ScanBuffer(test_buffer, options);
     
     // Should not crash
-    EXPECT_TRUE(matches.empty() || !matches.empty());
+    EXPECT_TRUE(matches.empty());
 }
 
 TEST_F(YaraRuleStoreTest, ScanBuffer_FastMode) {
@@ -384,7 +384,7 @@ TEST_F(YaraRuleStoreTest, ScanBuffer_FastMode) {
     
     auto matches = yara_store_->ScanBuffer(test_buffer, options);
     
-    EXPECT_TRUE(matches.empty() || !matches.empty());
+    EXPECT_TRUE(matches.empty());
 }
 
 TEST_F(YaraRuleStoreTest, ScanBuffer_CaptureMatchData) {
@@ -491,7 +491,7 @@ TEST_F(YaraRuleStoreTest, ScanFile_ValidFile) {
     auto matches = yara_store_->ScanFile(test_file.wstring(), options);
     
     // Should not crash
-    EXPECT_TRUE(matches.empty() || !matches.empty());
+    EXPECT_TRUE(matches.empty());
 }
 
 // ============================================================================
@@ -514,8 +514,8 @@ TEST_F(YaraRuleStoreTest, ScanContext_FeedChunk) {
     std::vector<uint8_t> chunk1 = {0x4D, 0x5A};
     std::vector<uint8_t> chunk2 = {0x90, 0x00};
     
-    context.FeedChunk(chunk1);
-    context.FeedChunk(chunk2);
+    context.FeedChunk(chunk1);//-V530
+	context.FeedChunk(chunk2);//-V530
     
     EXPECT_EQ(context.GetTotalBytesProcessed(), 4);
 }
@@ -524,19 +524,19 @@ TEST_F(YaraRuleStoreTest, ScanContext_Finalize) {
     auto context = yara_store_->CreateScanContext();
     
     std::vector<uint8_t> chunk = {0x50, 0x45, 0x00, 0x00};
-    context.FeedChunk(chunk);
+    context.FeedChunk(chunk);//-V530
     
     auto matches = context.Finalize();
     
     // Should return matches (or empty)
-    EXPECT_TRUE(matches.empty() || !matches.empty());
+    EXPECT_TRUE(matches.empty());
 }
 
 TEST_F(YaraRuleStoreTest, ScanContext_Reset) {
     auto context = yara_store_->CreateScanContext();
     
     std::vector<uint8_t> chunk = {0x00, 0x01, 0x02};
-    context.FeedChunk(chunk);
+    context.FeedChunk(chunk);//-V530
     
     context.Reset();
     
@@ -553,10 +553,10 @@ TEST_F(YaraRuleStoreTest, ScanContext_LargeStream) {
     
     for (size_t i = 0; i < total_size / chunk_size; ++i) {
         std::vector<uint8_t> chunk(chunk_size, static_cast<uint8_t>(i % 256));
-        context.FeedChunk(chunk);
+        context.FeedChunk(chunk);//-V530
     }
     
-    auto matches = context.Finalize();
+    auto matches = context.Finalize();//-V808
     
     EXPECT_EQ(context.GetTotalBytesProcessed(), total_size);
 }
@@ -565,7 +565,7 @@ TEST_F(YaraRuleStoreTest, ScanContext_MoveSemantics) {
     auto context1 = yara_store_->CreateScanContext();
     
     std::vector<uint8_t> chunk = {0x4D, 0x5A};
-    context1.FeedChunk(chunk);
+    context1.FeedChunk(chunk);//-V530
     
     // Move context
     auto context2 = std::move(context1);
@@ -624,7 +624,7 @@ TEST_F(YaraRuleStoreTest, GetStatistics_AfterScans) {
     
     // Perform multiple scans
     for (int i = 0; i < 5; ++i) {
-        yara_store_->ScanBuffer(test_buffer);
+        yara_store_->ScanBuffer(test_buffer);//-V530
     }
     
     auto stats = yara_store_->GetStatistics();
@@ -633,11 +633,11 @@ TEST_F(YaraRuleStoreTest, GetStatistics_AfterScans) {
 }
 
 TEST_F(YaraRuleStoreTest, ResetStatistics) {
-    std::vector<uint8_t> test_buffer = {0x00};
-    yara_store_->ScanBuffer(test_buffer);
-    
+    std::vector<uint8_t> test_buffer = { 0x00 };
+    yara_store_->ScanBuffer(test_buffer);//-V530 
+
     yara_store_->ResetStatistics();
-    
+
     auto stats = yara_store_->GetStatistics();
     EXPECT_EQ(stats.totalScans, 0);
 }
@@ -664,7 +664,7 @@ TEST_F(YaraRuleStoreTest, ExportCompiled_ValidPath) {
     auto error = yara_store_->ExportCompiled(export_path);
     
     // May succeed or fail depending on rules loaded
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 // ============================================================================
@@ -674,7 +674,7 @@ TEST_F(YaraRuleStoreTest, ExportCompiled_ValidPath) {
 TEST_F(YaraRuleStoreTest, Recompile_EmptyStore) {
     auto error = yara_store_->Recompile();
     
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 TEST_F(YaraRuleStoreTest, Verify_EmptyStore) {
@@ -685,13 +685,13 @@ TEST_F(YaraRuleStoreTest, Verify_EmptyStore) {
             log_messages.push_back(msg);
         });
     
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 TEST_F(YaraRuleStoreTest, Flush_NoChanges) {
     auto error = yara_store_->Flush();
     
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 // ============================================================================
@@ -789,8 +789,7 @@ TEST_F(YaraRuleStoreTest, YaraUtils_ParseThreatLevel) {
     
     auto threat_level = YaraUtils::ParseThreatLevel(metadata);
     
-    EXPECT_TRUE(threat_level == ThreatLevel::High || 
-                threat_level != ThreatLevel::High);
+    EXPECT_TRUE(threat_level == ThreatLevel::High);
 }
 
 TEST_F(YaraRuleStoreTest, YaraUtils_FindYaraFiles_EmptyDir) {
@@ -886,7 +885,7 @@ TEST_F(YaraRuleStoreTest, YaraScanOptions_CustomValues) {
 // ============================================================================
 
 TEST_F(YaraRuleStoreTest, ThreadSafety_ConcurrentScans) {
-    std::vector<uint8_t> test_buffer = {0x4D, 0x5A, 0x90, 0x00};
+    std::array<uint8_t,4> test_buffer = {0x4D, 0x5A, 0x90, 0x00};
     
     std::vector<std::thread> threads;
     std::atomic<int> scan_count{0};
@@ -932,7 +931,7 @@ TEST_F(YaraRuleStoreTest, Performance_SmallBufferScan) {
     
     auto start = std::chrono::high_resolution_clock::now();
     
-    auto matches = yara_store_->ScanBuffer(small_buffer);
+    auto matches = yara_store_->ScanBuffer(small_buffer);//-V808
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -950,7 +949,7 @@ TEST_F(YaraRuleStoreTest, Performance_LargeBufferScan) {
     
     auto start = std::chrono::high_resolution_clock::now();
     
-    auto matches = yara_store_->ScanBuffer(large_buffer, options);
+    auto matches = yara_store_->ScanBuffer(large_buffer, options);//-V808
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -965,7 +964,7 @@ TEST_F(YaraRuleStoreTest, Performance_ManySmallScans) {
     auto start = std::chrono::high_resolution_clock::now();
     
     for (int i = 0; i < 100; ++i) {
-        yara_store_->ScanBuffer(test_buffer);
+        yara_store_->ScanBuffer(test_buffer);//-V530
     }
     
     auto end = std::chrono::high_resolution_clock::now();
@@ -987,7 +986,7 @@ TEST_F(YaraRuleStoreTest, EdgeCase_MaxBufferSize) {
         YaraScanOptions options;
         options.timeoutSeconds = 300;
         
-        auto matches = yara_store_->ScanBuffer(max_buffer, options);
+        auto matches = yara_store_->ScanBuffer(max_buffer, options);//-V808
         
         SUCCEED();
     } catch (const std::bad_alloc&) {
@@ -1002,7 +1001,7 @@ TEST_F(YaraRuleStoreTest, EdgeCase_VeryLongRuleName) {
     auto error = yara_store_->AddRulesFromSource(rule);
     
     // Should handle long names
-    EXPECT_TRUE(error.IsSuccess() || !error.IsSuccess());
+    EXPECT_TRUE(error.IsSuccess());
 }
 
 TEST_F(YaraRuleStoreTest, EdgeCase_MaxTimeout) {
@@ -1011,7 +1010,7 @@ TEST_F(YaraRuleStoreTest, EdgeCase_MaxTimeout) {
     
     std::vector<uint8_t> test_buffer = {0x00};
     
-    auto matches = yara_store_->ScanBuffer(test_buffer, options);
+    auto matches = yara_store_->ScanBuffer(test_buffer, options);//-V808
     
     SUCCEED();
 }
@@ -1022,7 +1021,7 @@ TEST_F(YaraRuleStoreTest, EdgeCase_MaxMatchesPerRule) {
     
     std::vector<uint8_t> test_buffer = {0x00};
     
-    auto matches = yara_store_->ScanBuffer(test_buffer, options);
+    auto matches = yara_store_->ScanBuffer(test_buffer, options);//-V808
     
     SUCCEED();
 }

@@ -1041,6 +1041,12 @@ public:
     bool Reset() override;
     
 private:
+    /// @brief Cached indicator extracted from OpenIOC document
+    struct CachedIndicator {
+        std::string searchPath;   ///< Search path for type detection (e.g., "NetworkItem/IP")
+        std::string value;        ///< Indicator value (e.g., "192.168.1.1")
+    };
+    
     std::istream& m_input;
     ImportOptions m_options;
     size_t m_currentIndex = 0;
@@ -1049,6 +1055,7 @@ private:
     std::string m_lastError;
     std::optional<ParseError> m_lastParseError;
     bool m_initialized = false;
+    std::vector<CachedIndicator> m_cachedIndicators;  ///< Extracted indicators from document
     
     bool ParseDocument();
     [[nodiscard]] IOCType MapOpenIOCSearchToIOCType(std::string_view search) const;

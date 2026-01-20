@@ -423,7 +423,7 @@ TEST(BloomFilter_BatchOps, BatchQuery_AfterBatchAdd_AllPositive) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(1000);
-    filter.BatchAdd(testHashes);
+    filter.BatchAdd(testHashes);//-V530
     
     const size_t count = testHashes.size();
     auto results_buf = std::make_unique<bool[]>(count);
@@ -464,7 +464,7 @@ TEST(BloomFilter_ClearSerialize, Clear_ResetsAllBits) {
     
     // Add many elements
     const auto testHashes = GenerateTestHashes(1000);
-    filter.BatchAdd(testHashes);
+    filter.BatchAdd(testHashes);//-V530
     
     EXPECT_GT(filter.EstimatedFillRate(), 0.0);
     EXPECT_GT(filter.GetElementsAdded(), 0u);
@@ -489,7 +489,7 @@ TEST(BloomFilter_ClearSerialize, Serialize_ProducesValidData) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(100);
-    filter.BatchAdd(testHashes);
+    filter.BatchAdd(testHashes);//-V530
     
     std::vector<uint8_t> data;
     EXPECT_TRUE(filter.Serialize(data));
@@ -529,7 +529,7 @@ TEST(BloomFilter_Statistics, GetDetailedStats_ReturnsValidData) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(500);
-    filter.BatchAdd(testHashes);
+    filter.BatchAdd(testHashes);//-V530
     
     const auto stats = filter.GetDetailedStats();
     
@@ -552,7 +552,7 @@ TEST(BloomFilter_Statistics, EstimatedFillRate_IncreasesWithElements) {
     
     for (int batch = 0; batch < 10; ++batch) {
         const auto hashes = GenerateTestHashes(100, batch * 100);
-        filter.BatchAdd(hashes);
+        filter.BatchAdd(hashes);//-V530
         
         const double fillRate = filter.EstimatedFillRate();
         EXPECT_GT(fillRate, prevFillRate);
@@ -569,7 +569,7 @@ TEST(BloomFilter_Statistics, EstimatedFPR_IncreasesWithFillRate) {
     
     // Add elements
     const auto hashes = GenerateTestHashes(500);
-    filter.BatchAdd(hashes);
+    filter.BatchAdd(hashes);//-V530
     
     const double fpr = filter.EstimatedFalsePositiveRate();
     EXPECT_GT(fpr, 0.0);
@@ -590,7 +590,7 @@ TEST(BloomFilter_FPR, FalsePositiveRate_WithinExpectedBounds) {
     
     // Add expected number of elements
     const auto insertHashes = GenerateTestHashes(elements, 0);
-    filter.BatchAdd(insertHashes);
+    filter.BatchAdd(insertHashes);//-V530
     
     // Query with different hashes (guaranteed not in set)
     const auto queryHashes = GenerateTestHashes(testQueries, elements + 1000000);
@@ -615,7 +615,7 @@ TEST(BloomFilter_FPR, NoFalseNegatives_Guaranteed) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(5000);
-    filter.BatchAdd(testHashes);
+    filter.BatchAdd(testHashes);//-V530
     
     // No false negatives - all added elements MUST be found
     size_t falseNegatives = 0;
@@ -678,7 +678,7 @@ TEST(BloomFilter_ThreadSafety, ConcurrentQuery_NoDataRace) {
     
     // Pre-populate filter
     const auto insertHashes = GenerateTestHashes(5000);
-    filter.BatchAdd(insertHashes);
+    filter.BatchAdd(insertHashes);//-V530
     
     constexpr int numThreads = 8;
     constexpr int queriesPerThread = 10000;
@@ -857,7 +857,7 @@ TEST(BloomFilter_Performance, MightContain_UnderTargetLatency) {
     
     // Pre-populate
     const auto insertHashes = GenerateTestHashes(100000);
-    filter.BatchAdd(insertHashes);
+    filter.BatchAdd(insertHashes);//-V530
     
     constexpr size_t iterations = 100000;
     constexpr int64_t targetNsPerOp = 100;  // 100ns target for lookup
@@ -893,7 +893,7 @@ TEST(BloomFilter_Performance, BatchAdd_FasterThanSingleAdd) {
     
     // Batch add timing
     const int64_t batchNs = MeasureNanoseconds([&]() {
-        filter2.BatchAdd(hashes);
+        filter2.BatchAdd(hashes);//-V530
     });
     
     // Batch should be at least as fast (allowing for measurement variance)
@@ -912,7 +912,7 @@ TEST(BloomFilter_Memory, MultipleBuildCycles_NoLeaks) {
         ASSERT_TRUE(filter.InitializeForBuild());
         
         const auto hashes = GenerateTestHashes(1000, cycle * 1000);
-        filter.BatchAdd(hashes);
+        filter.BatchAdd(hashes);//-V530
         
         // Verify functionality
         for (uint64_t h : hashes) {

@@ -445,21 +445,23 @@ std::string DefangIOC(std::string_view value, IOCType type) {
             if (pos == 0) break;
         }
         
-        // Replace http with hxxp
+        // Replace URL schemes with defanged versions
         if (type == IOCType::URL) {
-            if (result.length() >= 7 && result.compare(0, 7, "http://") == 0) {
-                result.replace(0, 4, "hxxp");
-            } else if (result.length() >= 8 && result.compare(0, 8, "https://") == 0) {
+            if (result.length() >= 8 && result.compare(0, 8, "https://") == 0) {
                 result.replace(0, 5, "hxxps");
+            } else if (result.length() >= 7 && result.compare(0, 7, "http://") == 0) {
+                result.replace(0, 4, "hxxp");
+            } else if (result.length() >= 6 && result.compare(0, 6, "ftp://") == 0) {
+                result.replace(0, 3, "fxp");
             }
         }
         
-        // Replace @ with [at] for emails
+        // Replace @ with [@] for emails (industry standard defanging format)
         if (type == IOCType::Email) {
             size_t pos = result.find('@');
             if (pos != std::string::npos) {
                 try {
-                    result.replace(pos, 1, "[at]");
+                    result.replace(pos, 1, "[@]");
                 } catch (const std::exception&) {
                     return {};
                 }
@@ -503,20 +505,29 @@ std::string RefangIOC(std::string_view value, IOCType type) {
             result.replace(pos, 5, ".");
         }
         
-        // Replace hxxp with http
+        // Replace URL schemes with refanged versions
         if (type == IOCType::URL) {
-            if (result.length() >= 7 && result.compare(0, 7, "hxxp://") == 0) {
-                result.replace(0, 4, "http");
-            } else if (result.length() >= 8 && result.compare(0, 8, "hxxps://") == 0) {
+            if (result.length() >= 8 && result.compare(0, 8, "hxxps://") == 0) {
                 result.replace(0, 5, "https");
+            } else if (result.length() >= 7 && result.compare(0, 7, "hxxp://") == 0) {
+                result.replace(0, 4, "http");
+            } else if (result.length() >= 6 && result.compare(0, 6, "fxp://") == 0) {
+                result.replace(0, 3, "ftp");
             }
         }
         
-        // Replace [at] with @
+        // Replace [@] with @ (industry standard defanging format)
+        // Also support [at] for backwards compatibility
         if (type == IOCType::Email) {
-            pos = result.find("[at]");
+            pos = result.find("[@]");
             if (pos != std::string::npos) {
-                result.replace(pos, 4, "@");
+                result.replace(pos, 3, "@");
+            } else {
+                // Backwards compatibility: also support [at]
+                pos = result.find("[at]");
+                if (pos != std::string::npos) {
+                    result.replace(pos, 4, "@");
+                }
             }
         }
     }
@@ -541,15 +552,66 @@ bool CSVImportReader::Initialize(const ImportOptions& options) {
     m_currentLine = 0;
     m_bytesRead = 0;
     
+    // Check for empty input early - this is a valid state (nothing to read)
+    if (m_input.eof() || m_input.peek() == std::istream::traits_type::eof()) {
+        m_endOfInput = true;
+        // Empty input is valid - just nothing to read
+        // Set up default mappings so reader is in consistent state
+        if (m_columnMappings.empty()) {
+            CSVColumnMapping valueMapping;
+            valueMapping.columnIndex = 0;
+            valueMapping.type = CSVColumnType::Value;
+            valueMapping.headerName = "value";
+            m_columnMappings.push_back(valueMapping);
+        }
+        return true;
+    }
+    
     // If we have a header, parse it to detect columns
     if (m_options.csvConfig.hasHeader) {
         if (!ParseHeader()) {
             return false;
         }
     } else if (m_columnMappings.empty()) {
-        // No header and no mappings - cannot proceed unless we assume default structure
-        m_lastError = "No CSV header and no column mappings provided";
-        return false;
+        // No header and no mappings provided - assume default structure:
+        // Column 0 = IOC value (will auto-detect type)
+        // Column 1 = Type (optional)
+        // Column 2 = Confidence (optional)
+        // Column 3 = Reputation (optional)
+        // Column 4 = Category (optional)
+        CSVColumnMapping valueMapping;
+        valueMapping.columnIndex = 0;
+        valueMapping.type = CSVColumnType::Value;
+        valueMapping.headerName = "value";
+        m_columnMappings.push_back(valueMapping);
+        
+        // Add type column mapping if we have enough columns
+        CSVColumnMapping typeMapping;
+        typeMapping.columnIndex = 1;
+        typeMapping.type = CSVColumnType::Type;
+        typeMapping.headerName = "type";
+        m_columnMappings.push_back(typeMapping);
+        
+        // Add confidence column
+        CSVColumnMapping confMapping;
+        confMapping.columnIndex = 2;
+        confMapping.type = CSVColumnType::Confidence;
+        confMapping.headerName = "confidence";
+        m_columnMappings.push_back(confMapping);
+        
+        // Add reputation column
+        CSVColumnMapping repMapping;
+        repMapping.columnIndex = 3;
+        repMapping.type = CSVColumnType::Reputation;
+        repMapping.headerName = "reputation";
+        m_columnMappings.push_back(repMapping);
+        
+        // Add category column
+        CSVColumnMapping catMapping;
+        catMapping.columnIndex = 4;
+        catMapping.type = CSVColumnType::Category;
+        catMapping.headerName = "category";
+        m_columnMappings.push_back(catMapping);
     }
     
     return true;
@@ -1345,7 +1407,23 @@ IOCType CSVImportReader::DetectIOCType(std::string_view value) const {
 }
 
 bool CSVImportReader::HasMoreEntries() const noexcept {
-    return !m_endOfInput;
+    // If we already know there's no more input, return false
+    if (m_endOfInput) {
+        return false;
+    }
+    
+    // Check if stream has more content by peeking
+    // Cast away const to peek (safe because peek doesn't modify logical state)
+    auto& mutableInput = const_cast<std::istream&>(m_input);
+    
+    // Check if stream is still good
+    if (!mutableInput.good()) {
+        return false;
+    }
+    
+    // Peek to see if we're at EOF
+    int nextChar = mutableInput.peek();
+    return nextChar != std::char_traits<char>::eof();
 }
 
 std::optional<size_t> CSVImportReader::GetEstimatedTotal() const noexcept {
@@ -1403,9 +1481,24 @@ std::optional<ParseError> CSVImportReader::GetLastParseError() const {
 }
 
 bool CSVImportReader::Reset() {
+    // Clear and reset the input stream
     m_input.clear();
     m_input.seekg(0);
-    return Initialize(m_options);
+    
+    // Reset internal state
+    m_currentLine = 0;
+    m_bytesRead = 0;
+    m_endOfInput = false;
+    m_lineNumber = 0;
+    
+    // Re-read header if configured to do so
+    if (m_options.csvConfig.hasHeader) {
+        if (!ParseHeader()) {
+            return false;
+        }
+    }
+    
+    return true;
 }
 
 // ============================================================================
@@ -1762,14 +1855,56 @@ bool JSONImportReader::ParseEntryFromJSON(const std::string& jsonStr, IOCEntry& 
         }
         
         // Extract metadata with type safety
-        if (j.contains("reputation") && j["reputation"].is_number_integer()) {
-            int rep = j["reputation"].get<int>();
-            entry.reputation = static_cast<ReputationLevel>(std::clamp(rep, 0, 100));
+        // Reputation can be numeric (0-100) or string ("malicious", "suspicious", "clean", "unknown")
+        if (j.contains("reputation")) {
+            if (j["reputation"].is_number_integer()) {
+                int rep = j["reputation"].get<int>();
+                entry.reputation = static_cast<ReputationLevel>(std::clamp(rep, 0, 100));
+            } else if (j["reputation"].is_string()) {
+                std::string repStr = j["reputation"].get<std::string>();
+                std::transform(repStr.begin(), repStr.end(), repStr.begin(),
+                              [](unsigned char c) { return std::tolower(c); });
+                
+                if (repStr == "malicious" || repStr == "bad" || repStr == "dangerous") {
+                    entry.reputation = ReputationLevel::Malicious;
+                } else if (repStr == "suspicious" || repStr == "potentially_malicious") {
+                    entry.reputation = ReputationLevel::Suspicious;
+                } else if (repStr == "clean" || repStr == "safe" || repStr == "benign") {
+                    entry.reputation = ReputationLevel::Safe;  // Use Safe (not Clean)
+                } else if (repStr == "unknown" || repStr == "unverified") {
+                    entry.reputation = ReputationLevel::Unknown;
+                } else if (repStr == "critical" || repStr == "critical_threat") {
+                    entry.reputation = ReputationLevel::Critical;
+                } else if (repStr == "highrisk" || repStr == "high_risk" || repStr == "high-risk") {
+                    entry.reputation = ReputationLevel::HighRisk;
+                }
+                // Otherwise keep default
+            }
         }
         
-        if (j.contains("confidence") && j["confidence"].is_number_integer()) {
-            int conf = j["confidence"].get<int>();
-            entry.confidence = static_cast<ConfidenceLevel>(std::clamp(conf, 0, 100));
+        // Confidence can be numeric (0-100) or string ("high", "medium", "low", "none")
+        if (j.contains("confidence")) {
+            if (j["confidence"].is_number_integer()) {
+                int conf = j["confidence"].get<int>();
+                entry.confidence = static_cast<ConfidenceLevel>(std::clamp(conf, 0, 100));
+            } else if (j["confidence"].is_string()) {
+                std::string confStr = j["confidence"].get<std::string>();
+                std::transform(confStr.begin(), confStr.end(), confStr.begin(),
+                              [](unsigned char c) { return std::tolower(c); });
+                
+                if (confStr == "high" || confStr == "certain") {
+                    entry.confidence = ConfidenceLevel::High;
+                } else if (confStr == "confirmed" || confStr == "verified") {
+                    entry.confidence = ConfidenceLevel::Confirmed;
+                } else if (confStr == "medium" || confStr == "moderate" || confStr == "likely") {
+                    entry.confidence = ConfidenceLevel::Medium;
+                } else if (confStr == "low" || confStr == "possible" || confStr == "uncertain") {
+                    entry.confidence = ConfidenceLevel::Low;
+                } else if (confStr == "none" || confStr == "unknown") {
+                    entry.confidence = ConfidenceLevel::None;
+                }
+                // Otherwise keep default
+            }
         }
         
         if (j.contains("description") && j["description"].is_string()) {
@@ -1804,7 +1939,13 @@ bool JSONImportReader::ParseEntryFromJSON(const std::string& jsonStr, IOCEntry& 
 
 bool JSONImportReader::HasMoreEntries() const noexcept {
     if (m_isJsonLines) return !m_input.eof();
-    return m_currentIndex < m_buffer.length();
+    
+    // For non-JSONL JSON, check against cached entries count (not raw buffer length)
+    // Note: Before document is parsed, we conservatively return true if there's buffer content
+    if (!m_documentParsed) {
+        return !m_buffer.empty();
+    }
+    return m_currentIndex < m_cachedEntries.size();
 }
 
 std::optional<size_t> JSONImportReader::GetEstimatedTotal() const noexcept {
@@ -3651,7 +3792,7 @@ bool OpenIOCImportReader::ParseDocument() {
             return false;
         }
         
-        // Validate XML structure
+        // Parse XML structure
         pugi::xml_document doc;
         pugi::xml_parse_result result = doc.load_string(content.c_str());
         
@@ -3660,9 +3801,36 @@ bool OpenIOCImportReader::ParseDocument() {
             return false;
         }
         
-        // Note: Since we can't store the pugi::xml_document in the class,
-        // we use a streaming approach in ReadNextEntry.
-        // This is less efficient but necessary given the interface constraints.
+        // Extract all IndicatorItem elements and cache them
+        m_cachedIndicators.clear();
+        
+        // Lambda to recursively find all IndicatorItem elements
+        std::function<void(const pugi::xml_node&)> extractIndicators = [&](const pugi::xml_node& node) {
+            for (pugi::xml_node child : node.children()) {
+                if (std::string_view(child.name()) == "IndicatorItem") {
+                    // Extract Context and Content from this IndicatorItem
+                    auto context = child.child("Context");
+                    auto contentNode = child.child("Content");
+                    
+                    if (context && contentNode) {
+                        std::string searchPath = context.attribute("search").as_string();
+                        std::string value = contentNode.text().as_string();
+                        
+                        if (!searchPath.empty() && !value.empty()) {
+                            m_cachedIndicators.push_back({std::move(searchPath), std::move(value)});
+                        }
+                    }
+                }
+                // Recursively search child nodes
+                extractIndicators(child);
+            }
+        };
+        
+        // Start extraction from root
+        extractIndicators(doc);
+        
+        m_totalItems = m_cachedIndicators.size();
+        m_currentIndex = 0;
         
         return true;
     } catch (const std::bad_alloc&) {
@@ -3681,168 +3849,123 @@ bool OpenIOCImportReader::ReadNextEntry(IOCEntry& entry, IStringPoolWriter* stri
         return false;
     }
     
-    // Maximum buffer size for a single indicator item
-    constexpr size_t MAX_ITEM_BUFFER_SIZE = 1024 * 1024;  // 1MB per item
-    
-    try {
-        // Scan for <IndicatorItem> ... </IndicatorItem>
-        std::string buffer;
-        buffer.reserve(4096);
+    // Check if we have more cached indicators
+    while (m_currentIndex < m_cachedIndicators.size()) {
+        const auto& indicator = m_cachedIndicators[m_currentIndex];
+        m_currentIndex++;
         
-        char c = 0;
-        bool foundStart = false;
-        std::string tag;
-        tag.reserve(64);
-        bool inTag = false;
+        const std::string& search = indicator.searchPath;
+        const std::string& value = indicator.value;
         
-        // This is a streaming XML scanner
-        while (m_input.get(c)) {
-            m_bytesRead++;
-            
-            if (c == '<') {
-                inTag = true;
-                tag.clear();
-            } else if (c == '>') {
-                inTag = false;
-                if (tag == "IndicatorItem" || tag.find("IndicatorItem ") == 0) {
-                    foundStart = true;
-                    buffer = "<IndicatorItem>";
-                } else if (tag == "/IndicatorItem") {
-                    if (foundStart) {
-                        buffer += "</IndicatorItem>";
-                        
-                        // Parse the item
-                        pugi::xml_document doc;
-                        if (doc.load_string(buffer.c_str())) {
-                            auto item = doc.child("IndicatorItem");
-                            auto context = item.child("Context");
-                            auto content = item.child("Content");
-                            
-                            if (context && content) {
-                                std::string search = context.attribute("search").as_string();
-                                std::string value = content.text().as_string();
-                                
-                                // Validate value length
-                                constexpr size_t MAX_VALUE_LENGTH = 64 * 1024;  // 64KB
-                                if (value.length() > MAX_VALUE_LENGTH) {
-                                    foundStart = false;
-                                    buffer.clear();
-                                    continue;
-                                }
-                                
-                                IOCType type = MapOpenIOCSearchToIOCType(search);
-                                if (type != IOCType::Reserved && !value.empty()) {
-                                    // Initialize entry using assignment (safer than placement new)
-                                    entry = IOCEntry{};
-                                    entry.type = type;
-                                    entry.source = m_options.defaultSource;
-                                    entry.createdTime = static_cast<uint64_t>(std::time(nullptr));
-                                    entry.reputation = m_options.defaultReputation;
-                                    entry.confidence = m_options.defaultConfidence;
-                                    
-                                    if (type == IOCType::IPv4) {
-                                        uint8_t octets[4] = {0};
-                                        if (SafeParseIPv4(value, octets)) {
-                                            entry.value.ipv4 = {};
-                                            entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
-                                            entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
-                                        } else {
-                                            foundStart = false;
-                                            buffer.clear();
-                                            continue;  // Skip invalid IPv4
-                                        }
-                                    } else if (type == IOCType::FileHash) {
-                                        HashAlgorithm algo = DetermineHashAlgo(value.length());
-                                        bool hasExplicitType = false;
-                                        if (search.find("Md5") != std::string::npos) { algo = HashAlgorithm::MD5; hasExplicitType = true; }
-                                        else if (search.find("Sha1") != std::string::npos) { algo = HashAlgorithm::SHA1; hasExplicitType = true; }
-                                        else if (search.find("Sha256") != std::string::npos) { algo = HashAlgorithm::SHA256; hasExplicitType = true; }
-                                        
-                                        // Validate hash length if no explicit type
-                                        if (!hasExplicitType && !IsValidHashHexLength(value.length())) {
-                                            foundStart = false;
-                                            buffer.clear();
-                                            continue;
-                                        }
-                                        
-                                        entry.value.hash.algorithm = algo;
-                                        
-                                        // Validate hash byte length
-                                        const size_t byteLength = value.length() / 2;
-                                        if (byteLength > sizeof(entry.value.hash.data) || byteLength > 255) {
-                                            foundStart = false;
-                                            buffer.clear();
-                                            continue;
-                                        }
-                                        entry.value.hash.length = static_cast<uint8_t>(byteLength);
-                                        
-                                        if (!ParseHexString(value, entry.value.hash.data)) {
-                                            foundStart = false;
-                                            buffer.clear();
-                                            continue;  // Skip invalid hash
-                                        }
-                                        entry.valueType = static_cast<uint8_t>(IOCType::FileHash);
-                                    } else {
-                                        auto [offset, length] = stringPool->AddString(value);
-                                        entry.value.stringRef.stringOffset = offset;
-                                        entry.value.stringRef.stringLength = length;
-                                        entry.valueType = static_cast<uint8_t>(type);
-                                    }
-                                    return true;
-                                }
-                            }
-                        }
-                        foundStart = false;
-                        buffer.clear();
-                    }
-                }
-            }
-            
-            if (foundStart) {
-                buffer += c;
-                
-                // Security check: prevent buffer overflow
-                if (buffer.size() > MAX_ITEM_BUFFER_SIZE) {
-                    m_lastError = "OpenIOC indicator item exceeds maximum size";
-                    buffer.clear();
-                    foundStart = false;
-                }
-            } else if (inTag) {
-                tag += c;
-                
-                // Limit tag name size
-                if (tag.size() > 256) {
-                    tag.clear();
-                }
-            }
+        // Validate value length
+        constexpr size_t MAX_VALUE_LENGTH = 64 * 1024;  // 64KB
+        if (value.length() > MAX_VALUE_LENGTH) {
+            continue;  // Skip oversized values
         }
         
-        return false;
-    } catch (const std::bad_alloc&) {
-        m_lastError = "Memory allocation failed during OpenIOC parsing";
-        return false;
-    } catch (const std::exception& e) {
-        m_lastError = std::string("OpenIOC parse error: ") + e.what();
-        return false;
+        IOCType type = MapOpenIOCSearchToIOCType(search);
+        if (type == IOCType::Reserved || value.empty()) {
+            continue;  // Skip unknown types or empty values
+        }
+        
+        // Initialize entry
+        entry = IOCEntry{};
+        entry.type = type;
+        entry.source = m_options.defaultSource;
+        entry.createdTime = static_cast<uint64_t>(std::time(nullptr));
+        entry.reputation = m_options.defaultReputation;
+        entry.confidence = m_options.defaultConfidence;
+        
+        if (type == IOCType::IPv4) {
+            uint8_t octets[4] = {0};
+            if (SafeParseIPv4(value, octets)) {
+                entry.value.ipv4 = {};
+                entry.value.ipv4.Set(octets[0], octets[1], octets[2], octets[3]);
+                entry.valueType = static_cast<uint8_t>(IOCType::IPv4);
+            } else {
+                continue;  // Skip invalid IPv4
+            }
+        } else if (type == IOCType::FileHash) {
+            HashAlgorithm algo = DetermineHashAlgo(value.length());
+            bool hasExplicitType = false;
+            if (search.find("Md5") != std::string::npos) { algo = HashAlgorithm::MD5; hasExplicitType = true; }
+            else if (search.find("Sha1") != std::string::npos) { algo = HashAlgorithm::SHA1; hasExplicitType = true; }
+            else if (search.find("Sha256") != std::string::npos) { algo = HashAlgorithm::SHA256; hasExplicitType = true; }
+            
+            // Validate hash length if no explicit type
+            if (!hasExplicitType && !IsValidHashHexLength(value.length())) {
+                continue;
+            }
+            
+            entry.value.hash.algorithm = algo;
+            
+            // Validate hash byte length
+            const size_t byteLength = value.length() / 2;
+            if (byteLength > sizeof(entry.value.hash.data) || byteLength > 255) {
+                continue;
+            }
+            entry.value.hash.length = static_cast<uint8_t>(byteLength);
+            
+            if (!ParseHexString(value, entry.value.hash.data)) {
+                continue;  // Skip invalid hash
+            }
+            entry.valueType = static_cast<uint8_t>(IOCType::FileHash);
+        } else {
+            auto [offset, length] = stringPool->AddString(value);
+            entry.value.stringRef.stringOffset = offset;
+            entry.value.stringRef.stringLength = length;
+            entry.valueType = static_cast<uint8_t>(type);
+        }
+        
+        return true;
     }
+    
+    return false;
 }
 
 IOCType OpenIOCImportReader::MapOpenIOCSearchToIOCType(std::string_view search) const {
+    // IPv4/IP Address patterns
     if (search.find("IP/IPv4Address") != std::string::npos) return IOCType::IPv4;
+    if (search.find("NetworkItem/IP") != std::string::npos) return IOCType::IPv4;
+    if (search.find("/IP") != std::string::npos && search.find("IPv6") == std::string::npos) return IOCType::IPv4;
+    if (search.find("IPv4") != std::string::npos) return IOCType::IPv4;
+    
+    // IPv6 patterns  
+    if (search.find("IPv6") != std::string::npos) return IOCType::IPv6;
+    
+    // Domain/Host patterns
     if (search.find("DnsEntry/Host") != std::string::npos) return IOCType::Domain;
+    if (search.find("DnsItem/Host") != std::string::npos) return IOCType::Domain;
+    if (search.find("/Host") != std::string::npos) return IOCType::Domain;
+    if (search.find("Domain") != std::string::npos) return IOCType::Domain;
+    if (search.find("FQDN") != std::string::npos) return IOCType::Domain;
+    
+    // File hash patterns
     if (search.find("File/Md5") != std::string::npos) return IOCType::FileHash;
     if (search.find("File/Sha1") != std::string::npos) return IOCType::FileHash;
     if (search.find("File/Sha256") != std::string::npos) return IOCType::FileHash;
+    if (search.find("Md5sum") != std::string::npos) return IOCType::FileHash;
+    if (search.find("Sha1sum") != std::string::npos) return IOCType::FileHash;
+    if (search.find("Sha256sum") != std::string::npos) return IOCType::FileHash;
+    
+    // Email patterns
     if (search.find("Email/From") != std::string::npos) return IOCType::Email;
+    if (search.find("Email/To") != std::string::npos) return IOCType::Email;
+    if (search.find("EmailAddress") != std::string::npos) return IOCType::Email;
+    
+    // URL patterns
+    if (search.find("URL") != std::string::npos) return IOCType::URL;
+    if (search.find("Uri") != std::string::npos) return IOCType::URL;
+    
     return IOCType::Reserved;
 }
 
 bool OpenIOCImportReader::HasMoreEntries() const noexcept {
-    return !m_input.eof();
+    return m_currentIndex < m_cachedIndicators.size();
 }
 
 std::optional<size_t> OpenIOCImportReader::GetEstimatedTotal() const noexcept {
-    return std::nullopt;
+    return m_cachedIndicators.size();
 }
 
 uint64_t OpenIOCImportReader::GetBytesRead() const noexcept {
@@ -4227,14 +4350,19 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
         // Maximum entries to prevent DoS (configurable via options if needed)
         constexpr size_t MAX_TOTAL_ENTRIES = 100'000'000;  // 100 million
         
+        // Progress callback invocation counter (for periodic updates)
+        size_t progressCallbackCounter = 0;
+        constexpr size_t PROGRESS_CALLBACK_INTERVAL = 10;  // Invoke callback every N entries (low for responsive cancellation)
+        
         while (reader.ReadNextEntry(entry, &stringPool)) {
             // Check cancellation
-            if (m_cancellationRequested) {
+            if (m_cancellationRequested.load(std::memory_order_acquire)) {
                 result.wasCancelled = true;
                 break;
             }
             
             result.totalParsed++;
+            progressCallbackCounter++;
             
             // Safety limit check
             if (result.totalParsed > MAX_TOTAL_ENTRIES) {
@@ -4251,18 +4379,32 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
                     // database.AddIOCs(batch);
                     result.totalImported += batch.size();
                     batch.clear();
-                    
-                    // Update progress
-                    if (progressCallback) {
-                        UpdateProgress(progress, result.totalParsed, progress.totalEntries, 
-                                       reader.GetBytesRead(), 0, startTime);
-                        if (!progressCallback(progress)) {
-                            m_cancellationRequested = true;
-                        }
-                    }
                 }
             } else {
                 result.totalValidationFailures++;
+            }
+            
+            // Periodic progress callback (every N entries or when batch fills)
+            if (progressCallback && progressCallbackCounter >= PROGRESS_CALLBACK_INTERVAL) {
+                progressCallbackCounter = 0;
+                UpdateProgress(progress, result.totalParsed, progress.totalEntries, 
+                               reader.GetBytesRead(), 0, startTime);
+                if (!progressCallback(progress)) {
+                    m_cancellationRequested.store(true, std::memory_order_release);
+                    result.wasCancelled = true;
+                    break;  // Immediately stop on cancellation
+                }
+            }
+        }
+        
+        // Final progress callback at end of import
+        if (progressCallback && !result.wasCancelled && !m_cancellationRequested.load(std::memory_order_acquire)) {
+            UpdateProgress(progress, result.totalParsed, progress.totalEntries, 
+                           reader.GetBytesRead(), 0, startTime);
+            progress.percentComplete = 100.0;
+            if (!progressCallback(progress)) {
+                m_cancellationRequested.store(true, std::memory_order_release);
+                result.wasCancelled = true;
             }
         }
         
@@ -4756,18 +4898,18 @@ IOCType ThreatIntelImporter::DetectIOCType(std::string_view value) {
         return 0;
     }
     
-    // Days in month validation
-    static constexpr int daysInMonth[] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    if (tm.tm_mday > daysInMonth[tm.tm_mon]) {
-        if (tm.tm_mon == 1 && tm.tm_mday == 29) {
-            const int year = tm.tm_year + 1900;
-            const bool isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            if (!isLeapYear) {
-                return 0;
-            }
-        } else {
-            return 0;
+    // Days in month validation (February uses 28, leap year check is separate)
+    static constexpr int daysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    
+    if (tm.tm_mon == 1 && tm.tm_mday == 29) {
+        // Special case: February 29 - check if leap year
+        const int year = tm.tm_year + 1900;
+        const bool isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        if (!isLeapYear) {
+            return 0;  // Invalid: Feb 29 in non-leap year
         }
+    } else if (tm.tm_mday > daysInMonth[tm.tm_mon]) {
+        return 0;  // Invalid: day exceeds days in month
     }
     
     // Convert to Unix timestamp (UTC)
@@ -4785,6 +4927,14 @@ IOCType ThreatIntelImporter::DetectIOCType(std::string_view value) {
     int64_t adjusted = static_cast<int64_t>(result) + (tzOffsetMinutes * 60);
     if (adjusted < 0) {
         return 0;
+    }
+    
+    // Special case: Unix epoch (1970-01-01T00:00:00Z) returns 0, but we use 0 as error sentinel.
+    // To distinguish valid epoch from parse errors, return 1 for exact epoch.
+    // This is a common API design pattern where 0 = invalid and 1+ = valid timestamp.
+    // The 1-second loss of precision is negligible for threat intelligence use cases.
+    if (adjusted == 0) {
+        return 1;  // Return 1 to indicate "valid epoch" vs 0 for "error"
     }
     
     return static_cast<uint64_t>(adjusted);

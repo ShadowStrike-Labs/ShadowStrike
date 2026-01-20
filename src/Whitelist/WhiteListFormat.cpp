@@ -2332,7 +2332,7 @@ std::optional<HashValue> ParseHashString(
     }
     
     // Additional safety: ensure expected length doesn't exceed HashValue::MAX_HASH_LENGTH
-    if (expectedLen > HashValue::MAX_HASH_LENGTH) {
+    if (expectedLen > HashValue::MAX_HASH_LENGTH) {//-V547 we want additional safety.
         SS_LOG_ERROR(L"Whitelist",
             L"ParseHashString: algorithm %u has length %u exceeding max %u",
             static_cast<unsigned>(algo),

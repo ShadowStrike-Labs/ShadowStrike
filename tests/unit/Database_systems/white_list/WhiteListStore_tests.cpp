@@ -211,8 +211,8 @@ TEST_F(WhitelistStoreTest, Persistence_SaveAndLoad_PreservesData) {
     HashValue hash1 = CreateHash("persist_1");
     HashValue hash2 = CreateHash("persist_2");
     
-    store->AddHash(hash1, WhitelistReason::ReputationBased);
-    store->AddHash(hash2, WhitelistReason::PolicyBased);
+    store->AddHash(hash1, WhitelistReason::ReputationBased);//-V530
+    store->AddHash(hash2, WhitelistReason::PolicyBased);//-V530
     
     // 2. Persist to disk
     ASSERT_TRUE(store->Save().IsSuccess());
@@ -254,7 +254,7 @@ TEST_F(WhitelistStoreTest, AddPath_PrefixMatch_Success) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     std::wstring folder = L"C:\\Program Files\\TrustedApp";
-    store->AddPath(folder, PathMatchMode::Prefix, WhitelistReason::TrustedVendor);
+    store->AddPath(folder, PathMatchMode::Prefix, WhitelistReason::TrustedVendor);//-V530
     
     // Test sub-item
     std::wstring subItem = L"C:\\Program Files\\TrustedApp\\bin\\app.exe";
@@ -273,7 +273,7 @@ TEST_F(WhitelistStoreTest, AddPath_SuffixMatch_Success) {
     
     // Whitelist all .dll files
     std::wstring suffix = L".dll";
-    store->AddPath(suffix, PathMatchMode::Suffix, WhitelistReason::SystemFile);
+    store->AddPath(suffix, PathMatchMode::Suffix, WhitelistReason::SystemFile);//-V530
     
     // Test matching suffix
     auto res1 = store->IsPathWhitelisted(L"C:\\Windows\\System32\\kernel32.dll");
@@ -292,7 +292,7 @@ TEST_F(WhitelistStoreTest, AddPath_GlobMatch_Success) {
     
     // Whitelist pattern: C:\Windows\System32\*.exe
     std::wstring glob = L"C:\\Windows\\System32\\*.exe";
-    store->AddPath(glob, PathMatchMode::Glob, WhitelistReason::SystemFile);
+    store->AddPath(glob, PathMatchMode::Glob, WhitelistReason::SystemFile);//-V530
     
     // Should match
     auto res1 = store->IsPathWhitelisted(L"C:\\Windows\\System32\\notepad.exe");
@@ -312,7 +312,7 @@ TEST_F(WhitelistStoreTest, AddPath_RegexMatch_Success) {
     
     // Whitelist regex: Any path containing "TrustedApp" anywhere
     std::wstring regex = L".*TrustedApp.*\\.exe$";
-    store->AddPath(regex, PathMatchMode::Regex, WhitelistReason::PolicyBased);
+    store->AddPath(regex, PathMatchMode::Regex, WhitelistReason::PolicyBased);//-V530
     
     // Should match
     auto res1 = store->IsPathWhitelisted(L"C:\\Program Files\\TrustedApp\\app.exe");
@@ -333,7 +333,7 @@ TEST_F(WhitelistStoreTest, IsWhitelisted_ComprehensiveCheck_PrioritizesHash) {
     std::wstring path = L"C:\\Temp\\unknown.exe";
     
     // Whitelist the hash, but not the path
-    store->AddHash(hash, WhitelistReason::ReputationBased);
+    store->AddHash(hash, WhitelistReason::ReputationBased);//-V530
     
     auto res = store->IsWhitelisted(path, &hash, nullptr, {});
     
@@ -357,7 +357,7 @@ TEST_F(WhitelistStoreTest, AddHash_WithExpiration_ExpiresCorrectly) {
         (now + std::chrono::seconds(1)).time_since_epoch()
     ).count();
     
-    store->AddHash(hash, WhitelistReason::TemporaryBypass, L"Short lived", expiry);
+    store->AddHash(hash, WhitelistReason::TemporaryBypass, L"Short lived", expiry);//-V530
     
     // valid immediately
     EXPECT_TRUE(store->IsHashWhitelisted(hash).found);
@@ -381,7 +381,7 @@ TEST_F(WhitelistStoreTest, PurgeExpired_RemovesEntries) {
         (now - std::chrono::seconds(1)).time_since_epoch()
     ).count();
     
-    store->AddHash(hash, WhitelistReason::TemporaryBypass, L"Old", expiry);
+    store->AddHash(hash, WhitelistReason::TemporaryBypass, L"Old", expiry);//-V530
     EXPECT_EQ(store->GetEntryCount(), 1);
     
     StoreError err = store->PurgeExpired();
@@ -412,14 +412,14 @@ TEST_F(WhitelistStoreTest, Concurrent_ReadWrite_ThreadSafe) {
             for (int j = 0; j < OPS_PER_THREAD; ++j) {
                 std::string key = "W" + std::to_string(i) + "_" + std::to_string(j);
                 HashValue h = CreateHash(key);
-                store->AddHash(h, WhitelistReason::PolicyBased);
+                store->AddHash(h, WhitelistReason::PolicyBased);//-V530
             }
         }));
     }
     
     // Readers: check for a known hash (added beforehand) and randoms
     HashValue knownHash = CreateHash("known_exists");
-    store->AddHash(knownHash, WhitelistReason::UserApproved);
+    store->AddHash(knownHash, WhitelistReason::UserApproved);//-V530
     
     for (int i = 0; i < NUM_READERS; ++i) {
         futures.push_back(std::async(std::launch::async, [&]() {
@@ -434,7 +434,7 @@ TEST_F(WhitelistStoreTest, Concurrent_ReadWrite_ThreadSafe) {
                 
                 // Random lookup shouldn't crash
                 HashValue randomH = CreateHash("R_" + std::to_string(j));
-                store->IsHashWhitelisted(randomH);
+                store->IsHashWhitelisted(randomH);//-V530
             }
         }));
     }
@@ -495,7 +495,7 @@ TEST_F(WhitelistStoreTest, BatchLookup_OptimizedPath) {
     std::vector<HashValue> searchHashes;
     for (int i = 0; i < 100; ++i) {
         HashValue h = CreateHash("Key_" + std::to_string(i));
-        store->AddHash(h, WhitelistReason::UserApproved); // Add only even ones? No, add all
+        store->AddHash(h, WhitelistReason::UserApproved);//-V530
         searchHashes.push_back(h);
     }
     
@@ -526,7 +526,7 @@ TEST_F(WhitelistStoreTest, BloomFilter_RejectsBeforeIndexLookup) {
     store->SetBloomFilterEnabled(true);
     
     // Add one item
-    store->AddHash(CreateHash("Exists"), WhitelistReason::UserApproved);
+    store->AddHash(CreateHash("Exists"), WhitelistReason::UserApproved);//-V530
     
     // Query existing
     auto res1 = store->IsHashWhitelisted(CreateHash("Exists"));
@@ -582,7 +582,7 @@ TEST_F(WhitelistStoreTest, IsCertificateWhitelisted_ExistingCert_ReturnsWhitelis
         thumbprint[i] = static_cast<uint8_t>(0xAB ^ i);
     }
     
-    store->AddCertificate(thumbprint, WhitelistReason::ReputationBased);
+    store->AddCertificate(thumbprint, WhitelistReason::ReputationBased);//-V530
     
     auto result = store->IsCertificateWhitelisted(thumbprint);
     EXPECT_TRUE(result.found);
@@ -621,7 +621,7 @@ TEST_F(WhitelistStoreTest, IsPublisherWhitelisted_ExistingPublisher_ReturnsWhite
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     std::wstring publisher = L"Google LLC";
-    store->AddPublisher(publisher, WhitelistReason::PolicyBased);
+    store->AddPublisher(publisher, WhitelistReason::PolicyBased);//-V530
     
     auto result = store->IsPublisherWhitelisted(publisher);
     EXPECT_TRUE(result.found);
@@ -631,7 +631,7 @@ TEST_F(WhitelistStoreTest, IsPublisherWhitelisted_ExistingPublisher_ReturnsWhite
 TEST_F(WhitelistStoreTest, IsPublisherWhitelisted_CaseInsensitive) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddPublisher(L"Adobe Inc.", WhitelistReason::UserApproved);
+    store->AddPublisher(L"Adobe Inc.", WhitelistReason::UserApproved);//-V530
     
     // Query with different case
     auto result = store->IsPublisherWhitelisted(L"ADOBE INC.");
@@ -656,7 +656,7 @@ TEST_F(WhitelistStoreTest, GetEntry_ValidId_ReturnsEntry) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     HashValue hash = CreateHash("GetEntryTest");
-    store->AddHash(hash, WhitelistReason::UserApproved, L"Test Description");
+    store->AddHash(hash, WhitelistReason::UserApproved, L"Test Description");//-V530
     
     // Entry IDs typically start at 1
     auto entryOpt = store->GetEntry(1);
@@ -678,7 +678,7 @@ TEST_F(WhitelistStoreTest, GetEntries_Pagination_Works) {
     
     // Add 50 entries
     for (int i = 0; i < 50; ++i) {
-        store->AddHash(CreateHash("Paginate_" + std::to_string(i)), WhitelistReason::PolicyBased);
+        store->AddHash(CreateHash("Paginate_" + std::to_string(i)), WhitelistReason::PolicyBased);//-V530
     }
     
     // Get first page
@@ -698,9 +698,9 @@ TEST_F(WhitelistStoreTest, GetEntries_TypeFilter_FiltersCorrectly) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     // Add mixed types
-    store->AddHash(CreateHash("Hash1"), WhitelistReason::UserApproved);
-    store->AddHash(CreateHash("Hash2"), WhitelistReason::UserApproved);
-    store->AddPath(L"C:\\Test\\Path", PathMatchMode::Exact, WhitelistReason::SystemFile);
+    store->AddHash(CreateHash("Hash1"), WhitelistReason::UserApproved);//-V530
+    store->AddHash(CreateHash("Hash2"), WhitelistReason::UserApproved);//-V530
+    store->AddPath(L"C:\\Test\\Path", PathMatchMode::Exact, WhitelistReason::SystemFile);//-V530
     
     // Filter by FileHash only
     auto hashEntries = store->GetEntries(0, 100, WhitelistEntryType::FileHash);
@@ -714,7 +714,7 @@ TEST_F(WhitelistStoreTest, GetEntries_TypeFilter_FiltersCorrectly) {
 TEST_F(WhitelistStoreTest, UpdateEntryFlags_ChangesFlags) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("FlagTest"), WhitelistReason::UserApproved);
+    store->AddHash(CreateHash("FlagTest"), WhitelistReason::UserApproved);//-V530
     
     // Get current entry
     auto entryBefore = store->GetEntry(1);
@@ -735,7 +735,7 @@ TEST_F(WhitelistStoreTest, RevokeEntry_SoftDeletes) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     HashValue hash = CreateHash("RevokeMe");
-    store->AddHash(hash, WhitelistReason::UserApproved);
+    store->AddHash(hash, WhitelistReason::UserApproved);//-V530
     
     // Revoke
     StoreError err = store->RevokeEntry(1);
@@ -754,7 +754,7 @@ TEST_F(WhitelistStoreTest, RevokeEntry_SoftDeletes) {
 TEST_F(WhitelistStoreTest, RemoveEntry_ById_Success) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("RemoveById"), WhitelistReason::UserApproved);
+    store->AddHash(CreateHash("RemoveById"), WhitelistReason::UserApproved);//-V530
     EXPECT_EQ(store->GetEntryCount(), 1);
     
     StoreError err = store->RemoveEntry(1);
@@ -772,12 +772,12 @@ TEST_F(WhitelistStoreTest, Compact_ReducesFragmentation) {
     
     // Add and remove entries to create fragmentation
     for (int i = 0; i < 100; ++i) {
-        store->AddHash(CreateHash("Compact_" + std::to_string(i)), WhitelistReason::PolicyBased);
+        store->AddHash(CreateHash("Compact_" + std::to_string(i)), WhitelistReason::PolicyBased);//-V530
     }
     
     // Remove half
     for (int i = 0; i < 50; ++i) {
-        store->RemoveHash(CreateHash("Compact_" + std::to_string(i * 2)));
+        store->RemoveHash(CreateHash("Compact_" + std::to_string(i * 2)));//-V530
     }
     
     // Compact
@@ -796,7 +796,7 @@ TEST_F(WhitelistStoreTest, RebuildIndices_RestoresQueryability) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
     HashValue hash = CreateHash("RebuildTest");
-    store->AddHash(hash, WhitelistReason::UserApproved);
+    store->AddHash(hash, WhitelistReason::UserApproved);//-V530
     
     // Rebuild
     StoreError err = store->RebuildIndices();
@@ -810,8 +810,8 @@ TEST_F(WhitelistStoreTest, RebuildIndices_RestoresQueryability) {
 TEST_F(WhitelistStoreTest, VerifyIntegrity_HealthyDatabase_ReturnsSuccess) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("IntegrityCheck"), WhitelistReason::UserApproved);
-    store->Save();
+    store->AddHash(CreateHash("IntegrityCheck"), WhitelistReason::UserApproved);//-V530
+    store->Save();//-V530
     
     std::vector<std::string> logs;
     StoreError err = store->VerifyIntegrity([&logs](const std::string& msg) {
@@ -828,11 +828,11 @@ TEST_F(WhitelistStoreTest, ClearCache_ResetsStatistics) {
     store->SetCachingEnabled(true);
     
     HashValue hash = CreateHash("CacheTest");
-    store->AddHash(hash, WhitelistReason::UserApproved);
+    store->AddHash(hash, WhitelistReason::UserApproved);//-V530
     
     // Warm up cache
     for (int i = 0; i < 10; ++i) {
-        store->IsHashWhitelisted(hash);
+        store->IsHashWhitelisted(hash);//-V530
     }
     
     auto statsBefore = store->GetStatistics();
@@ -842,7 +842,7 @@ TEST_F(WhitelistStoreTest, ClearCache_ResetsStatistics) {
     store->ClearCache();
     
     // Query again - should be cache miss initially
-    store->IsHashWhitelisted(hash);
+    store->IsHashWhitelisted(hash);//-V530
     // Cache behavior depends on implementation
 }
 
@@ -853,8 +853,8 @@ TEST_F(WhitelistStoreTest, ClearCache_ResetsStatistics) {
 TEST_F(WhitelistStoreTest, ExportToJSONString_ReturnsValidJSON) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("Export1"), WhitelistReason::UserApproved, L"First Entry");
-    store->AddHash(CreateHash("Export2"), WhitelistReason::TrustedVendor, L"Second Entry");
+    store->AddHash(CreateHash("Export1"), WhitelistReason::UserApproved, L"First Entry");//-V530
+    store->AddHash(CreateHash("Export2"), WhitelistReason::TrustedVendor, L"Second Entry");//-V530
     
     std::string json = store->ExportToJSONString();
     
@@ -891,7 +891,7 @@ TEST_F(WhitelistStoreTest, ImportFromJSONString_AddsEntries) {
 TEST_F(WhitelistStoreTest, ExportToJSON_CreatesFile) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("FileExport"), WhitelistReason::UserApproved);
+    store->AddHash(CreateHash("FileExport"), WhitelistReason::UserApproved);//-V530
     
     std::wstring exportPath = dbPath + L".export.json";
     
@@ -907,7 +907,7 @@ TEST_F(WhitelistStoreTest, ExportToJSON_CreatesFile) {
 TEST_F(WhitelistStoreTest, ImportFromJSON_LoadsFromFile) {
     // First create and export
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
-    store->AddHash(CreateHash("RoundTrip"), WhitelistReason::PolicyBased);
+    store->AddHash(CreateHash("RoundTrip"), WhitelistReason::PolicyBased);//-V530
     
     std::wstring exportPath = dbPath + L".roundtrip.json";
     ASSERT_TRUE(store->ExportToJSON(exportPath).IsSuccess());
@@ -928,8 +928,8 @@ TEST_F(WhitelistStoreTest, ImportFromJSON_LoadsFromFile) {
 TEST_F(WhitelistStoreTest, ExportToCSV_CreatesValidCSV) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    store->AddHash(CreateHash("CSV1"), WhitelistReason::UserApproved, L"CSV Test");
-    store->AddPath(L"C:\\Test\\Path.exe", PathMatchMode::Exact, WhitelistReason::SystemFile);
+    store->AddHash(CreateHash("CSV1"), WhitelistReason::UserApproved, L"CSV Test");//-V530
+    store->AddPath(L"C:\\Test\\Path.exe", PathMatchMode::Exact, WhitelistReason::SystemFile);//-V530
     
     std::wstring csvPath = dbPath + L".export.csv";
     
@@ -1087,10 +1087,10 @@ TEST_F(WhitelistStoreTest, MatchCallback_InvokedOnMatch) {
     });
     
     HashValue hash = CreateHash("CallbackTest");
-    store->AddHash(hash, WhitelistReason::UserApproved);
+    store->AddHash(hash, WhitelistReason::UserApproved);//-V530
     
     // Query should trigger callback
-    store->IsHashWhitelisted(hash);
+    store->IsHashWhitelisted(hash);//-V530
     
     EXPECT_GE(callbackCount, 1);
     EXPECT_TRUE(capturedResult.found);

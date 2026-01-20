@@ -551,13 +551,24 @@ namespace ShadowStrike {
                                 }
                             };
 
-                            // Submit to thread pool using new API
-                            m_threadPool->Submit(
-                                std::move(safeCallback),
-                                TaskPriority::Normal,
-                                "Timer-" + std::to_string(executingId)
-                            );
+                            try {
+                                // Submit to thread pool using new API
+                                auto future = m_threadPool->Submit(
+                                    std::move(safeCallback),
+                                    TaskPriority::Normal,
+                                    "Timer-" + std::to_string(executingId)
+                                );
 
+								future.wait(); // Wait for completion
+							}
+							catch (const std::exception& e) {
+                                SS_LOG_ERROR(L"TimerManager",
+                                    L"Timer %llu submission to thread pool failed: %hs",
+                                    static_cast<unsigned long long>(executingId), e.what());
+                                throw;
+                            }
+						
+                            
                             // Update statistics
                             m_totalExecuted.fetch_add(1, std::memory_order_relaxed);
                         }

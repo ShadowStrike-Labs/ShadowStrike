@@ -1559,7 +1559,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
         DWORD winErr = GetLastError();
         SS_LOG_ERROR(L"YaraRuleStore", L"ScanProcess: OpenProcess failed for PID=%u (error: %u)",
             processId, winErr);
-        return matches;
+        return matches;//-V773 false positive: RAII guard releases handle
     }
 
     // RAII handle guard
@@ -1902,7 +1902,10 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
 
     // Reserve space to minimize reallocations (conservative estimate)
     try {
-        matches.reserve(std::min(static_cast<size_t>(safeMaxMatches * 10), static_cast<size_t>(1000)));
+        matches.reserve(std::min(
+            static_cast<size_t>(safeMaxMatches) * 10,
+            static_cast<size_t>(1000)
+        ));
     } catch (const std::bad_alloc&) {
         SS_LOG_WARN(L"YaraRuleStore", L"PerformScan: Failed to reserve match vector");
         // Continue - vector will grow as needed

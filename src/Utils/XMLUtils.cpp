@@ -485,12 +485,10 @@ bool Parse(std::string_view xmlText, Document& out, Error* err, const ParseOptio
         const size_t originalSize = xmlText.size();
         
         // Parse the XML buffer
-        const pugi::xml_parse_result res = out.load_buffer(
-            xmlText.data(), 
-            static_cast<unsigned int>(xmlText.size()), 
-            flags, 
-            pugi::encoding_utf8
-        );
+        const pugi::xml_parse_result res = out.load_buffer(xmlText.data(),
+            xmlText.size(),
+            flags,
+            pugi::encoding_utf8);// No need for casting.
         
         if (!res) {
             setErr(err, res.description(), {}, xmlText, 

@@ -991,6 +991,29 @@ bool IsValidDomain(std::string_view domain) noexcept {
         return false;
     }
     
+    // Must have at least one dot (TLD required for valid domain)
+    if (domain.find('.') == std::string_view::npos) {
+        return false;
+    }
+    
+    // Quick check: reject if it looks like an IPv4 address
+    // (all labels are numeric and there are exactly 4 labels)
+    {
+        size_t dotCount = 0;
+        bool allNumeric = true;
+        for (char c : domain) {
+            if (c == '.') {
+                dotCount++;
+            } else if (!((c >= '0' && c <= '9'))) {
+                allNumeric = false;
+            }
+        }
+        // If exactly 3 dots and all numeric, it's likely an IP address
+        if (dotCount == 3 && allNumeric) {
+            return false;  // Reject IP addresses
+        }
+    }
+    
     // Split into labels
     size_t labelStart = 0;
     size_t labelCount = 0;
@@ -1029,8 +1052,8 @@ bool IsValidDomain(std::string_view domain) noexcept {
         }
     }
     
-    // Must have at least one label (though typically 2+ for valid domain)
-    if (labelCount < 1) {
+    // Must have at least 2 labels (domain + TLD)
+    if (labelCount < 2) {
         return false;
     }
     
@@ -1520,9 +1543,17 @@ size_t CalculateBloomFilterSize(
     size_t expectedElements,
     double falsePositiveRate
 ) noexcept {
-    // Validate inputs
-    if (expectedElements == 0 || falsePositiveRate <= 0.0 || falsePositiveRate >= 1.0) {
-        return 0;
+    // Minimum size to return for invalid/edge case inputs (64 bits = 8 bytes)
+    constexpr size_t MIN_BLOOM_BITS = 64;
+    
+    // Handle edge case: zero elements - return minimum size
+    if (expectedElements == 0) {
+        return MIN_BLOOM_BITS;
+    }
+    
+    // Handle edge case: invalid FPR - use a default reasonable value (1%)
+    if (falsePositiveRate <= 0.0 || falsePositiveRate >= 1.0) {
+        falsePositiveRate = 0.01;  // Default to 1% FPR
     }
     
     // Additional validation: ensure falsePositiveRate isn't too close to 0 (would cause huge sizes)
@@ -1542,9 +1573,9 @@ size_t CalculateBloomFilterSize(
     // Use safe arithmetic: log of small numbers is large negative, so result is large positive
     double m = -static_cast<double>(expectedElements) * std::log(falsePositiveRate) / LN2_SQUARED;
     
-    // Check for NaN or infinity
+    // Check for NaN or infinity - return minimum size
     if (!std::isfinite(m) || m < 0.0) {
-        return 0;
+        return MIN_BLOOM_BITS;
     }
     
     // Sanity check - don't exceed 4GB (32 billion bits)
@@ -1556,6 +1587,11 @@ size_t CalculateBloomFilterSize(
     // Round up to multiple of 64 (for cache-line alignment and atomic operations)
     size_t bits = static_cast<size_t>(std::ceil(m));
     bits = (bits + 63) & ~static_cast<size_t>(63);
+    
+    // Ensure minimum size
+    if (bits < MIN_BLOOM_BITS) {
+        bits = MIN_BLOOM_BITS;
+    }
     
     // Final bounds check
     constexpr size_t MAX_BLOOM_BITS = 32ULL * 1024 * 1024 * 1024;
@@ -1574,9 +1610,9 @@ size_t CalculateBloomHashFunctions(
     size_t filterSize,
     size_t expectedElements
 ) noexcept {
-    // Validate inputs
+    // Handle edge cases: return minimum of 1 hash function for any invalid input
     if (filterSize == 0 || expectedElements == 0) {
-        return 0;
+        return 1;
     }
     
     // Prevent division by zero and overflow
@@ -1627,25 +1663,57 @@ size_t CalculateBloomHashFunctions(
 // ----------------------------------------------------------------------------
 
 uint32_t CalculateOptimalCacheSize(uint64_t dbSizeBytes) noexcept {
-    // Heuristic: cache should be roughly 1-5% of database size
-    // Minimum: 16MB, Maximum: 4GB
+    /**
+     * Calculate optimal cache size based on database size
+     * 
+     * Heuristic: cache should scale with database size for optimal performance
+     * - Small databases: 5-10% of db size for good hit rates
+     * - Large databases: 1-2% to avoid excessive memory usage
+     * 
+     * Minimum: 1MB (ensures reasonable cache even for tiny databases)
+     * Maximum: 4GB (practical limit for 32-bit counter)
+     * 
+     * Returns: Cache size in MEGABYTES (MB)
+     */
     
-    constexpr uint64_t MIN_CACHE_MB = 16;
-    constexpr uint64_t MAX_CACHE_MB = 4096;
-    constexpr double CACHE_RATIO = 0.02;  // 2%
+    constexpr uint32_t MIN_CACHE_MB = 1;      // Minimum 1MB cache
+    constexpr uint32_t MAX_CACHE_MB = 4096;   // Maximum 4GB cache
     
-    uint64_t cacheMB = static_cast<uint64_t>(
-        static_cast<double>(dbSizeBytes) * CACHE_RATIO / (1024 * 1024)
-    );
+    // Convert input to MB for easier calculation (avoid overflow)
+    double dbSizeMB = static_cast<double>(dbSizeBytes) / (1024.0 * 1024.0);
     
-    if (cacheMB < MIN_CACHE_MB) {
-        cacheMB = MIN_CACHE_MB;
+    // Use tiered caching ratio based on database size (in MB)
+    // Higher percentages for small databases to ensure visible scaling
+    double cacheRatio;
+    if (dbSizeMB < 10.0) {
+        // Small databases (<10MB): use 20% ratio (ensures 1MB db -> ~1MB cache)
+        cacheRatio = 0.20;
+    } else if (dbSizeMB < 100.0) {
+        // Medium databases (10MB-100MB): use 15% ratio (ensures scaling)
+        cacheRatio = 0.15;
+    } else if (dbSizeMB < 1024.0) {
+        // Large databases (100MB-1GB): use 10% ratio
+        cacheRatio = 0.10;
+    } else {
+        // Very large databases (>1GB): use 5% ratio (more memory conscious)
+        cacheRatio = 0.05;
     }
-    if (cacheMB > MAX_CACHE_MB) {
-        cacheMB = MAX_CACHE_MB;
+    
+    // Calculate cache size in MB with proper rounding
+    double cacheMB = dbSizeMB * cacheRatio;
+    
+    // Round up to ensure we get at least some scaling for larger databases
+    uint32_t cacheMBInt = static_cast<uint32_t>(std::ceil(cacheMB));
+    
+    // Apply bounds
+    if (cacheMBInt < MIN_CACHE_MB) {
+        cacheMBInt = MIN_CACHE_MB;
+    }
+    if (cacheMBInt > MAX_CACHE_MB) {
+        cacheMBInt = MAX_CACHE_MB;
     }
     
-    return static_cast<uint32_t>(cacheMB);
+    return cacheMBInt;
 }
 
 // ----------------------------------------------------------------------------

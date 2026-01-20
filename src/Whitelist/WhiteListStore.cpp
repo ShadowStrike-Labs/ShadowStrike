@@ -1141,7 +1141,7 @@ std::vector<LookupResult> WhitelistStore::BatchLookupHashes(
             results.push_back(IsHashWhitelisted(hashes[i], options));
         } catch (const std::exception&) {
             // Push empty result on error
-            results.push_back(LookupResult{});
+            results.emplace_back(LookupResult{});
         }
     }
     
