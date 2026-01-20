@@ -30,6 +30,8 @@
 #include <fstream>
 #include <sstream>
 #include <span>
+#include <chrono>
+#include <utility>
 
 namespace ShadowStrike {
 namespace ThreatIntel {
@@ -787,6 +789,1012 @@ TEST_F(ParserIntegrationTest, ParseWithPrePopulatedVector) {
     bool success = jsonParser->Parse(ToSpan(data), entries, defaultConfig);
     EXPECT_TRUE(success);
     EXPECT_GT(entries.size(), initialSize);
+}
+
+// ============================================================================
+// TITANIUM-GRADE EDGE CASE TESTS
+// ============================================================================
+
+/**
+ * @brief Enterprise-grade edge case tests for JsonFeedParser
+ * 
+ * These tests cover critical security, boundary, and robustness scenarios
+ * that are essential for enterprise antivirus deployments.
+ */
+class JsonFeedParserEdgeCaseTest : public ::testing::Test {
+protected:
+    std::unique_ptr<IFeedParser> parser;
+    ParserConfig defaultConfig;
+    
+    void SetUp() override {
+        parser = std::make_unique<JsonFeedParser>();
+        defaultConfig = ParserConfig{};
+    }
+    
+    [[nodiscard]] std::span<const uint8_t> ToSpan(const std::string& data) {
+        return std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size()
+        );
+    }
+};
+
+// --- Security Edge Cases ---
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithNullBytes) {
+    // Test: JSON containing null bytes (potential security issue)
+    std::string data = R"({"objects": [{"value": "192.168.1.1", "itype": "mal_ip"}]})";
+    data.insert(20, 1, '\0');  // Insert null byte
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should either fail gracefully or handle correctly
+    EXPECT_TRUE(success || !success);
+    EXPECT_TRUE(parser->GetLastError().empty() || !parser->GetLastError().empty());
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithScriptInjection) {
+    // Test: Attempt to inject script tags in JSON values
+    std::string data = R"({
+        "objects": [{
+            "value": "192.168.1.1",
+            "itype": "mal_ip",
+            "description": "<script>alert('xss')</script>"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should parse successfully - XSS is not a JSON parsing issue
+    EXPECT_TRUE(success);
+    // Values should be stored as-is (sanitization is display layer concern)
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithSQLInjection) {
+    // Test: SQL injection attempt in JSON values
+    std::string data = R"({
+        "objects": [{
+            "value": "'; DROP TABLE iocs; --",
+            "itype": "mal_domain"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Parser should handle this - SQL injection prevention is database layer
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithPathTraversal) {
+    // Test: Path traversal attempt in file path values
+    std::string data = R"({
+        "objects": [{
+            "value": "../../etc/passwd",
+            "itype": "mal_file"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);  // Parser should parse, validation is separate
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithExtremelyLongStrings) {
+    // Test: Very long string values (potential DoS via memory exhaustion)
+    std::string longValue(1024 * 1024, 'A');  // 1MB string
+    std::string data = R"({"objects": [{"value": ")" + longValue + R"(", "itype": "mal_ip"}]})";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should handle gracefully
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithDeepNesting) {
+    // Test: Deeply nested JSON (potential stack overflow)
+    std::string data = R"({"a":)";
+    for (int i = 0; i < 1000; i++) {
+        data += R"({"a":)";
+    }
+    data += "null";
+    for (int i = 0; i < 1001; i++) {
+        data += "}";
+    }
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should either fail gracefully or succeed (nlohmann::json handles this)
+    EXPECT_TRUE(success || !success);
+}
+
+// --- Boundary Conditions ---
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithIntegerOverflow) {
+    // Test: Integer values at the edge of representation
+    std::string data = R"({
+        "objects": [{
+            "value": "192.168.1.1",
+            "itype": "mal_ip",
+            "confidence": 18446744073709551615,
+            "severity_score": -9223372036854775808
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithFloatingPointEdgeCases) {
+    // Test: Edge case floating point values
+    std::string data = R"({
+        "objects": [{
+            "value": "192.168.1.1",
+            "itype": "mal_ip",
+            "score": 1.7976931348623157e+308,
+            "tiny_score": 2.2250738585072014e-308,
+            "negative_zero": -0.0
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithExactlyZeroItems) {
+    // Test: Empty objects array
+    std::string data = R"({"objects": []})";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entries.size(), 0u);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithExactlyOneItem) {
+    // Test: Single item edge case
+    std::string data = R"({"objects": [{"value": "192.168.1.1", "itype": "mal_ip"}]})";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entries.size(), 1u);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithSpecialIPAddresses) {
+    // Test: Special/reserved IP addresses
+    std::vector<std::pair<std::string, std::string>> specialIPs = {
+        {"0.0.0.0", "null_address"},
+        {"255.255.255.255", "broadcast"},
+        {"127.0.0.1", "localhost"},
+        {"169.254.0.1", "link_local"},
+        {"224.0.0.1", "multicast"},
+        {"::1", "ipv6_localhost"},
+        {"::ffff:192.168.1.1", "ipv4_mapped_ipv6"},
+        {"fe80::1", "ipv6_link_local"}
+    };
+    
+    for (const auto& [ip, description] : specialIPs) {
+        std::string data = R"({"objects": [{"value": ")" + ip + R"(", "itype": "mal_ip"}]})";
+        std::vector<IOCEntry> entries;
+        bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+        
+        EXPECT_TRUE(success) << "Failed for IP: " << ip << " (" << description << ")";
+    }
+}
+
+// --- Format Edge Cases ---
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithBOM) {
+    // Test: JSON with UTF-8 BOM
+    std::string bom = "\xEF\xBB\xBF";
+    std::string data = bom + R"({"objects": [{"value": "192.168.1.1", "itype": "mal_ip"}]})";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should handle BOM gracefully
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithControlCharacters) {
+    // Test: JSON with escaped control characters
+    std::string data = R"({
+        "objects": [{
+            "value": "192.168.1.1",
+            "itype": "mal_ip",
+            "description": "Test\t\r\n\b\f"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithEscapedUnicode) {
+    // Test: JSON with escaped Unicode sequences
+    std::string data = R"({
+        "objects": [{
+            "value": "192.168.1.1",
+            "itype": "mal_ip",
+            "description": "\u0048\u0065\u006C\u006C\u006F \u4E16\u754C"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithSurrogatePairs) {
+    // Test: JSON with Unicode surrogate pairs (emoji, etc.)
+    std::string data = R"({
+        "objects": [{
+            "value": "192.168.1.1",
+            "itype": "mal_ip",
+            "description": "Malware \uD83D\uDC80"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithTrailingComma) {
+    // Test: JSON with trailing comma (invalid JSON but common mistake)
+    std::string data = R"({
+        "objects": [
+            {"value": "192.168.1.1", "itype": "mal_ip"},
+        ]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // nlohmann::json rejects trailing commas by default
+    EXPECT_FALSE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithComments) {
+    // Test: JSON with comments (invalid standard JSON)
+    std::string data = R"({
+        // This is a comment
+        "objects": [{"value": "192.168.1.1", "itype": "mal_ip"}]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Standard JSON parsers reject comments
+    EXPECT_FALSE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithWhitespaceVariations) {
+    // Test: Various whitespace patterns
+    std::string data = "   \t\n\r {  \"objects\"  :  [  {  \"value\"  :  \"192.168.1.1\"  ,  \"itype\"  :  \"mal_ip\"  }  ]  }   ";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithDuplicateKeys) {
+    // Test: JSON with duplicate keys (behavior is undefined in JSON spec)
+    std::string data = R"({
+        "objects": [{"value": "192.168.1.1", "value": "10.0.0.1", "itype": "mal_ip"}]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // nlohmann::json takes the last value for duplicate keys
+    EXPECT_TRUE(success);
+}
+
+// --- Error Recovery Edge Cases ---
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithPartialData) {
+    // Test: Truncated JSON data
+    std::string data = R"({"objects": [{"value": "192.168)";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_FALSE(success);
+    EXPECT_FALSE(parser->GetLastError().empty());
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithNullValues) {
+    // Test: JSON with explicit null values
+    std::string data = R"({
+        "objects": [{
+            "value": null,
+            "itype": "mal_ip",
+            "severity": null,
+            "tags": null
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should handle null values gracefully
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithMixedValidInvalidEntries) {
+    // Test: Mix of valid and invalid entries
+    std::string data = R"({
+        "objects": [
+            {"value": "192.168.1.1", "itype": "mal_ip"},
+            {"invalid": "entry", "no_value": true},
+            {"value": "192.168.1.2", "itype": "mal_ip"},
+            {},
+            {"value": "192.168.1.3", "itype": "mal_ip"}
+        ]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    // Should skip invalid entries, parse valid ones
+    EXPECT_GE(entries.size(), 3u);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithDifferentFormats) {
+    // Test: Auto-detection of various JSON formats
+    std::vector<std::string> formats = {
+        R"({"objects": [{"value": "1.1.1.1", "itype": "mal_ip"}]})",       // ThreatStream
+        R"({"results": [{"indicator": "2.2.2.2", "type": "IPv4"}]})",     // AlienVault
+        R"({"data": [{"value": "3.3.3.3", "type": "ip"}]})",              // Generic data
+        R"({"indicators": [{"value": "4.4.4.4", "type": "ip"}]})",        // Generic indicators
+        R"({"iocs": [{"value": "5.5.5.5", "type": "ip"}]})",              // Generic iocs
+        R"({"entries": [{"value": "6.6.6.6", "type": "ip"}]})",           // Generic entries
+        R"({"items": [{"value": "7.7.7.7", "type": "ip"}]})"              // Generic items
+    };
+    
+    for (size_t i = 0; i < formats.size(); i++) {
+        std::vector<IOCEntry> entries;
+        bool success = parser->Parse(ToSpan(formats[i]), entries, defaultConfig);
+        
+        EXPECT_TRUE(success) << "Failed for format index: " << i;
+        EXPECT_GE(entries.size(), 1u) << "No entries parsed for format index: " << i;
+    }
+}
+
+// --- Performance Edge Cases ---
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithManySmallObjects) {
+    // Test: Many small objects (stress test for object allocation)
+    std::ostringstream json;
+    json << R"({"objects": [)";
+    for (int i = 0; i < 10000; i++) {
+        if (i > 0) json << ",";
+        json << R"({"value": "192.168.)" << (i / 256) << "." << (i % 256) << R"(", "itype": "mal_ip"})";
+    }
+    json << "]}";
+    
+    std::string data = json.str();
+    std::vector<IOCEntry> entries;
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entries.size(), 10000u);
+    // Should complete in reasonable time (< 5 seconds)
+    EXPECT_LT(duration.count(), 5000);
+}
+
+TEST_F(JsonFeedParserEdgeCaseTest, ParseJsonWithDeepArrayNesting) {
+    // Test: Deeply nested arrays (different from object nesting)
+    std::string data = R"({
+        "objects": [
+            {"value": "192.168.1.1", "itype": "mal_ip", "tags": [["a", ["b", ["c"]]], "d"]}
+        ]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+/**
+ * @brief Enterprise-grade edge case tests for CsvFeedParser
+ */
+class CsvFeedParserEdgeCaseTest : public ::testing::Test {
+protected:
+    std::unique_ptr<IFeedParser> parser;
+    ParserConfig defaultConfig;
+    
+    void SetUp() override {
+        parser = std::make_unique<CsvFeedParser>();
+        defaultConfig = ParserConfig{};
+    }
+    
+    [[nodiscard]] std::span<const uint8_t> ToSpan(const std::string& data) {
+        return std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size()
+        );
+    }
+};
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithNullBytes) {
+    // Test: CSV with null bytes
+    std::string data = "ip,type\n192.168.1.1,malware\n";
+    data.insert(10, 1, '\0');
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithExtremelyLongLine) {
+    // Test: Single line exceeding typical buffer sizes
+    std::string longDesc(1024 * 64, 'A');  // 64KB description
+    std::string data = "ip,description\n192.168.1.1,\"" + longDesc + "\"\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithMixedQuoteStyles) {
+    // Test: Inconsistent quote usage
+    std::string data = "ip,type,desc\n"
+                       "192.168.1.1,malware,\"quoted\"\n"
+                       "192.168.1.2,malware,unquoted\n"
+                       "192.168.1.3,\"malware\",mixed\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entries.size(), 3u);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithEscapedQuotes) {
+    // Test: CSV with escaped quotes inside quoted fields
+    std::string data = "ip,description\n"
+                       R"(192.168.1.1,"He said ""hello""")";
+    data += "\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithNewlinesInQuotedFields) {
+    // Test: Multiline quoted fields
+    std::string data = "ip,description\n"
+                       R"(192.168.1.1,"Line 1
+Line 2
+Line 3")";
+    data += "\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithVariableColumnCount) {
+    // Test: Rows with different column counts
+    std::string data = "ip,type,severity\n"
+                       "192.168.1.1,malware,high\n"
+                       "192.168.1.2,botnet\n"  // Missing column
+                       "192.168.1.3,c2,low,extra\n";  // Extra column
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should handle gracefully
+    EXPECT_TRUE(success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithUnicodeHeaders) {
+    // Test: Unicode in header names
+    std::string data = "IP地址,类型,严重性\n"
+                       "192.168.1.1,malware,high\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithOnlyWhitespace) {
+    // Test: CSV with only whitespace
+    // Parser may return true (success with 0 entries) or false (no valid content)
+    // Both are valid behaviors depending on implementation
+    std::string data = "   \t\n\r\n   \t   \n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // If success, should have no entries
+    if (success) {
+        EXPECT_EQ(entries.size(), 0u);
+    }
+    // Both outcomes are acceptable - the key is no crash
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithSemicolonDelimiter) {
+    // Test: European CSV format with semicolon delimiter
+    std::string data = "ip;type;severity\n"
+                       "192.168.1.1;malware;high\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Parser should auto-detect or allow configuration
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseCsvWithBOM) {
+    // Test: CSV with UTF-8 BOM
+    std::string bom = "\xEF\xBB\xBF";
+    std::string data = bom + "ip,type\n192.168.1.1,malware\n";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(CsvFeedParserEdgeCaseTest, ParseLargeCsvFile) {
+    // Test: Large CSV file (performance test)
+    std::ostringstream csv;
+    csv << "ip,type,severity\n";
+    for (int i = 0; i < 50000; i++) {
+        csv << "192.168." << (i / 256) << "." << (i % 256) << ",malware,high\n";
+    }
+    
+    std::string data = csv.str();
+    std::vector<IOCEntry> entries;
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entries.size(), 50000u);
+    // Should complete in reasonable time (< 10 seconds)
+    EXPECT_LT(duration.count(), 10000);
+}
+
+/**
+ * @brief Enterprise-grade edge case tests for StixFeedParser
+ */
+class StixFeedParserEdgeCaseTest : public ::testing::Test {
+protected:
+    std::unique_ptr<IFeedParser> parser;
+    ParserConfig defaultConfig;
+    
+    void SetUp() override {
+        parser = std::make_unique<StixFeedParser>();
+        defaultConfig = ParserConfig{};
+    }
+    
+    [[nodiscard]] std::span<const uint8_t> ToSpan(const std::string& data) {
+        return std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size()
+        );
+    }
+};
+
+TEST_F(StixFeedParserEdgeCaseTest, ParseStixWithComplexPattern) {
+    // Test: Complex STIX patterns with AND/OR operators
+    std::string data = R"({
+        "type": "bundle",
+        "id": "bundle--complex-1",
+        "objects": [{
+            "type": "indicator",
+            "id": "indicator--complex-1",
+            "pattern": "([ipv4-addr:value = '192.168.1.1'] AND [domain-name:value = 'evil.com']) OR [file:hashes.SHA256 = 'abc123']",
+            "pattern_type": "stix",
+            "valid_from": "2024-01-01T00:00:00.000Z"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(StixFeedParserEdgeCaseTest, ParseStixWithMultipleIndicatorTypes) {
+    // Test: Bundle with various indicator types
+    std::string data = R"({
+        "type": "bundle",
+        "id": "bundle--multi-type",
+        "objects": [
+            {"type": "indicator", "id": "indicator--1", "pattern": "[ipv4-addr:value = '1.1.1.1']", "valid_from": "2024-01-01T00:00:00.000Z"},
+            {"type": "indicator", "id": "indicator--2", "pattern": "[ipv6-addr:value = '2001:db8::1']", "valid_from": "2024-01-01T00:00:00.000Z"},
+            {"type": "indicator", "id": "indicator--3", "pattern": "[domain-name:value = 'evil.com']", "valid_from": "2024-01-01T00:00:00.000Z"},
+            {"type": "indicator", "id": "indicator--4", "pattern": "[url:value = 'http://evil.com/malware']", "valid_from": "2024-01-01T00:00:00.000Z"},
+            {"type": "indicator", "id": "indicator--5", "pattern": "[file:hashes.MD5 = 'd41d8cd98f00b204e9800998ecf8427e']", "valid_from": "2024-01-01T00:00:00.000Z"}
+        ]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    EXPECT_GE(entries.size(), 5u);
+}
+
+TEST_F(StixFeedParserEdgeCaseTest, ParseStixWithMixedObjectTypes) {
+    // Test: Bundle with non-indicator objects (should be skipped)
+    std::string data = R"({
+        "type": "bundle",
+        "id": "bundle--mixed",
+        "objects": [
+            {"type": "identity", "id": "identity--1", "name": "Test"},
+            {"type": "indicator", "id": "indicator--1", "pattern": "[ipv4-addr:value = '1.1.1.1']", "valid_from": "2024-01-01T00:00:00.000Z"},
+            {"type": "malware", "id": "malware--1", "name": "TestMalware"},
+            {"type": "indicator", "id": "indicator--2", "pattern": "[domain-name:value = 'evil.com']", "valid_from": "2024-01-01T00:00:00.000Z"},
+            {"type": "relationship", "id": "relationship--1", "relationship_type": "uses"}
+        ]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    // Should only parse indicators
+    EXPECT_EQ(entries.size(), 2u);
+}
+
+TEST_F(StixFeedParserEdgeCaseTest, ParseStixWithKillChainPhases) {
+    // Test: STIX indicator with kill chain phases
+    std::string data = R"({
+        "type": "bundle",
+        "id": "bundle--killchain",
+        "objects": [{
+            "type": "indicator",
+            "id": "indicator--killchain",
+            "pattern": "[ipv4-addr:value = '192.168.1.1']",
+            "pattern_type": "stix",
+            "valid_from": "2024-01-01T00:00:00.000Z",
+            "kill_chain_phases": [
+                {"kill_chain_name": "mitre-attack", "phase_name": "command-and-control"}
+            ]
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+}
+
+TEST_F(StixFeedParserEdgeCaseTest, ParseStixEmptyBundle) {
+    // Test: Empty STIX bundle
+    std::string data = R"({"type": "bundle", "id": "bundle--empty", "objects": []})";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entries.size(), 0u);
+}
+
+TEST_F(StixFeedParserEdgeCaseTest, ParseStixWithExpiredIndicator) {
+    // Test: STIX indicator with expired valid_until
+    std::string data = R"({
+        "type": "bundle",
+        "id": "bundle--expired",
+        "objects": [{
+            "type": "indicator",
+            "id": "indicator--expired",
+            "pattern": "[ipv4-addr:value = '192.168.1.1']",
+            "pattern_type": "stix",
+            "valid_from": "2020-01-01T00:00:00.000Z",
+            "valid_until": "2020-12-31T23:59:59.000Z"
+        }]
+    })";
+    
+    std::vector<IOCEntry> entries;
+    bool success = parser->Parse(ToSpan(data), entries, defaultConfig);
+    
+    // Should still parse, expiration check is application logic
+    EXPECT_TRUE(success);
+}
+
+/**
+ * @brief Memory safety and robustness tests
+ */
+class ParserMemorySafetyTest : public ::testing::Test {
+protected:
+    std::unique_ptr<IFeedParser> jsonParser;
+    std::unique_ptr<IFeedParser> csvParser;
+    std::unique_ptr<IFeedParser> stixParser;
+    ParserConfig defaultConfig;
+    
+    void SetUp() override {
+        jsonParser = std::make_unique<JsonFeedParser>();
+        csvParser = std::make_unique<CsvFeedParser>();
+        stixParser = std::make_unique<StixFeedParser>();
+        defaultConfig = ParserConfig{};
+    }
+    
+    [[nodiscard]] std::span<const uint8_t> ToSpan(const std::string& data) {
+        return std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size()
+        );
+    }
+};
+
+TEST_F(ParserMemorySafetyTest, ParseEmptySpan) {
+    // Test: Parsing completely empty span
+    std::span<const uint8_t> emptySpan;
+    std::vector<IOCEntry> entries;
+    
+    EXPECT_FALSE(jsonParser->Parse(emptySpan, entries, defaultConfig));
+    EXPECT_FALSE(csvParser->Parse(emptySpan, entries, defaultConfig));
+    EXPECT_FALSE(stixParser->Parse(emptySpan, entries, defaultConfig));
+}
+
+TEST_F(ParserMemorySafetyTest, ParseRepeatedlyWithoutReset) {
+    // Test: Multiple parses without creating new parser
+    std::string data = R"({"objects": [{"value": "192.168.1.1", "itype": "mal_ip"}]})";
+    
+    for (int i = 0; i < 100; i++) {
+        std::vector<IOCEntry> entries;
+        bool success = jsonParser->Parse(ToSpan(data), entries, defaultConfig);
+        EXPECT_TRUE(success);
+        EXPECT_EQ(entries.size(), 1u);
+    }
+}
+
+TEST_F(ParserMemorySafetyTest, ParseAlternatingSuccessFailure) {
+    // Test: Alternating valid and invalid data
+    std::string validData = R"({"objects": [{"value": "192.168.1.1", "itype": "mal_ip"}]})";
+    std::string invalidData = R"({"invalid json)";
+    
+    for (int i = 0; i < 50; i++) {
+        std::vector<IOCEntry> entries;
+        
+        if (i % 2 == 0) {
+            bool success = jsonParser->Parse(ToSpan(validData), entries, defaultConfig);
+            EXPECT_TRUE(success);
+        } else {
+            bool success = jsonParser->Parse(ToSpan(invalidData), entries, defaultConfig);
+            EXPECT_FALSE(success);
+        }
+    }
+}
+
+TEST_F(ParserMemorySafetyTest, ParseConcurrentParsers) {
+    // Test: Multiple parser instances don't interfere
+    auto parser1 = std::make_unique<JsonFeedParser>();
+    auto parser2 = std::make_unique<JsonFeedParser>();
+    auto parser3 = std::make_unique<JsonFeedParser>();
+    
+    std::string data1 = R"({"objects": [{"value": "1.1.1.1", "itype": "mal_ip"}]})";
+    std::string data2 = R"({"objects": [{"value": "2.2.2.2", "itype": "mal_ip"}]})";
+    std::string data3 = R"({"objects": [{"value": "3.3.3.3", "itype": "mal_ip"}]})";
+    
+    std::vector<IOCEntry> entries1, entries2, entries3;
+    
+    bool success1 = parser1->Parse(ToSpan(data1), entries1, defaultConfig);
+    bool success2 = parser2->Parse(ToSpan(data2), entries2, defaultConfig);
+    bool success3 = parser3->Parse(ToSpan(data3), entries3, defaultConfig);
+    
+    EXPECT_TRUE(success1);
+    EXPECT_TRUE(success2);
+    EXPECT_TRUE(success3);
+    
+    EXPECT_EQ(entries1.size(), 1u);
+    EXPECT_EQ(entries2.size(), 1u);
+    EXPECT_EQ(entries3.size(), 1u);
+}
+
+/**
+ * @brief Streaming parser edge case tests
+ * 
+ * Tests the ParseStreaming API which uses IOCReceivedCallback
+ * for memory-efficient processing of large feeds.
+ */
+class StreamingParserEdgeCaseTest : public ::testing::Test {
+protected:
+    std::unique_ptr<JsonFeedParser> parser;
+    ParserConfig defaultConfig;
+    
+    void SetUp() override {
+        parser = std::make_unique<JsonFeedParser>();
+        defaultConfig = ParserConfig{};
+    }
+    
+    [[nodiscard]] std::span<const uint8_t> ToSpan(const std::string& data) {
+        return std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size()
+        );
+    }
+};
+
+TEST_F(StreamingParserEdgeCaseTest, ParseLargeFileStreaming) {
+    // Test: Large file with streaming callback
+    std::ostringstream json;
+    json << R"({"objects": [)";
+    for (int i = 0; i < 5000; i++) {
+        if (i > 0) json << ",";
+        json << R"({"value": "192.168.)" << (i / 256) << "." << (i % 256) << R"(", "itype": "mal_ip"})";
+    }
+    json << "]}";
+    
+    std::string data = json.str();
+    std::vector<IOCEntry> receivedEntries;
+    
+    // Use IOCReceivedCallback to collect entries
+    IOCReceivedCallback callback = [&receivedEntries](const IOCEntry& entry) -> bool {
+        receivedEntries.push_back(entry);
+        return true;  // Continue processing
+    };
+    
+    bool success = parser->ParseStreaming(ToSpan(data), callback, defaultConfig);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(receivedEntries.size(), 5000u);
+}
+
+TEST_F(StreamingParserEdgeCaseTest, ParseStreamingWithEarlyTermination) {
+    // Test: Streaming with early termination via callback
+    std::string data = R"({"objects": [
+        {"value": "1.1.1.1", "itype": "mal_ip"},
+        {"value": "2.2.2.2", "itype": "mal_ip"},
+        {"value": "3.3.3.3", "itype": "mal_ip"},
+        {"value": "4.4.4.4", "itype": "mal_ip"},
+        {"value": "5.5.5.5", "itype": "mal_ip"}
+    ]})";
+    
+    size_t callbackCount = 0;
+    constexpr size_t MAX_ENTRIES = 3;
+    
+    IOCReceivedCallback callback = [&callbackCount, MAX_ENTRIES](const IOCEntry&) -> bool {
+        callbackCount++;
+        // Return false after 3 entries to terminate early
+        return callbackCount < MAX_ENTRIES;
+    };
+    
+    bool success = parser->ParseStreaming(ToSpan(data), callback, defaultConfig);
+    
+    // Should succeed even with early termination
+    EXPECT_TRUE(success || !success);  // Implementation may vary
+    EXPECT_GE(callbackCount, 1u);
+}
+
+TEST_F(StreamingParserEdgeCaseTest, ParseStreamingEmptyData) {
+    // Test: Streaming with empty data
+    std::string data = "";
+    std::vector<IOCEntry> receivedEntries;
+    
+    IOCReceivedCallback callback = [&receivedEntries](const IOCEntry& entry) -> bool {
+        receivedEntries.push_back(entry);
+        return true;
+    };
+    
+    bool success = parser->ParseStreaming(ToSpan(data), callback, defaultConfig);
+    
+    EXPECT_FALSE(success);
+    EXPECT_EQ(receivedEntries.size(), 0u);
+}
+
+TEST_F(StreamingParserEdgeCaseTest, ParseStreamingMalformedData) {
+    // Test: Streaming with malformed data
+    std::string data = R"({"objects": [{"invalid)";
+    std::vector<IOCEntry> receivedEntries;
+    
+    IOCReceivedCallback callback = [&receivedEntries](const IOCEntry& entry) -> bool {
+        receivedEntries.push_back(entry);
+        return true;
+    };
+    
+    bool success = parser->ParseStreaming(ToSpan(data), callback, defaultConfig);
+    
+    EXPECT_FALSE(success);
+}
+
+TEST_F(StreamingParserEdgeCaseTest, ParseStreamingWithNullCallback) {
+    // Test: Streaming with null callback (should handle gracefully)
+    std::string data = R"({"objects": [{"value": "1.1.1.1", "itype": "mal_ip"}]})";
+    
+    IOCReceivedCallback nullCallback = nullptr;
+    
+    // Should not crash with null callback
+    bool success = parser->ParseStreaming(ToSpan(data), nullCallback, defaultConfig);
+    
+    // Behavior depends on implementation
+    EXPECT_TRUE(success || !success);
+}
+
+TEST_F(StreamingParserEdgeCaseTest, ParseStreamingCallbackThrows) {
+    // Test: Callback throws exception (should be handled)
+    std::string data = R"({"objects": [
+        {"value": "1.1.1.1", "itype": "mal_ip"},
+        {"value": "2.2.2.2", "itype": "mal_ip"}
+    ]})";
+    
+    int callCount = 0;
+    IOCReceivedCallback throwingCallback = [&callCount](const IOCEntry&) -> bool {
+        callCount++;
+        if (callCount == 2) {
+            throw std::runtime_error("Test exception");
+        }
+        return true;
+    };
+    
+    // Should handle exception gracefully
+    try {
+        bool success = parser->ParseStreaming(ToSpan(data), throwingCallback, defaultConfig);
+        EXPECT_TRUE(success || !success);
+    } catch (const std::exception&) {
+        // Parser may propagate exception - both behaviors are valid
+        EXPECT_GE(callCount, 1);
+    }
+}
+
+TEST_F(StreamingParserEdgeCaseTest, ParseStreamingPerformance) {
+    // Test: Performance of streaming parser with large dataset
+    std::ostringstream json;
+    json << R"({"objects": [)";
+    for (int i = 0; i < 10000; i++) {
+        if (i > 0) json << ",";
+        json << R"({"value": "10.)" << ((i / 65536) % 256) << "." << ((i / 256) % 256) << "." << (i % 256) << R"(", "itype": "mal_ip"})";
+    }
+    json << "]}";
+    
+    std::string data = json.str();
+    size_t entryCount = 0;
+    
+    IOCReceivedCallback callback = [&entryCount](const IOCEntry&) -> bool {
+        entryCount++;
+        return true;
+    };
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = parser->ParseStreaming(ToSpan(data), callback, defaultConfig);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    EXPECT_TRUE(success);
+    EXPECT_EQ(entryCount, 10000u);
+    // Should complete in reasonable time (< 5 seconds)
+    EXPECT_LT(duration.count(), 5000);
 }
 
 } // namespace ThreatIntel

@@ -872,7 +872,7 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 4: FIND LEAF NODE CONTAINING TARGET HASH
+            // STEP 4: FIND LEAF NODE CONTAINING TARGET HASH (VERIFY IT EXISTS)
             // ========================================================================
 
             const BPlusTreeNode* leafConst = FindLeaf(fastHash);
@@ -884,7 +884,7 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 5: SEARCH FOR TARGET KEY IN LEAF NODE
+            // STEP 5: SEARCH FOR TARGET KEY IN LEAF NODE (VERIFY KEY EXISTS)
             // ========================================================================
 
             uint32_t keyPosition = BinarySearch(leafConst->keys, leafConst->keyCount, fastHash);
@@ -903,7 +903,18 @@ namespace ShadowStrike {
                 keyPosition, leafConst->keyCount);
 
             // ========================================================================
-            // STEP 6: BEGIN COW TRANSACTION
+            // STEP 6: BEGIN COW TRANSACTION WITH PATH-COPYING
+            // ========================================================================
+            // CRITICAL FIX: Use FindLeafForCOW instead of CloneNode!
+            //
+            // FindLeafForCOW performs PATH-COPYING: it clones all nodes from
+            // root to leaf, updating parent-child pointers along the way.
+            // This ensures that when we modify the leaf, the entire path
+            // is COW-safe and the parent correctly points to the cloned leaf.
+            //
+            // Previously, we used CloneNode which only cloned the leaf itself,
+            // leaving the parent pointing to the old leaf. This caused data
+            // loss because the modified leaf was orphaned from the tree!
             // ========================================================================
 
             m_inCOWTransaction.store(true, std::memory_order_release);
@@ -911,25 +922,28 @@ namespace ShadowStrike {
             m_fileOffsetToCOWNode.clear();  // Clear stale mappings
             m_truncatedAddrToCOWNode.clear();  // Clear stale mappings
 
-            // Clone leaf node for modification (COW semantics)
-            BPlusTreeNode* leaf = CloneNode(leafConst);
+            // Use FindLeafForCOW to get a properly path-copied leaf
+            BPlusTreeNode* leaf = FindLeafForCOW(fastHash);
             if (!leaf) {
                 m_inCOWTransaction.store(false, std::memory_order_release);
-                SS_LOG_ERROR(L"SignatureIndex", L"Remove: Failed to clone leaf node");
+                SS_LOG_ERROR(L"SignatureIndex", L"Remove: FindLeafForCOW returned null");
                 return StoreError{ SignatureStoreError::OutOfMemory, 0,
-                                  "Failed to clone node" };
+                                  "Failed to clone path to leaf" };
             }
 
-            // CRITICAL FIX: Register file offset mapping for CommitCOW
-            // CommitCOW needs to know which file offset this cloned node came from
-            // so it can write the modified node back to the correct location
-            uint32_t leafFileOffset = static_cast<uint32_t>(
-                reinterpret_cast<const uint8_t*>(leafConst) - 
-                static_cast<const uint8_t*>(m_baseAddress)
-            );
-            m_fileOffsetToCOWNode[leafFileOffset] = leaf;
+            // SECURITY: Verify the leaf we got is the same one we found earlier
+            // (Sanity check - FindLeafForCOW should return the same leaf)
+            keyPosition = BinarySearch(leaf->keys, leaf->keyCount, fastHash);
+            if (keyPosition >= leaf->keyCount || leaf->keys[keyPosition] != fastHash) {
+                RollbackCOW();
+                m_inCOWTransaction.store(false, std::memory_order_release);
+                SS_LOG_ERROR(L"SignatureIndex", 
+                    L"Remove: Key not found in COW leaf (race condition or corruption)");
+                return StoreError{ SignatureStoreError::IndexCorrupted, 0, 
+                                  "Key disappeared after COW clone" };
+            }
 
-            SS_LOG_TRACE(L"SignatureIndex", L"Remove: Leaf node cloned for COW");
+            SS_LOG_TRACE(L"SignatureIndex", L"Remove: Leaf path-copied for COW");
 
             // ========================================================================
             // STEP 7: REMOVE ENTRY FROM LEAF NODE
@@ -940,6 +954,7 @@ namespace ShadowStrike {
 
             // SECURITY: Validate we can perform the shift
             if (leaf->keyCount == 0) {
+                RollbackCOW();
                 m_inCOWTransaction.store(false, std::memory_order_release);
                 SS_LOG_ERROR(L"SignatureIndex", L"Remove: Leaf keyCount is 0, cannot remove");
                 return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Invalid keyCount" };
@@ -1010,11 +1025,8 @@ namespace ShadowStrike {
                 SS_LOG_WARN(L"SignatureIndex",
                     L"Remove: Leaf is now empty - checking if root");
 
-                // If this is the root and now empty, tree is empty
-                uint64_t leafOffset = reinterpret_cast<const uint8_t*>(leafConst) -
-                    static_cast<const uint8_t*>(m_baseAddress);
-
-                if (leafOffset == rootOffset) {
+                // If this leaf is the root (no parent), tree is now empty
+                if (leaf->parentOffset == 0) {
                     // Root is empty - tree is now empty
                     SS_LOG_INFO(L"SignatureIndex",
                         L"Remove: Tree is now empty after removal");
@@ -1071,11 +1083,9 @@ namespace ShadowStrike {
             // STEP 12: INVALIDATE CACHE ENTRIES
             // ========================================================================
 
-            // Calculate leaf offset for cache invalidation
-            uint64_t leafOffset = reinterpret_cast<const uint8_t*>(leafConst) -
-                static_cast<const uint8_t*>(m_baseAddress);
-
-            InvalidateCacheEntry(static_cast<uint32_t>(leafOffset));
+            // Note: Cache invalidation after COW commit - the cache is cleared during
+            // CommitCOW anyway, so this is mainly for completeness
+            ClearCache();
 
             SS_LOG_TRACE(L"SignatureIndex", L"Remove: Cache invalidated");
 
@@ -1514,6 +1524,7 @@ namespace ShadowStrike {
 
             uint64_t fastHash = hash.FastHash();
 
+            // First verify the key exists (read-only lookup)
             const BPlusTreeNode* leafConst = FindLeaf(fastHash);
             if (!leafConst) {
                 SS_LOG_DEBUG(L"SignatureIndex",
@@ -1535,32 +1546,43 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Key not found" };
             }
 
-            // Begin COW transaction
+            // ========================================================================
+            // BEGIN COW TRANSACTION WITH PATH-COPYING
+            // ========================================================================
+            // CRITICAL FIX: Use FindLeafForCOW instead of CloneNode!
+            //
+            // FindLeafForCOW performs PATH-COPYING: it clones all nodes from
+            // root to leaf, updating parent-child pointers along the way.
+            // This ensures that when we modify the leaf, the entire path
+            // is COW-safe and the parent correctly points to the cloned leaf.
+            //
+            // Previously, we used CloneNode which only cloned the leaf itself,
+            // leaving the parent pointing to the old leaf. This caused the
+            // update to be lost because the modified leaf was orphaned!
+            // ========================================================================
+
             m_inCOWTransaction.store(true, std::memory_order_release);
             m_cowRootNode = nullptr;  // Reset COW root tracking
             m_fileOffsetToCOWNode.clear();  // Clear stale mappings
             m_truncatedAddrToCOWNode.clear();  // Clear stale mappings
 
-            // Clone for COW
-            BPlusTreeNode* leaf = CloneNode(leafConst);
+            // Use FindLeafForCOW to get a properly path-copied leaf
+            BPlusTreeNode* leaf = FindLeafForCOW(fastHash);
             if (!leaf) {
                 m_inCOWTransaction.store(false, std::memory_order_release);
-                SS_LOG_ERROR(L"SignatureIndex", L"Update: Failed to clone node");
-                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Failed to clone node" };
+                SS_LOG_ERROR(L"SignatureIndex", L"Update: FindLeafForCOW returned null");
+                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Failed to clone path to leaf" };
             }
 
-            // CRITICAL FIX: Register file offset mapping for CommitCOW
-            uint32_t leafFileOffset = static_cast<uint32_t>(
-                reinterpret_cast<const uint8_t*>(leafConst) - 
-                static_cast<const uint8_t*>(m_baseAddress)
-            );
-            m_fileOffsetToCOWNode[leafFileOffset] = leaf;
-
-            // SECURITY: Re-validate position after clone
-            if (pos >= leaf->keyCount) {
+            // SECURITY: Re-validate position in the COW leaf
+            pos = BinarySearch(leaf->keys, leaf->keyCount, fastHash);
+            if (pos >= leaf->keyCount || leaf->keys[pos] != fastHash) {
                 RollbackCOW();
                 m_inCOWTransaction.store(false, std::memory_order_release);
-                return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Position invalid after clone" };
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"Update: Key not found in COW leaf (race condition or corruption)");
+                return StoreError{ SignatureStoreError::IndexCorrupted, 0, 
+                                  "Key disappeared after COW clone" };
             }
 
             // SECURITY: Validate offset fits if truncation occurs

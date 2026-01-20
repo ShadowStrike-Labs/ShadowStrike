@@ -143,82 +143,159 @@ namespace ShadowStrike {
                 return results;
             }
 
-            // Find starting leaf
-            const BPlusTreeNode* leaf = FindLeaf(minFastHash);
-            if (!leaf) {
-                SS_LOG_DEBUG(L"SignatureIndex", L"RangeQuery: No starting leaf found");
+            // ========================================================================
+            // USE TREE TRAVERSAL INSTEAD OF LINKED LIST (COW-SAFE)
+            // ========================================================================
+            // The linked list (nextLeaf/prevLeaf) can become inconsistent during
+            // COW operations when leaves are cloned and written to new locations.
+            // Tree traversal via children[] is MORE ROBUST because those pointers
+            // ARE properly maintained and validated during COW commits.
+            //
+            // ALGORITHM:
+            // 1. Start from root
+            // 2. Recursively traverse to find all keys in range [min, max]
+            // 3. Use in-order traversal (left, node, right) for sorted results
+            // 4. Early exit when all keys > maxFastHash
+            // ========================================================================
+
+            uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+            if (rootOffset >= m_indexSize) {
+                SS_LOG_WARN(L"SignatureIndex", L"RangeQuery: Invalid root offset");
                 return results;
             }
 
-            // SECURITY: Track iterations to prevent infinite loop in corrupted tree
+            const BPlusTreeNode* root = GetNode(rootOffset);
+            if (!root) {
+                SS_LOG_DEBUG(L"SignatureIndex", L"RangeQuery: Empty tree");
+                return results;
+            }
+
+            // SECURITY: Track iterations to prevent infinite loop
             constexpr size_t MAX_ITERATIONS = 1000000;
             size_t iterations = 0;
 
             // Track visited nodes to detect cycles
-            std::unordered_set<uintptr_t> visitedNodes;
+            std::unordered_set<uint32_t> visitedNodes;
+            visitedNodes.reserve(1024);
 
-            // Traverse leaf nodes via linked list
-            while (leaf && results.size() < effectiveMaxResults && iterations < MAX_ITERATIONS) {
-                // SECURITY: Cycle detection
-                uintptr_t nodeAddr = reinterpret_cast<uintptr_t>(leaf);
-                if (visitedNodes.count(nodeAddr) > 0) {
-                    SS_LOG_ERROR(L"SignatureIndex", L"RangeQuery: Cycle detected in leaf list");
-                    break;
+            // Use stack-based traversal for in-order tree walk
+            struct TraversalFrame {
+                const BPlusTreeNode* node;
+                uint32_t childIndex;  // Current child being processed
+                bool processedKeys;   // For internal nodes: have we processed keys yet?
+            };
+
+            std::vector<TraversalFrame> stack;
+            stack.reserve(64);
+            stack.push_back({root, 0, false});
+            visitedNodes.insert(rootOffset);
+
+            bool rangeExhausted = false;
+
+            while (!stack.empty() && results.size() < effectiveMaxResults && 
+                   iterations < MAX_ITERATIONS && !rangeExhausted) {
+                iterations++;
+                TraversalFrame& frame = stack.back();
+                const BPlusTreeNode* node = frame.node;
+
+                if (!node) {
+                    stack.pop_back();
+                    continue;
                 }
-                visitedNodes.insert(nodeAddr);
 
                 // SECURITY: Validate keyCount
-                if (leaf->keyCount > BPlusTreeNode::MAX_KEYS) {
+                if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
                     SS_LOG_ERROR(L"SignatureIndex",
-                        L"RangeQuery: Invalid keyCount %u in leaf", leaf->keyCount);
-                    break;
+                        L"RangeQuery: Invalid keyCount %u in node", node->keyCount);
+                    stack.pop_back();
+                    continue;
                 }
 
-                // Process keys in this leaf
-                for (uint32_t i = 0; i < leaf->keyCount && results.size() < effectiveMaxResults; ++i) {
-                    const uint64_t key = leaf->keys[i];
+                if (node->isLeaf) {
+                    // Process keys in this leaf that fall within range
+                    for (uint32_t i = 0; i < node->keyCount && results.size() < effectiveMaxResults; ++i) {
+                        const uint64_t key = node->keys[i];
 
-                    if (key > maxFastHash) {
-                        // Past range - done
-                        return results;
+                        if (key > maxFastHash) {
+                            // Past range - we can stop the entire search
+                            // (keys are sorted, so all subsequent keys will also be > max)
+                            rangeExhausted = true;
+                            break;
+                        }
+
+                        if (key >= minFastHash) {
+                            try {
+                                results.push_back(static_cast<uint64_t>(node->children[i]));
+                            }
+                            catch (const std::bad_alloc&) {
+                                SS_LOG_ERROR(L"SignatureIndex", L"RangeQuery: Memory allocation failed");
+                                return results;
+                            }
+                        }
                     }
+                    stack.pop_back();
+                }
+                else {
+                    // Internal node - in-order traversal
+                    // For range query, we need to visit children in order but can skip
+                    // children that don't contain keys in our range
 
-                    if (key >= minFastHash) {
-                        try {
-                            results.push_back(static_cast<uint64_t>(leaf->children[i]));
+                    if (frame.childIndex <= node->keyCount) {
+                        uint32_t childOffset = node->children[frame.childIndex];
+                        
+                        // Determine if we should visit this child based on range
+                        bool shouldVisit = true;
+                        
+                        if (frame.childIndex < node->keyCount) {
+                            // This child contains keys < node->keys[childIndex]
+                            // Skip if all keys in this subtree are < minFastHash
+                            // (We can only skip if the separator key is < min)
+                            if (frame.childIndex > 0 && node->keys[frame.childIndex - 1] < minFastHash) {
+                                // All keys in previous subtrees are definitely < min
+                                // But this subtree may still have keys >= min
+                            }
                         }
-                        catch (const std::bad_alloc&) {
-                            SS_LOG_ERROR(L"SignatureIndex", L"RangeQuery: Memory allocation failed");
-                            return results;
+                        
+                        // Check if we're past the range entirely
+                        if (frame.childIndex > 0 && node->keys[frame.childIndex - 1] > maxFastHash) {
+                            // All remaining children have keys > maxFastHash
+                            rangeExhausted = true;
+                            stack.pop_back();
+                            continue;
                         }
-                        catch (...) {
-                            SS_LOG_ERROR(L"SignatureIndex", L"RangeQuery: Unknown exception");
-                            return results;
+
+                        frame.childIndex++;
+
+                        if (shouldVisit && childOffset != 0 && childOffset < m_indexSize) {
+                            // SECURITY: Cycle detection
+                            if (visitedNodes.count(childOffset) == 0) {
+                                visitedNodes.insert(childOffset);
+                                const BPlusTreeNode* childNode = GetNode(childOffset);
+                                if (childNode) {
+                                    stack.push_back({childNode, 0, false});
+                                }
+                            }
+                            else {
+                                SS_LOG_ERROR(L"SignatureIndex",
+                                    L"RangeQuery: Cycle detected at offset 0x%X", childOffset);
+                            }
                         }
                     }
+                    else {
+                        // All children visited
+                        stack.pop_back();
+                    }
                 }
-
-                // Move to next leaf
-                if (leaf->nextLeaf == 0) {
-                    break;
-                }
-
-                // SECURITY: Validate nextLeaf offset before dereferencing
-                if (leaf->nextLeaf >= m_indexSize) {
-                    SS_LOG_ERROR(L"SignatureIndex",
-                        L"RangeQuery: Invalid nextLeaf offset 0x%X (indexSize=0x%llX)",
-                        leaf->nextLeaf, m_indexSize);
-                    break;
-                }
-
-                leaf = GetNode(leaf->nextLeaf);
-                iterations++;
             }
 
             if (iterations >= MAX_ITERATIONS) {
                 SS_LOG_WARN(L"SignatureIndex",
                     L"RangeQuery: Iteration limit reached (%zu iterations)", iterations);
             }
+
+            SS_LOG_TRACE(L"SignatureIndex",
+                L"RangeQuery: Found %zu results in range [0x%llX, 0x%llX]",
+                results.size(), minFastHash, maxFastHash);
 
             return results;
         }

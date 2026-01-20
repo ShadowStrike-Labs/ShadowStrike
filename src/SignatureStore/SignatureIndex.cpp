@@ -371,14 +371,35 @@ StoreError SignatureIndex::Verify() const noexcept {
 // ============================================================================
 
 /**
- * @brief Iterate over all entries in sorted order.
+ * @brief Iterate over all entries in sorted order (ascending by fastHash).
  * @param callback Function to call for each entry (return false to stop)
+ * 
+ * ============================================================================
+ * ENTERPRISE-GRADE IMPLEMENTATION NOTES
+ * ============================================================================
+ * 
+ * This function uses RECURSIVE TREE TRAVERSAL instead of linked list traversal.
+ * 
+ * WHY NOT USE LINKED LIST (nextLeaf/prevLeaf)?
+ * - During COW operations, linked list pointers can contain truncated memory
+ *   addresses instead of file offsets
+ * - The validation check (nextLeaf >= m_indexSize) would incorrectly reject
+ *   valid COW node addresses (which are memory addresses, not file offsets)
+ * - Tree traversal via children[] is MORE ROBUST because those pointers are
+ *   properly updated and validated during COW commit
+ * 
+ * SORTED ORDER GUARANTEE:
+ * - B+Tree guarantees sorted order via in-order traversal
+ * - Left-to-right traversal of children at each level maintains order
+ * - All keys in left subtree < parent key < all keys in right subtree
  * 
  * SECURITY: Protected against:
  * - Infinite loops via iteration limits
- * - Cycle detection in leaf list
+ * - Cycle detection in tree traversal
  * - Invalid keyCount values
  * - Out-of-bounds offsets
+ * - Stack overflow via explicit stack instead of recursion
+ * ============================================================================
  */
 void SignatureIndex::ForEach(
     std::function<bool(uint64_t fastHash, uint64_t signatureOffset)> callback
@@ -397,7 +418,7 @@ void SignatureIndex::ForEach(
         return;
     }
 
-    // Find leftmost leaf
+    // Find root
     uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
     
     // SECURITY: Validate root offset
@@ -407,133 +428,121 @@ void SignatureIndex::ForEach(
         return;
     }
     
-    const BPlusTreeNode* node = GetNode(rootOffset);
-    if (!node) {
+    const BPlusTreeNode* root = GetNode(rootOffset);
+    if (!root) {
         SS_LOG_DEBUG(L"SignatureIndex", L"ForEach: Empty tree");
         return;
     }
 
-    // SECURITY: Track depth to prevent infinite loop during navigation
-    constexpr uint32_t MAX_DEPTH = 64;
-    uint32_t depth = 0;
-    
-    // Track visited offsets for cycle detection
-    std::unordered_set<uint32_t> visitedOffsets;
-    visitedOffsets.insert(rootOffset);
+    // ========================================================================
+    // USE RECURSIVE TREE TRAVERSAL (ROBUST, COW-SAFE)
+    // ========================================================================
+    // The linked list (nextLeaf/prevLeaf) can become inconsistent during
+    // COW operations. Tree traversal via children[] is more robust because
+    // those pointers ARE properly maintained during COW commits.
+    // ========================================================================
 
-    // Navigate to leftmost leaf
-    while (!node->isLeaf && depth < MAX_DEPTH) {
-        // SECURITY: Validate keyCount before accessing children
-        if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Invalid keyCount %u during descent", node->keyCount);
-            return;
-        }
-        
-        // Note: For navigation to leftmost leaf, we take child[0] regardless of keyCount
-        // Child[0] always exists in a valid internal node
-        uint32_t childOffset = node->children[0];
-        
-        // SECURITY: Validate child offset
-        if (childOffset == 0 || childOffset >= m_indexSize) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Invalid child[0] offset 0x%X at depth %u", childOffset, depth);
-            return;
-        }
-        
-        // SECURITY: Cycle detection
-        if (visitedOffsets.count(childOffset) > 0) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Cycle detected during descent at offset 0x%X", childOffset);
-            return;
-        }
-        visitedOffsets.insert(childOffset);
-        
-        node = GetNode(childOffset);
-        if (!node) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Failed to load node at offset 0x%X", childOffset);
-            return;
-        }
-        depth++;
-    }
-
-    if (depth >= MAX_DEPTH) {
-        SS_LOG_ERROR(L"SignatureIndex", 
-            L"ForEach: Max depth %u exceeded during navigation", MAX_DEPTH);
-        return;
-    }
-
-    // SECURITY: Track iterations to prevent infinite loop in leaf linked list
-    constexpr size_t MAX_ITERATIONS = 10000000; // 10M leaves max
-    size_t iterations = 0;
     size_t entriesProcessed = 0;
-
-    // Clear visited set for leaf traversal (reuse memory)
-    visitedOffsets.clear();
-
-    // Traverse linked list of leaves
-    while (node && iterations < MAX_ITERATIONS) {
+    size_t leavesProcessed = 0;
+    bool stopRequested = false;
+    
+    std::unordered_set<uint32_t> visitedOffsets;
+    visitedOffsets.reserve(1024);
+    visitedOffsets.insert(rootOffset);
+    
+    // Use stack-based traversal to avoid recursion depth issues
+    struct TraversalFrame {
+        const BPlusTreeNode* node;
+        uint32_t childIndex;  // Next child to visit for internal nodes
+    };
+    
+    std::vector<TraversalFrame> stack;
+    stack.reserve(64); // Max tree depth
+    stack.push_back({root, 0});
+    
+    // SECURITY: Iteration limit to prevent infinite loops
+    constexpr size_t MAX_ITERATIONS = 10000000;
+    size_t iterations = 0;
+    
+    while (!stack.empty() && !stopRequested && iterations < MAX_ITERATIONS) {
+        iterations++;
+        TraversalFrame& frame = stack.back();
+        const BPlusTreeNode* node = frame.node;
+        
+        if (!node) {
+            stack.pop_back();
+            continue;
+        }
+        
         // SECURITY: Validate keyCount
         if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
             SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Invalid keyCount %u in leaf at iteration %zu", 
-                node->keyCount, iterations);
-            return;
+                L"ForEach: Invalid keyCount %u", node->keyCount);
+            stack.pop_back();
+            continue;
         }
         
-        // Process all entries in this leaf
-        for (uint32_t i = 0; i < node->keyCount; ++i) {
-            try {
-                if (!callback(node->keys[i], static_cast<uint64_t>(node->children[i]))) {
-                    // Early exit requested by callback
-                    SS_LOG_TRACE(L"SignatureIndex", 
-                        L"ForEach: Early exit after %zu entries", entriesProcessed);
-                    return;
+        if (node->isLeaf) {
+            // Process all entries in this leaf (already sorted within leaf)
+            leavesProcessed++;
+            for (uint32_t i = 0; i < node->keyCount && !stopRequested; ++i) {
+                try {
+                    if (!callback(node->keys[i], static_cast<uint64_t>(node->children[i]))) {
+                        stopRequested = true;
+                        break;
+                    }
+                    entriesProcessed++;
                 }
-                entriesProcessed++;
+                catch (...) {
+                    SS_LOG_ERROR(L"SignatureIndex", 
+                        L"ForEach: Callback threw exception after %zu entries", 
+                        entriesProcessed);
+                    stopRequested = true;
+                    break;
+                }
             }
-            catch (...) {
-                // Callback threw exception - stop iteration for safety
-                SS_LOG_ERROR(L"SignatureIndex", 
-                    L"ForEach: Callback threw exception after %zu entries", entriesProcessed);
-                return;
+            stack.pop_back();
+        }
+        else {
+            // Internal node - visit children in order (left to right for sorted traversal)
+            if (frame.childIndex <= node->keyCount) {
+                uint32_t childOffset = node->children[frame.childIndex];
+                frame.childIndex++; // Move to next child for when we return
+                
+                // SECURITY: Validate child offset
+                if (childOffset != 0 && childOffset < m_indexSize) {
+                    // SECURITY: Cycle detection
+                    if (visitedOffsets.count(childOffset) == 0) {
+                        visitedOffsets.insert(childOffset);
+                        const BPlusTreeNode* childNode = GetNode(childOffset);
+                        if (childNode) {
+                            stack.push_back({childNode, 0});
+                        }
+                        else {
+                            SS_LOG_WARN(L"SignatureIndex",
+                                L"ForEach: Failed to load child at offset 0x%X", childOffset);
+                        }
+                    }
+                    else {
+                        SS_LOG_ERROR(L"SignatureIndex",
+                            L"ForEach: Cycle detected at offset 0x%X", childOffset);
+                    }
+                }
+            }
+            else {
+                // All children visited, pop this frame
+                stack.pop_back();
             }
         }
-
-        // Check for end of list
-        if (node->nextLeaf == 0) {
-            break;
-        }
-        
-        // SECURITY: Validate nextLeaf offset
-        if (node->nextLeaf >= m_indexSize) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Invalid nextLeaf offset 0x%X at iteration %zu", 
-                node->nextLeaf, iterations);
-            return;
-        }
-        
-        // SECURITY: Cycle detection in leaf list
-        if (visitedOffsets.count(node->nextLeaf) > 0) {
-            SS_LOG_ERROR(L"SignatureIndex", 
-                L"ForEach: Cycle detected in leaf list at offset 0x%X", node->nextLeaf);
-            return;
-        }
-        visitedOffsets.insert(node->nextLeaf);
-        
-        node = GetNode(node->nextLeaf);
-        iterations++;
     }
-
+    
     if (iterations >= MAX_ITERATIONS) {
         SS_LOG_WARN(L"SignatureIndex", 
-            L"ForEach: Iteration limit reached (%zu iterations, %zu entries)", 
-            iterations, entriesProcessed);
+            L"ForEach: Iteration limit reached (%zu iterations)", iterations);
     }
     
     SS_LOG_TRACE(L"SignatureIndex", 
-        L"ForEach: Processed %zu entries across %zu leaves", entriesProcessed, iterations + 1);
+        L"ForEach: Processed %zu entries across %zu leaves", entriesProcessed, leavesProcessed);
 }
 
 /**

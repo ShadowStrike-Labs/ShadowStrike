@@ -267,11 +267,27 @@ TEST(ThreatIntelExporter_FormatIOCValue, InlineTypes_AreFormatted) {
 	EXPECT_EQ(ThreatIntelExporter::FormatIOCValue(MakeIPv4Entry(1, 1, 2, 3, 4, 32), nullptr), "1.2.3.4");
 	EXPECT_EQ(ThreatIntelExporter::FormatIOCValue(MakeIPv4Entry(2, 10, 0, 0, 0, 24), nullptr), "10.0.0.0/24");
 
-	const std::array<uint8_t, 3> h{{0x00, 0x01, 0xFF}};
-	IOCEntry hashEntry = MakeHashEntry(3, HashAlgorithm::SHA256, h);
+	// MD5 requires 16 bytes - FormatHash outputs the algorithm's expected length
+	const std::array<uint8_t, 16> md5Hash{{
+		0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04,
+		0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e
+	}};  // MD5 of empty string
+	IOCEntry hashEntry = MakeHashEntry(3, HashAlgorithm::MD5, md5Hash);
 	const std::string hashStr = ThreatIntelExporter::FormatIOCValue(hashEntry, nullptr);
-	// Hash formatter prints exactly length bytes (hex), so 3 bytes -> 6 chars.
-	EXPECT_EQ(hashStr, "0001ff");
+	// MD5 is 16 bytes = 32 hex characters
+	EXPECT_EQ(hashStr, "d41d8cd98f00b204e9800998ecf8427e");
+	
+	// SHA256 requires 32 bytes
+	const std::array<uint8_t, 32> sha256Hash{{
+		0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+		0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+		0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+		0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
+	}};  // SHA256 of empty string
+	IOCEntry sha256Entry = MakeHashEntry(4, HashAlgorithm::SHA256, sha256Hash);
+	const std::string sha256Str = ThreatIntelExporter::FormatIOCValue(sha256Entry, nullptr);
+	// SHA256 is 32 bytes = 64 hex characters
+	EXPECT_EQ(sha256Str, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
 TEST(ThreatIntelExporter_FormatIOCValue, StringTypes_ValidateStringPool) {
@@ -1241,8 +1257,9 @@ TEST(ThreatIntelExporter_File, ExportToFile_InvalidPath_ProducesDescriptiveError
 
 	std::array<IOCEntry, 1> entries{MakeIPv4Entry(1, 1, 2, 3, 4)};
 
-	// Invalid path (Windows reserved name)
-	ExportResult r = exporter.ExportToFile(std::span<const IOCEntry>(entries), nullptr, L"CON", options, nullptr);
+	// Invalid path (non-existent deeply nested directory with invalid characters)
+	ExportResult r = exporter.ExportToFile(std::span<const IOCEntry>(entries), nullptr, 
+		L"Z:\\NonExistent\\Very\\Deep\\Path\\That\\Cannot\\Possibly\\Exist\\file.txt", options, nullptr);
 	EXPECT_FALSE(r.success);
 	EXPECT_FALSE(r.errorMessage.empty());
 	// Error message should be descriptive
@@ -1574,6 +1591,523 @@ TEST(ThreatIntelExporter_Statistics, TracksExportStatistics) {
 	EXPECT_GT(exporter.GetTotalEntriesExported(), 0u);
 	EXPECT_GT(exporter.GetTotalBytesWritten(), 0u);
 	EXPECT_GT(exporter.GetTotalExportCount(), 0u);
+}
+
+// ============================================================================
+// CATEGORY 17: TITANIUM-GRADE ENTERPRISE EDGE CASES
+// ============================================================================
+
+// Test IPv6 formatting with various prefixes
+TEST(ThreatIntelExporter_Titanium, IPv6_VariousPrefixLengths) {
+	// Full IPv6 address /128
+	IOCEntry e1 = MakeActiveBaseEntry(1, IOCType::IPv6);
+	e1.value.ipv6 = {};
+	uint8_t addr1[16] = {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+	                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+	std::memcpy(e1.value.ipv6.address.data(), addr1, 16);
+	e1.value.ipv6.prefixLength = 128;
+	
+	std::string v1 = ThreatIntelExporter::FormatIOCValue(e1, nullptr);
+	EXPECT_EQ(v1, "2001:0db8:0000:0000:0000:0000:0000:0001");
+	
+	// /64 prefix
+	IOCEntry e2 = MakeActiveBaseEntry(2, IOCType::CIDRv6);
+	e2.value.ipv6 = {};
+	std::memcpy(e2.value.ipv6.address.data(), addr1, 16);
+	e2.value.ipv6.prefixLength = 64;
+	
+	std::string v2 = ThreatIntelExporter::FormatIOCValue(e2, nullptr);
+	EXPECT_NE(v2.find("/64"), std::string::npos);
+	
+	// Edge case: /1 prefix
+	e2.value.ipv6.prefixLength = 1;
+	std::string v3 = ThreatIntelExporter::FormatIOCValue(e2, nullptr);
+	EXPECT_NE(v3.find("/1"), std::string::npos);
+}
+
+// Test STIX pattern generation for different IOC types
+TEST(ThreatIntelExporter_Titanium, STIX_PatternGenerationAllTypes) {
+	ThreatIntelExporter exporter;
+	TestStringPool pool;
+	
+	ExportOptions options;
+	options.format = ExportFormat::STIX21;
+	options.fields = ExportFields::Type | ExportFields::Value;
+	options.prettyPrint = false;
+	
+	// IPv4
+	{
+		IOCEntry e = MakeIPv4Entry(1, 192, 168, 1, 1);
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("[ipv4-addr:value = '192.168.1.1']"), std::string::npos);
+	}
+	
+	// Domain with single quote escaping
+	{
+		const std::string domain = "evil'domain.com";
+		const uint64_t off = pool.Put(domain);
+		IOCEntry e = MakeActiveBaseEntry(2, IOCType::Domain);
+		e.value.stringRef.stringOffset = off;
+		e.value.stringRef.stringLength = static_cast<uint32_t>(domain.size());
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), &pool, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("domain-name:value"), std::string::npos);
+	}
+	
+	// Email
+	{
+		const std::string email = "malware@evil.com";
+		const uint64_t off = pool.Put(email);
+		IOCEntry e = MakeActiveBaseEntry(3, IOCType::Email);
+		e.value.stringRef.stringOffset = off;
+		e.value.stringRef.stringLength = static_cast<uint32_t>(email.size());
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), &pool, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("email-addr:value"), std::string::npos);
+	}
+}
+
+// Test MISP hash algorithm mapping
+TEST(ThreatIntelExporter_Titanium, MISP_HashAlgorithmMapping) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::MISP;
+	options.prettyPrint = false;
+	options.mispEventInfo = "Hash Test";
+	
+	// SHA1 hash
+	{
+		const std::array<uint8_t, 20> sha1{{
+			0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55,
+			0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
+		}};
+		IOCEntry e = MakeHashEntry(1, HashAlgorithm::SHA1, sha1);
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("\"type\":\"sha1\""), std::string::npos);
+	}
+	
+	// SHA512 hash
+	{
+		const std::array<uint8_t, 64> sha512{};  // Zero hash for testing
+		IOCEntry e = MakeHashEntry(2, HashAlgorithm::SHA512, sha512);
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("\"type\":\"sha512\""), std::string::npos);
+	}
+}
+
+// Test filter edge cases with empty collections
+TEST(ThreatIntelExporter_Titanium, Filter_EmptyCollectionsPassAll) {
+	ExportFilter f;
+	f.onlyActive = false;  // Don't filter on active
+	// All vectors are empty - should pass all entries
+	
+	IOCEntry e1 = MakeActiveBaseEntry(1, IOCType::IPv4);
+	IOCEntry e2 = MakeActiveBaseEntry(2, IOCType::Domain);
+	IOCEntry e3 = MakeActiveBaseEntry(3, IOCType::FileHash);
+	
+	EXPECT_TRUE(f.Matches(e1));
+	EXPECT_TRUE(f.Matches(e2));
+	EXPECT_TRUE(f.Matches(e3));
+}
+
+// Test filter with all criteria simultaneously
+TEST(ThreatIntelExporter_Titanium, Filter_AllCriteriaAtOnce) {
+	ExportFilter f;
+	f.onlyActive = true;
+	f.includeTypes = {IOCType::IPv4, IOCType::Domain};
+	f.excludeTypes = {IOCType::URL};
+	f.minReputation = ReputationLevel::Suspicious;
+	f.maxReputation = ReputationLevel::Critical;
+	f.minConfidence = ConfidenceLevel::Low;
+	f.includeCategories = {ThreatCategory::Malware, ThreatCategory::C2Server};
+	f.includeSources = {ThreatIntelSource::VirusTotal, ThreatIntelSource::InternalAnalysis};
+	f.createdAfter = 100;
+	f.createdBefore = 1000;
+	f.requiredFlags = IOCFlags::Enabled;
+	f.excludedFlags = IOCFlags::Whitelisted;
+	f.feedIds = {1, 2, 3};
+	
+	// Entry that matches everything
+	IOCEntry e = MakeActiveBaseEntry(1, IOCType::IPv4);
+	e.reputation = ReputationLevel::HighRisk;
+	e.confidence = ConfidenceLevel::Medium;
+	e.category = ThreatCategory::Malware;
+	e.source = ThreatIntelSource::VirusTotal;
+	e.createdTime = 500;
+	e.flags = IOCFlags::Enabled | IOCFlags::BlockOnMatch;
+	e.feedId = 2;
+	
+	EXPECT_TRUE(f.Matches(e));
+	
+	// Change each criterion to fail
+	e.feedId = 999;
+	EXPECT_FALSE(f.Matches(e));
+	e.feedId = 2;
+	
+	e.type = IOCType::URL;
+	EXPECT_FALSE(f.Matches(e));
+}
+
+// Test CSV with all special characters
+TEST(ThreatIntelExporter_Titanium, CSV_AllSpecialCharsCombined) {
+	ThreatIntelExporter exporter;
+	TestStringPool pool;
+	
+	ExportOptions options;
+	options.format = ExportFormat::CSV;
+	options.fields = ExportFields::Type | ExportFields::Value;
+	options.includeHeader = true;
+	options.csvDelimiter = ',';
+	options.csvQuote = '"';
+	
+	// Value with all problematic chars: comma, quote, newlines, tabs
+	const std::string nastyValue = "val,ue\r\n\"quoted\"\ttab";
+	const uint64_t off = pool.Put(nastyValue);
+	
+	IOCEntry e = MakeActiveBaseEntry(1, IOCType::Domain);
+	e.value.stringRef.stringOffset = off;
+	e.value.stringRef.stringLength = static_cast<uint32_t>(nastyValue.size());
+	
+	std::string out;
+	ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), &pool, out, options);
+	ASSERT_TRUE(r.success);
+	
+	// Value should be quoted and quotes doubled
+	EXPECT_NE(out.find("\"\"quoted\"\""), std::string::npos);
+}
+
+// Test export with maximum entries limit precisely at boundary
+TEST(ThreatIntelExporter_Titanium, MaxEntriesPreciseBoundary) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::PlainText;
+	options.fields = ExportFields::Value;
+	options.filter.onlyActive = false;
+	options.filter.maxEntries = 5;  // Exactly 5 entries
+	
+	std::vector<IOCEntry> entries;
+	for (int i = 0; i < 10; ++i) {
+		entries.push_back(MakeIPv4Entry(static_cast<uint64_t>(i + 1), 10, 0, 0, static_cast<uint8_t>(i)));
+	}
+	
+	std::string out;
+	ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(entries), nullptr, out, options);
+	ASSERT_TRUE(r.success);
+	EXPECT_EQ(r.totalExported, 5u);
+}
+
+// Test start index at various boundaries
+TEST(ThreatIntelExporter_Titanium, StartIndex_Boundaries) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::PlainText;
+	options.fields = ExportFields::Value;
+	options.filter.onlyActive = false;
+	
+	std::array<IOCEntry, 5> entries;
+	for (int i = 0; i < 5; ++i) {
+		entries[i] = MakeIPv4Entry(static_cast<uint64_t>(i + 1), 10, 0, 0, static_cast<uint8_t>(i));
+	}
+	
+	// Start at last entry
+	{
+		options.filter.startIndex = 4;
+		options.filter.maxEntries = 0;
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(entries), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_EQ(r.totalExported, 1u);
+	}
+	
+	// Start beyond entries - should export 0
+	{
+		options.filter.startIndex = 10;
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(entries), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_EQ(r.totalExported, 0u);
+	}
+}
+
+// Test progress callback with exact count verification
+TEST(ThreatIntelExporter_Titanium, ProgressCallback_ExactCounts) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::PlainText;
+	options.fields = ExportFields::Value;
+	options.filter.onlyActive = false;
+	options.flushInterval = 100000;  // Avoid flushes affecting counts
+	
+	std::vector<IOCEntry> entries;
+	for (int i = 0; i < 2500; ++i) {
+		entries.push_back(MakeIPv4Entry(static_cast<uint64_t>(i + 1), 10, 0, 0, static_cast<uint8_t>(i % 256)));
+	}
+	
+	std::atomic<size_t> lastExported{0};
+	std::atomic<int> callCount{0};
+	
+	auto callback = [&](const ExportProgress& p) {
+		callCount.fetch_add(1, std::memory_order_relaxed);
+		lastExported.store(p.exportedEntries, std::memory_order_relaxed);
+		return true;  // Continue
+	};
+	
+	std::ostringstream oss;
+	ExportResult r = exporter.ExportToStream(std::span<const IOCEntry>(entries), nullptr, oss, options, callback);
+	ASSERT_TRUE(r.success);
+	
+	// Should have at least 3 callbacks: at 1000, 2000, and final
+	EXPECT_GE(callCount.load(), 3);
+	// Final callback should have all entries
+	EXPECT_EQ(lastExported.load(), 2500u);
+}
+
+// Test OpenIOC search path mapping
+TEST(ThreatIntelExporter_Titanium, OpenIOC_SearchPathMapping) {
+	ThreatIntelExporter exporter;
+	TestStringPool pool;
+	
+	ExportOptions options;
+	options.format = ExportFormat::OpenIOC;
+	options.openIocAuthor = "ShadowStrike";
+	
+	// Registry key
+	{
+		const std::string regKey = "HKLM\\SOFTWARE\\Malware\\Key";
+		const uint64_t off = pool.Put(regKey);
+		IOCEntry e = MakeActiveBaseEntry(1, IOCType::RegistryKey);
+		e.value.stringRef.stringOffset = off;
+		e.value.stringRef.stringLength = static_cast<uint32_t>(regKey.size());
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), &pool, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("RegistryItem/Path"), std::string::npos);
+	}
+	
+	// Process name
+	{
+		const std::string procName = "malware.exe";
+		const uint64_t off = pool.Put(procName);
+		IOCEntry e = MakeActiveBaseEntry(2, IOCType::ProcessName);
+		e.value.stringRef.stringOffset = off;
+		e.value.stringRef.stringLength = static_cast<uint32_t>(procName.size());
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), &pool, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("ProcessItem/name"), std::string::npos);
+	}
+}
+
+// Test export result structure completeness
+TEST(ThreatIntelExporter_Titanium, ExportResult_AllFieldsPopulated) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::JSON;
+	options.fields = ExportFields::Basic;
+	options.filter.onlyActive = false;
+	
+	std::array<IOCEntry, 10> entries;
+	for (int i = 0; i < 10; ++i) {
+		entries[i] = MakeIPv4Entry(static_cast<uint64_t>(i + 1), 10, 0, 0, static_cast<uint8_t>(i));
+	}
+	
+	std::ostringstream oss;
+	ExportResult r = exporter.ExportToStream(std::span<const IOCEntry>(entries), nullptr, oss, options, nullptr);
+	
+	EXPECT_TRUE(r.success);
+	EXPECT_FALSE(r.wasCancelled);
+	EXPECT_EQ(r.format, ExportFormat::JSON);
+	EXPECT_EQ(r.compression, ExportCompression::None);
+	EXPECT_EQ(r.totalExported, 10u);
+	EXPECT_EQ(r.totalSkipped, 0u);
+	EXPECT_GT(r.bytesWritten, 0u);
+	EXPECT_GE(r.durationMs, 0u);
+	EXPECT_GE(r.entriesPerSecond, 0.0);
+	EXPECT_TRUE(r.errorMessage.empty());
+}
+
+// Test multiple sequential exports don't interfere
+TEST(ThreatIntelExporter_Titanium, SequentialExports_Independent) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::PlainText;
+	options.fields = ExportFields::Value;
+	options.filter.onlyActive = false;
+	
+	std::array<IOCEntry, 3> entries{
+		MakeIPv4Entry(1, 1, 1, 1, 1),
+		MakeIPv4Entry(2, 2, 2, 2, 2),
+		MakeIPv4Entry(3, 3, 3, 3, 3)
+	};
+	
+	// First export
+	std::string out1;
+	ExportResult r1 = exporter.ExportToString(std::span<const IOCEntry>(entries), nullptr, out1, options);
+	ASSERT_TRUE(r1.success);
+	
+	// Second export with different format
+	options.format = ExportFormat::JSON;
+	options.fields = ExportFields::Type | ExportFields::Value;
+	std::string out2;
+	ExportResult r2 = exporter.ExportToString(std::span<const IOCEntry>(entries), nullptr, out2, options);
+	ASSERT_TRUE(r2.success);
+	
+	// Results should be different formats
+	EXPECT_NE(out1.find("{"), 0u);  // PlainText doesn't start with {
+	EXPECT_EQ(out2.find("{"), 0u);  // JSON starts with {
+	
+	// Both should have 3 entries
+	EXPECT_EQ(r1.totalExported, 3u);
+	EXPECT_EQ(r2.totalExported, 3u);
+}
+
+// Test empty string pool value
+TEST(ThreatIntelExporter_Titanium, StringPool_EmptyStringValue) {
+	ThreatIntelExporter exporter;
+	TestStringPool pool;
+	
+	ExportOptions options;
+	options.format = ExportFormat::JSON;
+	options.fields = ExportFields::Type | ExportFields::Value;
+	
+	// Put an empty string
+	const std::string empty = "";
+	const uint64_t off = pool.Put("placeholder");  // Non-empty placeholder
+	
+	IOCEntry e = MakeActiveBaseEntry(1, IOCType::Domain);
+	e.value.stringRef.stringOffset = off;
+	e.value.stringRef.stringLength = 0;  // Zero length = empty value
+	
+	std::string out;
+	ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), &pool, out, options);
+	ASSERT_TRUE(r.success);
+	EXPECT_NE(out.find("\"value\":\"\""), std::string::npos);
+}
+
+// Test expiration time handling
+TEST(ThreatIntelExporter_Titanium, ExpirationTime_ZeroVsNonZero) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::JSON;
+	options.fields = ExportFields::ExpirationTime;
+	options.prettyPrint = false;
+	
+	// Entry with no expiration
+	{
+		IOCEntry e = MakeActiveBaseEntry(1, IOCType::IPv4);
+		e.expirationTime = 0;
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_NE(out.find("\"expiration_time\":null"), std::string::npos);
+	}
+	
+	// Entry with expiration
+	{
+		IOCEntry e = MakeActiveBaseEntry(2, IOCType::IPv4);
+		e.expirationTime = 1700000000;
+		
+		std::string out;
+		ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(&e, 1), nullptr, out, options);
+		ASSERT_TRUE(r.success);
+		EXPECT_EQ(out.find("null"), std::string::npos);  // Should not contain null
+	}
+}
+
+// Test concurrent export operations with multiple instances
+TEST(ThreatIntelExporter_Titanium, ConcurrentExports_MultipleInstances) {
+	constexpr size_t kNumThreads = 8;
+	constexpr size_t kEntriesPerThread = 100;
+	
+	std::vector<std::thread> threads;
+	std::atomic<int> successCount{0};
+	std::atomic<int> failCount{0};
+	
+	for (size_t t = 0; t < kNumThreads; ++t) {
+		threads.emplace_back([t, &successCount, &failCount]() {
+			ThreatIntelExporter exporter;  // Each thread has its own instance
+			ExportOptions options;
+			options.format = ExportFormat::PlainText;
+			options.fields = ExportFields::Value;
+			options.filter.onlyActive = false;
+			
+			std::vector<IOCEntry> entries;
+			for (size_t i = 0; i < kEntriesPerThread; ++i) {
+				entries.push_back(MakeIPv4Entry(
+					static_cast<uint64_t>(t * kEntriesPerThread + i + 1),
+					static_cast<uint8_t>(t),
+					static_cast<uint8_t>(i & 0xFF),
+					0, 0
+				));
+			}
+			
+			std::string out;
+			ExportResult r = exporter.ExportToString(std::span<const IOCEntry>(entries), nullptr, out, options);
+			
+			if (r.success && r.totalExported == kEntriesPerThread) {
+				successCount.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				failCount.fetch_add(1, std::memory_order_relaxed);
+			}
+		});
+	}
+	
+	for (auto& t : threads) {
+		t.join();
+	}
+	
+	EXPECT_EQ(successCount.load(), static_cast<int>(kNumThreads));
+	EXPECT_EQ(failCount.load(), 0);
+}
+
+// Test cancel during export with immediate effect
+TEST(ThreatIntelExporter_Titanium, CancelDuringExport_ImmediateStop) {
+	ThreatIntelExporter exporter;
+	ExportOptions options;
+	options.format = ExportFormat::PlainText;
+	options.fields = ExportFields::Value;
+	options.filter.onlyActive = false;
+	
+	std::vector<IOCEntry> entries;
+	for (int i = 0; i < 10000; ++i) {
+		entries.push_back(MakeIPv4Entry(static_cast<uint64_t>(i + 1), 10, 0, 0, static_cast<uint8_t>(i % 256)));
+	}
+	
+	std::atomic<size_t> entriesWhenCancelled{0};
+	
+	auto callback = [&](const ExportProgress& p) {
+		if (p.exportedEntries >= 500) {
+			exporter.RequestCancel();
+			entriesWhenCancelled.store(p.exportedEntries, std::memory_order_relaxed);
+			return true;  // Return true but cancel was requested
+		}
+		return true;
+	};
+	
+	std::ostringstream oss;
+	ExportResult r = exporter.ExportToStream(std::span<const IOCEntry>(entries), nullptr, oss, options, callback);
+	
+	EXPECT_TRUE(r.wasCancelled);
+	// Export should stop reasonably close to cancellation point
+	EXPECT_LT(r.totalExported, 5000u);  // Should not export all entries
+	
+	exporter.ResetCancellation();
+	EXPECT_FALSE(exporter.IsCancellationRequested());
 }
 
 } // namespace ShadowStrike::ThreatIntel::Tests

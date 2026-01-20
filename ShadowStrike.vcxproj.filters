@@ -333,9 +333,6 @@
     <ClCompile Include="tests\unit\database_systems\sig_store\sig_store_tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tests\unit\database_systems\sig_store\b.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="tests\unit\database_systems\sig_store\yara_rule_store_tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -444,7 +441,7 @@
     <ClCompile Include="src\ThreatIntel\ReputationCache.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\ThreatIntel\ThreatIntel_bloom_filter.cpp">
+    <ClCompile Include="src\ThreatIntel\ThreatIntelBloomFilter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\ThreatIntel\ThreatIntelDatabase.cpp">
@@ -493,6 +490,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\Utils\PE_sig_verf_tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\Database_systems\sig_store\SIMD_Matcher_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

@@ -169,13 +169,19 @@ namespace ShadowStrike {
                 // VALIDATION 5: Check file exists
                 if (!fs::exists(canonicalPath, ec)) {
                     SS_LOG_ERROR(L"SignatureStore", L"File not found: %s", filePath.c_str());
-                    return ScanResult{};
+                    ScanResult result{};
+                    result.errorCount = 1;
+                    result.lastError = "File not found";
+                    return result;
                 }
 
                 // VALIDATION 6: Verify it's a regular file (not directory, symlink, device, etc.)
                 if (!fs::is_regular_file(canonicalPath, ec)) {
                     SS_LOG_WARN(L"SignatureStore", L"ScanFile: Not a regular file: %s", filePath.c_str());
-                    return ScanResult{};
+                    ScanResult result{};
+                    result.errorCount = 1;
+                    result.lastError = "Not a regular file";
+                    return result;
                 }
 
                 // VALIDATION 7: Check file is not a symlink pointing outside allowed paths
@@ -618,12 +624,31 @@ namespace ShadowStrike {
             // TITANIUM VALIDATION LAYER - STREAM SCANNER
             // ========================================================================
 
-            if (!m_store || !m_store->IsInitialized()) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Store invalid");
+            // VALIDATION 1: Empty chunk check
+            if (chunk.empty() || chunk.data() == nullptr) {
                 return ScanResult{};
             }
 
-            if (chunk.empty() || chunk.data() == nullptr) {
+            // TITANIUM: Always track bytes processed, even if store is unavailable
+            // This allows streaming progress tracking independent of scan capability
+            try {
+                m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+                if (m_bytesProcessed <= SIZE_MAX - chunk.size()) {
+                    m_bytesProcessed += chunk.size();
+                }
+            }
+            catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::FeedChunk: Buffer allocation failed");
+                ScanResult result{};
+                result.errorCount = 1;
+                result.lastError = "Memory allocation failed";
+                return result;
+            }
+
+            // VALIDATION 2: Check store availability for actual scanning
+            if (!m_store || !m_store->IsInitialized()) {
+                // Store not available - data is buffered but can't be scanned yet
+                // This is not an error - bytes are tracked and will be scanned in Finalize()
                 return ScanResult{};
             }
 
@@ -633,59 +658,25 @@ namespace ShadowStrike {
             constexpr size_t DIRECT_SCAN_LIMIT = 50 * 1024 * 1024;
             if (chunk.size() > DIRECT_SCAN_LIMIT) {
                 SS_LOG_DEBUG(L"SignatureStore", L"StreamScanner: Direct scan for large chunk (%zu bytes)", chunk.size());
-                return m_store->ScanBuffer(chunk, m_options);
+                // Note: For direct scan, we already added to buffer above - clear it and scan directly
+                m_buffer.clear();
+                m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
+                auto result = m_store->ScanBuffer(m_buffer, m_options);
+                m_buffer.clear();
+                return result;
             }
 
             // 2. BUFFER MANAGEMENT & THRESHOLD SCAN (10MB)
-            // If the new chunk combined with the buffer exceeds 10MB,
-            // scan and clear the current buffer first, then add the new chunk.
+            // If the buffer exceeds 10MB, scan and clear it
             constexpr size_t SCAN_THRESHOLD = 10 * 1024 * 1024;
 
-            if (m_buffer.size() + chunk.size() > SCAN_THRESHOLD) {
-                // Scan existing accumulated data (if buffer is not empty)
-                ScanResult result{};
-                if (!m_buffer.empty()) {
-                    result = m_store->ScanBuffer(m_buffer, m_options);
-                    m_buffer.clear();
-                }
-
-                // Add the new chunk to the cleared buffer
-                try {
-                    m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-
-                    // Update statistics (Safe-math)
-                    if (m_bytesProcessed <= SIZE_MAX - chunk.size()) {
-                        m_bytesProcessed += chunk.size();
-                    }
-                }
-                catch (const std::bad_alloc&) {
-                    SS_LOG_ERROR(L"SignatureStore", L"StreamScanner: Allocation failed");
-                }
-
-                // If the newly added chunk itself exceeds 10MB, scan it immediately
-                if (m_buffer.size() >= SCAN_THRESHOLD) {
-                    auto chunkResult = m_store->ScanBuffer(m_buffer, m_options);
-                    m_buffer.clear();
-                    return chunkResult;
-                }
-
-                return result; // Return scan result of the previous accumulation
-            }
-
-            // 3. ACCUMULATION (Standard data buffering)
-            try {
-                m_buffer.insert(m_buffer.end(), chunk.begin(), chunk.end());
-                if (m_bytesProcessed <= SIZE_MAX - chunk.size()) {
-                    m_bytesProcessed += chunk.size();
-                }
-            }
-            catch (const std::bad_alloc&) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner: Buffer append failed");
-                auto res = m_store->ScanBuffer(m_buffer, m_options);
+            if (m_buffer.size() >= SCAN_THRESHOLD) {
+                auto result = m_store->ScanBuffer(m_buffer, m_options);
                 m_buffer.clear();
-                return res;
+                return result;
             }
 
+            // 3. Buffer accumulated but below threshold - no scan needed yet
             return ScanResult{};
         }
 
@@ -694,31 +685,40 @@ namespace ShadowStrike {
             // TITANIUM VALIDATION LAYER - FINALIZE
             // ========================================================================
 
+            ScanResult result{};
+            
+            // TITANIUM: Always report total bytes processed, regardless of store state
+            result.totalBytesScanned = m_bytesProcessed;
+
             // VALIDATION 1: Check for null store pointer
             if (!m_store) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::Finalize: Store pointer is null");
+                SS_LOG_WARN(L"SignatureStore", L"StreamScanner::Finalize: Store pointer is null");
+                // Still return bytes processed - scanning couldn't happen but data was tracked
                 m_buffer.clear();
-                return ScanResult{};
+                return result;
             }
 
-            // VALIDATION 2: Check if store is still initialized
+            // VALIDATION 2: Check if store is initialized
             if (!m_store->IsInitialized()) {
-                SS_LOG_ERROR(L"SignatureStore", L"StreamScanner::Finalize: Store is no longer initialized");
+                SS_LOG_WARN(L"SignatureStore", L"StreamScanner::Finalize: Store is not initialized");
+                // Still return bytes processed - scanning couldn't happen but data was tracked
                 m_buffer.clear();
-                return ScanResult{};
+                return result;
             }
 
             // VALIDATION 3: Nothing to scan
             if (m_buffer.empty()) {
-                ScanResult result{};
-                result.totalBytesScanned = 0;
+                // totalBytesScanned is already set above
                 return result;
             }
 
             // ========================================================================
             // FINAL SCAN AND CLEANUP
             // ========================================================================
-            auto result = m_store->ScanBuffer(m_buffer, m_options);
+            result = m_store->ScanBuffer(m_buffer, m_options);
+            
+            // Ensure totalBytesScanned reflects the full stream, not just the last buffer
+            result.totalBytesScanned = m_bytesProcessed;
 
             // Clear buffer and release memory
             m_buffer.clear();

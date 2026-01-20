@@ -499,8 +499,20 @@ TEST_F(SIMDMatcherTest, LargeBufferPerformance) {
 
     EXPECT_EQ(matches.size(), 10);
     
-    // Should scan 10MB in < 50ms (target: < 10ms)
-    EXPECT_LT(duration.count(), 50);
+    // Performance threshold varies by build configuration:
+    // - Release mode target: < 10ms
+    // - Debug mode: < 500ms (due to disabled optimizations and runtime checks)
+#ifdef _DEBUG
+    constexpr int64_t TIMEOUT_MS = 500;
+#elif defined(NDEBUG)
+    constexpr int64_t TIMEOUT_MS = 50;
+#else
+    // Unknown configuration - use conservative timeout
+    constexpr int64_t TIMEOUT_MS = 500;
+#endif
+    
+    EXPECT_LT(duration.count(), TIMEOUT_MS) 
+        << "SIMD search took " << duration.count() << "ms (limit: " << TIMEOUT_MS << "ms)";
 }
 
 // ============================================================================

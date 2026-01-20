@@ -858,6 +858,8 @@ bool DeadlockDetector::CheckForDeadlock() {
  * @param allWorkers Reference to all worker threads (for work stealing).
  * @param config Thread pool configuration settings.
  * @param pendingTasks Atomic counter for pending tasks.
+ * @param taskNotifyMutex Reference to shared mutex for task notification.
+ * @param taskNotifyCV Reference to shared CV for task notification.
  * @param etwManager Optional ETW tracing manager (may be nullptr).
  * 
  * @note Constructor does not start the thread. Call Start() explicitly.
@@ -867,14 +869,18 @@ WorkerThread::WorkerThread(
     PriorityTaskQueue& globalQueue,
     std::vector<std::unique_ptr<WorkerThread>>& allWorkers,
     const ThreadPoolConfig& config,
-    std::atomic<size_t>& pendingTasks,  
+    std::atomic<size_t>& pendingTasks,
+    std::mutex& taskNotifyMutex,
+    std::condition_variable& taskNotifyCV,
     ETWTracingManager* etwManager /*= nullptr*/
 )
     : threadId_(threadId)
     , globalQueue_(globalQueue)
     , allWorkers_(allWorkers)
     , config_(config)
-    , pendingTasks_(pendingTasks)  
+    , pendingTasks_(pendingTasks)
+    , taskNotifyMutex_(taskNotifyMutex)
+    , taskNotifyCV_(taskNotifyCV)
     , etwManager_(etwManager)
     , systemThreadId_(0)
     , lastActivityTime_(std::chrono::steady_clock::now())
@@ -925,8 +931,8 @@ void WorkerThread::Stop() {
         return; // Not running - idempotent
     }
     
-    // Wake up the worker thread if waiting on condition variable
-    cv_.notify_one();
+    // Wake up the worker thread if waiting on shared condition variable
+    taskNotifyCV_.notify_all();
     
     // Wait for clean thread termination
     if (thread_.joinable()) {
@@ -1104,10 +1110,12 @@ void WorkerThread::WorkerLoop() {
             lastActivityTime_ = std::chrono::steady_clock::now();
         }
         else {
-            // No work available - wait on condition variable
-            std::unique_lock<std::mutex> lock(cvMutex_);
-            cv_.wait_for(lock, kIdleWaitDuration, [this] {
-                return !running_.load(std::memory_order_acquire);
+            // No work available - wait on shared condition variable for task notification
+            std::unique_lock<std::mutex> lock(taskNotifyMutex_);
+            taskNotifyCV_.wait_for(lock, kIdleWaitDuration, [this] {
+                // Wake up if: stopped, or there's work in the queue
+                return !running_.load(std::memory_order_acquire) || 
+                       !globalQueue_.IsEmpty();
             });
         }
     }
@@ -1252,12 +1260,6 @@ void WorkerThread::ExecuteTask(TaskWrapper& task) {
     }
     
     // Always clear busy flag and decrement pending count
-    busy_.store(false, std::memory_order_release);
-    pendingTasks_.fetch_sub(1, std::memory_order_release);
-
-        
-    
-    
     busy_.store(false, std::memory_order_release);
     pendingTasks_.fetch_sub(1, std::memory_order_release);
 }
@@ -1467,6 +1469,9 @@ void ThreadPool::Shutdown(bool waitForCompletion) {
     else {
         globalQueue_.Clear();
     }
+    
+    // Wake up all workers so they can see shutdown flag and exit
+    taskNotifyCV_.notify_all();
 
     // Stop monitoring thread
     monitoringActive_.store(false, std::memory_order_release);
@@ -2001,13 +2006,15 @@ void ThreadPool::CreateWorkerThreads(size_t count) {
             // Create per-worker queue (for potential future work stealing optimization)
             auto queue = std::make_unique<PriorityTaskQueue>(config_.maxQueueSize);
             
-            // Create worker thread
+            // Create worker thread with shared notification CV
             auto worker = std::make_unique<WorkerThread>(
                 threadId,
                 globalQueue_,
                 workers_,
                 config_,
-                pendingTasks_,  
+                pendingTasks_,
+                taskNotifyMutex_,
+                taskNotifyCV_,
                 etwManager_.get()
             );
 

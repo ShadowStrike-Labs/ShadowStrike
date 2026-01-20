@@ -101,6 +101,60 @@ namespace ShadowStrike {
                         }
                     }
                 }
+                else if (iocArray->is_object()) {
+                    // Auto-detect common JSON feed formats when no path is specified
+                    // Try common array field names in order of prevalence
+                    static const std::vector<std::string> commonArrayPaths = {
+                        "objects",          // ThreatStream format
+                        "data",             // Generic API format  
+                        "results",          // AlienVault OTX format
+                        "indicators",       // Common threat feed format
+                        "iocs",             // Common IOC feed format
+                        "entries",          // Generic entry format
+                        "items",            // Generic item format
+                    };
+                    
+                    bool foundArray = false;
+                    for (const auto& fieldName : commonArrayPaths) {
+                        if (iocArray->contains(fieldName) && (*iocArray)[fieldName].is_array()) {
+                            iocArray = &(*iocArray)[fieldName];
+                            foundArray = true;
+                            break;
+                        }
+                    }
+                    
+                    // Try nested paths for specific formats
+                    if (!foundArray) {
+                        // MISP format: response.Attribute
+                        if (iocArray->contains("response") && (*iocArray)["response"].is_object()) {
+                            auto& responseObj = (*iocArray)["response"];
+                            if (responseObj.contains("Attribute") && responseObj["Attribute"].is_array()) {
+                                iocArray = &responseObj["Attribute"];
+                                foundArray = true;
+                            }
+                        }
+                    }
+                    
+                    // If still not found, check if the object has any array that could contain IOCs
+                    if (!foundArray) {
+                        for (auto& [key, value] : iocArray->items()) {
+                            if (value.is_array() && !value.empty()) {
+                                // Check if the array contains objects (likely IOC entries)
+                                if (value[0].is_object()) {
+                                    iocArray = &value;
+                                    foundArray = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle empty JSON object {} - valid but no IOCs
+                if (iocArray->is_object() && iocArray->empty()) {
+                    // Empty JSON object is valid - just no IOCs to parse
+                    return true;
+                }
 
                 if (!iocArray->is_array()) {
                     m_lastError = "IOC path does not point to array";
@@ -206,6 +260,46 @@ namespace ShadowStrike {
                             return false;
                         }
                     }
+                }
+                else if (iocArray->is_object()) {
+                    // Auto-detect common JSON feed formats when no path is specified
+                    static const std::vector<std::string> commonArrayPaths = {
+                        "objects", "data", "results", "indicators", "iocs", "entries", "items"
+                    };
+                    
+                    bool foundArray = false;
+                    for (const auto& fieldName : commonArrayPaths) {
+                        if (iocArray->contains(fieldName) && (*iocArray)[fieldName].is_array()) {
+                            iocArray = &(*iocArray)[fieldName];
+                            foundArray = true;
+                            break;
+                        }
+                    }
+                    
+                    // Try MISP format: response.Attribute
+                    if (!foundArray && iocArray->contains("response") && (*iocArray)["response"].is_object()) {
+                        auto& responseObj = (*iocArray)["response"];
+                        if (responseObj.contains("Attribute") && responseObj["Attribute"].is_array()) {
+                            iocArray = &responseObj["Attribute"];
+                            foundArray = true;
+                        }
+                    }
+                    
+                    // Try any array that contains objects
+                    if (!foundArray) {
+                        for (auto& [key, value] : iocArray->items()) {
+                            if (value.is_array() && !value.empty() && value[0].is_object()) {
+                                iocArray = &value;
+                                foundArray = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Handle empty JSON object
+                if (iocArray->is_object() && iocArray->empty()) {
+                    return true;
                 }
 
                 if (!iocArray->is_array()) {

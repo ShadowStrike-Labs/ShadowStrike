@@ -246,15 +246,15 @@ StoreError SignatureStore::Initialize(
         }
     }
 
-    // TITANIUM: Set initialized even if some components failed
-    // (allows partial functionality)
-    m_initialized.store(true, std::memory_order_release);
-
-    if (anyComponentInitialized) {
-        SS_LOG_INFO(L"SignatureStore", L"Initialized successfully");
-    } else {
-        SS_LOG_WARN(L"SignatureStore", L"Initialized but no components available");
+    // TITANIUM: Only set initialized if at least one component initialized
+    // This prevents "successful" initialization with invalid/nonexistent paths
+    if (!anyComponentInitialized) {
+        SS_LOG_ERROR(L"SignatureStore", L"Initialize failed: No components could be initialized");
+        return StoreError{SignatureStoreError::FileNotFound, 0, "No components could be initialized - database path may be invalid"};
     }
+
+    m_initialized.store(true, std::memory_order_release);
+    SS_LOG_INFO(L"SignatureStore", L"Initialized successfully");
     
     return StoreError{SignatureStoreError::Success};
 }

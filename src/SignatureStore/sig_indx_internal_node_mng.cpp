@@ -443,24 +443,143 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                 m_truncatedAddrToCOWNode[clonedTruncAddr] = clonedNode;
                 
                 // ================================================================
-                // CRITICAL FIX: Update previous leaf's nextLeaf pointer
+                // ENTERPRISE-GRADE LINKED LIST MAINTENANCE FOR LEAF NODES
                 // ================================================================
-                // When we clone a leaf node, its file location will change after
-                // CommitCOW. The previous leaf (if any) has nextLeaf pointing to
-                // the OLD location. If we don't update it, the linked list will
-                // be broken - ForEach traversal will read stale/wrong data.
+                // When we clone a leaf node, we MUST update the linked list pointers
+                // of adjacent leaves to maintain proper enumeration support.
                 //
-                // DESIGN DECISION: Instead of maintaining the linked list during
-                // COW operations (which would require cloning adjacent leaves and
-                // potentially cascading changes up the tree), we use tree-based
-                // traversal in ForEachInternalNoLock. The children[] pointers ARE
-                // properly maintained during COW commits, making tree traversal
-                // reliable while linked list traversal is not.
+                // Without this fix:
+                // - ForEach() using linked list would see stale pointers
+                // - RangeQuery() would fail to traverse consecutive leaves
+                // - Enumeration would produce incorrect results
                 //
-                // The nextLeaf/prevLeaf pointers remain for potential future use
-                // in range queries, but enumeration uses tree traversal for
-                // correctness and robustness.
+                // The linked list must be:
+                //   [prevLeaf] <-> [clonedNode] <-> [nextLeaf]
+                //
+                // We need to:
+                // 1. Update prevLeaf->nextLeaf to point to clonedNode
+                // 2. Update nextLeaf->prevLeaf to point to clonedNode
+                // 3. Update clonedNode's prevLeaf/nextLeaf to use truncated addresses
                 // ================================================================
+                
+                if (clonedNode->isLeaf) {
+                    uint32_t prevLeafAddr = clonedNode->prevLeaf;
+                    uint32_t nextLeafAddr = clonedNode->nextLeaf;
+                    
+                    SS_LOG_TRACE(L"SignatureIndex",
+                        L"FindLeafForCOW: Maintaining linked list for cloned leaf "
+                        L"(prevLeaf=0x%X, nextLeaf=0x%X)", prevLeafAddr, nextLeafAddr);
+                    
+                    // ============================================================
+                    // UPDATE PREVIOUS LEAF'S NEXTLEAF POINTER
+                    // ============================================================
+                    if (prevLeafAddr != 0) {
+                        BPlusTreeNode* prevLeafNode = nullptr;
+                        
+                        // Check if prevLeaf is already a COW node (truncated address)
+                        auto prevCowIt = m_truncatedAddrToCOWNode.find(prevLeafAddr);
+                        if (prevCowIt != m_truncatedAddrToCOWNode.end()) {
+                            prevLeafNode = prevCowIt->second;
+                            SS_LOG_TRACE(L"SignatureIndex",
+                                L"FindLeafForCOW: Found prevLeaf in COW pool at truncAddr 0x%X", 
+                                prevLeafAddr);
+                        }
+                        else if (prevLeafAddr < m_indexSize) {
+                            // It's a file offset - check if we have a COW clone
+                            auto prevFileIt = m_fileOffsetToCOWNode.find(prevLeafAddr);
+                            if (prevFileIt != m_fileOffsetToCOWNode.end()) {
+                                prevLeafNode = prevFileIt->second;
+                                SS_LOG_TRACE(L"SignatureIndex",
+                                    L"FindLeafForCOW: Found existing COW clone for prevLeaf at offset 0x%X", 
+                                    prevLeafAddr);
+                            }
+                            else {
+                                // Need to clone the previous leaf
+                                const BPlusTreeNode* prevLeafConst = GetNode(prevLeafAddr);
+                                if (prevLeafConst && prevLeafConst->isLeaf) {
+                                    prevLeafNode = CloneNode(prevLeafConst);
+                                    if (prevLeafNode) {
+                                        // Register the clone
+                                        m_fileOffsetToCOWNode[prevLeafAddr] = prevLeafNode;
+                                        uint32_t prevTruncAddr = static_cast<uint32_t>(
+                                            reinterpret_cast<uintptr_t>(prevLeafNode)
+                                        );
+                                        m_truncatedAddrToCOWNode[prevTruncAddr] = prevLeafNode;
+                                        
+                                        // Update clonedNode's prevLeaf to point to cloned prev
+                                        clonedNode->prevLeaf = prevTruncAddr;
+                                        
+                                        SS_LOG_TRACE(L"SignatureIndex",
+                                            L"FindLeafForCOW: Cloned prevLeaf from offset 0x%X -> truncAddr 0x%X",
+                                            prevLeafAddr, prevTruncAddr);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Update prevLeaf's nextLeaf to point to our cloned node
+                        if (prevLeafNode) {
+                            prevLeafNode->nextLeaf = clonedTruncAddr;
+                            SS_LOG_TRACE(L"SignatureIndex",
+                                L"FindLeafForCOW: Updated prevLeaf->nextLeaf to 0x%X", clonedTruncAddr);
+                        }
+                    }
+                    
+                    // ============================================================
+                    // UPDATE NEXT LEAF'S PREVLEAF POINTER
+                    // ============================================================
+                    if (nextLeafAddr != 0) {
+                        BPlusTreeNode* nextLeafNode = nullptr;
+                        
+                        // Check if nextLeaf is already a COW node (truncated address)
+                        auto nextCowIt = m_truncatedAddrToCOWNode.find(nextLeafAddr);
+                        if (nextCowIt != m_truncatedAddrToCOWNode.end()) {
+                            nextLeafNode = nextCowIt->second;
+                            SS_LOG_TRACE(L"SignatureIndex",
+                                L"FindLeafForCOW: Found nextLeaf in COW pool at truncAddr 0x%X", 
+                                nextLeafAddr);
+                        }
+                        else if (nextLeafAddr < m_indexSize) {
+                            // It's a file offset - check if we have a COW clone
+                            auto nextFileIt = m_fileOffsetToCOWNode.find(nextLeafAddr);
+                            if (nextFileIt != m_fileOffsetToCOWNode.end()) {
+                                nextLeafNode = nextFileIt->second;
+                                SS_LOG_TRACE(L"SignatureIndex",
+                                    L"FindLeafForCOW: Found existing COW clone for nextLeaf at offset 0x%X", 
+                                    nextLeafAddr);
+                            }
+                            else {
+                                // Need to clone the next leaf
+                                const BPlusTreeNode* nextLeafConst = GetNode(nextLeafAddr);
+                                if (nextLeafConst && nextLeafConst->isLeaf) {
+                                    nextLeafNode = CloneNode(nextLeafConst);
+                                    if (nextLeafNode) {
+                                        // Register the clone
+                                        m_fileOffsetToCOWNode[nextLeafAddr] = nextLeafNode;
+                                        uint32_t nextTruncAddr = static_cast<uint32_t>(
+                                            reinterpret_cast<uintptr_t>(nextLeafNode)
+                                        );
+                                        m_truncatedAddrToCOWNode[nextTruncAddr] = nextLeafNode;
+                                        
+                                        // Update clonedNode's nextLeaf to point to cloned next
+                                        clonedNode->nextLeaf = nextTruncAddr;
+                                        
+                                        SS_LOG_TRACE(L"SignatureIndex",
+                                            L"FindLeafForCOW: Cloned nextLeaf from offset 0x%X -> truncAddr 0x%X",
+                                            nextLeafAddr, nextTruncAddr);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Update nextLeaf's prevLeaf to point to our cloned node
+                        if (nextLeafNode) {
+                            nextLeafNode->prevLeaf = clonedTruncAddr;
+                            SS_LOG_TRACE(L"SignatureIndex",
+                                L"FindLeafForCOW: Updated nextLeaf->prevLeaf to 0x%X", clonedTruncAddr);
+                        }
+                    }
+                }
                 
                 node = clonedNode;
                 SS_LOG_TRACE(L"SignatureIndex",

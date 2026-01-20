@@ -735,13 +735,26 @@ TEST_F(ThreatIntelDatabaseTest, EnsureCapacity_AdditionalEntries) {
     ThreatIntelDatabase db;
     EXPECT_TRUE(db.Open(testDbPath));
     
+    // Fill the database to near capacity first to force extension
     size_t originalMax = db.GetMaxEntries();
+    size_t currentCount = db.GetEntryCount();
     
-    // Ensure capacity for 1000 additional entries
+    // Fill to near capacity (leave space for just a few entries)
+    if (originalMax > currentCount + 10) {
+        size_t toAllocate = originalMax - currentCount - 5; // Leave only 5 slots
+        db.AllocateEntries(toAllocate);
+    }
+    
+    size_t preExtendMax = db.GetMaxEntries();
+    
+    // Now request 1000 additional entries - should force extension
     EXPECT_TRUE(db.EnsureCapacity(1000));
     
     size_t newMax = db.GetMaxEntries();
-    EXPECT_GE(newMax, originalMax + 1000);
+    
+    // After EnsureCapacity, we should have at least 1000 available
+    size_t available = newMax - db.GetEntryCount();
+    EXPECT_GE(available, 1000);
     
     db.Close();
 }
@@ -1663,7 +1676,319 @@ TEST_F(ThreatIntelDatabaseTest, Utility_DeleteDatabaseFile) {
 }
 
 // ============================================================================
-// MAIN TEST ENTRY POINT
+// CATEGORY 16: TITANIUM EDGE CASES - HARDENING TESTS
 // ============================================================================
 
+TEST_F(ThreatIntelDatabaseTest, Titanium_RapidOpenCloseSequence) {
+    // Rapidly open and close database to test resource cleanup
+    for (int i = 0; i < 10; ++i) {
+        ThreatIntelDatabase db;
+        EXPECT_TRUE(db.Open(testDbPath));
+        EXPECT_TRUE(db.IsOpen());
+        db.AllocateEntry();
+        db.Close();
+        EXPECT_FALSE(db.IsOpen());
+    }
+    
+    // Verify final state is correct
+    ThreatIntelDatabase final_db;
+    EXPECT_TRUE(final_db.Open(testDbPath));
+    EXPECT_EQ(final_db.GetEntryCount(), 10);
+    final_db.Close();
+}
 
+TEST_F(ThreatIntelDatabaseTest, Titanium_AllocateExactCapacity) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    size_t maxEntries = db.GetMaxEntries();
+    size_t currentCount = db.GetEntryCount();
+    size_t toAllocate = maxEntries - currentCount;
+    
+    // Allocate to exact capacity
+    if (toAllocate > 0 && toAllocate <= 1000) { // Reasonable limit
+        size_t index = db.AllocateEntries(toAllocate);
+        EXPECT_NE(index, SIZE_MAX);
+        EXPECT_EQ(db.GetEntryCount(), maxEntries);
+    }
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_MultipleFlushOperations) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    // Perform multiple flushes
+    for (int i = 0; i < 10; ++i) {
+        db.AllocateEntry();
+        EXPECT_TRUE(db.Flush());
+    }
+    
+    EXPECT_EQ(db.GetEntryCount(), 10);
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_SyncOnReadOnlyMode) {
+    // Create and populate database
+    {
+        ThreatIntelDatabase db;
+        EXPECT_TRUE(db.Open(testDbPath));
+        db.AllocateEntries(10);
+        db.Close();
+    }
+    
+    // Open in read-only mode
+    {
+        DatabaseConfig config;
+        config.filePath = testDbPath;
+        config.readOnly = true;
+        config.createIfNotExists = false;
+        
+        ThreatIntelDatabase db;
+        EXPECT_TRUE(db.Open(config));
+        
+        // Sync should succeed (no-op)
+        EXPECT_TRUE(db.Sync());
+        
+        db.Close();
+    }
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_IntegrityAfterExtension) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    // Add entries
+    db.AllocateEntries(50);
+    
+    // Extend database
+    size_t currentSize = db.GetMappedSize();
+    EXPECT_TRUE(db.Extend(currentSize + 5 * 1024 * 1024));
+    
+    // Update checksum after extension (required for integrity check)
+    EXPECT_TRUE(db.UpdateHeaderChecksum());
+    
+    // Verify integrity after extension with updated checksum
+    EXPECT_TRUE(db.VerifyIntegrity());
+    EXPECT_EQ(db.GetEntryCount(), 50);
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_HeaderChecksumAfterModifications) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    // Multiple modifications
+    for (int i = 0; i < 5; ++i) {
+        db.AllocateEntries(10);
+        EXPECT_TRUE(db.UpdateHeaderChecksum());
+        EXPECT_TRUE(db.VerifyHeaderChecksum());
+    }
+    
+    EXPECT_EQ(db.GetEntryCount(), 50);
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_ConcurrentFlushOperations) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    db.AllocateEntries(100);
+    
+    std::vector<std::thread> threads;
+    std::atomic<int> successCount{0};
+    
+    // Multiple threads flushing simultaneously
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&]() {
+            for (int j = 0; j < 10; ++j) {
+                if (db.Flush()) {
+                    successCount++;
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    // All flushes should succeed
+    EXPECT_EQ(successCount.load(), 40);
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_MixedRevokedAndSinkholedEntries) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    db.AllocateEntries(100);
+    
+    // Mark some as revoked, some as sinkholed
+    for (size_t i = 0; i < 100; i += 4) {
+        IOCEntry* entry = db.GetMutableEntry(i);
+        if (entry) {
+            entry->flags |= IOCFlags::Revoked;
+        }
+    }
+    for (size_t i = 2; i < 100; i += 4) {
+        IOCEntry* entry = db.GetMutableEntry(i);
+        if (entry) {
+            entry->flags |= IOCFlags::Sinkholed;
+        }
+    }
+    
+    size_t reclaimed = db.Compact();
+    EXPECT_GT(reclaimed, 0);
+    
+    // 25 revoked + 25 sinkholed = 50 deleted, 50 remaining
+    EXPECT_EQ(db.GetEntryCount(), 50);
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_DataPersistenceAcrossReopen) {
+    const size_t testEntryCount = 100;
+    
+    // Create and populate
+    {
+        ThreatIntelDatabase db;
+        EXPECT_TRUE(db.Open(testDbPath));
+        db.AllocateEntries(testEntryCount);
+        
+        // Set some entry data
+        for (size_t i = 0; i < testEntryCount; ++i) {
+            IOCEntry* entry = db.GetMutableEntry(i);
+            if (entry) {
+                entry->type = IOCType::IPv4;
+                entry->confidence = ConfidenceLevel::High;
+            }
+        }
+        
+        EXPECT_TRUE(db.Flush());
+        db.Close();
+    }
+    
+    // Reopen and verify
+    {
+        ThreatIntelDatabase db;
+        EXPECT_TRUE(db.Open(testDbPath));
+        EXPECT_EQ(db.GetEntryCount(), testEntryCount);
+        
+        // Verify entry data
+        for (size_t i = 0; i < testEntryCount; ++i) {
+            const IOCEntry* entry = db.GetEntry(i);
+            if (entry) {
+                EXPECT_EQ(entry->type, IOCType::IPv4);
+                EXPECT_EQ(entry->confidence, ConfidenceLevel::High);
+            }
+        }
+        
+        db.Close();
+    }
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_ExtendBeyondInitialSize) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    size_t originalSize = db.GetMappedSize();
+    size_t originalMaxEntries = db.GetMaxEntries();
+    
+    // Extend significantly
+    size_t newSize = originalSize + 20 * 1024 * 1024; // +20MB
+    EXPECT_TRUE(db.Extend(newSize));
+    
+    EXPECT_GE(db.GetMappedSize(), newSize);
+    EXPECT_GT(db.GetMaxEntries(), originalMaxEntries);
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_DoubleOpenSameDatabase) {
+    ThreatIntelDatabase db1;
+    EXPECT_TRUE(db1.Open(testDbPath));
+    
+    // Second open on same instance should fail
+    EXPECT_FALSE(db1.Open(testDbPath));
+    
+    // Second instance trying to open same file (might succeed or fail depending on sharing mode)
+    ThreatIntelDatabase db2;
+    // Don't assert - behavior depends on file locking implementation
+    
+    db1.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_AllocateEntryVerifyIndex) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    // Verify returned indices are sequential
+    size_t prevIndex = SIZE_MAX;
+    for (int i = 0; i < 10; ++i) {
+        size_t index = db.AllocateEntry();
+        EXPECT_NE(index, SIZE_MAX);
+        if (prevIndex != SIZE_MAX) {
+            EXPECT_EQ(index, prevIndex + 1);
+        }
+        prevIndex = index;
+    }
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_FlushRangeValidation) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    db.AllocateEntries(100);
+    
+    // Valid ranges
+    EXPECT_TRUE(db.FlushRange(0, 1024));
+    EXPECT_TRUE(db.FlushRange(0, 0)); // Flush entire region
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_StatisticsConsistency) {
+    ThreatIntelDatabase db;
+    EXPECT_TRUE(db.Open(testDbPath));
+    
+    // Initial state
+    DatabaseStats stats1 = db.GetStats();
+    EXPECT_EQ(stats1.entryCount, 0);
+    
+    // After allocations
+    db.AllocateEntries(50);
+    DatabaseStats stats2 = db.GetStats();
+    EXPECT_EQ(stats2.entryCount, 50);
+    
+    // After flush
+    db.Flush();
+    DatabaseStats stats3 = db.GetStats();
+    EXPECT_EQ(stats3.flushCount, stats2.flushCount + 1);
+    
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, Titanium_PathHandlingEdgeCases) {
+    // Test with various special paths
+    ThreatIntelDatabase db;
+    
+    // Empty path
+    EXPECT_FALSE(db.Open(L""));
+    
+    // Path with special characters (might fail due to file system restrictions)
+    // Just verify no crash
+    EXPECT_NO_THROW({
+        db.Open(L"C:\\NonExistent\\Path\\test.db");
+        db.Close();
+    });
+}
+
+// ============================================================================

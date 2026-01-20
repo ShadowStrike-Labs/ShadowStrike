@@ -950,8 +950,11 @@ bool ThreatIntelDatabase::Extend(size_t newSize) noexcept {
     
     // Check bounds
     const size_t currentSize = m_region.Size();
+    
+    // TITANIUM FIX: Return false if trying to shrink or stay same size
+    // Extend() should only succeed when actually extending
     if (newSize <= currentSize) {
-        return true; // Already big enough
+        return false; // Cannot shrink or extend to same size
     }
     
     // TITANIUM: Apply strict size limits
@@ -965,9 +968,9 @@ bool ThreatIntelDatabase::Extend(size_t newSize) noexcept {
 }
 
 bool ThreatIntelDatabase::ExtendBy(size_t additionalBytes) noexcept {
-    // TITANIUM: Validate additionalBytes
+    // TITANIUM FIX: Return false for zero bytes - explicit request must be non-zero
     if (additionalBytes == 0) {
-        return true;  // Nothing to extend
+        return false;  // Zero extension is an invalid request
     }
     
     std::shared_lock lock(m_mutex);
@@ -983,9 +986,9 @@ bool ThreatIntelDatabase::ExtendBy(size_t additionalBytes) noexcept {
 }
 
 bool ThreatIntelDatabase::EnsureCapacity(size_t additionalEntries) noexcept {
-    // TITANIUM: Validate additionalEntries is reasonable
+    // TITANIUM FIX: Return false for zero entries - explicit request must be non-zero
     if (additionalEntries == 0) {
-        return true;  // Nothing needed
+        return false;  // Zero capacity request is invalid
     }
     
     // TITANIUM: Prevent unreasonably large allocations
@@ -1051,9 +1054,11 @@ size_t ThreatIntelDatabase::Compact() noexcept {
     for (size_t readIndex = 0; readIndex < originalCount; ++readIndex) {
         const IOCEntry& entry = m_entries[readIndex];
         
-        // Skip deleted entries (marked with type = Unknown/0 or special revoked flag)
-        // Using HasFlag to check IOCFlags::Revoked
-        if (static_cast<uint8_t>(entry.type) == 0 || HasFlag(entry.flags, IOCFlags::Revoked)) {
+        // TITANIUM FIX: Skip entries explicitly marked for removal
+        // Only Revoked and Sinkholed flags indicate entries should be compacted out
+        // Note: type == 0 is a valid IPv4 entry, NOT a deleted entry
+        if (HasFlag(entry.flags, IOCFlags::Revoked) ||
+            HasFlag(entry.flags, IOCFlags::Sinkholed)) {
             continue;
         }
         
@@ -1082,13 +1087,14 @@ size_t ThreatIntelDatabase::Compact() noexcept {
 
 bool ThreatIntelDatabase::Flush() noexcept {
     if (m_config.readOnly) {
-        return true; // Nothing to flush
+        return true; // Nothing to flush in read-only mode
     }
     
     std::shared_lock lock(m_mutex);
     
+    // TITANIUM FIX: If database is not open, nothing to flush - return success
     if (!m_region.IsValid()) {
-        return false;
+        return true;  // No-op for closed database is considered success
     }
     
     // Update header checksum before flush

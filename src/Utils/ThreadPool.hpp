@@ -195,7 +195,10 @@ struct ThreadPoolConfig {
     size_t minThreads = std::max<size_t>(ABSOLUTE_MIN_THREADS, std::thread::hardware_concurrency());
 
 	/** Maximum number of worker threads */
-    size_t maxThreads = std::max(MIN_THREAD_LIMIT, static_cast<size_t>(std::thread::hardware_concurrency() * 2));
+    size_t maxThreads = std::max(
+        static_cast<size_t>(MIN_THREAD_LIMIT),
+        static_cast<size_t>(std::thread::hardware_concurrency()) * 2
+    );
     
     /** Maximum number of tasks in the queue */
     size_t maxQueueSize = 10000;
@@ -710,6 +713,8 @@ public:
         std::vector<std::unique_ptr<WorkerThread>>& allWorkers,
         const ThreadPoolConfig& config,
         std::atomic<size_t>& pendingTasks,
+        std::mutex& taskNotifyMutex,
+        std::condition_variable& taskNotifyCV,
         ETWTracingManager* etwManager = nullptr
     );
     ~WorkerThread();
@@ -758,15 +763,16 @@ private:
 
     std::atomic<size_t>& pendingTasks_;
     
+    // Shared task notification (owned by ThreadPool)
+    std::mutex& taskNotifyMutex_;
+    std::condition_variable& taskNotifyCV_;
+    
     DWORD systemThreadId_{0};
     std::chrono::steady_clock::time_point lastActivityTime_;
     
     // Performance tracking
     std::atomic<uint64_t> executionTimeMs_{0};
     std::atomic<uint64_t> idleTimeMs_{0};
-
-    std::condition_variable cv_;
-	std::mutex cvMutex_;
 };
 
 // ============================================================================
@@ -1079,6 +1085,10 @@ private:
     // Synchronization for shutdown
     std::counting_semaphore<> taskCompletionSemaphore_{0};
     std::atomic<size_t> pendingTasks_{0};
+    
+    // Task notification - shared CV for waking idle workers
+    mutable std::mutex taskNotifyMutex_;
+    std::condition_variable taskNotifyCV_;
 };
 
 // ============================================================================
@@ -1367,6 +1377,9 @@ bool ThreadPool::EnqueueTask(Task<ResultType> task) {
                                   wrapper.GetContext().taskId,
                                   wrapper.GetContext().description);
     }
+    
+    // Notify one idle worker that a task is available
+    taskNotifyCV_.notify_one();
     
     return true;
 }

@@ -143,7 +143,7 @@ protected:
 // HASHVALUE STRUCTURE TESTS
 // ============================================================================
 
-TEST(HashValueTest, DefaultConstruction) {
+TEST(SignatureFormatTest, DefaultConstruction) {
     HashValue hash{};
     
     EXPECT_EQ(hash.type, HashType::MD5);
@@ -155,12 +155,14 @@ TEST(HashValueTest, DefaultConstruction) {
     }
 }
 
-TEST(HashValueTest, SizeIsExact68Bytes) {
-    // Critical: HashValue must be exactly 68 bytes for memory mapping
-    EXPECT_EQ(sizeof(HashValue), 68);
+TEST(SignatureFormatTest, SizeIsExact72Bytes) {
+    // Critical: HashValue must be exactly 72 bytes for memory mapping (8-byte aligned)
+    // Structure: type(1) + length(1) + reserved(2) + data(64) + padding(4) = 72 bytes
+    EXPECT_EQ(sizeof(HashValue), 72);
+    EXPECT_EQ(alignof(HashValue), 8);
 }
 
-TEST(HashValueTest, EqualityOperator) {
+TEST(SignatureFormatTest, EqualityOperator) {
     HashValue hash1{};
     hash1.type = HashType::SHA256;
     hash1.length = 32;
@@ -180,7 +182,7 @@ TEST(HashValueTest, EqualityOperator) {
     EXPECT_FALSE(hash1 == hash3);
 }
 
-TEST(HashValueTest, EqualityWithDifferentTypes) {
+TEST(SignatureFormatTest, EqualityWithDifferentTypes) {
     HashValue hash1{};
     hash1.type = HashType::MD5;
     hash1.length = 16;
@@ -194,7 +196,7 @@ TEST(HashValueTest, EqualityWithDifferentTypes) {
     EXPECT_FALSE(hash1 == hash2);
 }
 
-TEST(HashValueTest, EqualityWithDifferentLengths) {
+TEST(SignatureFormatTest, EqualityWithDifferentLengths) {
     HashValue hash1{};
     hash1.type = HashType::SHA256;
     hash1.length = 16;
@@ -208,7 +210,7 @@ TEST(HashValueTest, EqualityWithDifferentLengths) {
     EXPECT_FALSE(hash1 == hash2);
 }
 
-TEST(HashValueTest, FastHashConsistency) {
+TEST(SignatureFormatTest, FastHashConsistency) {
     HashValue hash{};
     hash.type = HashType::SHA256;
     hash.length = 32;
@@ -223,7 +225,7 @@ TEST(HashValueTest, FastHashConsistency) {
     EXPECT_EQ(fastHash1, fastHash2);
 }
 
-TEST(HashValueTest, FastHashDifferentForDifferentData) {
+TEST(SignatureFormatTest, FastHashDifferentForDifferentData) {
     HashValue hash1{};
     hash1.type = HashType::SHA256;
     hash1.length = 32;
@@ -237,7 +239,7 @@ TEST(HashValueTest, FastHashDifferentForDifferentData) {
     EXPECT_NE(hash1.FastHash(), hash2.FastHash());
 }
 
-TEST(HashValueTest, FastHashZeroLength) {
+TEST(SignatureFormatTest, FastHashZeroLength) {
     HashValue hash{};
     hash.type = HashType::SHA256;
     hash.length = 0;
@@ -253,31 +255,31 @@ TEST(HashValueTest, FastHashZeroLength) {
 // HASH LENGTH UTILITY TESTS
 // ============================================================================
 
-TEST(GetHashLengthTest, MD5Is16Bytes) {
+TEST(SignatureFormatTest, MD5Is16Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::MD5), 16);
 }
 
-TEST(GetHashLengthTest, SHA1Is20Bytes) {
+TEST(SignatureFormatTest, SHA1Is20Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::SHA1), 20);
 }
 
-TEST(GetHashLengthTest, SHA256Is32Bytes) {
+TEST(SignatureFormatTest, SHA256Is32Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::SHA256), 32);
 }
 
-TEST(GetHashLengthTest, SHA512Is64Bytes) {
+TEST(SignatureFormatTest, SHA512Is64Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::SHA512), 64);
 }
 
-TEST(GetHashLengthTest, IMPHASHIs16Bytes) {
+TEST(SignatureFormatTest, IMPHASHIs16Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::IMPHASH), 16);
 }
 
-TEST(GetHashLengthTest, SSDeepIs64Bytes) {
+TEST(SignatureFormatTest, SSDeepIs64Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::SSDEEP), 64);
 }
 
-TEST(GetHashLengthTest, TLSHIs35Bytes) {
+TEST(SignatureFormatTest, TLSHIs35Bytes) {
     EXPECT_EQ(GetHashLengthForType(HashType::TLSH), 35);
 }
 
@@ -285,7 +287,7 @@ TEST(GetHashLengthTest, TLSHIs35Bytes) {
 // HASHTYPE TO STRING TESTS
 // ============================================================================
 
-TEST(HashTypeToStringTest, AllTypesHaveValidStrings) {
+TEST(SignatureFormatTest, AllTypesHaveValidStrings) {
     EXPECT_STREQ(Format::HashTypeToString(HashType::MD5), "MD5");
     EXPECT_STREQ(Format::HashTypeToString(HashType::SHA1), "SHA1");
     EXPECT_STREQ(Format::HashTypeToString(HashType::SHA256), "SHA256");
@@ -295,7 +297,7 @@ TEST(HashTypeToStringTest, AllTypesHaveValidStrings) {
     EXPECT_STREQ(Format::HashTypeToString(HashType::TLSH), "TLSH");
 }
 
-TEST(HashTypeToStringTest, InvalidTypeReturnsUnknown) {
+TEST(SignatureFormatTest, InvalidTypeReturnsUnknown) {
     HashType invalid = static_cast<HashType>(255);
     EXPECT_STREQ(Format::HashTypeToString(invalid), "UNKNOWN");
 }
@@ -304,7 +306,7 @@ TEST(HashTypeToStringTest, InvalidTypeReturnsUnknown) {
 // HASH STRING PARSING TESTS
 // ============================================================================
 
-TEST(ParseHashStringTest, ValidMD5) {
+TEST(SignatureFormatTest, ValidMD5) {
     std::string md5Hex = "d41d8cd98f00b204e9800998ecf8427e";
     
     auto result = Format::ParseHashString(md5Hex, HashType::MD5);
@@ -318,7 +320,7 @@ TEST(ParseHashStringTest, ValidMD5) {
     EXPECT_EQ(result->data[15], 0x7E);
 }
 
-TEST(ParseHashStringTest, ValidSHA1) {
+TEST(SignatureFormatTest, ValidSHA1) {
     std::string sha1Hex = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
     
     auto result = Format::ParseHashString(sha1Hex, HashType::SHA1);
@@ -328,7 +330,7 @@ TEST(ParseHashStringTest, ValidSHA1) {
     EXPECT_EQ(result->length, 20);
 }
 
-TEST(ParseHashStringTest, ValidSHA256) {
+TEST(SignatureFormatTest, ValidSHA256) {
     std::string sha256Hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     
     auto result = Format::ParseHashString(sha256Hex, HashType::SHA256);
@@ -338,7 +340,7 @@ TEST(ParseHashStringTest, ValidSHA256) {
     EXPECT_EQ(result->length, 32);
 }
 
-TEST(ParseHashStringTest, ValidSHA512) {
+TEST(SignatureFormatTest, ValidSHA512) {
     std::string sha512Hex = 
         "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
         "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
@@ -350,7 +352,7 @@ TEST(ParseHashStringTest, ValidSHA512) {
     EXPECT_EQ(result->length, 64);
 }
 
-TEST(ParseHashStringTest, UppercaseHexAccepted) {
+TEST(SignatureFormatTest, UppercaseHexAccepted) {
     std::string upperMd5 = "D41D8CD98F00B204E9800998ECF8427E";
     
     auto result = Format::ParseHashString(upperMd5, HashType::MD5);
@@ -359,7 +361,7 @@ TEST(ParseHashStringTest, UppercaseHexAccepted) {
     EXPECT_EQ(result->length, 16);
 }
 
-TEST(ParseHashStringTest, MixedCaseHexAccepted) {
+TEST(SignatureFormatTest, MixedCaseHexAccepted) {
     std::string mixedMd5 = "D41d8Cd98f00B204e9800998ecF8427E";
     
     auto result = Format::ParseHashString(mixedMd5, HashType::MD5);
@@ -367,7 +369,7 @@ TEST(ParseHashStringTest, MixedCaseHexAccepted) {
     ASSERT_TRUE(result.has_value());
 }
 
-TEST(ParseHashStringTest, WhitespaceStripped) {
+TEST(SignatureFormatTest, WhitespaceStripped) {
     std::string withSpaces = "  d41d8cd9 8f00b204 e9800998 ecf8427e  ";
     
     auto result = Format::ParseHashString(withSpaces, HashType::MD5);
@@ -376,13 +378,13 @@ TEST(ParseHashStringTest, WhitespaceStripped) {
     EXPECT_EQ(result->length, 16);
 }
 
-TEST(ParseHashStringTest, EmptyStringReturnsNullopt) {
+TEST(SignatureFormatTest, EmptyStringReturnsNullopt) {
     auto result = Format::ParseHashString("", HashType::MD5);
     
     EXPECT_FALSE(result.has_value());
 }
 
-TEST(ParseHashStringTest, WrongLengthReturnsNullopt) {
+TEST(SignatureFormatTest, WrongLengthReturnsNullopt) {
     // MD5 should be 32 hex chars, this is 30
     std::string shortHash = "d41d8cd98f00b204e9800998ecf842";
     
@@ -391,7 +393,7 @@ TEST(ParseHashStringTest, WrongLengthReturnsNullopt) {
     EXPECT_FALSE(result.has_value());
 }
 
-TEST(ParseHashStringTest, OddLengthReturnsNullopt) {
+TEST(SignatureFormatTest, OddLengthReturnsNullopt) {
     std::string oddLength = "d41d8cd98f00b204e9800998ecf8427"; // 31 chars
     
     auto result = Format::ParseHashString(oddLength, HashType::MD5);
@@ -399,7 +401,7 @@ TEST(ParseHashStringTest, OddLengthReturnsNullopt) {
     EXPECT_FALSE(result.has_value());
 }
 
-TEST(ParseHashStringTest, InvalidHexCharacterReturnsNullopt) {
+TEST(SignatureFormatTest, InvalidHexCharacterReturnsNullopt) {
     std::string invalidHex = "d41d8cd98f00b204e9800998ecf8427g"; // 'g' is invalid
     
     auto result = Format::ParseHashString(invalidHex, HashType::MD5);
@@ -407,7 +409,7 @@ TEST(ParseHashStringTest, InvalidHexCharacterReturnsNullopt) {
     EXPECT_FALSE(result.has_value());
 }
 
-TEST(ParseHashStringTest, VeryLongStringReturnsNullopt) {
+TEST(SignatureFormatTest, VeryLongStringReturnsNullopt) {
     std::string longString(1000, 'a');
     
     auto result = Format::ParseHashString(longString, HashType::MD5);
@@ -419,7 +421,7 @@ TEST(ParseHashStringTest, VeryLongStringReturnsNullopt) {
 // HASH STRING FORMATTING TESTS
 // ============================================================================
 
-TEST(FormatHashStringTest, FormatMD5) {
+TEST(SignatureFormatTest, FormatMD5) {
     HashValue hash{};
     hash.type = HashType::MD5;
     hash.length = 16;
@@ -437,7 +439,7 @@ TEST(FormatHashStringTest, FormatMD5) {
     EXPECT_EQ(formatted.substr(28, 4), "427e");
 }
 
-TEST(FormatHashStringTest, FormatSHA256) {
+TEST(SignatureFormatTest, FormatSHA256) {
     HashValue hash{};
     hash.type = HashType::SHA256;
     hash.length = 32;
@@ -452,7 +454,7 @@ TEST(FormatHashStringTest, FormatSHA256) {
     EXPECT_EQ(formatted.substr(0, 8), "00010203");
 }
 
-TEST(FormatHashStringTest, ZeroLengthReturnsEmpty) {
+TEST(SignatureFormatTest, ZeroLengthReturnsEmpty) {
     HashValue hash{};
     hash.type = HashType::SHA256;
     hash.length = 0;
@@ -462,7 +464,7 @@ TEST(FormatHashStringTest, ZeroLengthReturnsEmpty) {
     EXPECT_TRUE(formatted.empty());
 }
 
-TEST(FormatHashStringTest, InvalidLengthReturnsEmpty) {
+TEST(SignatureFormatTest, InvalidLengthReturnsEmpty) {
     HashValue hash{};
     hash.type = HashType::SHA256;
     hash.length = 100; // Exceeds data array size
@@ -472,7 +474,7 @@ TEST(FormatHashStringTest, InvalidLengthReturnsEmpty) {
     EXPECT_TRUE(formatted.empty());
 }
 
-TEST(FormatHashStringTest, RoundTripPreservesData) {
+TEST(SignatureFormatTest, RoundTripPreservesData) {
     std::string original = "d41d8cd98f00b204e9800998ecf8427e";
     
     auto parsed = Format::ParseHashString(original, HashType::MD5);
@@ -926,8 +928,10 @@ TEST(StoreErrorTest, ClearResetsToSuccess) {
 // BINARY STRUCTURE SIZE TESTS (Critical for Memory Mapping)
 // ============================================================================
 
-TEST(StructureSizeTest, HashValueIs68Bytes) {
-    EXPECT_EQ(sizeof(HashValue), 68);
+TEST(StructureSizeTest, HashValueIs72Bytes) {
+    // HashValue is 72 bytes with 8-byte alignment for memory mapping
+    EXPECT_EQ(sizeof(HashValue), 72);
+    EXPECT_EQ(alignof(HashValue), 8);
 }
 
 TEST(StructureSizeTest, PatternEntryIs48Bytes) {
