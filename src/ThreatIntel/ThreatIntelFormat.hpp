@@ -747,39 +747,53 @@ struct alignas(4) IPv4Address {
     // =========================================================================
     
     /// @brief Create IPv4Address from 4 octets (factory method)
+    /// @note Sets octets directly to ensure correct traversal order in RadixTree
     [[nodiscard]] static IPv4Address Create(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) noexcept {
         IPv4Address result{};
-        result.address = (static_cast<uint32_t>(a) << 24) |
-                         (static_cast<uint32_t>(b) << 16) |
-                         (static_cast<uint32_t>(c) << 8) |
-                         static_cast<uint32_t>(d);
+        // Set octets directly to ensure consistent byte order for RadixTree traversal
+        // octets[0] = a (first/high octet), octets[3] = d (last/low octet)
+        result.octets[0] = a;
+        result.octets[1] = b;
+        result.octets[2] = c;
+        result.octets[3] = d;
         result.prefixLength = prefix;
         result.reserved[0] = result.reserved[1] = result.reserved[2] = 0;
         return result;
     }
     
     /// @brief Create IPv4Address from raw 32-bit value (factory method)
+    /// @note Assumes big-endian (network byte order) - high octet in MSB position
     [[nodiscard]] static IPv4Address Create(uint32_t addr, uint8_t prefix = 32) noexcept {
         IPv4Address result{};
-        result.address = addr;
+        // Extract octets from big-endian format for consistent RadixTree traversal
+        result.octets[0] = static_cast<uint8_t>((addr >> 24) & 0xFF);
+        result.octets[1] = static_cast<uint8_t>((addr >> 16) & 0xFF);
+        result.octets[2] = static_cast<uint8_t>((addr >> 8) & 0xFF);
+        result.octets[3] = static_cast<uint8_t>(addr & 0xFF);
         result.prefixLength = prefix;
         result.reserved[0] = result.reserved[1] = result.reserved[2] = 0;
         return result;
     }
     
     /// @brief Initialize from 4 octets
+    /// @note Sets octets directly to ensure correct traversal order in RadixTree
     void Set(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t prefix = 32) noexcept {
-        address = (static_cast<uint32_t>(a) << 24) |
-                  (static_cast<uint32_t>(b) << 16) |
-                  (static_cast<uint32_t>(c) << 8) |
-                  static_cast<uint32_t>(d);
+        // Set octets directly for consistent RadixTree traversal
+        octets[0] = a;
+        octets[1] = b;
+        octets[2] = c;
+        octets[3] = d;
         prefixLength = prefix;
         reserved[0] = reserved[1] = reserved[2] = 0;
     }
     
-    /// @brief Initialize from raw 32-bit value (host byte order)
+    /// @brief Initialize from raw 32-bit value (big-endian network byte order)
     void Set(uint32_t addr, uint8_t prefix = 32) noexcept {
-        address = addr;
+        // Extract octets from big-endian format for consistent RadixTree traversal
+        octets[0] = static_cast<uint8_t>((addr >> 24) & 0xFF);
+        octets[1] = static_cast<uint8_t>((addr >> 16) & 0xFF);
+        octets[2] = static_cast<uint8_t>((addr >> 8) & 0xFF);
+        octets[3] = static_cast<uint8_t>(addr & 0xFF);
         prefixLength = prefix;
         reserved[0] = reserved[1] = reserved[2] = 0;
     }

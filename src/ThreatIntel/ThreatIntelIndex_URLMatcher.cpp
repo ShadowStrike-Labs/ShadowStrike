@@ -365,16 +365,22 @@ bool URLPatternMatcher::Insert(std::string_view urlPattern, const IndexValue& va
  * @return true if found, false otherwise
  */
 bool URLPatternMatcher::Lookup(std::string_view url, IndexValue& outValue) const {
-    std::shared_lock<std::shared_mutex> lock(m_mutex);
-    
     if (url.empty()) {
         return false;
     }
     
-    // Ensure automaton is built
-    if (m_needsRebuild || !m_automaton.IsBuilt()) {
-        const_cast<URLPatternMatcher*>(this)->Build();
+    // Check if rebuild needed - must release shared lock before acquiring exclusive
+    {
+        std::shared_lock<std::shared_mutex> readLock(m_mutex);
+        if (m_needsRebuild || !m_automaton.IsBuilt()) {
+            // Release shared lock before Build() to avoid deadlock
+            readLock.unlock();
+            const_cast<URLPatternMatcher*>(this)->Build();
+        }
     }
+    
+    // Now acquire shared lock for the actual search
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
     
     // Search using Aho-Corasick
     auto matches = m_automaton.Search(url);
@@ -393,16 +399,22 @@ bool URLPatternMatcher::Lookup(std::string_view url, IndexValue& outValue) const
  * @return Vector of all matching IndexValues
  */
 std::vector<IndexValue> URLPatternMatcher::Match(std::string_view url) const {
-    std::shared_lock<std::shared_mutex> lock(m_mutex);
-    
     if (url.empty()) {
         return {};
     }
     
-    // Ensure automaton is built
-    if (m_needsRebuild || !m_automaton.IsBuilt()) {
-        const_cast<URLPatternMatcher*>(this)->Build();
+    // Check if rebuild needed - must release shared lock before acquiring exclusive
+    {
+        std::shared_lock<std::shared_mutex> readLock(m_mutex);
+        if (m_needsRebuild || !m_automaton.IsBuilt()) {
+            // Release shared lock before Build() to avoid deadlock
+            readLock.unlock();
+            const_cast<URLPatternMatcher*>(this)->Build();
+        }
     }
+    
+    // Now acquire shared lock for the actual search
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
     
     return m_automaton.Search(url);
 }
@@ -454,9 +466,9 @@ size_t URLPatternMatcher::GetPatternCount() const noexcept {
 
 size_t URLPatternMatcher::GetStateCount() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
-    // Return number of states in automaton
+    // Return actual number of states in the Aho-Corasick automaton
     // Each state represents a unique prefix seen during pattern addition
-    return m_patterns.size();  // Approximate - actual states may be more or less
+    return m_automaton.GetStateCount();
 }
 
 size_t URLPatternMatcher::GetMemoryUsage() const noexcept {

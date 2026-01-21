@@ -626,6 +626,7 @@ namespace {
  * @brief Format IPv4 address to string with CIDR notation
  * 
  * Thread-safe, exception-safe implementation using direct string building.
+ * Uses octets array directly to avoid endianness issues with union member.
  * 
  * @param addr IPv4Address structure containing address and prefix length
  * @return Formatted string like "192.168.1.1" or "192.168.1.0/24"
@@ -635,9 +636,8 @@ std::string FormatIPv4(const IPv4Address& addr) noexcept {
     std::string result;
     result.reserve(18);
     
-    uint32_t ip = addr.address;
-    
     // Format octets using fast integer-to-string without ostringstream
+    // Use octets array directly to avoid endianness issues
     auto appendOctet = [&result](uint32_t val) {
         if (val >= 100) {
             result += static_cast<char>('0' + val / 100);
@@ -652,13 +652,14 @@ std::string FormatIPv4(const IPv4Address& addr) noexcept {
         }
     };
     
-    appendOctet((ip >> 24) & 0xFF);
+    // Read from octets directly instead of bit-shifting from address union member
+    appendOctet(addr.octets[0]);
     result += '.';
-    appendOctet((ip >> 16) & 0xFF);
+    appendOctet(addr.octets[1]);
     result += '.';
-    appendOctet((ip >> 8) & 0xFF);
+    appendOctet(addr.octets[2]);
     result += '.';
-    appendOctet(ip & 0xFF);
+    appendOctet(addr.octets[3]);
     
     // Add CIDR notation if not a /32 (single host)
     if (addr.prefixLength < 32) {

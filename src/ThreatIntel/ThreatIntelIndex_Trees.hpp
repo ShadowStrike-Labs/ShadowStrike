@@ -77,6 +77,13 @@ namespace ShadowStrike {
             LRUCache<uint64_t, IndexValue> m_cache;
             HashAlgorithm m_algorithm;
             uint32_t m_height = 0;
+            
+            /// Node count for split tracking - must be per-instance, not static
+            size_t m_nodeCount = 1;
+            
+            /// Last leaf pointer for linked list maintenance
+            BNode* m_lastLeaf = nullptr;
+            
             mutable std::shared_mutex m_mutex;
         };
 
@@ -126,6 +133,13 @@ namespace ShadowStrike {
             std::unique_ptr<BNode> m_root;
             LRUCache<uint64_t, IndexValue> m_cache;
             uint32_t m_height = 0;
+            
+            /// Node count for split tracking - must be per-instance, not static
+            size_t m_nodeCount = 1;
+            
+            /// Last leaf pointer for linked list maintenance
+            BNode* m_lastLeaf = nullptr;
+            
             mutable std::shared_mutex m_mutex;
         };
 

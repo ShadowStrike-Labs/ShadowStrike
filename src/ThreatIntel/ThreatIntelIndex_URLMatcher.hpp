@@ -46,6 +46,9 @@ namespace ShadowStrike {
 
             [[nodiscard]] size_t GetPatternCount() const noexcept { return m_patternCount; }
             [[nodiscard]] bool IsBuilt() const noexcept { return m_built; }
+            
+            /// @brief Get the number of states in the automaton (for memory statistics)
+            [[nodiscard]] size_t GetStateCount() const noexcept { return m_states.size(); }
 
         private:
             struct State;

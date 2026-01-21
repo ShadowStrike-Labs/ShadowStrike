@@ -237,6 +237,9 @@ struct UnifiedLookupOptions {
     /// @brief Query external APIs on cache miss
     bool queryExternalAPI{false};
     
+    /// @brief Validate input IOC format before lookup (enterprise security feature)
+    bool validateInput{true};
+    
     /// @brief Timeout for this specific query (milliseconds, 0=use default)
     uint32_t timeoutMs{0};
     
@@ -320,6 +323,12 @@ struct ThreatLookupResult {
     
     /// @brief Lookup latency in nanoseconds
     uint64_t latencyNs{0};
+    
+    /// @brief Error code (0 = no error, non-zero = error occurred)
+    uint32_t errorCode{0};
+    
+    /// @brief Error message (empty if no error)
+    std::string errorMessage;
     
     /// @brief IOC type
     IOCType type{IOCType::Reserved};

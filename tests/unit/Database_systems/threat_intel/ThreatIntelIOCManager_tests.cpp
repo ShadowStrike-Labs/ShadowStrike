@@ -116,7 +116,16 @@ struct TempDir {
 			
 		case IOCType::FileHash:
 			if (!value.empty()) {
-				auto parsed = Format::ParseHashString(value, HashAlgorithm::SHA256);
+				// Auto-detect hash algorithm based on length
+				HashAlgorithm algo = HashAlgorithm::SHA256;  // Default
+				switch (value.length()) {
+					case 32:  algo = HashAlgorithm::MD5;    break;
+					case 40:  algo = HashAlgorithm::SHA1;   break;
+					case 64:  algo = HashAlgorithm::SHA256; break;
+					case 128: algo = HashAlgorithm::SHA512; break;
+					default:  algo = HashAlgorithm::SHA256; break;
+				}
+				auto parsed = Format::ParseHashString(value, algo);
 				if (parsed.has_value()) {
 					entry.value.hash = *parsed;
 				}
@@ -1195,14 +1204,16 @@ TEST(ThreatIntelIOCManager_ThreadSafety, ConcurrentQueryIOCs) {
 // ============================================================================
 
 TEST(ThreatIntelIOCManager_Utility, IOCRelationTypeToString) {
-	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::ParentOf), "ParentOf");
-	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::ChildOf), "ChildOf");
-	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::RelatedTo), "RelatedTo");
-	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::SameFamily), "SameFamily");
+	// STIX 2.1 compatible kebab-case format
+	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::ParentOf), "parent-of");
+	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::ChildOf), "child-of");
+	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::RelatedTo), "related-to");
+	EXPECT_STREQ(IOCRelationTypeToString(IOCRelationType::SameFamily), "same-family");
 }
 
 TEST(ThreatIntelIOCManager_Utility, ParseIOCRelationType) {
-	auto type1 = ParseIOCRelationType("ParentOf");
+	// STIX 2.1 compatible kebab-case format
+	auto type1 = ParseIOCRelationType("parent-of");
 	ASSERT_TRUE(type1.has_value());
 	EXPECT_EQ(*type1, IOCRelationType::ParentOf);
 	
@@ -1277,6 +1288,354 @@ TEST(ThreatIntelIOCManager_EdgeCase, EmptyDatabase) {
 	EXPECT_TRUE(results.empty());
 	
 	manager.Shutdown();
+	database.Close();
+}
+
+// ============================================================================
+// ADDITIONAL EDGE CASE TESTS - Enterprise-Grade Coverage
+// ============================================================================
+
+TEST(ThreatIntelIOCManager_EdgeCase, DeleteIOC_NonExistentId) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	// Try to delete non-existent entry
+	IOCOperationResult deleteResult = manager.DeleteIOC(99999, true);
+	EXPECT_FALSE(deleteResult.success);
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, UpdateIOC_NonExistentEntry) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCEntry entry = CreateTestIOC(IOCType::IPv4, "192.168.1.1");
+	entry.entryId = 99999; // Non-existent
+	
+	IOCAddOptions options;
+	IOCOperationResult updateResult = manager.UpdateIOC(entry, options);
+	EXPECT_FALSE(updateResult.success);
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, AddIOC_ZeroId) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCEntry entry = CreateTestIOC(IOCType::IPv4, "192.168.1.1");
+	IOCAddOptions options;
+	options.autoGenerateId = false; // Entry has entryId = 0
+	entry.entryId = 0;
+	
+	// Should still work because validation allows entryId = 0 for new entries
+	IOCOperationResult result = manager.AddIOC(entry, options);
+	// Note: the behavior depends on implementation - might succeed or fail
+	// We just verify no crash occurs
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, GetIOC_ZeroId) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCQueryOptions queryOptions;
+	auto result = manager.GetIOC(0, queryOptions);
+	
+	// Zero ID should return nullopt
+	EXPECT_FALSE(result.has_value());
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, RestoreIOC_NotDeleted) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCEntry entry = CreateTestIOC(IOCType::IPv4, "192.168.1.1");
+	IOCAddOptions options;
+	
+	IOCOperationResult addResult = manager.AddIOC(entry, options);
+	ASSERT_TRUE(addResult.success);
+	
+	// Try to restore an entry that wasn't deleted
+	IOCOperationResult restoreResult = manager.RestoreIOC(addResult.entryId);
+	// Should succeed (entry is already active) or fail gracefully
+	// The important thing is no crash
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, FindIOC_EmptyValue) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCQueryOptions queryOptions;
+	auto result = manager.FindIOC(IOCType::IPv4, "", queryOptions);
+	
+	// Empty value should return nullopt
+	EXPECT_FALSE(result.has_value());
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, ExistsIOC_EmptyValue) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	// Empty value should not exist
+	EXPECT_FALSE(manager.ExistsIOC(IOCType::IPv4, ""));
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, BatchAdd_SingleEntry) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	std::vector<IOCEntry> entries;
+	entries.push_back(CreateTestIOC(IOCType::IPv4, "192.168.1.1"));
+	
+	IOCBatchOptions options;
+	IOCBulkImportResult result = manager.BatchAddIOCs(entries, options);
+	
+	EXPECT_EQ(result.successCount, 1u);
+	EXPECT_EQ(result.failedCount, 0u);
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, BatchDelete_EmptyList) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	std::vector<uint64_t> emptyIds;
+	size_t deletedCount = manager.BatchDeleteIOCs(emptyIds, true);
+	
+	EXPECT_EQ(deletedCount, 0u);
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, StatisticsAfterOperations) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	auto statsBefore = manager.GetStatistics();
+	uint64_t totalAddsBefore = statsBefore.totalAdds.load();
+	
+	// Add an entry
+	IOCEntry entry = CreateTestIOC(IOCType::IPv4, "192.168.1.1");
+	IOCAddOptions options;
+	manager.AddIOC(entry, options);
+	
+	auto statsAfter = manager.GetStatistics();
+	EXPECT_GT(statsAfter.totalAdds.load(), totalAddsBefore);
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, NormalizeValue_UppercaseIP) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	// IP addresses don't need normalization, but verify no crash
+	std::string normalized = manager.NormalizeIOCValue(IOCType::IPv4, "192.168.1.1");
+	EXPECT_FALSE(normalized.empty());
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, ValidateIOC_ReservedType) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCEntry entry{};
+	entry.type = IOCType::Reserved;  // Invalid type
+	
+	std::string errorMsg;
+	bool valid = manager.ValidateIOC(entry, errorMsg);
+	
+	EXPECT_FALSE(valid);
+	EXPECT_FALSE(errorMsg.empty());
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, AddAndRetrieveIPv6) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	IOCEntry entry = CreateTestIOC(IOCType::IPv6, "2001:db8::1");
+	IOCAddOptions options;
+	
+	IOCOperationResult addResult = manager.AddIOC(entry, options);
+	EXPECT_TRUE(addResult.success);
+	
+	if (addResult.success) {
+		IOCQueryOptions queryOptions;
+		auto retrieved = manager.GetIOC(addResult.entryId, queryOptions);
+		EXPECT_TRUE(retrieved.has_value());
+		if (retrieved.has_value()) {
+			EXPECT_EQ(retrieved->type, IOCType::IPv6);
+		}
+	}
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, AddAndRetrieveFileHash) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	// SHA256 hash (64 characters)
+	IOCEntry entry = CreateTestIOC(IOCType::FileHash, 
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+	IOCAddOptions options;
+	
+	IOCOperationResult addResult = manager.AddIOC(entry, options);
+	EXPECT_TRUE(addResult.success);
+	
+	if (addResult.success) {
+		IOCQueryOptions queryOptions;
+		auto retrieved = manager.GetIOC(addResult.entryId, queryOptions);
+		EXPECT_TRUE(retrieved.has_value());
+		if (retrieved.has_value()) {
+			EXPECT_EQ(retrieved->type, IOCType::FileHash);
+		}
+	}
+	
+	manager.Shutdown();
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, DoubleShutdown) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	
+	manager.Shutdown();
+	manager.Shutdown(); // Second shutdown should be safe
+	manager.Shutdown(); // Third shutdown should also be safe
+	
+	// Verify manager is no longer initialized
+	EXPECT_FALSE(manager.IsInitialized());
+	
+	database.Close();
+}
+
+TEST(ThreatIntelIOCManager_EdgeCase, OperationsAfterShutdown) {
+	TempDir tempDir;
+	auto dbPath = tempDir.FilePath("test.db");
+	
+	ThreatIntelDatabase database;
+	ThreatIntelIOCManager manager;
+	
+	ASSERT_TRUE(CreateTestManager(manager, database, dbPath));
+	manager.Shutdown();
+	
+	// All operations should fail gracefully after shutdown
+	IOCEntry entry = CreateTestIOC(IOCType::IPv4, "192.168.1.1");
+	IOCAddOptions options;
+	
+	IOCOperationResult addResult = manager.AddIOC(entry, options);
+	EXPECT_FALSE(addResult.success);
+	
+	IOCQueryOptions queryOptions;
+	auto getResult = manager.GetIOC(1, queryOptions);
+	EXPECT_FALSE(getResult.has_value());
+	
+	EXPECT_FALSE(manager.ExistsIOC(IOCType::IPv4, "192.168.1.1"));
+	
 	database.Close();
 }
 

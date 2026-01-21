@@ -457,6 +457,22 @@ public:
      */
     [[nodiscard]] size_t GetDataOffset() const noexcept;
     
+    /**
+     * @brief Get a MemoryMappedView for this database
+     * 
+     * Returns a properly populated MemoryMappedView structure that can be
+     * passed to ThreatIntelIndex::Initialize() and other subsystems.
+     * 
+     * @return MemoryMappedView populated with database handles and addresses
+     * 
+     * @note The returned view is valid only while the database remains open.
+     *       Do not use the view after calling Close() or destroying the database.
+     * 
+     * @warning The view does not own the underlying resources - they are
+     *          managed by the ThreatIntelDatabase instance.
+     */
+    [[nodiscard]] MemoryMappedView GetMemoryMappedView() const noexcept;
+    
     // =========================================================================
     // Database Modification
     // =========================================================================

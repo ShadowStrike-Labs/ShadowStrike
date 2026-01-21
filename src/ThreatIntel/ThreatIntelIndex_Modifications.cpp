@@ -986,10 +986,127 @@ namespace ThreatIntel {
 
             size_t successCount = 0;
 
-            for (const auto& [entry, offset] : entries) {
-                auto error = Insert(entry, offset);
-                if (error.IsSuccess()) {
+            // Inline insert logic to avoid recursive locking (Insert() also locks m_rwLock)
+            for (const auto& [entry, entryOffset] : entries) {
+                bool success = false;
+
+                switch (entry.type) {
+                case IOCType::IPv4:
+                    if (m_impl->ipv4Index) {
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->ipv4Index->Insert(entry.value.ipv4, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv4);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(entry.value.ipv4.FastHash());
+                            }
+                            ++m_impl->stats.ipv4Entries;
+                        }
+                    }
+                    break;
+
+                case IOCType::IPv6:
+                    if (m_impl->ipv6Index) {
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->ipv6Index->Insert(entry.value.ipv6, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv6);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(entry.value.ipv6.FastHash());
+                            }
+                            ++m_impl->stats.ipv6Entries;
+                        }
+                    }
+                    break;
+
+                case IOCType::FileHash:
+                    if (!m_impl->hashIndexes.empty()) {
+                        size_t algoIndex = static_cast<size_t>(entry.value.hash.algorithm);
+                        if (algoIndex < m_impl->hashIndexes.size() && m_impl->hashIndexes[algoIndex]) {
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->hashIndexes[algoIndex]->Insert(entry.value.hash, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::FileHash);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(entry.value.hash.FastHash());
+                                }
+                                ++m_impl->stats.hashEntries;
+                            }
+                        }
+                    }
+                    break;
+
+                case IOCType::Domain:
+                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        std::string_view domain = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->domainIndex->Insert(domain, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::Domain);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(HashString(domain));
+                            }
+                            ++m_impl->stats.domainEntries;
+                        }
+                    }
+                    break;
+
+                case IOCType::URL:
+                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        std::string_view url = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->urlIndex->Insert(url, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::URL);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(HashString(url));
+                            }
+                            ++m_impl->stats.urlEntries;
+                        }
+                    }
+                    break;
+
+                case IOCType::Email:
+                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        std::string_view email = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->emailIndex->Insert(email, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::Email);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(HashString(email));
+                            }
+                            ++m_impl->stats.emailEntries;
+                        }
+                    }
+                    break;
+
+                default:
+                    if (m_impl->genericIndex) {
+                        uint64_t key = 0;
+                        if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            std::string_view value = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
+                            key = HashString(value);
+                        } else {
+                            std::memcpy(&key, entry.value.raw, sizeof(uint64_t));
+                        }
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->genericIndex->Insert(key, indexValue);
+                        if (success) {
+                            ++m_impl->stats.otherEntries;
+                        }
+                    }
+                    break;
+                }
+
+                if (success) {
                     ++successCount;
+                    ++m_impl->stats.totalEntries;
+                    m_impl->stats.totalInsertions.fetch_add(1, std::memory_order_relaxed);
                 }
             }
 
@@ -1062,15 +1179,145 @@ namespace ThreatIntel {
             m_impl->stats.totalUpdates.store(0, std::memory_order_relaxed);
             m_impl->stats.cowTransactions.store(0, std::memory_order_relaxed);
 
-            // Rebuild from entries
+            // Rebuild from entries - inline insert logic to avoid deadlock
+            // (Insert() would try to acquire the same lock we already hold)
             size_t processed = 0;
+            size_t successCount = 0;
+            
             for (const auto& entry : entries) {
                 // Calculate offset (simplified - in real implementation, 
                 // offset would be calculated from entry array base)
-                uint64_t offset = processed * sizeof(IOCEntry);
+                uint64_t entryOffset = processed * sizeof(IOCEntry);
+                bool success = false;
 
-                // Insert and handle result (suppress nodiscard warning)
-                [[maybe_unused]] auto insertResult = Insert(entry, offset);
+                // Direct insert into appropriate index based on type (no lock acquisition)
+                switch (entry.type) {
+                case IOCType::IPv4:
+                    if (m_impl->ipv4Index) {
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->ipv4Index->Insert(entry.value.ipv4, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv4);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(entry.value.ipv4.FastHash());
+                            }
+                            ++m_impl->stats.ipv4Entries;
+                        }
+                    }
+                    break;
+
+                case IOCType::IPv6:
+                    if (m_impl->ipv6Index) {
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->ipv6Index->Insert(entry.value.ipv6, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv6);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(entry.value.ipv6.FastHash());
+                            }
+                            ++m_impl->stats.ipv6Entries;
+                        }
+                    }
+                    break;
+
+                case IOCType::FileHash:
+                    if (!m_impl->hashIndexes.empty()) {
+                        size_t algoIndex = static_cast<size_t>(entry.value.hash.algorithm);
+                        if (algoIndex < m_impl->hashIndexes.size() &&
+                            m_impl->hashIndexes[algoIndex]) {
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->hashIndexes[algoIndex]->Insert(
+                                entry.value.hash, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::FileHash);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(entry.value.hash.FastHash());
+                                }
+                                ++m_impl->stats.hashEntries;
+                            }
+                        }
+                    }
+                    break;
+
+                case IOCType::Domain:
+                    if (m_impl->domainIndex && m_impl->view && 
+                        entry.value.stringRef.stringOffset > 0) {
+                        std::string_view domain = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset,
+                            entry.value.stringRef.stringLength);
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->domainIndex->Insert(domain, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::Domain);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(HashString(domain));
+                            }
+                            ++m_impl->stats.domainEntries;
+                        }
+                    }
+                    break;
+
+                case IOCType::URL:
+                    if (m_impl->urlIndex && m_impl->view && 
+                        entry.value.stringRef.stringOffset > 0) {
+                        std::string_view url = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset,
+                            entry.value.stringRef.stringLength);
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->urlIndex->Insert(url, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::URL);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(HashString(url));
+                            }
+                            ++m_impl->stats.urlEntries;
+                        }
+                    }
+                    break;
+
+                case IOCType::Email:
+                    if (m_impl->emailIndex && m_impl->view && 
+                        entry.value.stringRef.stringOffset > 0) {
+                        std::string_view email = m_impl->view->GetString(
+                            entry.value.stringRef.stringOffset,
+                            entry.value.stringRef.stringLength);
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->emailIndex->Insert(email, indexValue);
+                        if (success) {
+                            auto bloomIt = m_impl->bloomFilters.find(IOCType::Email);
+                            if (bloomIt != m_impl->bloomFilters.end()) {
+                                bloomIt->second->Add(HashString(email));
+                            }
+                            ++m_impl->stats.emailEntries;
+                        }
+                    }
+                    break;
+
+                default:
+                    // Generic index for other types
+                    if (m_impl->genericIndex) {
+                        uint64_t key = 0;
+                        if (m_impl->view && entry.value.stringRef.stringOffset > 0) {
+                            std::string_view value = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength);
+                            key = HashString(value);
+                        } else {
+                            std::memcpy(&key, entry.value.raw, sizeof(uint64_t));
+                        }
+                        IndexValue indexValue(entry.entryId, entryOffset);
+                        success = m_impl->genericIndex->Insert(key, indexValue);
+                        if (success) {
+                            ++m_impl->stats.otherEntries;
+                        }
+                    }
+                    break;
+                }
+
+                if (success) {
+                    ++m_impl->stats.totalEntries;
+                    ++successCount;
+                }
 
                 ++processed;
 
@@ -1085,6 +1332,7 @@ namespace ThreatIntel {
                 options.progressCallback(entries.size(), entries.size());
             }
 
+            m_impl->stats.totalInsertions.fetch_add(successCount, std::memory_order_relaxed);
             m_impl->stats.indexRebuilds.fetch_add(1, std::memory_order_relaxed);
 
             return StoreError::Success();
@@ -1131,12 +1379,136 @@ namespace ThreatIntel {
                 break;
             }
 
-            // Rebuild from matching entries
+            // Rebuild from matching entries - inline insert to avoid deadlock
             size_t processed = 0;
             for (const auto& entry : entries) {
                 if (entry.type == indexType) {
-                    uint64_t offset = processed * sizeof(IOCEntry);
-                    [[maybe_unused]] auto insertResult = Insert(entry, offset);
+                    uint64_t entryOffset = processed * sizeof(IOCEntry);
+                    bool success = false;
+                    
+                    // Direct insert based on specific type
+                    switch (indexType) {
+                    case IOCType::IPv4:
+                        if (m_impl->ipv4Index) {
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->ipv4Index->Insert(entry.value.ipv4, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv4);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(entry.value.ipv4.FastHash());
+                                }
+                                ++m_impl->stats.ipv4Entries;
+                                ++m_impl->stats.totalEntries;
+                            }
+                        }
+                        break;
+                    case IOCType::IPv6:
+                        if (m_impl->ipv6Index) {
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->ipv6Index->Insert(entry.value.ipv6, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::IPv6);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(entry.value.ipv6.FastHash());
+                                }
+                                ++m_impl->stats.ipv6Entries;
+                                ++m_impl->stats.totalEntries;
+                            }
+                        }
+                        break;
+                    case IOCType::Domain:
+                        if (m_impl->domainIndex && m_impl->view && 
+                            entry.value.stringRef.stringOffset > 0) {
+                            std::string_view domain = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength);
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->domainIndex->Insert(domain, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::Domain);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(HashString(domain));
+                                }
+                                ++m_impl->stats.domainEntries;
+                                ++m_impl->stats.totalEntries;
+                            }
+                        }
+                        break;
+                    case IOCType::URL:
+                        if (m_impl->urlIndex && m_impl->view && 
+                            entry.value.stringRef.stringOffset > 0) {
+                            std::string_view url = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength);
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->urlIndex->Insert(url, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::URL);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(HashString(url));
+                                }
+                                ++m_impl->stats.urlEntries;
+                                ++m_impl->stats.totalEntries;
+                            }
+                        }
+                        break;
+                    case IOCType::FileHash:
+                        if (!m_impl->hashIndexes.empty()) {
+                            size_t algoIndex = static_cast<size_t>(entry.value.hash.algorithm);
+                            if (algoIndex < m_impl->hashIndexes.size() &&
+                                m_impl->hashIndexes[algoIndex]) {
+                                IndexValue indexValue(entry.entryId, entryOffset);
+                                success = m_impl->hashIndexes[algoIndex]->Insert(
+                                    entry.value.hash, indexValue);
+                                if (success) {
+                                    auto bloomIt = m_impl->bloomFilters.find(IOCType::FileHash);
+                                    if (bloomIt != m_impl->bloomFilters.end()) {
+                                        bloomIt->second->Add(entry.value.hash.FastHash());
+                                    }
+                                    ++m_impl->stats.hashEntries;
+                                    ++m_impl->stats.totalEntries;
+                                }
+                            }
+                        }
+                        break;
+                    case IOCType::Email:
+                        if (m_impl->emailIndex && m_impl->view && 
+                            entry.value.stringRef.stringOffset > 0) {
+                            std::string_view email = m_impl->view->GetString(
+                                entry.value.stringRef.stringOffset,
+                                entry.value.stringRef.stringLength);
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->emailIndex->Insert(email, indexValue);
+                            if (success) {
+                                auto bloomIt = m_impl->bloomFilters.find(IOCType::Email);
+                                if (bloomIt != m_impl->bloomFilters.end()) {
+                                    bloomIt->second->Add(HashString(email));
+                                }
+                                ++m_impl->stats.emailEntries;
+                                ++m_impl->stats.totalEntries;
+                            }
+                        }
+                        break;
+                    default:
+                        if (m_impl->genericIndex) {
+                            uint64_t key = 0;
+                            if (m_impl->view && entry.value.stringRef.stringOffset > 0) {
+                                std::string_view value = m_impl->view->GetString(
+                                    entry.value.stringRef.stringOffset,
+                                    entry.value.stringRef.stringLength);
+                                key = HashString(value);
+                            } else {
+                                std::memcpy(&key, entry.value.raw, sizeof(uint64_t));
+                            }
+                            IndexValue indexValue(entry.entryId, entryOffset);
+                            success = m_impl->genericIndex->Insert(key, indexValue);
+                            if (success) {
+                                ++m_impl->stats.otherEntries;
+                                ++m_impl->stats.totalEntries;
+                            }
+                        }
+                        break;
+                    }
                 }
                 ++processed;
             }

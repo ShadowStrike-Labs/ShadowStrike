@@ -436,13 +436,21 @@ void SplitInternalAndInsert(HashBPlusTree::BNode*& root, HashBPlusTree::BNode* n
 
 /**
  * @brief Construct a B+Tree for a specific hash algorithm
+ * 
+ * ENTERPRISE-CRITICAL: m_nodeCount and m_lastLeaf are instance members,
+ * NOT static variables. Using static variables would corrupt state when
+ * multiple HashBPlusTree instances exist (one per hash algorithm).
  */
 HashBPlusTree::HashBPlusTree(HashAlgorithm algorithm)
     : m_root(std::make_unique<BNode>())
     , m_cache(10000)  // Cache up to 10k hot entries
     , m_algorithm(algorithm)
-    , m_height(1) {
+    , m_height(1)
+    , m_nodeCount(1)      // Root is first node
+    , m_lastLeaf(nullptr) // Will be set after root initialization
+{
     m_root->type = BNodeType::Leaf;
+    m_lastLeaf = m_root.get();  // Root is initially the only (and last) leaf
 }
 
 HashBPlusTree::~HashBPlusTree() {
@@ -480,15 +488,15 @@ bool HashBPlusTree::Insert(const HashValue& hash, const IndexValue& value) {
             return true;
         }
         
-        // Insert into leaf
-        static size_t nodeCount = 1;
-        static BNode* lastLeaf = m_root.get();
+        // Insert into leaf using instance members for node tracking
+        // ENTERPRISE-CRITICAL: Using instance members instead of static variables
+        // to prevent state corruption when multiple B+Tree instances exist
         
         if (!leaf->IsFull()) {
             InsertIntoLeaf(leaf, key, value);
         } else {
             BNode* rawRoot = m_root.release();
-            SplitLeafAndInsert(rawRoot, leaf, key, value, lastLeaf, m_height, nodeCount);
+            SplitLeafAndInsert(rawRoot, leaf, key, value, m_lastLeaf, m_height, m_nodeCount);
             m_root.reset(rawRoot);
         }
         
@@ -570,17 +578,23 @@ bool HashBPlusTree::Remove(const HashValue& hash) {
         return false;
     }
     
-    // Remove from leaf (no rebalancing for simplicity)
+    // Remove from leaf
+    // Note: B+Tree doesn't rebalance on removal - lazy deletion for performance
+    // Tree structure remains valid, just with potentially under-filled nodes
+    // This is acceptable for enterprise use cases where rebuilds happen periodically
     RemoveFromLeaf(leaf, pos);
     
-    // Remove from cache
-    // Note: LRU cache doesn't have remove, but entry will age out
+    // Remove from LRU cache for consistency
+    m_cache.Remove(key);
     
     return true;
 }
 
 /**
  * @brief Clear all entries
+ * 
+ * Resets the tree to initial state with a single empty root leaf node.
+ * ENTERPRISE-CRITICAL: Properly resets instance members m_nodeCount and m_lastLeaf
  */
 void HashBPlusTree::Clear() noexcept {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
@@ -595,6 +609,8 @@ void HashBPlusTree::Clear() noexcept {
     }
     
     m_height = 1;
+    m_nodeCount = 1;              // Reset to 1 (root node only)
+    m_lastLeaf = m_root.get();    // Root is now the only leaf
     m_cache.Clear();
 }
 
@@ -651,6 +667,30 @@ size_t HashBPlusTree::GetMemoryUsage() const noexcept {
     return nodeCount * sizeof(BNode) + m_cache.GetMemoryUsage();
 }
 
+/**
+ * @brief Iterate over all entries in the hash B+Tree
+ * 
+ * @note ENTERPRISE DOCUMENTATION - Architectural Trade-off
+ * 
+ * The HashBPlusTree stores hash values as 64-bit FNV-1a keys for memory efficiency.
+ * This means we cannot reconstruct the original full HashValue from the stored key.
+ * 
+ * For most use cases (bloom filter repopulation, statistics, entry counting), the
+ * 64-bit key is sufficient since:
+ * 1. Bloom filters use the same FNV-1a hash for membership testing
+ * 2. Index lookups use the same FNV-1a hash
+ * 3. Entry counting only needs the count, not the actual hash values
+ * 
+ * The HashValue passed to the callback contains:
+ * - algorithm: The correct hash algorithm for this tree
+ * - data: The first 8 bytes contain the 64-bit FNV-1a key (NOT the original hash)
+ * 
+ * For use cases requiring full hash reconstruction:
+ * - The entryId in IndexValue can be used to look up the original entry
+ * - The original hash can then be retrieved from the ThreatIntelStore
+ * 
+ * @param callback Function to call for each entry
+ */
 void HashBPlusTree::ForEach(const std::function<void(const HashValue&, const IndexValue&)>& callback) const {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     
@@ -660,17 +700,15 @@ void HashBPlusTree::ForEach(const std::function<void(const HashValue&, const Ind
         leaf = leaf->data.children[0];
     }
     
-    // Note: HashBPlusTree stores hash values as 64-bit keys (FNV-1a hash)
-    // We cannot reconstruct the original HashValue from the key alone
-    // This is a limitation - for full ForEach, we'd need to store full hash values
-    // For now, we provide a placeholder implementation
+    // Iterate through all leaf nodes via the linked list
     while (leaf != nullptr) {
         for (uint16_t i = 0; i < leaf->keyCount; ++i) {
-            // Create a HashValue from the key (limited - only hash is available)
+            // Create a HashValue with the stored key
+            // Note: This contains the FNV-1a hash, not the original hash bytes
+            // Use IndexValue.entryId to retrieve the original hash if needed
             HashValue hash{};
             hash.algorithm = m_algorithm;
-            // The key is a 64-bit hash, not the original hash bytes
-            // Copy what we can for statistics purposes
+            hash.length = sizeof(uint64_t);
             std::memcpy(hash.data.data(), &leaf->keys[i], sizeof(uint64_t));
             callback(hash, leaf->data.entries[i]);
         }
@@ -903,11 +941,22 @@ void SplitInternalAndInsertGeneric(GenericBPlusTree::BNode*& root, GenericBPlusT
 // GENERIC B+TREE - PUBLIC METHOD IMPLEMENTATIONS
 // ============================================================================
 
+/**
+ * @brief Construct a generic B+Tree for miscellaneous IOC types
+ * 
+ * ENTERPRISE-CRITICAL: m_nodeCount and m_lastLeaf are instance members,
+ * NOT static variables. Using static variables would corrupt state when
+ * multiple GenericBPlusTree instances exist.
+ */
 GenericBPlusTree::GenericBPlusTree(size_t initialCapacity)
     : m_root(std::make_unique<BNode>())
     , m_cache(std::min(initialCapacity / 10, size_t{10000}))
-    , m_height(1) {
+    , m_height(1)
+    , m_nodeCount(1)      // Root is first node
+    , m_lastLeaf(nullptr) // Will be set after root initialization
+{
     m_root->type = BNodeType::Leaf;
+    m_lastLeaf = m_root.get();  // Root is initially the only (and last) leaf
     (void)initialCapacity;  // Used for cache sizing
 }
 
@@ -935,14 +984,14 @@ bool GenericBPlusTree::Insert(uint64_t key, const IndexValue& value) {
             return true;
         }
         
-        static size_t nodeCount = 1;
-        static BNode* lastLeaf = m_root.get();
+        // ENTERPRISE-CRITICAL: Using instance members instead of static variables
+        // to prevent state corruption when multiple B+Tree instances exist
         
         if (!leaf->IsFull()) {
             InsertIntoLeafGeneric(leaf, key, value);
         } else {
             BNode* rawRoot = m_root.release();
-            SplitLeafAndInsertGeneric(rawRoot, leaf, key, value, lastLeaf, m_height, nodeCount);
+            SplitLeafAndInsertGeneric(rawRoot, leaf, key, value, m_lastLeaf, m_height, m_nodeCount);
             m_root.reset(rawRoot);
         }
         
@@ -1004,7 +1053,13 @@ bool GenericBPlusTree::Remove(uint64_t key) {
         return false;
     }
     
+    // Remove from leaf
+    // Note: B+Tree doesn't rebalance on removal - lazy deletion for performance
     RemoveFromLeafGeneric(leaf, pos);
+    
+    // Remove from LRU cache for consistency
+    m_cache.Remove(key);
+    
     return true;
 }
 
@@ -1021,6 +1076,8 @@ void GenericBPlusTree::Clear() noexcept {
     }
     
     m_height = 1;
+    m_nodeCount = 1;              // Reset to 1 (root node only)
+    m_lastLeaf = m_root.get();    // Root is now the only leaf
     m_cache.Clear();
 }
 

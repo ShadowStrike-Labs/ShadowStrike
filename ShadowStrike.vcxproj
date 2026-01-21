@@ -263,7 +263,7 @@
     <ClCompile Include="src\ThreatIntel\ThreatIntelIOCManager.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelLookup.cpp" />
     <ClCompile Include="src\ThreatIntel\ThreatIntelStore.cpp" />
-    <ClCompile Include="src\ThreatIntel\ThreatIntelBloomFilter.cpp" />
+    <ClCompile Include="src\ThreatIntel\threatintelbloomfilter.cpp" />
     <ClCompile Include="src\Utils\NetworkUtilsIpAddress.cpp" />
     <ClCompile Include="src\utils\Base64Utils.cpp" />
     <ClCompile Include="src\utils\CacheManager.cpp" />

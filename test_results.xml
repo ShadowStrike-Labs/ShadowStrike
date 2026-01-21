@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="79" failures="15" disabled="0" errors="0" time="34.521" timestamp="2026-01-21T19:42:40.620" name="AllTests">
+  <testsuite name="ThreatIntelStore_Lifecycle" tests="8" failures="1" disabled="0" skipped="0" errors="0" time="7.002" timestamp="2026-01-21T19:42:40.622">
+    <testcase name="DefaultConstruction_NotInitialized" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="123" status="run" result="completed" time="0." timestamp="2026-01-21T19:42:40.622" classname="ThreatIntelStore_Lifecycle" />
+    <testcase name="Initialize_WithValidConfig_Succeeds" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="129" status="run" result="completed" time="0.115" timestamp="2026-01-21T19:42:40.623" classname="ThreatIntelStore_Lifecycle" />
+    <testcase name="Initialize_Default_Succeeds" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="144" status="run" result="completed" time="0.37" timestamp="2026-01-21T19:42:40.739" classname="ThreatIntelStore_Lifecycle" />
+    <testcase name="DoubleInitialize_Fails" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="155" status="run" result="completed" time="0.112" timestamp="2026-01-21T19:42:41.110" classname="ThreatIntelStore_Lifecycle" />
+    <testcase name="Shutdown_Idempotent" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="168" status="run" result="completed" time="0.365" timestamp="2026-01-21T19:42:41.222" classname="ThreatIntelStore_Lifecycle" />
+    <testcase name="MultipleInitShutdownCycles_NoLeaks" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="179" status="run" result="completed" time="0.607" timestamp="2026-01-21T19:42:41.589" classname="ThreatIntelStore_Lifecycle" />
+    <testcase name="ConcurrentInitialization_OnlyOneSucceeds" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="198" status="run" result="completed" time="0.894" timestamp="2026-01-21T19:42:42.197" classname="ThreatIntelStore_Lifecycle">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:223&#x0A;Expected equality of these values:&#x0A;  successCount.load()&#x0A;    Which is: 8&#x0A;  1&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:223
+Expected equality of these values:
+  successCount.load()
+    Which is: 8
+  1
+]]></failure>
+    </testcase>
+    <testcase name="FactoryFunctions_CreateValidInstances" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="229" status="run" result="completed" time="4.531" timestamp="2026-01-21T19:42:43.092" classname="ThreatIntelStore_Lifecycle" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Lookups" tests="15" failures="0" disabled="0" skipped="0" errors="0" time="5.488" timestamp="2026-01-21T19:42:47.625">
+    <testcase name="LookupHash_SHA256_ValidFormat" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="249" status="run" result="completed" time="0.376" timestamp="2026-01-21T19:42:47.625" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupHash_MD5_ValidFormat" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="263" status="run" result="completed" time="0.372" timestamp="2026-01-21T19:42:48.002" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupHash_InvalidFormat_ReturnsNotFound" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="276" status="run" result="completed" time="0.369" timestamp="2026-01-21T19:42:48.375" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupIPv4_String_ValidAddress" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="286" status="run" result="completed" time="0.376" timestamp="2026-01-21T19:42:48.745" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupIPv4_Uint32_NetworkByteOrder" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="297" status="run" result="completed" time="0.375" timestamp="2026-01-21T19:42:49.123" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupIPv4_InvalidFormat_ReturnsNotFound" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="309" status="run" result="completed" time="0.374" timestamp="2026-01-21T19:42:49.499" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupIPv6_String_ValidAddress" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="319" status="run" result="completed" time="0.372" timestamp="2026-01-21T19:42:49.875" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupIPv6_Uint64_HighLow" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="330" status="run" result="completed" time="0.376" timestamp="2026-01-21T19:42:50.248" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupDomain_ValidDomain" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="341" status="run" result="completed" time="0.37" timestamp="2026-01-21T19:42:50.625" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupURL_ValidURL" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="352" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:42:50.996" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupEmail_ValidEmail" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="363" status="run" result="completed" time="0.605" timestamp="2026-01-21T19:42:51.364" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupJA3_ValidFingerprint" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="374" status="run" result="completed" time="0.376" timestamp="2026-01-21T19:42:51.970" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupCVE_ValidCVEID" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="385" status="run" result="completed" time="0.379" timestamp="2026-01-21T19:42:52.347" classname="ThreatIntelStore_Lookups" />
+    <testcase name="LookupIOC_GenericLookup" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="396" status="run" result="completed" time="0.384" timestamp="2026-01-21T19:42:52.728" classname="ThreatIntelStore_Lookups" />
+    <testcase name="UninitializedStore_ReturnsNotFound" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="407" status="run" result="completed" time="0." timestamp="2026-01-21T19:42:53.113" classname="ThreatIntelStore_Lookups" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Batch" tests="8" failures="0" disabled="0" skipped="0" errors="0" time="2.975" timestamp="2026-01-21T19:42:53.113">
+    <testcase name="BatchLookupHashes_EmptyList" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="424" status="run" result="completed" time="0.367" timestamp="2026-01-21T19:42:53.114" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupHashes_SingleHash" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="438" status="run" result="completed" time="0.377" timestamp="2026-01-21T19:42:53.481" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupHashes_MultipleHashes" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="451" status="run" result="completed" time="0.373" timestamp="2026-01-21T19:42:53.859" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupIPv4_EmptyList" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="470" status="run" result="completed" time="0.36" timestamp="2026-01-21T19:42:54.233" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupIPv4_MultipleAddresses" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="482" status="run" result="completed" time="0.371" timestamp="2026-01-21T19:42:54.594" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupDomains_MultipleDomains" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="501" status="run" result="completed" time="0.377" timestamp="2026-01-21T19:42:54.967" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupIOCs_MixedTypes" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="519" status="run" result="completed" time="0.372" timestamp="2026-01-21T19:42:55.346" classname="ThreatIntelStore_Batch" />
+    <testcase name="BatchLookupIOCs_AllInvalid" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="538" status="run" result="completed" time="0.369" timestamp="2026-01-21T19:42:55.719" classname="ThreatIntelStore_Batch" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_IOCMgmt" tests="10" failures="5" disabled="0" skipped="0" errors="0" time="3.299" timestamp="2026-01-21T19:42:56.090">
+    <testcase name="AddIOC_ValidEntry_Succeeds" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="560" status="run" result="completed" time="0.363" timestamp="2026-01-21T19:42:56.090" classname="ThreatIntelStore_IOCMgmt">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:565&#x0A;Value of: store-&gt;AddIOC(entry)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:565
+Value of: store->AddIOC(entry)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="AddIOC_Simplified_IPv4" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="570" status="run" result="completed" time="0.362" timestamp="2026-01-21T19:42:56.454" classname="ThreatIntelStore_IOCMgmt" />
+    <testcase name="AddIOC_Simplified_Hash" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="584" status="run" result="completed" time="0.364" timestamp="2026-01-21T19:42:56.818" classname="ThreatIntelStore_IOCMgmt" />
+    <testcase name="UpdateIOC_ExistingEntry" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="598" status="run" result="completed" time="0.36" timestamp="2026-01-21T19:42:57.183" classname="ThreatIntelStore_IOCMgmt">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:603&#x0A;Value of: store-&gt;AddIOC(entry)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:603
+Value of: store->AddIOC(entry)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="RemoveIOC_ValidType" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="611" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:42:57.544" classname="ThreatIntelStore_IOCMgmt">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:615&#x0A;Value of: store-&gt;AddIOC(IOCType::Domain, &quot;remove-test.com&quot;, ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:615
+Value of: store->AddIOC(IOCType::Domain, "remove-test.com", ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="BulkAddIOCs_EmptyList" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="621" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:42:57.912" classname="ThreatIntelStore_IOCMgmt" />
+    <testcase name="BulkAddIOCs_MultipleEntries" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="633" status="run" result="completed" time="0.368" timestamp="2026-01-21T19:42:58.279" classname="ThreatIntelStore_IOCMgmt">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:643&#x0A;Expected: (added) &gt; (0u), actual: 0 vs 0&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:643
+Expected: (added) > (0u), actual: 0 vs 0
+]]></failure>
+    </testcase>
+    <testcase name="HasIOC_AfterAdd_ReturnsTrue" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="649" status="run" result="completed" time="0.363" timestamp="2026-01-21T19:42:58.648" classname="ThreatIntelStore_IOCMgmt">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:654&#x0A;Value of: store-&gt;AddIOC(IOCType::Domain, domain, ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:654
+Value of: store->AddIOC(IOCType::Domain, domain, ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="HasIOC_NotAdded_ReturnsFalse" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="661" status="run" result="completed" time="0.375" timestamp="2026-01-21T19:42:59.013" classname="ThreatIntelStore_IOCMgmt" />
+    <testcase name="UninitializedStore_AddFails" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="670" status="run" result="completed" time="0." timestamp="2026-01-21T19:42:59.389" classname="ThreatIntelStore_IOCMgmt" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Feeds" tests="9" failures="5" disabled="0" skipped="0" errors="0" time="4.349" timestamp="2026-01-21T19:42:59.390">
+    <testcase name="AddFeed_ValidConfig" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="684" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:42:59.390" classname="ThreatIntelStore_Feeds">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:693&#x0A;Value of: store-&gt;AddFeed(feedCfg)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:693
+Value of: store->AddFeed(feedCfg)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="RemoveFeed_ExistingFeed" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="698" status="run" result="completed" time="0.372" timestamp="2026-01-21T19:42:59.757" classname="ThreatIntelStore_Feeds">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:705&#x0A;Value of: store-&gt;AddFeed(feedCfg)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:705
+Value of: store->AddFeed(feedCfg)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="EnableDisableFeed_TogglesState" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="712" status="run" result="completed" time="0.365" timestamp="2026-01-21T19:43:00.130" classname="ThreatIntelStore_Feeds">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:720&#x0A;Value of: store-&gt;AddFeed(feedCfg)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:720
+Value of: store->AddFeed(feedCfg)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="UpdateFeed_TriggersFeedUpdate" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="728" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:43:00.496" classname="ThreatIntelStore_Feeds">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:735&#x0A;Value of: store-&gt;AddFeed(feedCfg)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:735
+Value of: store->AddFeed(feedCfg)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="UpdateAllFeeds_ReturnsCount" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="742" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:43:00.864" classname="ThreatIntelStore_Feeds" />
+    <testcase name="GetFeedStatus_ExistingFeed" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="752" status="run" result="completed" time="0.367" timestamp="2026-01-21T19:43:01.231" classname="ThreatIntelStore_Feeds">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:759&#x0A;Value of: store-&gt;AddFeed(feedCfg)&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:759
+Value of: store->AddFeed(feedCfg)
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="GetFeedStatus_NonExistent_ReturnsNullopt" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="767" status="run" result="completed" time="0.375" timestamp="2026-01-21T19:43:01.598" classname="ThreatIntelStore_Feeds" />
+    <testcase name="GetAllFeedStatuses_ReturnsVector" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="777" status="run" result="completed" time="0.379" timestamp="2026-01-21T19:43:01.975" classname="ThreatIntelStore_Feeds" />
+    <testcase name="StartStopFeedUpdates_DoesNotCrash" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="787" status="run" result="completed" time="1.383" timestamp="2026-01-21T19:43:02.355" classname="ThreatIntelStore_Feeds" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Import" tests="5" failures="0" disabled="0" skipped="0" errors="0" time="1.853" timestamp="2026-01-21T19:43:03.739">
+    <testcase name="ImportSTIX_ValidFile" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="803" status="run" result="completed" time="0.372" timestamp="2026-01-21T19:43:03.740" classname="ThreatIntelStore_Import" />
+    <testcase name="ImportCSV_ValidFile" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="824" status="run" result="completed" time="0.365" timestamp="2026-01-21T19:43:04.113" classname="ThreatIntelStore_Import" />
+    <testcase name="ImportJSON_ValidFile" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="845" status="run" result="completed" time="0.369" timestamp="2026-01-21T19:43:04.479" classname="ThreatIntelStore_Import" />
+    <testcase name="ImportPlainText_ValidFile" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="865" status="run" result="completed" time="0.37" timestamp="2026-01-21T19:43:04.849" classname="ThreatIntelStore_Import" />
+    <testcase name="Import_NonExistentFile_Fails" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="886" status="run" result="completed" time="0.371" timestamp="2026-01-21T19:43:05.221" classname="ThreatIntelStore_Import" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Export" tests="1" failures="0" disabled="0" skipped="0" errors="0" time="0.366" timestamp="2026-01-21T19:43:05.593">
+    <testcase name="Export_ValidPath" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="899" status="run" result="completed" time="0.365" timestamp="2026-01-21T19:43:05.593" classname="ThreatIntelStore_Export" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Maintenance" tests="7" failures="0" disabled="0" skipped="0" errors="0" time="2.216" timestamp="2026-01-21T19:43:05.960">
+    <testcase name="Compact_ReducesSize" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="919" status="run" result="completed" time="0.367" timestamp="2026-01-21T19:43:05.960" classname="ThreatIntelStore_Maintenance" />
+    <testcase name="VerifyIntegrity_NewDatabase_Succeeds" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="929" status="run" result="completed" time="0.366" timestamp="2026-01-21T19:43:06.328" classname="ThreatIntelStore_Maintenance" />
+    <testcase name="RebuildIndexes_Succeeds" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="938" status="run" result="completed" time="0.367" timestamp="2026-01-21T19:43:06.695" classname="ThreatIntelStore_Maintenance" />
+    <testcase name="Flush_DoesNotCrash" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="947" status="run" result="completed" time="0.357" timestamp="2026-01-21T19:43:07.063" classname="ThreatIntelStore_Maintenance" />
+    <testcase name="EvictExpiredEntries_ReturnsCount" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="958" status="run" result="completed" time="0.376" timestamp="2026-01-21T19:43:07.421" classname="ThreatIntelStore_Maintenance" />
+    <testcase name="PurgeOldEntries_WithMaxAge" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="968" status="run" result="completed" time="0.377" timestamp="2026-01-21T19:43:07.798" classname="ThreatIntelStore_Maintenance" />
+    <testcase name="UninitializedStore_OperationsFail" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="978" status="run" result="completed" time="0." timestamp="2026-01-21T19:43:08.176" classname="ThreatIntelStore_Maintenance" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Stats" tests="5" failures="2" disabled="0" skipped="0" errors="0" time="1.528" timestamp="2026-01-21T19:43:08.177">
+    <testcase name="GetStatistics_InitialState_AllZero" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="992" status="run" result="completed" time="0.373" timestamp="2026-01-21T19:43:08.177" classname="ThreatIntelStore_Stats" />
+    <testcase name="GetStatistics_AfterLookups_Updated" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1004" status="run" result="completed" time="0.388" timestamp="2026-01-21T19:43:08.552" classname="ThreatIntelStore_Stats">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1013&#x0A;Expected equality of these values:&#x0A;  stats.totalLookups&#x0A;    Which is: 1&#x0A;  3u&#x0A;    Which is: 3&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1013
+Expected equality of these values:
+  stats.totalLookups
+    Which is: 1
+  3u
+    Which is: 3
+]]></failure>
+    </testcase>
+    <testcase name="GetCacheStatistics_ValidData" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1018" status="run" result="completed" time="0.379" timestamp="2026-01-21T19:43:08.941" classname="ThreatIntelStore_Stats" />
+    <testcase name="ResetStatistics_ZeroesCounters" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1028" status="run" result="completed" time="0.383" timestamp="2026-01-21T19:43:09.321" classname="ThreatIntelStore_Stats">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1033&#x0A;Expected: (store-&gt;GetStatistics().totalLookups) &gt; (0u), actual: 0 vs 0&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1033
+Expected: (store->GetStatistics().totalLookups) > (0u), actual: 0 vs 0
+]]></failure>
+    </testcase>
+    <testcase name="UninitializedStore_ReturnsEmptyStats" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1045" status="run" result="completed" time="0." timestamp="2026-01-21T19:43:09.705" classname="ThreatIntelStore_Stats" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Events" tests="3" failures="0" disabled="0" skipped="0" errors="0" time="1.208" timestamp="2026-01-21T19:43:09.706">
+    <testcase name="RegisterEventCallback_ReturnsValidId" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1059" status="run" result="completed" time="0.367" timestamp="2026-01-21T19:43:09.706" classname="ThreatIntelStore_Events" />
+    <testcase name="UnregisterEventCallback_DoesNotCrash" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1072" status="run" result="completed" time="0.363" timestamp="2026-01-21T19:43:10.074" classname="ThreatIntelStore_Events" />
+    <testcase name="MultipleCallbacks_AllReceiveEvents" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1085" status="run" result="completed" time="0.475" timestamp="2026-01-21T19:43:10.439" classname="ThreatIntelStore_Events" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_EdgeCases" tests="4" failures="0" disabled="0" skipped="0" errors="0" time="1.498" timestamp="2026-01-21T19:43:10.915">
+    <testcase name="EmptyStrings_HandleGracefully" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1116" status="run" result="completed" time="0.376" timestamp="2026-01-21T19:43:10.915" classname="ThreatIntelStore_EdgeCases" />
+    <testcase name="VeryLongStrings_NoBufferOverflow" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1129" status="run" result="completed" time="0.37" timestamp="2026-01-21T19:43:11.293" classname="ThreatIntelStore_EdgeCases" />
+    <testcase name="SpecialCharacters_HandleSafely" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1144" status="run" result="completed" time="0.373" timestamp="2026-01-21T19:43:11.664" classname="ThreatIntelStore_EdgeCases" />
+    <testcase name="NullBytes_HandleCorrectly" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1158" status="run" result="completed" time="0.375" timestamp="2026-01-21T19:43:12.038" classname="ThreatIntelStore_EdgeCases" />
+  </testsuite>
+  <testsuite name="ThreatIntelStore_Production" tests="4" failures="2" disabled="0" skipped="0" errors="0" time="2.727" timestamp="2026-01-21T19:43:12.414">
+    <testcase name="HighVolumeLookupsStress_Stable" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1177" status="run" result="completed" time="0.46" timestamp="2026-01-21T19:43:12.414" classname="ThreatIntelStore_Production">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1190&#x0A;Expected equality of these values:&#x0A;  stats.totalLookups&#x0A;    Which is: 1000&#x0A;  kIterations * 3u&#x0A;    Which is: 3000&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1190
+Expected equality of these values:
+  stats.totalLookups
+    Which is: 1000
+  kIterations * 3u
+    Which is: 3000
+]]></failure>
+    </testcase>
+    <testcase name="ConcurrentLookups_ThreadSafe" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1195" status="run" result="completed" time="0.896" timestamp="2026-01-21T19:43:12.876" classname="ThreatIntelStore_Production">
+      <failure message="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1223&#x0A;Expected equality of these values:&#x0A;  stats.totalLookups&#x0A;    Which is: 0&#x0A;  expected&#x0A;    Which is: 8000&#x0A;" type=""><![CDATA[C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp:1223
+Expected equality of these values:
+  stats.totalLookups
+    Which is: 0
+  expected
+    Which is: 8000
+]]></failure>
+    </testcase>
+    <testcase name="ConcurrentIOCManagement_Stable" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1228" status="run" result="completed" time="0.466" timestamp="2026-01-21T19:43:13.773" classname="ThreatIntelStore_Production" />
+    <testcase name="MixedOperationsStress_AllAPIs" file="C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\threat_intel\ThreatIntelStoreTests.cpp" line="1258" status="run" result="completed" time="0.901" timestamp="2026-01-21T19:43:14.240" classname="ThreatIntelStore_Production" />
+  </testsuite>
+</testsuites>

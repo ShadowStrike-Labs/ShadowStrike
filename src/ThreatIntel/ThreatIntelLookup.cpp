@@ -27,7 +27,9 @@
 #include <execution>
 #include <iomanip>
 #include <limits>
+#include <numeric>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -57,6 +59,810 @@
 
 namespace ShadowStrike {
 namespace ThreatIntel {
+
+// ============================================================================
+// ENTERPRISE ERROR CODES & CATEGORIES
+// ============================================================================
+
+/**
+ * @brief Error codes for threat intelligence lookup operations
+ * 
+ * Hierarchical error code system:
+ * - 0x0000: Success
+ * - 0x1xxx: Validation errors
+ * - 0x2xxx: Cache errors
+ * - 0x3xxx: Index errors
+ * - 0x4xxx: Database errors
+ * - 0x5xxx: External API errors
+ * - 0x6xxx: Configuration errors
+ * - 0x7xxx: Resource errors
+ * - 0xFxxx: Internal/fatal errors
+ */
+enum class LookupErrorCode : uint32_t {
+    // Success (0x0000)
+    Success                         = 0x0000,
+    
+    // Validation Errors (0x1xxx)
+    ValidationError                 = 0x1000,
+    InvalidIOCType                  = 0x1001,
+    InvalidIPv4Format               = 0x1002,
+    InvalidIPv6Format               = 0x1003,
+    InvalidDomainFormat             = 0x1004,
+    InvalidURLFormat                = 0x1005,
+    InvalidHashFormat               = 0x1006,
+    InvalidEmailFormat              = 0x1007,
+    EmptyValue                      = 0x1008,
+    ValueTooLong                    = 0x1009,
+    InvalidCIDRNotation             = 0x100A,
+    InvalidHashLength               = 0x100B,
+    InvalidHexCharacter             = 0x100C,
+    ReservedAddressRange            = 0x100D,
+    MalformedInput                  = 0x100E,
+    
+    // Cache Errors (0x2xxx)
+    CacheError                      = 0x2000,
+    CacheNotInitialized             = 0x2001,
+    CacheCorruption                 = 0x2002,
+    CacheEvictionFailed             = 0x2003,
+    CacheInsertionFailed            = 0x2004,
+    CacheCapacityExceeded           = 0x2005,
+    BloomFilterError                = 0x2006,
+    ThreadLocalCacheError           = 0x2007,
+    
+    // Index Errors (0x3xxx)
+    IndexError                      = 0x3000,
+    IndexNotInitialized             = 0x3001,
+    IndexCorruption                 = 0x3002,
+    IndexLookupFailed               = 0x3003,
+    RadixTreeError                  = 0x3004,
+    BTreeError                      = 0x3005,
+    HashIndexError                  = 0x3006,
+    
+    // Database Errors (0x4xxx)
+    DatabaseError                   = 0x4000,
+    DatabaseNotInitialized          = 0x4001,
+    DatabaseConnectionFailed        = 0x4002,
+    DatabaseQueryFailed             = 0x4003,
+    DatabaseTimeout                 = 0x4004,
+    DatabaseCorruption              = 0x4005,
+    EntryNotFound                   = 0x4006,
+    
+    // External API Errors (0x5xxx)
+    ExternalAPIError                = 0x5000,
+    APINotConfigured                = 0x5001,
+    APIConnectionFailed             = 0x5002,
+    APITimeout                      = 0x5003,
+    APIRateLimited                  = 0x5004,
+    APIAuthenticationFailed         = 0x5005,
+    APIResponseParseError           = 0x5006,
+    APICircuitOpen                  = 0x5007,
+    APIProviderUnavailable          = 0x5008,
+    APIQuotaExceeded                = 0x5009,
+    
+    // Configuration Errors (0x6xxx)
+    ConfigurationError              = 0x6000,
+    InvalidConfiguration            = 0x6001,
+    MissingRequiredConfig           = 0x6002,
+    ConfigurationMismatch           = 0x6003,
+    
+    // Resource Errors (0x7xxx)
+    ResourceError                   = 0x7000,
+    OutOfMemory                     = 0x7001,
+    ResourceExhausted               = 0x7002,
+    ThreadCreationFailed            = 0x7003,
+    
+    // Internal Errors (0xFxxx)
+    InternalError                   = 0xF000,
+    NotInitialized                  = 0xF001,
+    InvalidState                    = 0xF002,
+    UnexpectedException             = 0xF003,
+    AssertionFailed                 = 0xF004
+};
+
+/**
+ * @brief Get human-readable description for error code
+ */
+[[nodiscard]] constexpr const char* GetErrorDescription(LookupErrorCode code) noexcept {
+    switch (code) {
+        case LookupErrorCode::Success:                  return "Operation completed successfully";
+        case LookupErrorCode::ValidationError:          return "Input validation failed";
+        case LookupErrorCode::InvalidIOCType:           return "Invalid or unsupported IOC type";
+        case LookupErrorCode::InvalidIPv4Format:        return "Invalid IPv4 address format";
+        case LookupErrorCode::InvalidIPv6Format:        return "Invalid IPv6 address format";
+        case LookupErrorCode::InvalidDomainFormat:      return "Invalid domain name format";
+        case LookupErrorCode::InvalidURLFormat:         return "Invalid URL format";
+        case LookupErrorCode::InvalidHashFormat:        return "Invalid hash format";
+        case LookupErrorCode::InvalidEmailFormat:       return "Invalid email address format";
+        case LookupErrorCode::EmptyValue:               return "Empty value provided";
+        case LookupErrorCode::ValueTooLong:             return "Value exceeds maximum length";
+        case LookupErrorCode::InvalidCIDRNotation:      return "Invalid CIDR prefix notation";
+        case LookupErrorCode::InvalidHashLength:        return "Hash length does not match known algorithms";
+        case LookupErrorCode::InvalidHexCharacter:      return "Invalid hexadecimal character in hash";
+        case LookupErrorCode::ReservedAddressRange:     return "Address is in reserved/private range";
+        case LookupErrorCode::MalformedInput:           return "Malformed input data";
+        case LookupErrorCode::CacheError:               return "Cache operation failed";
+        case LookupErrorCode::CacheNotInitialized:      return "Cache subsystem not initialized";
+        case LookupErrorCode::CacheCorruption:          return "Cache data corruption detected";
+        case LookupErrorCode::CacheEvictionFailed:      return "Failed to evict cache entry";
+        case LookupErrorCode::CacheInsertionFailed:     return "Failed to insert into cache";
+        case LookupErrorCode::CacheCapacityExceeded:    return "Cache capacity exceeded";
+        case LookupErrorCode::BloomFilterError:         return "Bloom filter operation failed";
+        case LookupErrorCode::ThreadLocalCacheError:    return "Thread-local cache error";
+        case LookupErrorCode::IndexError:               return "Index operation failed";
+        case LookupErrorCode::IndexNotInitialized:      return "Index subsystem not initialized";
+        case LookupErrorCode::IndexCorruption:          return "Index data corruption detected";
+        case LookupErrorCode::IndexLookupFailed:        return "Index lookup operation failed";
+        case LookupErrorCode::RadixTreeError:           return "Radix tree operation failed";
+        case LookupErrorCode::BTreeError:               return "B-tree operation failed";
+        case LookupErrorCode::HashIndexError:           return "Hash index operation failed";
+        case LookupErrorCode::DatabaseError:            return "Database operation failed";
+        case LookupErrorCode::DatabaseNotInitialized:   return "Database not initialized";
+        case LookupErrorCode::DatabaseConnectionFailed: return "Database connection failed";
+        case LookupErrorCode::DatabaseQueryFailed:      return "Database query failed";
+        case LookupErrorCode::DatabaseTimeout:          return "Database operation timed out";
+        case LookupErrorCode::DatabaseCorruption:       return "Database corruption detected";
+        case LookupErrorCode::EntryNotFound:            return "Entry not found in database";
+        case LookupErrorCode::ExternalAPIError:         return "External API error";
+        case LookupErrorCode::APINotConfigured:         return "External API not configured";
+        case LookupErrorCode::APIConnectionFailed:      return "Failed to connect to external API";
+        case LookupErrorCode::APITimeout:               return "External API request timed out";
+        case LookupErrorCode::APIRateLimited:           return "External API rate limit exceeded";
+        case LookupErrorCode::APIAuthenticationFailed:  return "External API authentication failed";
+        case LookupErrorCode::APIResponseParseError:    return "Failed to parse external API response";
+        case LookupErrorCode::APICircuitOpen:           return "Circuit breaker is open for API provider";
+        case LookupErrorCode::APIProviderUnavailable:   return "API provider is unavailable";
+        case LookupErrorCode::APIQuotaExceeded:         return "API quota exceeded";
+        case LookupErrorCode::ConfigurationError:       return "Configuration error";
+        case LookupErrorCode::InvalidConfiguration:     return "Invalid configuration value";
+        case LookupErrorCode::MissingRequiredConfig:    return "Required configuration is missing";
+        case LookupErrorCode::ConfigurationMismatch:    return "Configuration mismatch detected";
+        case LookupErrorCode::ResourceError:            return "Resource error";
+        case LookupErrorCode::OutOfMemory:              return "Out of memory";
+        case LookupErrorCode::ResourceExhausted:        return "System resource exhausted";
+        case LookupErrorCode::ThreadCreationFailed:     return "Failed to create thread";
+        case LookupErrorCode::InternalError:            return "Internal error";
+        case LookupErrorCode::NotInitialized:           return "System not initialized";
+        case LookupErrorCode::InvalidState:             return "Invalid internal state";
+        case LookupErrorCode::UnexpectedException:      return "Unexpected exception caught";
+        case LookupErrorCode::AssertionFailed:          return "Internal assertion failed";
+        default:                                        return "Unknown error";
+    }
+}
+
+/**
+ * @brief Check if error code indicates a fatal/unrecoverable error
+ */
+[[nodiscard]] constexpr bool IsFatalError(LookupErrorCode code) noexcept {
+    const uint32_t category = static_cast<uint32_t>(code) & 0xF000;
+    return category == 0xF000;  // Internal errors are fatal
+}
+
+/**
+ * @brief Check if error code indicates a retriable operation
+ */
+[[nodiscard]] constexpr bool IsRetriableError(LookupErrorCode code) noexcept {
+    switch (code) {
+        case LookupErrorCode::APITimeout:
+        case LookupErrorCode::APIRateLimited:
+        case LookupErrorCode::APIConnectionFailed:
+        case LookupErrorCode::DatabaseTimeout:
+        case LookupErrorCode::ResourceExhausted:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// ============================================================================
+// ENTERPRISE INPUT VALIDATION
+// ============================================================================
+
+/**
+ * @brief Validation result with detailed error information
+ */
+struct ValidationResult {
+    bool isValid{false};
+    LookupErrorCode errorCode{LookupErrorCode::Success};
+    std::string errorDetail;
+    
+    [[nodiscard]] static ValidationResult Valid() noexcept {
+        return ValidationResult{true, LookupErrorCode::Success, ""};
+    }
+    
+    [[nodiscard]] static ValidationResult Invalid(
+        LookupErrorCode code, 
+        std::string detail = ""
+    ) noexcept {
+        return ValidationResult{false, code, std::move(detail)};
+    }
+    
+    [[nodiscard]] explicit operator bool() const noexcept { return isValid; }
+};
+
+/**
+ * @brief Enterprise-grade input validator for IOC values
+ * 
+ * Provides comprehensive validation for all IOC types with detailed
+ * error reporting. Uses static methods for zero-allocation validation.
+ * 
+ * Thread-safety: All methods are thread-safe (stateless).
+ */
+class IOCValidator {
+public:
+    // =========================================================================
+    // VALIDATION CONSTANTS
+    // =========================================================================
+    
+    static constexpr size_t MAX_DOMAIN_LENGTH = 253;        // RFC 1035
+    static constexpr size_t MAX_DOMAIN_LABEL_LENGTH = 63;   // RFC 1035
+    static constexpr size_t MAX_URL_LENGTH = 2048;          // Practical limit
+    static constexpr size_t MAX_EMAIL_LENGTH = 254;         // RFC 5321
+    static constexpr size_t MAX_HASH_HEX_LENGTH = 128;      // SHA-512 = 128 hex chars
+    static constexpr size_t MIN_DOMAIN_LENGTH = 1;          // Single char TLD
+    
+    // =========================================================================
+    // IPv4 VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate IPv4 address string
+     * 
+     * Validates format: dotted-decimal with optional CIDR notation.
+     * Does NOT accept leading zeros (they can be octal in some parsers).
+     * 
+     * Valid: "192.168.1.1", "10.0.0.0/8"
+     * Invalid: "192.168.1.256", "1.2.3.4.5", "192.168.01.1"
+     * 
+     * @param ipv4 IPv4 address string to validate
+     * @param allowReserved Whether to allow private/reserved ranges
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult ValidateIPv4(
+        std::string_view ipv4,
+        bool allowReserved = true
+    ) noexcept {
+        if (ipv4.empty()) {
+            return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+        }
+        
+        // Length check: "0.0.0.0" (7) to "255.255.255.255/32" (18)
+        if (ipv4.size() < 7 || ipv4.size() > 18) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidIPv4Format,
+                "Length must be 7-18 characters"
+            );
+        }
+        
+        uint8_t octets[4] = {0};
+        size_t octetIdx = 0;
+        uint32_t value = 0;
+        size_t digitCount = 0;
+        bool parsingPrefix = false;
+        uint32_t prefixValue = 0;
+        size_t prefixDigits = 0;
+        bool hasLeadingZero = false;
+        
+        for (size_t i = 0; i < ipv4.size(); ++i) {
+            const char c = ipv4[i];
+            
+            if (parsingPrefix) {
+                if (c >= '0' && c <= '9') {
+                    prefixValue = prefixValue * 10 + static_cast<uint32_t>(c - '0');
+                    ++prefixDigits;
+                    if (prefixDigits > 2 || prefixValue > 32) {
+                        return ValidationResult::Invalid(
+                            LookupErrorCode::InvalidCIDRNotation,
+                            "CIDR prefix must be 0-32"
+                        );
+                    }
+                } else {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidCIDRNotation,
+                        "Invalid character in CIDR prefix"
+                    );
+                }
+            } else if (c == '.') {
+                if (digitCount == 0) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidIPv4Format,
+                        "Empty octet"
+                    );
+                }
+                if (octetIdx >= 3) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidIPv4Format,
+                        "Too many dots"
+                    );
+                }
+                if (hasLeadingZero && value > 0) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidIPv4Format,
+                        "Leading zeros not allowed (potential octal)"
+                    );
+                }
+                octets[octetIdx++] = static_cast<uint8_t>(value);
+                value = 0;
+                digitCount = 0;
+                hasLeadingZero = false;
+            } else if (c == '/') {
+                if (digitCount == 0 || octetIdx != 3) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidCIDRNotation,
+                        "CIDR notation requires complete IP first"
+                    );
+                }
+                if (hasLeadingZero && value > 0) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidIPv4Format,
+                        "Leading zeros not allowed"
+                    );
+                }
+                octets[octetIdx++] = static_cast<uint8_t>(value);
+                parsingPrefix = true;
+                value = 0;
+                digitCount = 0;
+                hasLeadingZero = false;
+            } else if (c >= '0' && c <= '9') {
+                if (digitCount == 0 && c == '0') {
+                    hasLeadingZero = true;
+                }
+                value = value * 10 + static_cast<uint32_t>(c - '0');
+                ++digitCount;
+                if (value > 255) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidIPv4Format,
+                        "Octet value exceeds 255"
+                    );
+                }
+                if (digitCount > 3) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidIPv4Format,
+                        "Octet has too many digits"
+                    );
+                }
+            } else {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv4Format,
+                    std::string("Invalid character: '") + c + "'"
+                );
+            }
+        }
+        
+        // Handle final octet
+        if (!parsingPrefix) {
+            if (digitCount == 0 || octetIdx != 3) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv4Format,
+                    "Incomplete address"
+                );
+            }
+            if (hasLeadingZero && value > 0) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv4Format,
+                    "Leading zeros not allowed"
+                );
+            }
+            octets[octetIdx++] = static_cast<uint8_t>(value);
+        } else if (prefixDigits == 0) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidCIDRNotation,
+                "Empty CIDR prefix"
+            );
+        }
+        
+        if (octetIdx != 4) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidIPv4Format,
+                "Must have exactly 4 octets"
+            );
+        }
+        
+        // Check for reserved ranges if not allowed
+        if (!allowReserved) {
+            if (octets[0] == 10 ||                           // 10.0.0.0/8
+                (octets[0] == 172 && (octets[1] & 0xF0) == 16) ||  // 172.16.0.0/12
+                (octets[0] == 192 && octets[1] == 168) ||    // 192.168.0.0/16
+                octets[0] == 127 ||                          // 127.0.0.0/8
+                octets[0] == 0 ||                            // 0.0.0.0/8
+                (octets[0] == 169 && octets[1] == 254)) {    // 169.254.0.0/16
+                return ValidationResult::Invalid(
+                    LookupErrorCode::ReservedAddressRange,
+                    "Private/reserved IPv4 range"
+                );
+            }
+        }
+        
+        return ValidationResult::Valid();
+    }
+    
+    // =========================================================================
+    // IPv6 VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate IPv6 address string
+     * 
+     * Supports standard notation, :: compression, and IPv4-mapped addresses.
+     * 
+     * Valid: "2001:db8::1", "::1", "::ffff:192.168.1.1"
+     * Invalid: "2001:db8::1::2", "2001:gg8::1"
+     * 
+     * @param ipv6 IPv6 address string to validate
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult ValidateIPv6(std::string_view ipv6) noexcept {
+        if (ipv6.empty()) {
+            return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+        }
+        
+        // Max length: full notation + optional prefix
+        if (ipv6.size() > 45) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidIPv6Format,
+                "Address too long"
+            );
+        }
+        
+        // Check for :: compression
+        size_t doubleColonPos = ipv6.find("::");
+        bool hasDoubleColon = doubleColonPos != std::string_view::npos;
+        
+        // Only one :: allowed
+        if (hasDoubleColon) {
+            size_t secondDoubleColon = ipv6.find("::", doubleColonPos + 2);
+            if (secondDoubleColon != std::string_view::npos) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv6Format,
+                    "Multiple :: not allowed"
+                );
+            }
+        }
+        
+        // Count colons and validate groups
+        size_t colonCount = 0;
+        size_t groupCount = 0;
+        size_t currentGroupLen = 0;
+        bool inGroup = false;
+        
+        for (size_t i = 0; i < ipv6.size(); ++i) {
+            const char c = ipv6[i];
+            
+            if (c == ':') {
+                if (inGroup) {
+                    if (currentGroupLen > 4) {
+                        return ValidationResult::Invalid(
+                            LookupErrorCode::InvalidIPv6Format,
+                            "Hextet exceeds 4 characters"
+                        );
+                    }
+                    ++groupCount;
+                    currentGroupLen = 0;
+                    inGroup = false;
+                }
+                ++colonCount;
+            } else if (c == '/') {
+                // CIDR prefix
+                break;
+            } else if ((c >= '0' && c <= '9') || 
+                       (c >= 'a' && c <= 'f') || 
+                       (c >= 'A' && c <= 'F')) {
+                inGroup = true;
+                ++currentGroupLen;
+            } else if (c == '.') {
+                // Might be IPv4-mapped address at the end
+                // Just verify it's in the right position
+                continue;
+            } else {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv6Format,
+                    std::string("Invalid character: '") + c + "'"
+                );
+            }
+        }
+        
+        // Count final group
+        if (inGroup) {
+            if (currentGroupLen > 4) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv6Format,
+                    "Final hextet exceeds 4 characters"
+                );
+            }
+            ++groupCount;
+        }
+        
+        // Validate group count
+        if (hasDoubleColon) {
+            if (groupCount > 8) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv6Format,
+                    "Too many hextets with :: compression"
+                );
+            }
+        } else {
+            if (groupCount != 8) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidIPv6Format,
+                    "Must have exactly 8 hextets without :: compression"
+                );
+            }
+        }
+        
+        return ValidationResult::Valid();
+    }
+    
+    // =========================================================================
+    // DOMAIN VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate domain name according to RFC 1035
+     * 
+     * @param domain Domain name to validate
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult ValidateDomain(std::string_view domain) noexcept {
+        if (domain.empty()) {
+            return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+        }
+        
+        if (domain.size() > MAX_DOMAIN_LENGTH) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidDomainFormat,
+                "Domain exceeds 253 character limit"
+            );
+        }
+        
+        // Split by dots and validate each label
+        size_t labelStart = 0;
+        size_t labelLen = 0;
+        
+        for (size_t i = 0; i <= domain.size(); ++i) {
+            if (i == domain.size() || domain[i] == '.') {
+                if (labelLen == 0) {
+                    // Empty label (leading/trailing dot or consecutive dots)
+                    if (i == 0 || i == domain.size() || domain[i-1] == '.') {
+                        return ValidationResult::Invalid(
+                            LookupErrorCode::InvalidDomainFormat,
+                            "Empty label in domain"
+                        );
+                    }
+                }
+                
+                if (labelLen > MAX_DOMAIN_LABEL_LENGTH) {
+                    return ValidationResult::Invalid(
+                        LookupErrorCode::InvalidDomainFormat,
+                        "Label exceeds 63 character limit"
+                    );
+                }
+                
+                // Validate label characters
+                for (size_t j = labelStart; j < labelStart + labelLen; ++j) {
+                    const char c = domain[j];
+                    if (!((c >= 'a' && c <= 'z') ||
+                          (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') ||
+                          c == '-')) {
+                        return ValidationResult::Invalid(
+                            LookupErrorCode::InvalidDomainFormat,
+                            std::string("Invalid character in label: '") + c + "'"
+                        );
+                    }
+                }
+                
+                // Label cannot start or end with hyphen
+                if (labelLen > 0) {
+                    if (domain[labelStart] == '-' || domain[labelStart + labelLen - 1] == '-') {
+                        return ValidationResult::Invalid(
+                            LookupErrorCode::InvalidDomainFormat,
+                            "Label cannot start or end with hyphen"
+                        );
+                    }
+                }
+                
+                labelStart = i + 1;
+                labelLen = 0;
+            } else {
+                ++labelLen;
+            }
+        }
+        
+        return ValidationResult::Valid();
+    }
+    
+    // =========================================================================
+    // HASH VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate hash string (hex-encoded)
+     * 
+     * Validates length matches known algorithms and all characters are valid hex.
+     * 
+     * Supported: MD5 (32), SHA1 (40), SHA256 (64), SHA512 (128)
+     * 
+     * @param hash Hash string to validate
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult ValidateHash(std::string_view hash) noexcept {
+        if (hash.empty()) {
+            return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+        }
+        
+        const size_t len = hash.size();
+        
+        // Check for known hash lengths
+        if (len != 32 && len != 40 && len != 64 && len != 128) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidHashLength,
+                "Hash length must be 32 (MD5), 40 (SHA1), 64 (SHA256), or 128 (SHA512)"
+            );
+        }
+        
+        // Validate all characters are valid hex
+        for (size_t i = 0; i < len; ++i) {
+            const char c = hash[i];
+            if (!((c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) {
+                return ValidationResult::Invalid(
+                    LookupErrorCode::InvalidHexCharacter,
+                    std::string("Invalid hex character at position ") + std::to_string(i)
+                );
+            }
+        }
+        
+        return ValidationResult::Valid();
+    }
+    
+    // =========================================================================
+    // URL VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate URL format
+     * 
+     * Basic URL validation checking scheme, host presence, and length.
+     * 
+     * @param url URL to validate
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult ValidateURL(std::string_view url) noexcept {
+        if (url.empty()) {
+            return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+        }
+        
+        if (url.size() > MAX_URL_LENGTH) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidURLFormat,
+                "URL exceeds maximum length"
+            );
+        }
+        
+        // Check for scheme
+        size_t schemeEnd = url.find("://");
+        if (schemeEnd == std::string_view::npos) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidURLFormat,
+                "Missing URL scheme (http:// or https://)"
+            );
+        }
+        
+        // Validate scheme
+        std::string_view scheme = url.substr(0, schemeEnd);
+        if (scheme != "http" && scheme != "https" && scheme != "ftp" && scheme != "ftps") {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidURLFormat,
+                "Unsupported URL scheme"
+            );
+        }
+        
+        // Check for host
+        size_t hostStart = schemeEnd + 3;
+        if (hostStart >= url.size()) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidURLFormat,
+                "Missing host in URL"
+            );
+        }
+        
+        return ValidationResult::Valid();
+    }
+    
+    // =========================================================================
+    // EMAIL VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate email address format
+     * 
+     * Basic RFC 5321 validation for email addresses.
+     * 
+     * @param email Email address to validate
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult ValidateEmail(std::string_view email) noexcept {
+        if (email.empty()) {
+            return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+        }
+        
+        if (email.size() > MAX_EMAIL_LENGTH) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidEmailFormat,
+                "Email exceeds 254 character limit"
+            );
+        }
+        
+        // Find @ symbol
+        size_t atPos = email.find('@');
+        if (atPos == std::string_view::npos) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidEmailFormat,
+                "Missing @ symbol"
+            );
+        }
+        
+        // Validate local part (before @)
+        std::string_view localPart = email.substr(0, atPos);
+        if (localPart.empty() || localPart.size() > 64) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidEmailFormat,
+                "Invalid local part length"
+            );
+        }
+        
+        // Validate domain part (after @)
+        std::string_view domainPart = email.substr(atPos + 1);
+        if (domainPart.empty()) {
+            return ValidationResult::Invalid(
+                LookupErrorCode::InvalidEmailFormat,
+                "Missing domain part"
+            );
+        }
+        
+        // Delegate domain validation
+        return ValidateDomain(domainPart);
+    }
+    
+    // =========================================================================
+    // GENERIC VALIDATION
+    // =========================================================================
+    
+    /**
+     * @brief Validate IOC value based on type
+     * 
+     * Routes to type-specific validator.
+     * 
+     * @param type IOC type
+     * @param value IOC value
+     * @return Validation result with error details if invalid
+     */
+    [[nodiscard]] static ValidationResult Validate(
+        IOCType type,
+        std::string_view value
+    ) noexcept {
+        switch (type) {
+            case IOCType::IPv4:
+                return ValidateIPv4(value);
+            case IOCType::IPv6:
+                return ValidateIPv6(value);
+            case IOCType::Domain:
+                return ValidateDomain(value);
+            case IOCType::URL:
+                return ValidateURL(value);
+            case IOCType::FileHash:
+                return ValidateHash(value);
+            case IOCType::Email:
+                return ValidateEmail(value);
+            default:
+                // Generic validation - just check non-empty
+                if (value.empty()) {
+                    return ValidationResult::Invalid(LookupErrorCode::EmptyValue);
+                }
+                return ValidationResult::Valid();
+        }
+    }
+};
 
 // ThreatIntelLookup.hpp exposes UnifiedLookupOptions as the public options type.
 // The implementation historically used the name LookupOptions; keep that name
@@ -334,21 +1140,646 @@ private:
 // ============================================================================
 
 /**
+ * @brief Circuit Breaker for external API resilience
+ * 
+ * Implements the circuit breaker pattern to prevent cascading failures
+ * when external APIs are unavailable or experiencing issues.
+ * 
+ * States:
+ * - CLOSED: Normal operation, requests pass through
+ * - OPEN: Failure threshold exceeded, requests fail fast
+ * - HALF_OPEN: Testing if service recovered
+ * 
+ * Thread-safety: All operations are atomic and thread-safe.
+ */
+class CircuitBreaker {
+public:
+    enum class State : uint8_t {
+        Closed,     // Normal operation
+        Open,       // Failing fast
+        HalfOpen    // Testing recovery
+    };
+    
+    /**
+     * @brief Circuit breaker configuration
+     */
+    struct Config {
+        uint32_t failureThreshold{5};       // Failures before opening
+        uint32_t successThreshold{3};       // Successes to close from half-open
+        uint32_t resetTimeoutMs{30000};     // Time before half-open (30 seconds)
+        uint32_t halfOpenMaxCalls{3};       // Max calls in half-open state
+    };
+    
+    explicit CircuitBreaker(Config config = Config{}) noexcept
+        : m_config(config)
+        , m_state(State::Closed)
+        , m_failureCount(0)
+        , m_successCount(0)
+        , m_lastFailureTime(0)
+        , m_halfOpenCalls(0)
+    {}
+    
+    /**
+     * @brief Check if request should be allowed
+     * 
+     * @return true if request can proceed, false if circuit is open
+     */
+    [[nodiscard]] bool AllowRequest() noexcept {
+        const State currentState = m_state.load(std::memory_order_acquire);
+        
+        switch (currentState) {
+            case State::Closed:
+                return true;
+                
+            case State::Open: {
+                // Check if reset timeout has elapsed
+                const auto now = std::chrono::steady_clock::now();
+                const auto lastFailure = std::chrono::steady_clock::time_point(
+                    std::chrono::milliseconds(m_lastFailureTime.load(std::memory_order_relaxed))
+                );
+                
+                if (now - lastFailure >= std::chrono::milliseconds(m_config.resetTimeoutMs)) {
+                    // Transition to half-open
+                    State expected = State::Open;
+                    if (m_state.compare_exchange_strong(expected, State::HalfOpen,
+                                                        std::memory_order_acq_rel)) {
+                        m_halfOpenCalls.store(0, std::memory_order_relaxed);
+                        m_successCount.store(0, std::memory_order_relaxed);
+                    }
+                    return true;
+                }
+                return false;  // Still in open state
+            }
+            
+            case State::HalfOpen: {
+                // Limit concurrent calls in half-open state
+                const uint32_t calls = m_halfOpenCalls.fetch_add(1, std::memory_order_relaxed);
+                if (calls >= m_config.halfOpenMaxCalls) {
+                    m_halfOpenCalls.fetch_sub(1, std::memory_order_relaxed);
+                    return false;
+                }
+                return true;
+            }
+            
+            default:
+                return false;
+        }
+    }
+    
+    /**
+     * @brief Record successful request
+     */
+    void RecordSuccess() noexcept {
+        const State currentState = m_state.load(std::memory_order_acquire);
+        
+        if (currentState == State::HalfOpen) {
+            const uint32_t successes = m_successCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (successes >= m_config.successThreshold) {
+                // Transition to closed
+                State expected = State::HalfOpen;
+                if (m_state.compare_exchange_strong(expected, State::Closed,
+                                                    std::memory_order_acq_rel)) {
+                    m_failureCount.store(0, std::memory_order_relaxed);
+                }
+            }
+        } else if (currentState == State::Closed) {
+            // Reset failure count on success in closed state
+            m_failureCount.store(0, std::memory_order_relaxed);
+        }
+    }
+    
+    /**
+     * @brief Record failed request
+     */
+    void RecordFailure() noexcept {
+        const State currentState = m_state.load(std::memory_order_acquire);
+        
+        // Update last failure time
+        const auto now = std::chrono::steady_clock::now();
+        m_lastFailureTime.store(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()
+                ).count()
+            ),
+            std::memory_order_relaxed
+        );
+        
+        if (currentState == State::Closed) {
+            const uint32_t failures = m_failureCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (failures >= m_config.failureThreshold) {
+                // Transition to open
+                State expected = State::Closed;
+                m_state.compare_exchange_strong(expected, State::Open,
+                                                std::memory_order_acq_rel);
+            }
+        } else if (currentState == State::HalfOpen) {
+            // Single failure in half-open returns to open
+            State expected = State::HalfOpen;
+            if (m_state.compare_exchange_strong(expected, State::Open,
+                                                std::memory_order_acq_rel)) {
+                m_failureCount.store(m_config.failureThreshold, std::memory_order_relaxed);
+            }
+        }
+    }
+    
+    /**
+     * @brief Get current circuit state
+     */
+    [[nodiscard]] State GetState() const noexcept {
+        return m_state.load(std::memory_order_acquire);
+    }
+    
+    /**
+     * @brief Force circuit to closed state (for testing/recovery)
+     */
+    void Reset() noexcept {
+        m_state.store(State::Closed, std::memory_order_release);
+        m_failureCount.store(0, std::memory_order_relaxed);
+        m_successCount.store(0, std::memory_order_relaxed);
+        m_halfOpenCalls.store(0, std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get circuit breaker statistics
+     */
+    struct Statistics {
+        State state{State::Closed};
+        uint32_t failureCount{0};
+        uint32_t successCount{0};
+        uint64_t lastFailureTimeMs{0};
+    };
+    
+    [[nodiscard]] Statistics GetStatistics() const noexcept {
+        return Statistics{
+            m_state.load(std::memory_order_relaxed),
+            m_failureCount.load(std::memory_order_relaxed),
+            m_successCount.load(std::memory_order_relaxed),
+            m_lastFailureTime.load(std::memory_order_relaxed)
+        };
+    }
+
+private:
+    Config m_config;
+    std::atomic<State> m_state;
+    std::atomic<uint32_t> m_failureCount;
+    std::atomic<uint32_t> m_successCount;
+    std::atomic<uint64_t> m_lastFailureTime;
+    std::atomic<uint32_t> m_halfOpenCalls;
+};
+
+/**
+ * @brief Token bucket rate limiter for API call management
+ * 
+ * Implements token bucket algorithm for smooth rate limiting.
+ * Allows burst capacity while maintaining average rate limit.
+ * 
+ * Thread-safety: All operations are atomic and thread-safe.
+ */
+class RateLimiter {
+public:
+    /**
+     * @brief Rate limiter configuration
+     */
+    struct Config {
+        uint32_t tokensPerSecond{10};       // Refill rate
+        uint32_t bucketCapacity{30};        // Maximum burst capacity
+        uint32_t initialTokens{30};         // Starting tokens
+    };
+    
+    explicit RateLimiter(Config config = Config{}) noexcept
+        : m_config(config)
+        , m_tokens(config.initialTokens)
+        , m_lastRefillTime(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count()
+        )
+    {}
+    
+    /**
+     * @brief Try to acquire a token for making a request
+     * 
+     * @return true if token acquired, false if rate limited
+     */
+    [[nodiscard]] bool TryAcquire() noexcept {
+        RefillTokens();
+        
+        // Try to acquire a token
+        uint32_t currentTokens = m_tokens.load(std::memory_order_relaxed);
+        
+        while (currentTokens > 0) {
+            if (m_tokens.compare_exchange_weak(currentTokens, currentTokens - 1,
+                                               std::memory_order_acq_rel)) {
+                return true;
+            }
+            // currentTokens is updated by compare_exchange_weak on failure
+        }
+        
+        return false;  // No tokens available
+    }
+    
+    /**
+     * @brief Try to acquire multiple tokens
+     * 
+     * @param count Number of tokens to acquire
+     * @return true if all tokens acquired, false otherwise
+     */
+    [[nodiscard]] bool TryAcquire(uint32_t count) noexcept {
+        if (count == 0) return true;
+        
+        RefillTokens();
+        
+        uint32_t currentTokens = m_tokens.load(std::memory_order_relaxed);
+        
+        while (currentTokens >= count) {
+            if (m_tokens.compare_exchange_weak(currentTokens, currentTokens - count,
+                                               std::memory_order_acq_rel)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * @brief Get available token count
+     */
+    [[nodiscard]] uint32_t GetAvailableTokens() noexcept {
+        RefillTokens();
+        return m_tokens.load(std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get estimated wait time for a token
+     * 
+     * @return Wait time in milliseconds, 0 if token available now
+     */
+    [[nodiscard]] uint32_t GetWaitTimeMs() noexcept {
+        RefillTokens();
+        
+        const uint32_t tokens = m_tokens.load(std::memory_order_relaxed);
+        if (tokens > 0) {
+            return 0;
+        }
+        
+        // Calculate time until next token
+        return 1000 / m_config.tokensPerSecond;
+    }
+    
+    /**
+     * @brief Reset rate limiter to initial state
+     */
+    void Reset() noexcept {
+        m_tokens.store(m_config.initialTokens, std::memory_order_relaxed);
+        m_lastRefillTime.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count(),
+            std::memory_order_relaxed
+        );
+    }
+    
+    /**
+     * @brief Get rate limiter statistics
+     */
+    struct Statistics {
+        uint32_t availableTokens{0};
+        uint32_t capacity{0};
+        uint32_t tokensPerSecond{0};
+    };
+    
+    [[nodiscard]] Statistics GetStatistics() noexcept {
+        RefillTokens();
+        return Statistics{
+            m_tokens.load(std::memory_order_relaxed),
+            m_config.bucketCapacity,
+            m_config.tokensPerSecond
+        };
+    }
+
+private:
+    void RefillTokens() noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t nowMicros = std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch()
+        ).count();
+        
+        const uint64_t lastRefill = m_lastRefillTime.load(std::memory_order_relaxed);
+        const uint64_t elapsedMicros = nowMicros - lastRefill;
+        
+        // Calculate tokens to add based on elapsed time
+        // Using microseconds for precision
+        const uint64_t tokensToAdd = (elapsedMicros * m_config.tokensPerSecond) / 1000000;
+        
+        if (tokensToAdd > 0) {
+            // Try to update last refill time atomically
+            if (m_lastRefillTime.compare_exchange_strong(
+                    const_cast<uint64_t&>(lastRefill), nowMicros,
+                    std::memory_order_acq_rel)) {
+                
+                // Add tokens up to capacity
+                uint32_t currentTokens = m_tokens.load(std::memory_order_relaxed);
+                uint32_t newTokens;
+                
+                do {
+                    newTokens = static_cast<uint32_t>(std::min(
+                        static_cast<uint64_t>(currentTokens) + tokensToAdd,
+                        static_cast<uint64_t>(m_config.bucketCapacity)
+                    ));
+                } while (!m_tokens.compare_exchange_weak(currentTokens, newTokens,
+                                                         std::memory_order_relaxed));
+            }
+        }
+    }
+    
+    Config m_config;
+    std::atomic<uint32_t> m_tokens;
+    std::atomic<uint64_t> m_lastRefillTime;
+};
+
+/**
+ * @brief Latency histogram for performance tracking
+ * 
+ * Fixed-bucket histogram for tracking latency distributions.
+ * Supports percentile calculations (p50, p95, p99).
+ * 
+ * Bucket ranges (in nanoseconds):
+ * [0]: 0-100ns, [1]: 100-500ns, [2]: 500ns-1μs, [3]: 1-10μs,
+ * [4]: 10-100μs, [5]: 100μs-1ms, [6]: 1-10ms, [7]: 10-100ms,
+ * [8]: 100ms-1s, [9]: >1s
+ * 
+ * Thread-safety: All operations are atomic and thread-safe.
+ */
+class LatencyHistogram {
+public:
+    static constexpr size_t BUCKET_COUNT = 10;
+    
+    LatencyHistogram() noexcept {
+        for (auto& bucket : m_buckets) {
+            bucket.store(0, std::memory_order_relaxed);
+        }
+        m_totalCount.store(0, std::memory_order_relaxed);
+        m_totalLatencyNs.store(0, std::memory_order_relaxed);
+        m_minLatencyNs.store(UINT64_MAX, std::memory_order_relaxed);
+        m_maxLatencyNs.store(0, std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Record a latency measurement
+     * 
+     * @param latencyNs Latency in nanoseconds
+     */
+    void Record(uint64_t latencyNs) noexcept {
+        const size_t bucket = GetBucket(latencyNs);
+        m_buckets[bucket].fetch_add(1, std::memory_order_relaxed);
+        m_totalCount.fetch_add(1, std::memory_order_relaxed);
+        m_totalLatencyNs.fetch_add(latencyNs, std::memory_order_relaxed);
+        
+        // Update min
+        uint64_t currentMin = m_minLatencyNs.load(std::memory_order_relaxed);
+        while (latencyNs < currentMin) {
+            if (m_minLatencyNs.compare_exchange_weak(currentMin, latencyNs,
+                                                     std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        
+        // Update max
+        uint64_t currentMax = m_maxLatencyNs.load(std::memory_order_relaxed);
+        while (latencyNs > currentMax) {
+            if (m_maxLatencyNs.compare_exchange_weak(currentMax, latencyNs,
+                                                     std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+    
+    /**
+     * @brief Get approximate percentile latency
+     * 
+     * @param percentile Percentile (0.0-1.0), e.g., 0.99 for p99
+     * @return Approximate latency in nanoseconds
+     */
+    [[nodiscard]] uint64_t GetPercentile(double percentile) const noexcept {
+        const uint64_t total = m_totalCount.load(std::memory_order_relaxed);
+        if (total == 0) return 0;
+        
+        const uint64_t target = static_cast<uint64_t>(total * percentile);
+        uint64_t cumulative = 0;
+        
+        for (size_t i = 0; i < BUCKET_COUNT; ++i) {
+            cumulative += m_buckets[i].load(std::memory_order_relaxed);
+            if (cumulative >= target) {
+                return GetBucketUpperBound(i);
+            }
+        }
+        
+        return m_maxLatencyNs.load(std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get average latency
+     */
+    [[nodiscard]] uint64_t GetAverage() const noexcept {
+        const uint64_t count = m_totalCount.load(std::memory_order_relaxed);
+        if (count == 0) return 0;
+        return m_totalLatencyNs.load(std::memory_order_relaxed) / count;
+    }
+    
+    /**
+     * @brief Get minimum latency
+     */
+    [[nodiscard]] uint64_t GetMin() const noexcept {
+        const uint64_t min = m_minLatencyNs.load(std::memory_order_relaxed);
+        return min == UINT64_MAX ? 0 : min;
+    }
+    
+    /**
+     * @brief Get maximum latency
+     */
+    [[nodiscard]] uint64_t GetMax() const noexcept {
+        return m_maxLatencyNs.load(std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get total count
+     */
+    [[nodiscard]] uint64_t GetCount() const noexcept {
+        return m_totalCount.load(std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Reset histogram
+     */
+    void Reset() noexcept {
+        for (auto& bucket : m_buckets) {
+            bucket.store(0, std::memory_order_relaxed);
+        }
+        m_totalCount.store(0, std::memory_order_relaxed);
+        m_totalLatencyNs.store(0, std::memory_order_relaxed);
+        m_minLatencyNs.store(UINT64_MAX, std::memory_order_relaxed);
+        m_maxLatencyNs.store(0, std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get comprehensive statistics
+     */
+    struct Statistics {
+        uint64_t count{0};
+        uint64_t minNs{0};
+        uint64_t maxNs{0};
+        uint64_t avgNs{0};
+        uint64_t p50Ns{0};
+        uint64_t p95Ns{0};
+        uint64_t p99Ns{0};
+        std::array<uint64_t, BUCKET_COUNT> buckets{};
+    };
+    
+    [[nodiscard]] Statistics GetStatistics() const noexcept {
+        Statistics stats;
+        stats.count = m_totalCount.load(std::memory_order_relaxed);
+        stats.minNs = GetMin();
+        stats.maxNs = GetMax();
+        stats.avgNs = GetAverage();
+        stats.p50Ns = GetPercentile(0.50);
+        stats.p95Ns = GetPercentile(0.95);
+        stats.p99Ns = GetPercentile(0.99);
+        
+        for (size_t i = 0; i < BUCKET_COUNT; ++i) {
+            stats.buckets[i] = m_buckets[i].load(std::memory_order_relaxed);
+        }
+        
+        return stats;
+    }
+
+private:
+    [[nodiscard]] static size_t GetBucket(uint64_t latencyNs) noexcept {
+        if (latencyNs < 100) return 0;              // 0-100ns
+        if (latencyNs < 500) return 1;              // 100-500ns
+        if (latencyNs < 1000) return 2;             // 500ns-1μs
+        if (latencyNs < 10000) return 3;            // 1-10μs
+        if (latencyNs < 100000) return 4;           // 10-100μs
+        if (latencyNs < 1000000) return 5;          // 100μs-1ms
+        if (latencyNs < 10000000) return 6;         // 1-10ms
+        if (latencyNs < 100000000) return 7;        // 10-100ms
+        if (latencyNs < 1000000000) return 8;       // 100ms-1s
+        return 9;                                   // >1s
+    }
+    
+    [[nodiscard]] static constexpr uint64_t GetBucketUpperBound(size_t bucket) noexcept {
+        constexpr std::array<uint64_t, BUCKET_COUNT> bounds = {
+            100,        // 0-100ns
+            500,        // 100-500ns
+            1000,       // 500ns-1μs
+            10000,      // 1-10μs
+            100000,     // 10-100μs
+            1000000,    // 100μs-1ms
+            10000000,   // 1-10ms
+            100000000,  // 10-100ms
+            1000000000, // 100ms-1s
+            UINT64_MAX  // >1s
+        };
+        return bounds[bucket];
+    }
+    
+    std::array<std::atomic<uint64_t>, BUCKET_COUNT> m_buckets;
+    std::atomic<uint64_t> m_totalCount;
+    std::atomic<uint64_t> m_totalLatencyNs;
+    std::atomic<uint64_t> m_minLatencyNs;
+    std::atomic<uint64_t> m_maxLatencyNs;
+};
+
+/**
  * @brief Optimizes lookup queries based on runtime statistics
  * 
- * Determines optimal lookup tier strategy based on IOC type.
- * Thread-safe: all methods are const and use no shared state.
+ * Implements adaptive tier selection based on historical performance data.
+ * Tracks hit rates and latencies per tier to optimize lookup strategy.
+ * 
+ * Thread-safety: All public methods are thread-safe.
  */
 class QueryOptimizer {
 public:
-    constexpr QueryOptimizer() noexcept = default;
+    /**
+     * @brief Per-tier statistics for adaptive optimization
+     */
+    struct TierStats {
+        std::atomic<uint64_t> lookups{0};
+        std::atomic<uint64_t> hits{0};
+        std::atomic<uint64_t> totalLatencyNs{0};
+        
+        [[nodiscard]] double GetHitRate() const noexcept {
+            const uint64_t total = lookups.load(std::memory_order_relaxed);
+            if (total == 0) return 0.0;
+            return static_cast<double>(hits.load(std::memory_order_relaxed)) / total;
+        }
+        
+        [[nodiscard]] uint64_t GetAvgLatencyNs() const noexcept {
+            const uint64_t total = lookups.load(std::memory_order_relaxed);
+            if (total == 0) return 0;
+            return totalLatencyNs.load(std::memory_order_relaxed) / total;
+        }
+    };
+    
+    static constexpr size_t TIER_COUNT = 5;  // TL Cache, Shared Cache, Index, DB, External
+    
+    QueryOptimizer() noexcept = default;
     
     /**
      * @brief Determine optimal lookup strategy based on IOC type and history
+     * 
+     * Uses adaptive algorithm considering:
+     * - Historical hit rates per tier
+     * - Average latencies per tier
+     * - IOC type characteristics
+     * - Current system load indicators
+     * 
      * @param type The IOC type to query
      * @return Recommended number of tiers to use (1-5)
      */
-    [[nodiscard]] constexpr uint8_t GetOptimalTiers(IOCType type) const noexcept {
+    [[nodiscard]] uint8_t GetOptimalTiers(IOCType type) const noexcept {
+        // =====================================================================
+        // ADAPTIVE TIER SELECTION
+        // =====================================================================
+        // Base recommendation from IOC type, then adjust based on statistics
+        
+        uint8_t baseTiers = GetBaselineOptimalTiers(type);
+        
+        // Adjust based on tier statistics
+        const auto& tlStats = m_tierStats[0];
+        const auto& sharedStats = m_tierStats[1];
+        const auto& indexStats = m_tierStats[2];
+        
+        // If thread-local cache has high hit rate (>80%), we might skip shared cache
+        if (tlStats.GetHitRate() > 0.80 && tlStats.lookups.load(std::memory_order_relaxed) > 100) {
+            // Strong thread-local cache - might reduce tiers for speed
+            // But don't go below 2 to maintain cache warming
+        }
+        
+        // If shared cache hit rate is low but index hit rate is high,
+        // the optimizer could suggest pre-warming the cache
+        if (sharedStats.GetHitRate() < 0.30 && indexStats.GetHitRate() > 0.70) {
+            // Index is the primary hit source - cache might need warming
+            m_cacheWarmingRecommended.store(true, std::memory_order_relaxed);
+        }
+        
+        // Check for external API tier effectiveness
+        if (baseTiers >= 5) {
+            const auto& extStats = m_tierStats[4];
+            // If external API has high latency (>10ms avg) and low hit rate,
+            // consider limiting to avoid performance degradation
+            if (extStats.GetAvgLatencyNs() > 10000000 && extStats.GetHitRate() < 0.10) {
+                baseTiers = 4;  // Skip external API tier
+            }
+        }
+        
+        return baseTiers;
+    }
+    
+    /**
+     * @brief Get baseline optimal tiers based on IOC type characteristics
+     */
+    [[nodiscard]] static constexpr uint8_t GetBaselineOptimalTiers(IOCType type) noexcept {
         // Hash lookups are fastest through index
         if (type == IOCType::FileHash) {
             return 3;  // Cache + Index + Database
@@ -369,6 +1800,59 @@ public:
     }
     
     /**
+     * @brief Record tier lookup result for adaptive optimization
+     * 
+     * @param tier Tier index (0=TL Cache, 1=Shared Cache, 2=Index, 3=DB, 4=External)
+     * @param hit Whether the lookup was a hit
+     * @param latencyNs Lookup latency in nanoseconds
+     */
+    void RecordTierResult(size_t tier, bool hit, uint64_t latencyNs) noexcept {
+        if (tier >= TIER_COUNT) return;
+        
+        auto& stats = m_tierStats[tier];
+        stats.lookups.fetch_add(1, std::memory_order_relaxed);
+        if (hit) {
+            stats.hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        stats.totalLatencyNs.fetch_add(latencyNs, std::memory_order_relaxed);
+        
+        // Record in histogram for percentile tracking
+        m_tierHistograms[tier].Record(latencyNs);
+    }
+    
+    /**
+     * @brief Check if cache warming is recommended
+     */
+    [[nodiscard]] bool IsCacheWarmingRecommended() const noexcept {
+        return m_cacheWarmingRecommended.load(std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Reset cache warming recommendation
+     */
+    void ClearCacheWarmingRecommendation() noexcept {
+        m_cacheWarmingRecommended.store(false, std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get tier statistics
+     */
+    [[nodiscard]] const TierStats& GetTierStats(size_t tier) const noexcept {
+        static const TierStats empty{};
+        if (tier >= TIER_COUNT) return empty;
+        return m_tierStats[tier];
+    }
+    
+    /**
+     * @brief Get tier latency histogram
+     */
+    [[nodiscard]] const LatencyHistogram& GetTierHistogram(size_t tier) const noexcept {
+        static const LatencyHistogram empty{};
+        if (tier >= TIER_COUNT) return empty;
+        return m_tierHistograms[tier];
+    }
+    
+    /**
      * @brief Should we prefetch for this query
      * @param batchSize Number of items in batch
      * @return true if prefetching is recommended
@@ -376,6 +1860,49 @@ public:
     [[nodiscard]] static constexpr bool ShouldPrefetch(size_t batchSize) noexcept {
         return batchSize >= 10;  // Prefetch for batch >= 10
     }
+    
+    /**
+     * @brief Reset all optimizer statistics
+     */
+    void Reset() noexcept {
+        for (auto& stats : m_tierStats) {
+            stats.lookups.store(0, std::memory_order_relaxed);
+            stats.hits.store(0, std::memory_order_relaxed);
+            stats.totalLatencyNs.store(0, std::memory_order_relaxed);
+        }
+        for (auto& hist : m_tierHistograms) {
+            hist.Reset();
+        }
+        m_cacheWarmingRecommended.store(false, std::memory_order_relaxed);
+    }
+    
+    /**
+     * @brief Get comprehensive optimizer statistics
+     */
+    struct OptimizerStats {
+        std::array<double, TIER_COUNT> hitRates{};
+        std::array<uint64_t, TIER_COUNT> avgLatenciesNs{};
+        std::array<uint64_t, TIER_COUNT> p99LatenciesNs{};
+        bool cacheWarmingRecommended{false};
+    };
+    
+    [[nodiscard]] OptimizerStats GetOptimizerStats() const noexcept {
+        OptimizerStats stats;
+        stats.cacheWarmingRecommended = m_cacheWarmingRecommended.load(std::memory_order_relaxed);
+        
+        for (size_t i = 0; i < TIER_COUNT; ++i) {
+            stats.hitRates[i] = m_tierStats[i].GetHitRate();
+            stats.avgLatenciesNs[i] = m_tierStats[i].GetAvgLatencyNs();
+            stats.p99LatenciesNs[i] = m_tierHistograms[i].GetPercentile(0.99);
+        }
+        
+        return stats;
+    }
+
+private:
+    mutable std::array<TierStats, TIER_COUNT> m_tierStats{};
+    mutable std::array<LatencyHistogram, TIER_COUNT> m_tierHistograms{};
+    mutable std::atomic<bool> m_cacheWarmingRecommended{false};
 };
 
 // ============================================================================
@@ -580,6 +2107,7 @@ public:
      * @param value The IOC value to look up
      * @param options Lookup configuration options
      * @param tlCache Thread-local cache (may be nullptr)
+     * @param optimizer Query optimizer for adaptive tier selection (may be nullptr)
      * @return Lookup result with threat information and timing
      * 
      * @note Thread-safe: may be called concurrently from multiple threads
@@ -588,19 +2116,26 @@ public:
         IOCType type,
         std::string_view value,
         const LookupOptions& options,
-        ThreadLocalCache* tlCache
+        ThreadLocalCache* tlCache,
+        QueryOptimizer* optimizer = nullptr
     ) noexcept {
         const auto startTime = std::chrono::high_resolution_clock::now();
         
         ThreatLookupResult result;
         result.type = type;
         
-        // Tier 1: Thread-Local Cache (< 20ns)
-        if (LIKELY(tlCache != nullptr && options.maxLookupTiers >= 1)) {
-            const auto cachedResult = tlCache->Lookup(type, value);
-            if (cachedResult.has_value()) {
-                result = cachedResult.value();
-                result.source = ThreatLookupResult::Source::ThreadLocalCache;
+        // =====================================================================
+        // ENTERPRISE INPUT VALIDATION
+        // =====================================================================
+        // Validate input before any processing to prevent injection attacks
+        // and ensure data integrity across all tiers.
+        
+        if (options.validateInput) {
+            const ValidationResult validation = IOCValidator::Validate(type, value);
+            if (!validation.isValid) {
+                result.found = false;
+                result.errorCode = static_cast<uint32_t>(validation.errorCode);
+                result.errorMessage = GetErrorDescription(validation.errorCode);
                 
                 const auto endTime = std::chrono::high_resolution_clock::now();
                 result.latencyNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -611,13 +2146,64 @@ public:
             }
         }
         
-        // Tier 2: Shared Memory Cache (< 50ns)
+        // =====================================================================
+        // TIER 1: Thread-Local Cache (< 20ns)
+        // =====================================================================
+        if (LIKELY(tlCache != nullptr && options.maxLookupTiers >= 1)) {
+            const auto tierStart = std::chrono::high_resolution_clock::now();
+            
+            const auto cachedResult = tlCache->Lookup(type, value);
+            
+            const auto tierEnd = std::chrono::high_resolution_clock::now();
+            const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tierEnd - tierStart
+            ).count();
+            
+            if (cachedResult.has_value()) {
+                result = cachedResult.value();
+                result.source = ThreatLookupResult::Source::ThreadLocalCache;
+                
+                // Record optimizer statistics
+                if (optimizer != nullptr) {
+                    optimizer->RecordTierResult(0, true, tierLatency);
+                }
+                
+                const auto endTime = std::chrono::high_resolution_clock::now();
+                result.latencyNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    endTime - startTime
+                ).count();
+                
+                return result;
+            }
+            
+            // Record miss
+            if (optimizer != nullptr) {
+                optimizer->RecordTierResult(0, false, tierLatency);
+            }
+        }
+        
+        // =====================================================================
+        // TIER 2: Shared Memory Cache (< 50ns)
+        // =====================================================================
         if (LIKELY(m_cache != nullptr && options.maxLookupTiers >= 2)) {
+            const auto tierStart = std::chrono::high_resolution_clock::now();
+            
             result = LookupInCache(type, value);
+            
+            const auto tierEnd = std::chrono::high_resolution_clock::now();
+            const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tierEnd - tierStart
+            ).count();
+            
             if (result.found) {
                 result.source = ThreatLookupResult::Source::SharedCache;
                 
-                // Cache in thread-local cache
+                // Record optimizer statistics
+                if (optimizer != nullptr) {
+                    optimizer->RecordTierResult(1, true, tierLatency);
+                }
+                
+                // Cache in thread-local cache for faster subsequent lookups
                 if (tlCache != nullptr && options.cacheResult) {
                     tlCache->Insert(type, value, result);
                 }
@@ -629,14 +2215,34 @@ public:
                 
                 return result;
             }
+            
+            // Record miss
+            if (optimizer != nullptr) {
+                optimizer->RecordTierResult(1, false, tierLatency);
+            }
         }
         
-        // Tier 3: Index Lookup (< 100ns)
+        // =====================================================================
+        // TIER 3: Index Lookup (< 100ns)
+        // =====================================================================
         if (LIKELY(m_index != nullptr && options.maxLookupTiers >= 3)) {
+            const auto tierStart = std::chrono::high_resolution_clock::now();
+            
             result = LookupInIndex(type, value, options);
+            
+            const auto tierEnd = std::chrono::high_resolution_clock::now();
+            const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tierEnd - tierStart
+            ).count();
+            
             if (result.found) {
                 result.source = ThreatLookupResult::Source::Index;
                 
+                // Record optimizer statistics
+                if (optimizer != nullptr) {
+                    optimizer->RecordTierResult(2, true, tierLatency);
+                }
+                
                 // Update caches
                 if (options.cacheResult) {
                     if (tlCache != nullptr) {
@@ -654,14 +2260,34 @@ public:
                 
                 return result;
             }
+            
+            // Record miss
+            if (optimizer != nullptr) {
+                optimizer->RecordTierResult(2, false, tierLatency);
+            }
         }
         
-        // Tier 4: Database Query (< 500ns)
+        // =====================================================================
+        // TIER 4: Database Query (< 500ns)
+        // =====================================================================
         if (LIKELY(m_store != nullptr && options.maxLookupTiers >= 4)) {
+            const auto tierStart = std::chrono::high_resolution_clock::now();
+            
             result = LookupInDatabase(type, value, options);
+            
+            const auto tierEnd = std::chrono::high_resolution_clock::now();
+            const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tierEnd - tierStart
+            ).count();
+            
             if (result.found) {
                 result.source = ThreatLookupResult::Source::Database;
                 
+                // Record optimizer statistics
+                if (optimizer != nullptr) {
+                    optimizer->RecordTierResult(3, true, tierLatency);
+                }
+                
                 // Update caches
                 if (options.cacheResult) {
                     if (tlCache != nullptr) {
@@ -679,13 +2305,33 @@ public:
                 
                 return result;
             }
+            
+            // Record miss
+            if (optimizer != nullptr) {
+                optimizer->RecordTierResult(3, false, tierLatency);
+            }
         }
         
-        // Tier 5: External API Query (< 50ms, async)
+        // =====================================================================
+        // TIER 5: External API Query (< 50ms, async)
+        // =====================================================================
         if (UNLIKELY(options.queryExternalAPI && options.maxLookupTiers >= 5)) {
+            const auto tierStart = std::chrono::high_resolution_clock::now();
+            
             result = LookupViaExternalAPI(type, value, options);
+            
+            const auto tierEnd = std::chrono::high_resolution_clock::now();
+            const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tierEnd - tierStart
+            ).count();
+            
             if (result.found) {
                 result.source = ThreatLookupResult::Source::ExternalAPI;
+                
+                // Record optimizer statistics
+                if (optimizer != nullptr) {
+                    optimizer->RecordTierResult(4, true, tierLatency);
+                }
                 
                 // Cache external results
                 if (options.cacheResult) {
@@ -695,6 +2341,11 @@ public:
                     if (m_cache != nullptr) {
                         CacheResult(type, value, result);
                     }
+                }
+            } else {
+                // Record miss
+                if (optimizer != nullptr) {
+                    optimizer->RecordTierResult(4, false, tierLatency);
                 }
             }
         }
@@ -857,72 +2508,34 @@ private:
             result.found = true;
             
             // Index provides: entryId, entryOffset, latencyNs, indexType
-            // We need to fetch additional data from the store for full result
+            // We fetch additional data DIRECTLY from IOCManager to avoid recursion
+            // (calling m_store->Lookup* would create infinite recursion)
             
-            // If caller wants metadata, or we need reputation data, fetch from store
-            if (m_store != nullptr && indexResult.entryId != 0) {
-                // Create minimal store lookup options (no cache update - we are the cache layer)
-                StoreLookupOptions storeOpts;
-                storeOpts.useCache = false;
-                storeOpts.updateCache = false;
-                storeOpts.includeMetadata = options.includeMetadata;
-                storeOpts.includeConfidence = true;
-                storeOpts.includeSourceAttribution = options.includeSourceAttribution;
+            // If caller wants metadata or we need reputation data, fetch from IOCManager
+            if (m_iocManager != nullptr && indexResult.entryId != 0) {
+                // Query IOCManager directly for the entry data by ID
+                auto entryOpt = m_iocManager->GetIOC(indexResult.entryId);
                 
-                // Fetch entry from store using the index result
-                // The index gives us fast lookup, store gives us full data
-                StoreLookupResult storeResult;
-                
-                switch (type) {
-                    case IOCType::IPv4:
-                        storeResult = m_store->LookupIPv4(value, storeOpts);
-                        break;
-                    case IOCType::IPv6:
-                        storeResult = m_store->LookupIPv6(value, storeOpts);
-                        break;
-                    case IOCType::Domain:
-                        storeResult = m_store->LookupDomain(value, storeOpts);
-                        break;
-                    case IOCType::URL:
-                        storeResult = m_store->LookupURL(value, storeOpts);
-                        break;
-                    case IOCType::FileHash: {
-                        std::string_view algorithm;
-                        const size_t len = value.length();
-                        if (len == 32) algorithm = "MD5";
-                        else if (len == 40) algorithm = "SHA1";
-                        else if (len == 64) algorithm = "SHA256";
-                        else algorithm = "UNKNOWN";
-                        storeResult = m_store->LookupHash(algorithm, value, storeOpts);
-                        break;
-                    }
-                    case IOCType::Email:
-                        storeResult = m_store->LookupEmail(value, storeOpts);
-                        break;
-                    default:
-                        storeResult = m_store->LookupIOC(type, value, storeOpts);
-                        break;
-                }
-                
-                if (storeResult.found) {
-                    result.reputation = storeResult.reputation;
-                    result.confidence = storeResult.confidence;
-                    result.category = storeResult.category;
-                    result.primarySource = storeResult.primarySource;
-                    result.sourceFlags = storeResult.sourceFlags;
-                    result.firstSeen = storeResult.firstSeen;
-                    result.lastSeen = storeResult.lastSeen;
+                if (entryOpt.has_value()) {
+                    const auto& entry = entryOpt.value();
                     
-                    // Calculate threat score
-                    result.threatScore = storeResult.score > 0 ? storeResult.score :
-                        ResultAggregator::CalculateThreatScore(
-                            storeResult.reputation,
-                            storeResult.confidence,
-                            1
-                        );
+                    result.reputation = entry.reputation;
+                    result.confidence = entry.confidence;
+                    result.category = entry.category;
+                    result.primarySource = entry.source;
+                    result.sourceFlags = static_cast<uint32_t>(1) << static_cast<uint8_t>(entry.source);
+                    result.firstSeen = entry.firstSeen;
+                    result.lastSeen = entry.lastSeen;
                     
-                    if (options.includeMetadata && storeResult.entry.has_value()) {
-                        result.entry = storeResult.entry;
+                    // Calculate threat score from entry data
+                    result.threatScore = ResultAggregator::CalculateThreatScore(
+                        entry.reputation,
+                        entry.confidence,
+                        1  // Single source from index
+                    );
+                    
+                    if (options.includeMetadata) {
+                        result.entry = entry;
                     }
                 }
             }
@@ -953,126 +2566,48 @@ private:
         result.type = type;
         result.found = false;
         
-        if (UNLIKELY(m_store == nullptr)) {
+        // =====================================================================
+        // TIER 4: Direct IOCManager Query (avoids recursion through Store)
+        // =====================================================================
+        // We use m_iocManager directly instead of m_store to avoid infinite
+        // recursion, since Store's Lookup methods route through ThreatIntelLookup.
+        
+        if (UNLIKELY(m_iocManager == nullptr)) {
             return result;
         }
         
-        // =====================================================================
-        // Configure Store Lookup Options
-        // =====================================================================
-        StoreLookupOptions storeOpts;
-        storeOpts.useCache = false;  // We already checked cache at Tier 2
-        storeOpts.updateCache = false;  // Caller handles caching
-        storeOpts.includeMetadata = options.includeMetadata;
-        storeOpts.includeConfidence = true;
-        storeOpts.includeSourceAttribution = options.includeSourceAttribution;
-        storeOpts.minConfidenceThreshold = static_cast<uint8_t>(options.minConfidence);
+        // Query IOCManager directly for the IOC by type and value
+        auto entryOpt = m_iocManager->FindIOC(type, value);
         
-        // =====================================================================
-        // Execute Type-Specific Store Lookup
-        // =====================================================================
-        StoreLookupResult storeResult;
-        
-        switch (type) {
-            case IOCType::IPv4: {
-                // Store expects string_view for IPv4
-                storeResult = m_store->LookupIPv4(value, storeOpts);
-                break;
-            }
-            case IOCType::IPv6: {
-                // Store expects string_view for IPv6
-                storeResult = m_store->LookupIPv6(value, storeOpts);
-                break;
-            }
-            case IOCType::Domain: {
-                storeResult = m_store->LookupDomain(value, storeOpts);
-                break;
-            }
-            case IOCType::URL: {
-                storeResult = m_store->LookupURL(value, storeOpts);
-                break;
-            }
-            case IOCType::FileHash: {
-                // Store's LookupHash expects algorithm and hash value
-                // Auto-detect algorithm from hash length
-                std::string_view algorithm;
-                const size_t len = value.length();
-                if (len == 32) {
-                    algorithm = "MD5";
-                } else if (len == 40) {
-                    algorithm = "SHA1";
-                } else if (len == 64) {
-                    algorithm = "SHA256";
-                } else if (len == 128) {
-                    algorithm = "SHA512";
-                } else {
-                    algorithm = "UNKNOWN";
-                }
-                storeResult = m_store->LookupHash(algorithm, value, storeOpts);
-                break;
-            }
-            case IOCType::Email: {
-                storeResult = m_store->LookupEmail(value, storeOpts);
-                break;
-            }
-            default: {
-                // Generic lookup for other IOC types
-                storeResult = m_store->LookupIOC(type, value, storeOpts);
-                break;
-            }
-        }
-        
-        // =====================================================================
-        // Convert StoreLookupResult to ThreatLookupResult
-        // =====================================================================
-        if (!storeResult.found) {
+        if (!entryOpt.has_value()) {
             return result;
         }
         
+        const auto& entry = entryOpt.value();
+        
+        // =====================================================================
+        // Convert IOCEntry to ThreatLookupResult
+        // =====================================================================
         result.found = true;
-        result.reputation = storeResult.reputation;
-        result.confidence = storeResult.confidence;
-        result.category = storeResult.category;
-        result.primarySource = storeResult.primarySource;
-        result.sourceFlags = storeResult.sourceFlags;
-        
-        // Count source flags using portable popcount
-        uint32_t srcFlags = storeResult.sourceFlags;
-        uint16_t srcCount = 0;
-        while (srcFlags) {
-            srcCount += srcFlags & 1;
-            srcFlags >>= 1;
-        }
-        result.sourceCount = srcCount;
-        
-        result.firstSeen = storeResult.firstSeen;
-        result.lastSeen = storeResult.lastSeen;
+        result.reputation = entry.reputation;
+        result.confidence = entry.confidence;
+        result.category = entry.category;
+        result.primarySource = entry.source;
+        result.sourceFlags = static_cast<uint32_t>(1) << static_cast<uint8_t>(entry.source);
+        result.sourceCount = 1;
+        result.firstSeen = entry.firstSeen;
+        result.lastSeen = entry.lastSeen;
         
         // Calculate threat score
-        result.threatScore = storeResult.score > 0 ? storeResult.score :
-            ResultAggregator::CalculateThreatScore(
-                storeResult.reputation,
-                storeResult.confidence,
-                result.sourceCount
-            );
+        result.threatScore = ResultAggregator::CalculateThreatScore(
+            entry.reputation,
+            entry.confidence,
+            1  // Single source from database
+        );
         
         // Copy full entry if metadata was requested
-        if (options.includeMetadata && storeResult.entry.has_value()) {
-            result.entry = storeResult.entry;
-        }
-        
-        // Copy STIX bundle ID if available
-        if (storeResult.stixBundleId.has_value()) {
-            result.stixBundleId = storeResult.stixBundleId;
-        }
-        
-        // Copy related indicators
-        for (const auto& [relType, relValue] : storeResult.relatedIndicators) {
-            ThreatLookupResult::RelatedIOC related;
-            related.type = relType;
-            related.value = relValue;
-            related.relationship = "related";
-            result.relatedIOCs.push_back(std::move(related));
+        if (options.includeMetadata) {
+            result.entry = entry;
         }
         
         return result;
@@ -1112,108 +2647,279 @@ private:
         }
         
         // =====================================================================
-        // Rate Limiting Check
+        // ENTERPRISE EXTERNAL API INFRASTRUCTURE
         // =====================================================================
-        // Track API calls per provider to avoid rate limit violations
-        static thread_local std::array<std::chrono::steady_clock::time_point, 8> lastAPICall{};
-        static thread_local std::array<uint32_t, 8> apiCallCount{};
+        // Static initialization of per-provider infrastructure:
+        // - Circuit breakers for resilience
+        // - Rate limiters for quota management
+        // - Statistics tracking
         
-        const auto now = std::chrono::steady_clock::now();
-        constexpr auto RATE_LIMIT_WINDOW = std::chrono::seconds(60);
-        constexpr uint32_t MAX_CALLS_PER_MINUTE = 30;  // Conservative limit
+        static constexpr size_t PROVIDER_COUNT = 4;  // VT, AbuseIPDB, URLhaus, OTX
+        
+        // Provider configuration
+        struct ProviderConfig {
+            ThreatIntelSource source;
+            const char* name;
+            uint32_t ratePerMinute;     // API rate limit
+            uint32_t timeoutMs;         // Request timeout
+            uint32_t maxRetries;        // Maximum retry attempts
+            bool supportsIPv4;
+            bool supportsIPv6;
+            bool supportsDomain;
+            bool supportsURL;
+            bool supportsHash;
+            bool supportsEmail;
+        };
+        
+        static constexpr std::array<ProviderConfig, PROVIDER_COUNT> PROVIDER_CONFIGS = {{
+            { ThreatIntelSource::VirusTotal,     "VirusTotal",     4,   30000, 2, true, true, true, true, true, false },
+            { ThreatIntelSource::AbuseIPDB,      "AbuseIPDB",      30,  10000, 2, true, true, false, false, false, false },
+            { ThreatIntelSource::URLhaus,        "URLhaus",        60,  15000, 1, false, false, false, true, false, false },
+            { ThreatIntelSource::AlienVaultOTX,  "AlienVault OTX", 10,  20000, 2, true, true, true, true, true, true }
+        }};
+        
+        // Per-provider circuit breakers (static for persistence across calls)
+        static std::array<CircuitBreaker, PROVIDER_COUNT> s_circuitBreakers = {
+            CircuitBreaker{CircuitBreaker::Config{5, 3, 30000, 3}},  // VT
+            CircuitBreaker{CircuitBreaker::Config{5, 3, 30000, 3}},  // AbuseIPDB
+            CircuitBreaker{CircuitBreaker::Config{5, 3, 30000, 3}},  // URLhaus
+            CircuitBreaker{CircuitBreaker::Config{5, 3, 30000, 3}}   // OTX
+        };
+        
+        // Per-provider rate limiters (static for persistence across calls)
+        static std::array<RateLimiter, PROVIDER_COUNT> s_rateLimiters = {
+            RateLimiter{RateLimiter::Config{4, 10, 10}},   // VT: 4/sec, 10 burst
+            RateLimiter{RateLimiter::Config{30, 60, 60}},  // AbuseIPDB: 30/min
+            RateLimiter{RateLimiter::Config{60, 100, 100}}, // URLhaus: 60/min
+            RateLimiter{RateLimiter::Config{10, 30, 30}}   // OTX: 10/min
+        };
+        
+        // Per-provider statistics (static for persistence)
+        struct ProviderStats {
+            std::atomic<uint64_t> totalRequests{0};
+            std::atomic<uint64_t> successfulRequests{0};
+            std::atomic<uint64_t> failedRequests{0};
+            std::atomic<uint64_t> rateLimitedRequests{0};
+            std::atomic<uint64_t> circuitBreakerRejects{0};
+            std::atomic<uint64_t> totalLatencyMs{0};
+        };
+        static std::array<ProviderStats, PROVIDER_COUNT> s_providerStats{};
         
         // =====================================================================
-        // Provider Selection Based on IOC Type
+        // DETERMINE APPLICABLE PROVIDERS FOR IOC TYPE
         // =====================================================================
-        // Provider indices: 0=VirusTotal, 1=AbuseIPDB, 2=URLhaus, 3=OTX
         std::vector<size_t> applicableProviders;
+        applicableProviders.reserve(PROVIDER_COUNT);
         
-        switch (type) {
-            case IOCType::FileHash:
-                applicableProviders = {0, 3};  // VirusTotal, OTX
-                break;
-            case IOCType::IPv4:
-            case IOCType::IPv6:
-                applicableProviders = {0, 1, 3};  // VirusTotal, AbuseIPDB, OTX
-                break;
-            case IOCType::URL:
-                applicableProviders = {0, 2, 3};  // VirusTotal, URLhaus, OTX
-                break;
-            case IOCType::Domain:
-                applicableProviders = {0, 3};  // VirusTotal, OTX
-                break;
-            case IOCType::Email:
-                applicableProviders = {3};  // OTX only
-                break;
-            default:
-                applicableProviders = {3};  // Generic - OTX
-                break;
+        for (size_t i = 0; i < PROVIDER_COUNT; ++i) {
+            const auto& config = PROVIDER_CONFIGS[i];
+            bool applicable = false;
+            
+            switch (type) {
+                case IOCType::IPv4:
+                    applicable = config.supportsIPv4;
+                    break;
+                case IOCType::IPv6:
+                    applicable = config.supportsIPv6;
+                    break;
+                case IOCType::Domain:
+                    applicable = config.supportsDomain;
+                    break;
+                case IOCType::URL:
+                    applicable = config.supportsURL;
+                    break;
+                case IOCType::FileHash:
+                    applicable = config.supportsHash;
+                    break;
+                case IOCType::Email:
+                    applicable = config.supportsEmail;
+                    break;
+                default:
+                    // Try OTX for unknown types
+                    applicable = (i == 3);  // OTX index
+                    break;
+            }
+            
+            if (applicable) {
+                applicableProviders.push_back(i);
+            }
+        }
+        
+        if (applicableProviders.empty()) {
+            result.errorCode = static_cast<uint32_t>(LookupErrorCode::APINotConfigured);
+            result.errorMessage = "No external API provider supports this IOC type";
+            return result;
         }
         
         // =====================================================================
-        // Query Each Applicable Provider
+        // QUERY EACH APPLICABLE PROVIDER
         // =====================================================================
         std::vector<ThreatLookupResult::ExternalResult> externalResults;
         externalResults.reserve(applicableProviders.size());
         
         for (const size_t providerIdx : applicableProviders) {
-            // Check rate limit for this provider
-            if (now - lastAPICall[providerIdx] < RATE_LIMIT_WINDOW) {
-                if (apiCallCount[providerIdx] >= MAX_CALLS_PER_MINUTE) {
-                    continue;  // Skip this provider - rate limited
-                }
-            } else {
-                // Reset counter for new window
-                apiCallCount[providerIdx] = 0;
+            const auto& config = PROVIDER_CONFIGS[providerIdx];
+            auto& circuitBreaker = s_circuitBreakers[providerIdx];
+            auto& rateLimiter = s_rateLimiters[providerIdx];
+            auto& stats = s_providerStats[providerIdx];
+            
+            // Increment total request counter
+            stats.totalRequests.fetch_add(1, std::memory_order_relaxed);
+            
+            // -------------------------------------------------------------
+            // CHECK CIRCUIT BREAKER
+            // -------------------------------------------------------------
+            if (!circuitBreaker.AllowRequest()) {
+                stats.circuitBreakerRejects.fetch_add(1, std::memory_order_relaxed);
+                continue;  // Skip this provider - circuit is open
             }
             
-            // Query provider (would be async in production)
+            // -------------------------------------------------------------
+            // CHECK RATE LIMITER
+            // -------------------------------------------------------------
+            if (!rateLimiter.TryAcquire()) {
+                stats.rateLimitedRequests.fetch_add(1, std::memory_order_relaxed);
+                continue;  // Skip this provider - rate limited
+            }
+            
+            // -------------------------------------------------------------
+            // EXECUTE API QUERY WITH RETRY LOGIC
+            // -------------------------------------------------------------
             ThreatLookupResult::ExternalResult extResult;
-            const auto queryStart = std::chrono::steady_clock::now();
+            extResult.source = config.source;
             
-            switch (providerIdx) {
-                case 0:  // VirusTotal
-                    extResult.source = ThreatIntelSource::VirusTotal;
-                    // In production: Call VirusTotal API
-                    // extResult = QueryVirusTotal(type, value, options.timeoutMs);
-                    break;
+            bool querySuccess = false;
+            uint32_t retryCount = 0;
+            const uint32_t maxRetries = config.maxRetries;
+            
+            while (!querySuccess && retryCount <= maxRetries) {
+                const auto queryStart = std::chrono::steady_clock::now();
+                
+                // =========================================================
+                // PROVIDER-SPECIFIC API QUERY
+                // =========================================================
+                // NOTE: In production, these would be actual HTTP API calls.
+                // The implementation below provides the framework structure.
+                // Each provider query would:
+                // 1. Construct the API request with proper authentication
+                // 2. Send HTTP request with timeout
+                // 3. Parse JSON response
+                // 4. Map response to ExternalResult structure
+                
+                switch (providerIdx) {
+                    case 0: {  // VirusTotal
+                        // VirusTotal API v3 implementation framework
+                        // URL: https://www.virustotal.com/api/v3/{endpoint}
+                        // Auth: x-apikey header
+                        // Rate: 4 requests/minute (free), 1000/day (premium)
+                        //
+                        // Endpoints by IOC type:
+                        // - Hash: /files/{hash}
+                        // - IP: /ip_addresses/{ip}
+                        // - Domain: /domains/{domain}
+                        // - URL: /urls/{url_id} (base64 encoded)
+                        
+                        // Production code would call:
+                        // querySuccess = QueryVirusTotalAPI(type, value, config.timeoutMs, extResult);
+                        
+                        // Simulation: Mark as successful but no data (testing framework)
+                        querySuccess = true;
+                        extResult.score = 0;
+                        extResult.confidence = ConfidenceLevel::None;
+                        break;
+                    }
                     
-                case 1:  // AbuseIPDB
-                    extResult.source = ThreatIntelSource::AbuseIPDB;
-                    // In production: Call AbuseIPDB API
-                    // extResult = QueryAbuseIPDB(value, options.timeoutMs);
-                    break;
+                    case 1: {  // AbuseIPDB
+                        // AbuseIPDB API v2 implementation framework
+                        // URL: https://api.abuseipdb.com/api/v2/check
+                        // Auth: Key header
+                        // Rate: 1000 requests/day (free)
+                        //
+                        // Parameters:
+                        // - ipAddress: The IP to check
+                        // - maxAgeInDays: How far back to check (1-365)
+                        // - verbose: Include detailed reports
+                        
+                        // Production code would call:
+                        // querySuccess = QueryAbuseIPDBAPI(value, config.timeoutMs, extResult);
+                        
+                        querySuccess = true;
+                        extResult.score = 0;
+                        extResult.confidence = ConfidenceLevel::None;
+                        break;
+                    }
                     
-                case 2:  // URLhaus
-                    extResult.source = ThreatIntelSource::URLhaus;
-                    // In production: Call URLhaus API
-                    // extResult = QueryURLhaus(value, options.timeoutMs);
-                    break;
+                    case 2: {  // URLhaus
+                        // URLhaus API implementation framework
+                        // URL: https://urlhaus-api.abuse.ch/v1/url/
+                        // Auth: None (public API)
+                        // Rate: Reasonable use (no hard limit)
+                        //
+                        // POST data: url={encoded_url}
+                        // Response includes: threat type, tags, first/last seen
+                        
+                        // Production code would call:
+                        // querySuccess = QueryURLhausAPI(value, config.timeoutMs, extResult);
+                        
+                        querySuccess = true;
+                        extResult.score = 0;
+                        extResult.confidence = ConfidenceLevel::None;
+                        break;
+                    }
                     
-                case 3:  // AlienVault OTX
-                    extResult.source = ThreatIntelSource::AlienVaultOTX;
-                    // In production: Call OTX API
-                    // extResult = QueryOTX(type, value, options.timeoutMs);
-                    break;
+                    case 3: {  // AlienVault OTX
+                        // OTX DirectConnect API implementation framework
+                        // URL: https://otx.alienvault.com/api/v1/indicators/{type}/{ioc}
+                        // Auth: X-OTX-API-KEY header
+                        // Rate: 10000 requests/hour (with key)
+                        //
+                        // Types: IPv4, IPv6, domain, hostname, url, file (hash)
+                        // Returns: pulse_info, general, geo, malware, etc.
+                        
+                        // Production code would call:
+                        // querySuccess = QueryOTXAPI(type, value, config.timeoutMs, extResult);
+                        
+                        querySuccess = true;
+                        extResult.score = 0;
+                        extResult.confidence = ConfidenceLevel::None;
+                        break;
+                    }
                     
-                default:
-                    continue;
+                    default:
+                        break;
+                }
+                
+                const auto queryEnd = std::chrono::steady_clock::now();
+                extResult.queryLatencyMs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        queryEnd - queryStart
+                    ).count()
+                );
+                
+                stats.totalLatencyMs.fetch_add(extResult.queryLatencyMs, std::memory_order_relaxed);
+                
+                if (!querySuccess) {
+                    ++retryCount;
+                    if (retryCount <= maxRetries) {
+                        // Exponential backoff: 100ms, 200ms, 400ms...
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(100 * (1u << retryCount))
+                        );
+                    }
+                }
             }
             
-            const auto queryEnd = std::chrono::steady_clock::now();
-            extResult.queryLatencyMs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    queryEnd - queryStart
-                ).count()
-            );
-            
-            // Update rate limiting counters
-            lastAPICall[providerIdx] = now;
-            ++apiCallCount[providerIdx];
-            
-            // Add to results if we got data
-            // Note: In production, check extResult.confidence > 0
-            externalResults.push_back(std::move(extResult));
+            // -------------------------------------------------------------
+            // UPDATE CIRCUIT BREAKER AND STATISTICS
+            // -------------------------------------------------------------
+            if (querySuccess) {
+                circuitBreaker.RecordSuccess();
+                stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
+                externalResults.push_back(std::move(extResult));
+            } else {
+                circuitBreaker.RecordFailure();
+                stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         
         // =====================================================================
@@ -1494,12 +3200,9 @@ private:
             return addr;
         }
         
-        // Build address in network byte order (big-endian)
-        addr.address = (static_cast<uint32_t>(octets[0]) << 24) | 
-                      (static_cast<uint32_t>(octets[1]) << 16) | 
-                      (static_cast<uint32_t>(octets[2]) << 8) | 
-                      static_cast<uint32_t>(octets[3]);
-        addr.prefixLength = prefixLen;
+        // Use Set() to ensure consistent byte order for RadixTree traversal
+        // This properly initializes both the address and octets union members
+        addr.Set(octets[0], octets[1], octets[2], octets[3], prefixLen);
         
         return addr;
     }
@@ -1507,133 +3210,19 @@ private:
     /**
      * @brief Parse IPv6 address from string
      * 
-     * Supports full form, compressed form (::), and mixed notation (IPv4 suffix).
-     * Does NOT handle zone IDs (%interface).
+     * Delegates to Format::ParseIPv6 for consistent parsing with the rest
+     * of the codebase. Uses inet_pton internally for full IPv6 support.
      * 
      * @param ipv6 IPv6 address string
      * @return Parsed IPv6Address, zeroed on failure
      */
     [[nodiscard]] static IPv6Address ParseIPv6(std::string_view ipv6) noexcept {
-        IPv6Address addr{};
-        
-        // Minimum: "::" (2 chars), Maximum: "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255" (45 chars)
-        if (ipv6.size() < 2 || ipv6.size() > 45) {
-            return addr;
+        // Delegate to Format::ParseIPv6 for consistent parsing across codebase
+        auto result = Format::ParseIPv6(ipv6);
+        if (result.has_value()) {
+            return result.value();
         }
-        
-        // Parse hextets (16-bit groups)
-        uint16_t hextets[8] = {0};
-        size_t hextetCount = 0;
-        size_t doubleColonPos = SIZE_MAX;  // Position where :: was found
-        
-        size_t i = 0;
-        
-        // Handle leading ::
-        if (ipv6.size() >= 2 && ipv6[0] == ':' && ipv6[1] == ':') {
-            doubleColonPos = 0;
-            i = 2;
-        }
-        
-        while (i < ipv6.size() && hextetCount < 8) {
-            // Check for :: (double colon - compression)
-            if (i + 1 < ipv6.size() && ipv6[i] == ':' && ipv6[i + 1] == ':') {
-                if (doubleColonPos != SIZE_MAX) {
-                    return addr;  // Only one :: allowed
-                }
-                doubleColonPos = hextetCount;
-                i += 2;
-                continue;
-            }
-            
-            // Skip single colon separator (but not at start)
-            if (ipv6[i] == ':') {
-                if (i == 0) {
-                    return addr;  // Cannot start with single colon
-                }
-                ++i;
-                continue;
-            }
-            
-            // Parse hextet value
-            uint32_t value = 0;
-            size_t digitCount = 0;
-            
-            while (i < ipv6.size() && digitCount < 4) {
-                const char c = ipv6[i];
-                
-                if (c >= '0' && c <= '9') {
-                    value = (value << 4) | static_cast<uint32_t>(c - '0');
-                    ++digitCount;
-                    ++i;
-                } else if (c >= 'a' && c <= 'f') {
-                    value = (value << 4) | static_cast<uint32_t>(c - 'a' + 10);
-                    ++digitCount;
-                    ++i;
-                } else if (c >= 'A' && c <= 'F') {
-                    value = (value << 4) | static_cast<uint32_t>(c - 'A' + 10);
-                    ++digitCount;
-                    ++i;
-                } else if (c == ':' || c == '/') {
-                    break;  // End of hextet
-                } else if (c == '.') {
-                    // Might be embedded IPv4 - not supported in this implementation
-                    // For simplicity, we reject mixed notation
-                    return addr;
-                } else {
-                    return addr;  // Invalid character
-                }
-            }
-            
-            if (digitCount == 0) {
-                return addr;  // Empty hextet
-            }
-            
-            if (value > 0xFFFF) {
-                return addr;  // Hextet overflow
-            }
-            
-            hextets[hextetCount++] = static_cast<uint16_t>(value);
-            
-            // Handle CIDR prefix (skip for now)
-            if (i < ipv6.size() && ipv6[i] == '/') {
-                break;  // Stop at CIDR prefix
-            }
-        }
-        
-        // Expand :: compression
-        if (doubleColonPos != SIZE_MAX) {
-            // Calculate how many zeros to insert
-            const size_t zerosNeeded = 8 - hextetCount;
-            if (hextetCount > 8) {
-                return addr;  // Too many hextets
-            }
-            
-            // Move hextets after :: to the end
-            const size_t hextetsAfterCompression = hextetCount - doubleColonPos;
-            for (size_t j = 0; j < hextetsAfterCompression; ++j) {
-                const size_t srcIdx = hextetCount - 1 - j;
-                const size_t dstIdx = 7 - j;
-                if (srcIdx != dstIdx) {
-                    hextets[dstIdx] = hextets[srcIdx];
-                    hextets[srcIdx] = 0;
-                }
-            }
-            // Zeros are already in place from initialization
-            hextetCount = 8;
-        }
-        
-        if (hextetCount != 8) {
-            return addr;  // Must have exactly 8 hextets
-        }
-        
-        // Convert hextets to bytes (big-endian)
-        for (size_t j = 0; j < 8; ++j) {
-            addr.address[j * 2] = static_cast<uint8_t>((hextets[j] >> 8) & 0xFF);
-            addr.address[j * 2 + 1] = static_cast<uint8_t>(hextets[j] & 0xFF);
-        }
-        addr.prefixLength = 128;  // Default prefix
-        
-        return addr;
+        return IPv6Address{};
     }
     
     /**
@@ -1786,7 +3375,10 @@ public:
         const LookupOptions& options
     ) noexcept {
         if (UNLIKELY(!m_initialized)) {
-            return ThreatLookupResult{};
+            ThreatLookupResult result;
+            result.errorCode = static_cast<uint32_t>(LookupErrorCode::NotInitialized);
+            result.errorMessage = GetErrorDescription(LookupErrorCode::NotInitialized);
+            return result;
         }
         
         const auto startTime = std::chrono::high_resolution_clock::now();
@@ -1797,8 +3389,8 @@ public:
             tlCache = GetOrCreateThreadLocalCache();
         }
         
-        // Execute lookup through engine
-        auto result = m_engine->ExecuteLookup(type, value, options, tlCache);
+        // Execute lookup through engine with optimizer for adaptive tier tracking
+        auto result = m_engine->ExecuteLookup(type, value, options, tlCache, m_optimizer.get());
         
         // Update statistics
         UpdateStatistics(result);
@@ -1841,26 +3433,27 @@ public:
         if (useParallel) {
             // Parallel batch lookup - do NOT use thread-local cache here
             // because std::execution::par_unseq may migrate work between threads
+            // Also don't use optimizer in parallel to avoid contention
             std::vector<ThreatLookupResult> results(values.size());
             
-            // Use atomic counter for safe index tracking
-            std::atomic<size_t> processedCount{0};
+            // Create index range for parallel processing
+            std::vector<size_t> indices(values.size());
+            std::iota(indices.begin(), indices.end(), 0);
             
             std::for_each(
                 std::execution::par_unseq,
-                values.begin(), values.end(),
-                [&](std::string_view value) {
-                    const size_t index = static_cast<size_t>(&value - &values[0]);
-                    // Pass nullptr for tlCache - parallel execution is unsafe with shared cache
-                    results[index] = m_engine->ExecuteLookup(type, value, options, nullptr);
+                indices.begin(), indices.end(),
+                [&](size_t index) {
+                    // Pass nullptr for tlCache and optimizer - parallel execution safety
+                    results[index] = m_engine->ExecuteLookup(type, values[index], options, nullptr, nullptr);
                 }
             );
             
             batchResult.results = std::move(results);
         } else {
-            // Sequential batch lookup
+            // Sequential batch lookup with optimizer tracking
             for (const auto& value : values) {
-                auto result = m_engine->ExecuteLookup(type, value, options, tlCache);
+                auto result = m_engine->ExecuteLookup(type, value, options, tlCache, m_optimizer.get());
                 batchResult.results.push_back(std::move(result));
             }
         }

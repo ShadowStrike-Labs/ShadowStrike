@@ -294,16 +294,15 @@ class IOCValidator {
 public:
     /**
      * @brief Validate IOC entry
+     * @details For new entries (entryId == 0), the ID will be auto-assigned.
+     *          Validation focuses on data integrity, not identity.
      */
     [[nodiscard]] static bool Validate(
         const IOCEntry& entry,
         std::string& errorMessage
     ) noexcept {
-        // Validate entry ID
-        if (entry.entryId == 0) {
-            errorMessage = "Entry ID cannot be zero";
-            return false;
-        }
+        // Note: entryId == 0 is allowed for NEW entries (auto-generated IDs)
+        // Only reject explicitly invalid types
         
         // Validate IOC type
         if (entry.type == IOCType::Reserved) {
@@ -311,38 +310,40 @@ public:
             return false;
         }
         
-        // Validate timestamps
-        if (entry.createdTime == 0) {
-            errorMessage = "Created time cannot be zero";
-            return false;
-        }
-        
-        if (entry.lastSeen < entry.firstSeen) {
-            errorMessage = "Last seen cannot be before first seen";
-            return false;
+        // Validate timestamps - allow 0 for auto-generation
+        // Timestamps will be set during AddIOC if not provided
+        if (entry.createdTime != 0 && entry.lastSeen != 0 && entry.firstSeen != 0) {
+            if (entry.lastSeen < entry.firstSeen) {
+                errorMessage = "Last seen cannot be before first seen";
+                return false;
+            }
         }
         
         if (HasFlag(entry.flags, IOCFlags::HasExpiration)) {
-            if (entry.expirationTime <= entry.createdTime) {
+            if (entry.expirationTime != 0 && entry.createdTime != 0 &&
+                entry.expirationTime <= entry.createdTime) {
                 errorMessage = "Expiration time must be after creation time";
                 return false;
             }
         }
         
-        // Validate reputation and confidence
-        if (static_cast<uint8_t>(entry.reputation) > 100) {
+        // Validate reputation and confidence enums are in valid range
+        // ReputationLevel and ConfidenceLevel are enums with defined values
+        if (static_cast<uint8_t>(entry.reputation) > static_cast<uint8_t>(ReputationLevel::Malicious)) {
             errorMessage = "Invalid reputation value";
             return false;
         }
         
-        if (static_cast<uint8_t>(entry.confidence) > 100) {
+        if (static_cast<uint8_t>(entry.confidence) > static_cast<uint8_t>(ConfidenceLevel::Confirmed)) {
             errorMessage = "Invalid confidence value";
             return false;
         }
         
-        // Validate based on IOC type
+        // Validate based on IOC type - check for meaningful data
         switch (entry.type) {
             case IOCType::IPv4:
+                // Check if IPv4 data is valid using existing IsValid() method
+                // IsValid() returns false for 0.0.0.0 and broadcast addresses
                 if (!entry.value.ipv4.IsValid()) {
                     errorMessage = "Invalid IPv4 address";
                     return false;
@@ -350,6 +351,7 @@ public:
                 break;
                 
             case IOCType::IPv6:
+                // Check if IPv6 data is valid using existing IsValid() method
                 if (!entry.value.ipv6.IsValid()) {
                     errorMessage = "Invalid IPv6 address";
                     return false;
@@ -357,18 +359,37 @@ public:
                 break;
                 
             case IOCType::FileHash:
-                if (!entry.value.hash.IsValid()) {
-                    errorMessage = "Invalid hash value";
+                if (entry.value.hash.length == 0 || 
+                    entry.value.hash.length > entry.value.hash.data.size()) {
+                    errorMessage = "Invalid hash length";
                     return false;
+                }
+                // Check if hash has valid data (at least one non-zero byte)
+                {
+                    bool hasData = false;
+                    for (size_t i = 0; i < entry.value.hash.length && i < entry.value.hash.data.size(); ++i) {
+                        if (entry.value.hash.data[i] != 0) {
+                            hasData = true;
+                            break;
+                        }
+                    }
+                    if (!hasData) {
+                        errorMessage = "Invalid hash: all zeros is not a valid IOC";
+                        return false;
+                    }
                 }
                 break;
                 
             case IOCType::Domain:
             case IOCType::URL:
             case IOCType::Email:
-                if (entry.value.stringRef.stringLength == 0 ||
-                    entry.value.stringRef.stringLength > MAX_URL_LENGTH) {
-                    errorMessage = "Invalid string length";
+                // String references must have non-zero length
+                if (entry.value.stringRef.stringLength == 0) {
+                    errorMessage = "Invalid string: empty string is not a valid IOC";
+                    return false;
+                }
+                if (entry.value.stringRef.stringLength > MAX_URL_LENGTH) {
+                    errorMessage = "String too long";
                     return false;
                 }
                 break;
@@ -1077,12 +1098,13 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
         std::string valueStr;
         switch (entry.type) {
             case IOCType::IPv4: {
+                // Use octets array for consistent representation
                 char buf[32];
                 snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
-                    (entry.value.ipv4.address >> 24) & 0xFF,
-                    (entry.value.ipv4.address >> 16) & 0xFF,
-                    (entry.value.ipv4.address >> 8) & 0xFF,
-                    entry.value.ipv4.address & 0xFF
+                    entry.value.ipv4.octets[0],
+                    entry.value.ipv4.octets[1],
+                    entry.value.ipv4.octets[2],
+                    entry.value.ipv4.octets[3]
                 );
                 valueStr = buf;
                 break;
@@ -1150,6 +1172,11 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
         newEntry.flags |= IOCFlags::HasExpiration;
     }
     
+    // Enable entry by default (unless explicitly disabled)
+    if (!HasFlag(newEntry.flags, IOCFlags::Revoked)) {
+        newEntry.flags |= IOCFlags::Enabled;
+    }
+    
     // Write to database
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
     
@@ -1175,11 +1202,34 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     // Update deduplication index (if applicable)
     if (!options.skipDeduplication) {
         std::string valueStr;
-        // Extract value (same logic as above)
-        // ... (omitted for brevity, same as deduplication check)
+        // Extract value string for deduplication index
+        switch (newEntry.type) {
+            case IOCType::IPv4: {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+                    newEntry.value.ipv4.octets[0],
+                    newEntry.value.ipv4.octets[1],
+                    newEntry.value.ipv4.octets[2],
+                    newEntry.value.ipv4.octets[3]
+                );
+                valueStr = buf;
+                break;
+            }
+            case IOCType::FileHash:
+                // Convert hash bytes to hex string
+                for (size_t i = 0; i < newEntry.value.hash.length; ++i) {
+                    char buf[3];
+                    snprintf(buf, sizeof(buf), "%02x", newEntry.value.hash.data[i]);
+                    valueStr += buf;
+                }
+                break;
+            default:
+                valueStr = ""; // String types handled by database
+                break;
+        }
         
         if (!valueStr.empty()) {
-            m_impl->deduplicator->Add(entry.type, valueStr, newEntry.entryId);
+            m_impl->deduplicator->Add(newEntry.type, valueStr, newEntry.entryId);
         }
     }
     

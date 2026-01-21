@@ -101,10 +101,8 @@ namespace {
         return std::nullopt;
     }
     
-    IPv4Address addr{};
-    addr.prefixLength = 32;  // Default full address
-    
     // Check for CIDR notation
+    uint8_t prefixLen = 32;  // Default full address
     size_t slashPos = str.find('/');
     std::string_view ipPart = (slashPos != std::string_view::npos) 
         ? str.substr(0, slashPos) 
@@ -128,11 +126,12 @@ namespace {
         if (prefix > 32) {
             return std::nullopt;
         }
-        addr.prefixLength = static_cast<uint8_t>(prefix);
+        prefixLen = static_cast<uint8_t>(prefix);
     }
     
-    // Parse octets safely without exceptions
-    uint32_t result = 0;
+    // Parse octets directly into array for consistent byte order
+    // This avoids endianness issues with the union-based IPv4Address structure
+    uint8_t octets[4] = {0};
     int octetIndex = 0;
     uint32_t currentOctet = 0;
     size_t digitCount = 0;
@@ -144,7 +143,7 @@ namespace {
                 return std::nullopt;
             }
             
-            result = (result << 8) | currentOctet;
+            octets[octetIndex] = static_cast<uint8_t>(currentOctet);
             ++octetIndex;
             currentOctet = 0;
             digitCount = 0;
@@ -168,8 +167,9 @@ namespace {
         return std::nullopt;
     }
     
-    addr.address = result;
-    return addr;
+    // Use IPv4Address::Create to ensure consistent byte order across the union
+    // This properly sets both the octets array and the address member
+    return IPv4Address::Create(octets[0], octets[1], octets[2], octets[3], prefixLen);
 }
 
 /**
@@ -583,8 +583,11 @@ public:
         result.lastSeen = tlResult.lastSeen;
         result.entry = tlResult.entry;
         
-        // Update lookup success/failure statistics atomically
-        // These counters track all lookup operations through Store interface
+        // Update lookup statistics atomically
+        // totalLookups is incremented for every lookup operation
+        stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
+        
+        // Track success/failure statistics
         if (result.found) {
             stats.successfulLookups.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -612,9 +615,17 @@ ThreatIntelStore::~ThreatIntelStore() {
 // ============================================================================
 
 bool ThreatIntelStore::Initialize(const StoreConfig& config) {
-    if (m_isInitialized.load(std::memory_order_acquire)) {
-        return false; // Already initialized
+    // Use compare_exchange to atomically check and set initialization flag
+    // This ensures only one thread can proceed with initialization
+    bool expected = false;
+    if (!m_isInitialized.compare_exchange_strong(expected, true, 
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false; // Another thread already initializing or initialized
     }
+    
+    // At this point, we have exclusive right to initialize
+    // If initialization fails, we must reset the flag
+    bool initSuccess = false;
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
@@ -660,6 +671,7 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
                 L"Failed to open database: %s",
                 config.databasePath.c_str()
             );
+            m_isInitialized.store(false, std::memory_order_release);
             return false;
         }
 
@@ -683,6 +695,7 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
                     __FUNCTIONW__,
                     L"Failed to initialize reputation cache"
                 );
+                m_isInitialized.store(false, std::memory_order_release);
                 return false;
             }
         }
@@ -699,13 +712,26 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
                 __FUNCTIONW__,
                 L"Failed to get database header"
             );
+            m_isInitialized.store(false, std::memory_order_release);
             return false;
         }
 
-        // Create memory-mapped view for index
-        MemoryMappedView view;
-        view.baseAddress = const_cast<void*>(static_cast<const void*>(header));
-        view.fileSize = m_impl->database->GetMappedSize();
+        // Get properly populated memory-mapped view from database
+        // TITANIUM: Using GetMemoryMappedView() ensures all handles and addresses
+        // are correctly populated for ThreatIntelIndex initialization
+        MemoryMappedView view = m_impl->database->GetMemoryMappedView();
+        if (!view.IsValid()) {
+            Utils::Logger::Instance().LogEx(
+                Utils::LogLevel::Error,
+                L"ThreatIntelStore",
+                __FILEW__,
+                __LINE__,
+                __FUNCTIONW__,
+                L"Failed to get valid memory-mapped view from database"
+            );
+            m_isInitialized.store(false, std::memory_order_release);
+            return false;
+        }
 
         IndexBuildOptions indexOpts = IndexBuildOptions::Default();
         auto initError = m_impl->index->Initialize(view, header, indexOpts);
@@ -719,6 +745,7 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
                 L"Failed to initialize index: %S",
                 initError.message.c_str()
             );
+            m_isInitialized.store(false, std::memory_order_release);
             return false;
         }
 
@@ -734,6 +761,7 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
                 __FUNCTIONW__,
                 L"Failed to initialize IOC manager"
             );
+            m_isInitialized.store(false, std::memory_order_release);
             return false;
         }
 
@@ -757,6 +785,7 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
                 __FUNCTIONW__,
                 L"Failed to initialize lookup interface"
             );
+            m_isInitialized.store(false, std::memory_order_release);
             return false;
         }
 
@@ -783,7 +812,7 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
         m_impl->stats.lastUpdateAt = m_impl->stats.createdAt;
         m_impl->UpdateStatistics();
 
-        m_isInitialized.store(true, std::memory_order_release);
+        // m_isInitialized already set to true via compare_exchange_strong at the start
 
         Utils::Logger::Instance().LogEx(
             Utils::LogLevel::Info,
@@ -798,6 +827,9 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
         return true;
 
     } catch (const std::exception& ex) {
+        // Reset initialization flag on failure
+        m_isInitialized.store(false, std::memory_order_release);
+        
         Utils::Logger::Instance().LogEx(
             Utils::LogLevel::Error,
             L"ThreatIntelStore",
@@ -809,6 +841,9 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
         );
         return false;
     } catch (...) {
+        // Reset initialization flag on failure
+        m_isInitialized.store(false, std::memory_order_release);
+        
         Utils::Logger::Instance().LogEx(
             Utils::LogLevel::Error,
             L"ThreatIntelStore",
@@ -915,8 +950,7 @@ StoreLookupResult ThreatIntelStore::LookupHash(
     auto tlResult = m_impl->lookup->LookupHash(hashOpt.value(), unifiedOpts);
     auto result = m_impl->ConvertLookupResult(tlResult);
     
-    // Update statistics (successfulLookups/failedLookups updated in ConvertLookupResult)
-    m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
+    // Additional statistics for hash lookups (totalLookups already incremented in ConvertLookupResult)
     if (result.found) {
         m_impl->stats.databaseHits.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -1694,10 +1728,10 @@ bool ThreatIntelStore::UpdateFeed(const std::string& feedId) noexcept {
         return false;
     }
 
-    // Create minimal config for update
-    ThreatFeedConfig cfg{};
-    cfg.feedId = feedId;
-    return m_impl->feedManager->UpdateFeed(feedId, cfg);
+    // Trigger a manual sync for this feed
+    // SyncFeed returns a SyncResult with success flag
+    auto result = m_impl->feedManager->SyncFeed(feedId, nullptr);
+    return result.success;
 }
 
 size_t ThreatIntelStore::UpdateAllFeeds() noexcept {
@@ -4102,50 +4136,187 @@ void ThreatIntelStore::UnregisterEventCallback(size_t callbackId) noexcept {
 // Factory Functions
 // ============================================================================
 
+/**
+ * @brief Create an UNINITIALIZED ThreatIntelStore
+ * 
+ * Creates a new ThreatIntelStore instance that is NOT initialized.
+ * Caller must call Initialize() before using the store.
+ * 
+ * @return Unique pointer to uninitialized store, never nullptr
+ */
 std::unique_ptr<ThreatIntelStore> CreateThreatIntelStore() {
     try {
-        auto store = std::make_unique<ThreatIntelStore>();
-        if (!store->Initialize()) {
-            return nullptr;
-        }
-        return store;
+        // Just construct - do NOT initialize
+        // Caller is responsible for calling Initialize()
+        return std::make_unique<ThreatIntelStore>();
+    } catch (const std::exception& ex) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Failed to create ThreatIntelStore: %S",
+            ex.what()
+        );
+        return nullptr;
     } catch (...) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Unknown exception creating ThreatIntelStore"
+        );
         return nullptr;
     }
 }
 
+/**
+ * @brief Create and initialize a ThreatIntelStore with specific configuration
+ * 
+ * Creates a new ThreatIntelStore instance and initializes it with the
+ * provided configuration. Returns nullptr if initialization fails.
+ * 
+ * @param config Store configuration
+ * @return Unique pointer to initialized store, or nullptr on failure
+ */
 std::unique_ptr<ThreatIntelStore> CreateThreatIntelStore(const StoreConfig& config) {
     try {
         auto store = std::make_unique<ThreatIntelStore>();
         if (!store->Initialize(config)) {
+            Utils::Logger::Instance().LogEx(
+                Utils::LogLevel::Error,
+                L"ThreatIntelStore",
+                __FILEW__,
+                __LINE__,
+                __FUNCTIONW__,
+                L"Failed to initialize ThreatIntelStore with config"
+            );
             return nullptr;
         }
         return store;
+    } catch (const std::exception& ex) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Exception creating ThreatIntelStore: %S",
+            ex.what()
+        );
+        return nullptr;
     } catch (...) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Unknown exception creating ThreatIntelStore"
+        );
         return nullptr;
     }
 }
 
+/**
+ * @brief Create and initialize a high-performance ThreatIntelStore
+ * 
+ * Creates a store optimized for maximum lookup throughput:
+ * - Larger caches
+ * - More aggressive prefetching
+ * - SIMD optimizations enabled
+ * - Higher thread-local cache sizes
+ * 
+ * @return Unique pointer to initialized high-performance store, or nullptr on failure
+ */
 std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore() {
     try {
         auto store = std::make_unique<ThreatIntelStore>();
         if (!store->Initialize(StoreConfig::CreateHighPerformance())) {
+            Utils::Logger::Instance().LogEx(
+                Utils::LogLevel::Error,
+                L"ThreatIntelStore",
+                __FILEW__,
+                __LINE__,
+                __FUNCTIONW__,
+                L"Failed to initialize high-performance ThreatIntelStore"
+            );
             return nullptr;
         }
         return store;
+    } catch (const std::exception& ex) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Exception creating high-performance ThreatIntelStore: %S",
+            ex.what()
+        );
+        return nullptr;
     } catch (...) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Unknown exception creating high-performance ThreatIntelStore"
+        );
         return nullptr;
     }
 }
 
+/**
+ * @brief Create and initialize a low-memory ThreatIntelStore
+ * 
+ * Creates a store optimized for minimal memory footprint:
+ * - Smaller caches
+ * - Memory-mapped access only
+ * - Reduced thread-local storage
+ * - Suitable for embedded/constrained environments
+ * 
+ * @return Unique pointer to initialized low-memory store, or nullptr on failure
+ */
 std::unique_ptr<ThreatIntelStore> CreateLowMemoryThreatIntelStore() {
     try {
         auto store = std::make_unique<ThreatIntelStore>();
         if (!store->Initialize(StoreConfig::CreateLowMemory())) {
+            Utils::Logger::Instance().LogEx(
+                Utils::LogLevel::Error,
+                L"ThreatIntelStore",
+                __FILEW__,
+                __LINE__,
+                __FUNCTIONW__,
+                L"Failed to initialize low-memory ThreatIntelStore"
+            );
             return nullptr;
         }
         return store;
+    } catch (const std::exception& ex) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Exception creating low-memory ThreatIntelStore: %S",
+            ex.what()
+        );
+        return nullptr;
     } catch (...) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Unknown exception creating low-memory ThreatIntelStore"
+        );
         return nullptr;
     }
 }

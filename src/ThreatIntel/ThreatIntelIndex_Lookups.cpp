@@ -53,6 +53,10 @@ namespace ThreatIntel {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
 
+                        // Count bloom filter rejections as failed lookups for statistics
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
+
                         if (options.collectStatistics) {
                             result.latencyNs = GetNanoseconds() - startTime;
                         }
@@ -187,11 +191,20 @@ namespace ThreatIntel {
             IndexLookupResult result;
             result.indexType = IOCType::Domain;
 
-            // Check bloom filter
+            // Normalize domain for case-insensitive lookup
+            // Must normalize BEFORE bloom filter check to ensure consistent hashing
+            const std::string normalizedDomain = NormalizeDomain(domain);
+            if (normalizedDomain.empty()) {
+                m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
+                return result;
+            }
+
+            // Check bloom filter with normalized domain
             if (options.useBloomFilter) {
                 auto bloomIt = m_impl->bloomFilters.find(IOCType::Domain);
                 if (bloomIt != m_impl->bloomFilters.end()) {
-                    uint64_t key = HashString(domain);
+                    uint64_t key = HashString(normalizedDomain);
 
                     result.bloomChecked = true;
 
@@ -210,9 +223,9 @@ namespace ThreatIntel {
                 }
             }
 
-            // Perform lookup
+            // Perform lookup (trie also normalizes, but we pass normalized for consistency)
             IndexValue lookupValue;
-            bool found = m_impl->domainIndex->Lookup(domain, lookupValue);
+            bool found = m_impl->domainIndex->Lookup(normalizedDomain, lookupValue);
 
             if (found) {
                 result.found = true;

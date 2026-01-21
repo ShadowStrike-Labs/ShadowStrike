@@ -699,14 +699,16 @@ std::string FormatIPv4(const IPv4Address& addr) {
     std::string result;
     result.reserve(18);  // Max: "255.255.255.255/32"
     
-    // Format octets
-    result += std::to_string((addr.address >> 24) & 0xFF);
+    // Format octets directly from array to avoid endianness issues with union
+    // octets[0] = high octet (first number in dotted notation)
+    // octets[3] = low octet (last number in dotted notation)
+    result += std::to_string(addr.octets[0]);
     result += '.';
-    result += std::to_string((addr.address >> 16) & 0xFF);
+    result += std::to_string(addr.octets[1]);
     result += '.';
-    result += std::to_string((addr.address >> 8) & 0xFF);
+    result += std::to_string(addr.octets[2]);
     result += '.';
-    result += std::to_string(addr.address & 0xFF);
+    result += std::to_string(addr.octets[3]);
     
     // Add CIDR notation if not /32
     if (addr.prefixLength != 32) {
@@ -992,7 +994,8 @@ bool IsValidDomain(std::string_view domain) noexcept {
     }
     
     // Must have at least one dot (TLD required for valid domain)
-    if (domain.find('.') == std::string_view::npos) {
+    size_t lastDot = domain.rfind('.');
+    if (lastDot == std::string_view::npos) {
         return false;
     }
     
@@ -1014,21 +1017,37 @@ bool IsValidDomain(std::string_view domain) noexcept {
         }
     }
     
-    // Split into labels
+    // Extract TLD for validation
+    std::string_view tld = domain.substr(lastDot + 1);
+    
+    // TLD must contain at least one alphabetic character
+    // RFC 1123: No valid TLD is purely numeric
+    // This rejects malformed domains like "example.123"
+    bool tldHasAlpha = false;
+    for (char c : tld) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            tldHasAlpha = true;
+            break;
+        }
+    }
+    if (!tldHasAlpha) {
+        return false;  // TLD must have at least one letter
+    }
+    
+    // Split into labels and validate each
     size_t labelStart = 0;
     size_t labelCount = 0;
-    bool hasAlpha = false;
     
     for (size_t i = 0; i <= domain.length(); ++i) {
         if (i == domain.length() || domain[i] == '.') {
             std::string_view label = domain.substr(labelStart, i - labelStart);
             
-            // Label length check (1-63 characters)
+            // Label length check (1-63 characters per RFC 1035)
             if (label.empty() || label.length() > 63) {
                 return false;
             }
             
-            // Label cannot start or end with hyphen
+            // Label cannot start or end with hyphen (RFC 1123)
             if (label.front() == '-' || label.back() == '-') {
                 return false;
             }
@@ -1037,13 +1056,10 @@ bool IsValidDomain(std::string_view domain) noexcept {
             for (char c : label) {
                 if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                       (c >= '0' && c <= '9') || c == '-')) {
-                    // Allow underscore for some DNS records (e.g., DKIM)
+                    // Allow underscore for some DNS records (e.g., DKIM, DMARC)
                     if (c != '_') {
                         return false;
                     }
-                }
-                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-                    hasAlpha = true;
                 }
             }
             
@@ -1386,56 +1402,84 @@ bool IsValidURL(std::string_view url) noexcept {
 
         ipPart = addr.substr(0, slashPos);
     }
+    
+    // Handle special cases: "::" (unspecified) and "::1" (loopback)
+    if (ipPart == "::" || ipPart == "::1") {
+        return true;
+    }
 
     // Count colons and detect "::" compression
     int colonCount = 0;
     int doubleColonCount = 0;
-    size_t prevColon = std::string_view::npos;
+    bool prevWasColon = false;
 
     for (size_t i = 0; i < ipPart.size(); ++i) {
         if (ipPart[i] == ':') {
             ++colonCount;
-            if (prevColon != std::string_view::npos && i == prevColon + 1) {
+            if (prevWasColon) {
                 ++doubleColonCount;
             }
-            prevColon = i;
+            prevWasColon = true;
+        } else {
+            prevWasColon = false;
         }
     }
 
-    // Max one "::" allowed
+    // Max one "::" compression allowed
     if (doubleColonCount > 1) return false;
 
-    // Must have at least 2 colons and at most 7 (or less with ::)
-    if (colonCount < 2 || (doubleColonCount == 0 && colonCount != 7)) return false;
+    // Full form requires exactly 7 colons; compressed form can have 2-7
+    if (doubleColonCount == 0 && colonCount != 7) return false;
+    if (doubleColonCount == 1 && colonCount > 7) return false;
+    if (colonCount < 2) return false;
 
     // Validate each hex segment
     size_t pos = 0;
     int segments = 0;
-
-    while (pos < ipPart.size()) {
-        if (ipPart[pos] == ':') {
-            ++pos;
-            continue;
-        }
-
-        // Parse hex segment
-        size_t hexDigits = 0;
+    bool lastWasEmpty = false;
+    
+    while (pos <= ipPart.size()) {
+        // Find end of current segment
+        size_t segStart = pos;
         while (pos < ipPart.size() && ipPart[pos] != ':') {
-            char c = ipPart[pos];
-            bool isHex = (c >= '0' && c <= '9') ||
-                (c >= 'a' && c <= 'f') ||
-                (c >= 'A' && c <= 'F') ||
-                (c == '.');  // For IPv4-mapped suffix
-            if (!isHex) return false;
-            ++hexDigits;
             ++pos;
         }
-
-        // Segment must have 1-4 hex digits (or be IPv4 part)
-        if (hexDigits > 0) ++segments;
+        
+        size_t segLen = pos - segStart;
+        
+        if (segLen == 0) {
+            // Empty segment (from ::)
+            lastWasEmpty = true;
+        } else {
+            // Validate hex segment (1-4 hex digits)
+            if (segLen > 4) return false;
+            
+            for (size_t i = segStart; i < pos; ++i) {
+                char c = ipPart[i];
+                bool isHex = (c >= '0' && c <= '9') ||
+                             (c >= 'a' && c <= 'f') ||
+                             (c >= 'A' && c <= 'F');
+                if (!isHex) return false;
+            }
+            
+            ++segments;
+            lastWasEmpty = false;
+        }
+        
+        // Skip the colon
+        if (pos < ipPart.size()) {
+            ++pos;
+        } else {
+            break;
+        }
     }
 
-    return segments >= 2 && segments <= 8;
+    // With ::, we can have 1-7 segments; without, must have exactly 8
+    if (doubleColonCount == 1) {
+        return segments >= 1 && segments <= 7;
+    } else {
+        return segments == 8;
+    }
 }
 
 /**
@@ -1785,13 +1829,35 @@ std::optional<uint64_t> ParseSTIXTimestamp(std::string_view timestamp) noexcept 
         return std::nullopt;
     }
     
-    // Validate ranges
+    // Validate basic ranges
     if (year < 1970 || year > 2100) return std::nullopt;
     if (month < 1 || month > 12) return std::nullopt;
     if (day < 1 || day > 31) return std::nullopt;
     if (hour < 0 || hour > 23) return std::nullopt;
     if (minute < 0 || minute > 59) return std::nullopt;
     if (second < 0 || second > 60) return std::nullopt;  // 60 for leap seconds
+    
+    // Enterprise-grade date validation: validate day based on month
+    // Days per month lookup (non-leap year)
+    static constexpr int daysInMonth[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    
+    int maxDay = daysInMonth[month - 1];
+    
+    // Handle February in leap years
+    // Leap year rules: divisible by 4, except centuries unless divisible by 400
+    if (month == 2) {
+        bool isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        if (isLeapYear) {
+            maxDay = 29;
+        }
+    }
+    
+    // Validate day against month limit
+    if (day > maxDay) {
+        return std::nullopt;  // Invalid day for this month (e.g., Feb 30, Apr 31)
+    }
     
     // Convert to Unix epoch
     std::tm tm{};

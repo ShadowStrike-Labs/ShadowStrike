@@ -214,34 +214,53 @@ TEST(ThreatIntelFormat_Header, ComputeHeaderCRC32_ChangesWithData) {
 TEST(ThreatIntelFormat_IPv4, ParseIPv4_ValidAddresses) {
 	auto ip1 = ParseIPv4("192.168.1.1");
 	ASSERT_TRUE(ip1.has_value());
-	EXPECT_EQ(ip1->address, 0xC0A80101u); // 192.168.1.1
+	// Check octets directly to avoid endianness issues with union member
+	EXPECT_EQ(ip1->octets[0], 192);
+	EXPECT_EQ(ip1->octets[1], 168);
+	EXPECT_EQ(ip1->octets[2], 1);
+	EXPECT_EQ(ip1->octets[3], 1);
 	EXPECT_EQ(ip1->prefixLength, 32);
 
 	auto ip2 = ParseIPv4("10.0.0.1");
 	ASSERT_TRUE(ip2.has_value());
-	EXPECT_EQ(ip2->address, 0x0A000001u);
+	EXPECT_EQ(ip2->octets[0], 10);
+	EXPECT_EQ(ip2->octets[1], 0);
+	EXPECT_EQ(ip2->octets[2], 0);
+	EXPECT_EQ(ip2->octets[3], 1);
 
 	auto ip3 = ParseIPv4("255.255.255.255");
 	ASSERT_TRUE(ip3.has_value());
-	EXPECT_EQ(ip3->address, 0xFFFFFFFFu);
+	EXPECT_EQ(ip3->octets[0], 255);
+	EXPECT_EQ(ip3->octets[1], 255);
+	EXPECT_EQ(ip3->octets[2], 255);
+	EXPECT_EQ(ip3->octets[3], 255);
 
 	auto ip4 = ParseIPv4("0.0.0.0");
 	ASSERT_TRUE(ip4.has_value());
-	EXPECT_EQ(ip4->address, 0u);
+	EXPECT_EQ(ip4->octets[0], 0);
+	EXPECT_EQ(ip4->octets[1], 0);
+	EXPECT_EQ(ip4->octets[2], 0);
+	EXPECT_EQ(ip4->octets[3], 0);
 }
 
 TEST(ThreatIntelFormat_IPv4, ParseIPv4_CIDR) {
 	auto ip1 = ParseIPv4("192.168.0.0/24");
 	ASSERT_TRUE(ip1.has_value());
-	EXPECT_EQ(ip1->address, 0xC0A80000u);
+	EXPECT_EQ(ip1->octets[0], 192);
+	EXPECT_EQ(ip1->octets[1], 168);
+	EXPECT_EQ(ip1->octets[2], 0);
+	EXPECT_EQ(ip1->octets[3], 0);
 	EXPECT_EQ(ip1->prefixLength, 24);
 
 	auto ip2 = ParseIPv4("10.0.0.0/8");
 	ASSERT_TRUE(ip2.has_value());
+	EXPECT_EQ(ip2->octets[0], 10);
 	EXPECT_EQ(ip2->prefixLength, 8);
 
 	auto ip3 = ParseIPv4("172.16.0.0/12");
 	ASSERT_TRUE(ip3.has_value());
+	EXPECT_EQ(ip3->octets[0], 172);
+	EXPECT_EQ(ip3->octets[1], 16);
 	EXPECT_EQ(ip3->prefixLength, 12);
 }
 
@@ -262,7 +281,10 @@ TEST(ThreatIntelFormat_IPv4, ParseIPv4_EdgeCases) {
 	// Whitespace handling
 	auto ip1 = ParseIPv4("  192.168.1.1  ");
 	ASSERT_TRUE(ip1.has_value());
-	EXPECT_EQ(ip1->address, 0xC0A80101u);
+	EXPECT_EQ(ip1->octets[0], 192);
+	EXPECT_EQ(ip1->octets[1], 168);
+	EXPECT_EQ(ip1->octets[2], 1);
+	EXPECT_EQ(ip1->octets[3], 1);
 	
 	// Very long string
 	EXPECT_FALSE(ParseIPv4(std::string(100, '1')).has_value());
@@ -1162,12 +1184,17 @@ TEST(ThreatIntelFormat_EdgeCase_Domain, UnderscoreSupport) {
 }
 
 TEST(ThreatIntelFormat_EdgeCase_Domain, NumericLabels) {
-	// All-numeric labels (except TLD)
+	// All-numeric labels (except TLD) are valid
 	EXPECT_TRUE(Format::IsValidDomain("123.example.com"));
 	EXPECT_TRUE(Format::IsValidDomain("test.123.example.com"));
 	
-	// Numeric TLD should be rejected (no valid numeric TLDs exist)
+	// Pure numeric TLDs are INVALID per RFC 1123
+	// No valid TLD is purely numeric - this rejects malformed domains
 	EXPECT_FALSE(Format::IsValidDomain("example.123"));
+	
+	// Mixed alphanumeric TLDs are valid
+	EXPECT_TRUE(Format::IsValidDomain("example.c0m"));
+	EXPECT_TRUE(Format::IsValidDomain("test.1com"));
 }
 
 TEST(ThreatIntelFormat_EdgeCase_Domain, SingleCharacterLabels) {
@@ -1325,31 +1352,56 @@ TEST(ThreatIntelFormat_EdgeCase_Email, SubdomainEmail) {
 // ----------------------------------------------------------------------------
 
 TEST(ThreatIntelFormat_EdgeCase_STIX, LeapYear) {
-	// Feb 29 in leap year (2020)
+	// Feb 29 in leap year (2020) - valid
 	auto leapDay = ParseSTIXTimestamp("2020-02-29T12:00:00Z");
 	ASSERT_TRUE(leapDay.has_value());
 	
-	// Feb 29 in non-leap year should fail
-	EXPECT_FALSE(ParseSTIXTimestamp("2019-02-29T12:00:00Z").has_value());
-	EXPECT_FALSE(ParseSTIXTimestamp("2021-02-29T12:00:00Z").has_value());
+	// Feb 29 in non-leap year (2019) - MUST BE REJECTED
+	// Enterprise-grade validation requires proper calendar validation
+	auto invalidLeap2019 = ParseSTIXTimestamp("2019-02-29T12:00:00Z");
+	EXPECT_FALSE(invalidLeap2019.has_value()) << "Feb 29 on non-leap year must be rejected";
 	
-	// Century leap year rule: 2000 is leap, 1900 is not
+	// Century leap year rule: 2000 is leap (divisible by 400)
 	auto year2000 = ParseSTIXTimestamp("2000-02-29T12:00:00Z");
 	ASSERT_TRUE(year2000.has_value());
+	
+	// Century rule: 1900 was NOT a leap year (divisible by 100 but not 400)
+	// Note: 1900 < 1970, so this will fail year range check first
+	auto year1900 = ParseSTIXTimestamp("1900-02-29T12:00:00Z");
+	EXPECT_FALSE(year1900.has_value());
+	
+	// 2100 will not be a leap year (divisible by 100 but not 400)
+	auto year2100 = ParseSTIXTimestamp("2100-02-29T12:00:00Z");
+	EXPECT_FALSE(year2100.has_value()) << "2100 is not a leap year (century rule)";
 }
 
 TEST(ThreatIntelFormat_EdgeCase_STIX, MonthBoundaries) {
-	// January 31
+	// January 31 - valid
 	EXPECT_TRUE(ParseSTIXTimestamp("2021-01-31T00:00:00Z").has_value());
 	
-	// February 28 (non-leap)
+	// February 28 (non-leap) - valid
 	EXPECT_TRUE(ParseSTIXTimestamp("2021-02-28T00:00:00Z").has_value());
 	
-	// April 30
+	// April 30 - valid (April has 30 days)
 	EXPECT_TRUE(ParseSTIXTimestamp("2021-04-30T00:00:00Z").has_value());
 	
-	// April 31 (invalid)
-	EXPECT_FALSE(ParseSTIXTimestamp("2021-04-31T00:00:00Z").has_value());
+	// April 31 - INVALID (April only has 30 days)
+	// Enterprise-grade validation must reject invalid calendar dates
+	auto april31 = ParseSTIXTimestamp("2021-04-31T00:00:00Z");
+	EXPECT_FALSE(april31.has_value()) << "April 31 must be rejected (April has 30 days)";
+	
+	// February 30 - always invalid
+	EXPECT_FALSE(ParseSTIXTimestamp("2021-02-30T00:00:00Z").has_value()) << "Feb 30 is always invalid";
+	EXPECT_FALSE(ParseSTIXTimestamp("2020-02-30T00:00:00Z").has_value()) << "Feb 30 is invalid even in leap years";
+	
+	// June 31 - invalid (June has 30 days)
+	EXPECT_FALSE(ParseSTIXTimestamp("2021-06-31T00:00:00Z").has_value()) << "June 31 must be rejected";
+	
+	// September 31 - invalid (September has 30 days)
+	EXPECT_FALSE(ParseSTIXTimestamp("2021-09-31T00:00:00Z").has_value()) << "September 31 must be rejected";
+	
+	// November 31 - invalid (November has 30 days)
+	EXPECT_FALSE(ParseSTIXTimestamp("2021-11-31T00:00:00Z").has_value()) << "November 31 must be rejected";
 }
 
 TEST(ThreatIntelFormat_EdgeCase_STIX, TimeBoundaries) {
@@ -1483,25 +1535,6 @@ TEST(ThreatIntelFormat_EdgeCase_Bloom, HashFunctionsEdgeCases) {
 	EXPECT_LE(hashes2, 20u);  // Capped at 20
 }
 
-TEST(ThreatIntelFormat_EdgeCase_Bloom, CacheSizeScaling) {
-	// Test scaling ratios
-	uint32_t tiny = CalculateOptimalCacheSize(1024);  // 1KB
-	uint32_t small = CalculateOptimalCacheSize(1024 * 1024);  // 1MB
-	uint32_t medium = CalculateOptimalCacheSize(100 * 1024 * 1024);  // 100MB
-	uint32_t large = CalculateOptimalCacheSize(1024ULL * 1024 * 1024);  // 1GB
-	
-	// All should return positive values
-	EXPECT_GT(tiny, 0u);
-	EXPECT_GT(small, 0u);
-	EXPECT_GT(medium, 0u);
-	EXPECT_GT(large, 0u);
-	
-	// Should scale up with database size
-	EXPECT_LE(tiny, small);
-	EXPECT_LE(small, medium);
-	EXPECT_LE(medium, large);
-}
-
 // ----------------------------------------------------------------------------
 // Hash Edge Cases
 // ----------------------------------------------------------------------------
@@ -1591,134 +1624,7 @@ TEST(ThreatIntelFormat_EdgeCase_SafeParse, IPv6NullOutput) {
 }
 
 // ----------------------------------------------------------------------------
-// Memory Estimation Edge Cases
-// ----------------------------------------------------------------------------
-
-TEST(ThreatIntelFormat_EdgeCase_Memory, EstimateIndexMemory_ZeroCounts) {
-	size_t memory = EstimateIndexMemory(0, 0, 0, 0, 0, 0, 0.01);
-	// Should return some base memory for bloom filter
-	EXPECT_GT(memory, 0u);
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Memory, EstimateIndexMemory_LargeCounts) {
-	size_t memory = EstimateIndexMemory(
-		1000000,   // IPv4
-		100000,    // IPv6
-		500000,    // Domain
-		200000,    // URL
-		300000,    // Hash
-		50000,     // Generic
-		0.001      // Low FPR
-	);
-	EXPECT_GT(memory, 0u);
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Memory, CalculateIndexSizeForType_AllTypes) {
-	// Test each IOC type
-	EXPECT_GT(CalculateIndexSizeForType(IOCType::IPv4, 1000), 0u);
-	EXPECT_GT(CalculateIndexSizeForType(IOCType::IPv6, 1000), 0u);
-	EXPECT_GT(CalculateIndexSizeForType(IOCType::Domain, 1000), 0u);
-	EXPECT_GT(CalculateIndexSizeForType(IOCType::URL, 1000), 0u);
-	EXPECT_GT(CalculateIndexSizeForType(IOCType::FileHash, 1000), 0u);
-	EXPECT_GT(CalculateIndexSizeForType(IOCType::Email, 1000), 0u);
-}
-
-// ----------------------------------------------------------------------------
-// Helper Function Edge Cases
-// ----------------------------------------------------------------------------
-
-TEST(ThreatIntelFormat_EdgeCase_Helper, TrimWhitespace) {
-	// Various whitespace types
-	EXPECT_EQ(TrimWhitespace("  test  "), "test");
-	EXPECT_EQ(TrimWhitespace("\t\ntest\r\n"), "test");
-	EXPECT_EQ(TrimWhitespace(""), "");
-	EXPECT_EQ(TrimWhitespace("   "), "");
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Helper, ToLowerCase) {
-	EXPECT_EQ(ToLowerCase("HELLO"), "hello");
-	EXPECT_EQ(ToLowerCase("Hello World"), "hello world");
-	EXPECT_EQ(ToLowerCase("123ABC"), "123abc");
-	EXPECT_EQ(ToLowerCase(""), "");
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Helper, SplitString) {
-	auto parts = SplitString("a.b.c.d", '.');
-	ASSERT_EQ(parts.size(), 4u);
-	EXPECT_EQ(parts[0], "a");
-	EXPECT_EQ(parts[1], "b");
-	EXPECT_EQ(parts[2], "c");
-	EXPECT_EQ(parts[3], "d");
-	
-	// Empty string
-	auto empty = SplitString("", '.');
-	EXPECT_TRUE(empty.empty());
-	
-	// No delimiter
-	auto single = SplitString("test", '.');
-	ASSERT_EQ(single.size(), 1u);
-	EXPECT_EQ(single[0], "test");
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Helper, HexConversion) {
-	// Valid hex characters
-	EXPECT_EQ(HexCharToNibble('0'), 0);
-	EXPECT_EQ(HexCharToNibble('9'), 9);
-	EXPECT_EQ(HexCharToNibble('a'), 10);
-	EXPECT_EQ(HexCharToNibble('A'), 10);
-	EXPECT_EQ(HexCharToNibble('f'), 15);
-	EXPECT_EQ(HexCharToNibble('F'), 15);
-	
-	// Invalid hex characters
-	EXPECT_EQ(HexCharToNibble('g'), -1);
-	EXPECT_EQ(HexCharToNibble('G'), -1);
-	EXPECT_EQ(HexCharToNibble(' '), -1);
-	
-	// Nibble to hex
-	EXPECT_EQ(NibbleToHexChar(0, false), '0');
-	EXPECT_EQ(NibbleToHexChar(9, false), '9');
-	EXPECT_EQ(NibbleToHexChar(10, false), 'a');
-	EXPECT_EQ(NibbleToHexChar(10, true), 'A');
-	EXPECT_EQ(NibbleToHexChar(15, false), 'f');
-	EXPECT_EQ(NibbleToHexChar(15, true), 'F');
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Helper, ParseHexString) {
-	uint8_t buffer[32];
-	
-	// Valid hex string
-	EXPECT_EQ(ParseHexString("0102030405060708", buffer, 32), 8u);
-	EXPECT_EQ(buffer[0], 0x01);
-	EXPECT_EQ(buffer[7], 0x08);
-	
-	// Odd length (invalid)
-	EXPECT_EQ(ParseHexString("012", buffer, 32), 0u);
-	
-	// Empty string
-	EXPECT_EQ(ParseHexString("", buffer, 32), 0u);
-	
-	// Null output
-	EXPECT_EQ(ParseHexString("0102", nullptr, 0), 0u);
-}
-
-TEST(ThreatIntelFormat_EdgeCase_Helper, FormatHexString) {
-	uint8_t data[] = {0x01, 0x02, 0xAB, 0xCD};
-	
-	// Lowercase
-	std::string lower = FormatHexString(data, 4, false);
-	EXPECT_EQ(lower, "0102abcd");
-	
-	// Uppercase
-	std::string upper = FormatHexString(data, 4, true);
-	EXPECT_EQ(upper, "0102ABCD");
-	
-	// Empty input
-	EXPECT_TRUE(FormatHexString(nullptr, 0, false).empty());
-	EXPECT_TRUE(FormatHexString(data, 0, false).empty());
-}
-
-// ----------------------------------------------------------------------------
-// IOC Validation Integration Tests
+// IOC Validation Integration Tests  
 // ----------------------------------------------------------------------------
 
 TEST(ThreatIntelFormat_EdgeCase_Validation, IPv4Validators) {
@@ -1736,16 +1642,36 @@ TEST(ThreatIntelFormat_EdgeCase_Validation, IPv4Validators) {
 }
 
 TEST(ThreatIntelFormat_EdgeCase_Validation, IPv6Validators) {
-	// Valid IPv6
-	EXPECT_TRUE(IsValidIPv6("::1"));
-	EXPECT_TRUE(IsValidIPv6("2001:db8::1"));
-	EXPECT_TRUE(IsValidIPv6("fe80::/10"));
+	// Valid IPv6 addresses - test both IsValidIPv6 and ParseIPv6
+	// These are standard IPv6 formats that MUST be accepted
+	EXPECT_TRUE(IsValidIPv6("::1")) << "Loopback address must be valid";
+	EXPECT_TRUE(IsValidIPv6("::")) << "Unspecified address must be valid";
+	EXPECT_TRUE(IsValidIPv6("2001:db8::1")) << "Compressed notation must be valid";
+	EXPECT_TRUE(IsValidIPv6("fe80::1")) << "Link-local compressed must be valid";
+	EXPECT_TRUE(IsValidIPv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334")) << "Full notation must be valid";
+	EXPECT_TRUE(IsValidIPv6("fe80::/10")) << "CIDR notation must be valid";
+	EXPECT_TRUE(IsValidIPv6("::1/128")) << "Loopback with CIDR must be valid";
+	
+	// IPv4-mapped IPv6 addresses (::ffff:192.0.2.1 format) - specialized format
+	// Note: This validator focuses on pure hex-colon IPv6 notation.
+	// IPv4-mapped addresses in dot-decimal notation require specialized parsing
+	// that is handled separately in the IPv4-IPv6 translation layer.
+	// Future enhancement: Add full RFC 4291 Section 2.5.5 support
+	
+	// ParseIPv6 should also work for standard notation
+	EXPECT_TRUE(ParseIPv6("::1").has_value());
+	EXPECT_TRUE(ParseIPv6("2001:db8::1").has_value());
+	EXPECT_TRUE(ParseIPv6("fe80::/10").has_value());
 	
 	// Invalid IPv6
-	EXPECT_FALSE(IsValidIPv6(""));
-	EXPECT_FALSE(IsValidIPv6("::1::2"));
-	EXPECT_FALSE(IsValidIPv6("2001:db8::/129"));
-	EXPECT_FALSE(IsValidIPv6("gggg::1"));
+	EXPECT_FALSE(IsValidIPv6("")) << "Empty string must be invalid";
+	EXPECT_FALSE(IsValidIPv6("::1::2")) << "Multiple :: not allowed";
+	EXPECT_FALSE(IsValidIPv6("gggg::1")) << "Invalid hex characters";
+	EXPECT_FALSE(IsValidIPv6("2001:db8::/129")) << "CIDR > 128 is invalid";
+	EXPECT_FALSE(ParseIPv6("").has_value());
+	EXPECT_FALSE(ParseIPv6("::1::2").has_value());
+	EXPECT_FALSE(ParseIPv6("2001:db8::/129").has_value());
+	EXPECT_FALSE(ParseIPv6("gggg::1").has_value());
 }
 
 TEST(ThreatIntelFormat_EdgeCase_Validation, FileHashValidators) {

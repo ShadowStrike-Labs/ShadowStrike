@@ -139,19 +139,39 @@ struct StoreConfig {
     
     /**
      * @brief Create default configuration
+     * 
+     * Creates a configuration with sensible defaults for most use cases.
+     * The database path is set to a temporary directory for convenience.
+     * For production deployments, specify an explicit databasePath.
      */
     static StoreConfig CreateDefault() {
         StoreConfig config;
         config.cacheOptions = CacheOptions{};
+        
+        // Generate a unique temp directory path for the database
+        // TITANIUM: Use a deterministic temp path for default configuration
+        wchar_t tempPath[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, tempPath) > 0) {
+            // Create a unique database filename based on process ID
+            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_" 
+                + std::to_wstring(GetCurrentProcessId()) + L".tidb";
+        } else {
+            // Fallback to current directory if temp path unavailable
+            config.databasePath = L".\\ShadowStrike_ThreatIntel.tidb";
+        }
+        
         return config;
     }
     
     /**
      * @brief Create high-performance configuration
      * Optimized for enterprise deployments with maximum throughput
+     * 
+     * @note Uses a temporary database path by default. For production,
+     *       specify an explicit databasePath after calling this method.
      */
     static StoreConfig CreateHighPerformance() {
-        StoreConfig config;
+        StoreConfig config = CreateDefault(); // Start with default (includes temp path)
         config.cacheOptions.shardCount = 256;
         config.cacheOptions.totalCapacity = config.cacheOptions.shardCount * 65536; // 16,777,216 entries
         config.cacheOptions.positiveTTL = CacheConfig::DEFAULT_TTL_SECONDS * 2;
@@ -163,15 +183,26 @@ struct StoreConfig {
         config.maxIOCEntries = 100000000; // 100 million
         config.workerThreadCount = std::thread::hardware_concurrency();
         config.maxConcurrentFeedDownloads = 8;
+        
+        // Update database path to indicate high-perf variant
+        wchar_t tempPath[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, tempPath) > 0) {
+            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_HighPerf_" 
+                + std::to_wstring(GetCurrentProcessId()) + L".tidb";
+        }
+        
         return config;
     }
     
     /**
      * @brief Create low memory configuration
      * For embedded or resource-constrained environments
+     * 
+     * @note Uses a temporary database path by default. For production,
+     *       specify an explicit databasePath after calling this method.
      */
     static StoreConfig CreateLowMemory() {
-        StoreConfig config;
+        StoreConfig config = CreateDefault(); // Start with default (includes temp path)
         config.cacheOptions.shardCount = 16;
         config.cacheOptions.totalCapacity = config.cacheOptions.shardCount * 4096; // 65,536 entries
         config.cacheOptions.positiveTTL = 1800;
@@ -182,6 +213,14 @@ struct StoreConfig {
         config.enableCompression = true;
         config.workerThreadCount = 2;
         config.maxConcurrentFeedDownloads = 1;
+        
+        // Update database path to indicate low-memory variant
+        wchar_t tempPath[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, tempPath) > 0) {
+            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_LowMem_" 
+                + std::to_wstring(GetCurrentProcessId()) + L".tidb";
+        }
+        
         return config;
     }
 };
