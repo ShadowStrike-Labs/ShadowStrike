@@ -445,6 +445,16 @@ TEST_F(HashIndexTest, RemoveNonExistingHash_Fails) {
     EXPECT_EQ(result.code, WhitelistStoreError::EntryNotFound);
 }
 
+TEST_F(HashIndexTest, RemoveFromEmptyTreeReturnsNotFound) {
+    auto [index, buffer] = CreateIndex(TestConstants::SMALL_INDEX_SIZE);
+    
+    auto hash = m_generator->Generate(42);
+    auto result = index.Remove(hash);
+    
+    EXPECT_FALSE(result.IsSuccess());
+    EXPECT_EQ(result.code, WhitelistStoreError::EntryNotFound);
+}
+
 TEST_F(HashIndexTest, RemoveEmptyHash_Fails) {
     auto [index, buffer] = CreateIndex(TestConstants::SMALL_INDEX_SIZE);
     
@@ -602,6 +612,38 @@ TEST_F(HashIndexTest, TreeGrowthToMultipleLevels) {
         auto hash = m_generator->Generate(i);
         EXPECT_TRUE(index.Contains(hash)) << "Hash " << i << " lost after tree growth";
     }
+}
+
+TEST_F(HashIndexTest, TreeGrowthInsertsAndRemovesMaintainIntegrity) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    // Insert enough to grow the tree
+    const size_t insertCount = TestConstants::MAX_KEYS_PER_NODE * 3;
+    size_t successCount = InsertNHashes(index, insertCount);
+    
+    EXPECT_GT(successCount, 100u);
+    EXPECT_GT(index.GetTreeDepth(), 1u);
+    
+    // Remove every third hash to force underflow/merge scenarios
+    size_t removedCount = 0;
+    for (size_t i = 0; i < successCount; i += 3) {
+        auto hash = m_generator->Generate(i);
+        auto result = index.Remove(hash);
+        EXPECT_TRUE(result.IsSuccess()) << "Remove failed for " << i;
+        ++removedCount;
+    }
+    
+    // Verify remaining hashes are retrievable
+    for (size_t i = 0; i < successCount; ++i) {
+        auto hash = m_generator->Generate(i);
+        if (i % 3 == 0) {
+            EXPECT_FALSE(index.Contains(hash)) << "Removed hash still present " << i;
+        } else {
+            EXPECT_TRUE(index.Contains(hash)) << "Hash missing after merges " << i;
+        }
+    }
+    
+    EXPECT_EQ(index.GetEntryCount(), successCount - removedCount);
 }
 
 TEST_F(HashIndexTest, InsertInSortedOrder) {
@@ -1166,17 +1208,438 @@ TEST_F(HashIndexTest, RegressionRemoveFromSingleEntryIndex) {
     EXPECT_EQ(index.Lookup(hash).value(), 200u);
 }
 
-} // namespace ShadowStrike::Whitelist::Tests
-
 // ============================================================================
-// MAIN ENTRY POINT
+// ENTERPRISE EDGE-CASE TESTS - B+TREE SPLIT AND INTEGRITY
 // ============================================================================
 
-// Only define main when building as standalone test executable
-// When linking with main project, use gtest_main or the project's main
-#if defined(BUILD_TEST_EXECUTABLE) || defined(STANDALONE_TEST)
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+/**
+ * @brief Tests multiple consecutive splits to verify linked list integrity
+ * 
+ * CRITICAL: This test verifies that leaf node linked list is maintained
+ * correctly through multiple splits. Regression test for duplicate
+ * linked list update bug.
+ */
+TEST_F(HashIndexTest, EdgeCase_MultipleConsecutiveSplits) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    // Insert enough to cause multiple splits
+    const size_t insertCount = TestConstants::MAX_KEYS_PER_NODE * 4;
+    size_t successCount = InsertNHashes(index, insertCount);
+    
+    EXPECT_GT(successCount, TestConstants::MAX_KEYS_PER_NODE * 3);
+    EXPECT_GT(index.GetNodeCount(), 3u) << "Should have split multiple times";
+    
+    // Verify ALL entries are retrievable (linked list integrity)
+    for (size_t i = 0; i < successCount; ++i) {
+        auto hash = m_generator->Generate(i);
+        EXPECT_TRUE(index.Contains(hash)) 
+            << "Hash " << i << " missing after multiple splits - linked list corrupted";
+    }
 }
-#endif
+
+/**
+ * @brief Test that verifies leaf traversal after splits
+ * 
+ * After splits, the leaf linked list must allow traversal from
+ * first to last leaf without gaps.
+ */
+TEST_F(HashIndexTest, EdgeCase_LeafLinkedListIntegrity) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    // Insert to cause multiple splits
+    const size_t insertCount = TestConstants::MAX_KEYS_PER_NODE * 3;
+    size_t successCount = InsertNHashes(index, insertCount);
+    
+    EXPECT_GT(successCount, 100u);
+    
+    // Verify entry and node counts using available methods
+    const uint64_t entryCount = index.GetEntryCount();
+    const uint64_t nodeCount = index.GetNodeCount();
+    
+    // Total entries should match what we inserted
+    EXPECT_EQ(entryCount, successCount) 
+        << "Entry count mismatch - possible linked list corruption";
+    
+    // Node count should be reasonable
+    EXPECT_GT(nodeCount, 1u);
+    EXPECT_LT(nodeCount, successCount); // We shouldn't have more nodes than entries
+}
+
+/**
+ * @brief Test batch insert with splits
+ * 
+ * Verifies that BatchInsert correctly handles splits and maintains
+ * data integrity.
+ */
+TEST_F(HashIndexTest, EdgeCase_BatchInsertWithSplits) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    // Create batch large enough to cause splits
+    std::vector<std::pair<HashValue, uint64_t>> entries;
+    const size_t batchSize = TestConstants::MAX_KEYS_PER_NODE * 2;
+    
+    for (size_t i = 0; i < batchSize; ++i) {
+        entries.emplace_back(m_generator->Generate(i), i * 100);
+    }
+    
+    auto result = index.BatchInsert(entries);
+    EXPECT_TRUE(result.IsSuccess()) << "BatchInsert failed: " << result.message;
+    
+    // Verify all entries are present
+    for (size_t i = 0; i < batchSize; ++i) {
+        auto lookupResult = index.Lookup(entries[i].first);
+        EXPECT_TRUE(lookupResult.has_value()) 
+            << "Entry " << i << " missing after batch insert";
+        if (lookupResult.has_value()) {
+            EXPECT_EQ(lookupResult.value(), i * 100) 
+                << "Wrong offset for entry " << i;
+        }
+    }
+}
+
+/**
+ * @brief Test rapid insert-remove cycles under tree growth
+ * 
+ * Verifies tree maintains integrity when rapidly adding and removing
+ * entries while the tree is growing.
+ */
+TEST_F(HashIndexTest, EdgeCase_RapidInsertRemoveDuringGrowth) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    std::set<uint64_t> activeEntries;
+    
+    // Rapid insert/remove while tree grows
+    for (size_t round = 0; round < 10; ++round) {
+        // Insert a batch
+        for (size_t i = 0; i < 50; ++i) {
+            uint64_t idx = round * 100 + i;
+            auto hash = m_generator->Generate(idx);
+            if (index.Insert(hash, idx).IsSuccess()) {
+                activeEntries.insert(idx);
+            }
+        }
+        
+        // Remove some entries
+        std::vector<uint64_t> toRemove;
+        for (auto it = activeEntries.begin(); it != activeEntries.end(); ++it) {
+            if ((*it % 3) == 0) {
+                toRemove.push_back(*it);
+            }
+        }
+        
+        for (uint64_t idx : toRemove) {
+            auto hash = m_generator->Generate(idx);
+            if (index.Remove(hash).IsSuccess()) {
+                activeEntries.erase(idx);
+            }
+        }
+    }
+    
+    // Verify remaining entries
+    EXPECT_EQ(index.GetEntryCount(), activeEntries.size());
+    
+    for (uint64_t idx : activeEntries) {
+        EXPECT_TRUE(index.Contains(m_generator->Generate(idx)))
+            << "Entry " << idx << " missing after insert/remove cycles";
+    }
+}
+
+/**
+ * @brief Test exact MAX_KEYS boundary condition
+ * 
+ * Insert exactly MAX_KEYS entries, then one more to trigger split.
+ */
+TEST_F(HashIndexTest, EdgeCase_ExactMaxKeysBoundary) {
+    auto [index, buffer] = CreateIndex(TestConstants::MEDIUM_INDEX_SIZE);
+    
+    // Insert exactly MAX_KEYS entries
+    for (size_t i = 0; i < TestConstants::MAX_KEYS_PER_NODE; ++i) {
+        auto hash = m_generator->Generate(i);
+        EXPECT_TRUE(index.Insert(hash, i).IsSuccess()) 
+            << "Insert " << i << " failed before reaching MAX_KEYS";
+    }
+    
+    EXPECT_EQ(index.GetEntryCount(), TestConstants::MAX_KEYS_PER_NODE);
+    EXPECT_EQ(index.GetNodeCount(), 1u) << "Should still be single node";
+    
+    // Insert one more - this should trigger a split
+    auto hash = m_generator->Generate(TestConstants::MAX_KEYS_PER_NODE);
+    EXPECT_TRUE(index.Insert(hash, TestConstants::MAX_KEYS_PER_NODE).IsSuccess())
+        << "Insert at MAX_KEYS boundary failed";
+    
+    EXPECT_EQ(index.GetEntryCount(), TestConstants::MAX_KEYS_PER_NODE + 1);
+    EXPECT_GT(index.GetNodeCount(), 1u) << "Split should have occurred";
+    
+    // Verify all entries including the one that triggered split
+    for (size_t i = 0; i <= TestConstants::MAX_KEYS_PER_NODE; ++i) {
+        EXPECT_TRUE(index.Contains(m_generator->Generate(i)))
+            << "Entry " << i << " lost at MAX_KEYS boundary";
+    }
+}
+
+/**
+ * @brief Test Clear and reuse after tree growth
+ * 
+ * Verifies that Clear properly resets state and index can be reused.
+ */
+TEST_F(HashIndexTest, EdgeCase_ClearAfterTreeGrowth) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    // Build up tree
+    const size_t insertCount = TestConstants::MAX_KEYS_PER_NODE * 3;
+    InsertNHashes(index, insertCount);
+    
+    EXPECT_GT(index.GetEntryCount(), 100u);
+    EXPECT_GT(index.GetNodeCount(), 1u);
+    EXPECT_GT(index.GetTreeDepth(), 1u);
+    
+    // Clear
+    auto clearResult = index.Clear();
+    EXPECT_TRUE(clearResult.IsSuccess()) << "Clear failed: " << clearResult.message;
+    
+    // Verify state is reset
+    EXPECT_EQ(index.GetEntryCount(), 0u);
+    EXPECT_EQ(index.GetNodeCount(), 1u);
+    EXPECT_EQ(index.GetTreeDepth(), 1u);
+    
+    // Verify old entries are gone
+    for (size_t i = 0; i < 10; ++i) {
+        EXPECT_FALSE(index.Contains(m_generator->Generate(i)))
+            << "Entry " << i << " still present after Clear";
+    }
+    
+    // Verify can reuse
+    m_generator->Reset();
+    size_t successCount = InsertNHashes(index, insertCount);
+    EXPECT_GT(successCount, 100u);
+    
+    // Verify new entries
+    for (size_t i = 0; i < successCount; ++i) {
+        EXPECT_TRUE(index.Contains(m_generator->Generate(i)))
+            << "New entry " << i << " not found after Clear and reinsert";
+    }
+}
+
+/**
+ * @brief Test with all same hash prefix (worst case for some implementations)
+ * 
+ * When all hashes produce similar FastHash values, they go to same leaf
+ * causing rapid splits in one area.
+ */
+TEST_F(HashIndexTest, EdgeCase_SimilarHashValues) {
+    auto [index, buffer] = CreateIndex(TestConstants::MEDIUM_INDEX_SIZE);
+    
+    // Generate hashes with sequential indices - these will have similar structure
+    std::vector<HashValue> hashes;
+    for (uint64_t i = 0; i < 200; ++i) {
+        HashValue hash{};
+        hash.algorithm = HashAlgorithm::SHA256;
+        hash.length = 32;
+        
+        // Create hashes that differ only in last few bytes
+        std::memset(hash.data.data(), 0xAA, 32);
+        std::memcpy(hash.data.data() + 28, &i, sizeof(uint64_t) < 4 ? sizeof(uint64_t) : 4);
+        
+        hashes.push_back(hash);
+    }
+    
+    // Insert all
+    size_t successCount = 0;
+    for (size_t i = 0; i < hashes.size(); ++i) {
+        if (index.Insert(hashes[i], i).IsSuccess()) {
+            ++successCount;
+        }
+    }
+    
+    EXPECT_EQ(successCount, hashes.size());
+    
+    // Verify retrieval
+    for (size_t i = 0; i < hashes.size(); ++i) {
+        EXPECT_TRUE(index.Contains(hashes[i]))
+            << "Hash " << i << " with similar prefix not found";
+    }
+}
+
+/**
+ * @brief Test lookup performance doesn't degrade with tree depth
+ * 
+ * After many inserts, lookups should still complete in reasonable time.
+ */
+TEST_F(HashIndexTest, EdgeCase_DeepTreeLookup) {
+    auto [index, buffer] = CreateIndex(TestConstants::STRESS_INDEX_SIZE);
+    
+    // Insert many entries
+    const size_t insertCount = 5000;
+    InsertNHashes(index, insertCount);
+    
+    // Time multiple lookups
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    const size_t lookupCount = 1000;
+    size_t found = 0;
+    for (size_t i = 0; i < lookupCount; ++i) {
+        if (index.Contains(m_generator->Generate(i % insertCount))) {
+            ++found;
+        }
+    }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    
+    EXPECT_GT(found, lookupCount * 0.9) << "Too many lookups failed";
+    
+    // Sanity check - 1000 lookups shouldn't take more than 100ms even on slow systems
+    EXPECT_LT(duration.count(), 100000) 
+        << "Lookups too slow: " << duration.count() << "us for " << lookupCount << " lookups";
+}
+
+/**
+ * @brief Test that internal node splits work correctly
+ * 
+ * When tree grows deep enough, internal nodes also need to split.
+ */
+TEST_F(HashIndexTest, EdgeCase_InternalNodeSplit) {
+    auto [index, buffer] = CreateIndex(TestConstants::STRESS_INDEX_SIZE);
+    
+    // Insert enough to cause internal node splits
+    // This requires filling leaf nodes AND causing the internal node to split
+    const size_t insertCount = TestConstants::MAX_KEYS_PER_NODE * 
+                               TestConstants::MAX_KEYS_PER_NODE;
+    
+    size_t successCount = InsertNHashes(index, insertCount);
+    
+    // We expect most inserts to succeed (some may fail if space runs out)
+    EXPECT_GT(successCount, insertCount / 2);
+    
+    // Tree should have grown significantly
+    EXPECT_GE(index.GetTreeDepth(), 2u);
+    
+    // Verify data integrity
+    size_t verifyCount = std::min(successCount, size_t(1000)); // Sample verification
+    for (size_t i = 0; i < verifyCount; ++i) {
+        EXPECT_TRUE(index.Contains(m_generator->Generate(i)))
+            << "Entry " << i << " lost after internal node splits";
+    }
+}
+
+/**
+ * @brief Test mixed operations maintain consistency
+ * 
+ * Interleaves Insert, Lookup, Remove, BatchLookup operations.
+ */
+TEST_F(HashIndexTest, EdgeCase_MixedOperationsConsistency) {
+    auto [index, buffer] = CreateIndex(TestConstants::LARGE_INDEX_SIZE);
+    
+    std::set<uint64_t> expectedEntries;
+    
+    // Phase 1: Insert
+    for (uint64_t i = 0; i < 100; ++i) {
+        auto hash = m_generator->Generate(i);
+        EXPECT_TRUE(index.Insert(hash, i).IsSuccess());
+        expectedEntries.insert(i);
+    }
+    
+    // Phase 2: Mixed insert/lookup/remove
+    for (uint64_t i = 100; i < 300; ++i) {
+        // Insert new
+        auto hash = m_generator->Generate(i);
+        EXPECT_TRUE(index.Insert(hash, i).IsSuccess());
+        expectedEntries.insert(i);
+        
+        // Lookup random existing
+        if (!expectedEntries.empty()) {
+            uint64_t checkIdx = i % 100;
+            if (expectedEntries.count(checkIdx)) {
+                EXPECT_TRUE(index.Contains(m_generator->Generate(checkIdx)));
+            }
+        }
+        
+        // Remove every 5th old entry
+        if (i % 5 == 0 && i >= 110) {
+            uint64_t removeIdx = i - 100;
+            if (expectedEntries.count(removeIdx)) {
+                auto removeHash = m_generator->Generate(removeIdx);
+                if (index.Remove(removeHash).IsSuccess()) {
+                    expectedEntries.erase(removeIdx);
+                }
+            }
+        }
+    }
+    
+    // Verify final state
+    EXPECT_EQ(index.GetEntryCount(), expectedEntries.size());
+    
+    // Batch lookup to verify
+    std::vector<HashValue> lookupHashes;
+    for (uint64_t idx : expectedEntries) {
+        lookupHashes.push_back(m_generator->Generate(idx));
+    }
+    
+    std::vector<std::optional<uint64_t>> results;
+    index.BatchLookup(lookupHashes, results);
+    
+    ASSERT_EQ(results.size(), lookupHashes.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_TRUE(results[i].has_value()) 
+            << "Entry in expected set not found via BatchLookup";
+    }
+}
+
+/**
+ * @brief Test zero offset handling
+ * 
+ * Zero is a valid offset value and should not be confused with null/empty.
+ */
+TEST_F(HashIndexTest, EdgeCase_ZeroOffsetHandling) {
+    auto [index, buffer] = CreateIndex(TestConstants::SMALL_INDEX_SIZE);
+    
+    // Insert with offset 0
+    auto hash1 = m_generator->Generate(1);
+    EXPECT_TRUE(index.Insert(hash1, 0).IsSuccess());
+    
+    auto result = index.Lookup(hash1);
+    EXPECT_TRUE(result.has_value()) << "Zero offset entry not found";
+    EXPECT_EQ(result.value(), 0u) << "Zero offset not returned correctly";
+    
+    // Insert with offset 1
+    auto hash2 = m_generator->Generate(2);
+    EXPECT_TRUE(index.Insert(hash2, 1).IsSuccess());
+    
+    // Both should be retrievable
+    EXPECT_EQ(index.GetEntryCount(), 2u);
+    EXPECT_TRUE(index.Contains(hash1));
+    EXPECT_TRUE(index.Contains(hash2));
+}
+
+/**
+ * @brief Test sequential remove maintains tree integrity
+ * 
+ * Remove entries in order and verify tree stays valid.
+ */
+TEST_F(HashIndexTest, EdgeCase_SequentialRemoveIntegrity) {
+    auto [index, buffer] = CreateIndex(TestConstants::MEDIUM_INDEX_SIZE);
+    
+    // Insert entries
+    const size_t count = 200;
+    InsertNHashes(index, count);
+    
+    EXPECT_EQ(index.GetEntryCount(), count);
+    
+    // Remove in order
+    for (size_t i = 0; i < count; ++i) {
+        auto hash = m_generator->Generate(i);
+        auto result = index.Remove(hash);
+        EXPECT_TRUE(result.IsSuccess()) << "Remove " << i << " failed";
+        
+        // Verify remaining entries still accessible
+        if (i < count - 1) {
+            auto nextHash = m_generator->Generate(i + 1);
+            EXPECT_TRUE(index.Contains(nextHash))
+                << "Next entry " << (i + 1) << " lost after removing " << i;
+        }
+    }
+    
+    EXPECT_EQ(index.GetEntryCount(), 0u);
+}
+
+} // namespace ShadowStrike::Whitelist::Tests

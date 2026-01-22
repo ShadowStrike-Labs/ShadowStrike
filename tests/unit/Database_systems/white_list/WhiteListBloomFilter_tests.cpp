@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -358,14 +359,19 @@ TEST(BloomFilter_SingleOps, Add_WithHashValue_Works) {
     BloomFilter filter(DEFAULT_TEST_ELEMENTS, DEFAULT_TEST_FPR);
     ASSERT_TRUE(filter.InitializeForBuild());
     
+    // Create a valid HashValue - MUST set length field
     HashValue hv{};
     hv.algorithm = HashAlgorithm::SHA256;
+    hv.length = 32;  // SHA256 is 32 bytes - CRITICAL: length must be set!
     // Set some bytes
     hv.data[0] = 0x12;
     hv.data[1] = 0x34;
     hv.data[31] = 0xFF;
     
+    ASSERT_FALSE(hv.IsEmpty()) << "HashValue with length=32 should not be empty";
+    
     filter.Add(hv);
+    EXPECT_EQ(filter.GetElementsAdded(), 1u) << "HashValue should be added when length > 0";
     EXPECT_TRUE(filter.MightContain(hv));
 }
 
@@ -423,7 +429,7 @@ TEST(BloomFilter_BatchOps, BatchQuery_AfterBatchAdd_AllPositive) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(1000);
-    filter.BatchAdd(testHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(testHashes);
     
     const size_t count = testHashes.size();
     auto results_buf = std::make_unique<bool[]>(count);
@@ -443,15 +449,17 @@ TEST(BloomFilter_BatchOps, BatchQuery_EmptyFilter_MostlyNegative) {
 
     const auto testHashes = GenerateTestHashes(1000);
 
-   
     const size_t count = testHashes.size();
     auto results_buf = std::make_unique<bool[]>(count);
     std::span<bool> results(results_buf.get(), count);
 
     const size_t positives = filter.BatchQuery(testHashes, results);
 
-  
-    EXPECT_LT(positives, count / 10);
+    // Empty filter should have very few false positives (well under 10%)
+    // Using 10% as upper bound to account for statistical variance
+    constexpr double MAX_EMPTY_FILTER_FPR_THRESHOLD = 0.10;  // 10% - should be essentially 0 for empty filter
+    EXPECT_LT(positives, static_cast<size_t>(count * MAX_EMPTY_FILTER_FPR_THRESHOLD))
+        << "Empty filter should have near-zero false positives";
 }
 
 // ============================================================================
@@ -464,7 +472,7 @@ TEST(BloomFilter_ClearSerialize, Clear_ResetsAllBits) {
     
     // Add many elements
     const auto testHashes = GenerateTestHashes(1000);
-    filter.BatchAdd(testHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(testHashes);
     
     EXPECT_GT(filter.EstimatedFillRate(), 0.0);
     EXPECT_GT(filter.GetElementsAdded(), 0u);
@@ -489,7 +497,7 @@ TEST(BloomFilter_ClearSerialize, Serialize_ProducesValidData) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(100);
-    filter.BatchAdd(testHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(testHashes);
     
     std::vector<uint8_t> data;
     EXPECT_TRUE(filter.Serialize(data));
@@ -529,7 +537,7 @@ TEST(BloomFilter_Statistics, GetDetailedStats_ReturnsValidData) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(500);
-    filter.BatchAdd(testHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(testHashes);
     
     const auto stats = filter.GetDetailedStats();
     
@@ -552,7 +560,7 @@ TEST(BloomFilter_Statistics, EstimatedFillRate_IncreasesWithElements) {
     
     for (int batch = 0; batch < 10; ++batch) {
         const auto hashes = GenerateTestHashes(100, batch * 100);
-        filter.BatchAdd(hashes);//-V530
+        [[maybe_unused]] const size_t added = filter.BatchAdd(hashes);
         
         const double fillRate = filter.EstimatedFillRate();
         EXPECT_GT(fillRate, prevFillRate);
@@ -569,7 +577,7 @@ TEST(BloomFilter_Statistics, EstimatedFPR_IncreasesWithFillRate) {
     
     // Add elements
     const auto hashes = GenerateTestHashes(500);
-    filter.BatchAdd(hashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(hashes);
     
     const double fpr = filter.EstimatedFalsePositiveRate();
     EXPECT_GT(fpr, 0.0);
@@ -590,7 +598,7 @@ TEST(BloomFilter_FPR, FalsePositiveRate_WithinExpectedBounds) {
     
     // Add expected number of elements
     const auto insertHashes = GenerateTestHashes(elements, 0);
-    filter.BatchAdd(insertHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(insertHashes);
     
     // Query with different hashes (guaranteed not in set)
     const auto queryHashes = GenerateTestHashes(testQueries, elements + 1000000);
@@ -615,7 +623,7 @@ TEST(BloomFilter_FPR, NoFalseNegatives_Guaranteed) {
     ASSERT_TRUE(filter.InitializeForBuild());
     
     const auto testHashes = GenerateTestHashes(5000);
-    filter.BatchAdd(testHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(testHashes);
     
     // No false negatives - all added elements MUST be found
     size_t falseNegatives = 0;
@@ -678,7 +686,7 @@ TEST(BloomFilter_ThreadSafety, ConcurrentQuery_NoDataRace) {
     
     // Pre-populate filter
     const auto insertHashes = GenerateTestHashes(5000);
-    filter.BatchAdd(insertHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(insertHashes);
     
     constexpr int numThreads = 8;
     constexpr int queriesPerThread = 10000;
@@ -791,13 +799,27 @@ TEST(BloomFilter_EdgeCases, AllBitsSet_HasHighFPR) {
     BloomFilter filter(100, 0.5);  // Small filter, high FPR target
     ASSERT_TRUE(filter.InitializeForBuild());
     
-    // Add many elements to fill the filter
-    for (uint64_t i = 0; i < 100000; ++i) {
+    // Note: Even though we request 100 expected elements, the filter is clamped to MIN_BLOOM_BITS (8MB)
+    // To reach >90% fill rate with an 8MB filter, we need to add significantly more elements
+    // Calculate how many elements needed: with k hash functions and m bits,
+    // fillRate ≈ 1 - (1 - 1/m)^(k*n), solving for 90% fill rate gives us ~1.2-2M elements
+    const size_t actualBits = filter.GetBitCount();
+    const size_t hashFunctions = filter.GetHashFunctions();
+    
+    // Add enough elements to saturate the filter (aim for >90% fill rate)
+    // With MIN_BLOOM_BITS (8MB) and max hash functions (16), need ~1.2M elements
+    // We add 2M to ensure we exceed 90% even with various configurations
+    constexpr size_t elementsToAdd = 2'000'000;
+    
+    for (uint64_t i = 0; i < elementsToAdd; ++i) {
         filter.Add(GenerateTestHash(i));
     }
     
-    // Fill rate should approach 1.0
-    EXPECT_GT(filter.EstimatedFillRate(), 0.9);
+    // Fill rate should approach 1.0 after adding millions of elements
+    const double fillRate = filter.EstimatedFillRate();
+    EXPECT_GT(fillRate, 0.9) << "Fill rate " << fillRate << " with " << actualBits 
+                              << " bits, " << hashFunctions << " hash functions, " 
+                              << elementsToAdd << " elements added";
 }
 
 TEST(BloomFilter_EdgeCases, MultipleInitializations_SecondSucceeds) {
@@ -818,11 +840,14 @@ TEST(BloomFilter_EdgeCases, EmptyHashValue_NotAdded) {
     BloomFilter filter(DEFAULT_TEST_ELEMENTS, DEFAULT_TEST_FPR);
     ASSERT_TRUE(filter.InitializeForBuild());
     
-    HashValue empty{};  // All zeros, IsEmpty() should be true
+    // Default-initialized HashValue has length=0, which IsEmpty() returns true for
+    HashValue empty{};
+    ASSERT_TRUE(empty.IsEmpty()) << "Default HashValue should be empty (length=0)";
     
     filter.Add(empty);
     
-    // Elements added should still be 0 (empty hash is rejected)
+    // Empty hash (length=0) is rejected by Add(const HashValue&) - see header line 227-231
+    // The Add() method checks !hashValue.IsEmpty() before calling Add(hash)
     EXPECT_EQ(filter.GetElementsAdded(), 0u);
 }
 
@@ -857,10 +882,12 @@ TEST(BloomFilter_Performance, MightContain_UnderTargetLatency) {
     
     // Pre-populate
     const auto insertHashes = GenerateTestHashes(100000);
-    filter.BatchAdd(insertHashes);//-V530
+    [[maybe_unused]] const size_t added = filter.BatchAdd(insertHashes);
     
     constexpr size_t iterations = 100000;
-    constexpr int64_t targetNsPerOp = 100;  // 100ns target for lookup
+    // Performance target: 100ns per lookup - may vary based on hardware
+    // CI machines may be slower, so this is a soft target
+    constexpr int64_t targetNsPerOp = 100;
     
     const auto queryHashes = GenerateTestHashes(iterations, 1000000);
     
@@ -893,7 +920,7 @@ TEST(BloomFilter_Performance, BatchAdd_FasterThanSingleAdd) {
     
     // Batch add timing
     const int64_t batchNs = MeasureNanoseconds([&]() {
-        filter2.BatchAdd(hashes);//-V530
+        [[maybe_unused]] const size_t added = filter2.BatchAdd(hashes);
     });
     
     // Batch should be at least as fast (allowing for measurement variance)
@@ -912,7 +939,7 @@ TEST(BloomFilter_Memory, MultipleBuildCycles_NoLeaks) {
         ASSERT_TRUE(filter.InitializeForBuild());
         
         const auto hashes = GenerateTestHashes(1000, cycle * 1000);
-        filter.BatchAdd(hashes);//-V530
+        [[maybe_unused]] const size_t added = filter.BatchAdd(hashes);
         
         // Verify functionality
         for (uint64_t h : hashes) {
@@ -931,6 +958,440 @@ TEST(BloomFilter_Memory, LargeFilter_AllocatesSuccessfully) {
     EXPECT_TRUE(filter.InitializeForBuild());
     EXPECT_TRUE(filter.IsReady());
     EXPECT_GT(filter.GetMemoryUsage(), 1000000u);  // Should be > 1MB
+}
+
+// ============================================================================
+// PART 12: Additional Edge Cases & Enterprise Security Tests
+// ============================================================================
+
+TEST(BloomFilter_EdgeCases, SelfMoveAssignment_NoUndefinedBehavior) {
+    BloomFilter filter(DEFAULT_TEST_ELEMENTS, DEFAULT_TEST_FPR);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    const uint64_t testHash = 0xABCD1234ULL;
+    filter.Add(testHash);
+    
+    // Self-move assignment (edge case)
+    filter = std::move(filter);  // NOLINT: intentionally testing self-move
+    
+    // Filter should still be functional or in valid moved-from state
+    // The standard says self-move leaves object in valid but unspecified state
+    // Our implementation should handle this gracefully
+}
+
+TEST(BloomFilter_EdgeCases, ConsecutiveAddClearCycles_NoMemoryCorruption) {
+    BloomFilter filter(1000, 0.01);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    for (int cycle = 0; cycle < 100; ++cycle) {
+        // Add elements
+        for (uint64_t i = 0; i < 100; ++i) {
+            filter.Add(GenerateTestHash(cycle * 100 + i));
+        }
+        
+        // Verify some elements are set
+        EXPECT_GT(filter.EstimatedFillRate(), 0.0);
+        
+        // Clear
+        filter.Clear();
+        
+        // Verify cleared
+        EXPECT_DOUBLE_EQ(filter.EstimatedFillRate(), 0.0);
+        EXPECT_EQ(filter.GetElementsAdded(), 0u);
+    }
+    
+    // Filter should still be functional
+    EXPECT_TRUE(filter.IsReady());
+}
+
+TEST(BloomFilter_EdgeCases, InitializeAfterInitializeForBuild_ReplacesState) {
+    BloomFilter builder(1000, 0.01);
+    ASSERT_TRUE(builder.InitializeForBuild());
+    
+    // Add elements
+    const auto testHashes = GenerateTestHashes(100);
+    for (uint64_t h : testHashes) {
+        builder.Add(h);
+    }
+    
+    // Serialize
+    std::vector<uint8_t> serializedData;
+    ASSERT_TRUE(builder.Serialize(serializedData));
+    
+    // Create new filter and first initialize for build
+    BloomFilter filter(2000, 0.02);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    filter.Add(0x12345ULL);
+    
+    // Now initialize from memory (should replace build state)
+    ASSERT_TRUE(filter.Initialize(
+        serializedData.data(),
+        builder.GetBitCount(),
+        builder.GetHashFunctions()
+    ));
+    
+    EXPECT_TRUE(filter.IsMemoryMapped());
+    
+    // Original elements should be found
+    for (uint64_t h : testHashes) {
+        EXPECT_TRUE(filter.MightContain(h));
+    }
+}
+
+TEST(BloomFilter_EdgeCases, BatchAddWithUninitializedFilter_ReturnsZero) {
+    BloomFilter filter;  // Not initialized
+    
+    std::vector<uint64_t> hashes = {1, 2, 3, 4, 5};
+    
+    // Should return 0 and not crash
+    EXPECT_EQ(filter.BatchAdd(hashes), 0u);
+}
+
+TEST(BloomFilter_EdgeCases, BatchQueryWithUninitializedFilter_AllPositive) {
+    BloomFilter filter;  // Not initialized
+    
+    std::vector<uint64_t> hashes = {1, 2, 3, 4, 5};
+    auto results_buf = std::make_unique<bool[]>(5);
+    std::span<bool> results(results_buf.get(), 5);
+    
+    // Uninitialized filter returns conservative true for all
+    const size_t positives = filter.BatchQuery(hashes, results);
+    
+    EXPECT_EQ(positives, 5u);
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_TRUE(results[i]);
+    }
+}
+
+TEST(BloomFilter_EdgeCases, SerializeDeserializeRoundTrip_PreservesData) {
+    // Create and populate original filter
+    BloomFilter original(5000, 0.01);
+    ASSERT_TRUE(original.InitializeForBuild());
+    
+    const auto testHashes = GenerateTestHashes(1000);
+    [[maybe_unused]] const size_t added = original.BatchAdd(testHashes);
+    
+    const double originalFillRate = original.EstimatedFillRate();
+    const size_t originalBitCount = original.GetBitCount();
+    const size_t originalHashFunctions = original.GetHashFunctions();
+    
+    // Serialize
+    std::vector<uint8_t> serializedData;
+    ASSERT_TRUE(original.Serialize(serializedData));
+    
+    // Deserialize into new filter
+    BloomFilter restored;
+    ASSERT_TRUE(restored.Initialize(
+        serializedData.data(),
+        originalBitCount,
+        originalHashFunctions
+    ));
+    
+    // Verify all elements are found
+    size_t missingCount = 0;
+    for (uint64_t h : testHashes) {
+        if (!restored.MightContain(h)) {
+            ++missingCount;
+        }
+    }
+    EXPECT_EQ(missingCount, 0u) << "Round-trip serialization lost data!";
+    
+    // Fill rates should be identical
+    EXPECT_DOUBLE_EQ(restored.EstimatedFillRate(), originalFillRate);
+}
+
+TEST(BloomFilter_EdgeCases, NaNFPR_ClampedToValidRange) {
+    // Test with NaN FPR (edge case)
+    BloomFilter filter(DEFAULT_TEST_ELEMENTS, std::nan(""));
+    
+    // Should clamp to valid range
+    EXPECT_GE(filter.GetTargetFPR(), MIN_BLOOM_FPR);
+    EXPECT_LE(filter.GetTargetFPR(), MAX_BLOOM_FPR);
+    EXPECT_FALSE(std::isnan(filter.GetTargetFPR()));
+}
+
+TEST(BloomFilter_EdgeCases, InfiniteFPR_ClampedToValidRange) {
+    // Test with infinite FPR (edge case)
+    BloomFilter filter(DEFAULT_TEST_ELEMENTS, std::numeric_limits<double>::infinity());
+    
+    // Should clamp to valid range
+    EXPECT_GE(filter.GetTargetFPR(), MIN_BLOOM_FPR);
+    EXPECT_LE(filter.GetTargetFPR(), MAX_BLOOM_FPR);
+    EXPECT_FALSE(std::isinf(filter.GetTargetFPR()));
+}
+
+TEST(BloomFilter_EdgeCases, NegativeInfiniteFPR_ClampedToValidRange) {
+    BloomFilter filter(DEFAULT_TEST_ELEMENTS, -std::numeric_limits<double>::infinity());
+    
+    // Should clamp to minimum
+    EXPECT_GE(filter.GetTargetFPR(), MIN_BLOOM_FPR);
+}
+
+TEST(BloomFilter_EdgeCases, VerySmallFilter_FunctionalAtMinSize) {
+    // Test with minimum possible parameters
+    BloomFilter filter(1, 0.1);  // 1 element, 10% FPR
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    filter.Add(0x12345ULL);
+    
+    EXPECT_TRUE(filter.MightContain(0x12345ULL));
+    EXPECT_GE(filter.GetBitCount(), MIN_BLOOM_BITS);
+}
+
+TEST(BloomFilter_EdgeCases, AddAfterSerialize_DoesNotAffectOriginal) {
+    BloomFilter filter(1000, 0.01);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    const uint64_t hash1 = 0x11111111ULL;
+    const uint64_t hash2 = 0x22222222ULL;
+    
+    filter.Add(hash1);
+    
+    // Serialize
+    std::vector<uint8_t> data;
+    ASSERT_TRUE(filter.Serialize(data));
+    
+    // Add more after serialization
+    filter.Add(hash2);
+    
+    // Verify serialized data doesn't contain hash2 when loaded
+    BloomFilter loaded;
+    ASSERT_TRUE(loaded.Initialize(data.data(), filter.GetBitCount(), filter.GetHashFunctions()));
+    
+    EXPECT_TRUE(loaded.MightContain(hash1));
+    // hash2 should NOT definitely be in the serialized data
+    // (it might be due to FPR, but the serialized snapshot was taken before adding hash2)
+}
+
+TEST(BloomFilter_EdgeCases, ClearOnMemoryMapped_NoOp) {
+    BloomFilter builder(1000, 0.01);
+    ASSERT_TRUE(builder.InitializeForBuild());
+    builder.Add(0x12345ULL);
+    
+    std::vector<uint8_t> data;
+    ASSERT_TRUE(builder.Serialize(data));
+    
+    BloomFilter reader;
+    ASSERT_TRUE(reader.Initialize(data.data(), builder.GetBitCount(), builder.GetHashFunctions()));
+    
+    // Clear on memory-mapped should be no-op
+    reader.Clear();
+    
+    // Element should still be found (memory-mapped is read-only)
+    EXPECT_TRUE(reader.MightContain(0x12345ULL));
+}
+
+TEST(BloomFilter_EdgeCases, GetDetailedStats_MemoryMapped_ZeroMemory) {
+    BloomFilter builder(1000, 0.01);
+    ASSERT_TRUE(builder.InitializeForBuild());
+    
+    std::vector<uint8_t> data;
+    ASSERT_TRUE(builder.Serialize(data));
+    
+    BloomFilter reader;
+    ASSERT_TRUE(reader.Initialize(data.data(), builder.GetBitCount(), builder.GetHashFunctions()));
+    
+    const auto stats = reader.GetDetailedStats();
+    
+    EXPECT_EQ(stats.memoryBytes, 0u);  // Memory-mapped uses external memory
+    EXPECT_EQ(stats.allocatedBytes, 0u);
+    EXPECT_TRUE(stats.isMemoryMapped);
+}
+
+TEST(BloomFilter_EdgeCases, HashValueWithZeroLength_NotAdded) {
+    BloomFilter filter(DEFAULT_TEST_ELEMENTS, DEFAULT_TEST_FPR);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    // Create a HashValue with algorithm set but zero length
+    // HashValue::IsEmpty() checks (length == 0u), so this should be considered empty
+    HashValue hv{};
+    hv.algorithm = HashAlgorithm::SHA256;
+    hv.length = 0;  // Zero length = empty according to IsEmpty() implementation
+    
+    ASSERT_TRUE(hv.IsEmpty()) << "HashValue with length=0 should be empty regardless of algorithm";
+    
+    filter.Add(hv);
+    
+    // Empty hash should not be added (IsEmpty() returns true when length == 0)
+    EXPECT_EQ(filter.GetElementsAdded(), 0u);
+}
+
+TEST(BloomFilter_EdgeCases, HashValueWithFullData_Added) {
+    BloomFilter filter(DEFAULT_TEST_ELEMENTS, DEFAULT_TEST_FPR);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    HashValue hv{};
+    hv.algorithm = HashAlgorithm::SHA256;
+    hv.length = 32;
+    for (int i = 0; i < 32; ++i) {
+        hv.data[i] = static_cast<uint8_t>(i);
+    }
+    
+    filter.Add(hv);
+    
+    EXPECT_EQ(filter.GetElementsAdded(), 1u);
+    EXPECT_TRUE(filter.MightContain(hv));
+}
+
+TEST(BloomFilter_EdgeCases, BitCountAlignment_AlwaysMultipleOf64) {
+    // Test various element counts to verify bit alignment
+    for (size_t elements : {1, 7, 63, 64, 65, 127, 128, 1000, 10000}) {
+        BloomFilter filter(elements, 0.01);
+        EXPECT_EQ(filter.GetBitCount() % 64, 0u) 
+            << "BitCount not 64-aligned for elements=" << elements;
+    }
+}
+
+// ============================================================================
+// PART 13: Security Hardening Tests
+// ============================================================================
+
+TEST(BloomFilter_Security, InitializeWithMisalignedPointer_HandlesGracefully) {
+    // Allocate memory with intentional misalignment
+    std::vector<uint8_t> buffer(1024 + 1);
+    
+    // Get a potentially misaligned pointer (offset by 1)
+    void* misalignedPtr = &buffer[1];
+    
+    BloomFilter filter;
+    
+    // This should fail gracefully due to alignment check
+    // The filter validates pointer alignment in the implementation
+    bool result = filter.Initialize(misalignedPtr, 64, 7);
+    
+    // Either it fails validation or handles gracefully
+    // (depending on implementation specifics)
+    if (!result) {
+        EXPECT_FALSE(filter.IsReady());
+    }
+}
+
+TEST(BloomFilter_Security, InitializeWithExcessiveBitCount_Fails) {
+    uint64_t dummy = 0;
+    BloomFilter filter;
+    
+    // Try to initialize with bit count > MAX_BLOOM_BITS
+    EXPECT_FALSE(filter.Initialize(&dummy, MAX_BLOOM_BITS + 1, 7));
+}
+
+TEST(BloomFilter_Security, ConcurrentClearDuringAdd_NoCorruption) {
+    // This test verifies that even though Clear() is documented as
+    // requiring external synchronization, concurrent access doesn't
+    // cause undefined behavior (just potentially incorrect results)
+    
+    BloomFilter filter(100000, 0.01);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    std::atomic<bool> running{true};
+    std::atomic<size_t> addCount{0};
+    
+    // Adder thread
+    std::thread adder([&]() {
+        while (running.load(std::memory_order_relaxed)) {
+            filter.Add(GenerateTestHash(addCount.fetch_add(1)));
+        }
+    });
+    
+    // Periodic clear (not recommended but should not crash)
+    for (int i = 0; i < 10; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        filter.Clear();
+    }
+    
+    running.store(false);
+    adder.join();
+    
+    // Test passed if no crash or corruption
+    EXPECT_TRUE(filter.IsReady());
+}
+
+// ============================================================================
+// PART 14: Performance Regression Tests
+// ============================================================================
+
+TEST(BloomFilter_Performance, BatchQuery_FasterThanSingleQuery) {
+    BloomFilter filter(100000, 0.01);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    const auto insertHashes = GenerateTestHashes(50000);
+    [[maybe_unused]] const size_t added = filter.BatchAdd(insertHashes);
+    
+    const auto queryHashes = GenerateTestHashes(10000, 1000000);
+    
+    // Single query timing
+    const int64_t singleNs = MeasureNanoseconds([&]() {
+        for (uint64_t h : queryHashes) {
+            (void)filter.MightContain(h);
+        }
+    });
+    
+    // Batch query timing
+    auto results_buf = std::make_unique<bool[]>(queryHashes.size());
+    std::span<bool> results(results_buf.get(), queryHashes.size());
+    
+    const int64_t batchNs = MeasureNanoseconds([&]() {
+        [[maybe_unused]] const size_t positives = filter.BatchQuery(queryHashes, results);
+    });
+    
+    // Batch should be at least as fast
+    EXPECT_LE(batchNs, singleNs * 1.5)
+        << "BatchQuery (" << batchNs << "ns) should not be much slower than single queries (" << singleNs << "ns)";
+}
+
+TEST(BloomFilter_Performance, MemoryMappedQuery_ComparableToBuilt) {
+    // Build a filter
+    BloomFilter builder(100000, 0.01);
+    ASSERT_TRUE(builder.InitializeForBuild());
+    
+    const auto insertHashes = GenerateTestHashes(50000);
+    [[maybe_unused]] const size_t added = builder.BatchAdd(insertHashes);
+    
+    // Serialize and create memory-mapped reader
+    std::vector<uint8_t> data;
+    ASSERT_TRUE(builder.Serialize(data));
+    
+    BloomFilter reader;
+    ASSERT_TRUE(reader.Initialize(data.data(), builder.GetBitCount(), builder.GetHashFunctions()));
+    
+    const auto queryHashes = GenerateTestHashes(10000, 1000000);
+    
+    // Built filter query time
+    const int64_t builtNs = MeasureNanoseconds([&]() {
+        for (uint64_t h : queryHashes) {
+            (void)builder.MightContain(h);
+        }
+    });
+    
+    // Memory-mapped filter query time
+    const int64_t mappedNs = MeasureNanoseconds([&]() {
+        for (uint64_t h : queryHashes) {
+            (void)reader.MightContain(h);
+        }
+    });
+    
+    // Memory-mapped should be comparable (within 2x)
+    EXPECT_LT(mappedNs, builtNs * 2)
+        << "Memory-mapped query (" << mappedNs << "ns) much slower than built (" << builtNs << "ns)";
+}
+
+TEST(BloomFilter_Performance, EstimatedFillRate_NotTooSlow) {
+    BloomFilter filter(1000000, 0.01);
+    ASSERT_TRUE(filter.InitializeForBuild());
+    
+    const auto hashes = GenerateTestHashes(100000);
+    [[maybe_unused]] const size_t added = filter.BatchAdd(hashes);
+    
+    // Fill rate calculation should be reasonably fast
+    const int64_t durationNs = MeasureNanoseconds([&]() {
+        for (int i = 0; i < 100; ++i) {
+            (void)filter.EstimatedFillRate();
+        }
+    });
+    
+    const int64_t avgNs = durationNs / 100;
+    
+    // Should complete in reasonable time (< 10ms per call)
+    EXPECT_LT(avgNs, 10'000'000) << "EstimatedFillRate too slow: " << avgNs << "ns";
 }
 
 } // namespace ShadowStrike::Whitelist::Tests

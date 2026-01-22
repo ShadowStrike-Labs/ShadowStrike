@@ -144,6 +144,21 @@ template<typename T>
 }
 
 /**
+ * @brief Clamp floating point value with NaN/Inf handling
+ * @param value Value to clamp (may be NaN or Inf)
+ * @param minVal Minimum allowed value
+ * @param maxVal Maximum allowed value
+ * @return Clamped value (NaN/Inf mapped to minVal)
+ */
+[[nodiscard]] inline double ClampDouble(double value, double minVal, double maxVal) noexcept {
+    // Handle NaN and Inf - map to minimum value for safety
+    if (!std::isfinite(value)) {
+        return minVal;
+    }
+    return (value < minVal) ? minVal : ((value > maxVal) ? maxVal : value);
+}
+
+/**
  * @brief Population count (number of set bits) for 64-bit integer
  * @param value Input value
  * @return Number of bits set to 1
@@ -246,7 +261,7 @@ inline void SecureZero(void* ptr, size_t size) noexcept {
  */
 BloomFilter::BloomFilter(size_t expectedElements, double falsePositiveRate)
     : m_expectedElements(Clamp(expectedElements, size_t{1}, MAX_BLOOM_EXPECTED_ELEMENTS))
-    , m_targetFPR(Clamp(falsePositiveRate, MIN_BLOOM_FPR, MAX_BLOOM_FPR))
+    , m_targetFPR(ClampDouble(falsePositiveRate, MIN_BLOOM_FPR, MAX_BLOOM_FPR))
 {
     CalculateOptimalParameters(m_expectedElements, m_targetFPR);
 }
@@ -396,6 +411,14 @@ bool BloomFilter::Initialize(const void* data, size_t bitCount, size_t hashFunct
         return false;
     }
     
+    // Calculate required data size and validate memory region
+    const size_t wordCount = (bitCount + 63ULL) / 64ULL;
+    const size_t requiredBytes = wordCount * sizeof(uint64_t);
+    if (!ValidateMemoryRegion(data, requiredBytes)) {
+        SS_LOG_ERROR(L"Whitelist", L"BloomFilter::Initialize: invalid memory region (size=%zu, alignment issue or exceeds limit)", requiredBytes);
+        return false;
+    }
+    
     // Validate bit count is within allowed range
     if (bitCount == 0) {
         SS_LOG_ERROR(L"Whitelist", L"BloomFilter::Initialize: zero bit count");
@@ -470,7 +493,7 @@ bool BloomFilter::InitializeForBuild() noexcept {
         }
         
         // Validate allocation won't exhaust memory (each word is 8 bytes for atomic<uint64_t>)
-        constexpr size_t MAX_ALLOC_BYTES = 128ULL * 1024 * 1024;  // 128MB limit
+        // Uses MAX_ALLOC_BYTES from anonymous namespace (128MB limit)
         const size_t allocBytes = wordCount * sizeof(std::atomic<uint64_t>);
         if (allocBytes > MAX_ALLOC_BYTES) {
             SS_LOG_ERROR(L"Whitelist", L"BloomFilter::InitializeForBuild: allocation %zu bytes exceeds limit",
@@ -714,13 +737,14 @@ void BloomFilter::Clear() noexcept {
         return;
     }
     
-    // Zero all bits using secure zeroing to prevent compiler optimization
-    // This is important for security - old data should not leak
+    // Zero all bits using atomic stores for thread-safety
+    // Note: We use relaxed ordering for performance since we issue a release fence below
     for (auto& word : m_bits) {
         word.store(0, std::memory_order_relaxed);
     }
     
-    // Memory barrier to ensure all writes are visible
+    // Memory barrier to ensure all atomic writes are visible before any subsequent reads
+    // This prevents reordering and ensures visibility across threads
     std::atomic_thread_fence(std::memory_order_release);
     
     m_elementsAdded.store(0, std::memory_order_relaxed);
@@ -788,6 +812,10 @@ double BloomFilter::EstimatedFillRate() const noexcept {
     if (m_bitCount == 0) {
         return 0.0;
     }
+    
+    // Acquire fence to ensure we see consistent state from concurrent Add() operations
+    // This is important for accurate fill rate calculation during concurrent access
+    std::atomic_thread_fence(std::memory_order_acquire);
     
     // Get pointer to bits
     const uint64_t* bits = nullptr;

@@ -846,6 +846,13 @@ private:
     
     /// @brief Handle underflow after remove (merge/redistribute)
     [[nodiscard]] StoreError HandleUnderflow(BPlusTreeNode* node) noexcept;
+
+    /// @brief Remove separator key from parent after child node merge
+    [[nodiscard]] StoreError RemoveKeyFromParent(
+        BPlusTreeNode* mergedNode,
+        uint64_t mergedNodeOffset,
+        BPlusTreeNode* survivingNode
+    ) noexcept;
     
     /// @brief Count leaf nodes and gather statistics (helper for GetDetailedStats)
     void GatherLeafStats(
