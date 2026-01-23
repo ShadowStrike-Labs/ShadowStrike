@@ -588,6 +588,14 @@ private:
 
     // Rule metadata cache
     std::map<std::string, YaraRuleMetadata> m_ruleMetadata;
+    
+    // Rule source cache for merging support
+    // Key: "namespace::__source__<id>", Value: rule source string
+    // This enables proper rule merging by recompiling all sources together
+    std::map<std::string, std::string> m_ruleSources;
+    
+    // Monotonically increasing counter for unique source IDs (avoids hash collisions)
+    std::atomic<uint64_t> m_sourceIdCounter{0};
 
     // Statistics
     mutable std::atomic<uint64_t> m_totalScans{0};

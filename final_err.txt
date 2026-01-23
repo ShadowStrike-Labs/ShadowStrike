@@ -1,0 +1,8 @@
+DEBUG: Test starting
+DEBUG: Created database
+DEBUG: Created hash
+DEBUG: AddHash returned, success=1
+DEBUG: GetEntryCount=1
+DEBUG: About to call PurgeExpired
+DEBUG: PurgeExpired returned, success=1
+DEBUG: Test complete

@@ -33,6 +33,9 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <vector>
+#include <cstdint>
 
 using namespace ShadowStrike::Utils::XML;
 namespace fs = std::filesystem;
@@ -1010,4 +1013,553 @@ TEST_F(XMLUtilsTest, Stress_ManyXPathQueries) {
         std::string path = "root.item[" + std::to_string(i) + "]";
         EXPECT_TRUE(Contains(doc, path));
     }
+}
+
+// ============================================================================
+// ADDITIONAL EDGE CASE TESTS - ENTERPRISE COVERAGE
+// ============================================================================
+
+// GetBool extended cases
+TEST_F(XMLUtilsTest, GetBool_YesValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_YesValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("flag").text() = "yes";
+    
+    bool out = false;
+    ASSERT_TRUE(GetBool(doc, "root.flag", out));
+    EXPECT_TRUE(out);
+}
+
+TEST_F(XMLUtilsTest, GetBool_NoValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_NoValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("flag").text() = "NO";
+    
+    bool out = true;
+    ASSERT_TRUE(GetBool(doc, "root.flag", out));
+    EXPECT_FALSE(out);
+}
+
+TEST_F(XMLUtilsTest, GetBool_OnValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_OnValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("flag").text() = "On";
+    
+    bool out = false;
+    ASSERT_TRUE(GetBool(doc, "root.flag", out));
+    EXPECT_TRUE(out);
+}
+
+TEST_F(XMLUtilsTest, GetBool_OffValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_OffValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("flag").text() = "off";
+    
+    bool out = true;
+    ASSERT_TRUE(GetBool(doc, "root.flag", out));
+    EXPECT_FALSE(out);
+}
+
+TEST_F(XMLUtilsTest, GetBool_EmptyValue_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetBool_EmptyValue_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("flag").text() = "";
+    
+    bool out = false;
+    ASSERT_FALSE(GetBool(doc, "root.flag", out));
+}
+
+// GetInt64/GetUInt64 edge cases
+TEST_F(XMLUtilsTest, GetInt64_MaxValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_MaxValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "9223372036854775807";  // INT64_MAX
+    
+    int64_t out = 0;
+    ASSERT_TRUE(GetInt64(doc, "root.number", out));
+    EXPECT_EQ(out, INT64_MAX);
+}
+
+TEST_F(XMLUtilsTest, GetInt64_MinValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_MinValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "-9223372036854775808";  // INT64_MIN
+    
+    int64_t out = 0;
+    ASSERT_TRUE(GetInt64(doc, "root.number", out));
+    EXPECT_EQ(out, INT64_MIN);
+}
+
+TEST_F(XMLUtilsTest, GetInt64_Overflow_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_Overflow_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "9223372036854775808";  // INT64_MAX + 1
+    
+    int64_t out = 0;
+    ASSERT_FALSE(GetInt64(doc, "root.number", out));
+}
+
+TEST_F(XMLUtilsTest, GetInt64_TrailingWhitespace_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_TrailingWhitespace_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "123 ";
+    
+    int64_t out = 0;
+    // Should fail because entire string was not consumed
+    ASSERT_FALSE(GetInt64(doc, "root.number", out));
+}
+
+TEST_F(XMLUtilsTest, GetInt64_LeadingWhitespace_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetInt64_LeadingWhitespace_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = " 123";
+    
+    int64_t out = 0;
+    // from_chars does not skip leading whitespace
+    ASSERT_FALSE(GetInt64(doc, "root.number", out));
+}
+
+TEST_F(XMLUtilsTest, GetUInt64_MaxValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetUInt64_MaxValue_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "18446744073709551615";  // UINT64_MAX
+    
+    uint64_t out = 0;
+    ASSERT_TRUE(GetUInt64(doc, "root.number", out));
+    EXPECT_EQ(out, UINT64_MAX);
+}
+
+TEST_F(XMLUtilsTest, GetUInt64_NegativeValue_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetUInt64_NegativeValue_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "-1";
+    
+    uint64_t out = 0;
+    // Negative values should fail for unsigned
+    ASSERT_FALSE(GetUInt64(doc, "root.number", out));
+}
+
+TEST_F(XMLUtilsTest, GetUInt64_Overflow_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetUInt64_Overflow_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "18446744073709551616";  // UINT64_MAX + 1
+    
+    uint64_t out = 0;
+    ASSERT_FALSE(GetUInt64(doc, "root.number", out));
+}
+
+// GetDouble edge cases
+TEST_F(XMLUtilsTest, GetDouble_ScientificNotation_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_ScientificNotation_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "1.23e10";
+    
+    double out = 0.0;
+    ASSERT_TRUE(GetDouble(doc, "root.number", out));
+    EXPECT_NEAR(out, 1.23e10, 1e5);
+}
+
+TEST_F(XMLUtilsTest, GetDouble_NegativeScientific_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_NegativeScientific_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "-5.67e-8";
+    
+    double out = 0.0;
+    ASSERT_TRUE(GetDouble(doc, "root.number", out));
+    EXPECT_NEAR(out, -5.67e-8, 1e-14);
+}
+
+TEST_F(XMLUtilsTest, GetDouble_Infinity_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_Infinity_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "inf";
+    
+    double out = 0.0;
+    // SECURITY: Infinity should be rejected
+    ASSERT_FALSE(GetDouble(doc, "root.number", out));
+}
+
+TEST_F(XMLUtilsTest, GetDouble_NaN_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_NaN_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "nan";
+    
+    double out = 0.0;
+    // SECURITY: NaN should be rejected
+    ASSERT_FALSE(GetDouble(doc, "root.number", out));
+}
+
+TEST_F(XMLUtilsTest, GetDouble_EmptyString_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetDouble_EmptyString_Fails] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("number").text() = "";
+    
+    double out = 0.0;
+    ASSERT_FALSE(GetDouble(doc, "root.number", out));
+}
+
+// Parse with options
+TEST_F(XMLUtilsTest, Parse_PreserveWhitespace_Works) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Parse_PreserveWhitespace_Works] Testing...");
+    std::string xml = R"(<?xml version="1.0"?><root>  text with spaces  </root>)";
+    
+    Document doc;
+    Error err;
+    ParseOptions opt;
+    opt.preserveWhitespace = true;
+    
+    ASSERT_TRUE(Parse(xml, doc, &err, opt));
+    
+    std::string text = doc.child("root").text().as_string();
+    // With preserve whitespace, leading/trailing spaces in PCDATA are kept
+    EXPECT_TRUE(text.find("text with spaces") != std::string::npos);
+}
+
+// ToXPath edge cases
+TEST_F(XMLUtilsTest, ToXPath_MultipleIndices_Converted) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_MultipleIndices_Converted] Testing...");
+    std::string pathLike = "root.items[0].sub[2]";
+    std::string xpath = ToXPath(pathLike);
+    
+    // XPath uses 1-based indexing
+    EXPECT_EQ(xpath, "/root/items[1]/sub[3]");
+}
+
+TEST_F(XMLUtilsTest, ToXPath_AttributeOnly_Converted) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_AttributeOnly_Converted] Testing...");
+    std::string pathLike = "@version";
+    std::string xpath = ToXPath(pathLike);
+    
+    EXPECT_EQ(xpath, "/@version");
+}
+
+TEST_F(XMLUtilsTest, ToXPath_XPathInjection_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_XPathInjection_Rejected] Testing...");
+    // Attempt SQL-style injection in brackets
+    std::string pathLike = "root.item[1 or 1=1]";
+    std::string xpath = ToXPath(pathLike);
+    
+    // Should be rejected (returns __INVALID__)
+    EXPECT_EQ(xpath, "__INVALID__");
+}
+
+TEST_F(XMLUtilsTest, ToXPath_CommentInjection_Rejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_CommentInjection_Rejected] Testing...");
+    std::string pathLike = "root.item[comment()]";
+    std::string xpath = ToXPath(pathLike);
+    
+    // Should be rejected (returns __INVALID__ due to non-digit in brackets)
+    EXPECT_EQ(xpath, "__INVALID__");
+}
+
+// Set edge cases
+TEST_F(XMLUtilsTest, Set_EmptyValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_EmptyValue_Success] Testing...");
+    Document doc;
+    doc.append_child("root");
+    
+    ASSERT_TRUE(Set(doc, "root.item", ""));
+    
+    std::string out;
+    ASSERT_TRUE(GetText(doc, "root.item", out));
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(XMLUtilsTest, Set_SpecialCharactersValue_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_SpecialCharactersValue_Success] Testing...");
+    Document doc;
+    doc.append_child("root");
+    
+    std::string value = "<>&\"'test";
+    ASSERT_TRUE(Set(doc, "root.item", value));
+    
+    std::string out;
+    ASSERT_TRUE(GetText(doc, "root.item", out));
+    EXPECT_EQ(out, value);
+}
+
+TEST_F(XMLUtilsTest, Set_XPathFormat_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_XPathFormat_Success] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("item");
+    
+    ASSERT_TRUE(Set(doc, "/root/item", "XPathValue"));
+    
+    std::string out;
+    ASSERT_TRUE(GetText(doc, "root.item", out));
+    EXPECT_EQ(out, "XPathValue");
+}
+
+TEST_F(XMLUtilsTest, Set_XPathInjection_Blocked) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_XPathInjection_Blocked] Testing...");
+    Document doc;
+    doc.append_child("root").append_child("item");
+    
+    // Attempt XPath injection
+    bool result = Set(doc, "/root/item' or '1'='1", "hacked");
+    
+    EXPECT_FALSE(result);
+}
+
+TEST_F(XMLUtilsTest, Set_EmptyPath_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_EmptyPath_Fails] Testing...");
+    Document doc;
+    doc.append_child("root");
+    
+    ASSERT_FALSE(Set(doc, "", "value"));
+}
+
+TEST_F(XMLUtilsTest, Set_AttributeOnRoot_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Set_AttributeOnRoot_Fails] Testing...");
+    Document doc;
+    // Empty document - cannot set attribute at document level
+    ASSERT_FALSE(Set(doc, "@attr", "value"));
+}
+
+// Erase edge cases
+TEST_F(XMLUtilsTest, Erase_WithIndex_Removes) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Erase_WithIndex_Removes] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("item").text() = "First";
+    root.append_child("item").text() = "Second";
+    root.append_child("item").text() = "Third";
+    
+    // Erase second item (index 1, XPath [2])
+    ASSERT_TRUE(Erase(doc, "root.item[1]"));
+    
+    // Verify only two items remain
+    int count = 0;
+    for (auto child = doc.child("root").child("item"); child; child = child.next_sibling("item")) {
+        ++count;
+    }
+    EXPECT_EQ(count, 2);
+}
+
+TEST_F(XMLUtilsTest, Erase_XPathInjection_Blocked) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Erase_XPathInjection_Blocked] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("secret").text() = "password";
+    root.append_child("item");
+    
+    // Attempt XPath injection
+    bool result = Erase(doc, "/root/item | /root/secret");
+    
+    EXPECT_FALSE(result);
+    
+    // Verify secret is still there
+    EXPECT_TRUE(Contains(doc, "root.secret"));
+}
+
+TEST_F(XMLUtilsTest, Erase_EmptyPath_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Erase_EmptyPath_Fails] Testing...");
+    Document doc;
+    doc.append_child("root");
+    
+    // Empty path converts to "/" which won't match a node
+    // This should fail gracefully
+    bool result = Erase(doc, "");
+    EXPECT_FALSE(result);
+}
+
+// LoadFromFile edge cases
+TEST_F(XMLUtilsTest, LoadFromFile_InvalidXML_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_InvalidXML_Fails] Testing...");
+    createTestFile("invalid.xml", "<root><unclosed>");
+    
+    Document doc;
+    Error err;
+    
+    ASSERT_FALSE(LoadFromFile(testDir / "invalid.xml", doc, &err));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST_F(XMLUtilsTest, LoadFromFile_BinaryGarbage_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_BinaryGarbage_Fails] Testing...");
+    // Write binary garbage
+    std::string garbage;
+    for (int i = 0; i < 100; ++i) {
+        garbage += static_cast<char>(i);
+    }
+    createTestFile("binary.xml", garbage);
+    
+    Document doc;
+    Error err;
+    
+    ASSERT_FALSE(LoadFromFile(testDir / "binary.xml", doc, &err));
+}
+
+TEST_F(XMLUtilsTest, LoadFromFile_ExceedsMaxSize_Fails) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[LoadFromFile_ExceedsMaxSize_Fails] Testing...");
+    // Create a file that exceeds the specified max size
+    std::string smallXml = "<?xml version=\"1.0\"?><root><item>Small content</item></root>";
+    createTestFile("small.xml", smallXml);
+    
+    Document doc;
+    Error err;
+    
+    // Use a very small max size (10 bytes)
+    ASSERT_FALSE(LoadFromFile(testDir / "small.xml", doc, &err, {}, 10));
+    EXPECT_FALSE(err.message.empty());
+}
+
+// SaveToFile edge cases
+TEST_F(XMLUtilsTest, SaveToFile_OverwriteExisting_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[SaveToFile_OverwriteExisting_Success] Testing...");
+    // Create initial file
+    createTestFile("overwrite.xml", "<?xml version=\"1.0\"?><old>content</old>");
+    
+    // Create new document
+    Document doc;
+    doc.append_child("new").text() = "content";
+    
+    Error err;
+    SaveOptions opt;
+    opt.atomicReplace = true;
+    
+    ASSERT_TRUE(SaveToFile(testDir / "overwrite.xml", doc, &err, opt));
+    
+    // Verify new content
+    std::string content = readFile("overwrite.xml");
+    EXPECT_NE(content.find("<new>content</new>"), std::string::npos);
+    EXPECT_EQ(content.find("<old>"), std::string::npos);
+}
+
+TEST_F(XMLUtilsTest, SaveToFile_CreateSubdirectory_Success) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[SaveToFile_CreateSubdirectory_Success] Testing...");
+    Document doc;
+    doc.append_child("root");
+    
+    Error err;
+    SaveOptions opt;
+    opt.atomicReplace = false;
+    
+    // Save to nested subdirectory
+    fs::path nestedPath = testDir / "subdir1" / "subdir2" / "test.xml";
+    ASSERT_TRUE(SaveToFile(nestedPath, doc, &err, opt));
+    
+    // Verify file was created
+    EXPECT_TRUE(fs::exists(nestedPath));
+}
+
+// Security: Contains with injection attempts
+TEST_F(XMLUtilsTest, Security_Contains_FunctionCall_Blocked) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_Contains_FunctionCall_Blocked] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("item").text() = "value";
+    
+    // Attempt to use XPath function
+    EXPECT_FALSE(Contains(doc, "/root/item[contains(., 'v')]"));
+}
+
+TEST_F(XMLUtilsTest, Security_Contains_UnionOperator_Blocked) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[Security_Contains_UnionOperator_Blocked] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("public");
+    root.append_child("secret").text() = "password";
+    
+    // Attempt to use union operator to access multiple nodes
+    EXPECT_FALSE(Contains(doc, "/root/public | /root/secret"));
+}
+
+// Whitespace handling
+TEST_F(XMLUtilsTest, GetText_WhitespaceOnly_ReturnsWhitespace) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[GetText_WhitespaceOnly_ReturnsWhitespace] Testing...");
+    Document doc;
+    auto root = doc.append_child("root");
+    root.append_child("item").text() = "   ";
+    
+    std::string out;
+    ASSERT_TRUE(GetText(doc, "root.item", out));
+    EXPECT_EQ(out, "   ");
+}
+
+// Complex document operations
+TEST_F(XMLUtilsTest, ComplexDocument_ParseModifySave_RoundTrip) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ComplexDocument_ParseModifySave_RoundTrip] Testing...");
+    std::string originalXml = R"(<?xml version="1.0"?>
+<config>
+    <database host="localhost" port="5432">
+        <name>testdb</name>
+        <credentials>
+            <user>admin</user>
+            <password>secret</password>
+        </credentials>
+    </database>
+    <logging level="debug">
+        <file>/var/log/app.log</file>
+    </logging>
+</config>)";
+    
+    Document doc;
+    Error err;
+    ASSERT_TRUE(Parse(originalXml, doc, &err));
+    
+    // Modify values
+    ASSERT_TRUE(Set(doc, "config.database.name", "production_db"));
+    ASSERT_TRUE(Set(doc, "config.database.@port", "5433"));
+    ASSERT_TRUE(Set(doc, "config.logging.@level", "info"));
+    
+    // Save and reload
+    ASSERT_TRUE(SaveToFile(testDir / "complex.xml", doc, &err));
+    
+    Document reloaded;
+    ASSERT_TRUE(LoadFromFile(testDir / "complex.xml", reloaded, &err));
+    
+    // Verify modifications
+    std::string dbName, dbPort, logLevel;
+    ASSERT_TRUE(GetText(reloaded, "config.database.name", dbName));
+    ASSERT_TRUE(GetText(reloaded, "config.database.@port", dbPort));
+    ASSERT_TRUE(GetText(reloaded, "config.logging.@level", logLevel));
+    
+    EXPECT_EQ(dbName, "production_db");
+    EXPECT_EQ(dbPort, "5433");
+    EXPECT_EQ(logLevel, "info");
+}
+
+// Concurrent access safety (basic test)
+TEST_F(XMLUtilsTest, ConcurrentParse_DifferentDocuments_Safe) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ConcurrentParse_DifferentDocuments_Safe] Testing...");
+    std::string xml = "<?xml version=\"1.0\"?><root><item>Value</item></root>";
+    
+    std::vector<std::thread> threads;
+    std::atomic<int> successCount{0};
+    
+    for (int i = 0; i < 10; ++i) {
+        threads.emplace_back([&xml, &successCount]() {
+            Document doc;
+            Error err;
+            if (Parse(xml, doc, &err)) {
+                successCount++;
+            }
+        });
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    EXPECT_EQ(successCount.load(), 10);
 }

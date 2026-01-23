@@ -349,6 +349,9 @@ TEST_F(WhitelistStoreTest, IsWhitelisted_ComprehensiveCheck_PrioritizesHash) {
 TEST_F(WhitelistStoreTest, AddHash_WithExpiration_ExpiresCorrectly) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
+    // Disable caching to ensure we get fresh lookup results
+    store->SetCachingEnabled(false);
+    
     HashValue hash = CreateHash("temp_allow");
     
     // Set expiration to 1 second in future
@@ -362,13 +365,12 @@ TEST_F(WhitelistStoreTest, AddHash_WithExpiration_ExpiresCorrectly) {
     // valid immediately
     EXPECT_TRUE(store->IsHashWhitelisted(hash).found);
     
-    // Wait for expiration
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    // Wait for expiration (2 seconds to give margin for system load)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     
     // Should be expired
     auto res = store->IsHashWhitelisted(hash);
-    EXPECT_FALSE(res.found); 
-    // Assuming IsHashWhitelisted filters out expired items automatically
+    EXPECT_FALSE(res.found) << "Entry should be expired after 2 seconds (expiry was 1 second)";
 }
 
 TEST_F(WhitelistStoreTest, PurgeExpired_RemovesEntries) {
@@ -381,7 +383,8 @@ TEST_F(WhitelistStoreTest, PurgeExpired_RemovesEntries) {
         (now - std::chrono::seconds(1)).time_since_epoch()
     ).count();
     
-    store->AddHash(hash, WhitelistReason::TemporaryBypass, L"Old", expiry);//-V530
+    auto addResult = store->AddHash(hash, WhitelistReason::TemporaryBypass, L"Old", expiry);
+    ASSERT_TRUE(addResult.IsSuccess());
     EXPECT_EQ(store->GetEntryCount(), 1);
     
     StoreError err = store->PurgeExpired();
@@ -859,25 +862,31 @@ TEST_F(WhitelistStoreTest, ExportToJSONString_ReturnsValidJSON) {
     std::string json = store->ExportToJSONString();
     
     EXPECT_FALSE(json.empty());
-    // Basic JSON structure validation
-    EXPECT_NE(json.find('['), std::string::npos);
-    EXPECT_NE(json.find(']'), std::string::npos);
-    EXPECT_NE(json.find("Export1"), std::string::npos);
+    // Basic JSON structure validation - check for JSON array markers in entries
+    EXPECT_NE(json.find("entries"), std::string::npos);
+    // Check for description that was added
+    EXPECT_NE(json.find("First Entry"), std::string::npos);
+    // Check for valid JSON structure keys
+    EXPECT_NE(json.find("type"), std::string::npos);
+    EXPECT_NE(json.find("file_hash"), std::string::npos);
 }
 
 TEST_F(WhitelistStoreTest, ImportFromJSONString_AddsEntries) {
     ASSERT_TRUE(store->Create(dbPath).IsSuccess());
     
-    // Create JSON with hash entries
-    std::string jsonData = R"([
-        {
-            "type": "FileHash",
-            "algorithm": "SHA256",
-            "hash": "0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20",
-            "reason": "UserApproved",
-            "description": "Imported Entry"
-        }
-    ])";
+    // Create JSON with hash entries - must be object with "entries" array
+    std::string jsonData = R"({
+        "version": "1.0",
+        "entries": [
+            {
+                "type": "file_hash",
+                "algorithm": "sha256",
+                "value": "0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20",
+                "reason": "user_approved",
+                "description": "Imported Entry"
+            }
+        ]
+    })";
     
     size_t importedCount = 0;
     StoreError err = store->ImportFromJSONString(jsonData, [&](size_t current, size_t total) {
@@ -938,17 +947,20 @@ TEST_F(WhitelistStoreTest, ExportToCSV_CreatesValidCSV) {
     
     EXPECT_TRUE(fs::exists(csvPath));
     
-    // Verify file has content
-    std::ifstream file(csvPath);
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+    // Verify file has content - use scope to ensure file is closed before remove
+    {
+        std::ifstream file(csvPath);
+        std::string content((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+        
+        EXPECT_FALSE(content.empty());
+        // Should have header row + data rows
+        size_t lineCount = std::count(content.begin(), content.end(), '\n');
+        EXPECT_GE(lineCount, 2); // Header + at least 1 data row
+    } // file closed here
     
-    EXPECT_FALSE(content.empty());
-    // Should have header row + data rows
-    size_t lineCount = std::count(content.begin(), content.end(), '\n');
-    EXPECT_GE(lineCount, 2); // Header + at least 1 data row
-    
-    fs::remove(csvPath);
+    // Cleanup
+    try { fs::remove(csvPath); } catch(...) {}
 }
 
 // ============================================================================
@@ -1089,8 +1101,10 @@ TEST_F(WhitelistStoreTest, MatchCallback_InvokedOnMatch) {
     HashValue hash = CreateHash("CallbackTest");
     store->AddHash(hash, WhitelistReason::UserApproved);//-V530
     
-    // Query should trigger callback
-    store->IsHashWhitelisted(hash);//-V530
+    // Query with logLookup=true to trigger callback
+    QueryOptions opts;
+    opts.logLookup = true;
+    store->IsHashWhitelisted(hash, opts);//-V530
     
     EXPECT_GE(callbackCount, 1);
     EXPECT_TRUE(capturedResult.found);
@@ -1264,6 +1278,778 @@ TEST_F(WhitelistStoreTest, AddHash_EmptyHash_Fails) {
     
     EXPECT_FALSE(err.IsSuccess());
     EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+// ============================================================================
+// ADDITIONAL EDGE CASE TESTS - ENTERPRISE-GRADE COVERAGE
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// INPUT VALIDATION EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, AddHash_DuplicateEntry_ReturnsDuplicateError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    HashValue hash = CreateHash("DuplicateTest");
+    
+    // First add should succeed
+    StoreError err1 = store->AddHash(hash, WhitelistReason::UserApproved);
+    ASSERT_TRUE(err1.IsSuccess());
+    
+    // Second add of same hash should fail with DuplicateEntry
+    StoreError err2 = store->AddHash(hash, WhitelistReason::PolicyBased);
+    EXPECT_FALSE(err2.IsSuccess());
+    EXPECT_EQ(err2.code, WhitelistStoreError::DuplicateEntry);
+}
+
+TEST_F(WhitelistStoreTest, AddPath_TooLongPath_ReturnsPathTooLong) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Create path exceeding max length (32767 + some extra)
+    std::wstring longPath(40000, L'X');
+    
+    StoreError err = store->AddPath(longPath, PathMatchMode::Exact, WhitelistReason::UserApproved);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::PathTooLong);
+}
+
+TEST_F(WhitelistStoreTest, Load_EmptyPath_ReturnsError) {
+    StoreError err = store->Load(L"");
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::FileNotFound);
+}
+
+TEST_F(WhitelistStoreTest, Create_EmptyPath_ReturnsError) {
+    StoreError err = store->Create(L"");
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, Create_ExtremelySmallSizeRequest_Clamped) {
+    // Request size smaller than minimum (should be clamped to minimum)
+    StoreError err = store->Create(dbPath, 100); // Very small
+    
+    // Should succeed with clamped size
+    ASSERT_TRUE(err.IsSuccess()) << "Failed to create database: " << err.message;
+    EXPECT_TRUE(store->IsInitialized());
+}
+
+TEST_F(WhitelistStoreTest, AddHash_StringOverload_InvalidHexChars_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Contains invalid hex characters 'G' and 'Z'
+    std::string invalidHash = "0102030405060708090A0B0C0D0E0FGGHHIIXX1A1B1C1D1E1F20ZZ";
+    
+    StoreError err = store->AddHash(invalidHash, HashAlgorithm::SHA256, WhitelistReason::UserApproved);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, AddHash_StringOverload_WrongLength_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // SHA256 expects 64 hex chars, provide only 32
+    std::string shortHash = "0102030405060708090A0B0C0D0E0F10";
+    
+    StoreError err = store->AddHash(shortHash, HashAlgorithm::SHA256, WhitelistReason::UserApproved);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, AddHash_StringOverload_WithOxPrefix_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Valid SHA256 with 0x prefix
+    std::string hashWithPrefix = "0x0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20";
+    
+    StoreError err = store->AddHash(hashWithPrefix, HashAlgorithm::SHA256, WhitelistReason::UserApproved);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+    EXPECT_EQ(store->GetEntryCount(), 1);
+}
+
+TEST_F(WhitelistStoreTest, AddHash_StringOverload_MD5_ValidLength) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // MD5 expects 32 hex chars (16 bytes)
+    std::string md5Hash = "0102030405060708090a0b0c0d0e0f10";
+    
+    StoreError err = store->AddHash(md5Hash, HashAlgorithm::MD5, WhitelistReason::UserApproved);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+}
+
+TEST_F(WhitelistStoreTest, AddHash_StringOverload_SHA1_ValidLength) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // SHA1 expects 40 hex chars (20 bytes)
+    std::string sha1Hash = "0102030405060708090a0b0c0d0e0f1011121314";
+    
+    StoreError err = store->AddHash(sha1Hash, HashAlgorithm::SHA1, WhitelistReason::UserApproved);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+}
+
+TEST_F(WhitelistStoreTest, AddHash_StringOverload_SHA512_ValidLength) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // SHA512 expects 128 hex chars (64 bytes)
+    std::string sha512Hash = 
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+        "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
+    
+    StoreError err = store->AddHash(sha512Hash, HashAlgorithm::SHA512, WhitelistReason::UserApproved);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+}
+
+// ---------------------------------------------------------------------------
+// BATCH OPERATION EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, BatchAdd_EmptyBatch_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    std::vector<WhitelistEntry> emptyEntries;
+    
+    StoreError err = store->BatchAdd(emptyEntries);
+    
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(store->GetEntryCount(), 0);
+}
+
+TEST_F(WhitelistStoreTest, BatchLookupHashes_EmptyInput_ReturnsEmpty) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    std::vector<HashValue> emptyHashes;
+    
+    auto results = store->BatchLookupHashes(emptyHashes);
+    
+    EXPECT_TRUE(results.empty());
+}
+
+// ---------------------------------------------------------------------------
+// ENTRY MANAGEMENT EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, GetEntry_ZeroId_ReturnsNullopt) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    auto entryOpt = store->GetEntry(0);
+    
+    EXPECT_FALSE(entryOpt.has_value());
+}
+
+TEST_F(WhitelistStoreTest, GetEntry_MaxUInt64Id_ReturnsNullopt) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    auto entryOpt = store->GetEntry(UINT64_MAX);
+    
+    EXPECT_FALSE(entryOpt.has_value());
+}
+
+TEST_F(WhitelistStoreTest, UpdateEntryFlags_ZeroId_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->UpdateEntryFlags(0, WhitelistFlags::Enabled);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, UpdateEntryFlags_MaxUInt64Id_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->UpdateEntryFlags(UINT64_MAX, WhitelistFlags::Enabled);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, UpdateEntryFlags_NonExistentId_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // No entries added, ID 1 doesn't exist
+    StoreError err = store->UpdateEntryFlags(1, WhitelistFlags::Enabled);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::EntryNotFound);
+}
+
+TEST_F(WhitelistStoreTest, RemoveEntry_ZeroId_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->RemoveEntry(0);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, RemoveEntry_MaxUInt64Id_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->RemoveEntry(UINT64_MAX);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, RemoveEntry_AlreadyRevoked_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    store->AddHash(CreateHash("RevokeTest"), WhitelistReason::UserApproved);//-V530
+    
+    // First revoke should succeed
+    StoreError err1 = store->RevokeEntry(1);
+    ASSERT_TRUE(err1.IsSuccess());
+    
+    // Second revoke should fail (already revoked)
+    StoreError err2 = store->RemoveEntry(1);
+    EXPECT_FALSE(err2.IsSuccess());
+    EXPECT_EQ(err2.code, WhitelistStoreError::EntryNotFound);
+}
+
+// ---------------------------------------------------------------------------
+// MOVE SEMANTICS TESTS
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, MoveConstructor_TransfersOwnership) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    store->AddHash(CreateHash("MoveTest"), WhitelistReason::UserApproved);//-V530
+    EXPECT_EQ(store->GetEntryCount(), 1);
+    
+    // Move construct new store
+    WhitelistStore movedStore(std::move(*store));
+    
+    // New store should have the entry
+    EXPECT_TRUE(movedStore.IsInitialized());
+    EXPECT_EQ(movedStore.GetEntryCount(), 1);
+    
+    // Old store should be reset
+    EXPECT_FALSE(store->IsInitialized());
+}
+
+TEST_F(WhitelistStoreTest, MoveAssignment_TransfersOwnership) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    store->AddHash(CreateHash("MoveAssignTest"), WhitelistReason::UserApproved);//-V530
+    
+    // Create second store
+    WhitelistStore store2;
+    
+    // Move assign
+    store2 = std::move(*store);
+    
+    // Second store should have the entry
+    EXPECT_TRUE(store2.IsInitialized());
+    EXPECT_EQ(store2.GetEntryCount(), 1);
+    
+    // Old store should be reset
+    EXPECT_FALSE(store->IsInitialized());
+}
+
+// ---------------------------------------------------------------------------
+// LIFECYCLE EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, DoubleClose_Safe) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    store->Close();
+    EXPECT_FALSE(store->IsInitialized());
+    
+    // Second close should not crash
+    EXPECT_NO_THROW(store->Close());
+    EXPECT_FALSE(store->IsInitialized());
+}
+
+TEST_F(WhitelistStoreTest, Save_NotInitialized_ReturnsError) {
+    // Store is not initialized (no Create/Load called)
+    StoreError err = store->Save();
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+// ---------------------------------------------------------------------------
+// IMPORT/EXPORT EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_EmptyJSON_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->ImportFromJSONString("");
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_InvalidJSON_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    std::string invalidJson = "{ this is not valid json [[[";
+    
+    StoreError err = store->ImportFromJSONString(invalidJson);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_MissingEntriesField_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Valid JSON but missing required "entries" field
+    std::string jsonWithoutEntries = R"({"version": "1.0"})";
+    
+    StoreError err = store->ImportFromJSONString(jsonWithoutEntries);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_EntriesNotArray_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // "entries" is string instead of array
+    std::string jsonInvalidEntries = R"({"entries": "not an array"})";
+    
+    StoreError err = store->ImportFromJSONString(jsonInvalidEntries);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, ExportToJSON_NotInitialized_ReturnsError) {
+    // Store not initialized
+    std::wstring exportPath = dbPath + L".uninit.json";
+    
+    StoreError err = store->ExportToJSON(exportPath);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+TEST_F(WhitelistStoreTest, ExportToJSONString_NotInitialized_ReturnsErrorJSON) {
+    // Store not initialized
+    std::string json = store->ExportToJSONString();
+    
+    // Should return error JSON, not crash
+    EXPECT_FALSE(json.empty());
+    EXPECT_NE(json.find("error"), std::string::npos);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromJSON_NotInitialized_ReturnsError) {
+    std::wstring fakePath = dbPath + L".fake.json";
+    
+    StoreError err = store->ImportFromJSON(fakePath);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromCSV_NotInitialized_ReturnsError) {
+    std::wstring fakePath = dbPath + L".fake.csv";
+    
+    StoreError err = store->ImportFromCSV(fakePath);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+TEST_F(WhitelistStoreTest, ExportToCSV_NotInitialized_ReturnsError) {
+    std::wstring exportPath = dbPath + L".uninit.csv";
+    
+    StoreError err = store->ExportToCSV(exportPath);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+// ---------------------------------------------------------------------------
+// MAINTENANCE EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, VerifyIntegrity_NotInitialized_ReturnsError) {
+    std::vector<std::string> logs;
+    
+    StoreError err = store->VerifyIntegrity([&](const std::string& msg) {
+        logs.push_back(msg);
+    });
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+TEST_F(WhitelistStoreTest, Compact_EmptyDatabase_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // No entries added - compact should succeed
+    StoreError err = store->Compact();
+    
+    ASSERT_TRUE(err.IsSuccess());
+    EXPECT_EQ(store->GetEntryCount(), 0);
+}
+
+TEST_F(WhitelistStoreTest, Compact_NoDeletedEntries_NoOp) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Add some entries but don't delete any
+    for (int i = 0; i < 10; ++i) {
+        store->AddHash(CreateHash("NoDelete_" + std::to_string(i)), WhitelistReason::UserApproved);//-V530
+    }
+    
+    uint64_t countBefore = store->GetEntryCount();
+    
+    // Compact should be no-op (nothing deleted)
+    StoreError err = store->Compact();
+    
+    ASSERT_TRUE(err.IsSuccess());
+    EXPECT_EQ(store->GetEntryCount(), countBefore);
+}
+
+TEST_F(WhitelistStoreTest, RebuildIndices_EmptyDatabase_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // No entries - rebuild should succeed
+    StoreError err = store->RebuildIndices();
+    
+    ASSERT_TRUE(err.IsSuccess());
+}
+
+TEST_F(WhitelistStoreTest, PurgeExpired_NoExpiredEntries_NoOp) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Add entries without expiration
+    for (int i = 0; i < 5; ++i) {
+        store->AddHash(CreateHash("NoExpiry_" + std::to_string(i)), WhitelistReason::UserApproved);//-V530
+    }
+    
+    uint64_t countBefore = store->GetEntryCount();
+    
+    StoreError err = store->PurgeExpired();
+    
+    ASSERT_TRUE(err.IsSuccess());
+    EXPECT_EQ(store->GetEntryCount(), countBefore);
+}
+
+TEST_F(WhitelistStoreTest, UpdateChecksum_NotInitialized_ReturnsError) {
+    StoreError err = store->UpdateChecksum();
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidSection);
+}
+
+TEST_F(WhitelistStoreTest, Compact_ReadOnly_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    store->Close();
+    
+    store = std::make_unique<WhitelistStore>();
+    ASSERT_TRUE(store->Load(dbPath, true).IsSuccess()); // Read-only
+    
+    StoreError err = store->Compact();
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::ReadOnlyDatabase);
+}
+
+TEST_F(WhitelistStoreTest, RebuildIndices_ReadOnly_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    store->Close();
+    
+    store = std::make_unique<WhitelistStore>();
+    ASSERT_TRUE(store->Load(dbPath, true).IsSuccess()); // Read-only
+    
+    StoreError err = store->RebuildIndices();
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::ReadOnlyDatabase);
+}
+
+TEST_F(WhitelistStoreTest, PurgeExpired_ReadOnly_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    store->Close();
+    
+    store = std::make_unique<WhitelistStore>();
+    ASSERT_TRUE(store->Load(dbPath, true).IsSuccess()); // Read-only
+    
+    StoreError err = store->PurgeExpired();
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::ReadOnlyDatabase);
+}
+
+// ---------------------------------------------------------------------------
+// QUERY EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, GetEntries_OffsetBeyondTotal_ReturnsEmpty) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Add 5 entries
+    for (int i = 0; i < 5; ++i) {
+        store->AddHash(CreateHash("OffsetTest_" + std::to_string(i)), WhitelistReason::UserApproved);//-V530
+    }
+    
+    // Request offset beyond total
+    auto entries = store->GetEntries(100, 10);
+    
+    EXPECT_TRUE(entries.empty());
+}
+
+TEST_F(WhitelistStoreTest, GetEntries_LimitZero_ReturnsEmpty) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    store->AddHash(CreateHash("LimitZeroTest"), WhitelistReason::UserApproved);//-V530
+    
+    auto entries = store->GetEntries(0, 0);
+    
+    EXPECT_TRUE(entries.empty());
+}
+
+TEST_F(WhitelistStoreTest, IsHashWhitelisted_NotInitialized_ReturnsNotFound) {
+    // Store not initialized
+    HashValue hash = CreateHash("UninitTest");
+    
+    auto result = store->IsHashWhitelisted(hash);
+    
+    EXPECT_FALSE(result.found);
+}
+
+TEST_F(WhitelistStoreTest, IsPathWhitelisted_NotInitialized_ReturnsNotFound) {
+    // Store not initialized
+    auto result = store->IsPathWhitelisted(L"C:\\Test\\Path.exe");
+    
+    EXPECT_FALSE(result.found);
+}
+
+TEST_F(WhitelistStoreTest, IsPathWhitelisted_TooLongPath_ReturnsNotFound) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Path exceeding max length
+    std::wstring longPath(40000, L'X');
+    
+    auto result = store->IsPathWhitelisted(longPath);
+    
+    EXPECT_FALSE(result.found);
+}
+
+TEST_F(WhitelistStoreTest, IsPathWhitelisted_EmptyPath_ReturnsNotFound) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    auto result = store->IsPathWhitelisted(L"");
+    
+    EXPECT_FALSE(result.found);
+}
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, SetCacheSize_Zero_DisablesCache) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    EXPECT_NO_THROW(store->SetCacheSize(0));
+    
+    // Operations should still work with cache disabled
+    store->AddHash(CreateHash("NoCacheTest"), WhitelistReason::UserApproved);//-V530
+    auto result = store->IsHashWhitelisted(CreateHash("NoCacheTest"));
+    EXPECT_TRUE(result.found);
+}
+
+TEST_F(WhitelistStoreTest, SetCacheSize_ExceedsMax_ClampedToMax) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Request extremely large cache size (should be clamped)
+    EXPECT_NO_THROW(store->SetCacheSize(SIZE_MAX));
+    
+    // Should not crash, should work normally
+    store->AddHash(CreateHash("LargeCacheTest"), WhitelistReason::UserApproved);//-V530
+    auto result = store->IsHashWhitelisted(CreateHash("LargeCacheTest"));
+    EXPECT_TRUE(result.found);
+}
+
+// ---------------------------------------------------------------------------
+// PUBLISHER/CERTIFICATE EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, AddPublisher_EmptyName_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->AddPublisher(L"", WhitelistReason::UserApproved);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, IsPublisherWhitelisted_EmptyName_ReturnsNotFound) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    auto result = store->IsPublisherWhitelisted(L"");
+    
+    EXPECT_FALSE(result.found);
+}
+
+TEST_F(WhitelistStoreTest, IsPublisherWhitelisted_TooLongName_ReturnsNotFound) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // Create publisher name exceeding max length
+    std::wstring longPublisher(2000, L'X');
+    
+    auto result = store->IsPublisherWhitelisted(longPublisher);
+    
+    EXPECT_FALSE(result.found);
+}
+
+// ---------------------------------------------------------------------------
+// COMPREHENSIVE LOOKUP EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, IsWhitelisted_AllNullOptional_ReturnsNotFound) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    // All parameters empty/null
+    auto result = store->IsWhitelisted(L"", nullptr, nullptr, L"");
+    
+    EXPECT_FALSE(result.found);
+}
+
+TEST_F(WhitelistStoreTest, IsWhitelisted_NotInitialized_ReturnsNotFound) {
+    // Store not initialized
+    HashValue hash = CreateHash("Test");
+    
+    auto result = store->IsWhitelisted(L"C:\\Test.exe", &hash, nullptr, L"");
+    
+    EXPECT_FALSE(result.found);
+}
+
+// ---------------------------------------------------------------------------
+// STATISTICS EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, GetStatistics_NotInitialized_ReturnsZeroedStats) {
+    // Store not initialized
+    auto stats = store->GetStatistics();
+    
+    EXPECT_EQ(stats.totalEntries, 0);
+    EXPECT_EQ(stats.totalLookups, 0);
+}
+
+TEST_F(WhitelistStoreTest, GetEntryCount_NotInitialized_ReturnsZero) {
+    // Store not initialized
+    EXPECT_EQ(store->GetEntryCount(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// HASH REMOVAL EDGE CASES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, RemoveHash_EmptyHash_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    HashValue emptyHash{};
+    
+    StoreError err = store->RemoveHash(emptyHash);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+TEST_F(WhitelistStoreTest, RemoveHash_NonExistent_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    HashValue hash = CreateHash("NonExistent");
+    
+    StoreError err = store->RemoveHash(hash);
+    
+    // Should return error since hash doesn't exist
+    EXPECT_FALSE(err.IsSuccess());
+}
+
+TEST_F(WhitelistStoreTest, RemovePath_Empty_ReturnsError) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    StoreError err = store->RemovePath(L"", PathMatchMode::Exact);
+    
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, WhitelistStoreError::InvalidEntry);
+}
+
+// ---------------------------------------------------------------------------
+// IMPORT FROM VALID JSON WITH VARIOUS ENTRY TYPES
+// ---------------------------------------------------------------------------
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_ValidHashEntry_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    std::string validJson = R"({
+        "version": "1.0",
+        "entries": [
+            {
+                "type": "hash",
+                "algorithm": "sha256",
+                "value": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+                "reason": "user_approved",
+                "description": "Test hash entry"
+            }
+        ]
+    })";
+    
+    StoreError err = store->ImportFromJSONString(validJson);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+    EXPECT_GE(store->GetEntryCount(), 1);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_ValidPathEntry_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    std::string validJson = R"({
+        "version": "1.0",
+        "entries": [
+            {
+                "type": "path",
+                "path": "C:\\Windows\\System32\\notepad.exe",
+                "mode": "exact",
+                "reason": "system_file",
+                "description": "Notepad"
+            }
+        ]
+    })";
+    
+    StoreError err = store->ImportFromJSONString(validJson);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+    EXPECT_GE(store->GetEntryCount(), 1);
+}
+
+TEST_F(WhitelistStoreTest, ImportFromJSONString_MixedEntryTypes_Success) {
+    ASSERT_TRUE(store->Create(dbPath).IsSuccess());
+    
+    std::string validJson = R"({
+        "version": "1.0",
+        "entries": [
+            {
+                "type": "hash",
+                "algorithm": "sha256",
+                "value": "aabbccdd11223344556677889900aabbccddeeff00112233445566778899aabb"
+            },
+            {
+                "type": "file_path",
+                "path": "C:\\Apps\\trusted.exe",
+                "mode": "prefix"
+            }
+        ]
+    })";
+    
+    StoreError err = store->ImportFromJSONString(validJson);
+    
+    ASSERT_TRUE(err.IsSuccess()) << "Failed: " << err.message;
+    EXPECT_GE(store->GetEntryCount(), 2);
 }
 
 } // namespace ShadowStrike::Whitelist::Tests

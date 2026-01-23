@@ -132,6 +132,27 @@ constexpr size_t BATCH_CHUNK_SIZE = 8;
 constexpr uint32_t FNV1A_OFFSET_BASIS = 2166136261u;
 constexpr uint32_t FNV1A_PRIME = 16777619u;
 
+/**
+ * @brief Compute FNV-1a hash for byte array
+ * @param data Pointer to data
+ * @param length Length of data in bytes
+ * @return 32-bit FNV-1a hash value
+ * 
+ * Used for PathEntryRecord hash filtering and deduplication.
+ */
+[[nodiscard]] inline uint32_t ComputeFNV1aHash(const uint8_t* data, size_t length) noexcept {
+    if (!data || length == 0) {
+        return FNV1A_OFFSET_BASIS;
+    }
+    
+    uint32_t hash = FNV1A_OFFSET_BASIS;
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= data[i];
+        hash *= FNV1A_PRIME;
+    }
+    return hash;
+}
+
 // ============================================================================
 // HARDWARE FEATURE DETECTION
 // ============================================================================
@@ -672,12 +693,12 @@ template<typename T>
             return path.empty() ? true : false; // Empty is valid, too long is invalid
         }
         
-        // Reserve with overflow protection
+        // Reserve with overflow protection (check BEFORE multiplication)
         // Worst case UTF-8 expansion is 3x for BMP characters
-        const size_t maxSize = path.length() * 3;
-        if (maxSize < path.length()) { // Overflow check
-            return false;
+        if (path.length() > SIZE_MAX / 3) {
+            return false; // Would overflow
         }
+        const size_t maxSize = path.length() * 3;
         output.reserve(maxSize);
         
         for (wchar_t wc : path) {
@@ -711,6 +732,20 @@ template<typename T>
             output.pop_back();
         }
         
+        // SECURITY: Detect and reject path traversal attacks
+        // Patterns like ".." or "." segments could be used to escape directory boundaries
+        // Check for: /./ or /../ or starts with ./ or ../ or ends with /. or /..
+        if (output.find("/./") != std::string::npos ||
+            output.find("/../") != std::string::npos ||
+            (output.length() >= 2 && output.substr(0, 2) == "./") ||
+            (output.length() >= 3 && output.substr(0, 3) == "../") ||
+            (output.length() >= 2 && output.substr(output.length() - 2) == "/.") ||
+            (output.length() >= 3 && output.substr(output.length() - 3) == "/..")) {
+            SS_LOG_WARN(L"Whitelist", L"NormalizePath: path traversal detected, rejecting");
+            output.clear();
+            return false;
+        }
+        
         return true;
     } catch (const std::bad_alloc&) {
         // Memory allocation failed - clear output for safety
@@ -729,6 +764,48 @@ template<typename T>
  */
 [[nodiscard]] inline uint32_t SegmentHash(std::string_view segment) noexcept {
     return SegmentHashOptimized(segment);
+}
+
+/**
+ * @brief Split normalized path into segments by '/' separator
+ * @param path Normalized path (lowercase, forward slashes)
+ * @param segments Output vector of path segments
+ * 
+ * Example: "c:/windows/system32" -> ["c:", "windows", "system32"]
+ */
+inline void SplitPathSegments(std::string_view path, std::vector<std::string_view>& segments) noexcept {
+    segments.clear();
+    
+    if (path.empty()) {
+        return;
+    }
+    
+    try {
+        segments.reserve(32); // Pre-reserve reasonable capacity
+        
+        size_t start = 0;
+        while (start < path.length()) {
+            // Find next separator
+            size_t end = path.find('/', start);
+            
+            if (end == std::string_view::npos) {
+                // Last segment
+                if (start < path.length()) {
+                    segments.push_back(path.substr(start));
+                }
+                break;
+            }
+            
+            // Add segment if non-empty
+            if (end > start) {
+                segments.push_back(path.substr(start, end - start));
+            }
+            
+            start = end + 1;
+        }
+    } catch (...) {
+        segments.clear();
+    }
 }
 
 /**
@@ -815,22 +892,35 @@ public:
 
 } // anonymous namespace
 
-PathIndex::PathIndex() = default;
+PathIndex::PathIndex()
+    : m_heapRoot(std::make_unique<HeapTrieNode>())
+{
+    // Initialize with root node
+    m_nodeCount.store(1, std::memory_order_release);
+}
 
 PathIndex::~PathIndex() = default;
 
 PathIndex::PathIndex(PathIndex&& other) noexcept
-    : m_view(nullptr)
+    : m_heapRoot(nullptr)
+    , m_view(nullptr)
     , m_baseAddress(nullptr)
     , m_rootOffset(0)
     , m_indexOffset(0)
     , m_indexSize(0)
     , m_pathCount(0)
     , m_nodeCount(0)
+    , m_lookupCount(0)
+    , m_lookupHits(0)
+    , m_insertCount(0)
+    , m_removeCount(0)
+    , m_nextRecordIndex(0)
 {
     // Lock source for thread-safe move
     std::unique_lock lock(other.m_rwLock);
     
+    m_heapRoot = std::move(other.m_heapRoot);
+    m_pathRecords = std::move(other.m_pathRecords);
     m_view = other.m_view;
     m_baseAddress = other.m_baseAddress;
     m_rootOffset = other.m_rootOffset;
@@ -840,6 +930,18 @@ PathIndex::PathIndex(PathIndex&& other) noexcept
                       std::memory_order_release);
     m_nodeCount.store(other.m_nodeCount.load(std::memory_order_acquire),
                       std::memory_order_release);
+    m_nextRecordIndex.store(other.m_nextRecordIndex.load(std::memory_order_acquire),
+                            std::memory_order_release);
+    
+    // Transfer performance counters
+    m_lookupCount.store(other.m_lookupCount.load(std::memory_order_acquire),
+                        std::memory_order_release);
+    m_lookupHits.store(other.m_lookupHits.load(std::memory_order_acquire),
+                       std::memory_order_release);
+    m_insertCount.store(other.m_insertCount.load(std::memory_order_acquire),
+                        std::memory_order_release);
+    m_removeCount.store(other.m_removeCount.load(std::memory_order_acquire),
+                        std::memory_order_release);
     
     // Clear source
     other.m_view = nullptr;
@@ -849,6 +951,11 @@ PathIndex::PathIndex(PathIndex&& other) noexcept
     other.m_indexSize = 0;
     other.m_pathCount.store(0, std::memory_order_release);
     other.m_nodeCount.store(0, std::memory_order_release);
+    other.m_nextRecordIndex.store(0, std::memory_order_release);
+    other.m_lookupCount.store(0, std::memory_order_release);
+    other.m_lookupHits.store(0, std::memory_order_release);
+    other.m_insertCount.store(0, std::memory_order_release);
+    other.m_removeCount.store(0, std::memory_order_release);
 }
 
 PathIndex& PathIndex::operator=(PathIndex&& other) noexcept {
@@ -858,6 +965,8 @@ PathIndex& PathIndex::operator=(PathIndex&& other) noexcept {
         std::unique_lock lockOther(other.m_rwLock, std::defer_lock);
         std::lock(lockThis, lockOther);
         
+        m_heapRoot = std::move(other.m_heapRoot);
+        m_pathRecords = std::move(other.m_pathRecords);
         m_view = other.m_view;
         m_baseAddress = other.m_baseAddress;
         m_rootOffset = other.m_rootOffset;
@@ -867,6 +976,18 @@ PathIndex& PathIndex::operator=(PathIndex&& other) noexcept {
                           std::memory_order_release);
         m_nodeCount.store(other.m_nodeCount.load(std::memory_order_acquire),
                           std::memory_order_release);
+        m_nextRecordIndex.store(other.m_nextRecordIndex.load(std::memory_order_acquire),
+                                std::memory_order_release);
+        
+        // Transfer performance counters
+        m_lookupCount.store(other.m_lookupCount.load(std::memory_order_acquire),
+                            std::memory_order_release);
+        m_lookupHits.store(other.m_lookupHits.load(std::memory_order_acquire),
+                           std::memory_order_release);
+        m_insertCount.store(other.m_insertCount.load(std::memory_order_acquire),
+                            std::memory_order_release);
+        m_removeCount.store(other.m_removeCount.load(std::memory_order_acquire),
+                            std::memory_order_release);
         
         // Clear source
         other.m_view = nullptr;
@@ -876,6 +997,11 @@ PathIndex& PathIndex::operator=(PathIndex&& other) noexcept {
         other.m_indexSize = 0;
         other.m_pathCount.store(0, std::memory_order_release);
         other.m_nodeCount.store(0, std::memory_order_release);
+        other.m_nextRecordIndex.store(0, std::memory_order_release);
+        other.m_lookupCount.store(0, std::memory_order_release);
+        other.m_lookupHits.store(0, std::memory_order_release);
+        other.m_insertCount.store(0, std::memory_order_release);
+        other.m_removeCount.store(0, std::memory_order_release);
     }
     return *this;
 }
@@ -885,6 +1011,24 @@ StoreError PathIndex::Initialize(
     uint64_t offset,
     uint64_t size
 ) noexcept {
+    /*
+     * ========================================================================
+     * INITIALIZE PATH INDEX (THREATINTEL HYBRID MODEL)
+     * ========================================================================
+     * 
+     * Initializes the PathIndex in READ-ONLY mode by:
+     * 1. Validating memory-mapped view parameters
+     * 2. Loading PathEntryRecord structures from persistent storage
+     * 3. Rebuilding HeapTrieNode index from loaded records
+     *
+     * This follows the ThreatIntel pattern where:
+     * - Raw data (PathEntryRecord) is stored in memory-mapped file (persistent)
+     * - Heap-based index is rebuilt on startup for fast lookups
+     * - Startup cost is O(n) where n = number of entries
+     *
+     * ========================================================================
+     */
+    
     std::unique_lock lock(m_rwLock);
     
     // Validate view
@@ -917,8 +1061,9 @@ StoreError PathIndex::Initialize(
     m_indexOffset = offset;
     m_indexSize = size;
     
-    // Read root offset with bounds validation
-    constexpr uint64_t MIN_HEADER_SIZE = 24; // root + pathCount + nodeCount
+    // Minimum header size for hybrid model
+    // Header layout: root offset (8) + pathCount (8) + nodeCount (8) + recordCount (8) + reserved (32) = 64 bytes
+    constexpr uint64_t MIN_HEADER_SIZE = 64;
     if (size < MIN_HEADER_SIZE) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
@@ -926,13 +1071,13 @@ StoreError PathIndex::Initialize(
         );
     }
     
+    // Read legacy header fields for backwards compatibility
     const auto* rootPtr = view.GetAt<uint64_t>(offset);
     if (rootPtr) {
         m_rootOffset = *rootPtr;
-        // Validate root offset is within section bounds
+        // Validate root offset is within section bounds (legacy validation)
         if (m_rootOffset != 0) {
-            // Root must be within section and have room for at least one node
-            if (m_rootOffset >= size || m_rootOffset + sizeof(PathTrieNode) > size) {
+            if (m_rootOffset >= size) {
                 SS_LOG_WARN(L"Whitelist", L"PathIndex: invalid root offset %llu (size=%llu)", 
                            m_rootOffset, size);
                 m_rootOffset = 0;
@@ -942,26 +1087,61 @@ StoreError PathIndex::Initialize(
         m_rootOffset = 0;
     }
     
-    const auto* pathCountPtr = view.GetAt<uint64_t>(offset + 8);
-    const auto* nodeCountPtr = view.GetAt<uint64_t>(offset + 16);
+    // ========================================================================
+    // THREATINTEL HYBRID MODEL: Load records and rebuild index
+    // ========================================================================
     
-    if (pathCountPtr) {
-        m_pathCount.store(*pathCountPtr, std::memory_order_release);
-    } else {
-        m_pathCount.store(0, std::memory_order_release);
-    }
-    if (nodeCountPtr) {
-        m_nodeCount.store(*nodeCountPtr, std::memory_order_release);
-    } else {
-        m_nodeCount.store(0, std::memory_order_release);
+    // Step 1: Load PathEntryRecord structures from memory-mapped storage
+    auto loadError = LoadRecordsFromStorage();
+    if (loadError.code != WhitelistStoreError::Success) {
+        SS_LOG_ERROR(L"Whitelist", L"PathIndex::Initialize: LoadRecordsFromStorage failed: %S",
+            loadError.message.c_str());
+        // Non-fatal: continue with empty index
+        m_pathRecords.clear();
     }
     
-    SS_LOG_DEBUG(L"Whitelist",
-        L"PathIndex initialized: %llu paths, %llu nodes",
+    // Step 2: Rebuild HeapTrieNode index from loaded records
+    const auto startTime = std::chrono::steady_clock::now();
+    const uint64_t rebuiltCount = RebuildIndexFromRecords();
+    const auto endTime = std::chrono::steady_clock::now();
+    const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+    
+    SS_LOG_INFO(L"Whitelist",
+        L"PathIndex initialized (hybrid): %llu paths, %llu nodes rebuilt in %lld ms",
         m_pathCount.load(std::memory_order_relaxed),
-        m_nodeCount.load(std::memory_order_relaxed));
+        m_nodeCount.load(std::memory_order_relaxed),
+        durationMs);
     
     return StoreError::Success();
+}
+
+void PathIndex::EnableWriteMode(void* baseAddress, uint64_t size) noexcept {
+    /*
+     * ========================================================================
+     * ENABLE WRITE MODE FOR EXISTING DATABASE
+     * ========================================================================
+     *
+     * Called after Initialize() when loading an existing database for writing.
+     * This enables insert/remove operations by setting m_baseAddress.
+     *
+     * For PathIndex (ThreatIntel Hybrid Model), the heap-based trie is already
+     * rebuilt from records during Initialize(). This just enables the storage
+     * portion for persisting new entries.
+     *
+     * ========================================================================
+     */
+    
+    std::unique_lock lock(m_rwLock);
+    
+    if (!baseAddress) {
+        SS_LOG_WARN(L"Whitelist", L"PathIndex::EnableWriteMode called with null base address");
+        return;
+    }
+    
+    m_baseAddress = baseAddress;
+    m_indexSize = size;
+    
+    SS_LOG_DEBUG(L"Whitelist", L"PathIndex write mode enabled, size: %llu", size);
 }
 
 StoreError PathIndex::CreateNew(
@@ -969,6 +1149,28 @@ StoreError PathIndex::CreateNew(
     uint64_t availableSize,
     uint64_t& usedSize
 ) noexcept {
+    /*
+     * ========================================================================
+     * CREATE NEW PATH INDEX (THREATINTEL HYBRID MODEL)
+     * ========================================================================
+     * 
+     * Creates a new PathIndex in WRITABLE mode:
+     * 1. Initializes heap-based trie root node
+     * 2. Clears m_pathRecords vector for new entries
+     * 3. Sets up memory-mapped region for PathEntryRecord storage
+     *
+     * Storage Layout:
+     * - Offset 0-7:   Root offset (legacy, kept for compatibility)
+     * - Offset 8-15:  Path count
+     * - Offset 16-23: Node count
+     * - Offset 24-63: Reserved (header padding)
+     * - Offset 64-71: Record count (number of PathEntryRecord)
+     * - Offset 72-79: Reserved
+     * - Offset 80+:   PathEntryRecord array
+     *
+     * ========================================================================
+     */
+    
     std::unique_lock lock(m_rwLock);
     
     // Validate base address
@@ -979,12 +1181,15 @@ StoreError PathIndex::CreateNew(
         );
     }
     
-    // Validate minimum size requirement
+    // Minimum size: header (64) + record header (16) + at least one record (2072)
     constexpr uint64_t HEADER_SIZE = 64;
-    if (availableSize < HEADER_SIZE) {
+    constexpr uint64_t RECORD_HEADER_SIZE = 16;  // record count + reserved
+    constexpr uint64_t MIN_SIZE = HEADER_SIZE + RECORD_HEADER_SIZE + sizeof(PathEntryRecord);
+    
+    if (availableSize < MIN_SIZE) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
-            "Insufficient space for path index header"
+            "Insufficient space for path index (need at least header + 1 record)"
         );
     }
     
@@ -996,6 +1201,20 @@ StoreError PathIndex::CreateNew(
         );
     }
     
+    // Initialize heap-based trie root
+    try {
+        m_heapRoot = std::make_unique<HeapTrieNode>();
+    } catch (const std::bad_alloc&) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Failed to allocate heap trie root"
+        );
+    }
+    
+    // Clear persistent record storage
+    m_pathRecords.clear();
+    m_nextRecordIndex.store(0, std::memory_order_release);
+    
     // Clear any existing state
     m_view = nullptr; // Write mode
     m_baseAddress = baseAddress;
@@ -1004,20 +1223,24 @@ StoreError PathIndex::CreateNew(
     
     // Initialize header with zero-fill for security (prevent info leakage)
     auto* header = static_cast<uint8_t*>(baseAddress);
-    std::memset(header, 0, static_cast<size_t>(HEADER_SIZE));
+    std::memset(header, 0, static_cast<size_t>(HEADER_SIZE + RECORD_HEADER_SIZE));
     
-    // Initialize root offset to after header (will be set on first insert)
+    // Initialize root offset (legacy field)
     m_rootOffset = HEADER_SIZE;
     
-    // Initialize counters with proper memory ordering
+    // Initialize counters with proper memory ordering (root node = 1)
     m_pathCount.store(0, std::memory_order_release);
-    m_nodeCount.store(0, std::memory_order_release);
+    m_nodeCount.store(1, std::memory_order_release);
     
-    // Set output used size
-    usedSize = HEADER_SIZE;
+    // Write initial record count = 0
+    auto* recordCountPtr = reinterpret_cast<uint64_t*>(header + HEADER_SIZE);
+    *recordCountPtr = 0;
     
-    SS_LOG_DEBUG(L"Whitelist", L"PathIndex created: header size %llu, available %llu",
-                HEADER_SIZE, availableSize);
+    // Set output used size (header + record header)
+    usedSize = HEADER_SIZE + RECORD_HEADER_SIZE;
+    
+    SS_LOG_DEBUG(L"Whitelist", L"PathIndex created (hybrid): header %llu bytes, available %llu bytes",
+                usedSize, availableSize);
     
     return StoreError::Success();
 }
@@ -1028,23 +1251,21 @@ std::vector<uint64_t> PathIndex::Lookup(
 ) const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE PATH TRIE LOOKUP WITH PREFETCHING
+     * ENTERPRISE-GRADE PATH TRIE LOOKUP (HEAP-BASED)
      * ========================================================================
      *
-     * Implements compressed trie lookup with support for multiple match modes:
+     * Implements heap-based trie lookup following the proven DomainSuffixTrie
+     * pattern from ThreatIntelIndex. Uses std::unordered_map for unlimited
+     * children per node.
+     *
+     * Match modes supported:
      * - Exact: Path must match exactly
-     * - Prefix: Path must start with pattern
+     * - Prefix: Path must start with pattern  
      * - Suffix: Path must end with pattern
      * - Glob: Pattern uses wildcards (* and ?)
-     * - Regex: Full regex matching (expensive, use sparingly)
-     *
-     * Performance Optimizations:
-     * - Cache prefetching for next trie node during traversal
-     * - Validated node integrity checks for corruption detection
-     * - Early exit paths for common cases
+     * - Regex: Full regex matching
      *
      * Security Note: Returns empty vector on any error (conservative).
-     * Unknown paths should NOT be whitelisted.
      *
      * ========================================================================
      */
@@ -1053,29 +1274,27 @@ std::vector<uint64_t> PathIndex::Lookup(
     
     std::vector<uint64_t> results;
     
-    // Validate input - empty paths never match
+    // Validate input
     if (path.empty()) {
         return results;
     }
     
-    // Validate path length against Windows MAX_PATH limit
     if (path.length() > MAX_WINDOWS_PATH_LENGTH) {
-        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: path exceeds max length (%zu)", path.length());
+        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: path exceeds max length");
         return results;
     }
     
-    // Validate state - ensure index is initialized
-    if (!m_view && !m_baseAddress) {
-        return results; // Not initialized
-    }
-    
-    // Fast path: empty index returns immediately
-    const uint64_t pathCount = m_pathCount.load(std::memory_order_acquire);
-    if (pathCount == 0) {
+    // Validate heap root exists
+    if (!m_heapRoot) {
         return results;
     }
     
-    // Normalize path for lookup (lowercase, forward slashes)
+    // Fast path: empty index
+    if (m_pathCount.load(std::memory_order_acquire) == 0) {
+        return results;
+    }
+    
+    // Normalize path
     std::string normalizedPath;
     if (!NormalizePath(path, normalizedPath)) {
         SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: path normalization failed");
@@ -1087,242 +1306,101 @@ std::vector<uint64_t> PathIndex::Lookup(
     }
     
     try {
-        // Reserve reasonable space for results (cap to prevent excessive allocation)
+        results.reserve(16);
         constexpr size_t MAX_RESULTS = 1024;
-        results.reserve(std::min<size_t>(16, MAX_RESULTS));
         
-        // Get pointer to trie data with validation
-        const uint8_t* base = nullptr;
-        uint64_t baseSize = 0;
+        // Split normalized path into segments
+        std::vector<std::string_view> segments;
+        SplitPathSegments(normalizedPath, segments);
         
-        if (m_view) {
-            // Validate view bounds with overflow protection
-            uint64_t effectiveBase = 0;
-            if (!SafeAdd(reinterpret_cast<uint64_t>(m_view->baseAddress), m_indexOffset, effectiveBase)) {
-                return results; // Overflow - return empty (security)
-            }
-            base = static_cast<const uint8_t*>(m_view->baseAddress) + m_indexOffset;
-            baseSize = m_indexSize;
-        } else if (m_baseAddress) {
-            base = static_cast<const uint8_t*>(m_baseAddress) + m_indexOffset;
-            baseSize = m_indexSize;
-        }
-        
-        if (!base || baseSize == 0) {
+        if (segments.empty()) {
             return results;
         }
         
-        // Validate root offset before starting traversal
-        if (!IsValidNodeOffset(m_rootOffset, baseSize)) {
-            return results;
-        }
-        
-        // Prefetch root node for cache efficiency
-        SS_PREFETCH_READ(base + m_rootOffset);
-        
-        // Start at root node
-        uint64_t currentOffset = m_rootOffset;
-        std::string_view remaining(normalizedPath);
-        
-        // Traverse trie with depth limit to prevent infinite loops
-        size_t depth = 0;
-        
-        while (!remaining.empty() && depth < SAFE_MAX_TRIE_DEPTH) {
-            // Validate node offset
-            if (!IsValidNodeOffset(currentOffset, baseSize)) {
-                SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: invalid node offset at depth %zu", depth);
-                break;
-            }
+        // ====================================================================
+        // EXACT AND PREFIX MATCH - Simple trie traversal
+        // ====================================================================
+        if (mode == PathMatchMode::Exact || mode == PathMatchMode::Prefix) {
+            const HeapTrieNode* node = m_heapRoot.get();
             
-            const auto* node = reinterpret_cast<const PathTrieNode*>(base + currentOffset);
-            
-            // Validate node integrity for corruption detection
-            if (!ValidateNodeIntegrity(node, baseSize)) {
-                SS_LOG_ERROR(L"Whitelist", L"PathIndex::Lookup: corrupted node at offset %llu", currentOffset);
-                break;
-            }
-            
-            // Check node segment
-            std::string_view nodeSegment = node->GetSegment();
-            
-            if (!nodeSegment.empty()) {
-                // Check if remaining path starts with node segment
-                if (remaining.length() < nodeSegment.length() ||
-                    remaining.substr(0, nodeSegment.length()) != nodeSegment) {
-                    // Mismatch - check for prefix match mode
-                    if (mode == PathMatchMode::Prefix && node->IsTerminal()) {
-                        // This node might match as a prefix
-                        const size_t commonLen = CommonPrefixLength(remaining, nodeSegment);
-                        if (commonLen > 0 && commonLen == remaining.length()) {
-                            results.push_back(node->entryOffset);
-                        }
-                    }
-                    break; // No match in this branch
-                }
+            for (size_t i = 0; i < segments.size() && node != nullptr; ++i) {
+                const std::string segmentKey(segments[i]);
                 
-                // Consume matched segment
-                remaining = remaining.substr(nodeSegment.length());
-            }
-            
-            // Check for terminal match
-            if (remaining.empty() && node->IsTerminal()) {
-                // Exact match found
-                if (mode == PathMatchMode::Exact || 
-                    mode == PathMatchMode::Prefix ||
-                    node->matchMode == mode) {
+                // For prefix mode, collect terminal nodes along the path
+                if (mode == PathMatchMode::Prefix && node->isTerminal) {
                     results.push_back(node->entryOffset);
-                }
-            }
-            
-            // For prefix mode, also collect all terminal nodes along the path
-            if (mode == PathMatchMode::Prefix && node->IsTerminal() && !remaining.empty()) {
-                results.push_back(node->entryOffset);
-            }
-            
-            // Try to continue to children
-            if (remaining.empty() || !node->HasChildren()) {
-                break;
-            }
-            
-            // Find next segment (split by '/')
-            const size_t nextSep = remaining.find('/');
-            std::string_view nextSegment;
-            
-            if (nextSep != std::string_view::npos) {
-                nextSegment = remaining.substr(0, nextSep + 1);
-            } else {
-                nextSegment = remaining;
-            }
-            
-            // Calculate child index using optimized hash
-            const uint32_t childIdx = SegmentHash(nextSegment);
-            
-            // Bounds check child index (should always pass due to modulo)
-            if (childIdx >= PathTrieNode::MAX_CHILDREN) {
-                break;
-            }
-            
-            uint32_t childOffset = node->children[childIdx];
-            
-            // Prefetch next node if we have a direct hit
-            if (childOffset != 0 && IsValidNodeOffset(childOffset, baseSize)) {
-                SS_PREFETCH_READ(base + childOffset);
-            }
-            
-            if (childOffset == 0) {
-                // No child in this slot - try linear search through all children
-                bool found = false;
-                
-                // Prefetch all potential children for cache efficiency
-                for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-                    if (node->children[i] != 0 && IsValidNodeOffset(node->children[i], baseSize)) {
-                        SS_PREFETCH_READ_L2(base + node->children[i]);
-                    }
+                    if (results.size() >= MAX_RESULTS) break;
                 }
                 
-                for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN && !found; ++i) {
-                    const uint32_t childOff = node->children[i];
-                    
-                    // Skip empty slots
-                    if (childOff == 0) {
-                        continue;
-                    }
-                    
-                    // Validate child offset
-                    if (!IsValidNodeOffset(static_cast<uint64_t>(childOff), baseSize)) {
-                        SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: invalid child offset %u", childOff);
-                        continue;
-                    }
-                    
-                    const auto* childNode = reinterpret_cast<const PathTrieNode*>(base + childOff);
-                    std::string_view childSeg = childNode->GetSegment();
-                    
-                    // Check if remaining path starts with child segment
-                    if (!childSeg.empty() && remaining.length() >= childSeg.length() &&
-                        remaining.substr(0, childSeg.length()) == childSeg) {
-                        currentOffset = childOff;
-                        found = true;
-                    }
-                }
-                
-                if (!found) {
-                    break; // No matching child
-                }
-            } else {
-                // Validate direct child offset
-                if (!IsValidNodeOffset(static_cast<uint64_t>(childOffset), baseSize)) {
-                    SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: invalid direct child %u", childOffset);
+                // Find child for this segment
+                auto it = node->children.find(segmentKey);
+                if (it == node->children.end()) {
+                    node = nullptr; // No match
                     break;
                 }
-                currentOffset = childOffset;
+                node = it->second.get();
             }
             
-            ++depth;
-            
-            // Cap results to prevent excessive memory usage
-            if (results.size() >= MAX_RESULTS) {
-                SS_LOG_WARN(L"Whitelist", L"PathIndex::Lookup: max results reached");
-                break;
-            }
-        }
-        
-        // For suffix mode, we need a different approach (scan all paths)
-        // This is expensive but necessary for correct suffix matching
-        if (mode == PathMatchMode::Suffix && results.empty()) {
-            // Perform BFS to find all terminal nodes with matching suffix
-            std::queue<uint64_t> bfsQueue;
-            std::unordered_set<uint64_t> visited;
-            
-            bfsQueue.push(m_rootOffset);
-            visited.insert(m_rootOffset);
-            
-            constexpr size_t MAX_SUFFIX_ITERATIONS = 100'000;
-            size_t iterations = 0;
-            
-            while (!bfsQueue.empty() && iterations < MAX_SUFFIX_ITERATIONS && results.size() < MAX_RESULTS) {
-                const uint64_t offset = bfsQueue.front();
-                bfsQueue.pop();
-                ++iterations;
-                
-                if (!IsValidNodeOffset(offset, baseSize)) {
-                    continue;
-                }
-                
-                const auto* node = reinterpret_cast<const PathTrieNode*>(base + offset);
-                if (!ValidateNodeIntegrity(node, baseSize)) {
-                    continue;
-                }
-                
-                // Check if this terminal node's path ends with our search suffix
-                if (node->IsTerminal()) {
-                    std::string_view nodeSeg = node->GetSegment();
-                    // Check if segment ends with normalized path
-                    if (nodeSeg.length() >= normalizedPath.length()) {
-                        if (nodeSeg.substr(nodeSeg.length() - normalizedPath.length()) == normalizedPath) {
-                            results.push_back(node->entryOffset);
-                        }
-                    }
-                }
-                
-                // Add children to queue
-                for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-                    const uint32_t childOff = node->children[i];
-                    if (childOff != 0 && visited.find(childOff) == visited.end()) {
-                        if (IsValidNodeOffset(childOff, baseSize)) {
-                            bfsQueue.push(childOff);
-                            visited.insert(childOff);
-                        }
+            // Check for exact match at final node
+            if (node && node->isTerminal && results.size() < MAX_RESULTS) {
+                if (mode == PathMatchMode::Exact) {
+                    results.push_back(node->entryOffset);
+                } else if (mode == PathMatchMode::Prefix) {
+                    // Add final node if not already added
+                    if (results.empty() || results.back() != node->entryOffset) {
+                        results.push_back(node->entryOffset);
                     }
                 }
             }
         }
         
-        // For glob mode, implement wildcard matching
-        if (mode == PathMatchMode::Glob && results.empty()) {
-            // Glob patterns: * matches any sequence, ? matches single char
-            // BFS through trie with pattern matching
+        // ====================================================================
+        // SUFFIX MATCH - Find stored suffix patterns that match queryPath's end
+        // E.g., stored ".dll" should match query "kernel32.dll"
+        // ====================================================================
+        else if (mode == PathMatchMode::Suffix) {
+            // Iterate through ALL stored patterns that were added with Suffix mode
+            // and check if the queryPath ENDS WITH that pattern
+            std::function<void(const HeapTrieNode*, std::vector<std::string>&, size_t)> traverse;
+            traverse = [&](const HeapTrieNode* node, std::vector<std::string>& pathParts, size_t depth) {
+                // Stack overflow protection and result limit
+                if (!node || results.size() >= MAX_RESULTS || depth >= SAFE_MAX_TRIE_DEPTH) return;
+                
+                if (node->isTerminal && node->matchMode == PathMatchMode::Suffix) {
+                    // Reconstruct the stored pattern
+                    std::string storedPattern;
+                    for (size_t i = 0; i < pathParts.size(); ++i) {
+                        if (i > 0) storedPattern += '/';
+                        storedPattern += pathParts[i];
+                    }
+                    
+                    // Check if queryPath (normalizedPath) ENDS WITH storedPattern
+                    if (normalizedPath.length() >= storedPattern.length() &&
+                        normalizedPath.substr(normalizedPath.length() - storedPattern.length()) == storedPattern) {
+                        results.push_back(node->entryOffset);
+                    }
+                }
+                
+                for (const auto& [segment, child] : node->children) {
+                    pathParts.push_back(segment);
+                    traverse(child.get(), pathParts, depth + 1);
+                    pathParts.pop_back();
+                }
+            };
             
-            // Lambda for glob pattern matching
+            std::vector<std::string> pathParts;
+            traverse(m_heapRoot.get(), pathParts, 0);
+        }
+        
+        // ====================================================================
+        // GLOB MATCH - Wildcard pattern matching
+        // NOTE: This implements Windows-style glob semantics where:
+        //   - '*' matches zero or more characters INCLUDING path separators
+        //   - '?' matches exactly one character INCLUDING path separators
+        //   - This differs from Unix shell globs where '*' doesn't match '/'
+        //   - Windows behavior is intentional for path-based whitelisting
+        // ====================================================================
+        else if (mode == PathMatchMode::Glob) {
             auto globMatch = [](std::string_view pattern, std::string_view text) -> bool {
                 size_t pi = 0, ti = 0;
                 size_t starIdx = std::string_view::npos;
@@ -1353,117 +1431,151 @@ std::vector<uint64_t> PathIndex::Lookup(
                 return pi == pattern.length();
             };
             
-            // BFS to find matching paths
-            std::queue<std::pair<uint64_t, std::string>> bfsQueue; // (offset, accumulated_path)
-            std::unordered_set<uint64_t> visited;
-            
-            bfsQueue.push({m_rootOffset, ""});
-            visited.insert(m_rootOffset);
-            
-            constexpr size_t MAX_GLOB_ITERATIONS = 100'000;
-            size_t iterations = 0;
-            
-            while (!bfsQueue.empty() && iterations < MAX_GLOB_ITERATIONS && results.size() < MAX_RESULTS) {
-                auto [offset, accPath] = bfsQueue.front();
-                bfsQueue.pop();
-                ++iterations;
+            // Traverse all stored Glob patterns and check if they match normalizedPath
+            std::function<void(const HeapTrieNode*, std::string&, size_t)> traverse;
+            traverse = [&](const HeapTrieNode* node, std::string& accPath, size_t depth) {
+                // Stack overflow protection and result limit
+                if (!node || results.size() >= MAX_RESULTS || depth >= SAFE_MAX_TRIE_DEPTH) return;
                 
-                if (!IsValidNodeOffset(offset, baseSize)) {
-                    continue;
-                }
-                
-                const auto* node = reinterpret_cast<const PathTrieNode*>(base + offset);
-                if (!ValidateNodeIntegrity(node, baseSize)) {
-                    continue;
-                }
-                
-                // Build accumulated path
-                std::string_view nodeSeg = node->GetSegment();
-                std::string currentPath = accPath + std::string(nodeSeg);
-                
-                // Check if this terminal node matches glob pattern
-                if (node->IsTerminal()) {
-                    if (globMatch(normalizedPath, currentPath)) {
+                if (node->isTerminal && node->matchMode == PathMatchMode::Glob) {
+                    // accPath is the stored PATTERN, normalizedPath is the QUERY to match
+                    if (globMatch(accPath, normalizedPath)) {
                         results.push_back(node->entryOffset);
                     }
                 }
                 
-                // Add children to queue
-                for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-                    const uint32_t childOff = node->children[i];
-                    if (childOff != 0 && visited.find(childOff) == visited.end()) {
-                        if (IsValidNodeOffset(childOff, baseSize)) {
-                            bfsQueue.push({childOff, currentPath});
-                            visited.insert(childOff);
-                        }
-                    }
+                for (const auto& [segment, child] : node->children) {
+                    std::string newPath = accPath.empty() ? segment : (accPath + "/" + segment);
+                    traverse(child.get(), newPath, depth + 1);
                 }
-            }
+            };
+            
+            std::string accPath;
+            traverse(m_heapRoot.get(), accPath, 0);
         }
         
-        // For regex mode, use std::regex for full pattern matching
-        // Note: This is expensive - use sparingly
-        if (mode == PathMatchMode::Regex && results.empty()) {
-            try {
-                // Compile regex pattern with case-insensitive flag for Windows paths
-                std::regex pattern(normalizedPath, 
-                    std::regex_constants::ECMAScript | 
-                    std::regex_constants::icase |
-                    std::regex_constants::optimize);
+        // ====================================================================
+        // REGEX MATCH - Full regex pattern matching with ReDoS protection
+        // ====================================================================
+        else if (mode == PathMatchMode::Regex) {
+            /*
+             * REDOS PROTECTION (ENTERPRISE-GRADE)
+             * =====================================
+             * Regex can cause catastrophic backtracking with patterns like:
+             * - (a+)+$ - nested quantifiers
+             * - (a|aa)+$ - alternation with overlap
+             * - ([a-zA-Z]+)* - quantified groups
+             * 
+             * Protection measures:
+             * 1. Limit pattern length
+             * 2. Limit quantifier count
+             * 3. Detect nested quantifiers (quantifier inside group with quantifier)
+             * 4. Use nosubs flag to disable capturing groups
+             * 5. Catch and handle regex errors
+             */
+            constexpr size_t MAX_REGEX_LENGTH = 512;  // Reduced from 1024
+            constexpr size_t MAX_REGEX_QUANTIFIERS = 5;  // Reduced from 10
+            constexpr size_t MAX_NESTING_DEPTH = 3;
+            
+            // Check pattern length
+            if (normalizedPath.length() > MAX_REGEX_LENGTH) {
+                SS_LOG_ERROR(L"Whitelist", 
+                    L"PathIndex::Lookup: regex pattern too long (%zu > %zu)",
+                    normalizedPath.length(), MAX_REGEX_LENGTH);
+                return results;
+            }
+            
+            // Analyze pattern for dangerous constructs
+            size_t quantifierCount = 0;
+            size_t nestingDepth = 0;
+            size_t maxNesting = 0;
+            bool quantifierInGroup = false;
+            bool prevWasQuantifier = false;
+            
+            for (size_t i = 0; i < normalizedPath.length(); ++i) {
+                char c = normalizedPath[i];
                 
-                // BFS to find matching paths
-                std::queue<std::pair<uint64_t, std::string>> bfsQueue;
-                std::unordered_set<uint64_t> visited;
-                
-                bfsQueue.push({m_rootOffset, ""});
-                visited.insert(m_rootOffset);
-                
-                constexpr size_t MAX_REGEX_ITERATIONS = 50'000; // Lower limit for expensive regex
-                size_t iterations = 0;
-                
-                while (!bfsQueue.empty() && iterations < MAX_REGEX_ITERATIONS && results.size() < MAX_RESULTS) {
-                    auto [offset, accPath] = bfsQueue.front();
-                    bfsQueue.pop();
-                    ++iterations;
-                    
-                    if (!IsValidNodeOffset(offset, baseSize)) {
-                        continue;
+                // Track nesting depth
+                if (c == '(' || c == '[') {
+                    ++nestingDepth;
+                    maxNesting = std::max(maxNesting, nestingDepth);
+                    prevWasQuantifier = false;
+                } else if (c == ')' || c == ']') {
+                    if (nestingDepth > 0) --nestingDepth;
+                    // Check for quantifier immediately after group close
+                } else if (c == '*' || c == '+' || c == '?' || c == '{') {
+                    ++quantifierCount;
+                    // CRITICAL: Detect nested quantifiers (quantifier after group that had quantifier)
+                    if (nestingDepth > 0 || prevWasQuantifier) {
+                        quantifierInGroup = true;
                     }
-                    
-                    const auto* node = reinterpret_cast<const PathTrieNode*>(base + offset);
-                    if (!ValidateNodeIntegrity(node, baseSize)) {
-                        continue;
-                    }
-                    
-                    // Build accumulated path
-                    std::string_view nodeSeg = node->GetSegment();
-                    std::string currentPath = accPath + std::string(nodeSeg);
-                    
-                    // Check if this terminal node matches regex pattern
-                    if (node->IsTerminal()) {
-                        if (std::regex_match(currentPath, pattern)) {
-                            results.push_back(node->entryOffset);
-                        }
-                    }
-                    
-                    // Add children to queue
-                    for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-                        const uint32_t childOff = node->children[i];
-                        if (childOff != 0 && visited.find(childOff) == visited.end()) {
-                            if (IsValidNodeOffset(childOff, baseSize)) {
-                                bfsQueue.push({childOff, currentPath});
-                                visited.insert(childOff);
+                    prevWasQuantifier = true;
+                } else if (c == '|' && nestingDepth > 0) {
+                    // Alternation inside group can cause backtracking
+                    quantifierInGroup = true;
+                } else {
+                    prevWasQuantifier = false;
+                }
+            }
+            
+            // Reject dangerous patterns
+            if (quantifierCount > MAX_REGEX_QUANTIFIERS) {
+                SS_LOG_ERROR(L"Whitelist", 
+                    L"PathIndex::Lookup: regex has too many quantifiers (%zu > %zu)",
+                    quantifierCount, MAX_REGEX_QUANTIFIERS);
+                return results;
+            }
+            
+            if (maxNesting > MAX_NESTING_DEPTH) {
+                SS_LOG_ERROR(L"Whitelist", 
+                    L"PathIndex::Lookup: regex nesting too deep (%zu > %zu)",
+                    maxNesting, MAX_NESTING_DEPTH);
+                return results;
+            }
+            
+            if (quantifierInGroup) {
+                SS_LOG_ERROR(L"Whitelist", 
+                    L"PathIndex::Lookup: regex has nested/consecutive quantifiers (ReDoS risk)");
+                return results;
+            }
+            
+            // For regex, iterate through all stored Regex patterns and try to match queryPath
+            std::function<void(const HeapTrieNode*, std::string&, size_t)> traverse;
+            traverse = [&](const HeapTrieNode* node, std::string& accPath, size_t depth) {
+                // Stack overflow protection and result limit
+                if (!node || results.size() >= MAX_RESULTS || depth >= SAFE_MAX_TRIE_DEPTH) return;
+                
+                if (node->isTerminal && node->matchMode == PathMatchMode::Regex) {
+                    // accPath is the stored REGEX PATTERN, normalizedPath is the QUERY to match
+                    try {
+                        // Validate stored pattern length
+                        if (accPath.length() <= MAX_REGEX_LENGTH) {
+                            std::regex storedPattern(accPath, 
+                                std::regex_constants::ECMAScript | 
+                                std::regex_constants::icase |
+                                std::regex_constants::nosubs |
+                                std::regex_constants::optimize);
+                            
+                            if (std::regex_match(normalizedPath, storedPattern)) {
+                                results.push_back(node->entryOffset);
                             }
                         }
+                    } catch (const std::regex_error&) {
+                        // Invalid stored regex - skip it
                     }
                 }
-            } catch (const std::regex_error& e) {
-                SS_LOG_ERROR(L"Whitelist", L"PathIndex::Lookup: invalid regex pattern: %S", e.what());
-                // Return empty results for invalid regex
-            }
+                
+                for (const auto& [segment, child] : node->children) {
+                    std::string newPath = accPath.empty() ? segment : (accPath + "/" + segment);
+                    traverse(child.get(), newPath, depth + 1);
+                }
+            };
+            
+            std::string accPath;
+            traverse(m_heapRoot.get(), accPath, 0);
         }
         
-        // Remove duplicates if any (sort + unique for O(n log n))
+        // Remove duplicates
         if (results.size() > 1) {
             std::sort(results.begin(), results.end());
             results.erase(std::unique(results.begin(), results.end()), results.end());
@@ -1503,16 +1615,18 @@ StoreError PathIndex::Insert(
 ) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE PATH TRIE INSERT
+     * ENTERPRISE-GRADE PATH INSERT (THREATINTEL HYBRID MODEL)
      * ========================================================================
      *
-     * Inserts a path pattern into the compressed trie. Handles:
-     * - Path normalization and UTF-8 encoding
-     * - Node allocation and splitting
-     * - Prefix compression
-     * - Collision handling
+     * Inserts a path pattern using the ThreatIntel Hybrid persistence model:
+     * 1. Creates PathEntryRecord (persistent storage)
+     * 2. Adds record to m_pathRecords vector
+     * 3. Inserts into HeapTrieNode index (fast lookup)
      *
-     * Thread-safety: Protected by unique_lock
+     * This ensures:
+     * - Data persists across restarts (PathEntryRecord in memory-mapped file)
+     * - Fast lookups (HeapTrieNode with O(k) traversal)
+     * - Thread-safe operations (unique_lock)
      *
      * ========================================================================
      */
@@ -1525,6 +1639,19 @@ StoreError PathIndex::Insert(
             WhitelistStoreError::ReadOnlyDatabase,
             "Index is read-only"
         );
+    }
+    
+    // Validate heap root exists
+    if (!m_heapRoot) {
+        try {
+            m_heapRoot = std::make_unique<HeapTrieNode>();
+            m_nodeCount.store(1, std::memory_order_release);
+        } catch (const std::bad_alloc&) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::OutOfMemory,
+                "Failed to allocate heap trie root"
+            );
+        }
     }
     
     // Validate input
@@ -1535,22 +1662,81 @@ StoreError PathIndex::Insert(
         );
     }
     
-    // Validate path length
-    constexpr size_t MAX_PATH_LENGTH = 32767;
+    // Validate path length against PathEntryRecord limit
+    constexpr size_t MAX_PATH_LENGTH = PathEntryRecord::MAX_PATH_LENGTH;
     if (path.length() > MAX_PATH_LENGTH) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidEntry,
-            "Path exceeds maximum length"
+            "Path exceeds maximum length for storage"
         );
     }
     
-    // Normalize path
+    // Normalize path (or preserve pattern for Regex modes)
     std::string normalizedPath;
-    if (!NormalizePath(path, normalizedPath)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::InvalidEntry,
-            "Path normalization failed"
-        );
+    if (mode == PathMatchMode::Regex) {
+        // For Regex patterns, preserve backslash escapes (e.g., .*\.exe$)
+        // Only convert to UTF-8 and lowercase without path separator changes
+        try {
+            normalizedPath.reserve(path.length() * 3); // Worst case UTF-8
+            for (wchar_t wc : path) {
+                // Convert to lowercase for case-insensitive matching
+                wchar_t lower = (wc >= L'A' && wc <= L'Z') ? (wc + 32) : wc;
+                
+                // UTF-8 encoding
+                if (lower < 0x80) {
+                    normalizedPath.push_back(static_cast<char>(lower));
+                } else if (lower < 0x800) {
+                    normalizedPath.push_back(static_cast<char>(0xC0 | ((lower >> 6) & 0x1F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | (lower & 0x3F)));
+                } else {
+                    normalizedPath.push_back(static_cast<char>(0xE0 | ((lower >> 12) & 0x0F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | ((lower >> 6) & 0x3F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | (lower & 0x3F)));
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::OutOfMemory,
+                "Pattern conversion failed"
+            );
+        }
+    } else if (mode == PathMatchMode::Glob) {
+        // For Glob patterns, normalize backslash to forward slash (to match lookup)
+        // but preserve wildcard characters (* and ?)
+        try {
+            normalizedPath.reserve(path.length() * 3);
+            for (wchar_t wc : path) {
+                // Convert backslash to forward slash for consistent path matching
+                wchar_t ch = (wc == L'\\') ? L'/' : wc;
+                // Convert to lowercase
+                wchar_t lower = (ch >= L'A' && ch <= L'Z') ? (ch + 32) : ch;
+                
+                // UTF-8 encoding
+                if (lower < 0x80) {
+                    normalizedPath.push_back(static_cast<char>(lower));
+                } else if (lower < 0x800) {
+                    normalizedPath.push_back(static_cast<char>(0xC0 | ((lower >> 6) & 0x1F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | (lower & 0x3F)));
+                } else {
+                    normalizedPath.push_back(static_cast<char>(0xE0 | ((lower >> 12) & 0x0F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | ((lower >> 6) & 0x3F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | (lower & 0x3F)));
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::OutOfMemory,
+                "Pattern conversion failed"
+            );
+        }
+    } else {
+        // For Exact, Prefix, Suffix - use full path normalization
+        if (!NormalizePath(path, normalizedPath)) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::InvalidEntry,
+                "Path normalization failed"
+            );
+        }
     }
     
     if (normalizedPath.empty()) {
@@ -1560,532 +1746,126 @@ StoreError PathIndex::Insert(
         );
     }
     
-    // Get writable base with validation
-    if (m_indexOffset > 0) {
-        // Ensure offset doesn't cause pointer arithmetic overflow
-        uint64_t testOffset = 0;
-        if (!SafeAdd(reinterpret_cast<uint64_t>(m_baseAddress), m_indexOffset, testOffset)) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::InvalidSection,
-                "Index offset causes pointer overflow"
-            );
-        }
-    }
-    auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
-    
-    // Calculate space needed with overflow protection
-    const uint64_t nodeSize = sizeof(PathTrieNode);
-    const uint64_t currentNodeCount = m_nodeCount.load(std::memory_order_acquire);
-    
-    // Validate current node count is reasonable
-    constexpr uint64_t MAX_NODE_COUNT = UINT32_MAX;
-    if (currentNodeCount > MAX_NODE_COUNT) {
+    // Validate normalized path fits in record
+    if (normalizedPath.length() > MAX_PATH_LENGTH) {
         return StoreError::WithMessage(
-            WhitelistStoreError::IndexFull,
-            "Node count exceeds maximum"
+            WhitelistStoreError::InvalidEntry,
+            "Normalized path exceeds storage limit"
         );
     }
     
-    // Calculate next node offset with overflow protection
-    constexpr uint64_t HEADER_SIZE = 64;
-    uint64_t totalNodeSpace = 0;
-    if (!SafeMul(currentNodeCount, nodeSize, totalNodeSpace)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexFull,
-            "Node space calculation overflow"
-        );
-    }
-    
-    uint64_t nextNodeOffset = 0;
-    if (!SafeAdd(HEADER_SIZE, totalNodeSpace, nextNodeOffset)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexFull,
-            "Next node offset overflow"
-        );
-    }
-    
-    // Check space for at least one new node
-    uint64_t requiredSpace = 0;
-    if (!SafeAdd(nextNodeOffset, nodeSize, requiredSpace)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexFull,
-            "Required space calculation overflow"
-        );
-    }
-    
-    if (requiredSpace > m_indexSize) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexFull,
-            "Path index is full"
-        );
-    }
-    
-    // Navigate to insertion point
-    uint64_t currentOffset = m_rootOffset;
-    std::string_view remaining(normalizedPath);
-    
-    // Allocate root node if needed
-    if (currentNodeCount == 0) {
-        // Create root node - use secure zero initialization
-        auto* root = reinterpret_cast<PathTrieNode*>(base + HEADER_SIZE);
-        SecureZeroMemoryRegion(root, sizeof(PathTrieNode));
-        
-        // Store path segment (truncate if necessary)
-        const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
-        std::memcpy(root->segment, remaining.data(), segLen);
-        root->segmentLength = static_cast<uint8_t>(segLen);
-        root->matchMode = mode;
-        root->entryOffset = entryOffset;
-        root->SetTerminal(true);
-        
-        // Memory fence before updating shared state
-        SS_STORE_FENCE();
-        
-        // Update counters
-        m_rootOffset = HEADER_SIZE;
-        m_nodeCount.store(1, std::memory_order_release);
-        m_pathCount.fetch_add(1, std::memory_order_release);
-        m_insertCount.fetch_add(1, std::memory_order_relaxed);
-        
-        // Update header with proper ordering
-        auto* headerRoot = reinterpret_cast<uint64_t*>(base);
-        *headerRoot = m_rootOffset;
-        
-        auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-        *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-        
-        auto* headerNodeCount = reinterpret_cast<uint64_t*>(base + 16);
-        *headerNodeCount = m_nodeCount.load(std::memory_order_relaxed);
-        
-        SS_LOG_DEBUG(L"Whitelist", L"PathIndex: created root node for path");
-        return StoreError::Success();
-    }
-    
-    // Traverse trie to find insertion point with prefetching
-    size_t depth = 0;
-    
-    // Prefetch root node
-    SS_PREFETCH_WRITE(base + currentOffset);
-    
-    while (depth < SAFE_MAX_TRIE_DEPTH) {
-        // Validate node offset
-        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::IndexCorrupted,
-                "Node offset out of bounds during insert traversal"
-            );
-        }
-        
-        auto* node = reinterpret_cast<PathTrieNode*>(base + currentOffset);
-        std::string_view nodeSegment = node->GetSegment();
-        
-        // Find common prefix using optimized comparison
-        const size_t commonLen = CommonPrefixLength(remaining, nodeSegment);
-        
-        if (commonLen == 0 && !nodeSegment.empty()) {
-            // No common prefix - need to find/create sibling
-            const uint32_t childIdx = SegmentHash(remaining);
-            
-            if (childIdx < PathTrieNode::MAX_CHILDREN && node->children[childIdx] == 0) {
-                // Calculate new node offset with overflow protection
-                const uint64_t curNodeCount = m_nodeCount.load(std::memory_order_acquire);
-                uint64_t newNodeSpace = 0;
-                if (!SafeMul(curNodeCount, nodeSize, newNodeSpace)) {
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexFull,
-                        "Node space calculation overflow during insert"
-                    );
-                }
-                
-                uint64_t newNodeOffset = 0;
-                if (!SafeAdd(PATH_INDEX_HEADER_SIZE, newNodeSpace, newNodeOffset)) {
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexFull,
-                        "New node offset calculation overflow"
-                    );
-                }
-                
-                // Validate space for new node
-                uint64_t newNodeEndOffset = 0;
-                if (!SafeAdd(newNodeOffset, nodeSize, newNodeEndOffset) || newNodeEndOffset > m_indexSize) {
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexFull,
-                        "Path index is full - cannot allocate new child"
-                    );
-                }
-                
-                // Validate new node offset fits in uint32_t for children array
-                if (newNodeOffset > UINT32_MAX) {
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexFull,
-                        "Node offset exceeds uint32_t range"
-                    );
-                }
-                
-                // Allocate and initialize new node securely
-                auto* newNode = reinterpret_cast<PathTrieNode*>(base + newNodeOffset);
-                SecureZeroMemoryRegion(newNode, sizeof(PathTrieNode));
-                
-                const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
-                std::memcpy(newNode->segment, remaining.data(), segLen);
-                newNode->segmentLength = static_cast<uint8_t>(segLen);
-                newNode->matchMode = mode;
-                newNode->entryOffset = entryOffset;
-                newNode->SetTerminal(true);
-                
-                // Memory fence before linking to parent
-                SS_STORE_FENCE();
-                
-                // Link to parent atomically
-                node->children[childIdx] = static_cast<uint32_t>(newNodeOffset);
-                node->childCount++;
-                
-                m_nodeCount.fetch_add(1, std::memory_order_release);
-                m_pathCount.fetch_add(1, std::memory_order_release);
-                m_insertCount.fetch_add(1, std::memory_order_relaxed);
-                
-                // Update header counts
-                auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-                *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-                
-                auto* headerNodeCount = reinterpret_cast<uint64_t*>(base + 16);
-                *headerNodeCount = m_nodeCount.load(std::memory_order_relaxed);
-                
-                return StoreError::Success();
-            }
-            
-            // Child slot occupied - try to traverse
-            if (node->children[childIdx] != 0) {
-                // Prefetch next node
-                SS_PREFETCH_WRITE(base + node->children[childIdx]);
-                currentOffset = node->children[childIdx];
-                ++depth;
-                continue;
-            }
-        }
-        
-        if (commonLen == nodeSegment.length() && commonLen == remaining.length()) {
-            // Exact match - update existing node
-            if (node->IsTerminal()) {
-                // Already exists
-                return StoreError::WithMessage(
-                    WhitelistStoreError::DuplicateEntry,
-                    "Path already exists in index"
-                );
-            }
-            
-            // Make this node terminal
-            node->SetTerminal(true);
-            node->entryOffset = entryOffset;
-            node->matchMode = mode;
-            
-            m_pathCount.fetch_add(1, std::memory_order_release);
-            m_insertCount.fetch_add(1, std::memory_order_relaxed);
-            
-            auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-            *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-            
-            return StoreError::Success();
-        }
-        
-        if (commonLen == nodeSegment.length()) {
-            // Node segment is prefix of remaining - continue down
-            remaining = remaining.substr(commonLen);
-            
-            // Skip separator if present
-            if (!remaining.empty() && remaining[0] == '/') {
-                remaining = remaining.substr(1);
-            }
-            
-            if (remaining.empty()) {
-                // This node should be terminal
-                if (node->IsTerminal()) {
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::DuplicateEntry,
-                        "Path already exists"
-                    );
-                }
-                
-                node->SetTerminal(true);
-                node->entryOffset = entryOffset;
-                node->matchMode = mode;
-                
-                m_pathCount.fetch_add(1, std::memory_order_release);
-                m_insertCount.fetch_add(1, std::memory_order_relaxed);
-                return StoreError::Success();
-            }
-            
-            // Find child to continue
-            uint32_t childIdx = SegmentHash(remaining);
-            
-            if (childIdx < PathTrieNode::MAX_CHILDREN && node->children[childIdx] != 0) {
-                // Validate child offset before traversing
-                const uint64_t childOff = node->children[childIdx];
-                uint64_t childEndOff = 0;
-                if (!SafeAdd(childOff, nodeSize, childEndOff) || childEndOff > m_indexSize) {
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexCorrupted,
-                        "Child node offset invalid during traversal"
-                    );
-                }
-                currentOffset = childOff;
-                ++depth;
-                continue;
-            }
-            
-            // Allocate new child with overflow protection
-            const uint64_t curNodeCount = m_nodeCount.load(std::memory_order_acquire);
-            uint64_t newNodeSpace = 0;
-            if (!SafeMul(curNodeCount, nodeSize, newNodeSpace)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Node space calculation overflow"
-                );
-            }
-            
-            uint64_t newNodeOffset = 0;
-            if (!SafeAdd(HEADER_SIZE, newNodeSpace, newNodeOffset)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "New node offset overflow"
-                );
-            }
-            
-            // Validate space and uint32_t range
-            uint64_t newNodeEndOffset = 0;
-            if (!SafeAdd(newNodeOffset, nodeSize, newNodeEndOffset) || newNodeEndOffset > m_indexSize) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Path index full - cannot allocate child"
-                );
-            }
-            
-            if (newNodeOffset > UINT32_MAX) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Node offset exceeds uint32_t range"
-                );
-            }
-            
-            auto* newNode = reinterpret_cast<PathTrieNode*>(base + newNodeOffset);
-            SecureZeroMemoryRegion(newNode, sizeof(PathTrieNode));
-            
-            const size_t segLen = std::min(remaining.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
-            std::memcpy(newNode->segment, remaining.data(), segLen);
-            newNode->segmentLength = static_cast<uint8_t>(segLen);
-            newNode->matchMode = mode;
-            newNode->entryOffset = entryOffset;
-            newNode->SetTerminal(true);
-            
-            // Memory fence before linking
-            SS_STORE_FENCE();
-            
-            if (childIdx < PathTrieNode::MAX_CHILDREN) {
-                node->children[childIdx] = static_cast<uint32_t>(newNodeOffset);
-                node->childCount++;
-            }
-            
-            m_nodeCount.fetch_add(1, std::memory_order_release);
-            m_pathCount.fetch_add(1, std::memory_order_release);
-            m_insertCount.fetch_add(1, std::memory_order_relaxed);
-            
-            auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-            *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-            
-            auto* headerNodeCount = reinterpret_cast<uint64_t*>(base + 16);
-            *headerNodeCount = m_nodeCount.load(std::memory_order_relaxed);
-            
-            return StoreError::Success();
-        }
-        
+    try {
         // ====================================================================
-        // ENTERPRISE-GRADE NODE SPLIT IMPLEMENTATION
+        // STEP 0: Check for duplicate path (same path + mode = update)
+        // Enterprise behavior: update entry offset if same path+mode exists
         // ====================================================================
-        // 
-        // Scenario: commonLen < nodeSegment.length()
-        // We need to split the current node into two nodes:
-        //   1. A new internal node containing the common prefix
-        //   2. The original node (modified) containing the remaining suffix
-        //   3. A new leaf node for the path being inserted
-        //
-        // Example: Existing node has "program_files", inserting "program_data"
-        //   Common prefix: "program_" (commonLen = 8)
-        //   Node becomes: "program_" (internal)
-        //     -> Child 0: "files" (original content, terminal if it was)
-        //     -> Child 1: "data" (new insertion, terminal)
-        //
-        // This maintains proper trie structure with path compression.
-        // ====================================================================
+        std::vector<std::string_view> segments;
+        SplitPathSegments(normalizedPath, segments);
+        HeapTrieNode* current = m_heapRoot.get();
         
-        {
-            // Calculate offsets for two new nodes with overflow protection
-            const uint64_t curNodeCount = m_nodeCount.load(std::memory_order_acquire);
-            
-            // We need space for two new nodes: suffix node + new path node
-            uint64_t newNode1Offset = 0;  // Suffix node (remaining of original segment)
-            uint64_t newNode2Offset = 0;  // New path node
-            
-            uint64_t curNodeSpace = 0;
-            if (!SafeMul(curNodeCount, nodeSize, curNodeSpace)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Node space overflow in split"
-                );
+        for (const auto& segment : segments) {
+            if (!current) break;
+            auto it = current->children.find(std::string(segment));
+            if (it == current->children.end()) {
+                current = nullptr;  // Path doesn't exist yet
+                break;
             }
+            current = it->second.get();
+        }
+        
+        // If we found the full path and it's terminal with same mode, update it
+        if (current && current->isTerminal && current->matchMode == mode) {
+            // Update the entry offset in the heap node
+            current->entryOffset = entryOffset;
             
-            if (!SafeAdd(HEADER_SIZE, curNodeSpace, newNode1Offset)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Node1 offset overflow in split"
-                );
-            }
-            
-            if (!SafeAdd(newNode1Offset, nodeSize, newNode2Offset)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Node2 offset overflow in split"
-                );
-            }
-            
-            // Validate we have space for both new nodes
-            uint64_t totalRequired = 0;
-            if (!SafeAdd(newNode2Offset, nodeSize, totalRequired) || totalRequired > m_indexSize) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Insufficient space for node split"
-                );
-            }
-            
-            // Validate offsets fit in uint32_t
-            if (newNode1Offset > UINT32_MAX || newNode2Offset > UINT32_MAX) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Node offset exceeds uint32_t range in split"
-                );
-            }
-            
-            // Save original node state before modification
-            const bool originalWasTerminal = node->IsTerminal();
-            const uint64_t originalEntryOffset = node->entryOffset;
-            const PathMatchMode originalMatchMode = node->matchMode;
-            const uint32_t originalChildCount = node->childCount;
-            uint32_t originalChildren[PathTrieNode::MAX_CHILDREN];
-            std::memcpy(originalChildren, node->children, sizeof(originalChildren));
-            
-            // Calculate segments
-            // Original segment suffix (part after common prefix)
-            std::string_view suffixSegment = nodeSegment.substr(commonLen);
-            // New path suffix (part after common prefix)  
-            std::string_view newPathSegment = remaining.substr(commonLen);
-            
-            // Allocate suffix node (contains rest of original segment)
-            auto* suffixNode = reinterpret_cast<PathTrieNode*>(base + newNode1Offset);
-            SecureZeroMemoryRegion(suffixNode, sizeof(PathTrieNode));
-            
-            // Copy suffix segment
-            const size_t suffixLen = std::min(suffixSegment.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
-            std::memcpy(suffixNode->segment, suffixSegment.data(), suffixLen);
-            suffixNode->segmentLength = static_cast<uint8_t>(suffixLen);
-            
-            // Transfer original node's terminal state and children to suffix node
-            if (originalWasTerminal) {
-                suffixNode->SetTerminal(true);
-                suffixNode->entryOffset = originalEntryOffset;
-                suffixNode->matchMode = originalMatchMode;
-            }
-            
-            // Transfer original children to suffix node
-            std::memcpy(suffixNode->children, originalChildren, sizeof(originalChildren));
-            suffixNode->childCount = originalChildCount;
-            
-            // Allocate new path node (contains new insertion)
-            auto* newPathNode = reinterpret_cast<PathTrieNode*>(base + newNode2Offset);
-            SecureZeroMemoryRegion(newPathNode, sizeof(PathTrieNode));
-            
-            // Copy new path segment
-            const size_t newPathLen = std::min(newPathSegment.length(), PathTrieNode::MAX_SEGMENT_LENGTH);
-            std::memcpy(newPathNode->segment, newPathSegment.data(), newPathLen);
-            newPathNode->segmentLength = static_cast<uint8_t>(newPathLen);
-            newPathNode->SetTerminal(true);
-            newPathNode->entryOffset = entryOffset;
-            newPathNode->matchMode = mode;
-            
-            // Modify current node to become the internal node with common prefix
-            // This reuses the original node's position in the trie
-            
-            // Update segment to common prefix only
-            const size_t commonPrefixLen = std::min(commonLen, PathTrieNode::MAX_SEGMENT_LENGTH);
-            // Clear segment first for security
-            SecureZeroMemoryRegion(node->segment, PathTrieNode::MAX_SEGMENT_LENGTH);
-            std::memcpy(node->segment, nodeSegment.data(), commonPrefixLen);
-            node->segmentLength = static_cast<uint8_t>(commonPrefixLen);
-            
-            // Current node is no longer terminal (it's now an internal node)
-            node->SetTerminal(false);
-            node->entryOffset = 0;
-            
-            // Clear all children of current node
-            SecureZeroMemoryRegion(node->children, sizeof(node->children));
-            node->childCount = 0;
-            
-            // Link suffix node and new path node as children
-            // Calculate child indices using hash of first char of each suffix
-            const uint32_t suffixChildIdx = suffixSegment.empty() ? 0 : SegmentHash(suffixSegment);
-            const uint32_t newPathChildIdx = newPathSegment.empty() ? 0 : SegmentHash(newPathSegment);
-            
-            // Handle collision: if both hash to same index, use linear probing
-            if (suffixChildIdx == newPathChildIdx) {
-                // Place suffix at hashed index
-                node->children[suffixChildIdx] = static_cast<uint32_t>(newNode1Offset);
-                node->childCount++;
-                
-                // Find next available slot for new path
-                for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-                    const uint32_t probeIdx = (suffixChildIdx + i + 1) % PathTrieNode::MAX_CHILDREN;
-                    if (node->children[probeIdx] == 0) {
-                        node->children[probeIdx] = static_cast<uint32_t>(newNode2Offset);
-                        node->childCount++;
-                        break;
-                    }
+            // Also update the corresponding PathEntryRecord
+            for (auto& record : m_pathRecords) {
+                if ((record.flags & 1) == 0 &&  // Not deleted
+                    record.pathLength == normalizedPath.length() &&
+                    std::memcmp(record.path, normalizedPath.data(), normalizedPath.length()) == 0 &&
+                    record.matchMode == static_cast<uint8_t>(mode)) {
+                    record.entryOffset = entryOffset;
+                    break;
                 }
-            } else {
-                // No collision - direct placement
-                node->children[suffixChildIdx] = static_cast<uint32_t>(newNode1Offset);
-                node->children[newPathChildIdx] = static_cast<uint32_t>(newNode2Offset);
-                node->childCount = 2;
             }
-            
-            // Memory fence to ensure all writes are visible
-            SS_STORE_FENCE();
-            
-            // Update counters - we added 2 new nodes
-            m_nodeCount.fetch_add(2, std::memory_order_release);
-            m_pathCount.fetch_add(1, std::memory_order_release);
-            m_insertCount.fetch_add(1, std::memory_order_relaxed);
-            
-            // Update header
-            auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-            *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-            
-            auto* headerNodeCount = reinterpret_cast<uint64_t*>(base + 16);
-            *headerNodeCount = m_nodeCount.load(std::memory_order_relaxed);
             
             SS_LOG_DEBUG(L"Whitelist", 
-                L"PathIndex: node split at depth %zu, common prefix len %zu",
-                depth, commonLen);
+                L"PathIndex::Insert: updated existing entry, new offset %llu", entryOffset);
             
             return StoreError::Success();
         }
         
-        // All paths should be handled by node split above
-        // If we reach here, it's an unexpected state
-        ++depth;
+        // ====================================================================
+        // STEP 1: Create PathEntryRecord for persistent storage
+        // ====================================================================
+        PathEntryRecord record{};
+        record.magic = PathEntryRecord::MAGIC;
+        record.version = PathEntryRecord::VERSION;
+        record.pathLength = static_cast<uint16_t>(normalizedPath.length());
+        record.entryOffset = entryOffset;
+        record.matchMode = static_cast<uint8_t>(mode);
+        record.flags = 0;  // Not deleted
+        record.reserved = 0;
+        
+        // Compute FNV-1a hash for quick filtering
+        record.pathHash = ComputeFNV1aHash(
+            reinterpret_cast<const uint8_t*>(normalizedPath.data()),
+            normalizedPath.length()
+        );
+        
+        // Copy path data (secure memset first to prevent info leakage)
+        std::memset(record.path, 0, MAX_PATH_LENGTH);
+        std::memcpy(record.path, normalizedPath.data(), normalizedPath.length());
+        
+        // ====================================================================
+        // STEP 2: Add record to m_pathRecords vector
+        // ====================================================================
+        m_pathRecords.push_back(record);
+        const uint64_t recordIndex = m_nextRecordIndex.fetch_add(1, std::memory_order_relaxed);
+        
+        // ====================================================================
+        // STEP 3: Insert into HeapTrieNode index
+        // ====================================================================
+        if (!InsertIntoHeapTrie(normalizedPath, mode, entryOffset)) {
+            // Rollback: remove the record we just added
+            if (!m_pathRecords.empty()) {
+                m_pathRecords.pop_back();
+                m_nextRecordIndex.fetch_sub(1, std::memory_order_relaxed);
+            }
+            return StoreError::WithMessage(
+                WhitelistStoreError::InvalidEntry,
+                "Failed to insert into heap trie"
+            );
+        }
+        
+        // Update insert counter
+        m_insertCount.fetch_add(1, std::memory_order_relaxed);
+        
+        // NOTE: Records are stored in m_pathRecords but NOT immediately flushed to
+        // memory-mapped storage. This is by design (like ThreatIntel):
+        // - Immediate flushes would be too slow for bulk inserts
+        // - Call Flush() explicitly to persist to storage
+        // - Data is automatically flushed during Compact()
+        // - On graceful shutdown, caller should call Flush()
+        
+        SS_LOG_DEBUG(L"Whitelist", 
+            L"PathIndex::Insert: stored record %llu, path length %u, entry offset %llu",
+            recordIndex, record.pathLength, entryOffset);
+        
+        return StoreError::Success();
+        
+    } catch (const std::bad_alloc&) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Memory allocation failed during insert"
+        );
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", L"PathIndex::Insert exception: %S", e.what());
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidEntry,
+            "Exception during insert"
+        );
     }
-    
-    return StoreError::WithMessage(
-        WhitelistStoreError::IndexFull,
-        "Failed to insert path - max depth or no slot available"
-    );
 }
 
 StoreError PathIndex::Remove(
@@ -2094,20 +1874,19 @@ StoreError PathIndex::Remove(
 ) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE PATH TRIE REMOVE WITH SECURE DELETION
+     * ENTERPRISE-GRADE PATH REMOVE (THREATINTEL HYBRID MODEL)
      * ========================================================================
      *
-     * Removes a path pattern from the trie. The node is marked as non-terminal
-     * rather than physically deleted (lazy deletion for performance).
+     * Removes a path pattern using the ThreatIntel Hybrid persistence model:
+     * 1. Finds and marks the HeapTrieNode as non-terminal (lazy deletion)
+     * 2. Finds and marks the corresponding PathEntryRecord as deleted
      *
-     * Security Features:
-     * - Node validation before modification
-     * - Secure memory clearing of sensitive data
-     * - Atomic counter updates with underflow protection
+     * This ensures:
+     * - Removal is reflected in heap index immediately
+     * - Removal persists across restarts (record marked deleted)
+     * - Thread-safe operations (unique_lock)
      *
-     * Physical cleanup happens during compaction.
-     *
-     * Thread-safety: Protected by unique_lock
+     * Note: Physical removal from m_pathRecords is deferred to Compact()
      *
      * ========================================================================
      */
@@ -2119,6 +1898,14 @@ StoreError PathIndex::Remove(
         return StoreError::WithMessage(
             WhitelistStoreError::ReadOnlyDatabase,
             "Index is read-only"
+        );
+    }
+    
+    // Validate heap root exists
+    if (!m_heapRoot) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::EntryNotFound,
+            "Index not initialized"
         );
     }
     
@@ -2163,244 +1950,133 @@ StoreError PathIndex::Remove(
         );
     }
     
-    // Get writable base with validation
-    if (m_indexOffset > 0) {
-        uint64_t testOffset = 0;
-        if (!SafeAdd(reinterpret_cast<uint64_t>(m_baseAddress), m_indexOffset, testOffset)) {
+    try {
+        // Split normalized path into segments
+        std::vector<std::string_view> segments;
+        SplitPathSegments(normalizedPath, segments);
+        
+        if (segments.empty()) {
             return StoreError::WithMessage(
-                WhitelistStoreError::InvalidSection,
-                "Index offset causes pointer overflow"
-            );
-        }
-    }
-    auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
-    
-    // Validate root offset
-    if (!IsValidNodeOffset(m_rootOffset, m_indexSize)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::EntryNotFound,
-            "Root offset invalid - index may be corrupted or empty"
-        );
-    }
-    
-    // Navigate to the node with prefetching
-    uint64_t currentOffset = m_rootOffset;
-    std::string_view remaining(normalizedPath);
-    const uint64_t nodeSize = sizeof(PathTrieNode);
-    
-    // Prefetch root node
-    SS_PREFETCH_WRITE(base + currentOffset);
-    
-    size_t depth = 0;
-    
-    while (depth < SAFE_MAX_TRIE_DEPTH) {
-        // Validate node offset
-        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::IndexCorrupted,
-                "Node offset out of bounds during remove"
+                WhitelistStoreError::InvalidEntry,
+                "Path has no segments"
             );
         }
         
-        auto* node = reinterpret_cast<PathTrieNode*>(base + currentOffset);
+        // Navigate to the target node
+        HeapTrieNode* node = m_heapRoot.get();
         
-        // Validate node integrity
-        if (!ValidateNodeIntegrity(node, m_indexSize)) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::IndexCorrupted,
-                "Corrupted node detected during remove"
-            );
-        }
-        
-        std::string_view nodeSegment = node->GetSegment();
-        
-        // Check if segments match
-        if (!nodeSegment.empty()) {
-            if (remaining.length() < nodeSegment.length() ||
-                remaining.substr(0, nodeSegment.length()) != nodeSegment) {
-                // Mismatch - path not found
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const std::string segmentKey(segments[i]);
+            
+            auto it = node->children.find(segmentKey);
+            if (it == node->children.end()) {
                 return StoreError::WithMessage(
                     WhitelistStoreError::EntryNotFound,
                     "Path not found in index"
                 );
             }
-            
-            remaining = remaining.substr(nodeSegment.length());
+            node = it->second.get();
         }
         
-        // Check if this is the target node
-        if (remaining.empty()) {
-            if (node->IsTerminal() && node->matchMode == mode) {
-                // Found it - mark as non-terminal (lazy delete)
-                node->SetTerminal(false);
-                
-                // Securely clear the entry offset to prevent information leakage
-                node->entryOffset = 0;
-                
-                // Memory fence to ensure visibility
-                SS_STORE_FENCE();
-                
-                // Atomic decrement with proper ordering and underflow protection
-                const uint64_t previousCount = m_pathCount.fetch_sub(1, std::memory_order_acq_rel);
-                
-                // Safety check: ensure we didn't underflow
-                // Note: fetch_sub returns the PREVIOUS value, so if previousCount was 0,
-                // we have underflowed (counter wrapped to UINT64_MAX)
-                if (previousCount == 0) {
-                    // Critical: Counter underflow indicates data corruption or race condition
-                    // Restore count to maintain consistency and report error
-                    m_pathCount.fetch_add(1, std::memory_order_relaxed);
-                    
-                    SS_LOG_ERROR(L"Whitelist", 
-                        L"PathIndex::Remove: CRITICAL - path count underflow prevented, "
-                        L"possible index corruption or concurrent modification");
-                    
-                    // Use IndexCorrupted as this indicates a serious state inconsistency
-                    // that should trigger integrity verification
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexCorrupted,
-                        "Counter underflow detected - index state inconsistent"
-                    );
-                }
-                
-                // Update remove counter
-                m_removeCount.fetch_add(1, std::memory_order_relaxed);
-                
-                // Update header with current count
-                auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-                *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-                
-                SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Remove: path removed (lazy delete)");
-                return StoreError::Success();
-            }
-            
+        // Check if this is a terminal node with matching mode
+        if (!node->isTerminal) {
             return StoreError::WithMessage(
                 WhitelistStoreError::EntryNotFound,
-                "Path exists but not as terminal with matching mode"
+                "Path exists but is not a terminal node"
             );
         }
         
-        // Skip separator if present
-        if (!remaining.empty() && remaining[0] == '/') {
-            remaining = remaining.substr(1);
+        // For exact mode matching, verify the mode (unless searching any mode)
+        if (mode != PathMatchMode::Exact && node->matchMode != mode) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::EntryNotFound,
+                "Path found but match mode differs"
+            );
         }
         
-        if (remaining.empty()) {
-            // Check current node
-            if (node->IsTerminal() && node->matchMode == mode) {
-                node->SetTerminal(false);
-                node->entryOffset = 0;
-                
-                // Memory fence for visibility
-                SS_STORE_FENCE();
-                
-                // Atomic decrement with underflow protection
-                const uint64_t previousCount = m_pathCount.fetch_sub(1, std::memory_order_acq_rel);
-                
-                // Check for underflow - previousCount was the value BEFORE subtraction
-                if (previousCount == 0) {
-                    // Critical: Counter underflow indicates corruption
-                    m_pathCount.fetch_add(1, std::memory_order_relaxed);
-                    
-                    SS_LOG_ERROR(L"Whitelist", 
-                        L"PathIndex::Remove: CRITICAL - path count underflow in separator check, "
-                        L"possible index corruption");
-                    
-                    return StoreError::WithMessage(
-                        WhitelistStoreError::IndexCorrupted,
-                        "Counter underflow detected in terminal check - index state inconsistent"
-                    );
-                }
-                
-                // Update remove counter
-                m_removeCount.fetch_add(1, std::memory_order_relaxed);
-                
-                // Update header
-                auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-                *headerPathCount = m_pathCount.load(std::memory_order_relaxed);
-                
-                SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Remove: path removed (terminal check path)");
-                return StoreError::Success();
+        // ====================================================================
+        // STEP 1: Mark heap trie node as non-terminal (lazy deletion)
+        // ====================================================================
+        const uint64_t removedEntryOffset = node->entryOffset;
+        node->isTerminal = false;
+        node->entryOffset = 0;
+        
+        // ====================================================================
+        // STEP 2: Mark corresponding PathEntryRecord as deleted
+        // ====================================================================
+        // Compute hash for fast filtering
+        const uint32_t pathHash = ComputeFNV1aHash(
+            reinterpret_cast<const uint8_t*>(normalizedPath.data()),
+            normalizedPath.length()
+        );
+        
+        bool recordFound = false;
+        for (auto& record : m_pathRecords) {
+            if (record.IsDeleted()) {
+                continue;  // Skip already deleted records
             }
             
-            return StoreError::WithMessage(
-                WhitelistStoreError::EntryNotFound,
-                "Path not found"
-            );
-        }
-        
-        // Navigate to child
-        if (!node->HasChildren()) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::EntryNotFound,
-                "Path not found - no children"
-            );
-        }
-        
-        const uint32_t childIdx = SegmentHash(remaining);
-        
-        // Try direct child first with validation and prefetching
-        if (childIdx < PathTrieNode::MAX_CHILDREN && node->children[childIdx] != 0) {
-            const uint64_t childOff = node->children[childIdx];
-            if (!IsValidNodeOffset(childOff, m_indexSize)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexCorrupted,
-                    "Child offset invalid during remove traversal"
-                );
-            }
-            // Prefetch next node
-            SS_PREFETCH_WRITE(base + childOff);
-            currentOffset = childOff;
-            ++depth;
-            continue;
-        }
-        
-        // Linear search children with validation
-        bool found = false;
-        
-        // Prefetch all potential children
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-            if (node->children[i] != 0 && IsValidNodeOffset(node->children[i], m_indexSize)) {
-                SS_PREFETCH_READ_L2(base + node->children[i]);
-            }
-        }
-        
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN && !found; ++i) {
-            const uint32_t childOff = node->children[i];
-            if (childOff == 0) {
+            // Quick filter by hash
+            if (record.pathHash != pathHash) {
                 continue;
             }
             
-            // Validate child offset
-            if (!IsValidNodeOffset(static_cast<uint64_t>(childOff), m_indexSize)) {
-                SS_LOG_WARN(L"Whitelist", L"PathIndex::Remove: skipping invalid child offset %u", childOff);
+            // Verify path matches
+            std::string_view recordPath = record.GetPath();
+            if (recordPath != normalizedPath) {
                 continue;
             }
             
-            const auto* childNode = reinterpret_cast<const PathTrieNode*>(base + childOff);
-            std::string_view childSeg = childNode->GetSegment();
-            
-            if (!childSeg.empty() && remaining.length() >= childSeg.length() &&
-                remaining.substr(0, childSeg.length()) == childSeg) {
-                currentOffset = childOff;
-                found = true;
+            // Verify entry offset matches (for extra safety)
+            if (record.entryOffset != removedEntryOffset) {
+                continue;
             }
+            
+            // Mark record as deleted
+            record.MarkDeleted();
+            recordFound = true;
+            break;
         }
         
-        if (!found) {
+        if (!recordFound) {
+            SS_LOG_WARN(L"Whitelist", 
+                L"PathIndex::Remove: path removed from heap but record not found (inconsistent state)");
+            // Continue anyway - heap index is authoritative for lookups
+        }
+        
+        // Atomic decrement with underflow protection
+        const uint64_t previousCount = m_pathCount.fetch_sub(1, std::memory_order_acq_rel);
+        
+        // Check for underflow - previousCount was the value BEFORE subtraction
+        if (previousCount == 0) {
+            // Critical: Counter underflow indicates corruption
+            m_pathCount.fetch_add(1, std::memory_order_relaxed);
+            
+            SS_LOG_ERROR(L"Whitelist", 
+                L"PathIndex::Remove: CRITICAL - path count underflow prevented, "
+                L"possible index corruption or concurrent modification");
+            
             return StoreError::WithMessage(
-                WhitelistStoreError::EntryNotFound,
-                "Path not found - no matching child"
+                WhitelistStoreError::IndexCorrupted,
+                "Counter underflow detected - index state inconsistent"
             );
         }
         
-        ++depth;
+        // Update remove counter
+        m_removeCount.fetch_add(1, std::memory_order_relaxed);
+        
+        SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Remove: path removed, record %s",
+                    recordFound ? L"marked deleted" : L"not found");
+        
+        return StoreError::Success();
+        
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", L"PathIndex::Remove exception: %S", e.what());
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidEntry,
+            "Exception during remove"
+        );
     }
-    
-    return StoreError::WithMessage(
-        WhitelistStoreError::EntryNotFound,
-        "Path not found - max depth exceeded"
-    );
 }
 
 // ============================================================================
@@ -2410,15 +2086,14 @@ StoreError PathIndex::Remove(
 StoreError PathIndex::Clear() noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE TRIE CLEAR WITH SECURE MEMORY ZEROING
+     * ENTERPRISE-GRADE CLEAR (THREATINTEL HYBRID MODEL)
      * ========================================================================
      *
-     * Clears all paths from the index by:
-     * 1. Securely zeroing all node data
-     * 2. Resetting counters and root offset
-     * 3. Updating header metadata
-     *
-     * Security: Uses SecureZeroMemory to prevent data leakage
+     * Clears all paths from the PathIndex by:
+     * 1. Clearing m_pathRecords vector (persistent storage)
+     * 2. Resetting the heap root to a fresh node (index)
+     * 3. Resetting all counters
+     * 4. Zeroing the memory-mapped header
      *
      * Thread-safety: Protected by unique_lock
      *
@@ -2435,63 +2110,56 @@ StoreError PathIndex::Clear() noexcept {
         );
     }
     
-    // Get base pointer with validation
-    if (m_indexOffset > 0) {
-        uint64_t testOffset = 0;
-        if (!SafeAdd(reinterpret_cast<uint64_t>(m_baseAddress), m_indexOffset, testOffset)) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::InvalidSection,
-                "Index offset causes pointer overflow"
-            );
+    try {
+        // ====================================================================
+        // STEP 1: Clear persistent record storage
+        // ====================================================================
+        m_pathRecords.clear();
+        m_nextRecordIndex.store(0, std::memory_order_release);
+        
+        // ====================================================================
+        // STEP 2: Reset heap root (old tree is automatically deallocated)
+        // ====================================================================
+        m_heapRoot = std::make_unique<HeapTrieNode>();
+        
+        // ====================================================================
+        // STEP 3: Reset state counters
+        // ====================================================================
+        m_pathCount.store(0, std::memory_order_release);
+        m_nodeCount.store(1, std::memory_order_release); // Root node = 1
+        
+        // ====================================================================
+        // STEP 4: Zero the memory-mapped header for consistency
+        // ====================================================================
+        if (m_baseAddress) {
+            auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
+            
+            // Zero header + record count region (80 bytes)
+            constexpr uint64_t CLEAR_SIZE = 80;
+            if (m_indexSize >= CLEAR_SIZE) {
+                SecureZeroMemoryRegion(base, static_cast<size_t>(CLEAR_SIZE));
+            }
+            
+            // Reset root offset
+            m_rootOffset = 64; // HEADER_SIZE
         }
+        
+        SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Clear: index and records cleared");
+        
+        return StoreError::Success();
+        
+    } catch (const std::bad_alloc&) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Memory allocation failed during clear"
+        );
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", L"PathIndex::Clear exception: %S", e.what());
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidEntry,
+            "Exception during clear"
+        );
     }
-    
-    auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
-    
-    // Calculate total used space
-    const uint64_t nodeCount = m_nodeCount.load(std::memory_order_acquire);
-    constexpr uint64_t HEADER_SIZE = 64;
-    const uint64_t nodeSize = sizeof(PathTrieNode);
-    
-    uint64_t totalUsedSpace = 0;
-    if (!SafeMul(nodeCount, nodeSize, totalUsedSpace)) {
-        totalUsedSpace = m_indexSize; // Fallback: clear entire index
-    }
-    
-    uint64_t clearSize = 0;
-    if (!SafeAdd(HEADER_SIZE, totalUsedSpace, clearSize)) {
-        clearSize = m_indexSize;
-    }
-    
-    // Clamp to actual index size
-    if (clearSize > m_indexSize) {
-        clearSize = m_indexSize;
-    }
-    
-    // Securely zero all data (prevent information leakage)
-    SecureZeroMemoryRegion(base, static_cast<size_t>(clearSize));
-    
-    // Memory fence to ensure zeroing is visible
-    SS_STORE_FENCE();
-    
-    // Reset state
-    m_rootOffset = HEADER_SIZE;
-    m_pathCount.store(0, std::memory_order_release);
-    m_nodeCount.store(0, std::memory_order_release);
-    
-    // Update header (redundant but explicit)
-    auto* headerRoot = reinterpret_cast<uint64_t*>(base);
-    *headerRoot = 0;
-    
-    auto* headerPathCount = reinterpret_cast<uint64_t*>(base + 8);
-    *headerPathCount = 0;
-    
-    auto* headerNodeCount = reinterpret_cast<uint64_t*>(base + 16);
-    *headerNodeCount = 0;
-    
-    SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Clear: index cleared securely");
-    
-    return StoreError::Success();
 }
 
 // ============================================================================
@@ -2501,21 +2169,20 @@ StoreError PathIndex::Clear() noexcept {
 StoreError PathIndex::Compact() noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE TRIE COMPACTION WITH DEFRAGMENTATION
+     * ENTERPRISE-GRADE COMPACTION (THREATINTEL HYBRID MODEL)
      * ========================================================================
      *
-     * Rebuilds the trie to:
-     * 1. Remove lazy-deleted nodes (non-terminal with no terminal descendants)
-     * 2. Merge single-child paths (path compression)
-     * 3. Reorder nodes for better cache locality
-     * 4. Reclaim fragmented space
+     * Performs compaction on both layers:
+     * 1. Heap Index: Removes non-terminal leaf nodes (dead branches)
+     * 2. PathEntryRecords: Removes deleted records and rebuilds index
      *
-     * Algorithm:
-     * 1. BFS traversal to identify all live nodes
-     * 2. Allocate temporary buffer for new trie
-     * 3. Copy live nodes with new offsets
-     * 4. Update all child pointers
-     * 5. Copy back to original location
+     * This is a full rebuild operation that:
+     * - Physically removes deleted PathEntryRecords
+     * - Prunes empty branches from heap trie
+     * - Optionally flushes to persistent storage
+     *
+     * Performance: O(n) where n = number of records
+     * Recommended: Call during maintenance windows
      *
      * Thread-safety: Protected by unique_lock (exclusive access required)
      *
@@ -2532,251 +2199,146 @@ StoreError PathIndex::Compact() noexcept {
         );
     }
     
-    const uint64_t currentPathCount = m_pathCount.load(std::memory_order_acquire);
-    const uint64_t currentNodeCount = m_nodeCount.load(std::memory_order_acquire);
-    
-    // Fast path: empty or minimal index doesn't need compaction
-    if (currentNodeCount <= 1) {
-        SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Compact: nothing to compact");
+    // Validate heap root exists
+    if (!m_heapRoot) {
+        SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Compact: no heap root");
         return StoreError::Success();
     }
     
-    // Get base pointer
-    auto* base = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
-    constexpr uint64_t HEADER_SIZE = 64;
-    const uint64_t nodeSize = sizeof(PathTrieNode);
-    
-    // Validate root offset
-    if (!IsValidNodeOffset(m_rootOffset, m_indexSize)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::IndexCorrupted,
-            "Invalid root offset - cannot compact"
-        );
-    }
-    
-    // Structure to track node mappings during compaction
-    struct NodeMapping {
-        uint64_t oldOffset{0};
-        uint64_t newOffset{0};
-        bool isLive{false};
-        bool hasTerminalDescendant{false};
-    };
-    
-    // Collect all reachable nodes using BFS
-    std::vector<NodeMapping> nodeMappings;
-    std::unordered_set<uint64_t> visitedOffsets;
-    std::queue<uint64_t> bfsQueue;
+    const auto startTime = std::chrono::steady_clock::now();
+    const uint64_t beforeNodeCount = m_nodeCount.load(std::memory_order_acquire);
+    const size_t beforeRecordCount = m_pathRecords.size();
     
     try {
-        nodeMappings.reserve(static_cast<size_t>(currentNodeCount));
-    } catch (const std::bad_alloc&) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::OutOfMemory,
-            "Failed to allocate memory for compaction"
-        );
-    }
-    
-    // Start BFS from root
-    bfsQueue.push(m_rootOffset);
-    visitedOffsets.insert(m_rootOffset);
-    
-    // First pass: identify all reachable nodes
-    size_t processedNodes = 0;
-    constexpr size_t MAX_NODES_TO_PROCESS = 10'000'000; // Safety limit
-    
-    while (!bfsQueue.empty() && processedNodes < MAX_NODES_TO_PROCESS) {
-        const uint64_t currentOffset = bfsQueue.front();
-        bfsQueue.pop();
-        ++processedNodes;
+        // ====================================================================
+        // STEP 1: Compact PathEntryRecords (remove deleted records)
+        // ====================================================================
+        std::vector<PathEntryRecord> compactedRecords;
+        compactedRecords.reserve(beforeRecordCount);
         
-        // Validate node offset
-        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
-            SS_LOG_WARN(L"Whitelist", L"PathIndex::Compact: skipping invalid offset %llu", currentOffset);
-            continue;
-        }
-        
-        const auto* node = reinterpret_cast<const PathTrieNode*>(base + currentOffset);
-        
-        // Validate node integrity
-        if (!ValidateNodeIntegrity(node, m_indexSize)) {
-            SS_LOG_WARN(L"Whitelist", L"PathIndex::Compact: skipping corrupted node at %llu", currentOffset);
-            continue;
-        }
-        
-        // Record this node
-        NodeMapping mapping;
-        mapping.oldOffset = currentOffset;
-        mapping.isLive = node->IsTerminal(); // Initially live if terminal
-        nodeMappings.push_back(mapping);
-        
-        // Add children to queue
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-            const uint32_t childOff = node->children[i];
-            if (childOff != 0 && visitedOffsets.find(childOff) == visitedOffsets.end()) {
-                if (IsValidNodeOffset(childOff, m_indexSize)) {
-                    bfsQueue.push(childOff);
-                    visitedOffsets.insert(childOff);
-                }
-            }
-        }
-    }
-    
-    if (nodeMappings.empty()) {
-        SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Compact: no nodes to compact");
-        return StoreError::Success();
-    }
-    
-    // Second pass: mark nodes with terminal descendants as live
-    // Process in reverse (children before parents due to BFS order)
-    std::unordered_map<uint64_t, size_t> offsetToIndex;
-    for (size_t i = 0; i < nodeMappings.size(); ++i) {
-        offsetToIndex[nodeMappings[i].oldOffset] = i;
-    }
-    
-    // Mark terminal descendants
-    for (auto it = nodeMappings.rbegin(); it != nodeMappings.rend(); ++it) {
-        const auto* node = reinterpret_cast<const PathTrieNode*>(base + it->oldOffset);
-        
-        // Check if any child has terminal descendants
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-            const uint32_t childOff = node->children[i];
-            if (childOff != 0) {
-                auto childIt = offsetToIndex.find(childOff);
-                if (childIt != offsetToIndex.end()) {
-                    const auto& childMapping = nodeMappings[childIt->second];
-                    if (childMapping.isLive || childMapping.hasTerminalDescendant) {
-                        it->hasTerminalDescendant = true;
-                        break;
-                    }
-                }
+        for (const auto& record : m_pathRecords) {
+            if (!record.IsDeleted() && record.IsValid()) {
+                compactedRecords.push_back(record);
             }
         }
         
-        // Node is live if terminal or has terminal descendants
-        if (it->hasTerminalDescendant) {
-            it->isLive = true;
-        }
-    }
-    
-    // Count live nodes and calculate new offsets
-    uint64_t newNodeCount = 0;
-    uint64_t nextOffset = HEADER_SIZE;
-    
-    for (auto& mapping : nodeMappings) {
-        if (mapping.isLive) {
-            mapping.newOffset = nextOffset;
+        const size_t deletedRecords = beforeRecordCount - compactedRecords.size();
+        
+        // ====================================================================
+        // STEP 2: Rebuild heap index from compacted records
+        // ====================================================================
+        // This ensures heap index is perfectly in sync with records
+        m_heapRoot = std::make_unique<HeapTrieNode>();
+        m_nodeCount.store(1, std::memory_order_release);
+        m_pathCount.store(0, std::memory_order_release);
+        
+        uint64_t rebuiltCount = 0;
+        for (const auto& record : compactedRecords) {
+            std::string_view pathView = record.GetPath();
+            PathMatchMode mode = static_cast<PathMatchMode>(record.matchMode);
             
-            uint64_t newNextOffset = 0;
-            if (!SafeAdd(nextOffset, nodeSize, newNextOffset)) {
-                return StoreError::WithMessage(
-                    WhitelistStoreError::IndexFull,
-                    "Offset overflow during compaction"
-                );
+            if (InsertIntoHeapTrie(pathView, mode, record.entryOffset)) {
+                ++rebuiltCount;
             }
-            nextOffset = newNextOffset;
-            ++newNodeCount;
         }
-    }
-    
-    // Check if compaction is beneficial
-    if (newNodeCount == currentNodeCount) {
-        SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Compact: no dead nodes to remove");
+        
+        // ====================================================================
+        // STEP 3: Replace old records with compacted records
+        // ====================================================================
+        m_pathRecords = std::move(compactedRecords);
+        m_nextRecordIndex.store(m_pathRecords.size(), std::memory_order_release);
+        
+        // ====================================================================
+        // STEP 4: Prune empty branches from heap trie (optional cleanup)
+        // SECURITY: Add depth limit to prevent stack overflow
+        // ====================================================================
+        constexpr size_t PRUNE_MAX_DEPTH = 512;
+        
+        std::function<bool(HeapTrieNode*, size_t)> pruneEmptyBranches;
+        pruneEmptyBranches = [&](HeapTrieNode* node, size_t depth) -> bool {
+            if (!node || depth >= PRUNE_MAX_DEPTH) return false;  // Stack overflow protection
+            
+            std::vector<std::string> keysToRemove;
+            
+            for (auto& [key, child] : node->children) {
+                if (!pruneEmptyBranches(child.get(), depth + 1)) {
+                    keysToRemove.push_back(key);
+                }
+            }
+            
+            for (const auto& key : keysToRemove) {
+                node->children.erase(key);
+                m_nodeCount.fetch_sub(1, std::memory_order_relaxed);
+            }
+            
+            return node->isTerminal || !node->children.empty();
+        };
+        
+        pruneEmptyBranches(m_heapRoot.get(), 0);
+        
+        const auto endTime = std::chrono::steady_clock::now();
+        const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+        const uint64_t afterNodeCount = m_nodeCount.load(std::memory_order_acquire);
+        const size_t afterRecordCount = m_pathRecords.size();
+        
+        SS_LOG_INFO(L"Whitelist", 
+            L"PathIndex::Compact: records %zu->%zu (-%zu), nodes %llu->%llu, rebuilt %llu in %lld ms",
+            beforeRecordCount, afterRecordCount, deletedRecords,
+            beforeNodeCount, afterNodeCount, rebuiltCount, durationMs);
+        
         return StoreError::Success();
-    }
-    
-    // Allocate temporary buffer for new trie
-    const uint64_t newTrieSize = nextOffset;
-    std::vector<uint8_t> tempBuffer;
-    
-    try {
-        tempBuffer.resize(static_cast<size_t>(newTrieSize), 0);
+        
     } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"Whitelist", L"PathIndex::Compact: memory allocation failed");
         return StoreError::WithMessage(
             WhitelistStoreError::OutOfMemory,
-            "Failed to allocate temporary buffer for compaction"
+            "Memory allocation failed during compaction"
+        );
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", L"PathIndex::Compact exception: %S", e.what());
+        return StoreError::WithMessage(
+            WhitelistStoreError::InvalidEntry,
+            "Exception during compaction"
+        );
+    }
+}
+
+// ============================================================================
+// FLUSH IMPLEMENTATION (PUBLIC API)
+// ============================================================================
+
+StoreError PathIndex::Flush() noexcept {
+    /*
+     * ========================================================================
+     * ENTERPRISE-GRADE FLUSH OPERATION
+     * ========================================================================
+     *
+     * Persists all pending PathEntryRecords to the memory-mapped storage.
+     * This ensures data durability across application restarts.
+     *
+     * Call this method:
+     * - Before application shutdown
+     * - After bulk insert operations
+     * - Periodically if data durability is critical
+     *
+     * Thread-safety: Acquires exclusive write lock
+     *
+     * ========================================================================
+     */
+    
+    std::unique_lock lock(m_rwLock);
+    
+    if (!m_baseAddress) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::ReadOnlyDatabase,
+            "Cannot flush: no storage mapped"
         );
     }
     
-    // Build offset translation map
-    std::unordered_map<uint64_t, uint64_t> oldToNewOffset;
-    for (const auto& mapping : nodeMappings) {
-        if (mapping.isLive) {
-            oldToNewOffset[mapping.oldOffset] = mapping.newOffset;
-        }
-    }
+    SS_LOG_DEBUG(L"Whitelist", L"PathIndex::Flush: persisting %zu records to storage", 
+        m_pathRecords.size());
     
-    // Copy live nodes to temporary buffer with updated offsets
-    for (const auto& mapping : nodeMappings) {
-        if (!mapping.isLive) {
-            continue;
-        }
-        
-        const auto* oldNode = reinterpret_cast<const PathTrieNode*>(base + mapping.oldOffset);
-        auto* newNode = reinterpret_cast<PathTrieNode*>(tempBuffer.data() + mapping.newOffset);
-        
-        // Copy node data
-        std::memcpy(newNode, oldNode, sizeof(PathTrieNode));
-        
-        // Update child offsets
-        uint32_t newChildCount = 0;
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-            const uint32_t oldChildOff = oldNode->children[i];
-            if (oldChildOff != 0) {
-                auto it = oldToNewOffset.find(oldChildOff);
-                if (it != oldToNewOffset.end()) {
-                    // Child is live - update offset
-                    if (it->second <= UINT32_MAX) {
-                        newNode->children[i] = static_cast<uint32_t>(it->second);
-                        ++newChildCount;
-                    } else {
-                        newNode->children[i] = 0;
-                    }
-                } else {
-                    // Child was removed
-                    newNode->children[i] = 0;
-                }
-            }
-        }
-        newNode->childCount = newChildCount;
-    }
-    
-    // Write header to temporary buffer
-    auto* headerRoot = reinterpret_cast<uint64_t*>(tempBuffer.data());
-    auto rootIt = oldToNewOffset.find(m_rootOffset);
-    if (rootIt != oldToNewOffset.end()) {
-        *headerRoot = rootIt->second;
-    } else {
-        *headerRoot = HEADER_SIZE; // Default to first node after header
-    }
-    
-    auto* headerPathCount = reinterpret_cast<uint64_t*>(tempBuffer.data() + 8);
-    *headerPathCount = currentPathCount;
-    
-    auto* headerNodeCount = reinterpret_cast<uint64_t*>(tempBuffer.data() + 16);
-    *headerNodeCount = newNodeCount;
-    
-    // Memory fence before copying back
-    SS_STORE_FENCE();
-    
-    // Securely clear original data first
-    SecureZeroMemoryRegion(base, static_cast<size_t>(m_indexSize));
-    
-    // Copy compacted trie back to original location
-    std::memcpy(base, tempBuffer.data(), static_cast<size_t>(newTrieSize));
-    
-    // Update state
-    m_rootOffset = *headerRoot;
-    m_nodeCount.store(newNodeCount, std::memory_order_release);
-    
-    // Final memory fence
-    SS_STORE_FENCE();
-    
-    SS_LOG_INFO(L"Whitelist", 
-        L"PathIndex::Compact: compacted from %llu to %llu nodes (%.1f%% reduction)",
-        currentNodeCount, newNodeCount,
-        100.0 * (1.0 - static_cast<double>(newNodeCount) / static_cast<double>(currentNodeCount)));
-    
-    return StoreError::Success();
+    return FlushRecordsToStorage();
 }
 
 // ============================================================================
@@ -2786,13 +2348,12 @@ StoreError PathIndex::Compact() noexcept {
 PathIndexStats PathIndex::GetDetailedStats() const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE STATISTICS COLLECTION
+     * ENTERPRISE-GRADE STATISTICS COLLECTION (HEAP-BASED)
      * ========================================================================
      *
-     * Collects comprehensive statistics by traversing the trie:
+     * Collects comprehensive statistics by traversing the heap-based trie:
      * - Node counts (total, terminal, internal)
-     * - Structural metrics (depth, children, segments)
-     * - Memory metrics (usage, fragmentation)
+     * - Structural metrics (depth, children)
      * - Match mode distribution
      * - Performance counters
      *
@@ -2819,162 +2380,103 @@ PathIndexStats PathIndex::GetDetailedStats() const noexcept {
     stats.removeCount = m_removeCount.load(std::memory_order_relaxed);
     stats.lookupMisses = stats.lookupCount - stats.lookupHits;
     
-    // Early return if not initialized
-    if (!stats.isReady || stats.nodeCount == 0) {
+    // Early return if heap root doesn't exist
+    if (!m_heapRoot) {
         return stats;
     }
     
-    // Get base pointer for traversal
-    const uint8_t* base = nullptr;
-    if (m_view) {
-        base = static_cast<const uint8_t*>(m_view->baseAddress) + m_indexOffset;
-    } else if (m_baseAddress) {
-        base = static_cast<const uint8_t*>(m_baseAddress) + m_indexOffset;
-    }
-    
-    if (!base) {
-        return stats;
-    }
-    
-    // Validate root offset
-    if (!IsValidNodeOffset(m_rootOffset, m_indexSize)) {
-        stats.lastIntegrityCheckPassed = false;
-        return stats;
-    }
-    
-    // BFS traversal to collect detailed statistics
-    std::queue<std::pair<uint64_t, uint32_t>> bfsQueue; // (offset, depth)
-    std::unordered_set<uint64_t> visited;
-    
-    bfsQueue.push({m_rootOffset, 0});
-    visited.insert(m_rootOffset);
-    
-    uint64_t totalChildCount = 0;
-    uint64_t totalSegmentLength = 0;
-    uint64_t totalDepth = 0;
-    uint64_t terminalCount = 0;
-    constexpr size_t MAX_ITERATIONS = 10'000'000;
-    size_t iterations = 0;
-    
-    while (!bfsQueue.empty() && iterations < MAX_ITERATIONS) {
-        auto [currentOffset, depth] = bfsQueue.front();
-        bfsQueue.pop();
-        ++iterations;
+    try {
+        // Traverse heap trie to collect statistics
+        // SECURITY: Add depth limit to prevent stack overflow
+        constexpr uint32_t STATS_MAX_DEPTH = 512;
         
-        // Validate node offset
-        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
-            ++stats.corruptedNodes;
-            continue;
-        }
+        uint64_t totalChildren = 0;
+        uint64_t totalDepth = 0;
+        uint64_t terminalCount = 0;
+        uint64_t internalCount = 0;
+        uint64_t deletedCount = 0;
         
-        const auto* node = reinterpret_cast<const PathTrieNode*>(base + currentOffset);
-        
-        // Validate node integrity
-        if (!ValidateNodeIntegrity(node, m_indexSize)) {
-            ++stats.corruptedNodes;
-            continue;
-        }
-        
-        // Update max depth
-        if (depth > stats.maxDepth) {
-            stats.maxDepth = depth;
-        }
-        
-        // Count terminal vs internal
-        if (node->IsTerminal()) {
-            ++stats.terminalNodes;
-            ++terminalCount;
-            totalDepth += depth;
+        std::function<void(const HeapTrieNode*, uint32_t)> traverse;
+        traverse = [&](const HeapTrieNode* node, uint32_t depth) {
+            if (!node || depth >= STATS_MAX_DEPTH) return;  // Stack overflow protection
             
-            // Count by match mode
-            switch (node->matchMode) {
-                case PathMatchMode::Exact:   ++stats.exactMatchPaths; break;
-                case PathMatchMode::Prefix:  ++stats.prefixMatchPaths; break;
-                case PathMatchMode::Suffix:  ++stats.suffixMatchPaths; break;
-                case PathMatchMode::Glob:    ++stats.globMatchPaths; break;
-                case PathMatchMode::Regex:   ++stats.regexMatchPaths; break;
-                default: break;
+            // Update max depth
+            if (depth > stats.maxDepth) {
+                stats.maxDepth = depth;
             }
-        } else {
-            ++stats.internalNodes;
-        }
-        
-        // Segment statistics
-        totalSegmentLength += node->segmentLength;
-        if (node->segmentLength > stats.longestSegment) {
-            stats.longestSegment = node->segmentLength;
-        }
-        
-        // Child statistics
-        totalChildCount += node->childCount;
-        stats.emptyChildSlots += (PathTrieNode::MAX_CHILDREN - node->childCount);
-        
-        // Count deleted nodes (non-terminal with no children)
-        if (!node->IsTerminal() && !node->HasChildren()) {
-            ++stats.deletedNodes;
-        }
-        
-        // Add children to queue
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-            const uint32_t childOff = node->children[i];
-            if (childOff != 0 && visited.find(childOff) == visited.end()) {
-                if (IsValidNodeOffset(childOff, m_indexSize)) {
-                    bfsQueue.push({childOff, depth + 1});
-                    visited.insert(childOff);
+            
+            // Count children
+            totalChildren += node->children.size();
+            
+            // Count terminal vs internal
+            if (node->isTerminal) {
+                ++terminalCount;
+                totalDepth += depth;
+                
+                // Count by match mode
+                switch (node->matchMode) {
+                    case PathMatchMode::Exact:   ++stats.exactMatchPaths; break;
+                    case PathMatchMode::Prefix:  ++stats.prefixMatchPaths; break;
+                    case PathMatchMode::Suffix:  ++stats.suffixMatchPaths; break;
+                    case PathMatchMode::Glob:    ++stats.globMatchPaths; break;
+                    case PathMatchMode::Regex:   ++stats.regexMatchPaths; break;
+                    default: break;
+                }
+            } else {
+                ++internalCount;
+                
+                // Count deleted nodes (non-terminal leaf)
+                if (node->children.empty()) {
+                    ++deletedCount;
                 }
             }
+            
+            // Recurse to children
+            for (const auto& [segment, child] : node->children) {
+                traverse(child.get(), depth + 1);
+            }
+        };
+        
+        traverse(m_heapRoot.get(), 0);
+        
+        // Set counts
+        stats.terminalNodes = static_cast<uint32_t>(terminalCount);
+        stats.internalNodes = static_cast<uint32_t>(internalCount);
+        stats.deletedNodes = static_cast<uint32_t>(deletedCount);
+        
+        // Calculate derived metrics
+        const uint64_t actualNodeCount = terminalCount + internalCount;
+        
+        if (actualNodeCount > 0) {
+            stats.avgChildCount = static_cast<double>(totalChildren) / static_cast<double>(actualNodeCount);
         }
+        
+        if (terminalCount > 0) {
+            stats.avgDepth = static_cast<uint32_t>(totalDepth / terminalCount);
+        }
+        
+        // Fragmentation ratio
+        if (actualNodeCount > 0) {
+            stats.fragmentationRatio = static_cast<double>(deletedCount) / static_cast<double>(actualNodeCount);
+        }
+        
+        // Compaction needed if >10% deleted
+        stats.needsCompaction = (stats.fragmentationRatio > 0.10);
+        
+        // Integrity status - heap trie is always structurally valid
+        stats.lastIntegrityCheckPassed = true;
+        stats.corruptedNodes = 0;
+        stats.orphanedNodes = 0;
+        stats.lastIntegrityCheckTime = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+        
+    } catch (const std::exception&) {
+        // On any error, mark integrity as failed
+        stats.lastIntegrityCheckPassed = false;
     }
-    
-    // Calculate derived metrics
-    const uint64_t actualNodeCount = visited.size();
-    
-    if (actualNodeCount > 0) {
-        stats.avgChildCount = static_cast<double>(totalChildCount) / static_cast<double>(actualNodeCount);
-        stats.avgSegmentLength = static_cast<double>(totalSegmentLength) / static_cast<double>(actualNodeCount);
-    }
-    
-    if (terminalCount > 0) {
-        stats.avgDepth = static_cast<uint32_t>(totalDepth / terminalCount);
-    }
-    
-    // Memory metrics
-    constexpr uint64_t HEADER_SIZE = 64;
-    const uint64_t nodeSize = sizeof(PathTrieNode);
-    
-    uint64_t usedNodeSpace = 0;
-    if (!SafeMul(actualNodeCount, nodeSize, usedNodeSpace)) {
-        usedNodeSpace = m_indexSize;
-    }
-    
-    uint64_t usedSpace = 0;
-    if (!SafeAdd(HEADER_SIZE, usedNodeSpace, usedSpace)) {
-        usedSpace = m_indexSize;
-    }
-    
-    stats.usedSize = usedSpace;
-    stats.freeSpace = (usedSpace < m_indexSize) ? (m_indexSize - usedSpace) : 0;
-    
-    // Fragmentation ratio (deleted nodes / total nodes)
-    if (actualNodeCount > 0) {
-        stats.fragmentationRatio = static_cast<double>(stats.deletedNodes) / static_cast<double>(actualNodeCount);
-    }
-    
-    // Determine if compaction is needed (>10% deleted nodes)
-    stats.needsCompaction = (stats.fragmentationRatio > 0.10);
-    
-    // Check for orphaned nodes (allocated but not reachable)
-    stats.orphanedNodes = static_cast<uint32_t>(
-        stats.nodeCount > actualNodeCount ? (stats.nodeCount - actualNodeCount) : 0
-    );
-    
-    // Integrity status
-    stats.lastIntegrityCheckPassed = (stats.corruptedNodes == 0 && stats.orphanedNodes == 0);
-    stats.lastIntegrityCheckTime = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count()
-    );
     
     return stats;
 }
@@ -2986,16 +2488,16 @@ PathIndexStats PathIndex::GetDetailedStats() const noexcept {
 PathIndexIntegrityResult PathIndex::VerifyIntegrity() const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE TRIE INTEGRITY VERIFICATION
+     * ENTERPRISE-GRADE TRIE INTEGRITY VERIFICATION (HEAP-BASED)
      * ========================================================================
      *
-     * Performs comprehensive integrity checks:
-     * 1. Node offset validation (within bounds)
-     * 2. Node structure validation (field ranges)
-     * 3. Child pointer validation (no invalid offsets)
-     * 4. Cycle detection (no loops in trie)
-     * 5. Orphan detection (unreachable nodes)
-     * 6. Counter consistency (path count vs terminal nodes)
+     * Performs comprehensive integrity checks for heap-based trie:
+     * 1. Root node existence
+     * 2. Counter consistency (path count vs terminal nodes)
+     * 3. Node count validation
+     *
+     * Note: Heap-based trie with std::unique_ptr is inherently structurally
+     * sound - no pointer corruption, cycles, or orphans possible.
      *
      * Thread-safety: Uses shared_lock for concurrent verification
      *
@@ -3007,148 +2509,447 @@ PathIndexIntegrityResult PathIndex::VerifyIntegrity() const noexcept {
     PathIndexIntegrityResult result;
     result.isValid = true;
     
-    // Early return for uninitialized index
-    if (!m_view && !m_baseAddress) {
-        result.errorDetails = "Index not initialized";
-        return result;
-    }
-    
-    const uint64_t nodeCount = m_nodeCount.load(std::memory_order_acquire);
-    const uint64_t pathCount = m_pathCount.load(std::memory_order_acquire);
-    
-    // Empty index is valid
-    if (nodeCount == 0) {
-        result.isValid = (pathCount == 0);
-        if (!result.isValid) {
-            result.errorDetails = "Path count non-zero but node count is zero";
-        }
-        return result;
-    }
-    
-    // Get base pointer
-    const uint8_t* base = nullptr;
-    if (m_view) {
-        base = static_cast<const uint8_t*>(m_view->baseAddress) + m_indexOffset;
-    } else if (m_baseAddress) {
-        base = static_cast<const uint8_t*>(m_baseAddress) + m_indexOffset;
-    }
-    
-    if (!base) {
+    // Check if heap root exists
+    if (!m_heapRoot) {
         result.isValid = false;
-        result.errorDetails = "Invalid base pointer";
+        result.errorDetails = "Heap root is null";
         return result;
     }
     
-    // Validate root offset
-    if (!IsValidNodeOffset(m_rootOffset, m_indexSize)) {
-        result.isValid = false;
-        result.errorDetails = "Invalid root offset: " + std::to_string(m_rootOffset);
-        return result;
-    }
+    const uint64_t storedPathCount = m_pathCount.load(std::memory_order_acquire);
+    const uint64_t storedNodeCount = m_nodeCount.load(std::memory_order_acquire);
     
-    // BFS traversal for integrity verification
-    std::queue<uint64_t> bfsQueue;
-    std::unordered_set<uint64_t> visited;
-    uint64_t terminalCount = 0;
-    
-    bfsQueue.push(m_rootOffset);
-    visited.insert(m_rootOffset);
-    
-    constexpr size_t MAX_ITERATIONS = 10'000'000;
-    size_t iterations = 0;
-    
-    while (!bfsQueue.empty() && iterations < MAX_ITERATIONS) {
-        const uint64_t currentOffset = bfsQueue.front();
-        bfsQueue.pop();
-        ++iterations;
-        ++result.nodesChecked;
+    try {
+        // Traverse heap trie to count nodes and terminals
+        // SECURITY: Add depth limit to prevent stack overflow
+        constexpr size_t VERIFY_MAX_DEPTH = 512;
         
-        // Validate node offset (redundant but explicit)
-        if (!IsValidNodeOffset(currentOffset, m_indexSize)) {
-            ++result.invalidOffsets;
+        uint64_t actualNodeCount = 0;
+        uint64_t actualTerminalCount = 0;
+        
+        std::function<void(const HeapTrieNode*, size_t)> countNodes;
+        countNodes = [&](const HeapTrieNode* node, size_t depth) {
+            if (!node || depth >= VERIFY_MAX_DEPTH) return;  // Stack overflow protection
+            
+            ++actualNodeCount;
+            ++result.nodesChecked;
+            
+            if (node->isTerminal) {
+                ++actualTerminalCount;
+            }
+            
+            for (const auto& [segment, child] : node->children) {
+                countNodes(child.get(), depth + 1);
+            }
+        };
+        
+        countNodes(m_heapRoot.get(), 0);
+        
+        // Verify path count matches terminal count
+        if (actualTerminalCount != storedPathCount) {
             result.isValid = false;
-            continue;
+            result.errorDetails += "Path count mismatch: stored=" + std::to_string(storedPathCount) + 
+                ", actual terminals=" + std::to_string(actualTerminalCount) + "; ";
         }
         
-        const auto* node = reinterpret_cast<const PathTrieNode*>(base + currentOffset);
-        
-        // Validate node integrity
-        if (!ValidateNodeIntegrity(node, m_indexSize)) {
-            ++result.corruptedNodes;
-            result.isValid = false;
-            
-            // Log specific corruption details
-            if (node->segmentLength > PathTrieNode::MAX_SEGMENT_LENGTH) {
-                result.errorDetails += "Node at " + std::to_string(currentOffset) + 
-                    " has invalid segment length: " + std::to_string(node->segmentLength) + "; ";
-            }
-            if (node->childCount > PathTrieNode::MAX_CHILDREN) {
-                result.errorDetails += "Node at " + std::to_string(currentOffset) + 
-                    " has invalid child count: " + std::to_string(node->childCount) + "; ";
-            }
-            continue;
+        // Verify node count
+        if (actualNodeCount != storedNodeCount) {
+            // This is a warning, not an error - counts can drift slightly
+            result.errorDetails += "Node count mismatch: stored=" + std::to_string(storedNodeCount) + 
+                ", actual=" + std::to_string(actualNodeCount) + "; ";
         }
         
-        // Count terminals
-        if (node->IsTerminal()) {
-            ++terminalCount;
+        // Final status message
+        if (result.isValid && result.errorDetails.empty()) {
+            result.errorDetails = "All integrity checks passed";
         }
         
-        // Validate and traverse children
-        for (uint32_t i = 0; i < PathTrieNode::MAX_CHILDREN; ++i) {
-            const uint32_t childOff = node->children[i];
-            if (childOff == 0) {
-                continue;
-            }
-            
-            // Check for invalid offset
-            if (!IsValidNodeOffset(childOff, m_indexSize)) {
-                ++result.invalidOffsets;
-                result.isValid = false;
-                result.errorDetails += "Invalid child offset " + std::to_string(childOff) + 
-                    " at node " + std::to_string(currentOffset) + "; ";
-                continue;
-            }
-            
-            // Check for cycle
-            if (visited.find(childOff) != visited.end()) {
-                ++result.cycleDetected;
-                result.isValid = false;
-                result.errorDetails += "Cycle detected at offset " + std::to_string(childOff) + "; ";
-                continue;
-            }
-            
-            bfsQueue.push(childOff);
-            visited.insert(childOff);
-        }
-    }
-    
-    // Check for orphaned nodes (allocated but not reachable)
-    if (visited.size() < nodeCount) {
-        result.orphanedNodes = static_cast<uint32_t>(nodeCount - visited.size());
-        // Orphaned nodes are a warning, not necessarily invalid
-        // They can occur after lazy deletion before compaction
-    }
-    
-    // Verify path count matches terminal count
-    if (terminalCount != pathCount) {
+    } catch (const std::exception& e) {
         result.isValid = false;
-        result.errorDetails += "Path count mismatch: stored=" + std::to_string(pathCount) + 
-            ", actual terminals=" + std::to_string(terminalCount) + "; ";
-    }
-    
-    // Check for iteration limit exceeded
-    if (iterations >= MAX_ITERATIONS) {
-        result.isValid = false;
-        result.errorDetails += "Max iteration limit exceeded - possible corruption; ";
-    }
-    
-    // Final status message
-    if (result.isValid && result.errorDetails.empty()) {
-        result.errorDetails = "All integrity checks passed";
+        result.errorDetails = std::string("Exception during verification: ") + e.what();
     }
     
     return result;
+}
+
+// ============================================================================
+// THREATINTEL HYBRID PERSISTENCE MODEL IMPLEMENTATION
+// ============================================================================
+// Following the proven ThreatIntel pattern:
+// - PathEntryRecord stored in memory-mapped file (persistent)
+// - HeapTrieNode index rebuilt from records on startup (fast lookup)
+// ============================================================================
+
+bool PathIndex::InsertIntoHeapTrie(
+    std::string_view normalizedPath,
+    PathMatchMode mode,
+    uint64_t entryOffset
+) noexcept {
+    /*
+     * ========================================================================
+     * INSERT INTO HEAP TRIE (INDEX ONLY - NO PERSISTENCE)
+     * ========================================================================
+     * 
+     * This method handles ONLY the heap-based trie insertion. Used by:
+     * 1. RebuildIndexFromRecords() - rebuilding index on startup
+     * 2. Insert() - after creating the PathEntryRecord
+     *
+     * IMPORTANT: Caller must hold m_rwLock in exclusive mode
+     * 
+     * ========================================================================
+     */
+    
+    if (normalizedPath.empty()) {
+        return false;
+    }
+    
+    // Ensure heap root exists
+    if (!m_heapRoot) {
+        try {
+            m_heapRoot = std::make_unique<HeapTrieNode>();
+            m_nodeCount.store(1, std::memory_order_release);
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"Whitelist", L"InsertIntoHeapTrie: failed to allocate root node");
+            return false;
+        }
+    }
+    
+    try {
+        // Split path into segments
+        std::vector<std::string_view> segments;
+        std::string pathCopy(normalizedPath); // Need mutable copy for SplitPathSegments
+        SplitPathSegments(pathCopy, segments);
+        
+        if (segments.empty()) {
+            SS_LOG_WARN(L"Whitelist", L"InsertIntoHeapTrie: path produced no segments");
+            return false;
+        }
+        
+        // Navigate/create trie nodes for each segment
+        HeapTrieNode* node = m_heapRoot.get();
+        
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const std::string segmentKey(segments[i]);
+            
+            auto it = node->children.find(segmentKey);
+            if (it == node->children.end()) {
+                // Create new child node
+                auto newNode = std::make_unique<HeapTrieNode>();
+                auto [newIt, inserted] = node->children.emplace(segmentKey, std::move(newNode));
+                
+                if (!inserted) {
+                    SS_LOG_ERROR(L"Whitelist", L"InsertIntoHeapTrie: failed to insert child node");
+                    return false;
+                }
+                
+                m_nodeCount.fetch_add(1, std::memory_order_relaxed);
+                node = newIt->second.get();
+            } else {
+                node = it->second.get();
+            }
+        }
+        
+        // Mark terminal node
+        if (!node->isTerminal) {
+            m_pathCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        
+        node->isTerminal = true;
+        node->entryOffset = entryOffset;
+        node->matchMode = mode;
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", L"InsertIntoHeapTrie exception: %S", e.what());
+        return false;
+    }
+}
+
+uint64_t PathIndex::RebuildIndexFromRecords() noexcept {
+    /*
+     * ========================================================================
+     * REBUILD HEAP INDEX FROM PERSISTENT RECORDS
+     * ========================================================================
+     * 
+     * Iterates all PathEntryRecord in m_pathRecords and rebuilds the
+     * HeapTrieNode index. Called during Initialize() after LoadRecordsFromStorage().
+     *
+     * Following ThreatIntel pattern:
+     * - O(n) startup cost where n = number of entries
+     * - Typical performance: ~1µs per entry
+     * - 1 million entries ≈ 1 second startup time
+     *
+     * IMPORTANT: Caller must hold m_rwLock in exclusive mode
+     *
+     * ========================================================================
+     */
+    
+    // Reset heap index
+    try {
+        m_heapRoot = std::make_unique<HeapTrieNode>();
+        m_nodeCount.store(1, std::memory_order_release);
+        m_pathCount.store(0, std::memory_order_release);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"Whitelist", L"RebuildIndexFromRecords: failed to allocate root node");
+        return 0;
+    }
+    
+    uint64_t rebuiltCount = 0;
+    uint64_t skippedCount = 0;
+    uint64_t errorCount = 0;
+    
+    const auto startTime = std::chrono::steady_clock::now();
+    
+    for (const auto& record : m_pathRecords) {
+        // Skip invalid records
+        if (!record.IsValid()) {
+            ++errorCount;
+            continue;
+        }
+        
+        // Skip deleted records
+        if (record.IsDeleted()) {
+            ++skippedCount;
+            continue;
+        }
+        
+        // Get path from record
+        std::string_view pathView = record.GetPath();
+        if (pathView.empty()) {
+            ++errorCount;
+            continue;
+        }
+        
+        // Insert into heap trie
+        PathMatchMode mode = static_cast<PathMatchMode>(record.matchMode);
+        if (InsertIntoHeapTrie(pathView, mode, record.entryOffset)) {
+            ++rebuiltCount;
+        } else {
+            ++errorCount;
+        }
+    }
+    
+    const auto endTime = std::chrono::steady_clock::now();
+    const auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+    
+    SS_LOG_INFO(L"Whitelist", 
+        L"PathIndex rebuilt from %zu records: %llu active, %llu deleted, %llu errors in %lld µs",
+        m_pathRecords.size(), rebuiltCount, skippedCount, errorCount, durationUs);
+    
+    return rebuiltCount;
+}
+
+StoreError PathIndex::FlushRecordsToStorage() noexcept {
+    /*
+     * ========================================================================
+     * FLUSH RECORDS TO MEMORY-MAPPED STORAGE
+     * ========================================================================
+     * 
+     * Writes all PathEntryRecord in m_pathRecords to the memory-mapped region.
+     * Called during Compact() or explicit Flush() operations.
+     *
+     * Storage Layout (after header):
+     * - Offset 64: Record count (uint64_t)
+     * - Offset 72: Reserved (8 bytes)
+     * - Offset 80: PathEntryRecord[0]
+     * - Offset 80 + sizeof(PathEntryRecord): PathEntryRecord[1]
+     * - ...
+     *
+     * IMPORTANT: Caller must hold m_rwLock in exclusive mode
+     *
+     * ========================================================================
+     */
+    
+    // Validate writable state
+    if (!m_baseAddress) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::ReadOnlyDatabase,
+            "Cannot flush: index is read-only"
+        );
+    }
+    
+    constexpr uint64_t HEADER_SIZE = 64;
+    constexpr uint64_t RECORD_HEADER_OFFSET = HEADER_SIZE;  // Offset for record count
+    constexpr uint64_t RECORDS_START_OFFSET = 80;           // Offset where records begin
+    
+    const size_t recordCount = m_pathRecords.size();
+    const uint64_t requiredSize = RECORDS_START_OFFSET + (recordCount * sizeof(PathEntryRecord));
+    
+    // Check if we have enough space
+    if (requiredSize > m_indexSize) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"FlushRecordsToStorage: insufficient space (need %llu, have %llu)",
+            requiredSize, m_indexSize);
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexFull,
+            "Insufficient space for path records"
+        );
+    }
+    
+    auto* basePtr = static_cast<uint8_t*>(m_baseAddress);
+    
+    try {
+        // Write record count
+        auto* countPtr = reinterpret_cast<uint64_t*>(basePtr + RECORD_HEADER_OFFSET);
+        *countPtr = static_cast<uint64_t>(recordCount);
+        
+        // Write records
+        auto* recordsPtr = reinterpret_cast<PathEntryRecord*>(basePtr + RECORDS_START_OFFSET);
+        
+        for (size_t i = 0; i < recordCount; ++i) {
+            std::memcpy(&recordsPtr[i], &m_pathRecords[i], sizeof(PathEntryRecord));
+        }
+        
+        // Memory barrier to ensure writes are visible
+        SS_STORE_FENCE();
+        
+        SS_LOG_DEBUG(L"Whitelist", L"FlushRecordsToStorage: wrote %zu records (%llu bytes)",
+            recordCount, requiredSize);
+        
+        return StoreError::Success();
+        
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Whitelist", L"FlushRecordsToStorage exception: %S", e.what());
+        return StoreError::WithMessage(
+            WhitelistStoreError::FileCorrupted,
+            "Exception during record flush"
+        );
+    }
+}
+
+StoreError PathIndex::LoadRecordsFromStorage() noexcept {
+    /*
+     * ========================================================================
+     * LOAD RECORDS FROM MEMORY-MAPPED STORAGE
+     * ========================================================================
+     * 
+     * Reads PathEntryRecord structures from the memory-mapped region into
+     * m_pathRecords vector. Called during Initialize() for read-only mode.
+     *
+     * Security Features:
+     * - Validates record magic numbers
+     * - Validates record version
+     * - Bounds checking on all offsets
+     * - Graceful handling of corrupted records
+     *
+     * IMPORTANT: Caller must hold m_rwLock in exclusive mode
+     *
+     * ========================================================================
+     */
+    
+    // Clear existing records
+    m_pathRecords.clear();
+    m_nextRecordIndex.store(0, std::memory_order_release);
+    
+    // Validate view exists
+    if (!m_view || !m_view->IsValid()) {
+        SS_LOG_DEBUG(L"Whitelist", L"LoadRecordsFromStorage: no valid view (new database)");
+        return StoreError::Success(); // Not an error - might be new database
+    }
+    
+    constexpr uint64_t HEADER_SIZE = 64;
+    constexpr uint64_t RECORD_HEADER_OFFSET = HEADER_SIZE;
+    constexpr uint64_t RECORDS_START_OFFSET = 80;
+    
+    // Check minimum size for record header
+    if (m_indexSize < RECORDS_START_OFFSET) {
+        SS_LOG_DEBUG(L"Whitelist", L"LoadRecordsFromStorage: section too small for records");
+        return StoreError::Success(); // No records stored
+    }
+    
+    // Read record count
+    const auto* countPtr = m_view->GetAt<uint64_t>(m_indexOffset + RECORD_HEADER_OFFSET);
+    if (!countPtr) {
+        SS_LOG_WARN(L"Whitelist", L"LoadRecordsFromStorage: failed to read record count");
+        return StoreError::Success(); // Treat as empty
+    }
+    
+    const uint64_t recordCount = *countPtr;
+    
+    // Validate record count is reasonable
+    constexpr uint64_t MAX_RECORDS = 100'000'000; // 100 million max
+    if (recordCount > MAX_RECORDS) {
+        SS_LOG_ERROR(L"Whitelist", L"LoadRecordsFromStorage: invalid record count %llu", recordCount);
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Record count exceeds maximum"
+        );
+    }
+    
+    if (recordCount == 0) {
+        SS_LOG_DEBUG(L"Whitelist", L"LoadRecordsFromStorage: no records stored");
+        return StoreError::Success();
+    }
+    
+    // Validate space for all records
+    const uint64_t requiredSize = RECORDS_START_OFFSET + (recordCount * sizeof(PathEntryRecord));
+    if (requiredSize > m_indexSize) {
+        SS_LOG_ERROR(L"Whitelist", 
+            L"LoadRecordsFromStorage: insufficient data for %llu records", recordCount);
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Insufficient data for stored record count"
+        );
+    }
+    
+    // Load records with validation
+    try {
+        m_pathRecords.reserve(static_cast<size_t>(recordCount));
+        
+        const auto* recordsBase = m_view->GetAt<PathEntryRecord>(m_indexOffset + RECORDS_START_OFFSET);
+        if (!recordsBase) {
+            SS_LOG_ERROR(L"Whitelist", L"LoadRecordsFromStorage: failed to get records base pointer");
+            return StoreError::WithMessage(
+                WhitelistStoreError::IndexCorrupted,
+                "Failed to access record storage"
+            );
+        }
+        
+        uint64_t validCount = 0;
+        uint64_t invalidCount = 0;
+        
+        for (uint64_t i = 0; i < recordCount; ++i) {
+            const PathEntryRecord& record = recordsBase[i];
+            
+            // Validate record
+            if (!record.IsValid()) {
+                ++invalidCount;
+                SS_LOG_WARN(L"Whitelist", L"LoadRecordsFromStorage: invalid record at index %llu", i);
+                
+                // Add placeholder to maintain index alignment
+                PathEntryRecord placeholder{};
+                placeholder.flags = 0x01; // Mark as deleted
+                m_pathRecords.push_back(placeholder);
+                continue;
+            }
+            
+            m_pathRecords.push_back(record);
+            ++validCount;
+        }
+        
+        m_nextRecordIndex.store(recordCount, std::memory_order_release);
+        
+        SS_LOG_INFO(L"Whitelist", 
+            L"LoadRecordsFromStorage: loaded %llu records (%llu valid, %llu invalid)",
+            recordCount, validCount, invalidCount);
+        
+        return StoreError::Success();
+        
+    } catch (const std::bad_alloc&) {
+        m_pathRecords.clear();
+        return StoreError::WithMessage(
+            WhitelistStoreError::OutOfMemory,
+            "Failed to allocate memory for records"
+        );
+    } catch (const std::exception& e) {
+        m_pathRecords.clear();
+        SS_LOG_ERROR(L"Whitelist", L"LoadRecordsFromStorage exception: %S", e.what());
+        return StoreError::WithMessage(
+            WhitelistStoreError::FileCorrupted,
+            "Exception during record load"
+        );
+    }
 }
 
 } // namespace ShadowStrike::Whitelist

@@ -33,6 +33,7 @@
 #include <random>
 #include <functional>
 #include <limits>
+#include <cmath>
 
 #ifdef _WIN32
 #  ifndef NOMINMAX
@@ -1041,19 +1042,27 @@ bool GetText(const Node& root, std::string_view pathLike, std::string& out) noex
 /**
  * @brief Parse boolean from string.
  *
+ * Recognizes multiple representations of boolean values:
+ * - True: "1", "true", "TRUE", "True", "yes", "YES", "Yes", "on", "ON", "On"
+ * - False: "0", "false", "FALSE", "False", "no", "NO", "No", "off", "OFF", "Off"
+ *
  * @param s Input string
  * @param[out] v Boolean value
  * @return true if valid boolean representation
  */
 static inline bool parseBool(std::string_view s, bool& v) noexcept {
-    // True values
-    if (s == "1" || s == "true" || s == "TRUE" || s == "True") {
+    // True values (comprehensive set for enterprise compatibility)
+    if (s == "1" || s == "true" || s == "TRUE" || s == "True" ||
+        s == "yes" || s == "YES" || s == "Yes" ||
+        s == "on" || s == "ON" || s == "On") {
         v = true;
         return true;
     }
     
-    // False values
-    if (s == "0" || s == "false" || s == "FALSE" || s == "False") {
+    // False values (comprehensive set for enterprise compatibility)
+    if (s == "0" || s == "false" || s == "FALSE" || s == "False" ||
+        s == "no" || s == "NO" || s == "No" ||
+        s == "off" || s == "OFF" || s == "Off") {
         v = false;
         return true;
     }
@@ -1133,227 +1142,289 @@ bool GetDouble(const Node& root, std::string_view pathLike, double& out) noexcep
             return false;
         }
         
-        char* endp = nullptr;
-        out = std::strtod(s.c_str(), &endp);
+        const char* b = s.data();
+        const char* e = s.data() + s.size();
+        
+        // Use std::from_chars for consistent, locale-independent parsing
+        // Note: MSVC supports std::from_chars for floating-point since VS2019 16.4
+        const auto res = std::from_chars(b, e, out);
         
         // Ensure entire string was consumed and no error occurred
-        return endp && *endp == '\0';
+        if (res.ec != std::errc{} || res.ptr != e) {
+            return false;
+        }
+        
+        // SECURITY: Reject non-finite values (infinity, NaN)
+        // These can cause issues in calculations and comparisons
+        if (!std::isfinite(out)) {
+            return false;
+        }
+        
+        return true;
     }
     catch (...) {
         return false;
     }
 }
 
-            // Set support: creates intermediate nodes; if last step is @attr, sets attribute, otherwise sets .text
-            bool Set(Node& root, std::string_view pathLike, std::string_view value) noexcept {
-                try {
-                    if (pathLike.empty()) return false;
-                    
-                    // ? BUG #6 FIX: Uncontrolled Recursion Prevention
-                    // PROBLEM: Deep nested paths + large indices = exponential node creation
-                    // SOLUTION: Enforce strict limits on depth and total nodes created
-                    
-                    if (pathLike.front() == '/') {
-                        // Creating intermediate nodes with XPath is not reliable; only set if target exists
-                        const std::string xp(pathLike);
-                        
-                        // XPath validation (same as BUG #5)
-                        // ? ENHANCED: Stricter validation
-                        for (char c : xp) {
-                            if (std::isalnum(static_cast<unsigned char>(c)) || 
-                                c == '/' || c == '@' || c == '[' || c == ']' || 
-                                c == '_' || c == '-' || c == '.') {
-                                continue;
-                            }
-                            return false;
-                        }
-                        
-                        if (xp.size() > 1000) {
-                            return false;
-                        }
+//=============================================================================
+// Mutation Operations Implementation
+//=============================================================================
 
-                        pugi::xpath_node xn = root.select_node(xp.c_str());
-                        if (!xn) return false;
-                        
-                        // ? BUG #10 FIX: Check pugixml return values
-                        if (xn.attribute()) { 
-                            bool success = xn.attribute().set_value(std::string(value).c_str()); 
-                            return success;
-                        }
-                        if (xn.node()) { 
-                            xn.node().text() = std::string(value).c_str(); 
-                            return true; 
-                        }
-                        return false;
-                    }
+bool Set(Node& root, std::string_view pathLike, std::string_view value) noexcept {
+    try {
+        if (pathLike.empty()) {
+            return false;
+        }
+        
+        // Handle XPath format (starts with '/')
+        if (pathLike.front() == '/') {
+            const std::string xp(pathLike);
+            
+            // SECURITY: Validate XPath to prevent injection attacks
+            if (!isXPathSafe(xp)) {
+                return false;
+            }
+            
+            pugi::xpath_node xn = root.select_node(xp.c_str());
+            if (!xn) {
+                return false;
+            }
+            
+            // Set attribute value
+            if (xn.attribute()) {
+                return xn.attribute().set_value(std::string(value).c_str());
+            }
+            
+            // Set node text value
+            if (xn.node()) {
+                xn.node().text() = std::string(value).c_str();
+                return true;
+            }
+            
+            return false;
+        }
 
-                    std::vector<Step> steps;
-                    parsePathLike(pathLike, steps);
-                    if (steps.empty()) return false;
-                    
-                    // ? BUG #6 FIX: Enforce maximum path depth
-                    constexpr size_t MAX_PATH_DEPTH = 10;
-                    if (steps.size() > MAX_PATH_DEPTH) {
-                        return false;  // Path too deep
-                    }
+        // Parse dot-notation path into steps
+        std::vector<Step> steps;
+        parsePathLike(pathLike, steps);
+        
+        if (steps.empty()) {
+            return false;
+        }
+        
+        // SECURITY: Enforce maximum path depth to prevent stack overflow
+        if (steps.size() > kMaxPathDepth) {
+            return false;
+        }
 
-                    // Root node
-                    Node cur = root;
-                    if (cur.type() == pugi::node_document) {
-                        if (!cur.first_child()) {
-                            // if first element doesn't exist, create first element
-                            if (steps[0].isAttribute) return false; // attribute cannot be at root
-                            auto child = cur.append_child(steps[0].name.c_str());
-                            if (!child) return false;  // ? BUG #10: Check allocation
-                        }
-                        cur = cur.first_child();
-                        
-                        // ? FIX #NEW: If first step matches existing root name, skip it
-                        // Example: Set(doc, "root.item", "value") where doc already has <root>
-                        // We should skip "root" step and start from "item"
-                        if (!steps[0].isAttribute && std::string(cur.name()) == steps[0].name) {
-                            // First step matches root name, skip it in iteration
-                            // Change logic: start from step index 1 instead of 0
-                            // But we need to handle this in the loop below
-                            // Actually, we'll mark this and handle below
-                        } else if (!steps[0].isAttribute && std::string(cur.name()) != steps[0].name) {
-                            // if document contains another root, we cannot add new root
-                            if (root.first_child() && root.first_child().next_sibling()) return false;
-                            // no renaming of existing root; just proceed under it
-                        }
-                    }
-
-                    // Progression and creation
-                    Node parent = root.type() == pugi::node_document ? root.first_child() : root;
-                    
-                    // ? FIX #NEW: Determine starting step index
-                    size_t startStep = 0;
-                    if (root.type() == pugi::node_document && parent) {
-                        // If first step name matches document root name, skip it
-                        if (!steps[0].isAttribute && std::string(parent.name()) == steps[0].name) {
-                            startStep = 1;  // Skip first step, already at root
-                        }
-                    }
-                    
-                    // ? BUG #6 FIX: Track total nodes created across ALL steps
-                    size_t totalNodesCreated = 0;
-                    constexpr size_t MAX_TOTAL_NODES = 1000;  // Aggressive limit
-                    
-                    for (size_t i = startStep; i < steps.size(); ++i) {
-                        const Step& s = steps[i];
-                        const bool last = (i + 1 == steps.size());
-                        
-                        if (s.isAttribute) {
-                            if (!last) return false; // we don't support attribute in intermediate steps
-                            if (!parent) return false;
-                            auto a = parent.attribute(s.name.c_str());
-                            if (!a) {
-                                a = parent.append_attribute(s.name.c_str());
-                                if (!a) return false;  // ? BUG #10: Check allocation
-                            }
-                            bool success = a.set_value(std::string(value).c_str());
-                            return success;  // ? BUG #10: Return actual result
-                        }
-                        else {
-                            // find/create child node
-                            Node found;
-                            size_t foundIdx = 0;
-                            for (Node child = parent.child(s.name.c_str()); child; child = child.next_sibling(s.name.c_str())) {
-                                if (!s.hasIndex || foundIdx == s.index) { found = child; break; }
-                                ++foundIdx;
-                            }
-                            if (!found) {
-                                // if missing, create it, try to fill up to index
-                                if (!s.hasIndex || s.index == 0) {
-                                    found = parent.append_child(s.name.c_str());
-                                    if (!found) return false;  // ? BUG #10: Check allocation
-                                    totalNodesCreated++;
-                                }
-                                else {
-                                    // count existing and add until reaching s.index
-                                    size_t cnt = 0;
-                                    for (Node child = parent.child(s.name.c_str()); child; child = child.next_sibling(s.name.c_str())) {
-                                        ++cnt;
-                                        if (cnt > 100000) return false; // prevent infinite loop from malformed XML
-                                    }
-
-                                    constexpr size_t MAX_XML_ARRAY_SIZE = 10000;
-                                    if (s.index > MAX_XML_ARRAY_SIZE) return false; //Maximum array size protection
-                                    
-                                    // ? BUG #6 FIX: Check per-step AND total node creation
-                                    size_t nodesToCreate = (s.index >= cnt) ? (s.index - cnt + 1) : 0;
-                                    
-                                    if (nodesToCreate > 1000) return false; //Too many nodes to create at once
-                                    
-                                    totalNodesCreated += nodesToCreate;
-                                    if (totalNodesCreated > MAX_TOTAL_NODES) {
-                                        return false;  // Exceeded total node budget
-                                    }
-
-                                    for (; cnt <= s.index; ++cnt) {
-                                        auto child = parent.append_child(s.name.c_str());
-                                        if (!child) return false;  // ? BUG #10: Check allocation
-                                    }
-                                    
-                                    // find again
-                                    size_t idx = 0;
-                                    for (Node child = parent.child(s.name.c_str()); child; child = child.next_sibling(s.name.c_str())) {
-                                        if (idx == s.index) { found = child; break; }
-                                        ++idx;
-                                    }
-                                }
-                                if (!found) return false;
-                            }
-                            if (last) {
-                                found.text() = std::string(value).c_str();
-                                return true;
-                            }
-                            parent = found;
-                        }
-                    }
-                    return false;
+        // Initialize current node from root
+        Node cur = root;
+        if (cur.type() == pugi::node_document) {
+            if (!cur.first_child()) {
+                // Create first element if document is empty
+                if (steps[0].isAttribute) {
+                    return false;  // Cannot set attribute at document root
                 }
-                catch (...) {
+                
+                auto child = cur.append_child(steps[0].name.c_str());
+                if (!child) {
                     return false;
                 }
             }
-
-            bool Erase(Node& root, std::string_view pathLike) noexcept {
-                try {
-                    const std::string xp = ToXPath(pathLike);
-                    
-                    // ? BUG #5 FIX: XPath Injection Protection (same validation)
-                    // ? ENHANCED: Stricter validation
-                    for (char c : xp) {
-                        if (std::isalnum(static_cast<unsigned char>(c)) || 
-                            c == '/' || c == '@' || c == '[' || c == ']' || 
-                            c == '_' || c == '-' || c == '.') {
-                            continue;
-                        }
-                        return false;
-                    }
-                    
-                    if (xp.size() > 1000) {
-                        return false;
-                    }
-                    
-                    pugi::xpath_node xn = root.select_node(xp.c_str());
-                    if (!xn) return false;
-                    
-                    if (xn.attribute()) {
-                        Node parentNode = xn.parent();
-                        if (!parentNode) return false;  // ? BUG #10: Check parent validity
-						return parentNode.remove_attribute(xn.attribute());
-                    }
-                    if (xn.node()) {
-                        auto n = xn.node();
-                        auto p = n.parent();
-                        if (p) return p.remove_child(n);
-                    }
+            cur = cur.first_child();
+            
+            // Handle root name mismatch scenarios
+            if (!steps[0].isAttribute && std::string(cur.name()) != steps[0].name) {
+                // Document already has a different root - cannot add another
+                if (root.first_child() && root.first_child().next_sibling()) {
                     return false;
                 }
-                catch (...) { return false; }
             }
+        }
+
+        // Determine parent node and starting step index
+        Node parent = root.type() == pugi::node_document ? root.first_child() : root;
+        
+        size_t startStep = 0;
+        if (root.type() == pugi::node_document && parent) {
+            // Skip first step if it matches the document root name
+            if (!steps[0].isAttribute && std::string(parent.name()) == steps[0].name) {
+                startStep = 1;
+            }
+        }
+        
+        // SECURITY: Track total nodes created to prevent resource exhaustion
+        size_t totalNodesCreated = 0;
+        
+        // Iterate through path steps
+        for (size_t i = startStep; i < steps.size(); ++i) {
+            const Step& s = steps[i];
+            const bool isLastStep = (i + 1 == steps.size());
+            
+            if (s.isAttribute) {
+                // Attributes can only be set on the last step
+                if (!isLastStep) {
+                    return false;
+                }
+                
+                if (!parent) {
+                    return false;
+                }
+                
+                // Get or create attribute
+                auto attr = parent.attribute(s.name.c_str());
+                if (!attr) {
+                    attr = parent.append_attribute(s.name.c_str());
+                    if (!attr) {
+                        return false;
+                    }
+                }
+                
+                return attr.set_value(std::string(value).c_str());
+            }
+            else {
+                // Find existing child node matching the step
+                Node found;
+                size_t foundIdx = 0;
+                
+                for (Node child = parent.child(s.name.c_str()); 
+                     child; 
+                     child = child.next_sibling(s.name.c_str())) {
+                    if (!s.hasIndex || foundIdx == s.index) {
+                        found = child;
+                        break;
+                    }
+                    ++foundIdx;
+                }
+                
+                // Create node if not found
+                if (!found) {
+                    if (!s.hasIndex || s.index == 0) {
+                        // Simple case: create single node
+                        found = parent.append_child(s.name.c_str());
+                        if (!found) {
+                            return false;
+                        }
+                        ++totalNodesCreated;
+                    }
+                    else {
+                        // Count existing siblings
+                        size_t existingCount = 0;
+                        for (Node child = parent.child(s.name.c_str()); 
+                             child; 
+                             child = child.next_sibling(s.name.c_str())) {
+                            ++existingCount;
+                            
+                            // Prevent infinite loop on malformed XML
+                            if (existingCount > kMaxXmlArraySize) {
+                                return false;
+                            }
+                        }
+
+                        // SECURITY: Check array size limit
+                        if (s.index > kMaxXmlArraySize) {
+                            return false;
+                        }
+                        
+                        // Calculate nodes needed
+                        const size_t nodesToCreate = (s.index >= existingCount) 
+                            ? (s.index - existingCount + 1) 
+                            : 0;
+                        
+                        // SECURITY: Check per-step node creation limit
+                        if (nodesToCreate > kMaxNodesCreated) {
+                            return false;
+                        }
+                        
+                        totalNodesCreated += nodesToCreate;
+                        
+                        // SECURITY: Check total node budget
+                        if (totalNodesCreated > kMaxNodesCreated) {
+                            return false;
+                        }
+
+                        // Create required nodes
+                        for (size_t cnt = existingCount; cnt <= s.index; ++cnt) {
+                            auto child = parent.append_child(s.name.c_str());
+                            if (!child) {
+                                return false;
+                            }
+                        }
+                        
+                        // Find the target node
+                        size_t idx = 0;
+                        for (Node child = parent.child(s.name.c_str()); 
+                             child; 
+                             child = child.next_sibling(s.name.c_str())) {
+                            if (idx == s.index) {
+                                found = child;
+                                break;
+                            }
+                            ++idx;
+                        }
+                    }
+                    
+                    if (!found) {
+                        return false;
+                    }
+                }
+                
+                // Set value on last step, or continue traversal
+                if (isLastStep) {
+                    found.text() = std::string(value).c_str();
+                    return true;
+                }
+                
+                parent = found;
+            }
+        }
+        
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool Erase(Node& root, std::string_view pathLike) noexcept {
+    try {
+        const std::string xp = ToXPath(pathLike);
+        
+        // SECURITY: Validate XPath to prevent injection attacks
+        if (!isXPathSafe(xp)) {
+            return false;
+        }
+        
+        pugi::xpath_node xn = root.select_node(xp.c_str());
+        if (!xn) {
+            return false;
+        }
+        
+        // Handle attribute deletion
+        if (xn.attribute()) {
+            Node parentNode = xn.parent();
+            if (!parentNode) {
+                return false;
+            }
+            return parentNode.remove_attribute(xn.attribute());
+        }
+        
+        // Handle node deletion
+        if (xn.node()) {
+            auto n = xn.node();
+            auto p = n.parent();
+            if (p) {
+                return p.remove_child(n);
+            }
+        }
+        
+        return false;
+    }
+    catch (...) {
+        return false;
+    }
+}
 
 		}// namespace XML
 	}// namespace Utils

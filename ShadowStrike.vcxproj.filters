@@ -441,7 +441,7 @@
     <ClCompile Include="src\ThreatIntel\ReputationCache.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\ThreatIntel\threatintelbloomfilter.cpp">
+    <ClCompile Include="src\ThreatIntel\ThreatIntelBloomFilter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\ThreatIntel\ThreatIntelDatabase.cpp">

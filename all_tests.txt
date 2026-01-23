@@ -1,0 +1,591 @@
+
+========================================================================
+  ShadowStrike CryptoUtils Test Runner
+========================================================================
+
+
+========================================================================
+  ShadowStrike  Test Suite
+========================================================================
+
+Note: Google Test filter = WhitelistStoreTest.*
+[==========] Running 124 tests from 1 test suite.
+Running 3798 tests from 1 test suites
+
+[----------] Global test environment set-up.
+------------------------------------------------------------------------
+Test Suite: WhitelistStoreTest
+------------------------------------------------------------------------
+[ RUN      ] WhitelistStoreTest.Create_NewDatabase_Success
+  [ RUN      ] WhitelistStoreTest.Create_NewDatabase_Success
+[       OK ] WhitelistStoreTest.Create_NewDatabase_Success (37 ms)
+  [       OK ] WhitelistStoreTest.Create_NewDatabase_Success (37628 ?s)
+[ RUN      ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites
+  [ RUN      ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites
+[       OK ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites (112 ms)
+  [       OK ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites (112520 ?s)
+[ RUN      ] WhitelistStoreTest.Load_CreatedDatabase_Success
+  [ RUN      ] WhitelistStoreTest.Load_CreatedDatabase_Success
+[       OK ] WhitelistStoreTest.Load_CreatedDatabase_Success (77 ms)
+  [       OK ] WhitelistStoreTest.Load_CreatedDatabase_Success (78067 ?s)
+[ RUN      ] WhitelistStoreTest.Load_Writable_Success
+  [ RUN      ] WhitelistStoreTest.Load_Writable_Success
+[       OK ] WhitelistStoreTest.Load_Writable_Success (88 ms)
+  [       OK ] WhitelistStoreTest.Load_Writable_Success (88789 ?s)
+[ RUN      ] WhitelistStoreTest.Load_NonExistentFile_Fails
+  [ RUN      ] WhitelistStoreTest.Load_NonExistentFile_Fails
+[       OK ] WhitelistStoreTest.Load_NonExistentFile_Fails (24 ms)
+  [       OK ] WhitelistStoreTest.Load_NonExistentFile_Fails (25164 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_ValidEntry_Success
+  [ RUN      ] WhitelistStoreTest.AddHash_ValidEntry_Success
+[       OK ] WhitelistStoreTest.AddHash_ValidEntry_Success (59 ms)
+  [       OK ] WhitelistStoreTest.AddHash_ValidEntry_Success (59239 ?s)
+[ RUN      ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted
+[       OK ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted (55 ms)
+  [       OK ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted (56133 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success
+  [ RUN      ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success
+[       OK ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success (54 ms)
+  [       OK ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success (54515 ?s)
+[ RUN      ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData
+  [ RUN      ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData
+[       OK ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData (104 ms)
+  [       OK ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData (105188 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_ExactMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_ExactMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_ExactMatch_Success (55 ms)
+  [       OK ] WhitelistStoreTest.AddPath_ExactMatch_Success (55243 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_PrefixMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_PrefixMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_PrefixMatch_Success (55 ms)
+  [       OK ] WhitelistStoreTest.AddPath_PrefixMatch_Success (55417 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_SuffixMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_SuffixMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_SuffixMatch_Success (54 ms)
+  [       OK ] WhitelistStoreTest.AddPath_SuffixMatch_Success (55158 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_GlobMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_GlobMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_GlobMatch_Success (57 ms)
+  [       OK ] WhitelistStoreTest.AddPath_GlobMatch_Success (57332 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_RegexMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_RegexMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_RegexMatch_Success (58 ms)
+  [       OK ] WhitelistStoreTest.AddPath_RegexMatch_Success (58999 ?s)
+[ RUN      ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash
+  [ RUN      ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash
+[       OK ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash (53 ms)
+  [       OK ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash (54108 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+  [ RUN      ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+[       OK ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly (2059 ms)
+  [       OK ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly (2059669 ?s)
+[ RUN      ] WhitelistStoreTest.PurgeExpired_RemovesEntries
+  [ RUN      ] WhitelistStoreTest.PurgeExpired_RemovesEntries
+[       OK ] WhitelistStoreTest.PurgeExpired_RemovesEntries (87 ms)
+  [       OK ] WhitelistStoreTest.PurgeExpired_RemovesEntries (88031 ?s)
+[ RUN      ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe
+  [ RUN      ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe
+[       OK ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe (66 ms)
+  [       OK ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe (66690 ?s)
+[ RUN      ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness
+  [ RUN      ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness
+[       OK ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness (90 ms)
+  [       OK ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness (90221 ?s)
+[ RUN      ] WhitelistStoreTest.BatchLookup_OptimizedPath
+  [ RUN      ] WhitelistStoreTest.BatchLookup_OptimizedPath
+[       OK ] WhitelistStoreTest.BatchLookup_OptimizedPath (61 ms)
+  [       OK ] WhitelistStoreTest.BatchLookup_OptimizedPath (61442 ?s)
+[ RUN      ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup
+  [ RUN      ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup
+[       OK ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup (56 ms)
+  [       OK ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup (56546 ?s)
+[ RUN      ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success
+  [ RUN      ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success
+[       OK ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success (60 ms)
+  [       OK ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success (61137 ?s)
+[ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted
+[       OK ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted (58 ms)
+  [       OK ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted (58209 ?s)
+[ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted
+[       OK ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted (57 ms)
+  [       OK ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted (58123 ?s)
+[ RUN      ] WhitelistStoreTest.AddPublisher_ValidName_Success
+  [ RUN      ] WhitelistStoreTest.AddPublisher_ValidName_Success
+[       OK ] WhitelistStoreTest.AddPublisher_ValidName_Success (53 ms)
+  [       OK ] WhitelistStoreTest.AddPublisher_ValidName_Success (53818 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted (55 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted (55608 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive (59 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive (59376 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted (60 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted (60705 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry
+  [ RUN      ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry
+[       OK ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry (55 ms)
+  [       OK ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry (55520 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt
+  [ RUN      ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt
+[       OK ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt (55 ms)
+  [       OK ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt (56090 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntries_Pagination_Works
+  [ RUN      ] WhitelistStoreTest.GetEntries_Pagination_Works
+[       OK ] WhitelistStoreTest.GetEntries_Pagination_Works (56 ms)
+  [       OK ] WhitelistStoreTest.GetEntries_Pagination_Works (56871 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly
+  [ RUN      ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly
+[       OK ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly (55 ms)
+  [       OK ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly (55779 ?s)
+[ RUN      ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags
+  [ RUN      ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags
+[       OK ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags (105 ms)
+  [       OK ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags (105786 ?s)
+[ RUN      ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+  [ RUN      ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+[       OK ] WhitelistStoreTest.RevokeEntry_SoftDeletes (79 ms)
+  [       OK ] WhitelistStoreTest.RevokeEntry_SoftDeletes (79816 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveEntry_ById_Success
+  [ RUN      ] WhitelistStoreTest.RemoveEntry_ById_Success
+[       OK ] WhitelistStoreTest.RemoveEntry_ById_Success (82 ms)
+  [       OK ] WhitelistStoreTest.RemoveEntry_ById_Success (82371 ?s)
+[ RUN      ] WhitelistStoreTest.Compact_ReducesFragmentation
+  [ RUN      ] WhitelistStoreTest.Compact_ReducesFragmentation
+[       OK ] WhitelistStoreTest.Compact_ReducesFragmentation (60 ms)
+  [       OK ] WhitelistStoreTest.Compact_ReducesFragmentation (60574 ?s)
+[ RUN      ] WhitelistStoreTest.RebuildIndices_RestoresQueryability
+  [ RUN      ] WhitelistStoreTest.RebuildIndices_RestoresQueryability
+[       OK ] WhitelistStoreTest.RebuildIndices_RestoresQueryability (92 ms)
+  [       OK ] WhitelistStoreTest.RebuildIndices_RestoresQueryability (92666 ?s)
+[ RUN      ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess
+  [ RUN      ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess
+[       OK ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess (72 ms)
+  [       OK ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess (72691 ?s)
+[ RUN      ] WhitelistStoreTest.ClearCache_ResetsStatistics
+  [ RUN      ] WhitelistStoreTest.ClearCache_ResetsStatistics
+[       OK ] WhitelistStoreTest.ClearCache_ResetsStatistics (96 ms)
+  [       OK ] WhitelistStoreTest.ClearCache_ResetsStatistics (96980 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON
+  [ RUN      ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON
+[       OK ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON (58 ms)
+  [       OK ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON (58209 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_AddsEntries
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_AddsEntries
+[       OK ] WhitelistStoreTest.ImportFromJSONString_AddsEntries (61 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_AddsEntries (61810 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToJSON_CreatesFile
+  [ RUN      ] WhitelistStoreTest.ExportToJSON_CreatesFile
+[       OK ] WhitelistStoreTest.ExportToJSON_CreatesFile (55 ms)
+  [       OK ] WhitelistStoreTest.ExportToJSON_CreatesFile (55958 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile
+  [ RUN      ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile
+[       OK ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile (127 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile (127873 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToCSV_CreatesValidCSV
+  [ RUN      ] WhitelistStoreTest.ExportToCSV_CreatesValidCSV
+[       OK ] WhitelistStoreTest.ExportToCSV_CreatesValidCSV (2493 ms)
+  [       OK ] WhitelistStoreTest.ExportToCSV_CreatesValidCSV (2493584 ?s)
+[ RUN      ] WhitelistStoreTest.EntryBuilder_BasicUsage_Success
+  [ RUN      ] WhitelistStoreTest.EntryBuilder_BasicUsage_Success
+[       OK ] WhitelistStoreTest.EntryBuilder_BasicUsage_Success (23 ms)
+  [       OK ] WhitelistStoreTest.EntryBuilder_BasicUsage_Success (23848 ?s)
+[ RUN      ] WhitelistStoreTest.EntryBuilder_SetExpiration_SetsFlag
+  [ RUN      ] WhitelistStoreTest.EntryBuilder_SetExpiration_SetsFlag
+[       OK ] WhitelistStoreTest.EntryBuilder_SetExpiration_SetsFlag (22 ms)
+  [       OK ] WhitelistStoreTest.EntryBuilder_SetExpiration_SetsFlag (23213 ?s)
+[ RUN      ] WhitelistStoreTest.EntryBuilder_SetExpirationDuration_CalculatesCorrectly
+  [ RUN      ] WhitelistStoreTest.EntryBuilder_SetExpirationDuration_CalculatesCorrectly
+[       OK ] WhitelistStoreTest.EntryBuilder_SetExpirationDuration_CalculatesCorrectly (22 ms)
+  [       OK ] WhitelistStoreTest.EntryBuilder_SetExpirationDuration_CalculatesCorrectly (22417 ?s)
+[ RUN      ] WhitelistStoreTest.EntryBuilder_AddRemoveFlags_WorksCorrectly
+  [ RUN      ] WhitelistStoreTest.EntryBuilder_AddRemoveFlags_WorksCorrectly
+[       OK ] WhitelistStoreTest.EntryBuilder_AddRemoveFlags_WorksCorrectly (22 ms)
+  [       OK ] WhitelistStoreTest.EntryBuilder_AddRemoveFlags_WorksCorrectly (22465 ?s)
+[ RUN      ] WhitelistStoreTest.EntryBuilder_Validation_BasicUsage
+  [ RUN      ] WhitelistStoreTest.EntryBuilder_Validation_BasicUsage
+[       OK ] WhitelistStoreTest.EntryBuilder_Validation_BasicUsage (27 ms)
+  [       OK ] WhitelistStoreTest.EntryBuilder_Validation_BasicUsage (27440 ?s)
+[ RUN      ] WhitelistStoreTest.EntryBuilder_PathMatchMode_SetsCorrectly
+  [ RUN      ] WhitelistStoreTest.EntryBuilder_PathMatchMode_SetsCorrectly
+[       OK ] WhitelistStoreTest.EntryBuilder_PathMatchMode_SetsCorrectly (22 ms)
+  [       OK ] WhitelistStoreTest.EntryBuilder_PathMatchMode_SetsCorrectly (22858 ?s)
+[ RUN      ] WhitelistStoreTest.MatchCallback_InvokedOnMatch
+  [ RUN      ] WhitelistStoreTest.MatchCallback_InvokedOnMatch
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(1107): error: Expected: (callbackCount) >= (1), actual: 0 vs 1
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:1107
+    Expected: (callbackCount) >= (1), actual: 0 vs 1
+
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(1108): error: Value of: capturedResult.found
+  Actual: false
+Expected: true
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:1108
+    Value of: capturedResult.found
+  Actual: false
+Expected: true
+
+[  FAILED  ] WhitelistStoreTest.MatchCallback_InvokedOnMatch (57 ms)
+  [  FAILED  ] WhitelistStoreTest.MatchCallback_InvokedOnMatch (57813 ?s)
+[ RUN      ] WhitelistStoreTest.GetStatistics_ReturnsAccurateData
+  [ RUN      ] WhitelistStoreTest.GetStatistics_ReturnsAccurateData
+[       OK ] WhitelistStoreTest.GetStatistics_ReturnsAccurateData (58 ms)
+  [       OK ] WhitelistStoreTest.GetStatistics_ReturnsAccurateData (58283 ?s)
+[ RUN      ] WhitelistStoreTest.GetHeader_ReturnsValidHeader
+  [ RUN      ] WhitelistStoreTest.GetHeader_ReturnsValidHeader
+[       OK ] WhitelistStoreTest.GetHeader_ReturnsValidHeader (57 ms)
+  [       OK ] WhitelistStoreTest.GetHeader_ReturnsValidHeader (57427 ?s)
+[ RUN      ] WhitelistStoreTest.SetCachingEnabled_AffectsPerformance
+  [ RUN      ] WhitelistStoreTest.SetCachingEnabled_AffectsPerformance
+[       OK ] WhitelistStoreTest.SetCachingEnabled_AffectsPerformance (87 ms)
+  [       OK ] WhitelistStoreTest.SetCachingEnabled_AffectsPerformance (87526 ?s)
+[ RUN      ] WhitelistStoreTest.SetBloomFilterEnabled_TogglesFilter
+  [ RUN      ] WhitelistStoreTest.SetBloomFilterEnabled_TogglesFilter
+[       OK ] WhitelistStoreTest.SetBloomFilterEnabled_TogglesFilter (56 ms)
+  [       OK ] WhitelistStoreTest.SetBloomFilterEnabled_TogglesFilter (56840 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_ReadOnlyMode_Fails
+  [ RUN      ] WhitelistStoreTest.AddHash_ReadOnlyMode_Fails
+[       OK ] WhitelistStoreTest.AddHash_ReadOnlyMode_Fails (82 ms)
+  [       OK ] WhitelistStoreTest.AddHash_ReadOnlyMode_Fails (82779 ?s)
+[ RUN      ] WhitelistStoreTest.Save_ReadOnlyMode_Fails
+  [ RUN      ] WhitelistStoreTest.Save_ReadOnlyMode_Fails
+[       OK ] WhitelistStoreTest.Save_ReadOnlyMode_Fails (93 ms)
+  [       OK ] WhitelistStoreTest.Save_ReadOnlyMode_Fails (93558 ?s)
+[ RUN      ] WhitelistStoreTest.Operations_OnClosedStore_HandleGracefully
+  [ RUN      ] WhitelistStoreTest.Operations_OnClosedStore_HandleGracefully
+[       OK ] WhitelistStoreTest.Operations_OnClosedStore_HandleGracefully (61 ms)
+  [       OK ] WhitelistStoreTest.Operations_OnClosedStore_HandleGracefully (61924 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_EmptyPath_Fails
+  [ RUN      ] WhitelistStoreTest.AddPath_EmptyPath_Fails
+[       OK ] WhitelistStoreTest.AddPath_EmptyPath_Fails (66 ms)
+  [       OK ] WhitelistStoreTest.AddPath_EmptyPath_Fails (66732 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_EmptyHash_Fails
+  [ RUN      ] WhitelistStoreTest.AddHash_EmptyHash_Fails
+[       OK ] WhitelistStoreTest.AddHash_EmptyHash_Fails (55 ms)
+  [       OK ] WhitelistStoreTest.AddHash_EmptyHash_Fails (55622 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_DuplicateEntry_ReturnsDuplicateError
+  [ RUN      ] WhitelistStoreTest.AddHash_DuplicateEntry_ReturnsDuplicateError
+[       OK ] WhitelistStoreTest.AddHash_DuplicateEntry_ReturnsDuplicateError (55 ms)
+  [       OK ] WhitelistStoreTest.AddHash_DuplicateEntry_ReturnsDuplicateError (55906 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_TooLongPath_ReturnsPathTooLong
+  [ RUN      ] WhitelistStoreTest.AddPath_TooLongPath_ReturnsPathTooLong
+[       OK ] WhitelistStoreTest.AddPath_TooLongPath_ReturnsPathTooLong (58 ms)
+  [       OK ] WhitelistStoreTest.AddPath_TooLongPath_ReturnsPathTooLong (58772 ?s)
+[ RUN      ] WhitelistStoreTest.Load_EmptyPath_ReturnsError
+  [ RUN      ] WhitelistStoreTest.Load_EmptyPath_ReturnsError
+[       OK ] WhitelistStoreTest.Load_EmptyPath_ReturnsError (22 ms)
+  [       OK ] WhitelistStoreTest.Load_EmptyPath_ReturnsError (22342 ?s)
+[ RUN      ] WhitelistStoreTest.Create_EmptyPath_ReturnsError
+  [ RUN      ] WhitelistStoreTest.Create_EmptyPath_ReturnsError
+[       OK ] WhitelistStoreTest.Create_EmptyPath_ReturnsError (27 ms)
+  [       OK ] WhitelistStoreTest.Create_EmptyPath_ReturnsError (28144 ?s)
+[ RUN      ] WhitelistStoreTest.Create_ExtremelySmallSizeRequest_Clamped
+  [ RUN      ] WhitelistStoreTest.Create_ExtremelySmallSizeRequest_Clamped
+[       OK ] WhitelistStoreTest.Create_ExtremelySmallSizeRequest_Clamped (42 ms)
+  [       OK ] WhitelistStoreTest.Create_ExtremelySmallSizeRequest_Clamped (42527 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_StringOverload_InvalidHexChars_ReturnsError
+  [ RUN      ] WhitelistStoreTest.AddHash_StringOverload_InvalidHexChars_ReturnsError
+[       OK ] WhitelistStoreTest.AddHash_StringOverload_InvalidHexChars_ReturnsError (57 ms)
+  [       OK ] WhitelistStoreTest.AddHash_StringOverload_InvalidHexChars_ReturnsError (57857 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_StringOverload_WrongLength_ReturnsError
+  [ RUN      ] WhitelistStoreTest.AddHash_StringOverload_WrongLength_ReturnsError
+[       OK ] WhitelistStoreTest.AddHash_StringOverload_WrongLength_ReturnsError (58 ms)
+  [       OK ] WhitelistStoreTest.AddHash_StringOverload_WrongLength_ReturnsError (58304 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_StringOverload_WithOxPrefix_Success
+  [ RUN      ] WhitelistStoreTest.AddHash_StringOverload_WithOxPrefix_Success
+[       OK ] WhitelistStoreTest.AddHash_StringOverload_WithOxPrefix_Success (56 ms)
+  [       OK ] WhitelistStoreTest.AddHash_StringOverload_WithOxPrefix_Success (56343 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_StringOverload_MD5_ValidLength
+  [ RUN      ] WhitelistStoreTest.AddHash_StringOverload_MD5_ValidLength
+[       OK ] WhitelistStoreTest.AddHash_StringOverload_MD5_ValidLength (66 ms)
+  [       OK ] WhitelistStoreTest.AddHash_StringOverload_MD5_ValidLength (66744 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_StringOverload_SHA1_ValidLength
+  [ RUN      ] WhitelistStoreTest.AddHash_StringOverload_SHA1_ValidLength
+[       OK ] WhitelistStoreTest.AddHash_StringOverload_SHA1_ValidLength (61 ms)
+  [       OK ] WhitelistStoreTest.AddHash_StringOverload_SHA1_ValidLength (61277 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_StringOverload_SHA512_ValidLength
+  [ RUN      ] WhitelistStoreTest.AddHash_StringOverload_SHA512_ValidLength
+[       OK ] WhitelistStoreTest.AddHash_StringOverload_SHA512_ValidLength (55 ms)
+  [       OK ] WhitelistStoreTest.AddHash_StringOverload_SHA512_ValidLength (55869 ?s)
+[ RUN      ] WhitelistStoreTest.BatchAdd_EmptyBatch_Success
+  [ RUN      ] WhitelistStoreTest.BatchAdd_EmptyBatch_Success
+[       OK ] WhitelistStoreTest.BatchAdd_EmptyBatch_Success (61 ms)
+  [       OK ] WhitelistStoreTest.BatchAdd_EmptyBatch_Success (62134 ?s)
+[ RUN      ] WhitelistStoreTest.BatchLookupHashes_EmptyInput_ReturnsEmpty
+  [ RUN      ] WhitelistStoreTest.BatchLookupHashes_EmptyInput_ReturnsEmpty
+[       OK ] WhitelistStoreTest.BatchLookupHashes_EmptyInput_ReturnsEmpty (53 ms)
+  [       OK ] WhitelistStoreTest.BatchLookupHashes_EmptyInput_ReturnsEmpty (54047 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntry_ZeroId_ReturnsNullopt
+  [ RUN      ] WhitelistStoreTest.GetEntry_ZeroId_ReturnsNullopt
+[       OK ] WhitelistStoreTest.GetEntry_ZeroId_ReturnsNullopt (62 ms)
+  [       OK ] WhitelistStoreTest.GetEntry_ZeroId_ReturnsNullopt (62344 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntry_MaxUInt64Id_ReturnsNullopt
+  [ RUN      ] WhitelistStoreTest.GetEntry_MaxUInt64Id_ReturnsNullopt
+[       OK ] WhitelistStoreTest.GetEntry_MaxUInt64Id_ReturnsNullopt (57 ms)
+  [       OK ] WhitelistStoreTest.GetEntry_MaxUInt64Id_ReturnsNullopt (58060 ?s)
+[ RUN      ] WhitelistStoreTest.UpdateEntryFlags_ZeroId_ReturnsError
+  [ RUN      ] WhitelistStoreTest.UpdateEntryFlags_ZeroId_ReturnsError
+[       OK ] WhitelistStoreTest.UpdateEntryFlags_ZeroId_ReturnsError (56 ms)
+  [       OK ] WhitelistStoreTest.UpdateEntryFlags_ZeroId_ReturnsError (56446 ?s)
+[ RUN      ] WhitelistStoreTest.UpdateEntryFlags_MaxUInt64Id_ReturnsError
+  [ RUN      ] WhitelistStoreTest.UpdateEntryFlags_MaxUInt64Id_ReturnsError
+[       OK ] WhitelistStoreTest.UpdateEntryFlags_MaxUInt64Id_ReturnsError (53 ms)
+  [       OK ] WhitelistStoreTest.UpdateEntryFlags_MaxUInt64Id_ReturnsError (53616 ?s)
+[ RUN      ] WhitelistStoreTest.UpdateEntryFlags_NonExistentId_ReturnsError
+  [ RUN      ] WhitelistStoreTest.UpdateEntryFlags_NonExistentId_ReturnsError
+[       OK ] WhitelistStoreTest.UpdateEntryFlags_NonExistentId_ReturnsError (88 ms)
+  [       OK ] WhitelistStoreTest.UpdateEntryFlags_NonExistentId_ReturnsError (88810 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveEntry_ZeroId_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RemoveEntry_ZeroId_ReturnsError
+[       OK ] WhitelistStoreTest.RemoveEntry_ZeroId_ReturnsError (58 ms)
+  [       OK ] WhitelistStoreTest.RemoveEntry_ZeroId_ReturnsError (58219 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveEntry_MaxUInt64Id_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RemoveEntry_MaxUInt64Id_ReturnsError
+[       OK ] WhitelistStoreTest.RemoveEntry_MaxUInt64Id_ReturnsError (59 ms)
+  [       OK ] WhitelistStoreTest.RemoveEntry_MaxUInt64Id_ReturnsError (59412 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveEntry_AlreadyRevoked_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RemoveEntry_AlreadyRevoked_ReturnsError
+[       OK ] WhitelistStoreTest.RemoveEntry_AlreadyRevoked_ReturnsError (80 ms)
+  [       OK ] WhitelistStoreTest.RemoveEntry_AlreadyRevoked_ReturnsError (80182 ?s)
+[ RUN      ] WhitelistStoreTest.MoveConstructor_TransfersOwnership
+  [ RUN      ] WhitelistStoreTest.MoveConstructor_TransfersOwnership
+[       OK ] WhitelistStoreTest.MoveConstructor_TransfersOwnership (64 ms)
+  [       OK ] WhitelistStoreTest.MoveConstructor_TransfersOwnership (64410 ?s)
+[ RUN      ] WhitelistStoreTest.MoveAssignment_TransfersOwnership
+  [ RUN      ] WhitelistStoreTest.MoveAssignment_TransfersOwnership
+[       OK ] WhitelistStoreTest.MoveAssignment_TransfersOwnership (90 ms)
+  [       OK ] WhitelistStoreTest.MoveAssignment_TransfersOwnership (90595 ?s)
+[ RUN      ] WhitelistStoreTest.DoubleClose_Safe
+  [ RUN      ] WhitelistStoreTest.DoubleClose_Safe
+[       OK ] WhitelistStoreTest.DoubleClose_Safe (59 ms)
+  [       OK ] WhitelistStoreTest.DoubleClose_Safe (59369 ?s)
+[ RUN      ] WhitelistStoreTest.Save_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.Save_NotInitialized_ReturnsError
+[       OK ] WhitelistStoreTest.Save_NotInitialized_ReturnsError (22 ms)
+  [       OK ] WhitelistStoreTest.Save_NotInitialized_ReturnsError (22948 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_EmptyJSON_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_EmptyJSON_ReturnsError
+[       OK ] WhitelistStoreTest.ImportFromJSONString_EmptyJSON_ReturnsError (62 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_EmptyJSON_ReturnsError (62964 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_InvalidJSON_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_InvalidJSON_ReturnsError
+[       OK ] WhitelistStoreTest.ImportFromJSONString_InvalidJSON_ReturnsError (60 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_InvalidJSON_ReturnsError (60755 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_MissingEntriesField_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_MissingEntriesField_ReturnsError
+[       OK ] WhitelistStoreTest.ImportFromJSONString_MissingEntriesField_ReturnsError (53 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_MissingEntriesField_ReturnsError (53295 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_EntriesNotArray_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_EntriesNotArray_ReturnsError
+[       OK ] WhitelistStoreTest.ImportFromJSONString_EntriesNotArray_ReturnsError (55 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_EntriesNotArray_ReturnsError (55984 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToJSON_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ExportToJSON_NotInitialized_ReturnsError
+[       OK ] WhitelistStoreTest.ExportToJSON_NotInitialized_ReturnsError (22 ms)
+  [       OK ] WhitelistStoreTest.ExportToJSON_NotInitialized_ReturnsError (22779 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToJSONString_NotInitialized_ReturnsErrorJSON
+  [ RUN      ] WhitelistStoreTest.ExportToJSONString_NotInitialized_ReturnsErrorJSON
+[       OK ] WhitelistStoreTest.ExportToJSONString_NotInitialized_ReturnsErrorJSON (25 ms)
+  [       OK ] WhitelistStoreTest.ExportToJSONString_NotInitialized_ReturnsErrorJSON (25511 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSON_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ImportFromJSON_NotInitialized_ReturnsError
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(1650): error: Expected equality of these values:
+  err.code
+    Which is: ReadOnlyDatabase
+  WhitelistStoreError::InvalidSection
+    Which is: InvalidSection
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:1650
+    Expected equality of these values:
+  err.code
+    Which is: ReadOnlyDatabase
+  WhitelistStoreError::InvalidSection
+    Which is: InvalidSection
+
+[  FAILED  ] WhitelistStoreTest.ImportFromJSON_NotInitialized_ReturnsError (22 ms)
+  [  FAILED  ] WhitelistStoreTest.ImportFromJSON_NotInitialized_ReturnsError (22805 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromCSV_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ImportFromCSV_NotInitialized_ReturnsError
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(1659): error: Expected equality of these values:
+  err.code
+    Which is: ReadOnlyDatabase
+  WhitelistStoreError::InvalidSection
+    Which is: InvalidSection
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:1659
+    Expected equality of these values:
+  err.code
+    Which is: ReadOnlyDatabase
+  WhitelistStoreError::InvalidSection
+    Which is: InvalidSection
+
+[  FAILED  ] WhitelistStoreTest.ImportFromCSV_NotInitialized_ReturnsError (32 ms)
+  [  FAILED  ] WhitelistStoreTest.ImportFromCSV_NotInitialized_ReturnsError (33171 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToCSV_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.ExportToCSV_NotInitialized_ReturnsError
+[       OK ] WhitelistStoreTest.ExportToCSV_NotInitialized_ReturnsError (26 ms)
+  [       OK ] WhitelistStoreTest.ExportToCSV_NotInitialized_ReturnsError (26850 ?s)
+[ RUN      ] WhitelistStoreTest.VerifyIntegrity_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.VerifyIntegrity_NotInitialized_ReturnsError
+[       OK ] WhitelistStoreTest.VerifyIntegrity_NotInitialized_ReturnsError (28 ms)
+  [       OK ] WhitelistStoreTest.VerifyIntegrity_NotInitialized_ReturnsError (28962 ?s)
+[ RUN      ] WhitelistStoreTest.Compact_EmptyDatabase_Success
+  [ RUN      ] WhitelistStoreTest.Compact_EmptyDatabase_Success
+[       OK ] WhitelistStoreTest.Compact_EmptyDatabase_Success (57 ms)
+  [       OK ] WhitelistStoreTest.Compact_EmptyDatabase_Success (57477 ?s)
+[ RUN      ] WhitelistStoreTest.Compact_NoDeletedEntries_NoOp
+  [ RUN      ] WhitelistStoreTest.Compact_NoDeletedEntries_NoOp
+[       OK ] WhitelistStoreTest.Compact_NoDeletedEntries_NoOp (56 ms)
+  [       OK ] WhitelistStoreTest.Compact_NoDeletedEntries_NoOp (57165 ?s)
+[ RUN      ] WhitelistStoreTest.RebuildIndices_EmptyDatabase_Success
+  [ RUN      ] WhitelistStoreTest.RebuildIndices_EmptyDatabase_Success
+[       OK ] WhitelistStoreTest.RebuildIndices_EmptyDatabase_Success (116 ms)
+  [       OK ] WhitelistStoreTest.RebuildIndices_EmptyDatabase_Success (116245 ?s)
+[ RUN      ] WhitelistStoreTest.PurgeExpired_NoExpiredEntries_NoOp
+  [ RUN      ] WhitelistStoreTest.PurgeExpired_NoExpiredEntries_NoOp
+[       OK ] WhitelistStoreTest.PurgeExpired_NoExpiredEntries_NoOp (61 ms)
+  [       OK ] WhitelistStoreTest.PurgeExpired_NoExpiredEntries_NoOp (61681 ?s)
+[ RUN      ] WhitelistStoreTest.UpdateChecksum_NotInitialized_ReturnsError
+  [ RUN      ] WhitelistStoreTest.UpdateChecksum_NotInitialized_ReturnsError
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(1742): error: Expected equality of these values:
+  err.code
+    Which is: ReadOnlyDatabase
+  WhitelistStoreError::InvalidSection
+    Which is: InvalidSection
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:1742
+    Expected equality of these values:
+  err.code
+    Which is: ReadOnlyDatabase
+  WhitelistStoreError::InvalidSection
+    Which is: InvalidSection
+
+[  FAILED  ] WhitelistStoreTest.UpdateChecksum_NotInitialized_ReturnsError (29 ms)
+  [  FAILED  ] WhitelistStoreTest.UpdateChecksum_NotInitialized_ReturnsError (29296 ?s)
+[ RUN      ] WhitelistStoreTest.Compact_ReadOnly_ReturnsError
+  [ RUN      ] WhitelistStoreTest.Compact_ReadOnly_ReturnsError
+[       OK ] WhitelistStoreTest.Compact_ReadOnly_ReturnsError (79 ms)
+  [       OK ] WhitelistStoreTest.Compact_ReadOnly_ReturnsError (80048 ?s)
+[ RUN      ] WhitelistStoreTest.RebuildIndices_ReadOnly_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RebuildIndices_ReadOnly_ReturnsError
+[       OK ] WhitelistStoreTest.RebuildIndices_ReadOnly_ReturnsError (85 ms)
+  [       OK ] WhitelistStoreTest.RebuildIndices_ReadOnly_ReturnsError (86106 ?s)
+[ RUN      ] WhitelistStoreTest.PurgeExpired_ReadOnly_ReturnsError
+  [ RUN      ] WhitelistStoreTest.PurgeExpired_ReadOnly_ReturnsError
+[       OK ] WhitelistStoreTest.PurgeExpired_ReadOnly_ReturnsError (80 ms)
+  [       OK ] WhitelistStoreTest.PurgeExpired_ReadOnly_ReturnsError (80630 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntries_OffsetBeyondTotal_ReturnsEmpty
+  [ RUN      ] WhitelistStoreTest.GetEntries_OffsetBeyondTotal_ReturnsEmpty
+[       OK ] WhitelistStoreTest.GetEntries_OffsetBeyondTotal_ReturnsEmpty (66 ms)
+  [       OK ] WhitelistStoreTest.GetEntries_OffsetBeyondTotal_ReturnsEmpty (66255 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntries_LimitZero_ReturnsEmpty
+  [ RUN      ] WhitelistStoreTest.GetEntries_LimitZero_ReturnsEmpty
+[       OK ] WhitelistStoreTest.GetEntries_LimitZero_ReturnsEmpty (69 ms)
+  [       OK ] WhitelistStoreTest.GetEntries_LimitZero_ReturnsEmpty (69854 ?s)
+[ RUN      ] WhitelistStoreTest.IsHashWhitelisted_NotInitialized_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsHashWhitelisted_NotInitialized_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsHashWhitelisted_NotInitialized_ReturnsNotFound (24 ms)
+  [       OK ] WhitelistStoreTest.IsHashWhitelisted_NotInitialized_ReturnsNotFound (25170 ?s)
+[ RUN      ] WhitelistStoreTest.IsPathWhitelisted_NotInitialized_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsPathWhitelisted_NotInitialized_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsPathWhitelisted_NotInitialized_ReturnsNotFound (21 ms)
+  [       OK ] WhitelistStoreTest.IsPathWhitelisted_NotInitialized_ReturnsNotFound (21830 ?s)
+[ RUN      ] WhitelistStoreTest.IsPathWhitelisted_TooLongPath_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsPathWhitelisted_TooLongPath_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsPathWhitelisted_TooLongPath_ReturnsNotFound (57 ms)
+  [       OK ] WhitelistStoreTest.IsPathWhitelisted_TooLongPath_ReturnsNotFound (58155 ?s)
+[ RUN      ] WhitelistStoreTest.IsPathWhitelisted_EmptyPath_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsPathWhitelisted_EmptyPath_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsPathWhitelisted_EmptyPath_ReturnsNotFound (59 ms)
+  [       OK ] WhitelistStoreTest.IsPathWhitelisted_EmptyPath_ReturnsNotFound (59983 ?s)
+[ RUN      ] WhitelistStoreTest.SetCacheSize_Zero_DisablesCache
+  [ RUN      ] WhitelistStoreTest.SetCacheSize_Zero_DisablesCache
+[       OK ] WhitelistStoreTest.SetCacheSize_Zero_DisablesCache (52 ms)
+  [       OK ] WhitelistStoreTest.SetCacheSize_Zero_DisablesCache (53021 ?s)
+[ RUN      ] WhitelistStoreTest.SetCacheSize_ExceedsMax_ClampedToMax
+  [ RUN      ] WhitelistStoreTest.SetCacheSize_ExceedsMax_ClampedToMax
+[       OK ] WhitelistStoreTest.SetCacheSize_ExceedsMax_ClampedToMax (8291 ms)
+  [       OK ] WhitelistStoreTest.SetCacheSize_ExceedsMax_ClampedToMax (8292234 ?s)
+[ RUN      ] WhitelistStoreTest.AddPublisher_EmptyName_ReturnsError
+  [ RUN      ] WhitelistStoreTest.AddPublisher_EmptyName_ReturnsError
+[       OK ] WhitelistStoreTest.AddPublisher_EmptyName_ReturnsError (62 ms)
+  [       OK ] WhitelistStoreTest.AddPublisher_EmptyName_ReturnsError (62298 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_EmptyName_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_EmptyName_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_EmptyName_ReturnsNotFound (69 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_EmptyName_ReturnsNotFound (70087 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_TooLongName_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_TooLongName_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_TooLongName_ReturnsNotFound (60 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_TooLongName_ReturnsNotFound (60526 ?s)
+[ RUN      ] WhitelistStoreTest.IsWhitelisted_AllNullOptional_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsWhitelisted_AllNullOptional_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsWhitelisted_AllNullOptional_ReturnsNotFound (53 ms)
+  [       OK ] WhitelistStoreTest.IsWhitelisted_AllNullOptional_ReturnsNotFound (53509 ?s)
+[ RUN      ] WhitelistStoreTest.IsWhitelisted_NotInitialized_ReturnsNotFound
+  [ RUN      ] WhitelistStoreTest.IsWhitelisted_NotInitialized_ReturnsNotFound
+[       OK ] WhitelistStoreTest.IsWhitelisted_NotInitialized_ReturnsNotFound (25 ms)
+  [       OK ] WhitelistStoreTest.IsWhitelisted_NotInitialized_ReturnsNotFound (25257 ?s)
+[ RUN      ] WhitelistStoreTest.GetStatistics_NotInitialized_ReturnsZeroedStats
+  [ RUN      ] WhitelistStoreTest.GetStatistics_NotInitialized_ReturnsZeroedStats
+[       OK ] WhitelistStoreTest.GetStatistics_NotInitialized_ReturnsZeroedStats (22 ms)
+  [       OK ] WhitelistStoreTest.GetStatistics_NotInitialized_ReturnsZeroedStats (22736 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntryCount_NotInitialized_ReturnsZero
+  [ RUN      ] WhitelistStoreTest.GetEntryCount_NotInitialized_ReturnsZero
+[       OK ] WhitelistStoreTest.GetEntryCount_NotInitialized_ReturnsZero (21 ms)
+  [       OK ] WhitelistStoreTest.GetEntryCount_NotInitialized_ReturnsZero (22034 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveHash_EmptyHash_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RemoveHash_EmptyHash_ReturnsError
+[       OK ] WhitelistStoreTest.RemoveHash_EmptyHash_ReturnsError (56 ms)
+  [       OK ] WhitelistStoreTest.RemoveHash_EmptyHash_ReturnsError (56650 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveHash_NonExistent_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RemoveHash_NonExistent_ReturnsError
+[       OK ] WhitelistStoreTest.RemoveHash_NonExistent_ReturnsError (53 ms)
+  [       OK ] WhitelistStoreTest.RemoveHash_NonExistent_ReturnsError (53379 ?s)
+[ RUN      ] WhitelistStoreTest.RemovePath_Empty_ReturnsError
+  [ RUN      ] WhitelistStoreTest.RemovePath_Empty_ReturnsError
+[       OK ] WhitelistStoreTest.RemovePath_Empty_ReturnsError (54 ms)
+  [       OK ] WhitelistStoreTest.RemovePath_Empty_ReturnsError (54669 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_ValidHashEntry_Success
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_ValidHashEntry_Success
+[       OK ] WhitelistStoreTest.ImportFromJSONString_ValidHashEntry_Success (66 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_ValidHashEntry_Success (66444 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_ValidPathEntry_Success
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_ValidPathEntry_Success
+[       OK ] WhitelistStoreTest.ImportFromJSONString_ValidPathEntry_Success (71 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_ValidPathEntry_Success (71771 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_MixedEntryTypes_Success
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_MixedEntryTypes_Success
+[       OK ] WhitelistStoreTest.ImportFromJSONString_MixedEntryTypes_Success (63 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_MixedEntryTypes_Success (63799 ?s)
+
+Test Suite Complete: WhitelistStoreTest (19964 ms)
+  Tests: 124 | Passed: 120 | Failed: 4
+
+[----------] Global test environment tear-down
+[==========] 124 tests from 1 test suite ran. (19967 ms total)
+[  PASSED  ] 120 tests.
+[  FAILED  ] 4 tests, listed below:
+[  FAILED  ] WhitelistStoreTest.MatchCallback_InvokedOnMatch
+[  FAILED  ] WhitelistStoreTest.ImportFromJSON_NotInitialized_ReturnsError
+[  FAILED  ] WhitelistStoreTest.ImportFromCSV_NotInitialized_ReturnsError
+[  FAILED  ] WhitelistStoreTest.UpdateChecksum_NotInitialized_ReturnsError
+
+ 4 FAILED TESTS
+========================================================================
+  TEST SUMMARY
+========================================================================
+  Total Tests:   124
+  Passed:        120 (96.8%)
+  Failed:          4 (3.2%)
+========================================================================
+
+? TESTS FAILED
+

@@ -862,6 +862,34 @@ StoreError HashIndex::Initialize(
     return StoreError::Success();
 }
 
+void HashIndex::EnableWriteMode(void* baseAddress, uint64_t size) noexcept {
+    /*
+     * ========================================================================
+     * ENABLE WRITE MODE FOR EXISTING DATABASE
+     * ========================================================================
+     *
+     * Called after Initialize() when loading an existing database for writing.
+     * This enables insert/remove operations by setting m_baseAddress.
+     *
+     * Note: The index structure was already loaded by Initialize(), this just
+     * enables modifications by providing a writable base address.
+     *
+     * ========================================================================
+     */
+    
+    std::unique_lock lock(m_rwLock);
+    
+    if (!baseAddress) {
+        SS_LOG_WARN(L"Whitelist", L"HashIndex::EnableWriteMode called with null base address");
+        return;
+    }
+    
+    m_baseAddress = baseAddress;
+    m_indexSize = size;
+    
+    SS_LOG_DEBUG(L"Whitelist", L"HashIndex write mode enabled, size: %llu", size);
+}
+
 StoreError HashIndex::CreateNew(
     void* baseAddress,
     uint64_t availableSize,

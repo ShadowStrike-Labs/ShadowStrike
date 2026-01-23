@@ -1,0 +1,715 @@
+
+========================================================================
+  ShadowStrike CryptoUtils Test Runner
+========================================================================
+
+
+========================================================================
+  ShadowStrike  Test Suite
+========================================================================
+
+Note: Google Test filter = WhitelistStoreTest.*
+[==========] Running 124 tests from 1 test suite.
+Running 3798 tests from 1 test suites
+
+[----------] Global test environment set-up.
+------------------------------------------------------------------------
+Test Suite: WhitelistStoreTest
+------------------------------------------------------------------------
+[ RUN      ] WhitelistStoreTest.Create_NewDatabase_Success
+  [ RUN      ] WhitelistStoreTest.Create_NewDatabase_Success
+[       OK ] WhitelistStoreTest.Create_NewDatabase_Success (36 ms)
+  [       OK ] WhitelistStoreTest.Create_NewDatabase_Success (36629 ?s)
+[ RUN      ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites
+  [ RUN      ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites
+[       OK ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites (112 ms)
+  [       OK ] WhitelistStoreTest.Create_ExistingDatabase_Overwrites (112491 ?s)
+[ RUN      ] WhitelistStoreTest.Load_CreatedDatabase_Success
+  [ RUN      ] WhitelistStoreTest.Load_CreatedDatabase_Success
+[       OK ] WhitelistStoreTest.Load_CreatedDatabase_Success (75 ms)
+  [       OK ] WhitelistStoreTest.Load_CreatedDatabase_Success (75911 ?s)
+[ RUN      ] WhitelistStoreTest.Load_Writable_Success
+  [ RUN      ] WhitelistStoreTest.Load_Writable_Success
+[       OK ] WhitelistStoreTest.Load_Writable_Success (85 ms)
+  [       OK ] WhitelistStoreTest.Load_Writable_Success (86038 ?s)
+[ RUN      ] WhitelistStoreTest.Load_NonExistentFile_Fails
+  [ RUN      ] WhitelistStoreTest.Load_NonExistentFile_Fails
+[       OK ] WhitelistStoreTest.Load_NonExistentFile_Fails (23 ms)
+  [       OK ] WhitelistStoreTest.Load_NonExistentFile_Fails (23761 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_ValidEntry_Success
+  [ RUN      ] WhitelistStoreTest.AddHash_ValidEntry_Success
+[       OK ] WhitelistStoreTest.AddHash_ValidEntry_Success (54 ms)
+  [       OK ] WhitelistStoreTest.AddHash_ValidEntry_Success (54299 ?s)
+[ RUN      ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted
+[       OK ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted (52 ms)
+  [       OK ] WhitelistStoreTest.IsHashWhitelisted_NonExistent_ReturnsNotWhitelisted (52497 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success
+  [ RUN      ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success
+[       OK ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success (52 ms)
+  [       OK ] WhitelistStoreTest.RemoveHash_ExistingEntry_Success (53062 ?s)
+[ RUN      ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData
+  [ RUN      ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData
+[       OK ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData (101 ms)
+  [       OK ] WhitelistStoreTest.Persistence_SaveAndLoad_PreservesData (101768 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_ExactMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_ExactMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_ExactMatch_Success (53 ms)
+  [       OK ] WhitelistStoreTest.AddPath_ExactMatch_Success (53919 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_PrefixMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_PrefixMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_PrefixMatch_Success (53 ms)
+  [       OK ] WhitelistStoreTest.AddPath_PrefixMatch_Success (53508 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_SuffixMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_SuffixMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_SuffixMatch_Success (54 ms)
+  [       OK ] WhitelistStoreTest.AddPath_SuffixMatch_Success (54174 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_GlobMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_GlobMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_GlobMatch_Success (53 ms)
+  [       OK ] WhitelistStoreTest.AddPath_GlobMatch_Success (53210 ?s)
+[ RUN      ] WhitelistStoreTest.AddPath_RegexMatch_Success
+  [ RUN      ] WhitelistStoreTest.AddPath_RegexMatch_Success
+[       OK ] WhitelistStoreTest.AddPath_RegexMatch_Success (55 ms)
+  [       OK ] WhitelistStoreTest.AddPath_RegexMatch_Success (55938 ?s)
+[ RUN      ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash
+  [ RUN      ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash
+[       OK ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash (55 ms)
+  [       OK ] WhitelistStoreTest.IsWhitelisted_ComprehensiveCheck_PrioritizesHash (55564 ?s)
+[ RUN      ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+  [ RUN      ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(370): error: Value of: res.found
+  Actual: true
+Expected: false
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:370
+    Value of: res.found
+  Actual: true
+Expected: false
+
+[  FAILED  ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly (1571 ms)
+  [  FAILED  ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly (1572129 ?s)
+[ RUN      ] WhitelistStoreTest.PurgeExpired_RemovesEntries
+  [ RUN      ] WhitelistStoreTest.PurgeExpired_RemovesEntries
+[       OK ] WhitelistStoreTest.PurgeExpired_RemovesEntries (147 ms)
+  [       OK ] WhitelistStoreTest.PurgeExpired_RemovesEntries (147579 ?s)
+[ RUN      ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe
+  [ RUN      ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe
+[       OK ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe (59 ms)
+  [       OK ] WhitelistStoreTest.Concurrent_ReadWrite_ThreadSafe (59908 ?s)
+[ RUN      ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness
+  [ RUN      ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness
+[       OK ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness (81 ms)
+  [       OK ] WhitelistStoreTest.BatchAdd_PerformanceAndCorrectness (81991 ?s)
+[ RUN      ] WhitelistStoreTest.BatchLookup_OptimizedPath
+  [ RUN      ] WhitelistStoreTest.BatchLookup_OptimizedPath
+[       OK ] WhitelistStoreTest.BatchLookup_OptimizedPath (55 ms)
+  [       OK ] WhitelistStoreTest.BatchLookup_OptimizedPath (55891 ?s)
+[ RUN      ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup
+  [ RUN      ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup
+[       OK ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup (53 ms)
+  [       OK ] WhitelistStoreTest.BloomFilter_RejectsBeforeIndexLookup (53273 ?s)
+[ RUN      ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success
+  [ RUN      ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success
+[       OK ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success (52 ms)
+  [       OK ] WhitelistStoreTest.AddCertificate_ValidThumbprint_Success (52627 ?s)
+[ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted
+[       OK ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted (51 ms)
+  [       OK ] WhitelistStoreTest.IsCertificateWhitelisted_ExistingCert_ReturnsWhitelisted (51976 ?s)
+[ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted
+[       OK ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted (52 ms)
+  [       OK ] WhitelistStoreTest.IsCertificateWhitelisted_NonExistent_ReturnsNotWhitelisted (52842 ?s)
+[ RUN      ] WhitelistStoreTest.AddPublisher_ValidName_Success
+  [ RUN      ] WhitelistStoreTest.AddPublisher_ValidName_Success
+[       OK ] WhitelistStoreTest.AddPublisher_ValidName_Success (53 ms)
+  [       OK ] WhitelistStoreTest.AddPublisher_ValidName_Success (53542 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted (54 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_ExistingPublisher_ReturnsWhitelisted (54363 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive (53 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_CaseInsensitive (54008 ?s)
+[ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted
+  [ RUN      ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted
+[       OK ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted (57 ms)
+  [       OK ] WhitelistStoreTest.IsPublisherWhitelisted_NonExistent_ReturnsNotWhitelisted (57430 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry
+  [ RUN      ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry
+[       OK ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry (52 ms)
+  [       OK ] WhitelistStoreTest.GetEntry_ValidId_ReturnsEntry (52921 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt
+  [ RUN      ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt
+[       OK ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt (52 ms)
+  [       OK ] WhitelistStoreTest.GetEntry_InvalidId_ReturnsNullopt (52764 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntries_Pagination_Works
+  [ RUN      ] WhitelistStoreTest.GetEntries_Pagination_Works
+[       OK ] WhitelistStoreTest.GetEntries_Pagination_Works (53 ms)
+  [       OK ] WhitelistStoreTest.GetEntries_Pagination_Works (53830 ?s)
+[ RUN      ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly
+  [ RUN      ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly
+[       OK ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly (52 ms)
+  [       OK ] WhitelistStoreTest.GetEntries_TypeFilter_FiltersCorrectly (52577 ?s)
+[ RUN      ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags
+  [ RUN      ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags
+[       OK ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags (83 ms)
+  [       OK ] WhitelistStoreTest.UpdateEntryFlags_ChangesFlags (83226 ?s)
+[ RUN      ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+  [ RUN      ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+[       OK ] WhitelistStoreTest.RevokeEntry_SoftDeletes (78 ms)
+  [       OK ] WhitelistStoreTest.RevokeEntry_SoftDeletes (78949 ?s)
+[ RUN      ] WhitelistStoreTest.RemoveEntry_ById_Success
+  [ RUN      ] WhitelistStoreTest.RemoveEntry_ById_Success
+[       OK ] WhitelistStoreTest.RemoveEntry_ById_Success (77 ms)
+  [       OK ] WhitelistStoreTest.RemoveEntry_ById_Success (77333 ?s)
+[ RUN      ] WhitelistStoreTest.Compact_ReducesFragmentation
+  [ RUN      ] WhitelistStoreTest.Compact_ReducesFragmentation
+[       OK ] WhitelistStoreTest.Compact_ReducesFragmentation (54 ms)
+  [       OK ] WhitelistStoreTest.Compact_ReducesFragmentation (54833 ?s)
+[ RUN      ] WhitelistStoreTest.RebuildIndices_RestoresQueryability
+  [ RUN      ] WhitelistStoreTest.RebuildIndices_RestoresQueryability
+[       OK ] WhitelistStoreTest.RebuildIndices_RestoresQueryability (81 ms)
+  [       OK ] WhitelistStoreTest.RebuildIndices_RestoresQueryability (81932 ?s)
+[ RUN      ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess
+  [ RUN      ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess
+[       OK ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess (61 ms)
+  [       OK ] WhitelistStoreTest.VerifyIntegrity_HealthyDatabase_ReturnsSuccess (61570 ?s)
+[ RUN      ] WhitelistStoreTest.ClearCache_ResetsStatistics
+  [ RUN      ] WhitelistStoreTest.ClearCache_ResetsStatistics
+[       OK ] WhitelistStoreTest.ClearCache_ResetsStatistics (80 ms)
+  [       OK ] WhitelistStoreTest.ClearCache_ResetsStatistics (81047 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON
+  [ RUN      ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON
+[       OK ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON (53 ms)
+  [       OK ] WhitelistStoreTest.ExportToJSONString_ReturnsValidJSON (54016 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSONString_AddsEntries
+  [ RUN      ] WhitelistStoreTest.ImportFromJSONString_AddsEntries
+[       OK ] WhitelistStoreTest.ImportFromJSONString_AddsEntries (66 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSONString_AddsEntries (66565 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToJSON_CreatesFile
+  [ RUN      ] WhitelistStoreTest.ExportToJSON_CreatesFile
+[       OK ] WhitelistStoreTest.ExportToJSON_CreatesFile (54 ms)
+  [       OK ] WhitelistStoreTest.ExportToJSON_CreatesFile (54193 ?s)
+[ RUN      ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile
+  [ RUN      ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile
+[       OK ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile (118 ms)
+  [       OK ] WhitelistStoreTest.ImportFromJSON_LoadsFromFile (118236 ?s)
+[ RUN      ] WhitelistStoreTest.ExportToCSV_CreatesValidCSV
+  [ RUN      ] WhitelistStoreTest.ExportToCSV_CreatesValidCSV
+unknown file: error: C++ exception with description "remove: The process cannot access the file because it is being used by another process.: "C:\Users\RTX40\AppData\Local\Temp\\allowlist_test_455046.db.export.csv"" thrown in the test body.
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+
+    unknown file: error: SEH exception with code 0xc0000005 thrown in auxiliary test code (environments or event listeners).
+Stack trace:
+
+

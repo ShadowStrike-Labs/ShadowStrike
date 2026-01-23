@@ -3505,8 +3505,9 @@ bool CreateDatabase(
         return false;
     }
     
-    // Minimum size: header + at least one page for each major section
-    constexpr uint64_t kMinDbSize = PAGE_SIZE * 16u;  // 64KB minimum
+    // Minimum size: header + bloom filters + indices
+    // Bloom filter: 1MB, Path bloom: 512KB, plus header and indices
+    constexpr uint64_t kMinDbSize = 4ULL * 1024 * 1024;  // 4MB minimum
     if (initialSize < kMinDbSize) {
         initialSize = kMinDbSize;
         SS_LOG_DEBUG(L"Whitelist", 
@@ -3684,8 +3685,9 @@ bool CreateDatabase(
         return true;
     };
     
-    // Bloom filter section (1MB default for fast negative lookups)
-    constexpr uint64_t kBloomSize = 1024u * 1024u;
+    // Bloom filter section (3MB for 1M elements at 0.01% FPR - calculated as ~2.4MB optimal)
+    // Using 3MB to provide headroom for the calculated optimal size
+    constexpr uint64_t kBloomSize = 3u * 1024u * 1024u;
     if (!allocateSection(&header->bloomFilterOffset, &header->bloomFilterSize, 
                          kBloomSize, L"BloomFilter")) {
         error = StoreError::WithMessage(

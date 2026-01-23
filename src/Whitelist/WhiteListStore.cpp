@@ -368,7 +368,9 @@ StoreError WhitelistStore::Create(const std::wstring& databasePath, uint64_t ini
     }
     
     // Validate size bounds
-    constexpr uint64_t MIN_DATABASE_SIZE = 4096;           // 4KB minimum
+    // Minimum must accommodate: header (4KB) + bloom filter (1MB) + path bloom (512KB) + indices
+    // Total minimum: ~2MB to ensure all required sections can be allocated
+    constexpr uint64_t MIN_DATABASE_SIZE = 4ULL * 1024 * 1024;  // 4MB minimum (safe margin for all sections)
     constexpr uint64_t MAX_DATABASE_SIZE = 16ULL * 1024 * 1024 * 1024; // 16GB maximum
     
     if (initialSizeBytes < MIN_DATABASE_SIZE) {
@@ -493,6 +495,39 @@ StoreError WhitelistStore::Save() noexcept {
         );
     }
     
+    // ========================================================================
+    // PERSIST BLOOM FILTER TO MEMORY-MAPPED REGION
+    // ========================================================================
+    // The bloom filter uses internal storage for writes. Before saving,
+    // we must copy this data to the memory-mapped bloom filter section
+    // so it will be available after reload.
+    // ========================================================================
+    
+    const auto* header = GetHeader();
+    if (header && m_hashBloomFilter && !m_hashBloomFilter->IsMemoryMapped()) {
+        // Serialize bloom filter internal data
+        std::vector<uint8_t> bloomData;
+        if (m_hashBloomFilter->Serialize(bloomData) && !bloomData.empty()) {
+            // Validate target region
+            if (header->bloomFilterOffset > 0 && header->bloomFilterSize > 0) {
+                uint64_t bloomEnd = 0;
+                if (SafeAdd(header->bloomFilterOffset, header->bloomFilterSize, bloomEnd) &&
+                    bloomEnd <= m_mappedView.fileSize) {
+                    
+                    auto* destBloom = static_cast<uint8_t*>(m_mappedView.baseAddress) + 
+                                      header->bloomFilterOffset;
+                    
+                    // Copy only what fits in the allocated region
+                    const size_t copySize = (std::min)(bloomData.size(), 
+                                                       static_cast<size_t>(header->bloomFilterSize));
+                    std::memcpy(destBloom, bloomData.data(), copySize);
+                    
+                    SS_LOG_DEBUG(L"Whitelist", L"Persisted bloom filter: %zu bytes", copySize);
+                }
+            }
+        }
+    }
+    
     // Update header statistics before flush
     UpdateHeaderStats();
     
@@ -537,6 +572,14 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
     
     StoreError error;
     
+    // Determine if this is a new (empty) database - if so, indices need to be created fresh
+    // rather than loaded from memory-mapped regions
+    const bool isNewEmptyDatabase = (header->totalHashEntries == 0 && 
+                                      header->totalPathEntries == 0 && 
+                                      header->totalCertEntries == 0 &&
+                                      header->totalPublisherEntries == 0);
+    const bool isWritableMode = !m_readOnly.load(std::memory_order_acquire);
+    
     // Initialize hash bloom filter
     try {
         // Validate bloom filter parameters
@@ -547,26 +590,53 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
         if (expectedElements > 0 && expectedElements <= 1000000000ULL && fpr > 0.0 && fpr < 1.0) {
             m_hashBloomFilter = std::make_unique<BloomFilter>(expectedElements, fpr);
             
-            if (header->bloomFilterSize > 0 && header->bloomFilterOffset > 0) {
-                // Validate bloom filter offset
+            // For writable new databases, use internal storage (allows Add())
+            // For read-only or existing databases, use memory-mapped data
+            if (header->bloomFilterSize > 0 && header->bloomFilterOffset > 0 &&
+                !(isWritableMode && isNewEmptyDatabase)) {
+                // Load from memory-mapped data (read-only mode)
+                // NOTE: Use the bloom filter's calculated bit count, not section size,
+                // to ensure hash functions index the correct bit positions
                 uint64_t bloomEnd;
                 if (SafeAdd(header->bloomFilterOffset, header->bloomFilterSize, bloomEnd)) {
                     const void* bloomData = m_mappedView.GetAt<uint8_t>(header->bloomFilterOffset);
                     if (bloomData) {
-                        bool initSuccess = m_hashBloomFilter->Initialize(
-                            bloomData,
-                            header->bloomFilterSize * 8, // Convert bytes to bits
-                            7 // Default hash function count
-                        );
-                        if (!initSuccess) {
-                            SS_LOG_WARN(L"Whitelist", L"Failed to initialize bloom filter from mapped data");
+                        // Get the bit count calculated from parameters (same as when created)
+                        const size_t bitCount = m_hashBloomFilter->GetBitCount();
+                        const size_t requiredBytes = (bitCount + 7) / 8;
+                        
+                        // Verify the section is large enough for the calculated bloom filter
+                        if (requiredBytes <= header->bloomFilterSize) {
+                            bool initSuccess = m_hashBloomFilter->Initialize(
+                                bloomData,
+                                bitCount,  // Use calculated bit count, not section size
+                                m_hashBloomFilter->GetHashFunctions()
+                            );
+                            if (!initSuccess) {
+                                SS_LOG_WARN(L"Whitelist", L"Failed to initialize bloom filter from mapped data");
+                            }
+                        } else {
+                            SS_LOG_WARN(L"Whitelist", 
+                                L"Bloom filter section too small: need %zu bytes, have %llu",
+                                requiredBytes, header->bloomFilterSize);
                         }
                     }
+                }
+            } else if (isWritableMode && isNewEmptyDatabase) {
+                // For new writable databases, initialize internal storage for Add() support
+                // This allocates the bit array that will be persisted during Save()
+                if (!m_hashBloomFilter->InitializeForBuild()) {
+                    SS_LOG_WARN(L"Whitelist", L"Failed to initialize bloom filter for building");
+                    // Continue without bloom filter - degraded performance but functional
                 }
             }
         } else {
             SS_LOG_WARN(L"Whitelist", L"Invalid bloom filter parameters, using defaults");
             m_hashBloomFilter = std::make_unique<BloomFilter>(100000, 0.001);
+            // Also initialize for building with default parameters
+            if (isWritableMode && isNewEmptyDatabase) {
+                (void)m_hashBloomFilter->InitializeForBuild();
+            }
         }
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Whitelist", L"Failed to create hash bloom filter: %S", e.what());
@@ -581,11 +651,41 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
             // Validate hash index bounds
             uint64_t hashIndexEnd;
             if (SafeAdd(header->hashIndexOffset, header->hashIndexSize, hashIndexEnd)) {
-                error = m_hashIndex->Initialize(
-                    m_mappedView,
-                    header->hashIndexOffset,
-                    header->hashIndexSize
-                );
+                auto* indexBaseAddr = static_cast<uint8_t*>(m_mappedView.baseAddress) + 
+                                      header->hashIndexOffset;
+                
+                if (isWritableMode) {
+                    // Writable mode: use CreateNew for write support
+                    // Note: CreateNew reinitializes the index structure, but for existing data
+                    // we need to load it first. For simplicity, existing entries are retained
+                    // in entry data section and will work after rebuild.
+                    if (isNewEmptyDatabase) {
+                        // New database with no entries - fresh creation
+                        uint64_t usedSize = 0;
+                        error = m_hashIndex->CreateNew(indexBaseAddr, header->hashIndexSize, usedSize);
+                    } else {
+                        // Existing database with entries - initialize for writing
+                        // First load the existing index data, then enable write mode
+                        error = m_hashIndex->Initialize(
+                            m_mappedView,
+                            header->hashIndexOffset,
+                            header->hashIndexSize
+                        );
+                        
+                        if (error.IsSuccess()) {
+                            // Enable write mode by setting base address
+                            m_hashIndex->EnableWriteMode(indexBaseAddr, header->hashIndexSize);
+                        }
+                    }
+                } else {
+                    // Read-only mode - just load existing data
+                    error = m_hashIndex->Initialize(
+                        m_mappedView,
+                        header->hashIndexOffset,
+                        header->hashIndexSize
+                    );
+                }
+                
                 if (!error.IsSuccess()) {
                     SS_LOG_WARN(L"Whitelist", L"Failed to initialize hash index: %S",
                         error.message.c_str());
@@ -606,11 +706,32 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
             // Validate path index bounds
             uint64_t pathIndexEnd;
             if (SafeAdd(header->pathIndexOffset, header->pathIndexSize, pathIndexEnd)) {
-                error = m_pathIndex->Initialize(
-                    m_mappedView,
-                    header->pathIndexOffset,
-                    header->pathIndexSize
-                );
+                auto* indexBaseAddr = static_cast<uint8_t*>(m_mappedView.baseAddress) + 
+                                      header->pathIndexOffset;
+                
+                if (isWritableMode) {
+                    if (isNewEmptyDatabase) {
+                        uint64_t usedSize = 0;
+                        error = m_pathIndex->CreateNew(indexBaseAddr, header->pathIndexSize, usedSize);
+                    } else {
+                        // Load existing data, then enable write mode
+                        error = m_pathIndex->Initialize(
+                            m_mappedView,
+                            header->pathIndexOffset,
+                            header->pathIndexSize
+                        );
+                        
+                        if (error.IsSuccess()) {
+                            m_pathIndex->EnableWriteMode(indexBaseAddr, header->pathIndexSize);
+                        }
+                    }
+                } else {
+                    error = m_pathIndex->Initialize(
+                        m_mappedView,
+                        header->pathIndexOffset,
+                        header->pathIndexSize
+                    );
+                }
                 if (!error.IsSuccess()) {
                     SS_LOG_WARN(L"Whitelist", L"Failed to initialize path index: %S",
                         error.message.c_str());
@@ -631,11 +752,19 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
             // Validate string pool bounds
             uint64_t stringPoolEnd;
             if (SafeAdd(header->stringPoolOffset, header->stringPoolSize, stringPoolEnd)) {
-                error = m_stringPool->Initialize(
-                    m_mappedView,
-                    header->stringPoolOffset,
-                    header->stringPoolSize
-                );
+                // For writable stores with empty database, use CreateNew
+                if (isWritableMode && isNewEmptyDatabase) {
+                    uint64_t usedSize = 0;
+                    auto* poolBaseAddr = static_cast<uint8_t*>(m_mappedView.baseAddress) + 
+                                         header->stringPoolOffset;
+                    error = m_stringPool->CreateNew(poolBaseAddr, header->stringPoolSize, usedSize);
+                } else {
+                    error = m_stringPool->Initialize(
+                        m_mappedView,
+                        header->stringPoolOffset,
+                        header->stringPoolSize
+                    );
+                }
                 if (!error.IsSuccess()) {
                     SS_LOG_WARN(L"Whitelist", L"Failed to initialize string pool: %S",
                         error.message.c_str());
@@ -661,6 +790,82 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
         // Overflow occurred, use safe default
         SS_LOG_WARN(L"Whitelist", L"Entry count overflow, starting from 1");
         m_nextEntryId.store(1, std::memory_order_relaxed);
+    }
+    
+    // ========================================================================
+    // REBUILD BLOOM FILTER FROM PERSISTED ENTRIES
+    // ========================================================================
+    //
+    // Following ThreatIntel's hybrid persistence model:
+    // Bloom filters use internal storage (not memory-mapped), so they must be
+    // rebuilt from persisted hash entries on load to ensure correct lookups.
+    //
+    // This is O(n) where n = number of entries, but only runs on load.
+    // ========================================================================
+    if (!isNewEmptyDatabase && m_hashBloomFilter && header->totalHashEntries > 0) {
+        try {
+            // Scan entry data section to rebuild bloom filter
+            const uint64_t entryDataStart = header->entryDataOffset;
+            const uint64_t entryDataEnd = header->entryDataOffset + header->entryDataSize;
+            
+            // Validate entry data bounds
+            if (entryDataStart > 0 && entryDataEnd <= m_mappedView.fileSize) {
+                uint64_t entriesProcessed = 0;
+                uint64_t currentOffset = entryDataStart;
+                
+                // Scan through entries sequentially
+                while (currentOffset + sizeof(WhitelistEntry) <= entryDataEnd) {
+                    const auto* entry = m_mappedView.GetAt<WhitelistEntry>(currentOffset);
+                    if (!entry) {
+                        break;
+                    }
+                    
+                    // Only process valid hash entries
+                    if (entry->type == WhitelistEntryType::FileHash &&
+                        entry->hashLength > 0 && 
+                        entry->hashLength <= entry->hashData.size() &&
+                        !HasFlag(entry->flags, WhitelistFlags::Revoked)) {
+                        
+                        // Reconstruct HashValue and add to bloom filter
+                        HashValue hashVal;
+                        hashVal.algorithm = entry->hashAlgorithm;
+                        hashVal.length = entry->hashLength;
+                        std::memcpy(hashVal.data.data(), entry->hashData.data(), 
+                                    std::min<size_t>(entry->hashLength, hashVal.data.size()));
+                        
+                        m_hashBloomFilter->Add(hashVal);
+                        ++entriesProcessed;
+                    }
+                    
+                    // Move to next entry
+                    currentOffset += sizeof(WhitelistEntry);
+                    
+                    // Safety limit - prevent infinite loops on corrupted data
+                    if (entriesProcessed > header->totalHashEntries * 2) {
+                        SS_LOG_WARN(L"Whitelist", 
+                            L"Bloom filter rebuild exceeded expected entries, stopping");
+                        break;
+                    }
+                }
+                
+                SS_LOG_DEBUG(L"Whitelist", 
+                    L"Rebuilt bloom filter with %llu hash entries", entriesProcessed);
+                
+                // If we didn't find any entries but header says there should be some,
+                // disable bloom filter to avoid false negatives
+                if (entriesProcessed == 0 && header->totalHashEntries > 0) {
+                    SS_LOG_WARN(L"Whitelist", 
+                        L"Bloom filter rebuild found 0 entries (expected %llu), disabling bloom filter",
+                        header->totalHashEntries);
+                    m_bloomFilterEnabled.store(false, std::memory_order_release);
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(L"Whitelist", 
+                L"Failed to rebuild bloom filter: %S (continuing without)", e.what());
+            // Disable bloom filter on error to prevent false negatives
+            m_bloomFilterEnabled.store(false, std::memory_order_release);
+        }
     }
     
     return StoreError::Success();
@@ -748,11 +953,28 @@ LookupResult WhitelistStore::IsHashWhitelisted(
     if (options.useCache && m_cachingEnabled.load(std::memory_order_acquire)) {
         auto cached = GetFromCache(hash);
         if (cached.has_value()) {
-            m_cacheHits.fetch_add(1, std::memory_order_relaxed);
-            result = *cached;
-            result.cacheHit = true;
-            result.lookupTimeNs = calculateElapsedNs();
-            return result;
+            // IMPORTANT: Re-validate expiration even for cached results
+            // Cache may have been populated before entry expired
+            bool cacheStillValid = true;
+            
+            if (!options.includeExpired && cached->found && cached->expirationTime > 0) {
+                auto now = std::chrono::system_clock::now();
+                auto nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                    now.time_since_epoch()).count();
+                if (nowSec > 0 && static_cast<uint64_t>(nowSec) > cached->expirationTime) {
+                    // Cached entry has expired - invalidate and re-lookup
+                    cacheStillValid = false;
+                }
+            }
+            
+            if (cacheStillValid) {
+                m_cacheHits.fetch_add(1, std::memory_order_relaxed);
+                result = *cached;
+                result.cacheHit = true;
+                result.lookupTimeNs = calculateElapsedNs();
+                return result;
+            }
+            // Fall through to re-lookup (cache was invalidated by expiration)
         }
         m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
     }
@@ -825,6 +1047,7 @@ LookupResult WhitelistStore::IsHashWhitelisted(
         return result;
     }
     
+    // Check if entry has expired
     if (!options.includeExpired && entry->IsExpired()) {
         return result;
     }
@@ -856,9 +1079,12 @@ LookupResult WhitelistStore::IsHashWhitelisted(
     
     m_totalHits.fetch_add(1, std::memory_order_relaxed);
     
-    // Update hit count (atomic, thread-safe)
-    // Note: const_cast is safe here because hitCount is atomic
-    const_cast<WhitelistEntry*>(entry)->IncrementHitCount();
+    // Update hit count (only if database is writable)
+    // In read-only mode, the entry is from read-only mapped memory
+    if (!m_readOnly.load(std::memory_order_acquire)) {
+        // const_cast is safe here because we verified writable mode
+        const_cast<WhitelistEntry*>(entry)->IncrementHitCount();
+    }
     
     result.lookupTimeNs = calculateElapsedNs();
     RecordLookupTime(result.lookupTimeNs);
@@ -990,12 +1216,29 @@ LookupResult WhitelistStore::IsPathWhitelisted(
         return result;
     }
     
-    // Try exact match first
+    // Try all match modes in priority order:
+    // 1. Exact match (fastest, most specific)
+    // 2. Prefix match
+    // 3. Suffix match
+    // 4. Glob pattern match
+    // 5. Regex match (slowest, most flexible)
+    
     auto entryOffsets = m_pathIndex->Lookup(normalizedPath, PathMatchMode::Exact);
     
-    // Try prefix match if exact match fails
     if (entryOffsets.empty()) {
         entryOffsets = m_pathIndex->Lookup(normalizedPath, PathMatchMode::Prefix);
+    }
+    
+    if (entryOffsets.empty()) {
+        entryOffsets = m_pathIndex->Lookup(normalizedPath, PathMatchMode::Suffix);
+    }
+    
+    if (entryOffsets.empty()) {
+        entryOffsets = m_pathIndex->Lookup(normalizedPath, PathMatchMode::Glob);
+    }
+    
+    if (entryOffsets.empty()) {
+        entryOffsets = m_pathIndex->Lookup(normalizedPath, PathMatchMode::Regex);
     }
     
     if (entryOffsets.empty()) {
@@ -1399,7 +1642,16 @@ StoreError WhitelistStore::AddHash(
         m_hashBloomFilter->Add(hash);
     }
     
-    // Update statistics
+    // Increment entry count in header (thread-safe)
+    auto* mutableHeader = const_cast<WhitelistDatabaseHeader*>(GetHeader());
+    if (mutableHeader) {
+        // Atomic increment with overflow protection
+        if (mutableHeader->totalHashEntries < UINT64_MAX) {
+            ++mutableHeader->totalHashEntries;
+        }
+    }
+    
+    // Update statistics (timestamps, etc.)
     UpdateHeaderStats();
     
     SS_LOG_INFO(L"Whitelist", L"Added hash entry: ID=%llu, reason=%d", 
@@ -1703,6 +1955,15 @@ StoreError WhitelistStore::AddPath(
         }
     }
     
+    // Increment entry count in header (thread-safe)
+    auto* mutableHeader = const_cast<WhitelistDatabaseHeader*>(GetHeader());
+    if (mutableHeader) {
+        // Atomic increment with overflow protection
+        if (mutableHeader->totalPathEntries < UINT64_MAX) {
+            ++mutableHeader->totalPathEntries;
+        }
+    }
+    
     UpdateHeaderStats();
     
     SS_LOG_INFO(L"Whitelist", L"Added path entry: ID=%llu, mode=%d", 
@@ -1867,6 +2128,39 @@ StoreError WhitelistStore::RemoveEntry(uint64_t entryId) noexcept {
         static_cast<uint32_t>(foundEntry->flags) & ~static_cast<uint32_t>(WhitelistFlags::Enabled)
     );
     
+    // Decrement entry count in header based on type
+    auto* mutableHeader = const_cast<WhitelistDatabaseHeader*>(GetHeader());
+    if (mutableHeader) {
+        switch (foundEntry->type) {
+            case WhitelistEntryType::FileHash:
+                if (mutableHeader->totalHashEntries > 0) {
+                    --mutableHeader->totalHashEntries;
+                }
+                break;
+            case WhitelistEntryType::FilePath:
+            case WhitelistEntryType::ProcessPath:
+                if (mutableHeader->totalPathEntries > 0) {
+                    --mutableHeader->totalPathEntries;
+                }
+                break;
+            case WhitelistEntryType::Certificate:
+                if (mutableHeader->totalCertEntries > 0) {
+                    --mutableHeader->totalCertEntries;
+                }
+                break;
+            case WhitelistEntryType::Publisher:
+                if (mutableHeader->totalPublisherEntries > 0) {
+                    --mutableHeader->totalPublisherEntries;
+                }
+                break;
+            default:
+                if (mutableHeader->totalOtherEntries > 0) {
+                    --mutableHeader->totalOtherEntries;
+                }
+                break;
+        }
+    }
+    
     // Update modification time
     auto now = std::chrono::system_clock::now();
     auto epoch = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
@@ -1878,8 +2172,8 @@ StoreError WhitelistStore::RemoveEntry(uint64_t entryId) noexcept {
     SS_LOG_INFO(L"Whitelist", L"RemoveEntry: ID=%llu removed (type=%d)", 
         entryId, static_cast<int>(foundEntry->type));
     
-    // Clear cache since data changed
-    ClearCache();
+    // Clear cache since data changed (use unsafe variant - lock already held)
+    ClearCacheUnsafe();
     
     return StoreError::Success();
 }
@@ -1909,7 +2203,15 @@ StoreError WhitelistStore::RemoveHash(const HashValue& hash) noexcept {
     std::unique_lock lock(m_globalLock);
     
     if (m_hashIndex) {
-        return m_hashIndex->Remove(hash);
+        auto result = m_hashIndex->Remove(hash);
+        if (result.IsSuccess()) {
+            // Update header counter to maintain consistency with GetEntryCount()
+            auto* mutableHeader = m_mappedView.GetAtMutable<WhitelistDatabaseHeader>(0);
+            if (mutableHeader && mutableHeader->totalHashEntries > 0) {
+                --mutableHeader->totalHashEntries;
+            }
+        }
+        return result;
     }
     
     return StoreError::WithMessage(
@@ -1946,7 +2248,15 @@ StoreError WhitelistStore::RemovePath(
     std::unique_lock lock(m_globalLock);
     
     if (m_pathIndex) {
-        return m_pathIndex->Remove(path, matchMode);
+        auto result = m_pathIndex->Remove(path, matchMode);
+        if (result.IsSuccess()) {
+            // Update header counter to maintain consistency with GetEntryCount()
+            auto* mutableHeader = m_mappedView.GetAtMutable<WhitelistDatabaseHeader>(0);
+            if (mutableHeader && mutableHeader->totalPathEntries > 0) {
+                --mutableHeader->totalPathEntries;
+            }
+        }
+        return result;
     }
     
     return StoreError::WithMessage(
@@ -2159,6 +2469,39 @@ StoreError WhitelistStore::BatchAdd(
         
         if (indexResult.IsSuccess()) {
             ++added;
+            
+            // Update header entry count based on type
+            auto* mutableHeader = const_cast<WhitelistDatabaseHeader*>(GetHeader());
+            if (mutableHeader) {
+                switch (newEntry->type) {
+                    case WhitelistEntryType::FileHash:
+                        if (mutableHeader->totalHashEntries < UINT64_MAX) {
+                            ++mutableHeader->totalHashEntries;
+                        }
+                        break;
+                    case WhitelistEntryType::FilePath:
+                    case WhitelistEntryType::ProcessPath:
+                        if (mutableHeader->totalPathEntries < UINT64_MAX) {
+                            ++mutableHeader->totalPathEntries;
+                        }
+                        break;
+                    case WhitelistEntryType::Certificate:
+                        if (mutableHeader->totalCertEntries < UINT64_MAX) {
+                            ++mutableHeader->totalCertEntries;
+                        }
+                        break;
+                    case WhitelistEntryType::Publisher:
+                        if (mutableHeader->totalPublisherEntries < UINT64_MAX) {
+                            ++mutableHeader->totalPublisherEntries;
+                        }
+                        break;
+                    default:
+                        if (mutableHeader->totalOtherEntries < UINT64_MAX) {
+                            ++mutableHeader->totalOtherEntries;
+                        }
+                        break;
+                }
+            }
         } else {
             ++failed;
             // Could rollback entry allocation here for strict transaction
@@ -2178,9 +2521,9 @@ StoreError WhitelistStore::BatchAdd(
         );
     }
     
-    // Clear cache since data changed
+    // Clear cache since data changed (use unsafe variant - lock already held)
     if (added > 0) {
-        ClearCache();
+        ClearCacheUnsafe();
     }
     
     return StoreError::Success();
@@ -2322,8 +2665,8 @@ StoreError WhitelistStore::UpdateEntryFlags(
     SS_LOG_DEBUG(L"Whitelist", L"UpdateEntryFlags: ID=%llu, oldFlags=%u, newFlags=%u",
         entryId, static_cast<uint32_t>(oldFlags), static_cast<uint32_t>(flags));
     
-    // Clear cache since behavior may have changed
-    ClearCache();
+    // Clear cache since behavior may have changed (use unsafe variant - lock already held)
+    ClearCacheUnsafe();
     
     return StoreError::Success();
 }
@@ -2359,18 +2702,18 @@ StoreError WhitelistStore::ImportFromJSON(
      * ========================================================================
      */
     
-    // Validate state
-    if (m_readOnly.load(std::memory_order_acquire)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::ReadOnlyDatabase,
-            "Cannot import to read-only database"
-        );
-    }
-    
+    // Validate state - check initialization first (more fundamental issue)
     if (!m_initialized.load(std::memory_order_acquire)) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
             "Store not initialized"
+        );
+    }
+    
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::ReadOnlyDatabase,
+            "Cannot import to read-only database"
         );
     }
     
@@ -3203,9 +3546,11 @@ std::string WhitelistStore::ExportToJSONString(
         uint32_t exportedCount = 0;
         
         // Entry iteration - export all valid entries
-        if (header && header->entryDataOffset > 0 && header->entryDataSize > 0) {
+        // Use m_entryDataUsed to avoid iterating over unallocated space
+        const uint64_t usedSpace = m_entryDataUsed.load(std::memory_order_acquire);
+        if (header && header->entryDataOffset > 0 && usedSpace > 0) {
             const uint64_t entryDataStart = header->entryDataOffset;
-            const uint64_t entryDataEnd = entryDataStart + header->entryDataSize;
+            const uint64_t entryDataEnd = entryDataStart + std::min(usedSpace, header->entryDataSize);
             
             // Type to string helper
             auto typeToString = [](WhitelistEntryType type) -> std::string {
@@ -3764,7 +4109,13 @@ StoreError WhitelistStore::PurgeExpired() noexcept {
     }
     
     const uint64_t entryDataStart = header->entryDataOffset;
-    const uint64_t entryDataEnd = entryDataStart + header->entryDataSize;
+    // Use actual used space, not total allocated space (prevents long loop over empty data)
+    const uint64_t usedSpace = m_entryDataUsed.load(std::memory_order_acquire);
+    if (usedSpace == 0) {
+        // No entries allocated yet
+        return StoreError::Success();
+    }
+    const uint64_t entryDataEnd = entryDataStart + std::min(usedSpace, header->entryDataSize);
     
     if (entryDataEnd > m_mappedView.fileSize) {
         return StoreError::WithMessage(
@@ -3780,7 +4131,7 @@ StoreError WhitelistStore::PurgeExpired() noexcept {
     uint64_t certPurged = 0;
     uint64_t pubPurged = 0;
     
-    // Iterate through all entries
+    // Iterate through actually populated entries only
     uint64_t offset = entryDataStart;
     
     while (offset + sizeof(WhitelistEntry) <= entryDataEnd) {
@@ -3894,8 +4245,8 @@ StoreError WhitelistStore::PurgeExpired() noexcept {
         
         UpdateHeaderStats();
         
-        // Clear caches since entries may have changed
-        ClearCache();
+        // Clear caches since entries may have changed (use unsafe variant - lock already held)
+        ClearCacheUnsafe();
     }
     
     return StoreError::Success();
@@ -3959,7 +4310,13 @@ StoreError WhitelistStore::Compact() noexcept {
     }
     
     const uint64_t entryDataStart = header->entryDataOffset;
-    const uint64_t entryDataEnd = entryDataStart + header->entryDataSize;
+    // Use actual used space to avoid iterating over empty allocated space
+    const uint64_t usedSpace = m_entryDataUsed.load(std::memory_order_acquire);
+    if (usedSpace == 0) {
+        SS_LOG_INFO(L"Whitelist", L"No entries allocated to compact");
+        return StoreError::Success();
+    }
+    const uint64_t entryDataEnd = entryDataStart + std::min(usedSpace, header->entryDataSize);
     const uint64_t originalSize = m_mappedView.fileSize;
     
     if (entryDataEnd > originalSize) {
@@ -4171,8 +4528,8 @@ StoreError WhitelistStore::Compact() noexcept {
             L"Compaction complete: %zu entries retained, %zu bytes reclaimed",
             validEntryCount, spaceReclaimed);
         
-        // Clear query cache
-        ClearCache();
+        // Clear query cache (use unsafe variant - lock already held)
+        ClearCacheUnsafe();
         
         return StoreError::Success();
         
@@ -4260,12 +4617,19 @@ StoreError WhitelistStore::RebuildIndices() noexcept {
     // Validate entry data section
     if (header->entryDataOffset == 0 || header->entryDataSize == 0) {
         SS_LOG_INFO(L"Whitelist", L"No entries to index");
-        ClearCache();
+        ClearCacheUnsafe();  // Use unsafe variant - lock already held
         return StoreError::Success();
     }
     
     const uint64_t entryDataStart = header->entryDataOffset;
-    const uint64_t entryDataEnd = entryDataStart + header->entryDataSize;
+    // Use actual used space to avoid iterating over empty allocated space
+    const uint64_t usedSpace = m_entryDataUsed.load(std::memory_order_acquire);
+    if (usedSpace == 0) {
+        SS_LOG_INFO(L"Whitelist", L"No entries allocated to index");
+        ClearCacheUnsafe();  // Use unsafe variant - lock already held
+        return StoreError::Success();
+    }
+    const uint64_t entryDataEnd = entryDataStart + std::min(usedSpace, header->entryDataSize);
     
     if (entryDataEnd > m_mappedView.fileSize) {
         return StoreError::WithMessage(
@@ -4274,7 +4638,7 @@ StoreError WhitelistStore::RebuildIndices() noexcept {
         );
     }
     
-    // Iterate through all entries and rebuild indices
+    // Iterate through actually populated entries and rebuild indices
     uint64_t offset = entryDataStart;
     
     while (offset + sizeof(WhitelistEntry) <= entryDataEnd) {
@@ -4423,8 +4787,8 @@ StoreError WhitelistStore::RebuildIndices() noexcept {
         offset += sizeof(WhitelistEntry);
     }
     
-    // Clear query cache since indices changed
-    ClearCache();
+    // Clear query cache since indices changed (use unsafe variant - lock already held)
+    ClearCacheUnsafe();
     
     SS_LOG_INFO(L"Whitelist", L"Index rebuild complete: %zu hashes, %zu paths, %zu errors",
         hashesIndexed, pathsIndexed, indexErrors);
@@ -4678,20 +5042,37 @@ StoreError WhitelistStore::UpdateChecksum() noexcept {
 void WhitelistStore::ClearCache() noexcept {
     /*
      * ========================================================================
-     * CACHE CLEAR
+     * CACHE CLEAR (PUBLIC)
      * ========================================================================
      *
      * Invalidates all cached query results. Call this when the underlying
      * data has changed to ensure cache consistency.
      *
+     * Thread Safety: Acquires exclusive lock before clearing.
+     *
      * ========================================================================
      */
     
     std::unique_lock lock(m_globalLock);
+    ClearCacheUnsafe();
+}
+
+void WhitelistStore::ClearCacheUnsafe() noexcept {
+    /*
+     * ========================================================================
+     * CACHE CLEAR (INTERNAL - NO LOCKING)
+     * ========================================================================
+     *
+     * Internal version that assumes caller already holds the lock.
+     * Used by BatchAdd, RemoveHash, etc. to avoid recursive lock deadlock.
+     *
+     * IMPORTANT: Caller MUST hold m_globalLock before calling this.
+     *
+     * ========================================================================
+     */
     
-    // Clear each cache entry safely
+    // Clear each cache entry safely using SeqLock protocol
     for (auto& entry : m_queryCache) {
-        // Use SeqLock write protocol
         entry.BeginWrite();
         
         // Zero-initialize all fields
@@ -4822,9 +5203,15 @@ std::optional<Whitelist::WhitelistEntry> WhitelistStore::GetEntry(uint64_t entry
         return std::nullopt;
     }
     
-    // Validate entry data bounds
+    // Validate entry data bounds - use actual used space
     const uint64_t entryDataStart = header->entryDataOffset;
-    const uint64_t entryDataEnd = entryDataStart + header->entryDataSize;
+    const uint64_t usedSpace = m_entryDataUsed.load(std::memory_order_acquire);
+    
+    if (usedSpace == 0) {
+        return std::nullopt;
+    }
+    
+    const uint64_t entryDataEnd = entryDataStart + std::min(usedSpace, header->entryDataSize);
     
     if (entryDataEnd > m_mappedView.fileSize) {
         return std::nullopt;
@@ -4840,13 +5227,13 @@ std::optional<Whitelist::WhitelistEntry> WhitelistStore::GetEntry(uint64_t entry
         
         // Check if this is the entry we're looking for
         if (entry->entryId == entryId) {
-            // Skip if deleted/revoked
-            if (entry->type == WhitelistEntryType::Reserved ||
-                HasFlag(entry->flags, WhitelistFlags::Revoked)) {
-                return std::nullopt; // Entry exists but is deleted
+            // Skip if completely deleted (Reserved type means slot is empty)
+            if (entry->type == WhitelistEntryType::Reserved) {
+                return std::nullopt; // Entry slot is empty/deleted
             }
             
-            // Return copy of entry
+            // Return copy of entry - including revoked entries
+            // The caller can check the Revoked flag if they need to
             return *entry;
         }
         
@@ -4906,13 +5293,20 @@ std::vector<WhitelistEntry> WhitelistStore::GetEntries(
         return entries;
     }
     
-    // Validate entry data bounds
+    // Validate entry data bounds - use actual used space, not allocated size
     if (header->entryDataOffset == 0 || header->entryDataSize == 0) {
         return entries;
     }
     
     const uint64_t entryDataStart = header->entryDataOffset;
-    const uint64_t entryDataEnd = entryDataStart + header->entryDataSize;
+    const uint64_t usedSpace = m_entryDataUsed.load(std::memory_order_acquire);
+    
+    // If no entries have been allocated yet, return empty
+    if (usedSpace == 0) {
+        return entries;
+    }
+    
+    const uint64_t entryDataEnd = entryDataStart + std::min(usedSpace, header->entryDataSize);
     
     if (entryDataEnd > m_mappedView.fileSize) {
         return entries;

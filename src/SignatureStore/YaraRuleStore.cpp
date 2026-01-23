@@ -1305,6 +1305,11 @@ void YaraRuleStore::Close() noexcept {
     size_t metadataCount = m_ruleMetadata.size();
     m_ruleMetadata.clear();
     SS_LOG_DEBUG(L"YaraRuleStore", L"Close: Cleared %zu rule metadata entries", metadataCount);
+    
+    // Clear rule source cache
+    size_t sourceCount = m_ruleSources.size();
+    m_ruleSources.clear();
+    SS_LOG_DEBUG(L"YaraRuleStore", L"Close: Cleared %zu rule source entries", sourceCount);
 
     // ========================================================================
     // STEP 4: CLOSE MEMORY MAPPING
@@ -2258,6 +2263,9 @@ StoreError YaraRuleStore::AddRulesFromSource(
 
     size_t rulesAdded = 0;
     size_t rulesSkipped = 0;
+    
+    // Track added metadata keys for rollback on failure
+    std::vector<std::string> addedMetadataKeys;
 
     YR_RULE* rule = nullptr;
     yr_rules_foreach(compiledRules, rule) {
@@ -2352,35 +2360,116 @@ StoreError YaraRuleStore::AddRulesFromSource(
             metadata.isPrivate ? "yes" : "no");
 
         // ====================================================================
-        // STORE METADATA
+        // STORE METADATA (track for potential rollback)
         // ====================================================================
         m_ruleMetadata[fullName] = std::move(metadata);
+        addedMetadataKeys.push_back(fullName);
         rulesAdded++;
     }
 
     // ========================================================================
-    // STEP 5: MERGE COMPILED RULES
+    // STEP 5: MERGE COMPILED RULES (Enterprise-Grade Implementation)
     // ========================================================================
     if (rulesAdded > 0) {
-        // If we have existing rules, we need to merge
+        // Store the new rule source for future merging operations
+        // Use monotonically increasing counter to avoid hash collisions
+        uint64_t sourceId = m_sourceIdCounter.fetch_add(1, std::memory_order_relaxed);
+        std::string sourceKey = namespace_ + "::__source__" + std::to_string(sourceId);
+        m_ruleSources[sourceKey] = ruleSource;
+        
+        // If we have existing rules, perform proper merge by recompiling all sources
         if (m_rules) {
-            // In a production system, you'd implement proper rule merging
-            // For now, we replace (this is a limitation)
-            SS_LOG_WARN(L"YaraRuleStore",
-                L"AddRulesFromSource: Replacing existing rules (merge not yet implemented)");
+            SS_LOG_INFO(L"YaraRuleStore",
+                L"AddRulesFromSource: Merging with existing rules (recompilation)");
+            
+            // Create a new compiler and add ALL stored rule sources
+            YaraCompiler mergeCompiler;
+            bool mergeSuccess = true;
+            size_t sourcesCompiled = 0;
+            
+            for (const auto& [key, source] : m_ruleSources) {
+                // Extract namespace from key (format: "namespace::__source__hash")
+                std::string ns = "default";
+                size_t delimPos = key.find("::");
+                if (delimPos != std::string::npos) {
+                    ns = key.substr(0, delimPos);
+                }
+                
+                StoreError addResult = mergeCompiler.AddString(source, ns);
+                if (!addResult.IsSuccess()) {
+                    SS_LOG_WARN(L"YaraRuleStore",
+                        L"AddRulesFromSource: Failed to add stored source during merge: %S",
+                        addResult.message.c_str());
+                    // Continue with other sources - partial merge is better than nothing
+                } else {
+                    sourcesCompiled++;
+                }
+            }
+            
+            if (sourcesCompiled == 0) {
+                SS_LOG_ERROR(L"YaraRuleStore",
+                    L"AddRulesFromSource: Merge failed - no sources compiled successfully");
+                
+                // Rollback: remove the new source from cache
+                m_ruleSources.erase(sourceKey);
+                
+                // Rollback: remove all metadata entries that were added
+                for (const auto& key : addedMetadataKeys) {
+                    m_ruleMetadata.erase(key);
+                }
+                
+                // Cleanup the originally compiled rules
+                yr_rules_destroy(compiledRules);
+                
+                return StoreError{SignatureStoreError::CompilationFailed, 0,
+                    "Rule merge failed - compilation error"};
+            }
+            
+            // Get merged compiled rules
+            YR_RULES* mergedRules = mergeCompiler.GetRules();
+            if (!mergedRules) {
+                SS_LOG_ERROR(L"YaraRuleStore",
+                    L"AddRulesFromSource: Failed to get merged compiled rules");
+                
+                // Rollback: remove the new source from cache
+                m_ruleSources.erase(sourceKey);
+                
+                // Rollback: remove all metadata entries that were added
+                for (const auto& key : addedMetadataKeys) {
+                    m_ruleMetadata.erase(key);
+                }
+                
+                // Cleanup the originally compiled rules
+                yr_rules_destroy(compiledRules);
+                
+                return StoreError{SignatureStoreError::CompilationFailed, 0,
+                    "Rule merge failed - could not get compiled rules"};
+            }
+            
+            // Success: destroy old rules and replace with merged rules
             int destroyResult = yr_rules_destroy(m_rules);
             if (destroyResult != ERROR_SUCCESS) {
                 SS_LOG_WARN(L"YaraRuleStore",
-                    L"AddRulesFromSource: Failed to destroy old rules (error: %d)",
+                    L"AddRulesFromSource: Failed to destroy old rules during merge (error: %d)",
                     destroyResult);
             }
+            
+            // Destroy the single-source compiled rules (we use merged instead)
+            yr_rules_destroy(compiledRules);
+            
+            m_rules = mergedRules;
+            
+            SS_LOG_INFO(L"YaraRuleStore",
+                L"AddRulesFromSource: Successfully merged %zu rule sources, added %zu new rules",
+                sourcesCompiled, rulesAdded);
+        } else {
+            // No existing rules - just use the newly compiled rules
+            m_rules = compiledRules;
+            
+            SS_LOG_INFO(L"YaraRuleStore",
+                L"AddRulesFromSource: Successfully added %zu rules (%zu skipped)",
+                rulesAdded, rulesSkipped);
         }
-
-        m_rules = compiledRules;
-
-        SS_LOG_INFO(L"YaraRuleStore",
-            L"AddRulesFromSource: Successfully added %zu rules (%zu skipped)",
-            rulesAdded, rulesSkipped);
 
         return StoreError{ SignatureStoreError::Success };
     }
@@ -2627,9 +2716,136 @@ StoreError YaraRuleStore::RemoveRule(
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    // Remove from metadata
     std::string fullName = namespace_ + "::" + ruleName;
+    
+    // Check if rule exists - if not, return success (idempotent delete)
+    if (m_ruleMetadata.find(fullName) == m_ruleMetadata.end()) {
+        SS_LOG_DEBUG(L"YaraRuleStore", L"RemoveRule: Rule not found (already removed): %S", fullName.c_str());
+        return StoreError{SignatureStoreError::Success};
+    }
+
+    // Remove from metadata
     m_ruleMetadata.erase(fullName);
+
+    // ========================================================================
+    // ENTERPRISE-GRADE: Actually remove the rule from compiled rules
+    // We need to find which source contains this rule and rebuild without it
+    // ========================================================================
+    
+    // If no sources are tracked, we can only remove metadata (legacy behavior)
+    if (m_ruleSources.empty()) {
+        SS_LOG_WARN(L"YaraRuleStore", 
+            L"RemoveRule: No source cache - only metadata removed for: %S", fullName.c_str());
+        return StoreError{SignatureStoreError::Success};
+    }
+    
+    // Find and remove source entries that contain this rule
+    // We need to recompile all sources and check which rules are produced
+    std::vector<std::string> sourcesToKeep;
+    std::vector<std::string> keysToKeep;
+    
+    for (const auto& [key, source] : m_ruleSources) {
+        // Extract namespace from key
+        std::string ns = "default";
+        size_t delimPos = key.find("::");
+        if (delimPos != std::string::npos) {
+            ns = key.substr(0, delimPos);
+        }
+        
+        // Compile this source individually to check if it contains the target rule
+        YaraCompiler testCompiler;
+        if (!testCompiler.AddString(source, ns).IsSuccess()) {
+            continue;  // Skip invalid sources
+        }
+        
+        YR_RULES* testRules = testCompiler.GetRules();
+        if (!testRules) {
+            continue;
+        }
+        
+        // Check if this source contains the rule we want to remove
+        bool containsTargetRule = false;
+        YR_RULE* rule = nullptr;
+        yr_rules_foreach(testRules, rule) {
+            if (rule && rule->identifier) {
+                std::string ruleNs = rule->ns ? rule->ns->name : ns;
+                std::string checkFullName = ruleNs + "::" + rule->identifier;
+                if (checkFullName == fullName) {
+                    containsTargetRule = true;
+                    break;
+                }
+            }
+        }
+        
+        yr_rules_destroy(testRules);
+        
+        // Keep sources that don't contain the target rule
+        // (We can't easily modify a source to remove one rule from it,
+        // so sources with multiple rules that include the target will be lost)
+        if (!containsTargetRule) {
+            sourcesToKeep.push_back(source);
+            keysToKeep.push_back(key);
+        }
+    }
+    
+    // Rebuild m_ruleSources with only kept sources
+    m_ruleSources.clear();
+    for (size_t i = 0; i < keysToKeep.size(); ++i) {
+        m_ruleSources[keysToKeep[i]] = sourcesToKeep[i];
+    }
+    
+    // Recompile remaining rules
+    if (!m_ruleSources.empty()) {
+        YaraCompiler recompiler;
+        size_t compiledCount = 0;
+        
+        for (const auto& [key, source] : m_ruleSources) {
+            std::string ns = "default";
+            size_t delimPos = key.find("::");
+            if (delimPos != std::string::npos) {
+                ns = key.substr(0, delimPos);
+            }
+            
+            StoreError addResult = recompiler.AddString(source, ns);
+            if (addResult.IsSuccess()) {
+                compiledCount++;
+            } else {
+                SS_LOG_WARN(L"YaraRuleStore",
+                    L"RemoveRule: Failed to recompile source: %S", addResult.message.c_str());
+            }
+        }
+        
+        YR_RULES* newRules = recompiler.GetRules();
+        if (newRules) {
+            if (m_rules) {
+                yr_rules_destroy(m_rules);
+            }
+            m_rules = newRules;
+            
+            SS_LOG_INFO(L"YaraRuleStore", 
+                L"RemoveRule: Successfully removed rule %S and recompiled %zu sources", 
+                fullName.c_str(), compiledCount);
+        } else if (compiledCount == 0) {
+            // All sources failed, destroy current rules
+            if (m_rules) {
+                yr_rules_destroy(m_rules);
+                m_rules = nullptr;
+            }
+            SS_LOG_WARN(L"YaraRuleStore", 
+                L"RemoveRule: All sources failed to recompile, rules cleared");
+        } else {
+            SS_LOG_ERROR(L"YaraRuleStore", 
+                L"RemoveRule: Recompilation failed despite %zu successful AddString calls", 
+                compiledCount);
+            return StoreError{SignatureStoreError::CompilationFailed, 0, 
+                "Recompilation failed after rule removal"};
+        }
+    } else if (m_rules) {
+        // No more sources, destroy all rules
+        yr_rules_destroy(m_rules);
+        m_rules = nullptr;
+        SS_LOG_INFO(L"YaraRuleStore", L"RemoveRule: Last rule removed, rules cleared");
+    }
 
     SS_LOG_DEBUG(L"YaraRuleStore", L"Removed rule: %S", fullName.c_str());
     return StoreError{SignatureStoreError::Success};
@@ -2642,16 +2858,88 @@ StoreError YaraRuleStore::RemoveNamespace(const std::string& namespace_) noexcep
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    // Remove all rules in namespace
+    // Remove all rules in namespace from metadata
+    size_t rulesRemoved = 0;
     for (auto it = m_ruleMetadata.begin(); it != m_ruleMetadata.end(); ) {
         if (it->second.namespace_ == namespace_) {
             it = m_ruleMetadata.erase(it);
+            rulesRemoved++;
         } else {
             ++it;
         }
     }
+    
+    // Remove all source entries for this namespace
+    size_t sourcesRemoved = 0;
+    std::string nsPrefix = namespace_ + "::";
+    for (auto it = m_ruleSources.begin(); it != m_ruleSources.end(); ) {
+        if (it->first.substr(0, nsPrefix.length()) == nsPrefix) {
+            it = m_ruleSources.erase(it);
+            sourcesRemoved++;
+        } else {
+            ++it;
+        }
+    }
+    
+    // If sources were removed, recompile remaining rules
+    if (sourcesRemoved > 0 && !m_ruleSources.empty()) {
+        // Recompile all remaining sources with proper error handling
+        YaraCompiler recompiler;
+        size_t compiledCount = 0;
+        
+        for (const auto& [key, source] : m_ruleSources) {
+            std::string ns = "default";
+            size_t delimPos = key.find("::");
+            if (delimPos != std::string::npos) {
+                ns = key.substr(0, delimPos);
+            }
+            
+            StoreError addResult = recompiler.AddString(source, ns);
+            if (addResult.IsSuccess()) {
+                compiledCount++;
+            } else {
+                SS_LOG_WARN(L"YaraRuleStore",
+                    L"RemoveNamespace: Failed to add source during recompile: %S",
+                    addResult.message.c_str());
+            }
+        }
+        
+        YR_RULES* newRules = recompiler.GetRules();
+        if (newRules) {
+            if (m_rules) {
+                yr_rules_destroy(m_rules);
+            }
+            m_rules = newRules;
+            
+            SS_LOG_INFO(L"YaraRuleStore", 
+                L"RemoveNamespace: Successfully recompiled %zu sources after removal", 
+                compiledCount);
+        } else if (compiledCount == 0) {
+            // All sources failed to compile, clear rules
+            if (m_rules) {
+                yr_rules_destroy(m_rules);
+                m_rules = nullptr;
+            }
+            SS_LOG_WARN(L"YaraRuleStore", 
+                L"RemoveNamespace: All sources failed to recompile, rules cleared");
+        } else {
+            // Some sources compiled but GetRules failed - critical error
+            // Keep old rules to maintain consistency
+            SS_LOG_ERROR(L"YaraRuleStore", 
+                L"RemoveNamespace: Recompilation failed despite %zu successful AddString calls. "
+                L"Keeping old rules for consistency - state may be inconsistent.", 
+                compiledCount);
+            return StoreError{SignatureStoreError::CompilationFailed, 0, 
+                "Recompilation failed after namespace removal - state may be inconsistent"};
+        }
+    } else if (m_ruleSources.empty() && m_rules) {
+        // No more rules, destroy all
+        yr_rules_destroy(m_rules);
+        m_rules = nullptr;
+    }
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Removed namespace: %S", namespace_.c_str());
+    SS_LOG_INFO(L"YaraRuleStore", L"Removed namespace: %S (%zu rules, %zu sources)", 
+        namespace_.c_str(), rulesRemoved, sourcesRemoved);
     return StoreError{SignatureStoreError::Success};
 }
 

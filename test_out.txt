@@ -1,0 +1,39 @@
+
+========================================================================
+  ShadowStrike CryptoUtils Test Runner
+========================================================================
+
+
+========================================================================
+  ShadowStrike  Test Suite
+========================================================================
+
+Note: Google Test filter = WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+[==========] Running 1 test from 1 test suite.
+Running 3798 tests from 1 test suites
+
+[----------] Global test environment set-up.
+------------------------------------------------------------------------
+Test Suite: WhitelistStoreTest
+------------------------------------------------------------------------
+[ RUN      ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+  [ RUN      ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly
+[       OK ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly (1580 ms)
+  [       OK ] WhitelistStoreTest.AddHash_WithExpiration_ExpiresCorrectly (1580881 ?s)
+
+Test Suite Complete: WhitelistStoreTest (1581 ms)
+  Tests: 124 | Passed: 1 | Failed: 0
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (1584 ms total)
+[  PASSED  ] 1 test.
+========================================================================
+  TEST SUMMARY
+========================================================================
+  Total Tests:   1
+  Passed:          1 (100.0%)
+  Failed:          0 (0.0%)
+========================================================================
+
+? ALL TESTS PASSED
+

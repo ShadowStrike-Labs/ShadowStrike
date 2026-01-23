@@ -1,0 +1,52 @@
+
+========================================================================
+  ShadowStrike CryptoUtils Test Runner
+========================================================================
+
+
+========================================================================
+  ShadowStrike  Test Suite
+========================================================================
+
+Note: Google Test filter = WhitelistStoreTest.RevokeEntry*
+[==========] Running 1 test from 1 test suite.
+Running 3798 tests from 1 test suites
+
+[----------] Global test environment set-up.
+------------------------------------------------------------------------
+Test Suite: WhitelistStoreTest
+------------------------------------------------------------------------
+[ RUN      ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+  [ RUN      ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp(758): error: Value of: entry.has_value()
+  Actual: false
+Expected: true
+
+    C:\ShadowStrike\ShadowStrike\tests\unit\database_systems\white_list\WhiteListStore_tests.cpp:758
+    Value of: entry.has_value()
+  Actual: false
+Expected: true
+
+[  FAILED  ] WhitelistStoreTest.RevokeEntry_SoftDeletes (81 ms)
+  [  FAILED  ] WhitelistStoreTest.RevokeEntry_SoftDeletes (81821 ?s)
+
+Test Suite Complete: WhitelistStoreTest (81 ms)
+  Tests: 124 | Passed: 0 | Failed: 1
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (83 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] WhitelistStoreTest.RevokeEntry_SoftDeletes
+
+ 1 FAILED TEST
+========================================================================
+  TEST SUMMARY
+========================================================================
+  Total Tests:   1
+  Passed:          0 (0.0%)
+  Failed:          1 (100.0%)
+========================================================================
+
+? TESTS FAILED
+

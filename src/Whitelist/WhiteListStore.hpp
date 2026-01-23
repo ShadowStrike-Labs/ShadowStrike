@@ -614,6 +614,14 @@ public:
         uint64_t& usedSize
     ) noexcept;
     
+    /**
+     * @brief Enable write mode after Initialize (for loading existing writable database)
+     * @param baseAddress Writable memory base address
+     * @param size Size of index region in bytes
+     * @note Call after Initialize() to enable modifications on existing database
+     */
+    void EnableWriteMode(void* baseAddress, uint64_t size) noexcept;
+    
     // ========================================================================
     // QUERY OPERATIONS
     // ========================================================================
@@ -1052,6 +1060,14 @@ public:
         uint64_t& usedSize
     ) noexcept;
     
+    /**
+     * @brief Enable write mode after Initialize (for loading existing writable database)
+     * @param baseAddress Writable memory base address
+     * @param size Size of index region in bytes
+     * @note Call after Initialize() to enable modifications on existing database
+     */
+    void EnableWriteMode(void* baseAddress, uint64_t size) noexcept;
+    
     // ========================================================================
     // QUERY OPERATIONS
     // ========================================================================
@@ -1120,6 +1136,14 @@ public:
      */
     [[nodiscard]] StoreError Compact() noexcept;
     
+    /**
+     * @brief Flush pending records to persistent storage
+     * @return Success or error code
+     * @note Call this before shutdown to ensure all inserts are persisted
+     * @note Records are automatically flushed during Compact()
+     */
+    [[nodiscard]] StoreError Flush() noexcept;
+    
     // ========================================================================
     // STATISTICS AND DIAGNOSTICS
     // ========================================================================
@@ -1152,11 +1176,97 @@ private:
     // ========================================================================
     // INTERNAL TYPES
     // ========================================================================
-    struct TrieNode;
+    
+    /**
+     * @brief Persistent record for path entry storage (ThreatIntel Hybrid Model)
+     * 
+     * This structure is stored in the memory-mapped file region to enable
+     * persistence across application restarts. On startup, HeapTrieNode index
+     * is rebuilt by iterating these records.
+     * 
+     * Following the proven ThreatIntel pattern:
+     * - Raw data stored in memory-mapped file (persistent)
+     * - HeapTrieNode index rebuilt on startup (fast lookups)
+     */
+    #pragma pack(push, 1)
+    struct PathEntryRecord {
+        static constexpr uint32_t MAGIC = 0x50455052; // 'REPR' - Path Entry Record
+        static constexpr uint16_t VERSION = 1;
+        static constexpr size_t MAX_PATH_LENGTH = 2048;
+        
+        uint32_t magic{MAGIC};              ///< Record magic for validation
+        uint16_t version{VERSION};          ///< Record version
+        uint16_t pathLength{0};             ///< Length of path in bytes (UTF-8)
+        uint64_t entryOffset{0};            ///< Offset to whitelist entry
+        uint8_t matchMode{0};               ///< PathMatchMode cast to uint8
+        uint8_t flags{0};                   ///< Flags (bit 0 = deleted)
+        uint16_t reserved{0};               ///< Reserved for alignment
+        uint32_t pathHash{0};               ///< FNV-1a hash for quick filtering
+        char path[MAX_PATH_LENGTH];         ///< Normalized UTF-8 path
+        
+        [[nodiscard]] bool IsValid() const noexcept {
+            return magic == MAGIC && version == VERSION && pathLength <= MAX_PATH_LENGTH;
+        }
+        
+        [[nodiscard]] bool IsDeleted() const noexcept {
+            return (flags & 0x01) != 0;
+        }
+        
+        void MarkDeleted() noexcept {
+            flags |= 0x01;
+        }
+        
+        [[nodiscard]] std::string_view GetPath() const noexcept {
+            return std::string_view(path, std::min<size_t>(pathLength, MAX_PATH_LENGTH));
+        }
+    };
+    #pragma pack(pop)
+    
+    static_assert(sizeof(PathEntryRecord) == 2072, "PathEntryRecord must be 2072 bytes");
+    
+    /**
+     * @brief Heap-allocated trie node for path indexing
+     * 
+     * Uses std::unordered_map for unlimited children per node,
+     * following the proven DomainSuffixTrie pattern from ThreatIntelIndex.
+     * This provides enterprise-grade reliability with unlimited branching.
+     */
+    struct HeapTrieNode {
+        /// Children indexed by path segment (supports unlimited children)
+        std::unordered_map<std::string, std::unique_ptr<HeapTrieNode>> children;
+        
+        /// Entry offset (valid if isTerminal is true)
+        uint64_t entryOffset{0};
+        
+        /// Match mode for this terminal node
+        PathMatchMode matchMode{PathMatchMode::Exact};
+        
+        /// Is this a terminal node (has an entry)?
+        bool isTerminal{false};
+        
+        HeapTrieNode() = default;
+        ~HeapTrieNode() = default;
+        
+        // Non-copyable, movable
+        HeapTrieNode(const HeapTrieNode&) = delete;
+        HeapTrieNode& operator=(const HeapTrieNode&) = delete;
+        HeapTrieNode(HeapTrieNode&&) = default;
+        HeapTrieNode& operator=(HeapTrieNode&&) = default;
+    };
     
     // ========================================================================
     // MEMBER DATA
     // ========================================================================
+    
+    /// Heap-allocated trie root (primary storage for writable index)
+    std::unique_ptr<HeapTrieNode> m_heapRoot;
+    
+    /// Persistent path entry records (ThreatIntel Hybrid Model)
+    /// These are stored in memory-mapped region for persistence
+    std::vector<PathEntryRecord> m_pathRecords;
+    
+    /// Next record index for appending new entries
+    std::atomic<uint64_t> m_nextRecordIndex{0};
     
     const MemoryMappedView* m_view{nullptr};  ///< Read-only view (not owned)
     void* m_baseAddress{nullptr};              ///< Writable base (not owned)
@@ -1172,7 +1282,42 @@ private:
     mutable std::atomic<uint64_t> m_lookupHits{0};    ///< Successful lookups
     mutable std::atomic<uint64_t> m_insertCount{0};   ///< Total inserts
     mutable std::atomic<uint64_t> m_removeCount{0};   ///< Total removes
-};
+    
+    // ========================================================================
+    // INTERNAL HELPER METHODS
+    // ========================================================================
+    
+    /**
+     * @brief Insert path into HeapTrieNode (index only, no persistence)
+     * @param normalizedPath Normalized UTF-8 path
+     * @param mode Match mode
+     * @param entryOffset Entry offset
+     * @return True if inserted successfully
+     */
+    bool InsertIntoHeapTrie(
+        std::string_view normalizedPath,
+        PathMatchMode mode,
+        uint64_t entryOffset
+    ) noexcept;
+    
+    /**
+     * @brief Rebuild HeapTrieNode index from persistent records
+     * @return Number of entries rebuilt
+     */
+    uint64_t RebuildIndexFromRecords() noexcept;
+    
+    /**
+     * @brief Write records to memory-mapped region for persistence
+     * @return StoreError indicating success or failure
+     */
+    StoreError FlushRecordsToStorage() noexcept;
+    
+    /**
+     * @brief Load records from memory-mapped region
+     * @return StoreError indicating success or failure  
+     */
+    StoreError LoadRecordsFromStorage() noexcept;
+};  // class PathIndex
 
 // ============================================================================
 // QUERY CACHE (LRU with SeqLock for lock-free reads)
@@ -1760,6 +1905,10 @@ public:
     
     /// @brief Clear query cache
     void ClearCache() noexcept;
+    
+    /// @brief Clear query cache - internal version that doesn't lock
+    /// @note Caller MUST hold m_globalLock before calling
+    void ClearCacheUnsafe() noexcept;
     
     // ========================================================================
     // STATISTICS

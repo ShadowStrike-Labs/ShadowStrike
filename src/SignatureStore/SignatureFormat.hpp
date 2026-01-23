@@ -451,6 +451,7 @@ enum class SignatureStoreError : uint32_t {
     MappingFailed,
     ChecksumMismatch,
     TooLarge,
+    CompilationFailed,      // Yara rule compilation failed
     Unknown = 0xFFFFFFFF
 };
 
