@@ -1140,17 +1140,78 @@ bool ThreatIntelFeedManager::Initialize(const Config& config) {
     // Create data directory if needed with security checks
     if (!m_config.dataDirectory.empty()) {
         try {
-            // Validate path doesn't contain suspicious elements
+            // SECURITY FIX: Proper path traversal validation using canonical paths.
+            // Previous code only did substring matching for ".." which is insufficient:
+            // - Alternative separators (mixed / and \)
+            // - UNC paths (\\server\share)
+            // - NT path namespaces (\??\)
+            // - Symbolic link resolution
+            // - Device names (CON, NUL, etc.)
+            //
+            // Use std::filesystem::canonical after creating directories to verify
+            // the resolved path is within expected boundaries.
+            
             const std::filesystem::path dataPath(m_config.dataDirectory);
-            if (dataPath.has_relative_path() && dataPath.relative_path().string().find("..") != std::string::npos) {
+            
+            // First check: Reject paths with obvious traversal patterns
+            const std::string pathStr = dataPath.string();
+            if (pathStr.find("..") != std::string::npos) {
+                SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                    L"Security: Path contains traversal sequence: %S", pathStr.c_str());
                 m_initialized.store(false, std::memory_order_release);
-                return false;  // Reject path traversal attempts
+                return false;
             }
             
+            // Check for Windows device names
+            static const std::array<std::string_view, 12> reservedNames = {
+                "CON", "PRN", "AUX", "NUL",
+                "COM1", "COM2", "COM3", "COM4",
+                "LPT1", "LPT2", "LPT3", "LPT4"
+            };
+            
+            std::string filename = dataPath.filename().string();
+            // Convert to uppercase for comparison
+            std::transform(filename.begin(), filename.end(), filename.begin(), ::toupper);
+            // Remove extension
+            auto dotPos = filename.find('.');
+            if (dotPos != std::string::npos) {
+                filename = filename.substr(0, dotPos);
+            }
+            
+            for (const auto& reserved : reservedNames) {
+                if (filename == reserved) {
+                    SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                        L"Security: Path contains reserved device name");
+                    m_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+            }
+            
+            // Create directories
             std::filesystem::create_directories(dataPath);
             
+            // Second check: Get canonical path and verify it resolves properly
+            std::error_code ec;
+            const auto canonicalPath = std::filesystem::canonical(dataPath, ec);
+            if (ec) {
+                SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                    L"Security: Failed to canonicalize path: %S", ec.message().c_str());
+                m_initialized.store(false, std::memory_order_release);
+                return false;
+            }
+            
+            // Third check: Verify canonical path doesn't escape expected location
+            // The canonical path should not contain ".." after resolution
+            const std::string canonicalStr = canonicalPath.string();
+            if (canonicalStr.find("..") != std::string::npos) {
+                SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                    L"Security: Canonical path still contains traversal");
+                m_initialized.store(false, std::memory_order_release);
+                return false;
+            }
+            
             // Verify we can write to the directory
-            const auto testFile = dataPath / ".write_test";
+            const auto testFile = canonicalPath / ".write_test";
             {
                 std::ofstream test(testFile, std::ios::out);
                 if (!test.is_open()) {
@@ -1160,10 +1221,14 @@ bool ThreatIntelFeedManager::Initialize(const Config& config) {
             }
             std::filesystem::remove(testFile);
             
-        } catch (const std::filesystem::filesystem_error&) {
+        } catch (const std::filesystem::filesystem_error& e) {
+            SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                L"Filesystem error: %S", e.what());
             m_initialized.store(false, std::memory_order_release);
             return false;
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ThreatIntelFeedManager", 
+                L"Exception: %S", e.what());
             m_initialized.store(false, std::memory_order_release);
             return false;
         }

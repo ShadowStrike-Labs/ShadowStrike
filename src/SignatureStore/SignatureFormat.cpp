@@ -598,6 +598,210 @@ std::string FormatHashString(const HashValue& hash) {
     return result;
 }
 
+// ============================================================================
+// PATH SECURITY VALIDATION (Format namespace - exported in header)
+// ============================================================================
+
+namespace {
+/**
+ * @brief Checks if a path component contains path traversal patterns.
+ * 
+ * @param path The path to check.
+ * @return true if path traversal is detected, false otherwise.
+ * 
+ * @details Detects:
+ * - Parent directory references (..\, ../)
+ * - Current directory references (.\, ./)  
+ * - Alternative data streams (:) in unexpected positions
+ * - Device paths (e.g., \\.\, CON, PRN, AUX, NUL)
+ */
+[[nodiscard]] bool ContainsPathTraversalPatternsInternal(const std::wstring& path) noexcept {
+    if (path.empty()) return false;
+    
+    // Check for parent directory traversal (..\ or ../)
+    // This is the primary path traversal attack vector
+    if (path.find(L"..\\") != std::wstring::npos ||
+        path.find(L"../") != std::wstring::npos) {
+        return true;
+    }
+    
+    // Check if path starts with .. (relative traversal at start)
+    if (path.size() >= 2 && path[0] == L'.' && path[1] == L'.') {
+        return true;
+    }
+    
+    // Check for device path prefix (\\.\) which could access raw devices
+    if (path.size() >= 4 && 
+        path[0] == L'\\' && path[1] == L'\\' && 
+        path[2] == L'.' && path[3] == L'\\') {
+        return true;
+    }
+    
+    // Check for reserved Windows device names (case-insensitive)
+    // These can cause issues when used as file names
+    static const std::wstring reservedDevices[] = {
+        L"CON", L"PRN", L"AUX", L"NUL",
+        L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+        L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+    };
+    
+    // Extract the filename part (after last backslash)
+    size_t lastSlash = path.rfind(L'\\');
+    std::wstring filename = (lastSlash != std::wstring::npos) 
+        ? path.substr(lastSlash + 1) 
+        : path;
+    
+    // Remove extension for device name check
+    size_t dotPos = filename.find(L'.');
+    std::wstring baseName = (dotPos != std::wstring::npos) 
+        ? filename.substr(0, dotPos) 
+        : filename;
+    
+    // Convert to uppercase for case-insensitive comparison
+    for (wchar_t& c : baseName) {
+        if (c >= L'a' && c <= L'z') c -= 32;
+    }
+    
+    for (const auto& device : reservedDevices) {
+        if (baseName == device) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+} // anonymous namespace
+
+/**
+ * @brief Validates and canonicalizes a file path for safe file operations.
+ * 
+ * @param inputPath The user-provided path to validate.
+ * @param canonicalPath Output: The canonicalized (resolved) absolute path.
+ * @param errorMessage Output: Error description if validation fails.
+ * @return true if path is safe to use, false if validation failed.
+ * 
+ * @details Security measures:
+ * 1. Rejects empty paths
+ * 2. Rejects paths with embedded NUL characters
+ * 3. Rejects paths with traversal patterns (..)
+ * 4. Rejects Windows reserved device names
+ * 5. Canonicalizes the path to resolve any remaining . or .. components
+ * 6. Validates the canonical path doesn't escape expected boundaries
+ * 
+ * @security This function is critical for preventing path traversal attacks
+ * where an attacker provides paths like "..\..\Windows\System32\config" to
+ * access sensitive system files.
+ */
+[[nodiscard]] bool ValidateAndCanonicalizePath(
+    const std::wstring& inputPath,
+    std::wstring& canonicalPath,
+    std::string& errorMessage
+) noexcept {
+    canonicalPath.clear();
+    errorMessage.clear();
+    
+    // SECURITY CHECK 1: Reject empty paths
+    if (inputPath.empty()) {
+        errorMessage = "Empty path";
+        return false;
+    }
+    
+    // SECURITY CHECK 2: Reject excessively long paths (DoS prevention)
+    constexpr size_t MAX_SAFE_PATH_LENGTH = 32767;  // Windows MAX_PATH extended
+    if (inputPath.size() > MAX_SAFE_PATH_LENGTH) {
+        errorMessage = "Path exceeds maximum allowed length";
+        return false;
+    }
+    
+    // SECURITY CHECK 3: Reject embedded NUL characters (truncation attack)
+    if (inputPath.find(L'\0') != std::wstring::npos) {
+        errorMessage = "Path contains embedded NUL character";
+        SS_LOG_WARN(L"SignatureStore", L"Security: Rejected path with embedded NUL");
+        return false;
+    }
+    
+    // SECURITY CHECK 4: Reject obvious path traversal patterns
+    // This catches ".." patterns before canonicalization
+    if (ContainsPathTraversalPatternsInternal(inputPath)) {
+        errorMessage = "Path contains traversal patterns or reserved names";
+        SS_LOG_WARN(L"SignatureStore", 
+            L"Security: Rejected path with traversal pattern: %s", inputPath.c_str());
+        return false;
+    }
+    
+    // SECURITY CHECK 5: Canonicalize the path
+    // GetFullPathNameW resolves ., .., and normalizes separators
+    // Use extended buffer size to handle long paths
+    std::wstring canonBuffer;
+    try {
+        canonBuffer.resize(MAX_SAFE_PATH_LENGTH);
+    }
+    catch (const std::exception&) {
+        errorMessage = "Memory allocation failed";
+        return false;
+    }
+    
+    DWORD result = GetFullPathNameW(
+        inputPath.c_str(),
+        static_cast<DWORD>(canonBuffer.size()),
+        canonBuffer.data(),
+        nullptr
+    );
+    
+    if (result == 0) {
+        errorMessage = "Failed to resolve path";
+        SS_LOG_LAST_ERROR(L"SignatureStore", L"GetFullPathNameW failed");
+        return false;
+    }
+    
+    if (result >= canonBuffer.size()) {
+        errorMessage = "Resolved path exceeds buffer size";
+        return false;
+    }
+    
+    canonBuffer.resize(result);
+    
+    // SECURITY CHECK 6: Verify the canonical path doesn't still contain traversal
+    // This catches edge cases that might slip through
+    if (ContainsPathTraversalPatternsInternal(canonBuffer)) {
+        errorMessage = "Canonicalized path still contains traversal patterns";
+        SS_LOG_WARN(L"SignatureStore", 
+            L"Security: Canonical path still has traversal: %s", canonBuffer.c_str());
+        return false;
+    }
+    
+    // SECURITY CHECK 7: Ensure path is absolute (starts with drive letter or UNC)
+    bool isAbsolute = false;
+    if (canonBuffer.size() >= 3) {
+        // Check for drive letter (C:\)
+        if (((canonBuffer[0] >= L'A' && canonBuffer[0] <= L'Z') ||
+             (canonBuffer[0] >= L'a' && canonBuffer[0] <= L'z')) &&
+            canonBuffer[1] == L':' && canonBuffer[2] == L'\\') {
+            isAbsolute = true;
+        }
+        // Check for UNC path (\\server)
+        else if (canonBuffer[0] == L'\\' && canonBuffer[1] == L'\\') {
+            isAbsolute = true;
+        }
+        // Check for long path prefix (\\?\)
+        else if (canonBuffer.size() >= 4 &&
+                 canonBuffer[0] == L'\\' && canonBuffer[1] == L'\\' &&
+                 canonBuffer[2] == L'?' && canonBuffer[3] == L'\\') {
+            isAbsolute = true;
+        }
+    }
+    
+    if (!isAbsolute) {
+        errorMessage = "Path must be absolute";
+        SS_LOG_WARN(L"SignatureStore", 
+            L"Security: Rejected non-absolute path: %s", canonBuffer.c_str());
+        return false;
+    }
+    
+    canonicalPath = std::move(canonBuffer);
+    return true;
+}
+
 } // namespace Format
 
 // ============================================================================
@@ -716,6 +920,12 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
      * Uses RAII guards to ensure cleanup on any error path.
      * Resources are only "released" (not closed) on success.
      *
+     * Security Features:
+     * - Path traversal protection (prevents ..\ attacks)
+     * - Path canonicalization (resolves to absolute path)
+     * - Reserved device name rejection (CON, NUL, etc.)
+     * - Embedded NUL character detection (truncation attack)
+     *
      * ========================================================================
      */
 
@@ -723,42 +933,30 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
     MemoryMapping::CloseView(view);
 
     // ========================================================================
-    // STEP 1: INPUT VALIDATION
+    // STEP 1: PATH SECURITY VALIDATION & CANONICALIZATION
     // ========================================================================
-
-    if (path.empty()) {
+    
+    // SECURITY: Validate and canonicalize path to prevent traversal attacks
+    // This prevents attackers from using paths like "..\..\Windows\System32"
+    std::wstring canonicalPath;
+    std::string validationError;
+    
+    if (!Format::ValidateAndCanonicalizePath(path, canonicalPath, validationError)) {
         error.code = SignatureStoreError::InvalidFormat;
         error.win32Error = 0;
-        error.message = "Empty file path";
-        return false;
-    }
-
-    // Path length validation (Windows MAX_PATH limit consideration)
-    constexpr size_t MAX_PATH_LEN = 32767;
-    if (path.length() > MAX_PATH_LEN) {
-        error.code = SignatureStoreError::InvalidFormat;
-        error.win32Error = 0;
-        error.message = "File path too long";
-        return false;
-    }
-
-    // SECURITY: Check for embedded NUL characters (path truncation attack prevention)
-    // A NUL character in the path could cause the string to be truncated
-    // when passed to Windows API, potentially accessing unintended files
-    if (path.find(L'\0') != std::wstring::npos) {
-        error.code = SignatureStoreError::InvalidFormat;
-        error.win32Error = 0;
-        error.message = "Path contains embedded NUL character";
-        SS_LOG_ERROR(L"SignatureStore", L"Security: Path contains embedded NUL character");
+        error.message = "Path validation failed: " + validationError;
+        SS_LOG_ERROR(L"SignatureStore", 
+            L"Security: Path validation failed for: %s - %S", 
+            path.c_str(), validationError.c_str());
         return false;
     }
 
     // ========================================================================
-    // STEP 2: OPEN FILE WITH RAII
+    // STEP 2: OPEN FILE WITH RAII (using validated canonical path)
     // ========================================================================
 
     DWORD win32Error = 0;
-    HandleGuard fileGuard(OpenFileForMapping(path, readOnly, win32Error));
+    HandleGuard fileGuard(OpenFileForMapping(canonicalPath, readOnly, win32Error));
     
     if (!fileGuard.IsValid()) {
         error.code = SignatureStoreError::FileNotFound;

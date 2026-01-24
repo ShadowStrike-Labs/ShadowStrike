@@ -556,6 +556,142 @@ namespace ShadowStrike {
                 }
                 return result;
             }
+
+            // ========================================================================
+            //                      SQL SECURITY HELPERS
+            // ========================================================================
+
+            /**
+             * @brief Escapes special characters in SQL string literals to prevent SQL injection.
+             * 
+             * @param input The string to escape.
+             * @return Escaped string safe for use in SQL string literals.
+             * 
+             * @details Escapes single quotes (') by doubling them ('') as per SQL standard.
+             * This is the only character that needs escaping in SQL string literals.
+             * 
+             * @note This should be used when dynamically constructing SQL with string literals.
+             * Prefer parameterized queries when possible for better security.
+             */
+            [[nodiscard]] std::string EscapeSqlString(std::string_view input) noexcept {
+                std::string result;
+                result.reserve(input.size() + input.size() / 8);  // Extra space for escapes
+                
+                for (const char c : input) {
+                    if (c == '\'') {
+                        result += "''";  // SQL standard: escape single quote by doubling
+                    }
+                    else {
+                        result += c;
+                    }
+                }
+                return result;
+            }
+
+            /**
+             * @brief Escapes special characters for SQL LIKE pattern to prevent injection.
+             * 
+             * @param input The pattern string to escape.
+             * @return Escaped string safe for use in SQL LIKE clauses.
+             * 
+             * @details Escapes:
+             * - Single quotes (') -> '' (SQL string literal escape)
+             * - Percent (%) -> [%] (LIKE wildcard escape using bracket notation)
+             * - Underscore (_) -> [_] (LIKE single-char wildcard escape)
+             * - Left bracket ([) -> [[] (escape bracket itself)
+             * 
+             * @note Uses SQLite bracket escape syntax which is portable across most SQL databases.
+             */
+            [[nodiscard]] std::string EscapeSqlLikePattern(std::string_view input) noexcept {
+                std::string result;
+                result.reserve(input.size() + input.size() / 4);  // Extra space for escapes
+                
+                for (const char c : input) {
+                    switch (c) {
+                        case '\'': result += "''";   break;  // Escape single quote
+                        case '[':  result += "[[]";  break;  // Escape bracket first (meta char)
+                        case '%':  result += "[%]";  break;  // Escape LIKE wildcard
+                        case '_':  result += "[_]";  break;  // Escape LIKE single-char wildcard
+                        default:   result += c;      break;
+                    }
+                }
+                return result;
+            }
+
+            // ========================================================================
+            //                      CSV SECURITY HELPERS  
+            // ========================================================================
+
+            /**
+             * @brief Sanitizes a field value for CSV export to prevent formula injection.
+             * 
+             * @param field The field value to sanitize.
+             * @return Sanitized string safe for CSV export.
+             * 
+             * @details CSV Formula Injection (aka CSV Injection or DDE Injection) occurs
+             * when a field begins with characters that spreadsheet applications interpret
+             * as formula indicators: =, @, +, -, or tab/carriage return.
+             * 
+             * Prevention: Prepends a single quote (') to force text interpretation.
+             * This is the recommended OWASP mitigation technique.
+             * 
+             * @see https://owasp.org/www-community/attacks/CSV_Injection
+             */
+            [[nodiscard]] std::string SanitizeCsvField(std::string_view field) noexcept {
+                if (field.empty()) {
+                    return std::string();
+                }
+                
+                // Characters that trigger formula interpretation in spreadsheets
+                const char firstChar = field.front();
+                const bool needsSanitization = (firstChar == '=' || 
+                                                 firstChar == '@' || 
+                                                 firstChar == '+' || 
+                                                 firstChar == '-' ||
+                                                 firstChar == '\t' ||
+                                                 firstChar == '\r');
+                
+                if (needsSanitization) {
+                    // Prepend single quote to force text interpretation
+                    std::string result;
+                    result.reserve(field.size() + 1);
+                    result += '\'';
+                    result += field;
+                    return result;
+                }
+                
+                return std::string(field);
+            }
+
+            /**
+             * @brief Wide string version of SanitizeCsvField.
+             * 
+             * @param field The wide string field value to sanitize.
+             * @return Sanitized wide string safe for CSV export.
+             */
+            [[nodiscard]] std::wstring SanitizeCsvFieldW(std::wstring_view field) noexcept {
+                if (field.empty()) {
+                    return std::wstring();
+                }
+                
+                const wchar_t firstChar = field.front();
+                const bool needsSanitization = (firstChar == L'=' || 
+                                                 firstChar == L'@' || 
+                                                 firstChar == L'+' || 
+                                                 firstChar == L'-' ||
+                                                 firstChar == L'\t' ||
+                                                 firstChar == L'\r');
+                
+                if (needsSanitization) {
+                    std::wstring result;
+                    result.reserve(field.size() + 1);
+                    result += L'\'';
+                    result += field;
+                    return result;
+                }
+                
+                return std::wstring(field);
+            }
         }
 
         // ============================================================================
@@ -1960,6 +2096,10 @@ namespace ShadowStrike {
          * 
          * @details Constructs WHERE clauses for all non-empty filter fields.
          * Adds ORDER BY and LIMIT clauses based on filter settings.
+         * 
+         * @security All string filter values are escaped using EscapeSqlLikePattern
+         * to prevent SQL injection attacks. This escapes single quotes and LIKE
+         * metacharacters (%, _, [) safely.
          */
         std::string QuarantineDB::buildQuerySQL(const QueryFilter& filter, std::vector<std::string>& outParams) {
             std::ostringstream sql;
@@ -1982,33 +2122,34 @@ namespace ShadowStrike {
             }
 
             if (filter.startTime) {
-                sql << " AND quarantine_time >= '" << timePointToString(*filter.startTime) << "'";
+                sql << " AND quarantine_time >= '" << EscapeSqlString(timePointToString(*filter.startTime)) << "'";
             }
 
             if (filter.endTime) {
-                sql << " AND quarantine_time <= '" << timePointToString(*filter.endTime) << "'";
+                sql << " AND quarantine_time <= '" << EscapeSqlString(timePointToString(*filter.endTime)) << "'";
             }
 
+            // User-controlled patterns - must escape to prevent SQL injection
             if (filter.originalPathPattern) {
-                sql << " AND original_path LIKE '" << ToUTF8(*filter.originalPathPattern) << "'";
+                sql << " AND original_path LIKE '" << EscapeSqlLikePattern(ToUTF8(*filter.originalPathPattern)) << "'";
             }
 
             if (filter.threatNamePattern) {
-                sql << " AND threat_name LIKE '" << ToUTF8(*filter.threatNamePattern) << "'";
+                sql << " AND threat_name LIKE '" << EscapeSqlLikePattern(ToUTF8(*filter.threatNamePattern)) << "'";
             }
 
             if (filter.fileHashPattern) {
-                std::string hashPattern = ToUTF8(*filter.fileHashPattern);
-                sql << " AND (md5_hash LIKE '" << hashPattern << "' OR sha1_hash LIKE '"
-                    << hashPattern << "' OR sha256_hash LIKE '" << hashPattern << "')";
+                std::string escapedHashPattern = EscapeSqlLikePattern(ToUTF8(*filter.fileHashPattern));
+                sql << " AND (md5_hash LIKE '" << escapedHashPattern << "' OR sha1_hash LIKE '"
+                    << escapedHashPattern << "' OR sha256_hash LIKE '" << escapedHashPattern << "')";
             }
 
             if (filter.userNamePattern) {
-                sql << " AND user_name LIKE '" << ToUTF8(*filter.userNamePattern) << "'";
+                sql << " AND user_name LIKE '" << EscapeSqlLikePattern(ToUTF8(*filter.userNamePattern)) << "'";
             }
 
             if (filter.machineNamePattern) {
-                sql << " AND machine_name LIKE '" << ToUTF8(*filter.machineNamePattern) << "'";
+                sql << " AND machine_name LIKE '" << EscapeSqlLikePattern(ToUTF8(*filter.machineNamePattern)) << "'";
             }
 
             // Order and limit
@@ -4007,22 +4148,32 @@ namespace ShadowStrike {
                 "Threat Type,Threat Name,Severity,Status,SHA256 Hash,User,Machine,Detection Reason,Notes\n";
             csvFile.write(header.c_str(), header.size());
 
-            // Helper lambda for CSV escape (keep same)
+            // Helper lambda for CSV escape with formula injection prevention
+            // @security Prevents CSV/Formula injection by:
+            // 1. Sanitizing fields starting with formula trigger characters (=, @, +, -, tab, CR)
+            // 2. Escaping double quotes by doubling them
+            // 3. Wrapping fields containing special characters in quotes
             auto escapeCsv = [](const std::wstring& field) -> std::string {
                 std::string utf8Field = ToUTF8(field);
-                if (utf8Field.find(',') != std::string::npos ||
-                    utf8Field.find('"') != std::string::npos ||
-                    utf8Field.find('\n') != std::string::npos) {
+                
+                // First, sanitize formula injection trigger characters
+                std::string sanitizedField = SanitizeCsvField(utf8Field);
+                
+                // Then handle structural CSV escaping
+                if (sanitizedField.find(',') != std::string::npos ||
+                    sanitizedField.find('"') != std::string::npos ||
+                    sanitizedField.find('\n') != std::string::npos ||
+                    sanitizedField.find('\r') != std::string::npos) {
                     std::string escaped = "\"";
-                    for (char c : utf8Field) {
+                    for (char c : sanitizedField) {
                         if (c == '"') escaped += "\"\"";
                         else escaped += c;
                     }
                     escaped += "\"";
                     return escaped;
                 }
-                return utf8Field;
-                };
+                return sanitizedField;
+            };
 
             // Write entries (convert each field to UTF-8)
             for (const auto& entry : entries) {

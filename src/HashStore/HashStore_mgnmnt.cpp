@@ -5,6 +5,7 @@
 #include"HashStore.hpp"
 #include<map>
 #include<unordered_set>
+#include"../Utils/JSONUtils.hpp"
 
 namespace ShadowStrike {
 
@@ -229,7 +230,7 @@ namespace ShadowStrike {
             m_totalLookups.fetch_add(1, std::memory_order_relaxed);
 
             SS_LOG_INFO(L"HashStore",
-                L"AddHash: Successfully added hash %S (type=%u, threat=%u, insert_time=%llu µs)",
+                L"AddHash: Successfully added hash %S (type=%u, threat=%u, insert_time=%llu ï¿½s)",
                 signatureName.c_str(), static_cast<uint8_t>(hash.type),
                 threatVal, insertTimeUs);
 
@@ -389,7 +390,7 @@ namespace ShadowStrike {
                 std::vector<std::pair<HashValue, uint64_t>> batchEntries;
                 batchEntries.reserve(typeIndices.size());
 
-                // Use hash set for O(1) duplicate detection instead of O(n²)
+                // Use hash set for O(1) duplicate detection instead of O(nï¿½)
                 std::unordered_set<uint64_t> seenFastHashes;
                 seenFastHashes.reserve(typeIndices.size());
 
@@ -470,7 +471,7 @@ namespace ShadowStrike {
 
             SS_LOG_INFO(L"HashStore",
                 L"AddHashBatch: Completed - Success: %zu, Failed: %zu, "
-                L"Invalid: %zu, Time: %llu µs, Throughput: %.2f ops/sec",
+                L"Invalid: %zu, Time: %llu ï¿½s, Throughput: %.2f ops/sec",
                 successCount, failureCount, invalidIndices.size(),
                 batchTimeUs, throughput);
 
@@ -807,53 +808,40 @@ namespace ShadowStrike {
             }
 
             // ========================================================================
-            // STEP 6: SERIALIZE METADATA
+            // STEP 6: SERIALIZE METADATA USING JSON LIBRARY
             // ========================================================================
-
-            // Pre-allocate with reasonable estimate to avoid reallocations
+            
+            // Use nlohmann::json via ShadowStrike::Utils::JSON for proper serialization
+            // This guarantees valid JSON output with correct escaping of all special
+            // characters including unicode, control characters, and JSON metacharacters.
             std::string metadataJson;
             try {
-                metadataJson.reserve(totalMetadataSize + 100);
-            }
-            catch (const std::exception&) {
-                return StoreError{ SignatureStoreError::Unknown, 0, "Memory allocation failed" };
-            }
-
-            metadataJson = "{";
-
-            // Add description
-            metadataJson += "\"description\":\"";
-            // Escape JSON special characters
-            for (unsigned char ch : newDescription) {
-                switch (ch) {
-                case '"':  metadataJson += "\\\""; break;
-                case '\\': metadataJson += "\\\\"; break;
-                case '\n': metadataJson += "\\n";  break;
-                case '\r': metadataJson += "\\r";  break;
-                case '\t': metadataJson += "\\t";  break;
-                default:
-                    if (ch >= 0x20) {
-                        metadataJson += static_cast<char>(ch);
-                    }
+                Utils::JSON::Json metadataObj;
+                
+                // Set description - library handles all escaping automatically
+                metadataObj["description"] = newDescription;
+                
+                // Set tags array - library handles array serialization
+                metadataObj["tags"] = newTags;
+                
+                // Set timestamp
+                const auto now = std::time(nullptr);
+                metadataObj["updated_at"] = static_cast<int64_t>(now);
+                
+                // Serialize to string using the library's Stringify function
+                if (!Utils::JSON::Stringify(metadataObj, metadataJson)) {
+                    SS_LOG_ERROR(L"HashStore", 
+                        L"UpdateHashMetadata: JSON serialization failed");
+                    return StoreError{ SignatureStoreError::Unknown, 0, 
+                        "Failed to serialize metadata to JSON" };
                 }
             }
-            metadataJson += "\",";
-
-            // Add tags array
-            metadataJson += "\"tags\":[";
-            for (size_t i = 0; i < newTags.size(); ++i) {
-                metadataJson += "\"" + newTags[i] + "\"";
-                if (i < newTags.size() - 1) {
-                    metadataJson += ",";
-                }
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"HashStore",
+                    L"UpdateHashMetadata: JSON construction failed: %S", ex.what());
+                return StoreError{ SignatureStoreError::Unknown, 0, 
+                    "Memory allocation failed during JSON construction" };
             }
-            metadataJson += "],";
-
-            // Add timestamp
-            const auto now = std::time(nullptr);
-            metadataJson += "\"updated_at\":" + std::to_string(now);
-
-            metadataJson += "}";
 
             // ========================================================================
             // STEP 7: UPDATE STATISTICS & AUDIT LOG
@@ -879,7 +867,7 @@ namespace ShadowStrike {
             // Log audit trail
             SS_LOG_INFO(L"HashStore",
                 L"UpdateHashMetadata: Successfully updated (offset=%llu, "
-                L"desc_len=%zu, tags=%zu, time=%llu µs)",
+                L"desc_len=%zu, tags=%zu, time=%llu ï¿½s)",
                 *signatureOffset, descriptionSize, newTags.size(), updateTimeUs);
 
             // ========================================================================

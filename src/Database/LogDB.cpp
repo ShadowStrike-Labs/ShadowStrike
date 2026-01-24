@@ -481,6 +481,100 @@ namespace ShadowStrike {
                 return L"Unknown";
             }
 
+            // ========================================================================
+            //                      JSON SECURITY HELPERS
+            // ========================================================================
+
+            /**
+             * @brief Escapes special characters in a wide string for safe JSON string output.
+             * 
+             * @param input The wide string to escape.
+             * @return Escaped wide string safe for JSON string literals.
+             * 
+             * @details Escapes the following characters per RFC 8259:
+             * - Backslash (\) -> \\
+             * - Double quote (") -> \"
+             * - Backspace (0x08) -> \b
+             * - Form feed (0x0C) -> \f
+             * - Newline (0x0A) -> \n
+             * - Carriage return (0x0D) -> \r
+             * - Tab (0x09) -> \t
+             * - Other control characters (0x00-0x1F) -> \uXXXX
+             * 
+             * @security Prevents JSON injection by properly escaping all special characters.
+             */
+            [[nodiscard]] std::wstring EscapeJsonString(std::wstring_view input) noexcept {
+                std::wstring result;
+                result.reserve(input.size() + input.size() / 8);  // Extra space for escapes
+                
+                for (const wchar_t c : input) {
+                    switch (c) {
+                        case L'\\': result += L"\\\\"; break;
+                        case L'"':  result += L"\\\""; break;
+                        case L'\b': result += L"\\b";  break;
+                        case L'\f': result += L"\\f";  break;
+                        case L'\n': result += L"\\n";  break;
+                        case L'\r': result += L"\\r";  break;
+                        case L'\t': result += L"\\t";  break;
+                        default:
+                            if (c < 0x20) {
+                                // Escape control characters as Unicode escape sequence
+                                wchar_t buf[7];
+                                _snwprintf_s(buf, _TRUNCATE, L"\\u%04x", static_cast<unsigned int>(c));
+                                result += buf;
+                            }
+                            else {
+                                result += c;
+                            }
+                            break;
+                    }
+                }
+                return result;
+            }
+
+            // ========================================================================
+            //                      CSV SECURITY HELPERS
+            // ========================================================================
+
+            /**
+             * @brief Sanitizes a wide string field for CSV export to prevent formula injection.
+             * 
+             * @param field The field value to sanitize.
+             * @return Sanitized wide string safe for CSV export.
+             * 
+             * @details CSV Formula Injection occurs when a field begins with characters
+             * that spreadsheet applications interpret as formula indicators.
+             * 
+             * Trigger characters: =, @, +, -, tab (\t), carriage return (\r)
+             * 
+             * Prevention: Prepends a single quote (') to force text interpretation.
+             * 
+             * @see https://owasp.org/www-community/attacks/CSV_Injection
+             */
+            [[nodiscard]] std::wstring SanitizeCsvFieldW(std::wstring_view field) noexcept {
+                if (field.empty()) {
+                    return std::wstring();
+                }
+                
+                const wchar_t firstChar = field.front();
+                const bool needsSanitization = (firstChar == L'=' || 
+                                                 firstChar == L'@' || 
+                                                 firstChar == L'+' || 
+                                                 firstChar == L'-' ||
+                                                 firstChar == L'\t' ||
+                                                 firstChar == L'\r');
+                
+                if (needsSanitization) {
+                    std::wstring result;
+                    result.reserve(field.size() + 1);
+                    result += L'\'';
+                    result += field;
+                    return result;
+                }
+                
+                return std::wstring(field);
+            }
+
         } // anonymous namespace
 
         // ============================================================================
@@ -1755,8 +1849,8 @@ namespace ShadowStrike {
                                 const QueryFilter* filter,
                                 DatabaseError* err)
         {
-            // JSON export implementation
-            // This would format entries as JSON array
+            // JSON export implementation with proper escaping
+            // @security Uses EscapeJsonString to prevent JSON injection
             
             auto entries = filter ? Query(*filter, err) : Query(QueryFilter{}, err);
 
@@ -1768,11 +1862,11 @@ namespace ShadowStrike {
                 
                 json << L"  {\n";
                 json << L"    \"id\": " << entry.id << L",\n";
-                json << L"    \"timestamp\": \"" << timePointToString(entry.timestamp).c_str() << L"\",\n";
-                json << L"    \"level\": \"" << LogLevelToString(entry.level) << L"\",\n";
-                json << L"    \"category\": \"" << LogCategoryToString(entry.category) << L"\",\n";
-                json << L"    \"source\": \"" << entry.source << L"\",\n";
-                json << L"    \"message\": \"" << entry.message << L"\"\n";
+                json << L"    \"timestamp\": \"" << EscapeJsonString(ToWide(timePointToString(entry.timestamp))) << L"\",\n";
+                json << L"    \"level\": \"" << EscapeJsonString(LogLevelToString(entry.level)) << L"\",\n";
+                json << L"    \"category\": \"" << EscapeJsonString(LogCategoryToString(entry.category)) << L"\",\n";
+                json << L"    \"source\": \"" << EscapeJsonString(entry.source) << L"\",\n";
+                json << L"    \"message\": \"" << EscapeJsonString(entry.message) << L"\"\n";
                 json << L"  }";
                 
                 if (i < entries.size() - 1) {
@@ -1803,12 +1897,36 @@ namespace ShadowStrike {
          * 
          * @details CSV columns: ID, Timestamp, Level, Category, Source, Message,
          * ProcessID, ThreadID. Message field is quoted to handle commas.
+         * 
+         * @security Uses SanitizeCsvFieldW to prevent CSV formula injection attacks.
+         * Fields starting with =, @, +, - are prefixed with a single quote.
          */
         bool LogDB::ExportToCSV(std::wstring_view filePath,
                                const QueryFilter* filter,
                                DatabaseError* err)
         {
             auto entries = filter ? Query(*filter, err) : Query(QueryFilter{}, err);
+
+            // Helper lambda for CSV escape with formula injection prevention
+            auto escapeCsvField = [](std::wstring_view field) -> std::wstring {
+                // First sanitize against formula injection
+                std::wstring sanitized = SanitizeCsvFieldW(field);
+                
+                // Then handle structural CSV escaping
+                if (sanitized.find(L',') != std::wstring::npos ||
+                    sanitized.find(L'"') != std::wstring::npos ||
+                    sanitized.find(L'\n') != std::wstring::npos ||
+                    sanitized.find(L'\r') != std::wstring::npos) {
+                    std::wstring escaped = L"\"";
+                    for (wchar_t c : sanitized) {
+                        if (c == L'"') escaped += L"\"\"";
+                        else escaped += c;
+                    }
+                    escaped += L"\"";
+                    return escaped;
+                }
+                return sanitized;
+            };
 
             std::wostringstream csv;
             
@@ -1822,8 +1940,8 @@ namespace ShadowStrike {
                 csv << ToWide(timestampStr) << L",";
                 csv << LogLevelToString(entry.level) << L",";
                 csv << LogCategoryToString(entry.category) << L",";
-                csv << entry.source << L",";
-                csv << L"\"" << entry.message << L"\",";
+                csv << escapeCsvField(entry.source) << L",";
+                csv << escapeCsvField(entry.message) << L",";
                 csv << entry.processId << L",";
                 csv << entry.threadId << L"\n";
             }

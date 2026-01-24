@@ -1585,14 +1585,13 @@ namespace ShadowStrike {
                                   "Key disappeared after COW clone" };
             }
 
-            // SECURITY: Validate offset fits if truncation occurs
-            if (newSignatureOffset > UINT32_MAX) {
-                SS_LOG_WARN(L"SignatureIndex",
-                    L"Update: Offset 0x%llX truncated to uint32_t", newSignatureOffset);
-            }
+            // SECURITY FIX (v1.1): With 64-bit offsets in BPlusTreeNode, we can now
+            // store the full offset without truncation. The original code logged a
+            // warning but proceeded with truncation, which corrupted the index.
+            // Now we store the full 64-bit value safely.
 
-            // Update offset
-            leaf->children[pos] = static_cast<uint32_t>(newSignatureOffset);
+            // Update offset (64-bit storage now safe)
+            leaf->children[pos] = newSignatureOffset;
 
             // Commit COW transaction
             StoreError commitErr = CommitCOW();

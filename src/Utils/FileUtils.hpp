@@ -158,6 +158,31 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] std::wstring NormalizePath(std::wstring_view path, bool resolveFinal = false, Error* err = nullptr);
 
+			/**
+			 * @brief Verify that a path resides within an expected root directory.
+			 * 
+			 * SECURITY: This function provides protection against path traversal attacks.
+			 * It normalizes both the path and root, then verifies the path is a descendant
+			 * of the root directory. This should be used after NormalizePath to ensure
+			 * user-supplied paths don't escape their intended directory scope.
+			 * 
+			 * @param path The path to validate (will be normalized)
+			 * @param root The root directory the path must reside within (will be normalized)
+			 * @param resolveSymlinks If true, resolve symlinks before comparison
+			 * @param err Optional error output
+			 * @return true if path is under root, false otherwise (including on any error)
+			 * 
+			 * @example
+			 * @code
+			 *   // Validate user input stays within data directory
+			 *   if (!IsPathUnderRoot(userPath, L"C:\\AppData\\MyApp", true, &err)) {
+			 *       // Reject the path - potential traversal attack
+			 *   }
+			 * @endcode
+			 */
+			[[nodiscard]] bool IsPathUnderRoot(std::wstring_view path, std::wstring_view root, 
+			                                   bool resolveSymlinks = true, Error* err = nullptr);
+
 			// ============================================================================
 			// File Existence and Status
 			// ============================================================================

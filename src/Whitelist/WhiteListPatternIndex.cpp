@@ -732,16 +732,69 @@ template<typename T>
             output.pop_back();
         }
         
-        // SECURITY: Detect and reject path traversal attacks
-        // Patterns like ".." or "." segments could be used to escape directory boundaries
-        // Check for: /./ or /../ or starts with ./ or ../ or ends with /. or /..
-        if (output.find("/./") != std::string::npos ||
-            output.find("/../") != std::string::npos ||
-            (output.length() >= 2 && output.substr(0, 2) == "./") ||
-            (output.length() >= 3 && output.substr(0, 3) == "../") ||
-            (output.length() >= 2 && output.substr(output.length() - 2) == "/.") ||
-            (output.length() >= 3 && output.substr(output.length() - 3) == "/..")) {
-            SS_LOG_WARN(L"Whitelist", L"NormalizePath: path traversal detected, rejecting");
+        // SECURITY FIX: Robust path traversal detection and normalization.
+        // Instead of just detecting patterns, we actively normalize the path
+        // by resolving . and .. segments, then verify no .. segments remain.
+        // This is more robust than simple substring matching which can miss edge cases.
+        
+        // Split path into segments and resolve . and ..
+        std::vector<std::string> segments;
+        segments.reserve(32);
+        
+        size_t start = 0;
+        while (start < output.length()) {
+            size_t end = output.find('/', start);
+            if (end == std::string::npos) {
+                end = output.length();
+            }
+            
+            std::string segment = output.substr(start, end - start);
+            
+            if (segment == ".") {
+                // Current directory - skip it
+            } else if (segment == "..") {
+                // Parent directory - pop the last segment if we have one
+                // For security, we reject if .. would go above root
+                if (segments.empty()) {
+                    // Attempting to traverse above root - security violation
+                    SS_LOG_WARN(L"Whitelist", L"NormalizePath: path traversal above root detected, rejecting");
+                    output.clear();
+                    return false;
+                }
+                // Don't pop drive letters (e.g., "c:")
+                if (!segments.back().empty() && 
+                    !(segments.back().length() == 2 && segments.back()[1] == ':')) {
+                    segments.pop_back();
+                } else {
+                    // Can't go above drive root
+                    SS_LOG_WARN(L"Whitelist", L"NormalizePath: path traversal above drive root detected, rejecting");
+                    output.clear();
+                    return false;
+                }
+            } else if (!segment.empty()) {
+                // Normal segment - add it
+                segments.push_back(std::move(segment));
+            }
+            
+            start = end + 1;
+        }
+        
+        // Rebuild normalized path
+        output.clear();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (i > 0) {
+                output.push_back('/');
+            }
+            output.append(segments[i]);
+        }
+        
+        // Final security check: ensure no ".." remains after normalization
+        // (This should never happen if the above logic is correct, but defense in depth)
+        if (output.find("/../") != std::string::npos ||
+            output.find("/..") == output.length() - 3 ||
+            output.substr(0, 3) == "../" ||
+            output == "..") {
+            SS_LOG_WARN(L"Whitelist", L"NormalizePath: residual path traversal detected after normalization");
             output.clear();
             return false;
         }

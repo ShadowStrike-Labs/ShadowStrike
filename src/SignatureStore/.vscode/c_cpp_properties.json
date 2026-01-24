@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${vcpkgRoot}/x64-windows/include",
+                "C:/Users/RTX40/source/repos/ShadowStrike/ShadowStrike/external/ssdeep",
+                "C:/Users/RTX40/source/repos/ShadowStrike/ShadowStrike/external/tlsh/include",
+                "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um"
+                
+            ],
+            "compilerPath": "C:/Program Files/Microsoft Visual Studio/18/Enterprise/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ]
+        }
+    ],
+    "version": 4
+}

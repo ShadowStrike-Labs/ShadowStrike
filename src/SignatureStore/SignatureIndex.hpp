@@ -346,7 +346,8 @@ private:
 
 
     // Tree root
-    std::atomic<uint32_t> m_rootOffset{0};
+    // SECURITY FIX (v1.1): Changed from uint32_t to uint64_t to support databases > 4GB
+    std::atomic<uint64_t> m_rootOffset{0};
     std::atomic<uint32_t> m_treeHeight{0};
 
     // Statistics
@@ -536,7 +537,8 @@ private:
     LARGE_INTEGER m_perfFrequency{};
 
   
-    std::atomic<uint32_t> m_rootOffset{0};
+    // SECURITY FIX (v1.1): Changed from uint32_t to uint64_t to support databases > 4GB
+    std::atomic<uint64_t> m_rootOffset{0};
     mutable std::atomic<uint64_t> m_totalSearches{0};
     mutable std::atomic<uint64_t> m_totalMatches{0};
     

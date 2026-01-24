@@ -292,6 +292,104 @@ namespace ShadowStrike {
                 return finalPath;
             }
 
+            bool IsPathUnderRoot(std::wstring_view path, std::wstring_view root, 
+                                 bool resolveSymlinks, Error* err) {
+                /**
+                 * SECURITY: Path traversal protection helper.
+                 * 
+                 * This function verifies that a given path is a descendant of a root directory.
+                 * It handles:
+                 * - Path normalization (resolving . and ..)
+                 * - Symlink resolution (optional)
+                 * - Case-insensitive comparison (Windows)
+                 * - Trailing separator normalization
+                 * 
+                 * Always use this function to validate user-supplied paths before operations.
+                 */
+                
+                // Input validation
+                if (path.empty() || root.empty()) {
+                    if (err) {
+                        err->win32 = ERROR_INVALID_PARAMETER;
+                        err->message = "Path or root is empty";
+                    }
+                    return false;
+                }
+                
+                // Normalize both paths
+                Error normalizeErr;
+                std::wstring normalizedPath = NormalizePath(path, resolveSymlinks, &normalizeErr);
+                if (normalizedPath.empty()) {
+                    if (err) *err = normalizeErr;
+                    return false;
+                }
+                
+                std::wstring normalizedRoot = NormalizePath(root, resolveSymlinks, &normalizeErr);
+                if (normalizedRoot.empty()) {
+                    if (err) *err = normalizeErr;
+                    return false;
+                }
+                
+                // Remove long path prefix for comparison (\\?\)
+                auto stripLongPathPrefix = [](std::wstring& p) {
+                    if (p.starts_with(L"\\\\?\\UNC\\")) {
+                        // Convert \\?\UNC\server\share to \\server\share
+                        p = L"\\\\" + p.substr(8);
+                    } else if (p.starts_with(L"\\\\?\\")) {
+                        p = p.substr(4);
+                    }
+                };
+                
+                stripLongPathPrefix(normalizedPath);
+                stripLongPathPrefix(normalizedRoot);
+                
+                // Ensure root ends with a separator for proper prefix matching
+                // This prevents C:\AppData matching C:\AppDataBackup
+                if (!normalizedRoot.empty() && 
+                    normalizedRoot.back() != L'\\' && 
+                    normalizedRoot.back() != L'/') {
+                    normalizedRoot += L'\\';
+                }
+                
+                // Convert both to lowercase for case-insensitive comparison (Windows)
+                auto toLowerInPlace = [](std::wstring& s) {
+                    for (wchar_t& c : s) {
+                        if (c >= L'A' && c <= L'Z') {
+                            c = c - L'A' + L'a';
+                        }
+                    }
+                };
+                
+                toLowerInPlace(normalizedPath);
+                toLowerInPlace(normalizedRoot);
+                
+                // Normalize separators to backslash
+                auto normalizeSlashes = [](std::wstring& s) {
+                    for (wchar_t& c : s) {
+                        if (c == L'/') c = L'\\';
+                    }
+                };
+                
+                normalizeSlashes(normalizedPath);
+                normalizeSlashes(normalizedRoot);
+                
+                // Check if path starts with root (path is descendant of root)
+                // Also handle exact match (path == root without trailing separator)
+                std::wstring pathWithSep = normalizedPath;
+                if (!pathWithSep.empty() && pathWithSep.back() != L'\\') {
+                    pathWithSep += L'\\';
+                }
+                
+                bool isUnderRoot = pathWithSep.starts_with(normalizedRoot);
+                
+                if (!isUnderRoot && err) {
+                    err->win32 = ERROR_ACCESS_DENIED;
+                    err->message = "Path is not under the specified root directory";
+                }
+                
+                return isUnderRoot;
+            }
+
 
             // ============================================================================
             // File Existence and Status Operations

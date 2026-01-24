@@ -16,6 +16,26 @@ namespace ShadowStrike {
         // ============================================================================
         // ================= IMPORT / EXPORT OPERATIONS ===============================
         // ============================================================================
+
+        /**
+         * @brief Batch size for streaming file import to prevent memory exhaustion.
+         * 
+         * @details This constant limits memory usage during import operations.
+         * Processing in batches of 1000 hashes ensures:
+         * - Constant memory footprint regardless of input file size
+         * - Good balance between memory usage and I/O efficiency
+         * - Prevention of DoS attacks via large file uploads
+         */
+        constexpr size_t IMPORT_BATCH_SIZE = 1000;
+
+        /**
+         * @brief Maximum allowed file size for import operations (100 MB).
+         * 
+         * @details Prevents processing of excessively large files that could
+         * cause resource exhaustion or take too long to process.
+         */
+        constexpr size_t MAX_IMPORT_FILE_SIZE = 100ULL * 1024 * 1024;
+
         //imports hashes from the given file path to the hash store
         StoreError HashStore::ImportFromFile(
             const std::wstring& filePath,
@@ -23,11 +43,17 @@ namespace ShadowStrike {
         ) noexcept {
             /*
              * ========================================================================
-             * IMPORT FROM FILE - TEXT FILE HASH IMPORT
+             * IMPORT FROM FILE - STREAMING TEXT FILE HASH IMPORT
              * ========================================================================
              *
              * Format: TYPE:HASH:NAME:LEVEL
              * Example: SHA256:a1b2c3...:Trojan.Generic:High
+             *
+             * Security Features:
+             * - Streaming line-by-line processing (prevents memory exhaustion DoS)
+             * - Batch accumulation with bounded size
+             * - File size validation
+             * - Progress tracking for large files
              *
              * ========================================================================
              */
@@ -39,38 +65,60 @@ namespace ShadowStrike {
             }
 
             // Open file
-            std::ifstream file(filePath);
+            std::ifstream file(filePath, std::ios::binary | std::ios::ate);
             if (!file.is_open()) {
                 SS_LOG_ERROR(L"HashStore", L"ImportFromFile: Cannot open file");
                 return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file" };
             }
 
-            // Read all lines
-            std::vector<std::string> lines;
-            std::string line;
-            while (std::getline(file, line)) {
-                if (!line.empty() && line[0] != '#') {  // Skip comments
-                    lines.push_back(line);
-                }
+            // Security: Check file size to prevent resource exhaustion
+            const auto fileSize = file.tellg();
+            if (fileSize < 0) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: Cannot determine file size");
+                return StoreError{ SignatureStoreError::Unknown, 0, "Cannot determine file size" };
             }
-            file.close();
-
-            if (lines.empty()) {
-                SS_LOG_WARN(L"HashStore", L"ImportFromFile: No valid entries");
-                return StoreError{ SignatureStoreError::Success };
+            
+            if (static_cast<size_t>(fileSize) > MAX_IMPORT_FILE_SIZE) {
+                SS_LOG_ERROR(L"HashStore", L"ImportFromFile: File too large (%lld bytes, max %zu)",
+                    static_cast<long long>(fileSize), MAX_IMPORT_FILE_SIZE);
+                return StoreError{ SignatureStoreError::TooLarge, 0, 
+                    "File exceeds maximum allowed size (100 MB)" };
             }
+            
+            // Reset to beginning for line-by-line reading
+            file.seekg(0, std::ios::beg);
 
-            // Parse and import
+            // Estimate total lines for progress reporting (rough estimate: ~80 bytes per line)
+            const size_t estimatedTotalLines = (fileSize > 0) 
+                ? static_cast<size_t>(fileSize) / 80 + 1 
+                : 0;
+
+            // Batch buffers - bounded size to prevent memory exhaustion
             std::vector<HashValue> hashes;
             std::vector<std::string> names;
             std::vector<ThreatLevel> levels;
+            
+            // Pre-allocate batch buffers
+            hashes.reserve(IMPORT_BATCH_SIZE);
+            names.reserve(IMPORT_BATCH_SIZE);
+            levels.reserve(IMPORT_BATCH_SIZE);
 
             size_t lineNum = 0;
-            for (const auto& entry : lines) {
+            size_t totalImported = 0;
+            size_t totalSkipped = 0;
+            std::string line;
+
+            // Stream file line-by-line to prevent memory exhaustion
+            while (std::getline(file, line)) {
                 lineNum++;
 
+                // Skip empty lines and comments
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+
                 // Parse: TYPE:HASH:NAME:LEVEL
-                std::istringstream iss(entry);
+                std::istringstream iss(line);
                 std::string typeStr, hashStr, name, levelStr;
 
                 if (!std::getline(iss, typeStr, ':') ||
@@ -78,6 +126,7 @@ namespace ShadowStrike {
                     !std::getline(iss, name, ':') ||
                     !std::getline(iss, levelStr)) {
                     SS_LOG_WARN(L"HashStore", L"ImportFromFile: Invalid format at line %zu", lineNum);
+                    totalSkipped++;
                     continue;
                 }
 
@@ -92,6 +141,7 @@ namespace ShadowStrike {
                 auto hash = Format::ParseHashString(hashStr, type);
                 if (!hash.has_value()) {
                     SS_LOG_WARN(L"HashStore", L"ImportFromFile: Invalid hash at line %zu", lineNum);
+                    totalSkipped++;
                     continue;
                 }
 
@@ -101,21 +151,53 @@ namespace ShadowStrike {
                 else if (levelStr == "High") level = ThreatLevel::High;
                 else if (levelStr == "Low") level = ThreatLevel::Low;
 
+                // Add to current batch
                 hashes.push_back(*hash);
-                names.push_back(name);
+                names.push_back(std::move(name));
                 levels.push_back(level);
+
+                // Process batch when full to maintain bounded memory usage
+                if (hashes.size() >= IMPORT_BATCH_SIZE) {
+                    StoreError err = AddHashBatch(hashes, names, levels);
+                    if (err.code != SignatureStoreError::Success) {
+                        SS_LOG_ERROR(L"HashStore", 
+                            L"ImportFromFile: Batch import failed at line %zu: %S",
+                            lineNum, err.message.c_str());
+                        return err;
+                    }
+                    
+                    totalImported += hashes.size();
+                    
+                    // Clear buffers for next batch (capacity preserved)
+                    hashes.clear();
+                    names.clear();
+                    levels.clear();
+                }
 
                 // Progress callback
                 if (progressCallback) {
-                    progressCallback(lineNum, lines.size());
+                    progressCallback(lineNum, estimatedTotalLines);
                 }
             }
 
-            // Batch import
-            StoreError err = AddHashBatch(hashes, names, levels);
+            file.close();
 
-            SS_LOG_INFO(L"HashStore", L"ImportFromFile: Imported %zu hashes", hashes.size());
-            return err;
+            // Process remaining entries in final batch
+            if (!hashes.empty()) {
+                StoreError err = AddHashBatch(hashes, names, levels);
+                if (err.code != SignatureStoreError::Success) {
+                    SS_LOG_ERROR(L"HashStore", L"ImportFromFile: Final batch import failed: %S",
+                        err.message.c_str());
+                    return err;
+                }
+                totalImported += hashes.size();
+            }
+
+            SS_LOG_INFO(L"HashStore", 
+                L"ImportFromFile: Completed - imported %zu hashes, skipped %zu invalid entries",
+                totalImported, totalSkipped);
+            
+            return StoreError{ SignatureStoreError::Success };
         }
 
 
@@ -223,7 +305,7 @@ namespace ShadowStrike {
                 file.close();
 
                 SS_LOG_INFO(L"HashStore",
-                    L"ExportToFile: Complete - %zu hashes exported in %llu µs",
+                    L"ExportToFile: Complete - %zu hashes exported in %llu ï¿½s",
                     exportedCount, exportTimeUs);
 
                 return StoreError{ SignatureStoreError::Success };
@@ -398,7 +480,7 @@ namespace ShadowStrike {
             }
 
             SS_LOG_INFO(L"HashStore",
-                L"ImportFromJson: Parsed %zu valid hashes (invalid: %zu, parse time: %llu µs)",
+                L"ImportFromJson: Parsed %zu valid hashes (invalid: %zu, parse time: %llu ï¿½s)",
                 validCount, invalidCount, parseTimeUs);
 
             StoreError batchErr = AddHashBatch(hashes, names, levels);
@@ -543,7 +625,7 @@ namespace ShadowStrike {
             }
 
             SS_LOG_DEBUG(L"HashStore",
-                L"ExportToJson: Exported %zu hashes in %llu µs, JSON size: %zu bytes",
+                L"ExportToJson: Exported %zu hashes in %llu ï¿½s, JSON size: %zu bytes",
                 exportCount, exportTimeUs, result.size());
 
             return result;

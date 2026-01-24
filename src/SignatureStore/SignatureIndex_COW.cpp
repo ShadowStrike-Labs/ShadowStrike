@@ -211,19 +211,21 @@ namespace ShadowStrike {
             // ========================================================================
 
             // Create mapping so we can update pointers correctly
-            std::unordered_map<uintptr_t, uint32_t> nodeOffsetMap;
+            // SECURITY FIX (v1.1): Changed value type from uint32_t to uint64_t to
+            // prevent truncation of file offsets when database exceeds 4GB boundary.
+            std::unordered_map<uintptr_t, uint64_t> nodeOffsetMap;
             nodeOffsetMap.reserve(m_cowNodes.size());
 
             uint64_t offsetCounter = newOffset;
             for (size_t i = 0; i < m_cowNodes.size(); ++i) {
                 uintptr_t oldAddr = reinterpret_cast<uintptr_t>(m_cowNodes[i].get());
-                uint32_t newFileOffset = static_cast<uint32_t>(offsetCounter);
+                uint64_t newFileOffset = offsetCounter;
 
                 nodeOffsetMap[oldAddr] = newFileOffset;
                 offsetCounter += sizeof(BPlusTreeNode);
 
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"CommitCOW: Mapping node %zu: addr=0x%p → file offset=0x%X",
+                    L"CommitCOW: Mapping node %zu: addr=0x%p → file offset=0x%llX",
                     i, reinterpret_cast<void*>(oldAddr), newFileOffset);
             }
 
@@ -662,19 +664,21 @@ namespace ShadowStrike {
             // STEP 5: BUILD OFFSET MAPPING (Old Address → New Address)
             // ========================================================================
 
-            std::unordered_map<uintptr_t, uint32_t> nodeOffsetMap;
+            // SECURITY FIX (v1.1): Changed value type from uint32_t to uint64_t to
+            // prevent truncation of file offsets when database exceeds 4GB boundary.
+            std::unordered_map<uintptr_t, uint64_t> nodeOffsetMap;
             nodeOffsetMap.reserve(m_cowNodes.size());
 
             uint64_t offsetCounter = newOffset;
             for (size_t i = 0; i < m_cowNodes.size(); ++i) {
                 uintptr_t oldAddr = reinterpret_cast<uintptr_t>(m_cowNodes[i].get());
-                uint32_t newFileOffset = static_cast<uint32_t>(offsetCounter);
+                uint64_t newFileOffset = offsetCounter;
 
                 nodeOffsetMap[oldAddr] = newFileOffset;
                 offsetCounter += sizeof(BPlusTreeNode);
 
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"CommitCOWInternal: Mapping node %zu: addr=0x%p → file offset=0x%X",
+                    L"CommitCOWInternal: Mapping node %zu: addr=0x%p → file offset=0x%llX",
                     i, reinterpret_cast<void*>(oldAddr), newFileOffset);
             }
 

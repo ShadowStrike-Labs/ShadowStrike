@@ -67,13 +67,30 @@ namespace {
  * @param b Second operand
  * @param result Output result
  * @return True if addition succeeded, false if overflow
+ * 
+ * SECURITY: Uses compiler built-ins when available for robust overflow detection.
+ * These built-ins are generally more efficient and consistent than manual checks.
  */
 [[nodiscard]] inline bool SafeAdd(uint64_t a, uint64_t b, uint64_t& result) noexcept {
+#if defined(_MSC_VER) && defined(_M_X64)
+    // MSVC x64: Use intrinsic for unsigned 64-bit addition with carry detection
+    unsigned long long res = 0;
+    if (_addcarry_u64(0, a, b, &res)) {
+        return false;  // Overflow occurred
+    }
+    result = res;
+    return true;
+#elif defined(__GNUC__) || defined(__clang__)
+    // GCC/Clang: Use __builtin_add_overflow for best codegen and safety
+    return !__builtin_add_overflow(a, b, &result);
+#else
+    // Fallback: Manual check for other compilers
     if (a > std::numeric_limits<uint64_t>::max() - b) {
         return false;  // Would overflow
     }
     result = a + b;
     return true;
+#endif
 }
 
 /**
@@ -82,17 +99,25 @@ namespace {
  * @param b Second operand
  * @param result Output result
  * @return True if multiplication succeeded, false if overflow
+ * 
+ * SECURITY: Uses compiler built-ins when available for robust overflow detection.
  */
 [[nodiscard]] inline bool SafeMul(uint64_t a, uint64_t b, uint64_t& result) noexcept {
     if (a == 0 || b == 0) {
         result = 0;
         return true;
     }
+#if defined(__GNUC__) || defined(__clang__)
+    // GCC/Clang: Use __builtin_mul_overflow for best codegen and safety
+    return !__builtin_mul_overflow(a, b, &result);
+#else
+    // Fallback: Manual check
     if (a > std::numeric_limits<uint64_t>::max() / b) {
         return false;  // Would overflow
     }
     result = a * b;
     return true;
+#endif
 }
 
 /**
@@ -3780,8 +3805,27 @@ StoreError WhitelistStore::ExportToCSV(
         }
         
         // CSV escape helper - wraps field in quotes if necessary
+        // SECURITY: Also prevents CSV formula injection by prepending single quote
+        // to fields starting with dangerous characters (=, +, -, @, tab, carriage return)
+        // This forces spreadsheet applications to treat the field as text, not a formula.
         auto escapeCSVField = [](const std::string& field) -> std::string {
-            // Check if quoting is needed
+            if (field.empty()) return field;
+            
+            // SECURITY: CSV Formula Injection Prevention (OWASP CWE-1236)
+            // Fields starting with these characters can be interpreted as formulas
+            // by spreadsheet applications like Excel, LibreOffice Calc, etc.
+            // An attacker could inject payloads like "=cmd|' /C calc'!A0" or similar.
+            // Prepending a single quote forces text interpretation.
+            const char firstChar = field[0];
+            const bool needsFormulaSanitization = 
+                (firstChar == '=' || 
+                 firstChar == '+' || 
+                 firstChar == '-' || 
+                 firstChar == '@' ||
+                 firstChar == '\t' ||
+                 firstChar == '\r');
+            
+            // Check if structural quoting is needed (commas, quotes, newlines)
             bool needsQuotes = false;
             for (char c : field) {
                 if (c == ',' || c == '"' || c == '\n' || c == '\r') {
@@ -3790,19 +3834,35 @@ StoreError WhitelistStore::ExportToCSV(
                 }
             }
             
-            if (!needsQuotes) return field;
+            // Build the escaped field
+            std::string result;
             
-            // Escape quotes and wrap
-            std::string escaped = "\"";
-            for (char c : field) {
-                if (c == '"') {
-                    escaped += "\"\""; // Double quote escaping
-                } else {
-                    escaped += c;
-                }
+            if (needsFormulaSanitization) {
+                // Prepend single quote for formula injection prevention
+                result = "'";
             }
-            escaped += '"';
-            return escaped;
+            
+            if (!needsQuotes && !needsFormulaSanitization) {
+                return field;
+            }
+            
+            if (needsQuotes) {
+                // Escape quotes and wrap in double quotes
+                result += '"';
+                for (char c : field) {
+                    if (c == '"') {
+                        result += "\"\""; // Double quote escaping
+                    } else {
+                        result += c;
+                    }
+                }
+                result += '"';
+            } else {
+                // Just prepend the sanitization character, no structural quoting needed
+                result += field;
+            }
+            
+            return result;
         };
         
         // Write UTF-8 BOM for Excel compatibility

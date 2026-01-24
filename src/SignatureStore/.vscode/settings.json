@@ -1,0 +1,20 @@
+{
+    "files.associations": {
+        "functional": "cpp",
+        "algorithm": "cpp",
+        "atomic": "cpp",
+        "thread": "cpp",
+        "shared_mutex": "cpp",
+        "iosfwd": "cpp",
+        "xstring": "cpp",
+        "xutility": "cpp",
+        "span": "cpp",
+        "array": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "map": "cpp",
+        "queue": "cpp",
+        "mutex": "cpp",
+        "future": "cpp"
+    }
+}

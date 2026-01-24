@@ -175,9 +175,44 @@ namespace ShadowStrike {
 					::WinHttpSetTimeouts(requestGuard.handle, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
 
 					// Add custom headers with validation
+					// SECURITY: Sanitize headers to prevent CRLF injection (HTTP Header Injection)
+					// CRLF sequences (\r\n) are interpreted as header separators by WinHttpAddRequestHeaders,
+					// allowing attackers to inject arbitrary headers if they control header values.
+					auto sanitizeHeaderValue = [](const std::wstring& value) -> std::wstring {
+						std::wstring result;
+						result.reserve(value.size());
+						for (wchar_t ch : value) {
+							// Strip CR (0x0D) and LF (0x0A) characters to prevent injection
+							if (ch != L'\r' && ch != L'\n') {
+								result.push_back(ch);
+							}
+						}
+						return result;
+					};
+					
+					auto sanitizeHeaderName = [](const std::wstring& name) -> std::wstring {
+						std::wstring result;
+						result.reserve(name.size());
+						for (wchar_t ch : name) {
+							// Header names must not contain CR, LF, or colon (except at the end which we add)
+							if (ch != L'\r' && ch != L'\n' && ch != L':') {
+								result.push_back(ch);
+							}
+						}
+						return result;
+					};
+					
 					for (const auto& header : options.headers) {
 						if (!header.name.empty() && header.name.size() < 256 && header.value.size() < 8192) {
-							std::wstring headerStr = header.name + L": " + header.value;
+							std::wstring safeName = sanitizeHeaderName(header.name);
+							std::wstring safeValue = sanitizeHeaderValue(header.value);
+							
+							// Skip if sanitization resulted in empty name
+							if (safeName.empty()) {
+								continue;
+							}
+							
+							std::wstring headerStr = safeName + L": " + safeValue;
 							::WinHttpAddRequestHeaders(requestGuard.handle, headerStr.c_str(),
 								static_cast<DWORD>(headerStr.length()), WINHTTP_ADDREQ_FLAG_ADD);
 						}

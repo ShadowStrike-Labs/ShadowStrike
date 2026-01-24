@@ -193,6 +193,74 @@ namespace ShadowStrike {
         };
 
         // ============================================================================
+        // SQL SECURITY UTILITIES
+        // ============================================================================
+
+        /**
+         * @brief Validates that a string is a safe SQL identifier (table/column name).
+         * 
+         * @param identifier The identifier string to validate.
+         * @return true if the identifier is safe to use in SQL statements.
+         * 
+         * @details SQL identifiers must:
+         * - Not be empty
+         * - Not exceed 128 characters (SQLite limit)
+         * - Start with a letter or underscore
+         * - Contain only alphanumeric characters and underscores
+         * 
+         * @security This prevents SQL injection when table or column names
+         * cannot be parameterized (SQL parameters only work for values,
+         * not identifiers).
+         * 
+         * @note This is a strict whitelist approach - only allows safe characters.
+         * No escaping is performed; invalid identifiers are rejected.
+         * 
+         * @code
+         * IsValidSqlIdentifier("users")           // true
+         * IsValidSqlIdentifier("user_table")      // true  
+         * IsValidSqlIdentifier("_private")        // true
+         * IsValidSqlIdentifier("table123")        // true
+         * IsValidSqlIdentifier("")                // false (empty)
+         * IsValidSqlIdentifier("users;DROP")      // false (contains semicolon)
+         * IsValidSqlIdentifier("user-name")       // false (contains hyphen)
+         * IsValidSqlIdentifier("123table")        // false (starts with digit)
+         * @endcode
+         */
+        [[nodiscard]] inline bool IsValidSqlIdentifier(std::string_view identifier) noexcept {
+            // Empty identifiers are invalid
+            if (identifier.empty()) {
+                return false;
+            }
+            
+            // SQLite has a default limit of 128 bytes for identifiers
+            constexpr size_t MAX_IDENTIFIER_LENGTH = 128;
+            if (identifier.size() > MAX_IDENTIFIER_LENGTH) {
+                return false;
+            }
+            
+            // First character must be a letter or underscore
+            const char first = identifier.front();
+            if (!((first >= 'a' && first <= 'z') ||
+                  (first >= 'A' && first <= 'Z') ||
+                  first == '_')) {
+                return false;
+            }
+            
+            // Remaining characters must be alphanumeric or underscore
+            for (const char c : identifier) {
+                const bool isValid = (c >= 'a' && c <= 'z') ||
+                                     (c >= 'A' && c <= 'Z') ||
+                                     (c >= '0' && c <= '9') ||
+                                     c == '_';
+                if (!isValid) {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+
+        // ============================================================================
         // CONFIGURATION
         // ============================================================================
 
@@ -1037,11 +1105,26 @@ namespace ShadowStrike {
                 return false;
             }
             
+            // Security: Validate table name against SQL injection
+            // SQL identifiers cannot be parameterized, so we must validate
+            if (!IsValidSqlIdentifier(tableName)) {
+                setError(err, SQLITE_MISUSE, L"Invalid table name: must contain only alphanumeric characters and underscores");
+                return false;
+            }
+            
+            // Security: Validate all column names against SQL injection
+            for (const auto& column : columns) {
+                if (!IsValidSqlIdentifier(column)) {
+                    setError(err, SQLITE_MISUSE, L"Invalid column name: must contain only alphanumeric characters and underscores");
+                    return false;
+                }
+            }
+            
             try {
                 auto conn = AcquireConnection(err);
                 if (!conn) return false;
                 
-                // Build INSERT statement
+                // Build INSERT statement (identifiers are now validated safe)
                 std::string sql = "INSERT INTO ";
                 sql += tableName;
                 sql += " (";

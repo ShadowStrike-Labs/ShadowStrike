@@ -36,6 +36,7 @@
  */
 #include"pch.h"
 #include "SignatureBuilder.hpp"
+#include "SignatureFormat.hpp"  // For Format::ValidateAndCanonicalizePath
 
 #include <unordered_set>
 #include <algorithm>
@@ -291,35 +292,32 @@ StoreError BatchSignatureBuilder::AddSourceFiles(
         }
 
         // ====================================================================
-        // PATH TRAVERSAL ATTACK PREVENTION
+        // PATH TRAVERSAL ATTACK PREVENTION (SECURITY FIX)
         // ====================================================================
+        // 
+        // SECURITY FIX: Replace weak substring checks with comprehensive path
+        // validation using Format::ValidateAndCanonicalizePath. This properly
+        // handles canonicalization, device names, UNC paths, and all traversal
+        // vectors that simple string matching would miss (CWE-22).
+        //
 
-        // Reject paths with directory traversal attempts
-        if (filePath.find(L"..") != std::wstring::npos) {
+        std::wstring canonicalPath;
+        std::string validationError;
+        if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, validationError)) {
             SS_LOG_WARN(L"BatchSignatureBuilder",
-                L"AddSourceFiles: Path contains '..' (directory traversal) - skipping");
+                L"AddSourceFiles: Path validation failed at index %zu: %S - skipping",
+                i, validationError.c_str());
             continue;
         }
 
-        // Reject paths with home directory reference (Unix-style, but be safe)
-        if (filePath.find(L'~') != std::wstring::npos) {
-            SS_LOG_WARN(L"BatchSignatureBuilder",
-                L"AddSourceFiles: Path contains '~' (home directory) - skipping");
-            continue;
-        }
-
-        // Reject paths with null bytes (security risk)
-        if (filePath.find(L'\0') != std::wstring::npos) {
-            SS_LOG_WARN(L"BatchSignatureBuilder",
-                L"AddSourceFiles: Path contains null byte at index %zu - skipping", i);
-            continue;
-        }
+        // Use the validated canonical path for all subsequent operations
+        const std::wstring& validatedPath = canonicalPath;
 
         // ====================================================================
         // FILE EXISTENCE & ATTRIBUTE CHECKING
         // ====================================================================
 
-        const DWORD attribs = GetFileAttributesW(filePath.c_str());
+        const DWORD attribs = GetFileAttributesW(validatedPath.c_str());
 
         // File must exist and be accessible
         if (attribs == INVALID_FILE_ATTRIBUTES) {
@@ -375,15 +373,17 @@ StoreError BatchSignatureBuilder::AddSourceFiles(
         // ====================================================================
         // DUPLICATE DETECTION (prevent processing same file twice)
         // ====================================================================
+        // Use canonical path for deduplication to catch different representations
+        // of the same file (e.g., C:\foo\..\bar vs C:\bar)
 
-        auto [it, inserted] = seenPaths.insert(filePath);
+        auto [it, inserted] = seenPaths.insert(validatedPath);
         if (!inserted) {
             SS_LOG_DEBUG(L"BatchSignatureBuilder",
                 L"AddSourceFiles: Duplicate file at index %zu - skipping", i);
             continue;
         }
 
-        validatedPaths.push_back(filePath);
+        validatedPaths.push_back(validatedPath);
     }
 
     // ========================================================================

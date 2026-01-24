@@ -381,44 +381,217 @@ bool SignatureBuilder::IsRegexSafe(
     std::string& errorMessage
 ) noexcept {
     /*
-     * Detects potentially dangerous regex patterns (ReDoS)
+     * SECURITY FIX: Enhanced ReDoS (Regular Expression Denial of Service) detection.
+     * 
+     * Previous implementation used a simple blacklist of dangerous patterns which
+     * is brittle and easily bypassed. This enhanced version:
+     * 
+     * 1. Detects nested quantifiers dynamically (not just specific patterns)
+     * 2. Calculates a complexity score based on multiple factors
+     * 3. Rejects patterns exceeding a complexity threshold
+     * 4. Limits quantifier repetition counts
+     * 5. Limits alternation group counts
+     * 
+     * Note: For high-performance scanning, consider using a non-backtracking
+     * regex engine like RE2 or Hyperscan instead of std::regex.
      */
 
-     // Check for catastrophic backtracking patterns
-    const std::array<std::string_view,6> DANGEROUS_PATTERNS = {
-        "(a+)+",           // Nested quantifiers
-        "(a*)*",
-        "(a|a)*",          // Alternation with overlap
-        "(a|ab)*",
-        "a{1000,2000}",    // Excessive repetition
-        ".*.*.*",          // Multiple wildcards
-    };
+    if (pattern.empty()) {
+        return true;  // Empty patterns are safe (will fail validation later)
+    }
 
-    for (const auto& dangerous : DANGEROUS_PATTERNS) {
+    // Maximum allowed values for various pattern features
+    constexpr size_t MAX_PATTERN_LENGTH = 4096;
+    constexpr size_t MAX_NESTING_DEPTH = 6;
+    constexpr size_t MAX_QUANTIFIER_COUNT = 20;
+    constexpr size_t MAX_ALTERNATION_COUNT = 50;
+    constexpr size_t MAX_REPETITION_BOUND = 1000;
+    constexpr size_t MAX_COMPLEXITY_SCORE = 100;
+
+    // Length check (DoS prevention)
+    if (pattern.length() > MAX_PATTERN_LENGTH) {
+        errorMessage = "Pattern too long (" + std::to_string(pattern.length()) + 
+                       " > " + std::to_string(MAX_PATTERN_LENGTH) + ")";
+        return false;
+    }
+
+    // Tracking variables
+    size_t nestingDepth = 0;
+    size_t maxNestingDepth = 0;
+    size_t quantifierCount = 0;
+    size_t alternationCount = 0;
+    size_t complexityScore = 0;
+    bool inCharClass = false;
+    bool lastWasQuantifier = false;
+    size_t quantifierAtDepth = 0;  // Track depth where we saw a quantifier
+
+    for (size_t i = 0; i < pattern.length(); ++i) {
+        char c = pattern[i];
+        char prev = (i > 0) ? pattern[i - 1] : '\0';
+        char next = (i + 1 < pattern.length()) ? pattern[i + 1] : '\0';
+
+        // Skip escaped characters
+        if (prev == '\\') {
+            lastWasQuantifier = false;
+            continue;
+        }
+
+        // Track character classes
+        if (c == '[' && !inCharClass) {
+            inCharClass = true;
+            lastWasQuantifier = false;
+            continue;
+        }
+        if (c == ']' && inCharClass) {
+            inCharClass = false;
+            continue;
+        }
+        if (inCharClass) continue;
+
+        // Track groups and nesting
+        if (c == '(') {
+            nestingDepth++;
+            maxNestingDepth = std::max(maxNestingDepth, nestingDepth);
+            complexityScore += nestingDepth;  // Deeper groups are more expensive
+            lastWasQuantifier = false;
+            continue;
+        }
+        if (c == ')') {
+            if (nestingDepth > 0) {
+                // Check for quantifier immediately after group close
+                if (next == '*' || next == '+' || next == '?' || next == '{') {
+                    // Group followed by quantifier
+                    if (lastWasQuantifier || quantifierAtDepth >= nestingDepth) {
+                        // Nested quantifiers detected! (e.g., (a+)+ or ((a*)*))
+                        errorMessage = "Nested quantifiers detected (ReDoS risk)";
+                        return false;
+                    }
+                    quantifierAtDepth = nestingDepth;
+                }
+                nestingDepth--;
+            }
+            continue;
+        }
+
+        // Track alternation
+        if (c == '|') {
+            alternationCount++;
+            complexityScore += 2;
+            lastWasQuantifier = false;
+            continue;
+        }
+
+        // Track quantifiers
+        if (c == '*' || c == '+' || c == '?') {
+            quantifierCount++;
+            complexityScore += (c == '*' || c == '+') ? 5 : 2;
+            
+            // Detect consecutive quantifiers (e.g., a++, a*+, etc.)
+            if (lastWasQuantifier && (prev == '*' || prev == '+' || prev == '?')) {
+                errorMessage = "Consecutive quantifiers detected";
+                return false;
+            }
+            
+            // Detect quantifier at current depth for nested check
+            if (nestingDepth > 0) {
+                if (quantifierAtDepth >= nestingDepth) {
+                    // We already had a quantifier at this or higher depth
+                    errorMessage = "Nested quantifiers detected at same depth level (ReDoS risk)";
+                    return false;
+                }
+                quantifierAtDepth = nestingDepth;
+            }
+            
+            lastWasQuantifier = true;
+            continue;
+        }
+
+        // Track repetition bounds {n,m}
+        if (c == '{') {
+            quantifierCount++;
+            // Parse the repetition count
+            size_t j = i + 1;
+            size_t minRep = 0, maxRep = 0;
+            bool foundComma = false;
+            
+            while (j < pattern.length() && pattern[j] != '}') {
+                if (pattern[j] == ',') {
+                    foundComma = true;
+                } else if (pattern[j] >= '0' && pattern[j] <= '9') {
+                    if (!foundComma) {
+                        minRep = minRep * 10 + (pattern[j] - '0');
+                    } else {
+                        maxRep = maxRep * 10 + (pattern[j] - '0');
+                    }
+                }
+                j++;
+            }
+            
+            if (!foundComma) maxRep = minRep;
+            
+            // Check repetition bounds
+            if (maxRep > MAX_REPETITION_BOUND) {
+                errorMessage = "Excessive repetition bound (" + std::to_string(maxRep) + 
+                               " > " + std::to_string(MAX_REPETITION_BOUND) + ")";
+                return false;
+            }
+            
+            // Add to complexity based on repetition size
+            complexityScore += (maxRep > 100) ? 10 : (maxRep > 10) ? 5 : 2;
+            
+            lastWasQuantifier = true;
+            continue;
+        }
+
+        // Wildcard .* is expensive
+        if (c == '.') {
+            if (next == '*' || next == '+') {
+                complexityScore += 10;
+            }
+        }
+
+        lastWasQuantifier = false;
+    }
+
+    // Validate limits
+    if (maxNestingDepth > MAX_NESTING_DEPTH) {
+        errorMessage = "Regex nesting too deep (" + std::to_string(maxNestingDepth) + 
+                       " > " + std::to_string(MAX_NESTING_DEPTH) + ")";
+        return false;
+    }
+
+    if (quantifierCount > MAX_QUANTIFIER_COUNT) {
+        errorMessage = "Too many quantifiers (" + std::to_string(quantifierCount) + 
+                       " > " + std::to_string(MAX_QUANTIFIER_COUNT) + ")";
+        return false;
+    }
+
+    if (alternationCount > MAX_ALTERNATION_COUNT) {
+        errorMessage = "Too many alternations (" + std::to_string(alternationCount) + 
+                       " > " + std::to_string(MAX_ALTERNATION_COUNT) + ")";
+        return false;
+    }
+
+    if (complexityScore > MAX_COMPLEXITY_SCORE) {
+        errorMessage = "Pattern complexity too high (score " + std::to_string(complexityScore) + 
+                       " > " + std::to_string(MAX_COMPLEXITY_SCORE) + ")";
+        return false;
+    }
+
+    // Check for known dangerous pattern constructs
+    // These are generic versions that catch variations
+    const std::array<std::pair<std::string_view, std::string_view>, 4> DANGEROUS_PATTERNS = {{
+        {".*.*.*", "Multiple wildcards"},
+        {".*.+.*", "Multiple wildcards"},
+        {".+.*.+", "Multiple wildcards"},
+        {".+.+.+", "Multiple wildcards"}
+    }};
+
+    for (const auto& [dangerous, description] : DANGEROUS_PATTERNS) {
         if (pattern.find(dangerous) != std::string::npos) {
-
-            errorMessage = "Pattern contains dangerous construct: " + std::string(dangerous);
+            errorMessage = "Pattern contains dangerous construct: " + std::string(description);
             return false;
         }
-    }
-
-    // Check depth of nesting
-    int nesting = 0;
-    int maxNesting = 0;
-
-    for (char c : pattern) {
-        if (c == '(') {
-            nesting++;
-            maxNesting = std::max(maxNesting, nesting);
-        }
-        else if (c == ')') {
-            nesting--;
-        }
-    }
-
-    if (maxNesting > 10) {
-        errorMessage = "Regex nesting too deep (" + std::to_string(maxNesting) + ")";
-        return false;
     }
 
     return true;

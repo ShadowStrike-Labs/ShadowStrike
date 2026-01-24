@@ -1940,9 +1940,40 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     }
 
     // CREATE A NAMED MUTEX FOR INJECTION SYNCHRONIZATION
-    // This prevents multiple injectors from racing
+    // SECURITY FIX: Use a restrictive DACL to prevent unprivileged users from squatting
+    // on the mutex name and causing a denial of service.
+    // The DACL grants access only to SYSTEM and Administrators.
+    
+    // Build security descriptor with restricted DACL
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    
+    // SDDL string: D:(A;;GA;;;BA)(A;;GA;;;SY)
+    // D: = DACL
+    // (A;;GA;;;BA) = Allow Generic All to Built-in Administrators
+    // (A;;GA;;;SY) = Allow Generic All to Local System
+    const wchar_t* sddl = L"D:(A;;GA;;;BA)(A;;GA;;;SY)";
+    
+    BOOL sdResult = ::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        SDDL_REVISION_1,
+        &pSD,
+        nullptr
+    );
+    
+    // RAII cleanup for security descriptor
+    struct SDGuard {
+        PSECURITY_DESCRIPTOR sd;
+        ~SDGuard() { if (sd) ::LocalFree(sd); }
+    } sdGuard{ sdResult ? pSD : nullptr };
+    
+    if (sdResult && pSD) {
+        sa.lpSecurityDescriptor = pSD;
+    }
+    // If SDDL conversion fails, we proceed with default security (less secure but functional)
+    
     std::wstring mutexName = L"Global\\ShadowStrike_Inject_" + std::to_wstring(pid);
-    HANDLE hMutex = ::CreateMutexW(nullptr, FALSE, mutexName.c_str());
+    HANDLE hMutex = ::CreateMutexW(sdResult ? &sa : nullptr, FALSE, mutexName.c_str());
     if (!hMutex) {
         SetWin32Error(err, L"CreateMutexW");
         return false;

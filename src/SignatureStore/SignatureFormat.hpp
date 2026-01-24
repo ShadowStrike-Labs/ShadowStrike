@@ -56,7 +56,7 @@ namespace SignatureStore {
 // Magic numbers for format validation
 constexpr uint32_t SIGNATURE_DB_MAGIC = 0x53535344;      // 'SSSD' = ShadowStrike Signature Database
 constexpr uint16_t SIGNATURE_DB_VERSION_MAJOR = 1;
-constexpr uint16_t SIGNATURE_DB_VERSION_MINOR = 0;
+constexpr uint16_t SIGNATURE_DB_VERSION_MINOR = 1;       // v1.1: 64-bit offsets in B+Tree nodes
 
 // Performance-critical alignment constants
 constexpr size_t PAGE_SIZE = 4096;                        // Standard Windows page size
@@ -210,7 +210,8 @@ struct alignas(8) BPlusTreeNode {
     bool isLeaf;
     uint8_t reserved[7];                                  // Alignment to 8 bytes
     uint32_t keyCount;                                    // Number of keys in this node
-    uint32_t parentOffset;                                // Offset to parent node (0 = root)
+    uint32_t reserved2;                                   // Padding for alignment
+    uint64_t parentOffset;                                // Offset to parent node (0 = root)
     
     // Keys: hash fast-hash values for quick comparison
     std::array<uint64_t, MAX_KEYS> keys;
@@ -218,15 +219,23 @@ struct alignas(8) BPlusTreeNode {
     // Values/Children: 
     // - Internal nodes: offsets to child nodes
     // - Leaf nodes: offsets to signature data
-    std::array<uint32_t, MAX_CHILDREN> children;
+    // 
+    // SECURITY NOTE (v1.1): Changed from uint32_t to uint64_t to prevent
+    // integer truncation when database exceeds 4GB. On 64-bit systems with
+    // ASLR enabled, memory addresses can exceed 4GB boundary, causing pointer
+    // corruption if truncated to 32 bits. This is a BREAKING FORMAT CHANGE.
+    std::array<uint64_t, MAX_CHILDREN> children;
     
     // Leaf node linked list for sequential scans
-    uint32_t nextLeaf;                                    // Next leaf in sequence
-    uint32_t prevLeaf;                                    // Previous leaf in sequence
+    // SECURITY NOTE (v1.1): Changed from uint32_t to uint64_t for consistency
+    // with children array and to support databases larger than 4GB.
+    uint64_t nextLeaf;                                    // Next leaf in sequence
+    uint64_t prevLeaf;                                    // Previous leaf in sequence
 };
 #pragma pack(pop)
 
 // Ensure node fits in cache-friendly size (multiple cache lines)
+// NOTE (v1.1): Node size increased due to 64-bit offsets, but still within page size
 static_assert(sizeof(BPlusTreeNode) <= PAGE_SIZE, "BPlusTreeNode too large");
 static_assert(alignof(BPlusTreeNode) == 8, "BPlusTreeNode must be 8-byte aligned");
 
@@ -551,6 +560,33 @@ namespace Format {
 
 // Format hash value as hex string
 [[nodiscard]] std::string FormatHashString(const HashValue& hash);
+
+/**
+ * @brief Validates and canonicalizes a file path for safe file operations.
+ * 
+ * @param inputPath The user-provided path to validate.
+ * @param canonicalPath Output: The canonicalized (resolved) absolute path.
+ * @param errorMessage Output: Error description if validation fails.
+ * @return true if path is safe to use, false if validation failed.
+ * 
+ * @details Security measures (CWE-22 Path Traversal prevention):
+ * 1. Rejects empty paths
+ * 2. Rejects excessively long paths (DoS prevention)
+ * 3. Rejects paths with embedded NUL characters (truncation attack)
+ * 4. Rejects paths with traversal patterns (..)
+ * 5. Rejects Windows reserved device names (CON, PRN, AUX, NUL, etc.)
+ * 6. Canonicalizes the path to resolve any remaining . or .. components
+ * 7. Ensures path is absolute (starts with drive letter or UNC)
+ * 
+ * @security This function is critical for preventing path traversal attacks
+ * where an attacker provides paths like "..\..\Windows\System32\config" to
+ * access sensitive system files.
+ */
+[[nodiscard]] bool ValidateAndCanonicalizePath(
+    const std::wstring& inputPath,
+    std::wstring& canonicalPath,
+    std::string& errorMessage
+) noexcept;
 
 } // namespace Format
 namespace MemoryMapping {

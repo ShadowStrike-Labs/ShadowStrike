@@ -55,6 +55,161 @@ namespace {
     constexpr size_t MAX_JSON_BUFFER_SIZE = 256 * 1024 * 1024;  // 256MB
 
     // ========================================================================
+    // SAFE INPUT READING UTILITIES (DoS Prevention)
+    // ========================================================================
+    
+    /**
+     * @brief Read a line from stream with strict length limit BEFORE allocation.
+     * 
+     * SECURITY FIX: Unlike std::getline which allocates memory dynamically as it
+     * reads (allowing DoS via extremely long lines), this function reads character
+     * by character and stops BEFORE exceeding the maximum length. This prevents
+     * memory exhaustion from malicious input files without newlines.
+     * 
+     * @param stream Input stream to read from
+     * @param line Output string for the read line
+     * @param maxLength Maximum allowed line length (default 64KB)
+     * @param lineTruncated Output: true if line was truncated due to length limit
+     * @return true if a line was read (even if truncated), false on EOF/error
+     * 
+     * @security This is critical for preventing CWE-770 (Allocation of Resources
+     * Without Limits or Throttling) attacks via crafted input files.
+     */
+    [[nodiscard]] bool SafeGetLine(
+        std::istream& stream,
+        std::string& line,
+        size_t maxLength = MAX_LINE_LENGTH,
+        bool* lineTruncated = nullptr
+    ) noexcept {
+        line.clear();
+        if (lineTruncated) *lineTruncated = false;
+        
+        if (!stream.good() || stream.eof()) {
+            return false;
+        }
+        
+        // Pre-allocate reasonable initial size
+        try {
+            line.reserve(std::min(maxLength, size_t{ 256 }));
+        } catch (...) {
+            // Allocation failed - continue without reservation
+        }
+        
+        char ch;
+        size_t bytesRead = 0;
+        bool reachedNewline = false;
+        
+        while (stream.get(ch)) {
+            // Check for end of line
+            if (ch == '\n') {
+                reachedNewline = true;
+                break;
+            }
+            
+            // Check length limit BEFORE adding character
+            if (bytesRead >= maxLength) {
+                // Line exceeds maximum - mark as truncated and skip rest of line
+                if (lineTruncated) *lineTruncated = true;
+                
+                // Skip remaining characters until newline or EOF
+                while (stream.get(ch) && ch != '\n') {
+                    // Discarding excess characters
+                }
+                break;
+            }
+            
+            // Safe to add character
+            try {
+                line.push_back(ch);
+                bytesRead++;
+            } catch (const std::exception&) {
+                // Allocation failed mid-read
+                return false;
+            }
+        }
+        
+        // Handle CRLF line endings
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        
+        // Return true if we read anything or reached a newline (empty line is valid)
+        return reachedNewline || !line.empty() || bytesRead > 0;
+    }
+    
+    /**
+     * @brief Read stream content with strict size limit BEFORE full allocation.
+     * 
+     * SECURITY FIX: Reads stream content in chunks up to a maximum size limit.
+     * Unlike reading the entire stream via rdbuf() which can cause OOM, this
+     * function checks size incrementally and fails fast if limit is exceeded.
+     * 
+     * @param stream Input stream to read from
+     * @param content Output string for the content
+     * @param maxSize Maximum allowed content size
+     * @param bytesRead Output: actual bytes read
+     * @return true if content was read within limit, false if exceeded or error
+     * 
+     * @security Critical for preventing memory exhaustion from large input files.
+     */
+    [[nodiscard]] bool SafeReadStreamContent(
+        std::istream& stream,
+        std::string& content,
+        size_t maxSize,
+        size_t& bytesRead
+    ) noexcept {
+        content.clear();
+        bytesRead = 0;
+        
+        if (!stream.good()) {
+            return false;
+        }
+        
+        // Read in chunks to avoid single large allocation
+        constexpr size_t CHUNK_SIZE = 64 * 1024;  // 64KB chunks
+        std::array<char, CHUNK_SIZE> buffer;
+        
+        try {
+            content.reserve(std::min(maxSize, size_t{ 1024 * 1024 }));  // Reserve up to 1MB initially
+        } catch (...) {
+            // Continue without reservation
+        }
+        
+        while (stream.good() && !stream.eof()) {
+            // Check if we've reached the limit
+            if (bytesRead >= maxSize) {
+                content.clear();
+                return false;  // Size limit exceeded
+            }
+            
+            // Calculate remaining bytes we can read
+            size_t remainingCapacity = maxSize - bytesRead;
+            size_t toRead = std::min(CHUNK_SIZE, remainingCapacity);
+            
+            stream.read(buffer.data(), static_cast<std::streamsize>(toRead));
+            std::streamsize actualRead = stream.gcount();
+            
+            if (actualRead > 0) {
+                try {
+                    content.append(buffer.data(), static_cast<size_t>(actualRead));
+                    bytesRead += static_cast<size_t>(actualRead);
+                } catch (const std::exception&) {
+                    content.clear();
+                    return false;  // Allocation failed
+                }
+            }
+            
+            // Check for read errors (not just EOF)
+            if (stream.bad()) {
+                content.clear();
+                return false;
+            }
+        }
+        
+        return true;
+    }
+
+    // ========================================================================
     // DELEGATING WRAPPERS - Use Format namespace canonical implementations
     // ========================================================================
     
@@ -704,20 +859,19 @@ bool CSVImportReader::ReadRow(std::vector<std::string>& fields) {
         }
         
         std::string line;
-        try {
-            if (!std::getline(m_input, line)) {
-                m_endOfInput = true;
-                return false;
-            }
-        } catch (const std::exception& e) {
-            m_lastError = std::string("I/O error reading line: ") + e.what();
+        bool lineTruncated = false;
+        
+        // SECURITY FIX: Use SafeGetLine instead of std::getline to prevent
+        // memory exhaustion from malicious files with extremely long lines.
+        // SafeGetLine limits allocation BEFORE reading, not after.
+        if (!SafeGetLine(m_input, line, MAX_LINE_LENGTH, &lineTruncated)) {
             m_endOfInput = true;
             return false;
         }
         
-        // Handle Windows CRLF
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+        if (lineTruncated) {
+            m_lastError = "Line truncated - exceeded maximum length";
+            // Log but continue processing
         }
         
         m_currentLine++;
@@ -1538,19 +1692,19 @@ bool JSONImportReader::Initialize(const ImportOptions& options) {
                 m_isJsonLines = false;
                 
                 // For standard JSON, load content with size limit
+                // SECURITY FIX: Use SafeReadStreamContent to prevent memory exhaustion
+                // from large input files. The previous code used rdbuf() which reads
+                // the entire stream before checking size limits.
                 constexpr size_t MAX_JSON_SIZE = 256 * 1024 * 1024;  // 256MB
                 
-                std::stringstream buffer;
-                buffer << m_input.rdbuf();
-                m_buffer = buffer.str();
-                
-                if (m_buffer.size() > MAX_JSON_SIZE) {
-                    m_lastError = "JSON content exceeds maximum size limit";
+                size_t bytesReadLocal = 0;
+                if (!SafeReadStreamContent(m_input, m_buffer, MAX_JSON_SIZE, bytesReadLocal)) {
+                    m_lastError = "JSON content exceeds maximum size limit or read error";
                     m_buffer.clear();
                     return false;
                 }
                 
-                m_bytesRead = m_buffer.size();
+                m_bytesRead = bytesReadLocal;
                 
                 if (!ParseDocument()) {
                     return false;
@@ -1700,8 +1854,23 @@ bool JSONImportReader::ParseAndCacheEntries() {
 
 bool JSONImportReader::ReadNextJSONLine(std::string& line) {
     if (m_input.eof()) return false;
-    std::getline(m_input, line);
+    
+    // SECURITY FIX: Use SafeGetLine instead of std::getline to prevent
+    // memory exhaustion from malicious JSONL files with extremely long lines.
+    constexpr size_t MAX_JSON_LINE_LENGTH = 16 * 1024 * 1024;  // 16MB per JSON line
+    bool truncated = false;
+    
+    if (!SafeGetLine(m_input, line, MAX_JSON_LINE_LENGTH, &truncated)) {
+        return false;
+    }
+    
     m_bytesRead += line.length() + 1;
+    
+    if (truncated) {
+        // Line was truncated - this JSON entry will likely fail to parse
+        // but we continue to allow other entries to be processed
+    }
+    
     return !line.empty() || !m_input.eof();
 }
 
@@ -1994,18 +2163,15 @@ bool STIX21ImportReader::Initialize(const ImportOptions& options) {
         // Maximum allowed STIX bundle size to prevent memory exhaustion
         constexpr size_t MAX_STIX_BUNDLE_SIZE = 512 * 1024 * 1024;  // 512MB
         
-        // Load bundle with size check
-        std::stringstream buffer;
-        buffer << m_input.rdbuf();
-        m_bundleContent = buffer.str();
-        m_bytesRead = m_bundleContent.size();
-        
-        // Security check: prevent excessively large bundles
-        if (m_bundleContent.size() > MAX_STIX_BUNDLE_SIZE) {
-            m_lastError = "STIX bundle exceeds maximum allowed size";
+        // SECURITY FIX: Use SafeReadStreamContent to prevent memory exhaustion.
+        // Previous code used rdbuf() which reads entire stream before checking size.
+        size_t bytesReadLocal = 0;
+        if (!SafeReadStreamContent(m_input, m_bundleContent, MAX_STIX_BUNDLE_SIZE, bytesReadLocal)) {
+            m_lastError = "STIX bundle exceeds maximum allowed size or read error";
             m_bundleContent.clear();
             return false;
         }
+        m_bytesRead = bytesReadLocal;
         
         // Check for empty content
         if (m_bundleContent.empty()) {
@@ -2636,11 +2802,17 @@ bool MISPImportReader::ParseEvent() {
      */
     
     try {
-        // Read entire stream into buffer (MISP events are typically manageable size)
-        std::stringstream buffer;
-        buffer << m_input.rdbuf();
-        std::string content = buffer.str();
-        m_bytesRead = content.length();
+        // SECURITY FIX: Use SafeReadStreamContent to prevent memory exhaustion.
+        // MISP events can be arbitrarily large if maliciously crafted.
+        constexpr size_t MAX_MISP_SIZE = 256 * 1024 * 1024;  // 256MB
+        
+        std::string content;
+        size_t bytesReadLocal = 0;
+        if (!SafeReadStreamContent(m_input, content, MAX_MISP_SIZE, bytesReadLocal)) {
+            m_lastError = "MISP event exceeds maximum allowed size or read error";
+            return false;
+        }
+        m_bytesRead = bytesReadLocal;
         
         if (content.empty()) {
             m_lastError = "Empty MISP event input";
@@ -3011,19 +3183,21 @@ bool PlainTextImportReader::ReadNextEntry(IOCEntry& entry, IStringPoolWriter* st
     if (m_endOfInput) return false;
     
     // Maximum line length to prevent DoS
-    constexpr size_t MAX_LINE_LENGTH = 1024 * 1024;  // 1MB
+    constexpr size_t LOCAL_MAX_LINE_LENGTH = 1024 * 1024;  // 1MB
     
     try {
         std::string line;
-        line.reserve(256);  // Pre-allocate reasonable size
+        bool truncated = false;
         
-        while (std::getline(m_input, line)) {
+        // SECURITY FIX: Use SafeGetLine instead of std::getline to prevent
+        // memory exhaustion from malicious files with extremely long lines.
+        while (SafeGetLine(m_input, line, LOCAL_MAX_LINE_LENGTH, &truncated)) {
             m_currentLine++;
             m_bytesRead += line.length() + 1;
             
-            // Security check: skip excessively long lines
-            if (line.length() > MAX_LINE_LENGTH) {
-                m_lastError = "Line exceeds maximum length";
+            // Security check: skip truncated lines
+            if (truncated) {
+                m_lastError = "Line truncated - exceeded maximum length";
                 continue;  // Skip this line
             }
             
@@ -3774,18 +3948,15 @@ bool OpenIOCImportReader::ParseDocument() {
         // Maximum allowed OpenIOC document size
         constexpr size_t MAX_OPENIOC_SIZE = 256 * 1024 * 1024;  // 256MB
         
-        // OpenIOC is XML, we need to parse the whole document
-        // Using pugixml
-        std::stringstream buffer;
-        buffer << m_input.rdbuf();
-        std::string content = buffer.str();
-        m_bytesRead = content.size();
-        
-        // Security check: prevent excessively large documents
-        if (content.size() > MAX_OPENIOC_SIZE) {
-            m_lastError = "OpenIOC document exceeds maximum allowed size";
+        // SECURITY FIX: Use SafeReadStreamContent to prevent memory exhaustion.
+        // Previous code used rdbuf() which reads entire stream before checking size.
+        std::string content;
+        size_t bytesReadLocal = 0;
+        if (!SafeReadStreamContent(m_input, content, MAX_OPENIOC_SIZE, bytesReadLocal)) {
+            m_lastError = "OpenIOC document exceeds maximum allowed size or read error";
             return false;
         }
+        m_bytesRead = bytesReadLocal;
         
         if (content.empty()) {
             m_lastError = "Empty OpenIOC document";
