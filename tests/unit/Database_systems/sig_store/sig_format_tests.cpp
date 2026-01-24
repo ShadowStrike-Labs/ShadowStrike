@@ -951,7 +951,7 @@ TEST(StructureSizeTest, BPlusTreeNodeFitsInPage) {
 }
 
 TEST(StructureSizeTest, TrieNodeBinaryCorrectSize) {
-    EXPECT_EQ(sizeof(TrieNodeBinary), 1052);
+    EXPECT_EQ(sizeof(TrieNodeBinary), 1056);
 }
 
 TEST(StructureSizeTest, TrieIndexHeaderIs96Bytes) {

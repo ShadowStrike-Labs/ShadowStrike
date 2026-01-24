@@ -1038,7 +1038,7 @@ TEST(PatternUtilsTest, HexStringConversion) {
     EXPECT_EQ((*bytes)[2], 0x05);
 
     auto hexStr = PatternUtils::BytesToHexString(*bytes);
-    EXPECT_EQ(hexStr, "48 8B05");  // Note: no spaces in output
+    EXPECT_EQ(hexStr, "48 8B 05");  // Space-separated uppercase hex bytes
 }
 
 TEST(PatternUtilsTest, HammingDistance) {

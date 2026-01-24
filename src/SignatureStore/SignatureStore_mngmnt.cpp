@@ -256,10 +256,11 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
             }
 
-            // VALIDATION 3: Signature ID validation (0 is typically invalid)
+            // VALIDATION 3: Signature ID validation
+            // NOTE: Pattern ID 0 is valid in PatternStore (first pattern can have ID 0)
+            // Only log warning for debugging, allow the operation
             if (signatureId == 0) {
-                SS_LOG_WARN(L"SignatureStore", L"RemovePattern: Removing signature ID 0 (may be invalid)");
-                // Allow but log warning
+                SS_LOG_DEBUG(L"SignatureStore", L"RemovePattern: Removing signature ID 0 (valid for first pattern)");
             }
 
             try {

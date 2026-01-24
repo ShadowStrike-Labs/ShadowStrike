@@ -1354,11 +1354,10 @@ namespace ShadowStrike {
             // VALIDATION
             // ========================================================================
 
-            if (signatureId == 0) {
-                SS_LOG_ERROR(L"PatternIndex", L"RemovePattern: Invalid signature ID (0)");
-                return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                                  "Invalid signature ID" };
-            }
+            // NOTE: signatureId == 0 is VALID in PatternStore
+            // The first pattern added to an empty store gets ID 0
+            // PatternStore assigns IDs as: signatureId = m_patternCache.size()
+            // Therefore, removing this validation allows legitimate removal of pattern ID 0
 
             // Validate base address is available for writing
             if (!m_baseAddress) {

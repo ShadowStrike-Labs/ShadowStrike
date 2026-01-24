@@ -179,29 +179,55 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
     try {
         std::string current;
         current.reserve(16); // Typical token size
+        bool inBracket = false;   // Track if we're inside [...]
+        bool inBrace = false;     // Track if we're inside {...}
 
         for (size_t i = 0; i < patternStr.length(); ++i) {
             const char c = patternStr[i];
 
             if (std::isspace(static_cast<unsigned char>(c))) {
+                // Only split on whitespace if not inside brackets or braces
+                if (!inBracket && !inBrace) {
+                    if (!current.empty()) {
+                        tokens.push_back(current);
+                        current.clear();
+                    }
+                }
+                else {
+                    current += c; // Preserve whitespace inside brackets/braces
+                }
+            }
+            else if (c == '{') {
                 if (!current.empty()) {
                     tokens.push_back(current);
                     current.clear();
                 }
+                inBrace = true;
+                current += c;
             }
-            else if (c == '{' || c == '}') {
+            else if (c == '}') {
+                current += c;
+                if (inBrace) {
+                    tokens.push_back(current);
+                    current.clear();
+                    inBrace = false;
+                }
+            }
+            else if (c == '[') {
                 if (!current.empty()) {
                     tokens.push_back(current);
                     current.clear();
                 }
+                inBracket = true;
                 current += c;
             }
-            else if (c == '[' || c == ']') {
-                if (!current.empty() && current.back() != '[') {
+            else if (c == ']') {
+                current += c;
+                if (inBracket) {
                     tokens.push_back(current);
                     current.clear();
+                    inBracket = false;
                 }
-                current += c;
             }
             else {
                 current += c;
@@ -1469,11 +1495,20 @@ StoreError PatternStore::RemovePattern(uint64_t signatureId) noexcept {
 
     m_patternCache.erase(it);
 
-    // Rebuild automaton
-    StoreError rebuildErr = BuildAutomaton();
-    if (!rebuildErr.IsSuccess()) {
-        SS_LOG_WARN(L"PatternStore", L"RemovePattern: Automaton rebuild failed");
-        return rebuildErr;
+    // Rebuild automaton only if there are patterns remaining
+    if (!m_patternCache.empty()) {
+        StoreError rebuildErr = BuildAutomaton();
+        if (!rebuildErr.IsSuccess()) {
+            SS_LOG_WARN(L"PatternStore", L"RemovePattern: Automaton rebuild failed");
+            return rebuildErr;
+        }
+    }
+    else {
+        // Clear automaton when all patterns are removed
+        SS_LOG_DEBUG(L"PatternStore", L"RemovePattern: No patterns remaining, clearing automaton");
+        if (m_automaton) {
+            m_automaton->Clear();
+        }
     }
 
     return StoreError{ SignatureStoreError::Success };
@@ -2617,10 +2652,13 @@ std::string BytesToHexString(
 
     try {
         std::ostringstream oss;
-        oss << std::hex << std::setfill('0');
+        oss << std::hex << std::uppercase << std::setfill('0');
         
-        for (uint8_t byte : bytes) {
-            oss << std::setw(2) << static_cast<unsigned>(byte);
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            if (i > 0) {
+                oss << ' '; // Add space between bytes
+            }
+            oss << std::setw(2) << static_cast<unsigned>(bytes[i]);
         }
 
         return oss.str();

@@ -1399,6 +1399,11 @@ std::vector<uint64_t> PathIndex::Lookup(
         //   - '?' matches exactly one character INCLUDING path separators
         //   - This differs from Unix shell globs where '*' doesn't match '/'
         //   - Windows behavior is intentional for path-based whitelisting
+        //
+        // IMPLEMENTATION LOGIC:
+        //   - Query path contains glob pattern (e.g., "C:/Windows/*.dll")
+        //   - Traverse ALL stored paths regardless of their matchMode
+        //   - Check if stored path matches the query glob pattern
         // ====================================================================
         else if (mode == PathMatchMode::Glob) {
             auto globMatch = [](std::string_view pattern, std::string_view text) -> bool {
@@ -1431,15 +1436,18 @@ std::vector<uint64_t> PathIndex::Lookup(
                 return pi == pattern.length();
             };
             
-            // Traverse all stored Glob patterns and check if they match normalizedPath
+            // Traverse ALL stored paths and check if they match the query glob pattern
+            // normalizedPath = query pattern (e.g., "c:/windows/system32/*.dll")
+            // accPath = stored path (e.g., "c:/windows/system32/kernel32.dll")
             std::function<void(const HeapTrieNode*, std::string&, size_t)> traverse;
             traverse = [&](const HeapTrieNode* node, std::string& accPath, size_t depth) {
                 // Stack overflow protection and result limit
                 if (!node || results.size() >= MAX_RESULTS || depth >= SAFE_MAX_TRIE_DEPTH) return;
                 
-                if (node->isTerminal && node->matchMode == PathMatchMode::Glob) {
-                    // accPath is the stored PATTERN, normalizedPath is the QUERY to match
-                    if (globMatch(accPath, normalizedPath)) {
+                // Check ALL terminal nodes, not just Glob-mode patterns
+                if (node->isTerminal) {
+                    // normalizedPath is the PATTERN (query), accPath is the TEXT (stored path)
+                    if (globMatch(normalizedPath, accPath)) {
                         results.push_back(node->entryOffset);
                     }
                 }

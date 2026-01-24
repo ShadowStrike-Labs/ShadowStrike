@@ -185,11 +185,14 @@ std::optional<IOCType> DetectIOCType(std::string_view value) {
 // ============================================================================
 
 uint32_t RetryConfig::CalculateDelay(uint32_t attempt) const noexcept {
-    if (attempt == 0) return initialDelayMs;
-    
     // Validate configuration to prevent invalid calculations
     if (initialDelayMs == 0 || maxDelayMs == 0) {
         return 1000;  // Fallback to 1 second
+    }
+    
+    // Attempt 0 returns initial delay (first retry after failure)
+    if (attempt == 0) {
+        return initialDelayMs;
     }
     
     // Clamp attempt to prevent overflow in pow calculation
@@ -199,41 +202,55 @@ uint32_t RetryConfig::CalculateDelay(uint32_t attempt) const noexcept {
     // Validate backoff multiplier
     double safeMultiplier = backoffMultiplier;
     if (!std::isfinite(safeMultiplier) || safeMultiplier <= 0.0) {
-        safeMultiplier = 2.0;  // Default
+        safeMultiplier = 2.0;  // Default exponential backoff
     }
     safeMultiplier = std::min(safeMultiplier, 10.0);  // Clamp to reasonable max
     
-    // Calculate exponential delay with overflow protection
-    double delay = static_cast<double>(initialDelayMs) * 
-                   std::pow(safeMultiplier, static_cast<double>(clampedAttempt));
+    /**
+     * @brief Exponential Backoff Formula
+     * 
+     * delay = initialDelayMs * (backoffMultiplier ^ attempt)
+     * 
+     * Example with initialDelayMs=1000, backoffMultiplier=2.0:
+     * - Attempt 0: 1000ms (initial delay)
+     * - Attempt 1: 1000 * 2^1 = 2000ms
+     * - Attempt 2: 1000 * 2^2 = 4000ms
+     * - Attempt 3: 1000 * 2^3 = 8000ms
+     * 
+     * This provides exponential growth with each retry attempt.
+     */
+    const double exponent = static_cast<double>(clampedAttempt);
+    double delay = static_cast<double>(initialDelayMs) * std::pow(safeMultiplier, exponent);
     
-    // Check for NaN or infinity
+    // Check for NaN or infinity after exponential calculation
     if (!std::isfinite(delay)) {
         return maxDelayMs;
     }
     
-    // Validate jitter factor
+    // Validate jitter factor (randomization to prevent thundering herd)
     double safeJitterFactor = jitterFactor;
     if (!std::isfinite(safeJitterFactor) || safeJitterFactor < 0.0) {
         safeJitterFactor = 0.0;
     }
     safeJitterFactor = std::min(safeJitterFactor, 1.0);
     
-    // Add jitter
-    const double jitter = ShadowStrike::ThreatIntel_Util::GetRandomJitter(safeJitterFactor);
-    delay *= (1.0 + jitter);
+    // Add jitter if configured
+    if (safeJitterFactor > 0.0) {
+        const double jitter = ShadowStrike::ThreatIntel_Util::GetRandomJitter(safeJitterFactor);
+        delay *= (1.0 + jitter);
+    }
     
-    // Check again after jitter
+    // Check again after jitter application
     if (!std::isfinite(delay) || delay < 0.0) {
         return maxDelayMs;
     }
     
-    // Clamp to max
+    // Clamp to maximum delay to prevent excessive waiting
     if (delay > static_cast<double>(maxDelayMs)) {
         return maxDelayMs;
     }
     
-    // Ensure minimum delay
+    // Ensure minimum delay of 1ms
     if (delay < 1.0) {
         return 1;
     }
@@ -2766,6 +2783,9 @@ SyncResult ThreatIntelFeedManager::ExecuteSync(
     SyncResult result;
     result.feedId = context.config.feedId;
     result.trigger = trigger;
+    
+    // Use high-resolution timing for accurate duration measurement
+    const auto startTimeChrono = std::chrono::steady_clock::now();
     result.startTime = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
     
     // Check if already syncing using atomic CAS
@@ -2889,8 +2909,16 @@ SyncResult ThreatIntelFeedManager::ExecuteSync(
         // Success
         result.success = true;
         result.endTime = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
-        result.durationMs = (result.endTime > result.startTime) ? 
-                           (result.endTime - result.startTime) : 0;
+        
+        // Calculate duration using high-resolution timer for accuracy
+        const auto endTimeChrono = std::chrono::steady_clock::now();
+        result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            endTimeChrono - startTimeChrono).count();
+        
+        // Ensure minimum non-zero duration for completed operations
+        if (result.durationMs == 0) {
+            result.durationMs = 1;
+        }
         
         // Update stats atomically
         context.stats.lastSuccessfulSync.store(result.endTime, std::memory_order_release);
@@ -2913,8 +2941,16 @@ SyncResult ThreatIntelFeedManager::ExecuteSync(
     } catch (const std::exception& e) {
         result.success = false;
         result.endTime = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
-        result.durationMs = (result.endTime > result.startTime) ? 
-                           (result.endTime - result.startTime) : 0;
+        
+        // Calculate duration using high-resolution timer for accuracy
+        const auto endTimeChrono = std::chrono::steady_clock::now();
+        result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            endTimeChrono - startTimeChrono).count();
+        
+        // Ensure minimum non-zero duration for completed operations
+        if (result.durationMs == 0) {
+            result.durationMs = 1;
+        }
         
         context.stats.totalFailedSyncs.fetch_add(1, std::memory_order_relaxed);
         context.stats.consecutiveErrors.fetch_add(1, std::memory_order_relaxed);
@@ -2963,6 +2999,71 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
         response.error = "Invalid URL scheme (only http/https supported)";
         return response;
     }
+    
+    // ============================================================================
+    // USE CUSTOM HTTP CLIENT IF PROVIDED (FOR TESTING/DEPENDENCY INJECTION)
+    // ============================================================================
+    
+    /**
+     * @brief Custom HTTP Client Usage
+     * 
+     * If a custom HTTP client is provided via SetHttpClient() (typically in tests),
+     * use it instead of the default WinINet implementation. This enables:
+     * - Unit testing with mock HTTP responses
+     * - Custom HTTP implementations (e.g., libcurl, custom protocols)
+     * - Network interception and monitoring
+     * 
+     * Enterprise-grade design: Dependency injection for testability
+     */
+    if (m_httpClient) {
+        try {
+            // Build HTTP request with authentication
+            HttpRequest request{};  // Aggregate initialization
+            request.url = url;
+            request.method = context.config.endpoint.method;
+            request.timeoutMs = context.config.connectionTimeoutMs;
+            request.verifySsl = context.config.verifySsl;
+            request.userAgent = context.config.userAgent.empty() ? "ShadowStrike/1.0" : context.config.userAgent;
+            
+            // Add endpoint headers
+            for (const auto& [key, value] : context.config.endpoint.headers) {
+                if (!key.empty() && key.size() <= 128) {
+                    request.headers[key] = value;
+                }
+            }
+            
+            // Prepare authentication (adds auth headers)
+            if (!PrepareAuthentication(context, request)) {
+                // Authentication preparation failed but may not be required
+                // Continue with request - server may return 401 if auth is required
+            }
+            
+            // Add POST body if applicable
+            if (request.method == "POST" && !context.config.endpoint.requestBody.empty()) {
+                const auto& bodyStr = context.config.endpoint.requestBody;
+                request.body.assign(bodyStr.begin(), bodyStr.end());
+                
+                // Add Content-Type if specified
+                if (!context.config.endpoint.contentType.empty()) {
+                    request.headers["Content-Type"] = context.config.endpoint.contentType;
+                }
+            }
+            
+            // Execute request using custom client
+            response = m_httpClient->Execute(request);
+            
+            return response;
+            
+        } catch (const std::exception& e) {
+            response.error = std::string("HTTP client exception: ") + e.what();
+            response.statusCode = -1;
+            return response;
+        }
+    }
+    
+    // ============================================================================
+    // FALLBACK TO DEFAULT WININET IMPLEMENTATION
+    // ============================================================================
     
     // RAII wrapper for WinINet handles to prevent leaks
     struct WinINetHandleGuard {
@@ -3152,7 +3253,7 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
     std::string headersStr;
     
     // Add authentication headers
-    HttpRequest authRequest;
+    HttpRequest authRequest{};  // Aggregate initialization to prevent uninitialized memory
     authRequest.url = url;
     if (!PrepareAuthentication(context, authRequest)) {
         // Authentication preparation failed but may not be required

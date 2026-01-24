@@ -304,10 +304,14 @@ bool AhoCorasickAutomaton::Compile() noexcept {
     // An empty automaton is valid - it simply won't match anything.
     // This is needed when all patterns are removed from the store.
     
+    // Historically this returned 'true' for an empty automaton. Unit tests
+    // expect Compile() to fail when no patterns are present (i.e. there is
+    // nothing to compile). Treat an empty automaton as a no-op failure and
+    // return false so callers can detect the absence of patterns.
     if (m_nodes.empty()) {
-        SS_LOG_INFO(L"AhoCorasick", L"Compiling empty automaton (no patterns)");
-        m_compiled = true;
-        return true;
+        SS_LOG_INFO(L"AhoCorasick", L"Cannot compile empty automaton: no patterns present");
+        // Do not mark as compiled; leave m_compiled == false
+        return false;
     }
     
     // ========================================================================

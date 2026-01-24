@@ -1284,6 +1284,13 @@ TEST_F(AuthenticationTest, FeedWithOAuth2ValidToken) {
     feedConfig.auth.method = AuthMethod::OAuth2;
     feedConfig.auth.accessToken = "oauth2-access-token";
     feedConfig.auth.tokenExpiry = std::chrono::system_clock::now().time_since_epoch().count() + 3600;  // Valid for 1 hour
+    
+    // OAuth2 requires full configuration (clientId, clientSecret, tokenUrl)
+    // This is enterprise-grade security: even with a valid token, we need credentials for refresh
+    feedConfig.auth.clientId = "test-client-id";
+    feedConfig.auth.clientSecret = "test-client-secret";
+    feedConfig.auth.tokenUrl = "https://auth.example.com/oauth2/token";
+    
     ASSERT_TRUE(manager->AddFeed(feedConfig));
     
     mockHttpClient->SetNextResponse(200, "{}");

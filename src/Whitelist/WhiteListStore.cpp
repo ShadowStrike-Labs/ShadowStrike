@@ -3080,18 +3080,18 @@ StoreError WhitelistStore::ImportFromCSV(
      * ========================================================================
      */
     
-    // Validate state
-    if (m_readOnly.load(std::memory_order_acquire)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::ReadOnlyDatabase,
-            "Cannot import to read-only database"
-        );
-    }
-    
+    // Validate state - check initialization first
     if (!m_initialized.load(std::memory_order_acquire)) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
             "Store not initialized"
+        );
+    }
+    
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::ReadOnlyDatabase,
+            "Cannot import to read-only database"
         );
     }
     
@@ -4987,18 +4987,18 @@ StoreError WhitelistStore::UpdateChecksum() noexcept {
      * ========================================================================
      */
     
-    // Validate state
-    if (m_readOnly.load(std::memory_order_acquire)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::ReadOnlyDatabase,
-            "Cannot update checksum in read-only mode"
-        );
-    }
-    
+    // Validate state - check initialization first
     if (!m_initialized.load(std::memory_order_acquire)) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
             "Store not initialized"
+        );
+    }
+    
+    if (m_readOnly.load(std::memory_order_acquire)) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::ReadOnlyDatabase,
+            "Cannot update checksum in read-only mode"
         );
     }
     

@@ -492,13 +492,16 @@ TEST(ReputationCacheTests, Clear_ResetsEntriesAndBloomAndCounters) {
 
 	c.Clear();
 	EXPECT_EQ(c.GetEntryCount(), 0u);
-	CacheValue out{};
-	EXPECT_FALSE(c.Lookup(key, out));
-	EXPECT_FALSE(c.MightContain(key));
 
+	// Get statistics immediately after Clear() to verify reset
 	CacheStatistics after = c.GetStatistics();
 	EXPECT_EQ(after.totalEntries, 0u);
 	EXPECT_EQ(after.bloomRejects, 0u);
+
+	// Verify that lookups work correctly after Clear()
+	CacheValue out{};
+	EXPECT_FALSE(c.Lookup(key, out));
+	EXPECT_FALSE(c.MightContain(key));
 }
 
 TEST(ReputationCacheTests, EvictExpired_RemovesExpiredAcrossShards) {

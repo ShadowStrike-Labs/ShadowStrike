@@ -1768,7 +1768,9 @@ namespace ShadowStrike {
                     const std::wstring longp = AddLongPathPrefix(d);
                     if (!longp.empty() && !RemoveDirectoryW(longp.c_str())) {
                         const DWORD ec = GetLastError();
-                        if (ec != ERROR_DIR_NOT_EMPTY && ec != ERROR_PATH_NOT_FOUND) {
+                        // Only ignore if directory already gone, otherwise log and continue
+                        // (we'll try to remove parent dirs, they might fail too)
+                        if (ec != ERROR_PATH_BUSY && ec != ERROR_FILE_NOT_FOUND) {
                             SS_LOG_WARN(L"FileUtils", L"RemoveDirectoryRecursive: Failed to remove directory: %s (error %lu)", d.c_str(), ec);
                         }
                     }
@@ -1778,10 +1780,13 @@ namespace ShadowStrike {
                 const std::wstring longp = AddLongPathPrefix(dir);
                 if (!longp.empty() && !RemoveDirectoryW(longp.c_str())) {
                     const DWORD ec = GetLastError();
-                    if (ec != ERROR_DIR_NOT_EMPTY && ec != ERROR_PATH_NOT_FOUND && ec != ERROR_FILE_NOT_FOUND) {
-                        if (err) err->win32 = ec;
-                        return false;
+                    // ERROR_PATH_NOT_FOUND / ERROR_FILE_NOT_FOUND = already deleted, success
+                    // ERROR_DIR_NOT_EMPTY = failed to delete contents, FAILURE
+                    if (ec == ERROR_PATH_NOT_FOUND || ec == ERROR_FILE_NOT_FOUND) {
+                        return true;  // Already gone = success
                     }
+                    if (err) err->win32 = ec;
+                    return false;  // Failed to remove
                 }
 
                 return true;
