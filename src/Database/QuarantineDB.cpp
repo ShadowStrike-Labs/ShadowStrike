@@ -589,18 +589,21 @@ namespace ShadowStrike {
             }
 
             /**
-             * @brief Escapes special characters for SQL LIKE pattern to prevent injection.
+             * @brief Escapes characters for SQL string literals used in LIKE patterns.
              * 
              * @param input The pattern string to escape.
              * @return Escaped string safe for use in SQL LIKE clauses.
              * 
-             * @details Escapes:
+             * @details Escapes for SQL STRING safety (prevents SQL injection):
              * - Single quotes (') -> '' (SQL string literal escape)
-             * - Percent (%) -> [%] (LIKE wildcard escape using bracket notation)
-             * - Underscore (_) -> [_] (LIKE single-char wildcard escape)
-             * - Left bracket ([) -> [[] (escape bracket itself)
+             * - Left bracket ([) -> [[] (escape bracket which is a metachar in SQLite LIKE)
              * 
-             * @note Uses SQLite bracket escape syntax which is portable across most SQL databases.
+             * @note LIKE wildcards (% and _) are NOT escaped here because patterns
+             * often contain intentional wildcards (e.g., "%filename%"). If user input
+             * should match literal % or _, escape those at the input point before
+             * constructing the pattern.
+             * 
+             * @see SearchByFileName() for an example of pre-escaping user input.
              */
             [[nodiscard]] std::string EscapeSqlLikePattern(std::string_view input) noexcept {
                 std::string result;
@@ -608,10 +611,10 @@ namespace ShadowStrike {
                 
                 for (const char c : input) {
                     switch (c) {
-                        case '\'': result += "''";   break;  // Escape single quote
-                        case '[':  result += "[[]";  break;  // Escape bracket first (meta char)
-                        case '%':  result += "[%]";  break;  // Escape LIKE wildcard
-                        case '_':  result += "[_]";  break;  // Escape LIKE single-char wildcard
+                        case '\'': result += "''";   break;  // Escape single quote for SQL
+                        case '[':  result += "[[]";  break;  // Escape bracket (SQLite LIKE metachar)
+                        // Note: % and _ are NOT escaped - they're valid LIKE wildcards
+                        // Escape them at input point if literal matching is needed
                         default:   result += c;      break;
                     }
                 }
@@ -1571,6 +1574,11 @@ namespace ShadowStrike {
                                                                                   DatabaseError* err)
         {
             QueryFilter filter;
+            // Build wildcard pattern for partial filename matching.
+            // Note: We don't escape LIKE wildcards (%, _, [) here because:
+            // 1. Users expect natural text matching (e.g., "malware_sample" should match filenames with underscores)
+            // 2. EscapeSqlLikePattern in buildQuerySQL will handle SQL injection prevention
+            // 3. The % wildcards we add here need to remain as wildcards in the final SQL
             std::wstring pattern = L"%";
             pattern += fileName;
             pattern += L"%";

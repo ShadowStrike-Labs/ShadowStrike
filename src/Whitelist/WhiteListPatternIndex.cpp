@@ -783,7 +783,7 @@ template<typename T>
         output.clear();
         for (size_t i = 0; i < segments.size(); ++i) {
             if (i > 0) {
-                output.push_back('/');
+        output.push_back('/');
             }
             output.append(segments[i]);
         }
@@ -791,8 +791,8 @@ template<typename T>
         // Final security check: ensure no ".." remains after normalization
         // (This should never happen if the above logic is correct, but defense in depth)
         if (output.find("/../") != std::string::npos ||
-            output.find("/..") == output.length() - 3 ||
-            output.substr(0, 3) == "../" ||
+            (output.length() >= 3 && output.find("/..") == output.length() - 3) ||  // Fixed: check length first to prevent underflow
+            (output.length() >= 3 && output.substr(0, 3) == "../") ||
             output == "..") {
             SS_LOG_WARN(L"Whitelist", L"NormalizePath: residual path traversal detected after normalization");
             output.clear();

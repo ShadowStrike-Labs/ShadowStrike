@@ -424,6 +424,10 @@ bool SignatureBuilder::IsRegexSafe(
     bool inCharClass = false;
     bool lastWasQuantifier = false;
     size_t quantifierAtDepth = 0;  // Track depth where we saw a quantifier
+    
+    // Track which nesting levels contain alternation (for detecting (a|b)* patterns)
+    // Using bitfield: bit N = 1 means nesting level N contains alternation
+    uint64_t alternationAtDepth = 0;  // Supports up to 64 nesting levels
 
     for (size_t i = 0; i < pattern.length(); ++i) {
         char c = pattern[i];
@@ -466,8 +470,22 @@ bool SignatureBuilder::IsRegexSafe(
                         errorMessage = "Nested quantifiers detected (ReDoS risk)";
                         return false;
                     }
+                    
+                    // Check if this group contains alternation - (a|b)* creates ReDoS risk
+                    // due to ambiguous matching paths causing exponential backtracking
+                    if (nestingDepth < 64 && (alternationAtDepth & (1ULL << nestingDepth))) {
+                        errorMessage = "Alternation inside quantified group detected (ReDoS risk)";
+                        return false;
+                    }
+                    
                     quantifierAtDepth = nestingDepth;
                 }
+                
+                // Clear the alternation flag for this depth as we're leaving this group
+                if (nestingDepth < 64) {
+                    alternationAtDepth &= ~(1ULL << nestingDepth);
+                }
+                
                 nestingDepth--;
             }
             continue;
@@ -478,6 +496,10 @@ bool SignatureBuilder::IsRegexSafe(
             alternationCount++;
             complexityScore += 2;
             lastWasQuantifier = false;
+            // Mark this nesting level as containing alternation
+            if (nestingDepth > 0 && nestingDepth < 64) {
+                alternationAtDepth |= (1ULL << nestingDepth);
+            }
             continue;
         }
 
