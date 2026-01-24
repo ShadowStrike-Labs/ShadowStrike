@@ -573,7 +573,7 @@ namespace ShadowStrike {
                 HCRYPTMSG hMsg = nullptr;
                 DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
                 
-                if (!CryptQueryObject(//-V1109
+                if (!CryptQueryObject(//-V1109 //-V5014
                     CERT_QUERY_OBJECT_FILE,
                     pathCopy.c_str(),
                     CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -816,7 +816,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    BOOL qok = CryptQueryObject(//-V1109
+                    BOOL qok = CryptQueryObject(//-V1109 //-V5014
                         CERT_QUERY_OBJECT_FILE,
                         catPathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1108,7 +1108,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    if (!CryptQueryObject(//-V1109
+                    if (!CryptQueryObject(//-V1109 //-V5014
                         CERT_QUERY_OBJECT_FILE,
                         pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1240,7 +1240,7 @@ namespace ShadowStrike {
                         HCERTSTORE hStoreTmp = nullptr;
                         HCRYPTMSG hMsgTmp = nullptr;
                         
-                        if (!CryptQueryObject(//-V1109
+                        if (!CryptQueryObject(//-V1109 //-V5014
                             CERT_QUERY_OBJECT_FILE,
                             std::wstring(catalogPath).c_str(),
                             CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1558,7 +1558,7 @@ namespace ShadowStrike {
                 HCERTSTORE hStore = nullptr;
                 HCRYPTMSG hMsg = nullptr;
                 DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
-                BOOL qok = CryptQueryObject(//-V1109
+                BOOL qok = CryptQueryObject(//-V1109 //-V5014
                     CERT_QUERY_OBJECT_FILE,
                     std::wstring(filePath).c_str(),
                     CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1713,7 +1713,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    if (!CryptQueryObject(//-V1109
+                    if (!CryptQueryObject(//-V1109 //-V5014
                         CERT_QUERY_OBJECT_FILE,
                         pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -1919,7 +1919,7 @@ namespace ShadowStrike {
                     HCRYPTMSG hMsg = nullptr;
                     DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
 
-                    if (!CryptQueryObject(//-V1109
+                    if (!CryptQueryObject(//-V1109 //-V5014
                         CERT_QUERY_OBJECT_FILE,
                         pathCopy.c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -2219,7 +2219,7 @@ namespace ShadowStrike {
                     HCERTSTORE hStoreTmp = nullptr;
                     HCRYPTMSG hMsgTmp = nullptr;
 
-                    if (!CryptQueryObject(//-V1109
+                    if (!CryptQueryObject(//-V1109 //-V5014
                         CERT_QUERY_OBJECT_FILE,
                         std::wstring(filePath).c_str(),
                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,

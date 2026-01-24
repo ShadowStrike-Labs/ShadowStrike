@@ -557,7 +557,7 @@ TEST_F(SignatureBuilderTest, SetCustomDeduplication) {
     
     m_builder->SetCustomDeduplication(func);
     // Function is stored, verify no exception
-    EXPECT_NO_THROW(m_builder->Deduplicate());
+    EXPECT_NO_THROW(m_builder->Deduplicate()); //-V530
 }
 
 TEST_F(SignatureBuilderTest, SetCustomOptimization) {
@@ -569,7 +569,7 @@ TEST_F(SignatureBuilderTest, SetCustomOptimization) {
     
     m_builder->SetCustomOptimization(func);
     // Function is stored, verify no exception
-    EXPECT_NO_THROW(m_builder->Optimize());
+    EXPECT_NO_THROW(m_builder->Optimize()); //-V530
 }
 
 TEST_F(SignatureBuilderTest, SetBuildPriority) {

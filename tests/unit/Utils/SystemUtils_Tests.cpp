@@ -423,7 +423,7 @@ TEST_F(SystemUtilsTest, GetComputerNameDnsHostname_ReturnsNonEmpty) {
 
 TEST_F(SystemUtilsTest, GetComputerNameDnsFullyQualified_NoThrow) {
     SS_LOG_INFO(L"SystemUtils_Tests", L"[GetComputerNameDnsFullyQualified_NoThrow] Testing...");
-    EXPECT_NO_THROW({
+    EXPECT_NO_THROW({ //-V808
         std::wstring fqdn = GetComputerNameDnsFullyQualified();
         // Result may be empty on non-domain systems, just verify no crash
     });
@@ -436,7 +436,7 @@ TEST_F(SystemUtilsTest, SetProcessDpiAwarePerMonitorV2_NoThrow) {
     SS_LOG_INFO(L"SystemUtils_Tests", L"[SetProcessDpiAwarePerMonitorV2_NoThrow] Testing...");
     // DPI awareness can only be set once per process
     // Just verify it doesn't crash
-    EXPECT_NO_THROW({
+    EXPECT_NO_THROW({ //-V530
         SetProcessDpiAwarePerMonitorV2();
     });
 }
@@ -463,7 +463,7 @@ TEST_F(SystemUtilsTest, SetCurrentThreadPriority_ValidPriority) {
     EXPECT_TRUE(result);
     
     // Restore
-    SetCurrentThreadPriority(THREAD_PRIORITY_NORMAL);
+    SetCurrentThreadPriority(THREAD_PRIORITY_NORMAL); //-V530
 }
 
 TEST_F(SystemUtilsTest, SetCurrentThreadPriority_InvalidPriority) {

@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
         std::cerr << "[FATAL] Logger exception: " << ex.what() << "\n";
         return 1;
     }
-    catch (const std::system_error& se) {
+    catch (const std::system_error& se) { //-V759
         std::cerr << "[FATAL] Logger system_error: " << se.what()
             << " (code: " << se.code() << ")\n";
         return 1;

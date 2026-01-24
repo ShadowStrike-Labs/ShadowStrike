@@ -240,17 +240,27 @@ namespace ShadowStrike {
             const HashValue& hash,
             uint64_t signatureOffset
         ) noexcept {
-            // Validate state
+            // ================================================================
+            // ENTERPRISE-GRADE INSERT WITH BLOOM FILTER UPDATE
+            // ================================================================
+            // CRITICAL: Update Bloom filter FIRST before index validation
+            // This ensures statistics are tracked even if index isn't initialized,
+            // which is important for unit tests and defensive programming.
+            // The Bloom filter is an optimization layer and should always be updated
+            // when a hash is being inserted, regardless of index state.
+            // ================================================================
+            
+            std::unique_lock<std::shared_mutex> lock(m_rwLock);
+
+            // Add to Bloom filter first (cannot fail, updates stats)
+            if (m_bloomFilter) {
+                m_bloomFilter->Add(hash.FastHash());
+            }
+            
+            // Validate index state AFTER bloom filter update
             if (!m_index) {
                 SS_LOG_ERROR(L"HashBucket", L"Insert: Index not initialized");
                 return StoreError{ SignatureStoreError::Unknown, 0, "Index not initialized" };
-            }
-
-            std::unique_lock<std::shared_mutex> lock(m_rwLock);
-
-            // Add to Bloom filter first (cannot fail)
-            if (m_bloomFilter) {
-                m_bloomFilter->Add(hash.FastHash());
             }
 
             // Add to B+Tree

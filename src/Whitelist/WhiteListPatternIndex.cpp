@@ -1446,8 +1446,33 @@ std::vector<uint64_t> PathIndex::Lookup(
                 
                 // Check ALL terminal nodes, not just Glob-mode patterns
                 if (node->isTerminal) {
-                    // normalizedPath is the PATTERN (query), accPath is the TEXT (stored path)
-                    if (globMatch(normalizedPath, accPath)) {
+                    // ================================================================
+                    // GLOB MATCHING: Direction depends on stored vs query pattern
+                    // ================================================================
+                    // There are two use cases for glob matching:
+                    // 
+                    // 1. Query with glob pattern (e.g., Lookup("*.dll", Glob)):
+                    //    - normalizedPath = query glob pattern
+                    //    - accPath = stored exact path
+                    //    - Match: globMatch(normalizedPath, accPath)
+                    // 
+                    // 2. Stored glob pattern (e.g., IsPathWhitelisted for stored "*.exe"):
+                    //    - normalizedPath = query exact path
+                    //    - accPath = stored glob pattern
+                    //    - Match: globMatch(accPath, normalizedPath)
+                    // 
+                    // We determine direction by checking if the STORED node has Glob mode.
+                    // ================================================================
+                    bool matches = false;
+                    if (node->matchMode == PathMatchMode::Glob) {
+                        // Stored entry is a glob pattern - match stored pattern vs query text
+                        matches = globMatch(accPath, normalizedPath);
+                    } else {
+                        // Query is a glob pattern - match query pattern vs stored text
+                        matches = globMatch(normalizedPath, accPath);
+                    }
+                    
+                    if (matches) {
                         results.push_back(node->entryOffset);
                     }
                 }

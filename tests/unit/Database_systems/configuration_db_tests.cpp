@@ -406,7 +406,7 @@ TEST_F(ConfigurationDBTest, EncryptValueDirectlySucceeds) {
 TEST_F(ConfigurationDBTest, SetBatchSucceeds) {
     EXPECT_TRUE(InitializeConfigDB());
 
-    std::vector<std::pair<std::wstring, ConfigurationDB::ConfigValue>> batch;
+    std::vector<std::pair<std::wstring, ConfigurationDB::ConfigValue>> batch; //-V827
     batch.emplace_back(L"batch.key1", std::wstring(L"value1"));
     batch.emplace_back(L"batch.key2", int64_t(42));
     batch.emplace_back(L"batch.key3", true);

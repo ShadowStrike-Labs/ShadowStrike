@@ -128,7 +128,7 @@ protected:
      */
     fs::path CreateEmptyFile(const std::wstring& filename) {
         fs::path filePath = m_testDir / filename;
-        std::ofstream file(filePath, std::ios::binary);
+        std::ofstream file(filePath, std::ios::binary); //-V808
         return filePath;
     }
 
@@ -495,17 +495,17 @@ TEST_F(PESignatureVerifierTest, ValidateCertificateChain_WithDifferentRevocation
     
     // Test with OnlineOnly - should not crash
     m_verifier.SetRevocationMode(RevocationMode::OnlineOnly);
-    m_verifier.ValidateCertificateChain(cert, &err);
+    m_verifier.ValidateCertificateChain(cert, &err); //-V530
     err.Clear();
     
     // Test with OfflineAllowed - should not crash
     m_verifier.SetRevocationMode(RevocationMode::OfflineAllowed);
-    m_verifier.ValidateCertificateChain(cert, &err);
+    m_verifier.ValidateCertificateChain(cert, &err); //-V530
     err.Clear();
     
     // Test with Disabled - should not crash
     m_verifier.SetRevocationMode(RevocationMode::Disabled);
-    m_verifier.ValidateCertificateChain(cert, &err);
+    m_verifier.ValidateCertificateChain(cert, &err); //-V530
     
     CertFreeCertificateContext(cert);
     
@@ -738,8 +738,8 @@ TEST_F(PESignatureVerifierTest, GetIssuerName_SelfSignedCert) {
     
     std::wstring signer, issuer;
     
-    m_verifier.GetSignerName(cert, signer, nullptr);
-    m_verifier.GetIssuerName(cert, issuer, nullptr);
+    m_verifier.GetSignerName(cert, signer, nullptr); //-V530
+    m_verifier.GetIssuerName(cert, issuer, nullptr); //-V530
     
     CertFreeCertificateContext(cert);
     
@@ -813,8 +813,8 @@ TEST_F(PESignatureVerifierTest, GetCertThumbprint_Consistency) {
     
     std::wstring thumbprint1, thumbprint2;
     
-    m_verifier.GetCertThumbprint(cert, thumbprint1, nullptr, true);
-    m_verifier.GetCertThumbprint(cert, thumbprint2, nullptr, true);
+    m_verifier.GetCertThumbprint(cert, thumbprint1, nullptr, true); //-V530
+    m_verifier.GetCertThumbprint(cert, thumbprint2, nullptr, true); //-V530
     
     CertFreeCertificateContext(cert);
     
@@ -1075,9 +1075,9 @@ TEST_F(PESignatureVerifierTest, ConcurrentMetadataExtraction) {
             
             for (int i = 0; i < 10; ++i) {
                 std::wstring name, issuer, thumb;
-                localVerifier.GetSignerName(certs[t], name, nullptr);
-                localVerifier.GetIssuerName(certs[t], issuer, nullptr);
-                localVerifier.GetCertThumbprint(certs[t], thumb, nullptr, true);
+                localVerifier.GetSignerName(certs[t], name, nullptr); //-V530
+                localVerifier.GetIssuerName(certs[t], issuer, nullptr); //-V530
+                localVerifier.GetCertThumbprint(certs[t], thumb, nullptr, true); //-V530
             }
             
             completedCount++;
@@ -1180,7 +1180,7 @@ TEST_F(PESignatureVerifierTest, DISABLED_StressTest_ManyVerifications) {
     
     for (int i = 0; i < kIterations; ++i) {
         SignatureInfo info;
-        m_verifier.VerifyPESignature(m_signedSystemFile.wstring(), info, nullptr);
+        m_verifier.VerifyPESignature(m_signedSystemFile.wstring(), info, nullptr); //-V530
     }
     
     // Should complete without memory leaks or crashes
@@ -1197,9 +1197,9 @@ TEST_F(PESignatureVerifierTest, DISABLED_StressTest_ManyMetadataExtractions) {
     
     for (int i = 0; i < kIterations; ++i) {
         std::wstring name, issuer, thumb;
-        m_verifier.GetSignerName(cert, name, nullptr);
-        m_verifier.GetIssuerName(cert, issuer, nullptr);
-        m_verifier.GetCertThumbprint(cert, thumb, nullptr, true);
+        m_verifier.GetSignerName(cert, name, nullptr); //-V530
+        m_verifier.GetIssuerName(cert, issuer, nullptr); //-V530
+        m_verifier.GetCertThumbprint(cert, thumb, nullptr, true); //-V530
     }
     
     CertFreeCertificateContext(cert);

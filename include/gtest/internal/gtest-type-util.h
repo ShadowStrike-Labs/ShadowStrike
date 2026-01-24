@@ -80,7 +80,7 @@ inline std::string CanonicalizeForStdLibVersioning(std::string s) {
       break;
     }
     // Replace this occurrence of substring
-    s.replace(pos, strlen(to_search), 1, replace_char);
+    s.replace(pos, strlen(to_search), 1, replace_char); //-V814
     ++pos;
   }
   return s;

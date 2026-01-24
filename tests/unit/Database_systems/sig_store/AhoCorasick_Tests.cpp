@@ -556,7 +556,7 @@ TEST_F(AhoCorasickTest, ManyPatterns_LargeTrie) {
 
 TEST_F(AhoCorasickTest, DeepTrie_LongPatterns) {
     // Create patterns of varying lengths from same prefix
-    std::string base = "AAAAAAAAAA"; // 10 A's
+    std::string base = "AAAAAAAAAA"; // 10 A's //-V808
     for (int i = 1; i <= 20; ++i) {
         std::string pattern = std::string(i * 10, 'A') + std::to_string(i);
         ASSERT_TRUE(AddStringPattern(pattern, i));

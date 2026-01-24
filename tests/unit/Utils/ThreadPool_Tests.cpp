@@ -313,7 +313,7 @@ TEST_F(ThreadPoolTest, SubmitToShutdownPoolThrows) {
     }
     pool.Shutdown();//-V530
 
-    EXPECT_THROW({
+    EXPECT_THROW({ //-V530
         pool.Submit([](const TaskContext&) {});
         }, std::runtime_error);
 }
@@ -1360,7 +1360,7 @@ TEST_F(ThreadPoolTest, PriorityScheduling_CriticalPriorityPreemptsOthers) {
     std::mutex orderMutex;
 
     // Submit normal priority first
-    pool.Submit(
+    pool.Submit( //-V530
         [&](const TaskContext&) {
             std::lock_guard<std::mutex> lock(orderMutex);
             executionOrder.push_back(2);
@@ -1369,7 +1369,7 @@ TEST_F(ThreadPoolTest, PriorityScheduling_CriticalPriorityPreemptsOthers) {
     );
 
     // Submit critical priority
-    pool.Submit(
+    pool.Submit( //-V530
         [&](const TaskContext&) {
             std::lock_guard<std::mutex> lock(orderMutex);
             executionOrder.push_back(4);
@@ -1378,7 +1378,7 @@ TEST_F(ThreadPoolTest, PriorityScheduling_CriticalPriorityPreemptsOthers) {
     );
 
     // Submit low priority
-    pool.Submit(
+    pool.Submit( //-V530
         [&](const TaskContext&) {
             std::lock_guard<std::mutex> lock(orderMutex);
             executionOrder.push_back(1);
@@ -1412,7 +1412,7 @@ TEST_F(ThreadPoolTest, ShutdownFlagPersistsAfterShutdown) {
     EXPECT_FALSE(pool.IsInitialized());
     
     // Submitting to a shutdown pool should throw
-    EXPECT_THROW({
+    EXPECT_THROW({ //-V530
         pool.Submit([](const TaskContext&) {});
     }, std::runtime_error);
 }
@@ -1566,7 +1566,7 @@ TEST_F(ThreadPoolTest, ShutdownWhilePaused) {
 
     // Submit some tasks while paused (ignore futures - shutdown will clear queue)
     for (int i = 0; i < 5; ++i) {
-        pool.Submit([](const TaskContext&) {
+        pool.Submit([](const TaskContext&) { //-V530
             std::this_thread::sleep_for(10ms);
         });
     }
@@ -1594,7 +1594,7 @@ TEST_F(ThreadPoolTest, ConcurrentPauseResumeIsSafe) {
     std::thread submitter([&]() {
         while (!stop.load()) {
             try {
-                pool.Submit([&taskCount](const TaskContext&) {
+                pool.Submit([&taskCount](const TaskContext&) { //-V530
                     taskCount.fetch_add(1);
                 });
             } catch (...) {
@@ -1636,7 +1636,7 @@ TEST_F(ThreadPoolTest, ConcurrentStatisticsAccess) {
     std::thread submitter([&]() {
         for (int i = 0; i < 100 && !stop.load(); ++i) {
             try {
-                pool.Submit([](const TaskContext&) {
+                pool.Submit([](const TaskContext&) { //-V530
                     std::this_thread::sleep_for(1ms);
                 });
             } catch (...) {}

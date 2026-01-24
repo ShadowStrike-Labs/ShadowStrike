@@ -524,18 +524,18 @@ TEST_F(CryptoUtilsTest, AsymmetricCipher_ECDH_DifferentCurves) {
 
 TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_Basic) {
     SS_LOG_INFO(L"CryptoUtils_Tests", L"[KeyDerivation_PBKDF2_Basic] Testing...");
-    const std::string password = "password";
+    const std::string password = "password"; //-V5013
     std::vector<uint8_t> salt(16, 0x00);
     std::vector<uint8_t> key1(32), key2(32);
     
     // Same params should produce same key
-    ASSERT_TRUE(KeyDerivation::PBKDF2(
+    ASSERT_TRUE(KeyDerivation::PBKDF2( //-V5013
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 10000, HashUtils::Algorithm::SHA256,
         key1.data(), key1.size(), err.get()
     ));
     
-    ASSERT_TRUE(KeyDerivation::PBKDF2(
+    ASSERT_TRUE(KeyDerivation::PBKDF2( //-V5013
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 10000, HashUtils::Algorithm::SHA256,
         key2.data(), key2.size(), err.get()
@@ -546,17 +546,17 @@ TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_Basic) {
 
 TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_DifferentIterations) {
     SS_LOG_INFO(L"CryptoUtils_Tests", L"[KeyDerivation_PBKDF2_DifferentIterations] Testing...");
-    const std::string password = "password";
+    const std::string password = "password"; //-V5013
     std::vector<uint8_t> salt(16, 0x00);
     std::vector<uint8_t> key1(32), key2(32);
     
-    ASSERT_TRUE(KeyDerivation::PBKDF2(
+    ASSERT_TRUE(KeyDerivation::PBKDF2( //-V5013
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 10000, HashUtils::Algorithm::SHA256,
         key1.data(), key1.size(), err.get()
     ));
     
-    ASSERT_TRUE(KeyDerivation::PBKDF2(
+    ASSERT_TRUE(KeyDerivation::PBKDF2( //-V5013
         reinterpret_cast<const uint8_t*>(password.data()), password.size(),
         salt.data(), salt.size(), 20000, HashUtils::Algorithm::SHA256,
         key2.data(), key2.size(), err.get()
@@ -568,20 +568,20 @@ TEST_F(CryptoUtilsTest, KeyDerivation_PBKDF2_DifferentIterations) {
 TEST_F(CryptoUtilsTest, KeyDerivation_HKDF_WithInfo) {
     SS_LOG_INFO(L"CryptoUtils_Tests", L"[KeyDerivation_HKDF_WithInfo] Testing...");
     const std::string ikm = "input";
-    const std::string salt = "salt";
+    const std::string salt = "salt"; //-V5013
     const std::string info1 = "context1";
     const std::string info2 = "context2";
     
     std::vector<uint8_t> key1(32), key2(32);
     
-    ASSERT_TRUE(KeyDerivation::HKDF(
+    ASSERT_TRUE(KeyDerivation::HKDF( //-V5013
         reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
         reinterpret_cast<const uint8_t*>(salt.data()), salt.size(),
         reinterpret_cast<const uint8_t*>(info1.data()), info1.size(),
         HashUtils::Algorithm::SHA256, key1.data(), key1.size(), err.get()
     ));
     
-    ASSERT_TRUE(KeyDerivation::HKDF(
+    ASSERT_TRUE(KeyDerivation::HKDF( //-V5013
         reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
         reinterpret_cast<const uint8_t*>(salt.data()), salt.size(),
         reinterpret_cast<const uint8_t*>(info2.data()), info2.size(),
@@ -633,18 +633,18 @@ TEST_F(CryptoUtilsTest, EncryptFileWithPassword_Roundtrip) {
     auto decryptedPath = testDir / "data.dec";
     
     const std::string content = "Password Protected";
-    const std::string password = "StrongPass123!";
+    const std::string password = "StrongPass123!"; //-V5013
     
     {
         std::ofstream ofs(inputPath);
         ofs << content;
     }
     
-    ASSERT_TRUE(EncryptFileWithPassword(inputPath.wstring(), encryptedPath.wstring(),
+    ASSERT_TRUE(EncryptFileWithPassword(inputPath.wstring(), encryptedPath.wstring(), //-V5013
                                        password, err.get()))
         << WStringToUtf8(err->message);
     
-    ASSERT_TRUE(DecryptFileWithPassword(encryptedPath.wstring(), decryptedPath.wstring(),
+    ASSERT_TRUE(DecryptFileWithPassword(encryptedPath.wstring(), decryptedPath.wstring(), //-V5013
                                        password, err.get()))
         << WStringToUtf8(err->message);
     

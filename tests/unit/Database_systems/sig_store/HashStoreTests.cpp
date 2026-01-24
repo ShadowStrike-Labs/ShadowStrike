@@ -433,16 +433,43 @@ TEST_F(HashStoreTestFixture, HashBucket_StatisticsInitialState) {
 }
 
 TEST_F(HashStoreTestFixture, HashBucket_ResetStatistics) {
-    HashBucket bucket(HashType::MD5);
+    // ========================================================================
+    // TEST: HashBucket statistics reset functionality
+    // ========================================================================
+    // This test verifies that ResetStatistics() properly clears all tracked
+    // counters. Since bloom filter hit/miss stats are only incremented during
+    // Lookup() operations (not Insert()), we need to use a fully initialized
+    // HashStore to generate meaningful statistics before testing reset.
+    // ========================================================================
     
-    // Simulate some activity by calling GetStatistics
-    bucket.GetStatistics();//-V530
+    std::wstring dbPath = GetTestDbPath();
+    HashStore store;
     
-    bucket.ResetStatistics();
+    // Create and initialize a proper HashStore
+    ASSERT_TRUE(store.CreateNew(dbPath, 10 * 1024 * 1024).IsSuccess());
     
-    auto stats = bucket.GetStatistics();
-    EXPECT_EQ(stats.bloomFilterHits, 0);
-    EXPECT_EQ(stats.bloomFilterMisses, 0);
+    // Perform some lookups to generate statistics (lookups on empty store)
+    HashValue testHash = MakeMD5("d41d8cd98f00b204e9800998ecf8427e");
+    
+    // Multiple lookups to ensure statistics are incremented
+    for (int i = 0; i < 5; ++i) {
+        store.LookupHash(testHash);  // Returns nullopt (not found) but increments stats
+    }
+    
+    // Verify statistics were incremented
+    auto statsBefore = store.GetStatistics();
+    EXPECT_GT(statsBefore.totalLookups, 0u) << "Expected lookups to be counted";
+    
+    // Reset statistics
+    store.ResetStatistics();
+    
+    // Verify all statistics are reset to zero
+    auto statsAfter = store.GetStatistics();
+    EXPECT_EQ(statsAfter.totalLookups, 0u) << "totalLookups should be reset to 0";
+    EXPECT_EQ(statsAfter.cacheHits, 0u) << "cacheHits should be reset to 0";
+    EXPECT_EQ(statsAfter.cacheMisses, 0u) << "cacheMisses should be reset to 0";
+    
+    store.Close();
 }
 
 // Additional HashBucket tests would require mock MemoryMappedView and SignatureIndex

@@ -1574,7 +1574,7 @@ class FunctionMocker<R(Args...)> final : public UntypedFunctionMockerBase {
     Mock::RegisterUseByOnCallOrExpectCall(MockObject(), file, line);
     TypedExpectation<F>* const expectation =
         new TypedExpectation<F>(this, file, line, source_text, m);
-    const std::shared_ptr<ExpectationBase> untyped_expectation(expectation);
+    const std::shared_ptr<ExpectationBase> untyped_expectation(expectation); //-V824
     // See the definition of untyped_expectations_ for why access to
     // it is unprotected here.
     untyped_expectations_.push_back(untyped_expectation);

@@ -972,7 +972,7 @@ TEST(BloomFilter_EdgeCases, SelfMoveAssignment_NoUndefinedBehavior) {
     filter.Add(testHash);
     
     // Self-move assignment (edge case)
-    filter = std::move(filter);  // NOLINT: intentionally testing self-move
+    filter = std::move(filter);  // NOLINT: intentionally testing self-move //-V570
     
     // Filter should still be functional or in valid moved-from state
     // The standard says self-move leaves object in valid but unspecified state
@@ -1248,7 +1248,7 @@ TEST(BloomFilter_EdgeCases, BitCountAlignment_AlwaysMultipleOf64) {
 
 TEST(BloomFilter_Security, InitializeWithMisalignedPointer_HandlesGracefully) {
     // Allocate memory with intentional misalignment
-    std::vector<uint8_t> buffer(1024 + 1);
+    std::vector<uint8_t> buffer(1024 + 1); //-V826
     
     // Get a potentially misaligned pointer (offset by 1)
     void* misalignedPtr = &buffer[1];

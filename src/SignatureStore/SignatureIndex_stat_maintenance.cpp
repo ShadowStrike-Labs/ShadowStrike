@@ -233,7 +233,7 @@ namespace ShadowStrike {
             // After m_cowNodes.clear(), the pointers in these maps are invalid.
             // If not cleared, FindLeafForCOW might find stale entries and crash.
             m_fileOffsetToCOWNode.clear();
-            m_truncatedAddrToCOWNode.clear();
+            m_ptrAddrToCOWNode.clear();
             m_cowRootNode = nullptr;
 
             // Clear node cache
@@ -270,17 +270,17 @@ namespace ShadowStrike {
             // InsertInternalRaw uses FindLeafForCOW which checks m_cowRootNode first.
             m_cowRootNode = newRoot;
             
-            // CRITICAL: Register the new root in truncated address map!
+            // CRITICAL: Register the new root in pointer address map (64-bit safe)!
             // When InsertIntoParent creates a new internal root after splitting,
             // it stores child pointers as truncated addresses. If those addresses
             // aren't registered, FindLeafForCOW won't be able to resolve them.
-            uint32_t rootTruncAddr = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(newRoot)
-            );
-            m_truncatedAddrToCOWNode[rootTruncAddr] = newRoot;
+            uintptr_t rootPtrAddr = reinterpret_cast<uintptr_t>(newRoot);
+            uint32_t rootTruncAddr = static_cast<uint32_t>(rootPtrAddr);
+            m_ptrAddrToCOWNode[rootPtrAddr] = newRoot;
             
             SS_LOG_DEBUG(L"SignatureIndex",
-                L"Rebuild: Registered new root at truncAddr=0x%X", rootTruncAddr);
+                L"Rebuild: Registered new root at ptrAddr=0x%llX (truncAddr=0x%X)", 
+                static_cast<unsigned long long>(rootPtrAddr), rootTruncAddr);
             
             // Note: m_rootOffset will be updated after CommitCOW when the COW node
             // is written to the memory buffer and gets a real offset.

@@ -372,13 +372,30 @@ private:
     // Maps file offset → COW node pointer (for updating parent children after clone)
     // When we clone a node from file offset X, we record m_fileOffsetToCOWNode[X] = cowNode
     // When we clone a parent, we can update its children[] to point to existing COW nodes
+    // NOTE: During COW, children[] temporarily stores pointer addresses (cast from 64-bit
+    // to 32-bit for storage). The full 64-bit address is tracked in m_ptrAddrToCOWNode.
     std::unordered_map<uint32_t, BPlusTreeNode*> m_fileOffsetToCOWNode;
     
-    // Maps truncated memory address → COW node pointer (for COW tree traversal)
-    // When we create a COW node and store its truncated address in children[],
+    // Maps memory address → COW node pointer (for COW tree traversal)
+    // When we create a COW node and store its address in children[],
     // we need to resolve it back to the actual node during traversal.
-    // This is necessary because children[] is uint32_t but pointers are 64-bit.
-    std::unordered_map<uint32_t, BPlusTreeNode*> m_truncatedAddrToCOWNode;
+    // NOTE: Uses uintptr_t key to preserve full 64-bit pointer on x64 systems.
+    // The children[] array stores uint32_t offsets, but during COW we temporarily
+    // store full pointer addresses (cast to uint32_t for storage, but tracked here
+    // with full precision to avoid collision issues on 64-bit systems).
+    std::unordered_map<uintptr_t, BPlusTreeNode*> m_ptrAddrToCOWNode;
+    
+    // Helper: Find COW node by truncated address (lower 32 bits of pointer)
+    // Returns nullptr if not found. Handles 64-bit pointer lookup correctly.
+    // NOTE: Linear scan is acceptable as COW node count is small (<1000 per transaction)
+    [[nodiscard]] BPlusTreeNode* FindCOWNodeByTruncatedAddr(uint32_t truncatedAddr) const noexcept {
+        for (const auto& [fullAddr, node] : m_ptrAddrToCOWNode) {
+            if (static_cast<uint32_t>(fullAddr) == truncatedAddr) {
+                return node;
+            }
+        }
+        return nullptr;
+    }
 
     // Performance monitoring
     mutable LARGE_INTEGER m_perfFrequency{};

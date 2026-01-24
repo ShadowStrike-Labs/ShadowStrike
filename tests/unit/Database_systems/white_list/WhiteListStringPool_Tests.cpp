@@ -1155,7 +1155,7 @@ TEST_F(StringPoolTest, MoveAssignment_SelfAssignment_NoChange) {
     
     // Self-assignment (use compiler trick to avoid warning)
     StringPool* poolPtr = pool.get();
-    *poolPtr = std::move(*poolPtr);
+    *poolPtr = std::move(*poolPtr); //-V570
     
     // State should be preserved
     EXPECT_TRUE(pool->IsReady());
@@ -1233,7 +1233,7 @@ TEST_F(StringPoolTest, ConcurrentMixedReadWrite_Safe) {
                 while (!start) std::this_thread::yield();
                 for (int j = 0; j < 100; ++j) {
                     std::string s = "Write_T" + std::to_string(i) + "_" + std::to_string(j);
-                    pool->AddString(s); // May fail if pool full, that's OK
+                    pool->AddString(s); // May fail if pool full, that's OK //-V530
                 }
             }));
         } else {

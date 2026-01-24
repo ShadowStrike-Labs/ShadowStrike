@@ -247,7 +247,7 @@ bool Certificate::LoadFromFile(std::wstring_view path, Error* err) noexcept {
         DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
         HCERTSTORE hTemp = nullptr;
 
-        BOOL ok = CryptQueryObject(
+        BOOL ok = CryptQueryObject( //-V1109 //-V5014
             CERT_QUERY_OBJECT_FILE,
             pathStr.c_str(),
             contentFlags,

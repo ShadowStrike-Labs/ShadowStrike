@@ -251,10 +251,10 @@ namespace ShadowStrike {
                     return std::nullopt;
                 }
 
-                // First, remap known truncated COW-node addresses
-                const auto nodeIt = m_truncatedAddrToCOWNode.find(pointerValue);
-                if (nodeIt != m_truncatedAddrToCOWNode.end()) {
-                    const auto offsetIt = nodeOffsetMap.find(reinterpret_cast<uintptr_t>(nodeIt->second));
+                // First, remap known COW-node addresses using 64-bit safe lookup
+                BPlusTreeNode* cowNode = FindCOWNodeByTruncatedAddr(pointerValue);
+                if (cowNode != nullptr) {
+                    const auto offsetIt = nodeOffsetMap.find(reinterpret_cast<uintptr_t>(cowNode));
                     if (offsetIt != nodeOffsetMap.end()) {
                         return offsetIt->second;
                     }
@@ -461,7 +461,7 @@ namespace ShadowStrike {
 
             // CRITICAL FIX: Clear tracking maps to prevent stale references
             m_fileOffsetToCOWNode.clear();
-            m_truncatedAddrToCOWNode.clear();
+            m_ptrAddrToCOWNode.clear();
             m_cowRootNode = nullptr;
 
             // CRITICAL FIX: Invalidate node cache after commit
@@ -688,7 +688,7 @@ namespace ShadowStrike {
             // Since pointers are stored as uint32_t (truncated), we need to search
             // the map by comparing the lower 32 bits of each key
             //
-            // CRITICAL FIX: Check BOTH m_truncatedAddrToCOWNode AND m_fileOffsetToCOWNode
+            // CRITICAL FIX: Check BOTH m_ptrAddrToCOWNode AND m_fileOffsetToCOWNode
             // because pointers may be either:
             // - Truncated memory addresses (for newly allocated COW nodes)
             // - File offsets (for nodes cloned from the committed file)
@@ -697,10 +697,10 @@ namespace ShadowStrike {
                     return std::nullopt;
                 }
 
-                // First, check if this is a truncated COW-node memory address
-                const auto nodeIt = m_truncatedAddrToCOWNode.find(pointerValue);
-                if (nodeIt != m_truncatedAddrToCOWNode.end()) {
-                    const auto offsetIt = nodeOffsetMap.find(reinterpret_cast<uintptr_t>(nodeIt->second));
+                // First, check if this is a truncated COW-node memory address (64-bit safe)
+                BPlusTreeNode* cowNode = FindCOWNodeByTruncatedAddr(pointerValue);
+                if (cowNode != nullptr) {
+                    const auto offsetIt = nodeOffsetMap.find(reinterpret_cast<uintptr_t>(cowNode));
                     if (offsetIt != nodeOffsetMap.end()) {
                         return offsetIt->second;
                     }
@@ -883,7 +883,7 @@ namespace ShadowStrike {
             m_cowNodes.clear();
             // Also clear tracking maps to prevent stale references
             m_fileOffsetToCOWNode.clear();
-            m_truncatedAddrToCOWNode.clear();
+            m_ptrAddrToCOWNode.clear();
             // Reset COW root pointer since it's now committed
             m_cowRootNode = nullptr;
 
@@ -975,7 +975,7 @@ namespace ShadowStrike {
             // These maps contain pointers to nodes that were just freed
             try {
                 m_fileOffsetToCOWNode.clear();
-                m_truncatedAddrToCOWNode.clear();
+                m_ptrAddrToCOWNode.clear();
             }
             catch (...) {
                 // Maps may fail to clear on extreme memory conditions

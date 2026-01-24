@@ -553,7 +553,7 @@ TEST_F(BoyerMooreTest, RandomData_NoMatch) {
     }
     
     // Just verify search completes without crash
-    auto results = matcher.Search(ToSpan(buffer));
+    auto results = matcher.Search(ToSpan(buffer)); //-V808
     // Don't assert on count - random data may or may not match
 }
 
@@ -656,7 +656,7 @@ TEST_F(BoyerMooreTest, OffsetAccuracy_LongPattern) {
 TEST_F(BoyerMooreTest, OffsetConsistency_FindFirstVsSearch) {
     auto matcher = MakeExactMatcher("pattern");
     
-    std::vector<std::string> testCases = {
+    std::vector<std::string> testCases = { //-V826
         "pattern",
         "pattern at start",
         "find the pattern here",

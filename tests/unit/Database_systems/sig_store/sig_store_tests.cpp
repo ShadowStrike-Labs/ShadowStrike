@@ -1068,7 +1068,7 @@ TEST_F(SignatureStoreTest, ScanOptions_ExtremeTimeout) {
     EXPECT_GE(options.GetValidatedTimeout(), TitaniumLimits::MIN_TIMEOUT_MS);
     
     // Very large timeout should be clamped to maximum
-    options.timeoutMilliseconds = UINT64_MAX;
+    options.timeoutMilliseconds = UINT64_MAX; //-V569
     EXPECT_LE(options.GetValidatedTimeout(), TitaniumLimits::MAX_TIMEOUT_MS);
 }
 
@@ -1107,7 +1107,7 @@ TEST_F(SignatureStoreTest, StreamScanner_MultipleReset) {
     auto scanner = sig_store_->CreateStreamScanner();
     
     std::vector<uint8_t> chunk = {0x01, 0x02, 0x03};
-    scanner.FeedChunk(chunk);
+    scanner.FeedChunk(chunk); //-V530
     
     // Multiple resets should be safe
     scanner.Reset();

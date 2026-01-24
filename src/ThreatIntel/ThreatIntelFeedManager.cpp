@@ -185,14 +185,26 @@ std::optional<IOCType> DetectIOCType(std::string_view value) {
 // ============================================================================
 
 uint32_t RetryConfig::CalculateDelay(uint32_t attempt) const noexcept {
+    // ========================================================================
+    // ENTERPRISE-GRADE EXPONENTIAL BACKOFF WITH JITTER
+    // ========================================================================
+    // Implements industry-standard retry delay calculation with:
+    // - Exponential backoff to avoid thundering herd
+    // - Optional jitter to prevent synchronization
+    // - Overflow protection for high attempt counts
+    // - Configuration validation for robustness
+    //
+    // Retry attempt semantics:
+    // - attempt=0: First retry (return initialDelayMs)
+    // - attempt=1: Second retry (return initialDelayMs * backoffMultiplier)
+    // - attempt=N: (N+1)th retry (exponentially increased)
+    //
+    // Formula: delay = initialDelayMs * (backoffMultiplier ^ attempt)
+    // ========================================================================
+    
     // Validate configuration to prevent invalid calculations
     if (initialDelayMs == 0 || maxDelayMs == 0) {
         return 1000;  // Fallback to 1 second
-    }
-    
-    // Attempt 0 returns initial delay (first retry after failure)
-    if (attempt == 0) {
-        return initialDelayMs;
     }
     
     // Clamp attempt to prevent overflow in pow calculation
@@ -212,10 +224,10 @@ uint32_t RetryConfig::CalculateDelay(uint32_t attempt) const noexcept {
      * delay = initialDelayMs * (backoffMultiplier ^ attempt)
      * 
      * Example with initialDelayMs=1000, backoffMultiplier=2.0:
-     * - Attempt 0: 1000ms (initial delay)
-     * - Attempt 1: 1000 * 2^1 = 2000ms
-     * - Attempt 2: 1000 * 2^2 = 4000ms
-     * - Attempt 3: 1000 * 2^3 = 8000ms
+     * - Attempt 0: 1000 * 2^0 = 1000ms (first retry)
+     * - Attempt 1: 1000 * 2^1 = 2000ms (second retry)
+     * - Attempt 2: 1000 * 2^2 = 4000ms (third retry)
+     * - Attempt 3: 1000 * 2^3 = 8000ms (fourth retry)
      * 
      * This provides exponential growth with each retry attempt.
      */

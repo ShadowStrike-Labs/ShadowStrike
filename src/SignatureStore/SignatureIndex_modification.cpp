@@ -474,10 +474,9 @@ namespace ShadowStrike {
             uint32_t parentAddr = leftChild->parentOffset;
             BPlusTreeNode* parent = nullptr;
 
-            // Check if parent is a COW node (truncated address)
-            auto cowIt = m_truncatedAddrToCOWNode.find(parentAddr);
-            if (cowIt != m_truncatedAddrToCOWNode.end()) {
-                parent = cowIt->second;
+            // Check if parent is a COW node (using 64-bit safe lookup)
+            parent = FindCOWNodeByTruncatedAddr(parentAddr);
+            if (parent != nullptr) {
                 SS_LOG_TRACE(L"SignatureIndex",
                     L"InsertIntoParent: Found parent in COW pool (truncAddr=0x%X)", parentAddr);
             }
@@ -680,13 +679,14 @@ namespace ShadowStrike {
             newParent->parentOffset = parent->parentOffset;
 
             // Update children's parent pointers for newParent's children
-            uint32_t newParentTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newParent));
+            uintptr_t newParentPtrAddr = reinterpret_cast<uintptr_t>(newParent);
+            uint32_t newParentTruncAddr = static_cast<uint32_t>(newParentPtrAddr);
             for (uint32_t i = 0; i <= newParent->keyCount; ++i) {
                 uint32_t childAddr = newParent->children[i];
-                // Find the child node (may be COW or file node)
-                auto cowIt = m_truncatedAddrToCOWNode.find(childAddr);
-                if (cowIt != m_truncatedAddrToCOWNode.end()) {
-                    cowIt->second->parentOffset = newParentTruncAddr;
+                // Find the child node (may be COW or file node) using 64-bit safe lookup
+                BPlusTreeNode* childNode = FindCOWNodeByTruncatedAddr(childAddr);
+                if (childNode != nullptr) {
+                    childNode->parentOffset = newParentTruncAddr;
                 }
             }
 
@@ -743,7 +743,7 @@ namespace ShadowStrike {
             m_inCOWTransaction.store(true, std::memory_order_release);
             m_cowRootNode = nullptr; // Reset COW root tracking for this transaction
             m_fileOffsetToCOWNode.clear(); // Clear file offset to COW node mapping
-            m_truncatedAddrToCOWNode.clear(); // Clear truncated address to COW node mapping
+            m_ptrAddrToCOWNode.clear(); // Clear pointer address to COW node mapping
 
             // Use internal helper
             StoreError err = InsertInternal(hash, signatureOffset);
@@ -920,7 +920,7 @@ namespace ShadowStrike {
             m_inCOWTransaction.store(true, std::memory_order_release);
             m_cowRootNode = nullptr;  // Reset COW root tracking
             m_fileOffsetToCOWNode.clear();  // Clear stale mappings
-            m_truncatedAddrToCOWNode.clear();  // Clear stale mappings
+            m_ptrAddrToCOWNode.clear();  // Clear stale mappings
 
             // Use FindLeafForCOW to get a properly path-copied leaf
             BPlusTreeNode* leaf = FindLeafForCOW(fastHash);
@@ -1350,7 +1350,7 @@ namespace ShadowStrike {
             m_inCOWTransaction.store(true, std::memory_order_release);
             m_cowRootNode = nullptr; // Reset COW root tracking for this batch
             m_fileOffsetToCOWNode.clear(); // Clear file offset to COW node mapping
-            m_truncatedAddrToCOWNode.clear(); // Clear truncated address to COW node mapping
+            m_ptrAddrToCOWNode.clear(); // Clear pointer address to COW node mapping
 
             SS_LOG_TRACE(L"SignatureIndex", L"BatchInsert: Write lock acquired");
 
@@ -1564,7 +1564,7 @@ namespace ShadowStrike {
             m_inCOWTransaction.store(true, std::memory_order_release);
             m_cowRootNode = nullptr;  // Reset COW root tracking
             m_fileOffsetToCOWNode.clear();  // Clear stale mappings
-            m_truncatedAddrToCOWNode.clear();  // Clear stale mappings
+            m_ptrAddrToCOWNode.clear();  // Clear stale mappings
 
             // Use FindLeafForCOW to get a properly path-copied leaf
             BPlusTreeNode* leaf = FindLeafForCOW(fastHash);

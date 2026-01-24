@@ -1030,7 +1030,11 @@ namespace ShadowStrike {
                 }
 
                 // SE_BACKUP_NAME is necessary
-                EnableBackupPrivilege(err);
+                if (!EnableBackupPrivilege(err)) {
+
+                    SS_LOG_ERROR(L"RegistryUtils_save_to_file", L"Failed to get Backup Privilege : %ls", err->message.c_str());
+                    return false;
+                }
 
                 const LSTATUS st = RegSaveKeyW(m_key, path.c_str(), nullptr);
                 if (st != ERROR_SUCCESS) {
@@ -1048,7 +1052,10 @@ namespace ShadowStrike {
                 }
 
 				// SE_RESTORE_NAME is necessary
-                EnableRestorePrivilege(err);
+                if (!EnableRestorePrivilege(err)) {
+                    SS_LOG_ERROR(L"RegistryUtils_restore_from_file", L"Failed to Get Restore Privilege : %ls", err->message.c_str());
+                    return false;
+                }
 
                 const LSTATUS st = RegRestoreKeyW(m_key, path.c_str(), flags);
                 if (st != ERROR_SUCCESS) {

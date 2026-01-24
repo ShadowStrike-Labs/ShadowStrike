@@ -312,11 +312,12 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
             m_fileOffsetToCOWNode[rootOffset] = clonedRoot;
             m_cowRootNode = clonedRoot;
             
-            // Register truncated address for child pointer resolution
-            uint32_t truncatedAddr = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(clonedRoot)
-            );
-            m_truncatedAddrToCOWNode[truncatedAddr] = clonedRoot;
+            // Register pointer address for child pointer resolution (64-bit safe)
+            // NOTE: We store the full uintptr_t as map key to avoid 64-bit pointer collisions.
+            // The children[] array stores only lower 32-bits, but we track full address here.
+            uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(clonedRoot);
+            uint32_t truncatedAddr = static_cast<uint32_t>(ptrAddr);
+            m_ptrAddrToCOWNode[ptrAddr] = clonedRoot;
             
             SS_LOG_TRACE(L"SignatureIndex",
                 L"FindLeafForCOW: Cloned file root at offset 0x%X", rootOffset);
@@ -381,10 +382,11 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
         // ================================================================
         
         // First check if this is a truncated address pointing to a COW node
-        auto cowIt = m_truncatedAddrToCOWNode.find(childAddr);
-        if (cowIt != m_truncatedAddrToCOWNode.end()) {
+        // NOTE: Use helper that correctly handles 64-bit pointer lookup
+        BPlusTreeNode* cowNode = FindCOWNodeByTruncatedAddr(childAddr);
+        if (cowNode != nullptr) {
             // Found in COW node map - use COW node directly
-            node = cowIt->second;
+            node = cowNode;
             SS_LOG_TRACE(L"SignatureIndex",
                 L"FindLeafForCOW: Resolved truncated addr 0x%X to COW node", childAddr);
         }
@@ -423,24 +425,23 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                 // Register the clone in file offset map
                 m_fileOffsetToCOWNode[childAddr] = clonedNode;
                 
-                // Update parent's child pointer to point to cloned node
-                uint32_t clonedTruncAddr = static_cast<uint32_t>(
-                    reinterpret_cast<uintptr_t>(clonedNode)
-                );
+                // Update parent's child pointer to point to cloned node (64-bit safe)
+                // NOTE: Store full pointer in map, truncated value in children[] array
+                uintptr_t clonedPtrAddr = reinterpret_cast<uintptr_t>(clonedNode);
+                uint32_t clonedTruncAddr = static_cast<uint32_t>(clonedPtrAddr);
                 node->children[pos] = clonedTruncAddr;
                 
                 // CRITICAL FIX: Update cloned node's parentOffset to point to current parent
                 // The parentOffset copied from file may be stale (pointing to old root location).
                 // We need to update it to point to the current COW parent (node).
-                uint32_t parentTruncAddr = static_cast<uint32_t>(
-                    reinterpret_cast<uintptr_t>(node)
-                );
+                uintptr_t parentPtrAddr = reinterpret_cast<uintptr_t>(node);
+                uint32_t parentTruncAddr = static_cast<uint32_t>(parentPtrAddr);
                 clonedNode->parentOffset = parentTruncAddr;
                 
-                // CRITICAL FIX: Register truncated address for child pointer resolution
-                // Without this, subsequent traversals won't find this COW node when
-                // following child pointers that store truncated addresses.
-                m_truncatedAddrToCOWNode[clonedTruncAddr] = clonedNode;
+                // CRITICAL FIX: Register full pointer address for child pointer resolution
+                // This enables 64-bit safe lookup during subsequent COW traversals.
+                // The map is keyed by full uintptr_t to avoid pointer collision issues.
+                m_ptrAddrToCOWNode[clonedPtrAddr] = clonedNode;
                 
                 // ================================================================
                 // ENTERPRISE-GRADE LINKED LIST MAINTENANCE FOR LEAF NODES
@@ -476,10 +477,9 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                     if (prevLeafAddr != 0) {
                         BPlusTreeNode* prevLeafNode = nullptr;
                         
-                        // Check if prevLeaf is already a COW node (truncated address)
-                        auto prevCowIt = m_truncatedAddrToCOWNode.find(prevLeafAddr);
-                        if (prevCowIt != m_truncatedAddrToCOWNode.end()) {
-                            prevLeafNode = prevCowIt->second;
+                        // Check if prevLeaf is already a COW node (using 64-bit safe lookup)
+                        prevLeafNode = FindCOWNodeByTruncatedAddr(prevLeafAddr);
+                        if (prevLeafNode != nullptr) {
                             SS_LOG_TRACE(L"SignatureIndex",
                                 L"FindLeafForCOW: Found prevLeaf in COW pool at truncAddr 0x%X", 
                                 prevLeafAddr);
@@ -499,12 +499,11 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                                 if (prevLeafConst && prevLeafConst->isLeaf) {
                                     prevLeafNode = CloneNode(prevLeafConst);
                                     if (prevLeafNode) {
-                                        // Register the clone
+                                        // Register the clone (64-bit safe)
                                         m_fileOffsetToCOWNode[prevLeafAddr] = prevLeafNode;
-                                        uint32_t prevTruncAddr = static_cast<uint32_t>(
-                                            reinterpret_cast<uintptr_t>(prevLeafNode)
-                                        );
-                                        m_truncatedAddrToCOWNode[prevTruncAddr] = prevLeafNode;
+                                        uintptr_t prevPtrAddr = reinterpret_cast<uintptr_t>(prevLeafNode);
+                                        uint32_t prevTruncAddr = static_cast<uint32_t>(prevPtrAddr);
+                                        m_ptrAddrToCOWNode[prevPtrAddr] = prevLeafNode;
                                         
                                         // Update clonedNode's prevLeaf to point to cloned prev
                                         clonedNode->prevLeaf = prevTruncAddr;
@@ -531,10 +530,9 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                     if (nextLeafAddr != 0) {
                         BPlusTreeNode* nextLeafNode = nullptr;
                         
-                        // Check if nextLeaf is already a COW node (truncated address)
-                        auto nextCowIt = m_truncatedAddrToCOWNode.find(nextLeafAddr);
-                        if (nextCowIt != m_truncatedAddrToCOWNode.end()) {
-                            nextLeafNode = nextCowIt->second;
+                        // Check if nextLeaf is already a COW node (using 64-bit safe lookup)
+                        nextLeafNode = FindCOWNodeByTruncatedAddr(nextLeafAddr);
+                        if (nextLeafNode != nullptr) {
                             SS_LOG_TRACE(L"SignatureIndex",
                                 L"FindLeafForCOW: Found nextLeaf in COW pool at truncAddr 0x%X", 
                                 nextLeafAddr);
@@ -554,12 +552,11 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                                 if (nextLeafConst && nextLeafConst->isLeaf) {
                                     nextLeafNode = CloneNode(nextLeafConst);
                                     if (nextLeafNode) {
-                                        // Register the clone
+                                        // Register the clone (64-bit safe)
                                         m_fileOffsetToCOWNode[nextLeafAddr] = nextLeafNode;
-                                        uint32_t nextTruncAddr = static_cast<uint32_t>(
-                                            reinterpret_cast<uintptr_t>(nextLeafNode)
-                                        );
-                                        m_truncatedAddrToCOWNode[nextTruncAddr] = nextLeafNode;
+                                        uintptr_t nextPtrAddr = reinterpret_cast<uintptr_t>(nextLeafNode);
+                                        uint32_t nextTruncAddr = static_cast<uint32_t>(nextPtrAddr);
+                                        m_ptrAddrToCOWNode[nextPtrAddr] = nextLeafNode;
                                         
                                         // Update clonedNode's nextLeaf to point to cloned next
                                         clonedNode->nextLeaf = nextTruncAddr;
@@ -937,14 +934,12 @@ StoreError SignatureIndex::SplitNode(
 
         uint32_t originalNext = node->nextLeaf;
 
-        // Get truncated addresses for COW node pointers
-        // These will be converted to file offsets during CommitCOW
-        uint32_t newNodeTruncated = static_cast<uint32_t>(
-            reinterpret_cast<uintptr_t>(*newNode)
-        );
-        uint32_t nodeTruncated = static_cast<uint32_t>(
-            reinterpret_cast<uintptr_t>(node)
-        );
+        // Get pointer addresses for COW node pointers (64-bit safe)
+        // Store full address in map, truncated value in linked list fields
+        uintptr_t newNodePtrAddr = reinterpret_cast<uintptr_t>(*newNode);
+        uintptr_t nodePtrAddr = reinterpret_cast<uintptr_t>(node);
+        uint32_t newNodeTruncated = static_cast<uint32_t>(newNodePtrAddr);
+        uint32_t nodeTruncated = static_cast<uint32_t>(nodePtrAddr);
 
         // Link node -> newNode (truncated address, converted to file offset on commit)
         node->nextLeaf = newNodeTruncated;
@@ -967,13 +962,11 @@ StoreError SignatureIndex::SplitNode(
         // would skip newNode entirely, causing enumeration bugs.
         // ================================================================
         if (originalNext != 0) {
-            // Check if originalNext is already a COW node (truncated address)
-            auto cowIt = m_truncatedAddrToCOWNode.find(originalNext);
-            BPlusTreeNode* nextLeafNode = nullptr;
+            // Check if originalNext is already a COW node (using 64-bit safe lookup)
+            BPlusTreeNode* nextLeafNode = FindCOWNodeByTruncatedAddr(originalNext);
             
-            if (cowIt != m_truncatedAddrToCOWNode.end()) {
+            if (nextLeafNode != nullptr) {
                 // Already a COW node - use it directly
-                nextLeafNode = cowIt->second;
                 SS_LOG_TRACE(L"SignatureIndex",
                     L"SplitNode: Found next leaf in COW pool at truncAddr 0x%X", originalNext);
             }
@@ -992,12 +985,11 @@ StoreError SignatureIndex::SplitNode(
                     if (nextLeafConst && nextLeafConst->isLeaf) {
                         nextLeafNode = CloneNode(nextLeafConst);
                         if (nextLeafNode) {
-                            // Register the clone
+                            // Register the clone (64-bit safe)
                             m_fileOffsetToCOWNode[originalNext] = nextLeafNode;
-                            uint32_t clonedTruncAddr = static_cast<uint32_t>(
-                                reinterpret_cast<uintptr_t>(nextLeafNode)
-                            );
-                            m_truncatedAddrToCOWNode[clonedTruncAddr] = nextLeafNode;
+                            uintptr_t clonedPtrAddr = reinterpret_cast<uintptr_t>(nextLeafNode);
+                            uint32_t clonedTruncAddr = static_cast<uint32_t>(clonedPtrAddr);
+                            m_ptrAddrToCOWNode[clonedPtrAddr] = nextLeafNode;
                             
                             // Update newNode's nextLeaf to point to cloned node
                             (*newNode)->nextLeaf = clonedTruncAddr;
@@ -1183,17 +1175,19 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
             m_cowNodes.size());
 
         // ====================================================================
-        // STEP 4: REGISTER IN TRUNCATED ADDRESS MAP (FOR COW TRAVERSAL)
+        // STEP 4: REGISTER IN POINTER ADDRESS MAP (FOR COW TRAVERSAL)
         // ====================================================================
-        // Store mapping from truncated address (lower 32-bits of pointer) to COW node.
+        // Store mapping from full pointer address to COW node.
         // This allows FindLeafForCOW to resolve children[] pointers back to COW nodes
         // during tree traversal before commit.
-        uint32_t truncatedAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ptr));
-        m_truncatedAddrToCOWNode[truncatedAddr] = ptr;
+        // NOTE: Using full uintptr_t key for 64-bit safety (avoids pointer collisions)
+        uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
+        uint32_t truncatedAddr = static_cast<uint32_t>(ptrAddr);
+        m_ptrAddrToCOWNode[ptrAddr] = ptr;
         
         SS_LOG_TRACE(L"SignatureIndex",
-            L"AllocateNode: Registered truncated address 0x%X → node ptr",
-            truncatedAddr);
+            L"AllocateNode: Registered address 0x%llX (truncated 0x%X) → node ptr",
+            static_cast<unsigned long long>(ptrAddr), truncatedAddr);
 
         return ptr;
     }
@@ -1517,17 +1511,19 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
             m_cowNodes.size());
 
         // ====================================================================
-        // REGISTER IN TRUNCATED ADDRESS MAP (FOR COW TRAVERSAL)
+        // REGISTER IN POINTER ADDRESS MAP (FOR COW TRAVERSAL)
         // ====================================================================
-        // Store mapping from truncated address (lower 32-bits of pointer) to COW node.
+        // Store mapping from full pointer address to COW node.
         // This allows FindLeafForCOW to resolve children[] pointers back to COW nodes
         // during tree traversal before commit.
-        uint32_t truncatedAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ptr));
-        m_truncatedAddrToCOWNode[truncatedAddr] = ptr;
+        // NOTE: Using full uintptr_t key for 64-bit safety (avoids pointer collisions)
+        uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
+        uint32_t truncatedAddr = static_cast<uint32_t>(ptrAddr);
+        m_ptrAddrToCOWNode[ptrAddr] = ptr;
         
         SS_LOG_TRACE(L"SignatureIndex",
-            L"CloneNode: Registered truncated address 0x%X → cloned node ptr",
-            truncatedAddr);
+            L"CloneNode: Registered address 0x%llX (truncated 0x%X) → cloned node ptr",
+            static_cast<unsigned long long>(ptrAddr), truncatedAddr);
 
         return ptr;
     }

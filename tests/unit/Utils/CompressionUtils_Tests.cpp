@@ -571,9 +571,9 @@ TEST_F(CompressionUtilsTest, Security_MaxCompressedSizeLimit) {
     SS_LOG_INFO(L"CompressionUtils_Tests", L"[Security_MaxCompressedSizeLimit] Testing...");
     // MAX_COMPRESSED_SIZE is 256MB
     size_t oversized = MAX_COMPRESSED_SIZE + 1;
-    auto data = GenerateRandomData(std::min(oversized, size_t(1024))); // Don't actually allocate 256MB
+    auto data = GenerateRandomData(std::min(oversized, size_t(1024))); // Don't actually allocate 256MB //-V808
     
-    std::vector<uint8_t> output;
+    std::vector<uint8_t> output; //-V808
     
     // Should reject if we try to compress data larger than limit
     // Note: We can't actually test with 256MB+ due to memory constraints in tests

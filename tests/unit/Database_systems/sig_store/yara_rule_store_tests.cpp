@@ -1080,7 +1080,7 @@ TEST_F(YaraRuleStoreTest, RuleMerging_AddMultipleRuleSets) {
     EXPECT_TRUE(error2.IsSuccess()) << "Error: " << error2.message;
     
     // Both rules should be accessible
-    auto rules = yara_store_->ListRules();
+    auto rules = yara_store_->ListRules(); //-V808
     
     // Check metadata exists for both
     auto meta1 = yara_store_->GetRuleMetadata("MergeRule1", "namespace1");
@@ -1216,7 +1216,7 @@ TEST_F(YaraRuleStoreTest, ScanOptions_MinTimeout) {
     options.timeoutSeconds = YaraTitaniumLimits::MIN_TIMEOUT_SECONDS;
     
     std::vector<uint8_t> buffer = {0x00, 0x01};
-    auto matches = yara_store_->ScanBuffer(buffer, options);
+    auto matches = yara_store_->ScanBuffer(buffer, options); //-V808
     
     SUCCEED();
 }
@@ -1226,7 +1226,7 @@ TEST_F(YaraRuleStoreTest, ScanOptions_ZeroTimeout) {
     options.timeoutSeconds = 0;  // Should be clamped or handled
     
     std::vector<uint8_t> buffer = {0x00};
-    auto matches = yara_store_->ScanBuffer(buffer, options);
+    auto matches = yara_store_->ScanBuffer(buffer, options); //-V808
     
     SUCCEED();
 }
@@ -1278,7 +1278,7 @@ TEST_F(YaraRuleStoreTest, RemoveNamespace_PreservesOtherNamespaces) {
     ASSERT_TRUE(yara_store_->AddRulesFromSource(rule2, "remove_ns").IsSuccess());
     
     // Remove one namespace
-    yara_store_->RemoveNamespace("remove_ns");
+    yara_store_->RemoveNamespace("remove_ns"); //-V530
     
     // Other namespace should be preserved
     EXPECT_TRUE(yara_store_->GetRuleMetadata("PreserveRule1", "keep_ns").has_value());
@@ -1349,7 +1349,7 @@ TEST_F(YaraRuleStoreTest, ExportCompiled_WithRulesLoaded) {
 
 TEST_F(YaraRuleStoreTest, ExportCompiled_InvalidPath) {
     std::string rule = CreateTestRule("ExportRule2", "4D 5A");
-    yara_store_->AddRulesFromSource(rule, "default");
+    yara_store_->AddRulesFromSource(rule, "default"); //-V530
     
     auto error = yara_store_->ExportCompiled(L"\\\\invalid\\network\\path\\export.yc");
     EXPECT_FALSE(error.IsSuccess());
@@ -1551,7 +1551,7 @@ TEST_F(YaraRuleStoreTest, EdgeCase_LargeRuleSource) {
 // Empty buffer scan
 TEST_F(YaraRuleStoreTest, ScanBuffer_EmptyAfterRulesAdded) {
     std::string rule = CreateTestRule("EmptyBufRule", "4D 5A");
-    yara_store_->AddRulesFromSource(rule, "default");
+    yara_store_->AddRulesFromSource(rule, "default"); //-V530
     
     std::vector<uint8_t> emptyBuffer;
     auto matches = yara_store_->ScanBuffer(emptyBuffer);
@@ -1563,7 +1563,7 @@ TEST_F(YaraRuleStoreTest, ScanBuffer_EmptyAfterRulesAdded) {
 TEST_F(YaraRuleStoreTest, Statistics_AccuracyAfterOperations) {
     // Test that statistics are properly reset and can be retrieved
     std::string rule = CreateTestRule("StatsRule", "4D 5A");
-    yara_store_->AddRulesFromSource(rule, "default");
+    yara_store_->AddRulesFromSource(rule, "default"); //-V530
     
     // Reset statistics should work even without initialization
     yara_store_->ResetStatistics();
@@ -1578,16 +1578,16 @@ TEST_F(YaraRuleStoreTest, Statistics_AccuracyAfterOperations) {
 // GetTopRules with data
 TEST_F(YaraRuleStoreTest, GetTopRules_WithMatches) {
     std::string rule = CreateTestRule("TopRule", "4D 5A");
-    yara_store_->AddRulesFromSource(rule, "default");
+    yara_store_->AddRulesFromSource(rule, "default"); //-V530
     
     std::vector<uint8_t> buffer = {0x4D, 0x5A};
     
     // Generate some hits
     for (int i = 0; i < 5; ++i) {
-        yara_store_->ScanBuffer(buffer);
+        yara_store_->ScanBuffer(buffer); //-V530
     }
     
-    auto topRules = yara_store_->GetTopRules(5);
+    auto topRules = yara_store_->GetTopRules(5); //-V808
     // May or may not have entries depending on hit tracking
     SUCCEED();
 }

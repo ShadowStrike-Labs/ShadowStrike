@@ -336,8 +336,8 @@ TEST_F(BoyerMooreTest, FindFirstOptimization) {
 
 TEST_F(BoyerMooreTest, WildcardMaskMatching) {
     // Pattern: 48 ?? 05 (matches 48 XX 05 for any XX)
-    auto pattern = HexStringToBytes("48 00 05").value();
-    std::vector<uint8_t> mask = {0xFF, 0x00, 0xFF};  // Don't care about middle byte
+    auto pattern = HexStringToBytes("48 00 05").value(); //-V836
+    std::vector<uint8_t> mask = {0xFF, 0x00, 0xFF};  // Don't care about middle byte //-V826
 
     BoyerMooreMatcher matcher(pattern, mask);
 
@@ -440,7 +440,7 @@ TEST_F(SIMDMatcherTest, AVX2VsScalarConsistency) {
     }
 
     // Insert pattern at known positions
-    std::vector<size_t> knownPositions = {100, 1000, 5000, 9000};
+    std::vector<size_t> knownPositions = {100, 1000, 5000, 9000}; //-V826
     for (auto pos : knownPositions) {
         std::copy(pattern.begin(), pattern.end(), buffer.begin() + pos);
     }
@@ -789,7 +789,7 @@ TEST_F(PatternStoreTest, GetStatistics) {
     ASSERT_TRUE(m_store->AddPattern("FF D0", "P2", ThreatLevel::Medium).IsSuccess());
 
     std::vector<uint8_t> buffer = {0x48, 0x8B, 0x05};
-    m_store->Scan(buffer);
+    m_store->Scan(buffer); //-V530
 
     auto stats = m_store->GetStatistics();
     
@@ -840,7 +840,7 @@ TEST_F(PatternStoreTest, ConcurrentAddAndScan) {
     auto scannerThread = std::thread([this, &stop]() {
         std::vector<uint8_t> buffer(100, 0x48);
         while (!stop.load()) {
-            m_store->Scan(buffer);
+            m_store->Scan(buffer); //-V530
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     });
@@ -848,7 +848,7 @@ TEST_F(PatternStoreTest, ConcurrentAddAndScan) {
     // Adder thread
     for (int i = 0; i < 20; ++i) {
         std::string pattern = "48 " + std::to_string(i);
-        m_store->AddPattern(pattern, "Pattern" + std::to_string(i), ThreatLevel::Low);
+        m_store->AddPattern(pattern, "Pattern" + std::to_string(i), ThreatLevel::Low); //-V530
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
@@ -871,7 +871,7 @@ TEST_F(PatternStoreTest, DISABLED_BenchmarkScanSpeed) {
     // Add 1000 patterns
     for (int i = 0; i < 1000; ++i) {
         std::string pattern = "48 8B " + std::to_string(i & 0xFF);
-        m_store->AddPattern(pattern, "Pattern" + std::to_string(i), ThreatLevel::Low);
+        m_store->AddPattern(pattern, "Pattern" + std::to_string(i), ThreatLevel::Low); //-V530
     }
 
     // 10MB buffer
@@ -897,7 +897,7 @@ TEST_F(PatternStoreTest, DISABLED_BenchmarkThroughput) {
 
     // Add patterns
     for (int i = 0; i < 100; ++i) {
-        m_store->AddPattern("48 8B 05", "Pattern" + std::to_string(i), ThreatLevel::Low);
+        m_store->AddPattern("48 8B 05", "Pattern" + std::to_string(i), ThreatLevel::Low); //-V530
     }
 
     // 100MB buffer
@@ -905,7 +905,7 @@ TEST_F(PatternStoreTest, DISABLED_BenchmarkThroughput) {
     std::vector<uint8_t> buffer(bufferSize, 0x00);
 
     auto start = std::chrono::high_resolution_clock::now();
-    m_store->Scan(buffer);
+    m_store->Scan(buffer); //-V530
     auto end = std::chrono::high_resolution_clock::now();
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -989,7 +989,7 @@ TEST_F(PatternStoreTest, HeatmapTracking) {
     // Scan multiple times with first pattern
     std::vector<uint8_t> buffer1 = {0x48, 0x8B, 0x05};
     for (int i = 0; i < 10; ++i) {
-        m_store->Scan(buffer1);
+        m_store->Scan(buffer1); //-V530
     }
 
     auto heatmap = m_store->GetHeatmap();

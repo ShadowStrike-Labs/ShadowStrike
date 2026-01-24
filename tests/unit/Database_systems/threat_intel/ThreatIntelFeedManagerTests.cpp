@@ -1535,23 +1535,29 @@ TEST_F(ConfigurationTest, FeedEndpointGetPaginatedUrl) {
 
 TEST_F(ConfigurationTest, RetryConfigCalculateDelay) {
     // Test: RetryConfig::CalculateDelay
+    // 
+    // Semantic: attempt N means the Nth retry (0-indexed)
+    // - attempt 0 = first retry → initialDelayMs
+    // - attempt 1 = second retry → initialDelayMs * multiplier
+    // - attempt N = (N+1)th retry → initialDelayMs * multiplier^N
+    //
     RetryConfig retryConfig;
     retryConfig.initialDelayMs = 1000;
     retryConfig.maxDelayMs = 60000;
     retryConfig.backoffMultiplier = 2.0;
     retryConfig.jitterFactor = 0.0;  // No jitter for predictable test
     
-    // Attempt 0 should return 0
-    EXPECT_EQ(retryConfig.CalculateDelay(0), 0u);
+    // Attempt 0: first retry → initialDelay (1000 * 2^0 = 1000)
+    EXPECT_EQ(retryConfig.CalculateDelay(0), 1000u);
     
-    // Attempt 1 should return initialDelay
-    EXPECT_EQ(retryConfig.CalculateDelay(1), 1000u);
+    // Attempt 1: second retry → initialDelay * 2 (1000 * 2^1 = 2000)
+    EXPECT_EQ(retryConfig.CalculateDelay(1), 2000u);
     
-    // Attempt 2 should be doubled
-    EXPECT_EQ(retryConfig.CalculateDelay(2), 2000u);
+    // Attempt 2: third retry → initialDelay * 4 (1000 * 2^2 = 4000)
+    EXPECT_EQ(retryConfig.CalculateDelay(2), 4000u);
     
-    // Attempt 3 should be quadrupled
-    EXPECT_EQ(retryConfig.CalculateDelay(3), 4000u);
+    // Attempt 3: fourth retry → initialDelay * 8 (1000 * 2^3 = 8000)
+    EXPECT_EQ(retryConfig.CalculateDelay(3), 8000u);
 }
 
 TEST_F(ConfigurationTest, RetryConfigCalculateDelayWithMaxClamp) {

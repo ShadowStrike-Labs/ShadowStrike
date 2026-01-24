@@ -206,7 +206,7 @@ TEST_F(FileUtilsTest, NormalizePath_EmptyPath) {
 TEST_F(FileUtilsTest, NormalizePath_InvalidCharacters) {
     SS_LOG_INFO(L"FileUtilsTests", L"[NormalizePath_InvalidCharacters] Testing...");
     Error err{};
-    std::wstring result = NormalizePath(L"C:\\invalid<>|?.txt", false, &err);
+    std::wstring result = NormalizePath(L"C:\\invalid<>|?.txt", false, &err); //-V808
     // Windows will normalize but may fail on actual file operations
     EXPECT_NE(err.win32, static_cast<DWORD>(0));
 }
