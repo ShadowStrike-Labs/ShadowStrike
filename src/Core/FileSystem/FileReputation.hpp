@@ -92,6 +92,18 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File path utilities
+#include "../../Utils/HashUtils.hpp"          // Hash computation
+#include "../../Utils/CertUtils.hpp"          // Certificate verification
+#include "../../Utils/CacheManager.hpp"       // LRU caching
+#include "../../HashStore/HashStore.hpp"      // Hash lookups
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Threat intelligence
+#include "../../ThreatIntel/ReputationCache.hpp"    // Reputation caching
+#include "../../Whitelist/WhiteListStore.hpp" // Whitelisted files
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

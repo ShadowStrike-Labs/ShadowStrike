@@ -109,6 +109,16 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/ProcessUtils.hpp"       // Client process identification
+#include "../../PatternStore/PatternStore.hpp" // Protocol patterns
+#include "../../HashStore/HashStore.hpp"      // Torrent infohash lookups
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Malicious torrent IOCs
+#include "../../Whitelist/WhiteListStore.hpp" // Allowed P2P applications
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

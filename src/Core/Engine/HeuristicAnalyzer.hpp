@@ -187,6 +187,20 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // PE/ELF parsing
+#include "../../Utils/HashUtils.hpp"          // ImpHash calculation
+#include "../../Utils/StringUtils.hpp"        // String extraction
+#include "../../HashStore/HashStore.hpp"      // SSDEEP/TLSH fuzzy matching
+#include "../../PatternStore/PatternStore.hpp" // String/shellcode patterns
+#include "../../SignatureStore/SignatureStore.hpp" // YARA rules
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Cert reputation
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <bitset>

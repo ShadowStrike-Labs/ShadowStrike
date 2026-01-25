@@ -86,6 +86,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File reading
+#include "../../Utils/CompressionUtils.hpp"   // Archive handling
+#include "../../Utils/StringUtils.hpp"        // String extraction
+#include "../../PatternStore/PatternStore.hpp" // Exploit patterns
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // CVE/exploit database
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

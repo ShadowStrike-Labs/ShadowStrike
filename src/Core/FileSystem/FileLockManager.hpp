@@ -76,6 +76,13 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File operations
+#include "../../Utils/ProcessUtils.hpp"       // Process handle enumeration
+#include "../../Utils/SystemUtils.hpp"        // System operations
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

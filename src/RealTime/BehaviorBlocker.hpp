@@ -145,6 +145,17 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/ProcessUtils.hpp"          // Process termination
+#include "../Utils/FileUtils.hpp"             // File rollback
+#include "../Utils/RegistryUtils.hpp"         // Registry rollback
+#include "../Whitelist/WhiteListStore.hpp"    // Critical process list
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

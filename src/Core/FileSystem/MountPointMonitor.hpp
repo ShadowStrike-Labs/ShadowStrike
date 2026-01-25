@@ -46,6 +46,13 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // Drive enumeration
+#include "../../Utils/SystemUtils.hpp"        // Device info
+#include "../../Whitelist/WhiteListStore.hpp" // Device whitelist
+
 #include <cstdint>
 #include <string>
 #include <vector>

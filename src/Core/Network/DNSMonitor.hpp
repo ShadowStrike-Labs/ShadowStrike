@@ -111,6 +111,16 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // DNS resolution utilities
+#include "../../Utils/StringUtils.hpp"        // Domain parsing
+#include "../../Utils/CacheManager.hpp"       // DNS cache management
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Domain reputation
+#include "../../PatternStore/PatternStore.hpp" // DGA pattern matching
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted domains
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

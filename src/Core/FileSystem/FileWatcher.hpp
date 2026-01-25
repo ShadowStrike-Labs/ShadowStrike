@@ -95,6 +95,14 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // Path normalization
+#include "../../Utils/StringUtils.hpp"        // Path pattern matching
+#include "../../Utils/ThreadPool.hpp"         // Event processing
+#include "../../Whitelist/WhiteListStore.hpp" // Excluded paths
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

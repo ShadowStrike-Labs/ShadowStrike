@@ -128,6 +128,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/ProcessUtils.hpp"       // Application identification
+#include "../../Utils/CertUtils.hpp"          // App signature verification
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // IP reputation
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted applications
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

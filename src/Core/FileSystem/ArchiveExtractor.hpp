@@ -93,6 +93,14 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/CompressionUtils.hpp"   // Decompression algorithms
+#include "../../Utils/FileUtils.hpp"          // File I/O
+#include "../../Utils/HashUtils.hpp"          // Entry hashing
+#include "../../Utils/CryptoUtils.hpp"        // Password handling
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

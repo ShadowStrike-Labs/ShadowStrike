@@ -164,6 +164,18 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/ProcessUtils.hpp"       // Process context
+#include "../../Utils/SystemUtils.hpp"        // System information
+#include "../../PatternStore/PatternStore.hpp" // Injection patterns
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // IOC correlation
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted processes/modules
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

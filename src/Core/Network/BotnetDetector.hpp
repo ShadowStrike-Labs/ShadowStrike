@@ -114,6 +114,16 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/StringUtils.hpp"        // Domain analysis
+#include "../../PatternStore/PatternStore.hpp" // C2/DGA patterns
+#include "../../SignatureStore/SignatureStore.hpp" // Botnet signatures
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // C2 infrastructure IOCs
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted infrastructure
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

@@ -153,6 +153,19 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/ProcessUtils.hpp"       // Process/memory access
+#include "../../Utils/HashUtils.hpp"          // Memory content hashing
+#include "../../PatternStore/PatternStore.hpp" // YARA/shellcode patterns
+#include "../../SignatureStore/SignatureStore.hpp" // Malware signatures
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // IOC lookups
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted modules
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

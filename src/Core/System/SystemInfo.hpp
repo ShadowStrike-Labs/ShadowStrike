@@ -53,6 +53,14 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // Core system utilities
+#include "../../Utils/RegistryUtils.hpp"      // Registry-based system info
+#include "../../Utils/NetworkUtils.hpp"       // Network interface detection
+#include "../../Utils/ProcessUtils.hpp"       // Process environment
+
 #include <cstdint>
 #include <string>
 #include <vector>

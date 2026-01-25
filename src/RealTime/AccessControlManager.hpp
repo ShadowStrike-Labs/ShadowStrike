@@ -116,6 +116,13 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/ProcessUtils.hpp"          // Process context
+#include "../Utils/SystemUtils.hpp"           // System security settings
+#include "../Whitelist/WhiteListStore.hpp"    // Trusted processes
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

@@ -166,6 +166,20 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/ProcessUtils.hpp"       // Process context
+#include "../../Utils/FileUtils.hpp"          // File operations
+#include "../../Utils/RegistryUtils.hpp"      // Registry operations
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // IOC correlation
+#include "../../PatternStore/PatternStore.hpp" // Attack patterns
+#include "../../SignatureStore/SignatureStore.hpp" // Behavioral signatures
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted behaviors
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <bitset>

@@ -100,6 +100,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/RegistryUtils.hpp"      // Registry operations
+#include "../../Utils/FileUtils.hpp"          // Startup folders
+#include "../../Utils/CertUtils.hpp"          // Binary verification
+#include "../../Utils/ProcessUtils.hpp"       // Process enumeration
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted startup items
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

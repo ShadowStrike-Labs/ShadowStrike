@@ -160,6 +160,20 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/ProcessUtils.hpp"          // Process information
+#include "../Utils/StringUtils.hpp"           // Command line parsing
+#include "../Utils/FileUtils.hpp"             // Executable analysis
+#include "../HashStore/HashStore.hpp"         // Hash-based blocking
+#include "../ThreatIntel/ThreatIntelLookup.hpp"  // IOC correlation
+#include "../PatternStore/PatternStore.hpp"   // LOLBAS patterns
+#include "../Whitelist/WhiteListStore.hpp"    // Trusted processes
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

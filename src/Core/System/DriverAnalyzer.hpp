@@ -53,6 +53,18 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // OS info, CPU features
+#include "../../Utils/FileUtils.hpp"          // File operations
+#include "../../Utils/ProcessUtils.hpp"       // Process/module enumeration
+#include "../../Utils/CertUtils.hpp"          // Signature verification
+#include "../../Utils/HashUtils.hpp"          // Hash computation
+#include "../../HashStore/HashStore.hpp"      // Known driver hash lookup
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Threat intelligence
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted driver whitelist
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -73,6 +85,11 @@ namespace System {
 // FORWARD DECLARATIONS
 // ============================================================================
 class DriverAnalyzerImpl;
+
+// Infrastructure forward declarations for dependency injection
+namespace SignatureStore { class HashStore; }
+namespace ThreatIntel { class ThreatIntelLookup; }
+namespace Whitelist { class WhitelistStore; }
 
 // ============================================================================
 // ENUMERATIONS

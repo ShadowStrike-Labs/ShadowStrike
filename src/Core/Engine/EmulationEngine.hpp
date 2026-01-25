@@ -160,6 +160,20 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/ProcessUtils.hpp"       // Process emulation
+#include "../../Utils/FileUtils.hpp"          // Virtual filesystem
+#include "../../Utils/RegistryUtils.hpp"      // Virtual registry
+#include "../../PatternStore/PatternStore.hpp" // Unpacker patterns
+#include "../../SignatureStore/SignatureStore.hpp" // YARA memory scanning
+#include "../../HashStore/HashStore.hpp"      // Unpacked hash comparison
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Network IOC checking
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <bitset>

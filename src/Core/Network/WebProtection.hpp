@@ -103,6 +103,17 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/CertUtils.hpp"          // Certificate validation
+#include "../../Utils/StringUtils.hpp"        // Content parsing
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Reputation lookups
+#include "../../PatternStore/PatternStore.hpp" // XSS/exploit patterns
+#include "../../SignatureStore/SignatureStore.hpp" // Exploit signatures
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted sites
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

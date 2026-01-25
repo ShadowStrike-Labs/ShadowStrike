@@ -96,6 +96,18 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File operations, memory mapping
+#include "../../Utils/CertUtils.hpp"          // Authenticode verification
+#include "../../Utils/HashUtils.hpp"          // Hash computation
+#include "../../Utils/PE_sig_verf.hpp"        // PE signature verification
+#include "../../HashStore/HashStore.hpp"      // Known hash lookups
+#include "../../PatternStore/PatternStore.hpp" // Pattern matching
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Threat intelligence
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted executables
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

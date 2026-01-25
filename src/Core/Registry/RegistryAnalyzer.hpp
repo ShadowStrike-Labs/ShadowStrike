@@ -105,6 +105,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/RegistryUtils.hpp"      // Registry operations
+#include "../../Utils/FileUtils.hpp"          // Hive file access
+#include "../../Utils/HashUtils.hpp"          // Value hashing
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Known malware patterns
+#include "../../PatternStore/PatternStore.hpp" // Value pattern matching
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

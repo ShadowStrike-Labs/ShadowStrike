@@ -167,6 +167,20 @@
 
 #pragma once
 
+#pragma once
+
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/NetworkUtils.hpp"          // Network utilities
+#include "../Utils/ProcessUtils.hpp"          // Process context
+#include "../ThreatIntel/ThreatIntelLookup.hpp"  // IP/domain reputation
+#include "../PatternStore/PatternStore.hpp"   // Traffic signatures
+#include "../Whitelist/WhiteListStore.hpp"    // Trusted connections
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

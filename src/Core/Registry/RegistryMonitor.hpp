@@ -115,6 +115,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/RegistryUtils.hpp"      // Registry operations
+#include "../../Utils/ProcessUtils.hpp"       // Process context
+#include "../../Utils/StringUtils.hpp"        // Path handling
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted processes/keys
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Known malware patterns
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

@@ -46,6 +46,13 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // Path operations
+#include "../../Utils/SystemUtils.hpp"        // System paths
+#include "../../Whitelist/WhiteListStore.hpp" // Excluded paths
+
 #include <cstdint>
 #include <string>
 #include <vector>

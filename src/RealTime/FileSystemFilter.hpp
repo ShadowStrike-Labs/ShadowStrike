@@ -157,6 +157,31 @@
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#pragma once
+
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/FileUtils.hpp"             // File operations
+#include "../Utils/CacheManager.hpp"          // Scan caching
+#include "../Utils/ThreadPool.hpp"            // Parallel processing
+#include "../Whitelist/WhiteListStore.hpp"    // Path exclusions
+#include "../HashStore/HashStore.hpp"         // Hash lookups
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>

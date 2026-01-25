@@ -110,6 +110,16 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/ProcessUtils.hpp"       // Process identification
+#include "../../Utils/CacheManager.hpp"       // Node list caching
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Tor node lists
+#include "../../PatternStore/PatternStore.hpp" // Traffic fingerprint patterns
+#include "../../Whitelist/WhiteListStore.hpp" // Allowed Tor usage
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

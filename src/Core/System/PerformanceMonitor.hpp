@@ -54,6 +54,12 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // Memory info, CPU info
+#include "../../Utils/ProcessUtils.hpp"       // Per-process resource tracking
+
 #include <cstdint>
 #include <string>
 #include <vector>

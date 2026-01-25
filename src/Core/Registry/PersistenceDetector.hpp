@@ -108,6 +108,17 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/RegistryUtils.hpp"      // Registry enumeration
+#include "../../Utils/FileUtils.hpp"          // Startup folder scanning
+#include "../../Utils/ProcessUtils.hpp"       // Task scheduler access
+#include "../../Utils/CertUtils.hpp"          // Binary verification
+#include "../../HashStore/HashStore.hpp"      // Known persistence hashes
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Threat patterns
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted persistence
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

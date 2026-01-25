@@ -111,6 +111,17 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // URL parsing utilities
+#include "../../Utils/StringUtils.hpp"        // String manipulation
+#include "../../Utils/CacheManager.hpp"       // URL cache
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // URL/domain reputation
+#include "../../ThreatIntel/ThreatIntelIndex_URLMatcher.hpp" // URL pattern matching
+#include "../../PatternStore/PatternStore.hpp" // Phishing/malware patterns
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted URLs/domains
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

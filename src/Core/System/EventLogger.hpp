@@ -53,6 +53,15 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/Logger.hpp"             // Base logging infrastructure
+#include "../../Utils/StringUtils.hpp"        // String formatting
+#include "../../Utils/SystemUtils.hpp"        // Machine info for events
+#include "../../Utils/JSONUtils.hpp"          // JSON event formatting
+#include "../../Database/LogDB.hpp"           // Persistent storage
+
 #include <cstdint>
 #include <string>
 #include <vector>

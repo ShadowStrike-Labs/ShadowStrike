@@ -140,6 +140,18 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/ProcessUtils.hpp"          // Process enumeration
+#include "../Utils/SystemUtils.hpp"           // System information
+#include "../Utils/RegistryUtils.hpp"         // Registry artifacts
+#include "../Utils/FileUtils.hpp"             // File system checks
+#include "../PatternStore/PatternStore.hpp"   // Sandbox patterns
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <bitset>

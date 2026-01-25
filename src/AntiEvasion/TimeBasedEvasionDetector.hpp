@@ -84,6 +84,16 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/ProcessUtils.hpp"          // Process context
+#include "../Utils/SystemUtils.hpp"           // System timing
+#include "../PatternStore/PatternStore.hpp"   // Timing patterns
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <chrono>
 #include <cstdint>

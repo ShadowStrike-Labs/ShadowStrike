@@ -95,6 +95,7 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/ErrorUtils.hpp"
+#include "../../Whitelist/WhiteListStore.hpp" // Protected process list
 
 // Standard library
 #include <string>

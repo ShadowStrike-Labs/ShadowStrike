@@ -112,6 +112,16 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/HashUtils.hpp"          // JA3 hash computation
+#include "../../Utils/CertUtils.hpp"          // Certificate extraction
+#include "../../PatternStore/PatternStore.hpp" // Protocol/shellcode patterns
+#include "../../SignatureStore/SignatureStore.hpp" // Malware signatures
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // IP/domain reputation
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

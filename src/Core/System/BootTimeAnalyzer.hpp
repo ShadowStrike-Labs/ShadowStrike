@@ -53,6 +53,15 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // Boot info, OS version
+#include "../../Utils/RegistryUtils.hpp"      // Startup registry entries
+#include "../../Utils/FileUtils.hpp"          // Startup folder enumeration
+#include "../../Utils/CertUtils.hpp"          // Startup item verification
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted startup items
+
 #include <cstdint>
 #include <string>
 #include <vector>

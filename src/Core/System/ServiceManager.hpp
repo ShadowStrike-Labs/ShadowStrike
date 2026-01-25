@@ -54,6 +54,15 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // OS info, privilege checks
+#include "../../Utils/RegistryUtils.hpp"      // Service registry operations
+#include "../../Utils/FileUtils.hpp"          // Binary path validation
+#include "../../Utils/CertUtils.hpp"          // Driver signature verification
+#include "../../Utils/ProcessUtils.hpp"       // Process handle operations
+
 #include <cstdint>
 #include <string>
 #include <vector>

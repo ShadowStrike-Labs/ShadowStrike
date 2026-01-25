@@ -131,6 +131,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Low-level network utilities
+#include "../../Utils/ProcessUtils.hpp"       // Process context
+#include "../../Utils/StringUtils.hpp"        // IP/DNS string handling
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // IP/Domain reputation
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted connections
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

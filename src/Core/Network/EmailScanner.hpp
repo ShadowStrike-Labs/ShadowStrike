@@ -107,6 +107,18 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/StringUtils.hpp"        // MIME parsing
+#include "../../Utils/CompressionUtils.hpp"   // Attachment decompression
+#include "../../Utils/FileUtils.hpp"          // Attachment handling
+#include "../../PatternStore/PatternStore.hpp" // Phishing/malware patterns
+#include "../../SignatureStore/SignatureStore.hpp" // Malware signatures
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Sender/domain reputation
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted senders
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

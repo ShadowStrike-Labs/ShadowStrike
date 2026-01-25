@@ -76,6 +76,14 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/HashUtils.hpp"          // Core hash algorithms
+#include "../../Utils/FileUtils.hpp"          // File reading, memory mapping
+#include "../../Utils/CacheManager.hpp"       // Hash caching
+#include "../../Utils/ThreadPool.hpp"         // Async hashing
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

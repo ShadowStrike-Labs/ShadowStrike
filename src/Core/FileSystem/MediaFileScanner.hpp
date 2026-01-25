@@ -47,6 +47,13 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File reading
+#include "../../PatternStore/PatternStore.hpp" // Exploit patterns
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Steganography signatures
+
 #include <cstdint>
 #include <string>
 #include <vector>

@@ -118,6 +118,14 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/RegistryUtils.hpp"      // Registry access
+#include "../../Utils/SystemUtils.hpp"        // System info
+#include "../../Utils/NetworkUtils.hpp"       // Network settings
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Malware patterns
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

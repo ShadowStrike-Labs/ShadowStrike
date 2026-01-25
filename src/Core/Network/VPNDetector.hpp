@@ -110,6 +110,17 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/NetworkUtils.hpp"       // Network utilities
+#include "../../Utils/SystemUtils.hpp"        // Adapter enumeration
+#include "../../Utils/ProcessUtils.hpp"       // Process identification
+#include "../../Utils/RegistryUtils.hpp"      // VPN registry entries
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"  // VPN IP ranges
+#include "../../PatternStore/PatternStore.hpp" // Protocol fingerprints
+#include "../../Whitelist/WhiteListStore.hpp" // Allowed VPN providers
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

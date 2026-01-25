@@ -126,6 +126,15 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/HashUtils.hpp"             // File hashing
+#include "../Utils/CacheManager.hpp"          // Verdict caching
+#include "../ThreatIntel/ThreatIntelLookup.hpp"  // Cloud lookups
+#include "../SignatureStore/SignatureStore.hpp" // Rapid signature updates
+#include "../Whitelist/WhiteListStore.hpp"    // Known-good files
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

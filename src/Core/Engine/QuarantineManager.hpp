@@ -194,6 +194,19 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File operations
+#include "../../Utils/CryptoUtils.hpp"        // AES-256-GCM encryption
+#include "../../Utils/HashUtils.hpp"          // Hash calculation
+#include "../../Utils/ProcessUtils.hpp"       // Process termination
+#include "../../Utils/RegistryUtils.hpp"      // Registry cleanup
+#include "../../Database/QuarantineDB.hpp"    // Metadata storage
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

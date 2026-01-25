@@ -175,6 +175,17 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/FileUtils.hpp"             // File operations
+#include "../Utils/HashUtils.hpp"             // Hash computation
+#include "../HashStore/HashStore.hpp"         // Baseline storage
+#include "../Whitelist/WhiteListStore.hpp"    // Excluded paths
+
+// ============================================================================
+// STANDARD LIBRARY INCLUDES
+// ============================================================================
 #include <atomic>
 #include <array>
 #include <chrono>

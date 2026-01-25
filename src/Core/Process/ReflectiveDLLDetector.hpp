@@ -98,6 +98,7 @@
 #include "../../HashStore/HashStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../Whitelist/WhiteListStore.hpp" // Legitimate reflective loaders
 
 // Standard library
 #include <string>

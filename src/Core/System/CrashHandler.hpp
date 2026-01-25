@@ -53,6 +53,14 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // System info for crash context
+#include "../../Utils/ProcessUtils.hpp"       // Stack trace, module info
+#include "../../Utils/FileUtils.hpp"          // Dump file operations
+#include "../../Utils/Logger.hpp"             // Crash logging
+
 #include <cstdint>
 #include <string>
 #include <vector>

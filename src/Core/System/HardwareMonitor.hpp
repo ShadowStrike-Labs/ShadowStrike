@@ -54,6 +54,12 @@
 
 #pragma once
 
+// ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/SystemUtils.hpp"        // System info utilities
+#include "../../Utils/FileUtils.hpp"          // Disk info access
+
 #include <cstdint>
 #include <string>
 #include <vector>

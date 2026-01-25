@@ -97,6 +97,13 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../../Utils/FileUtils.hpp"          // File reading
+#include "../../Utils/StringUtils.hpp"        // Extension handling
+#include "../../PatternStore/PatternStore.hpp" // Magic number patterns
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>

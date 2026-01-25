@@ -90,6 +90,7 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/ErrorUtils.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../Whitelist/WhiteListStore.hpp" // Trusted processes
 
 // Standard library
 #include <string>

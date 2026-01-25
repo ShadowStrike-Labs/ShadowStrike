@@ -159,6 +159,16 @@
 #pragma once
 
 // ============================================================================
+// INFRASTRUCTURE INCLUDES
+// ============================================================================
+#include "../Utils/ProcessUtils.hpp"          // Process context
+#include "../Utils/FileUtils.hpp"             // File operations
+#include "../Utils/CacheManager.hpp"          // Scan result caching
+#include "../ThreatIntel/ThreatIntelLookup.hpp"  // IOC correlation
+#include "../Whitelist/WhiteListStore.hpp"    // Exclusions
+#include "../HashStore/HashStore.hpp"         // Hash-based blocking
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <cstdint>
