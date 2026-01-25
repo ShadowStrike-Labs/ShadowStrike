@@ -144,6 +144,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\AntiEvasion\DebuggerEvasionDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\EnvironmentEvasionDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\MetamorphicDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\PackerDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\SandboxEvasionDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\TimeBasedEvasionDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\VMEvasionDetector.cpp" />
     <ClCompile Include="src\database\ConfigurationDB.cpp" />
     <ClCompile Include="src\database\DatabaseManager.cpp" />
     <ClCompile Include="src\database\LogDB.cpp" />
