@@ -99,6 +99,16 @@
 #  pragma comment(lib, "ntdll.lib")
 #endif
 
+// Undefine conflicting macros if previously defined
+#ifdef HEAP_TAIL_CHECKING_ENABLED
+#undef HEAP_TAIL_CHECKING_ENABLED
+#endif
+
+#ifdef HEAP_FREE_CHECKING_ENABLED
+#undef HEAP_FREE_CHECKING_ENABLED
+#endif
+
+
 // ============================================================================
 // SHADOWSTRIKE INTERNAL INCLUDES
 // ============================================================================
