@@ -52,6 +52,7 @@
 #include "../../Utils/FileUtils.hpp"          // Path operations
 #include "../../Utils/SystemUtils.hpp"        // System paths
 #include "../../Whitelist/WhiteListStore.hpp" // Excluded paths
+#include "../../Utils/Logger.hpp"             // Logging
 
 #include <cstdint>
 #include <string>
@@ -75,6 +76,41 @@ namespace FileSystem {
 class DirectoryMonitorImpl;
 
 // ============================================================================
+// COMPILE-TIME CONSTANTS
+// ============================================================================
+
+namespace DirectoryMonitorConstants {
+
+    inline constexpr uint32_t VERSION_MAJOR = 3;
+    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_PATCH = 0;
+
+    /// @brief Maximum concurrent monitors
+    inline constexpr size_t MAX_CONCURRENT_MONITORS = 1000;
+
+    /// @brief Event queue capacity per monitor
+    inline constexpr size_t EVENT_QUEUE_CAPACITY = 10000;
+
+    /// @brief Event processing timeout (milliseconds)
+    inline constexpr uint32_t EVENT_TIMEOUT_MS = 100;
+
+    /// @brief Rate limiting window (seconds)
+    inline constexpr uint32_t RATE_LIMIT_WINDOW_SEC = 60;
+
+    /// @brief Maximum events per path per window
+    inline constexpr uint32_t MAX_EVENTS_PER_PATH_PER_WINDOW = 1000;
+
+}  // namespace DirectoryMonitorConstants
+
+// ============================================================================
+// TYPE ALIASES
+// ============================================================================
+
+using Clock = std::chrono::steady_clock;
+using TimePoint = std::chrono::steady_clock::time_point;
+using SystemTimePoint = std::chrono::system_clock::time_point;
+
+// ============================================================================
 // ENUMERATIONS
 // ============================================================================
 
@@ -95,6 +131,35 @@ enum class PathCategory : uint8_t {
     Custom = 9                     // User-defined
 };
 
+/**
+ * @enum DirectoryMonitorStatus
+ * @brief Status of directory monitor.
+ */
+enum class DirectoryMonitorStatus : uint8_t {
+    Uninitialized = 0,
+    Initializing = 1,
+    Running = 2,
+    Paused = 3,
+    Error = 4,
+    Stopping = 5,
+    Stopped = 6
+};
+
+/**
+ * @enum FileSystemAction
+ * @brief Type of file system action detected.
+ */
+enum class FileSystemAction : uint32_t {
+    Unknown = 0,
+    FileAdded = 1,
+    FileRemoved = 2,
+    FileModified = 3,
+    FileRenamed = 4,
+    DirectoryAdded = 5,
+    DirectoryRemoved = 6,
+    DirectoryRenamed = 7
+};
+
 // ============================================================================
 // DATA STRUCTURES
 // ============================================================================
@@ -111,7 +176,10 @@ struct alignas(64) MonitoredPath {
     bool isActive{ false };
 
     std::atomic<uint64_t> eventsReceived{ 0 };
-    std::chrono::steady_clock::time_point lastEvent;
+    TimePoint lastEvent;
+    TimePoint createdTime;
+
+    [[nodiscard]] std::string ToJson() const;
 };
 
 /**
@@ -119,6 +187,7 @@ struct alignas(64) MonitoredPath {
  * @brief Configuration for directory monitor.
  */
 struct alignas(32) DirectoryMonitorConfig {
+    bool enabled{ true };
     bool monitorSystemPaths{ true };
     bool monitorUserPaths{ true };
     bool monitorStartupLocations{ true };
@@ -126,12 +195,21 @@ struct alignas(32) DirectoryMonitorConfig {
     bool monitorRemovableMedia{ true };
     bool monitorNetworkShares{ false };
     bool autoDiscoverNewPaths{ true };
+    bool enableRateLimiting{ true };
+    bool enableIntelligentFiltering{ true };
+
+    uint32_t maxConcurrentMonitors{ DirectoryMonitorConstants::MAX_CONCURRENT_MONITORS };
+    uint32_t eventQueueCapacity{ DirectoryMonitorConstants::EVENT_QUEUE_CAPACITY };
+    uint32_t rateLimitWindowSec{ DirectoryMonitorConstants::RATE_LIMIT_WINDOW_SEC };
+    uint32_t maxEventsPerWindow{ DirectoryMonitorConstants::MAX_EVENTS_PER_PATH_PER_WINDOW };
 
     std::vector<std::wstring> additionalPaths;
     std::vector<std::wstring> excludedPaths;
 
-    static DirectoryMonitorConfig CreateDefault() noexcept;
-    static DirectoryMonitorConfig CreateHighSecurity() noexcept;
+    [[nodiscard]] static DirectoryMonitorConfig CreateDefault() noexcept;
+    [[nodiscard]] static DirectoryMonitorConfig CreateHighSecurity() noexcept;
+    [[nodiscard]] bool IsValid() const noexcept;
+    [[nodiscard]] std::string ToJson() const;
 };
 
 /**
@@ -142,15 +220,46 @@ struct alignas(64) DirectoryMonitorStatistics {
     std::atomic<uint32_t> activeMonitors{ 0 };
     std::atomic<uint64_t> totalEvents{ 0 };
     std::atomic<uint64_t> filteredEvents{ 0 };
+    std::atomic<uint64_t> rateLimitedEvents{ 0 };
+    std::atomic<uint64_t> errors{ 0 };
+    std::atomic<uint64_t> callbackInvocations{ 0 };
+    std::atomic<uint64_t> pathsDiscovered{ 0 };
+    std::atomic<uint64_t> totalProcessingTimeUs{ 0 };
+
+    std::array<std::atomic<uint64_t>, 10> byCategory{};  // Per PathCategory
+    std::array<std::atomic<uint64_t>, 8> byAction{};      // Per FileSystemAction
+
+    TimePoint startTime = Clock::now();
 
     void Reset() noexcept;
+    [[nodiscard]] double GetAverageProcessingTimeMs() const noexcept;
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @struct DirectoryEvent
+ * @brief File system event information.
+ */
+struct DirectoryEvent {
+    uint64_t eventId{ 0 };
+    uint32_t monitorId{ 0 };
+    std::wstring path;
+    std::wstring filename;
+    std::wstring oldFilename;  // For renames
+    FileSystemAction action{ FileSystemAction::Unknown };
+    PathCategory category{ PathCategory::Unknown };
+    SystemTimePoint timestamp;
+
+    [[nodiscard]] std::string ToJson() const;
 };
 
 // ============================================================================
 // CALLBACK TYPES
 // ============================================================================
 
-using DirectoryEventCallback = std::function<void(const std::wstring& path, const std::wstring& filename, uint32_t action)>;
+using DirectoryEventCallback = std::function<void(const DirectoryEvent& event)>;
+using MonitorStatusCallback = std::function<void(uint32_t monitorId, bool active)>;
+using ErrorCallback = std::function<void(const std::wstring& path, const std::string& error)>;
 
 // ============================================================================
 // MAIN CLASS DEFINITION
@@ -159,31 +268,58 @@ using DirectoryEventCallback = std::function<void(const std::wstring& path, cons
 /**
  * @class DirectoryMonitor
  * @brief High-level directory monitoring orchestrator.
+ *
+ * Thread-safe singleton providing enterprise-grade directory monitoring
+ * with intelligent filtering, automatic critical path discovery, and
+ * seamless integration with ShadowStrike detection engines.
  */
-class DirectoryMonitor {
+class DirectoryMonitor final {
 public:
-    static DirectoryMonitor& Instance();
+    [[nodiscard]] static DirectoryMonitor& Instance() noexcept;
+    [[nodiscard]] static bool HasInstance() noexcept;
 
-    bool Initialize(const DirectoryMonitorConfig& config);
+    DirectoryMonitor(const DirectoryMonitor&) = delete;
+    DirectoryMonitor& operator=(const DirectoryMonitor&) = delete;
+    DirectoryMonitor(DirectoryMonitor&&) = delete;
+    DirectoryMonitor& operator=(DirectoryMonitor&&) = delete;
+
+    // ========================================================================
+    // LIFECYCLE
+    // ========================================================================
+
+    [[nodiscard]] bool Initialize(const DirectoryMonitorConfig& config = {});
     void Shutdown() noexcept;
+    [[nodiscard]] bool IsInitialized() const noexcept;
+    [[nodiscard]] DirectoryMonitorStatus GetStatus() const noexcept;
+
+    // ========================================================================
+    // MONITOR MANAGEMENT
+    // ========================================================================
 
     /**
-     * @brief Starts monitoring all critical paths.
+     * @brief Starts monitoring all critical system paths.
      */
     void MonitorCriticalPaths();
 
     /**
      * @brief Starts monitoring specific path.
      */
-    [[nodiscard]] uint32_t AddMonitor(const std::wstring& path, PathCategory category, bool recursive = true);
+    [[nodiscard]] uint32_t AddMonitor(const std::wstring& path,
+                                       PathCategory category = PathCategory::Custom,
+                                       bool recursive = true);
 
     /**
-     * @brief Removes monitor.
+     * @brief Removes monitor by ID.
      */
     void RemoveMonitor(uint32_t monitorId);
 
     /**
-     * @brief Checks if path is monitored.
+     * @brief Removes all monitors.
+     */
+    void RemoveAllMonitors();
+
+    /**
+     * @brief Checks if path is currently monitored.
      */
     [[nodiscard]] bool IsMonitored(const std::wstring& path) const;
 
@@ -191,6 +327,20 @@ public:
      * @brief Gets all monitored paths.
      */
     [[nodiscard]] std::vector<MonitoredPath> GetMonitoredPaths() const;
+
+    /**
+     * @brief Gets specific monitor by ID.
+     */
+    [[nodiscard]] std::optional<MonitoredPath> GetMonitorById(uint32_t monitorId) const;
+
+    /**
+     * @brief Gets count of active monitors.
+     */
+    [[nodiscard]] size_t GetActiveMonitorCount() const noexcept;
+
+    // ========================================================================
+    // MONITOR CONTROL
+    // ========================================================================
 
     /**
      * @brief Pauses all monitoring.
@@ -202,20 +352,63 @@ public:
      */
     void ResumeAll() noexcept;
 
+    /**
+     * @brief Pauses specific monitor.
+     */
+    void PauseMonitor(uint32_t monitorId) noexcept;
+
+    /**
+     * @brief Resumes specific monitor.
+     */
+    void ResumeMonitor(uint32_t monitorId) noexcept;
+
+    // ========================================================================
+    // CALLBACKS
+    // ========================================================================
+
     void SetEventCallback(DirectoryEventCallback callback);
+    void SetMonitorStatusCallback(MonitorStatusCallback callback);
+    void SetErrorCallback(ErrorCallback callback);
+    void UnregisterCallbacks();
+
+    // ========================================================================
+    // CONFIGURATION
+    // ========================================================================
+
+    [[nodiscard]] DirectoryMonitorConfig GetConfiguration() const;
+    void SetConfiguration(const DirectoryMonitorConfig& config);
+
+    // ========================================================================
+    // STATISTICS
+    // ========================================================================
 
     [[nodiscard]] const DirectoryMonitorStatistics& GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
+
+    // ========================================================================
+    // TESTING & DIAGNOSTICS
+    // ========================================================================
+
+    [[nodiscard]] bool SelfTest();
+    [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
     DirectoryMonitor();
     ~DirectoryMonitor();
 
-    DirectoryMonitor(const DirectoryMonitor&) = delete;
-    DirectoryMonitor& operator=(const DirectoryMonitor&) = delete;
-
-    std::unique_ptr<DirectoryMonitorImpl> m_impl;
+    // PIMPL - ALL implementation details hidden
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetPathCategoryName(PathCategory category) noexcept;
+[[nodiscard]] std::string_view GetFileSystemActionName(FileSystemAction action) noexcept;
+[[nodiscard]] std::string_view GetMonitorStatusName(DirectoryMonitorStatus status) noexcept;
 
 }  // namespace FileSystem
 }  // namespace Core

@@ -242,6 +242,11 @@ namespace ShadowStrike {
             class EmulationEngine;
             class ScanEngine;
             class QuarantineManager;
+            class PackerUnpacker;
+            class PolymorphicDetector;
+            class ZeroDayDetector;
+            class SandboxAnalyzer;
+            class MachineLearningDetector;
         }
     }
 }
@@ -337,6 +342,21 @@ namespace ThreatDetectorConstants {
     
     /// @brief ThreatIntel weight
     constexpr double THREATINTEL_WEIGHT = 0.85;
+
+    /// @brief Machine Learning weight
+    constexpr double ML_WEIGHT = 0.80;
+
+    /// @brief Packer/Unpacker weight
+    constexpr double PACKER_WEIGHT = 0.75;
+
+    /// @brief Polymorphic detector weight
+    constexpr double POLYMORPHIC_WEIGHT = 0.85;
+
+    /// @brief Zero-day detector weight
+    constexpr double ZERODAY_WEIGHT = 0.95;
+
+    /// @brief Sandbox analyzer weight
+    constexpr double SANDBOX_WEIGHT = 0.90;
     
     // -------------------------------------------------------------------------
     // Limits
@@ -1874,6 +1894,31 @@ public:
      * @brief Set quarantine manager.
      */
     void SetQuarantineManager(QuarantineManager* manager);
+
+    /**
+     * @brief Set packer/unpacker engine for packed executable analysis.
+     */
+    void SetPackerUnpacker(PackerUnpacker* unpacker);
+
+    /**
+     * @brief Set polymorphic detector for polymorphic/metamorphic malware detection.
+     */
+    void SetPolymorphicDetector(PolymorphicDetector* detector);
+
+    /**
+     * @brief Set zero-day detector for exploit and shellcode detection.
+     */
+    void SetZeroDayDetector(ZeroDayDetector* detector);
+
+    /**
+     * @brief Set sandbox analyzer for dynamic analysis in isolated VMs.
+     */
+    void SetSandboxAnalyzer(SandboxAnalyzer* analyzer);
+
+    /**
+     * @brief Set machine learning detector for AI-based classification.
+     */
+    void SetMachineLearningDetector(MachineLearningDetector* detector);
 
 private:
     // =========================================================================

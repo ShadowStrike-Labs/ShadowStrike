@@ -74,8 +74,51 @@ namespace FileSystem {
 class MountPointMonitorImpl;
 
 // ============================================================================
+// COMPILE-TIME CONSTANTS
+// ============================================================================
+
+namespace MountPointMonitorConstants {
+
+    inline constexpr uint32_t VERSION_MAJOR = 3;
+    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_PATCH = 0;
+
+    /// @brief Maximum tracked devices in history
+    inline constexpr size_t MAX_DEVICE_HISTORY = 10000;
+
+    /// @brief Event queue capacity
+    inline constexpr size_t EVENT_QUEUE_CAPACITY = 1000;
+
+    /// @brief Polling interval for drive enumeration (milliseconds)
+    inline constexpr uint32_t POLLING_INTERVAL_MS = 1000;
+
+}  // namespace MountPointMonitorConstants
+
+// ============================================================================
+// TYPE ALIASES
+// ============================================================================
+
+using Clock = std::chrono::steady_clock;
+using TimePoint = std::chrono::steady_clock::time_point;
+using SystemTimePoint = std::chrono::system_clock::time_point;
+
+// ============================================================================
 // ENUMERATIONS
 // ============================================================================
+
+/**
+ * @enum MountPointMonitorStatus
+ * @brief Status of mount point monitor.
+ */
+enum class MountPointMonitorStatus : uint8_t {
+    Uninitialized = 0,
+    Initializing = 1,
+    Running = 2,
+    Paused = 3,
+    Error = 4,
+    Stopping = 5,
+    Stopped = 6
+};
 
 /**
  * @enum DriveType
@@ -224,8 +267,21 @@ struct alignas(64) MountPointMonitorStatistics {
     std::atomic<uint64_t> devicesBlocked{ 0 };
     std::atomic<uint64_t> threatsDetected{ 0 };
     std::atomic<uint32_t> activeMounts{ 0 };
+    std::atomic<uint64_t> usbConnections{ 0 };
+    std::atomic<uint64_t> networkMounts{ 0 };
+    std::atomic<uint64_t> virtualMounts{ 0 };
+    std::atomic<uint64_t> autorunBlocked{ 0 };
+    std::atomic<uint64_t> errors{ 0 };
+    std::atomic<uint64_t> totalProcessingTimeUs{ 0 };
+
+    std::array<std::atomic<uint64_t>, 8> byDriveType{};  // Per DriveType
+    std::array<std::atomic<uint64_t>, 8> byEventType{};  // Per MountEvent
+
+    TimePoint startTime = Clock::now();
 
     void Reset() noexcept;
+    [[nodiscard]] double GetAverageProcessingTimeMs() const noexcept;
+    [[nodiscard]] std::string ToJson() const;
 };
 
 // ============================================================================
@@ -242,13 +298,48 @@ using DevicePolicyCallback = std::function<DevicePolicy(const DriveInfo& device)
 /**
  * @class MountPointMonitor
  * @brief Enterprise-grade mount point security monitor.
+ *
+ * Thread-safe singleton providing comprehensive monitoring of removable media,
+ * network shares, and virtual drives with security policy enforcement and
+ * threat detection capabilities.
  */
-class MountPointMonitor {
+class MountPointMonitor final {
 public:
-    static MountPointMonitor& Instance();
+    [[nodiscard]] static MountPointMonitor& Instance() noexcept;
+    [[nodiscard]] static bool HasInstance() noexcept;
 
-    bool Initialize(const MountPointMonitorConfig& config);
+    MountPointMonitor(const MountPointMonitor&) = delete;
+    MountPointMonitor& operator=(const MountPointMonitor&) = delete;
+    MountPointMonitor(MountPointMonitor&&) = delete;
+    MountPointMonitor& operator=(MountPointMonitor&&) = delete;
+
+    // ========================================================================
+    // LIFECYCLE
+    // ========================================================================
+
+    [[nodiscard]] bool Initialize(const MountPointMonitorConfig& config = {});
     void Shutdown() noexcept;
+    [[nodiscard]] bool IsInitialized() const noexcept;
+    [[nodiscard]] MountPointMonitorStatus GetStatus() const noexcept;
+
+    /**
+     * @brief Starts monitoring for mount point changes.
+     */
+    [[nodiscard]] bool Start();
+
+    /**
+     * @brief Stops monitoring.
+     */
+    void Stop() noexcept;
+
+    /**
+     * @brief Checks if monitor is running.
+     */
+    [[nodiscard]] bool IsRunning() const noexcept;
+
+    // ========================================================================
+    // DRIVE ENUMERATION
+    // ========================================================================
 
     /**
      * @brief Gets all currently mounted drives.
@@ -261,9 +352,42 @@ public:
     [[nodiscard]] std::optional<DriveInfo> GetDriveInfo(wchar_t driveLetter) const;
 
     /**
+     * @brief Gets all removable drives.
+     */
+    [[nodiscard]] std::vector<DriveInfo> GetRemovableDrives() const;
+
+    /**
+     * @brief Gets all network drives.
+     */
+    [[nodiscard]] std::vector<DriveInfo> GetNetworkDrives() const;
+
+    /**
+     * @brief Refreshes drive enumeration.
+     */
+    void RefreshDriveList();
+
+    // ========================================================================
+    // DEVICE HISTORY AND TRACKING
+    // ========================================================================
+
+    /**
      * @brief Gets device connection history.
      */
     [[nodiscard]] std::vector<DeviceHistoryEntry> GetDeviceHistory() const;
+
+    /**
+     * @brief Gets history for specific device.
+     */
+    [[nodiscard]] std::optional<DeviceHistoryEntry> GetDeviceHistory(const std::wstring& serialNumber) const;
+
+    /**
+     * @brief Clears device history.
+     */
+    void ClearDeviceHistory();
+
+    // ========================================================================
+    // WHITELIST MANAGEMENT
+    // ========================================================================
 
     /**
      * @brief Adds device to whitelist.
@@ -281,25 +405,77 @@ public:
     [[nodiscard]] bool IsWhitelisted(const std::wstring& serialNumber) const;
 
     /**
+     * @brief Gets all whitelisted devices.
+     */
+    [[nodiscard]] std::vector<std::wstring> GetWhitelistedDevices() const;
+
+    // ========================================================================
+    // DEVICE CONTROL
+    // ========================================================================
+
+    /**
      * @brief Safely ejects a drive.
      */
     [[nodiscard]] bool EjectDrive(wchar_t driveLetter);
 
+    /**
+     * @brief Blocks a specific drive.
+     */
+    [[nodiscard]] bool BlockDrive(wchar_t driveLetter);
+
+    /**
+     * @brief Sets drive to read-only.
+     */
+    [[nodiscard]] bool SetReadOnly(wchar_t driveLetter, bool readOnly);
+
+    // ========================================================================
+    // CALLBACKS
+    // ========================================================================
+
     void SetMountEventCallback(MountEventCallback callback);
     void SetPolicyCallback(DevicePolicyCallback callback);
+    void UnregisterCallbacks();
+
+    // ========================================================================
+    // CONFIGURATION
+    // ========================================================================
+
+    [[nodiscard]] MountPointMonitorConfig GetConfiguration() const;
+    void SetConfiguration(const MountPointMonitorConfig& config);
+
+    // ========================================================================
+    // STATISTICS
+    // ========================================================================
 
     [[nodiscard]] const MountPointMonitorStatistics& GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
+
+    // ========================================================================
+    // TESTING & DIAGNOSTICS
+    // ========================================================================
+
+    [[nodiscard]] bool SelfTest();
+    [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
     MountPointMonitor();
     ~MountPointMonitor();
 
-    MountPointMonitor(const MountPointMonitor&) = delete;
-    MountPointMonitor& operator=(const MountPointMonitor&) = delete;
-
-    std::unique_ptr<MountPointMonitorImpl> m_impl;
+    // PIMPL - ALL implementation details hidden
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetDriveTypeName(DriveType type) noexcept;
+[[nodiscard]] std::string_view GetMountEventName(MountEvent event) noexcept;
+[[nodiscard]] std::string_view GetDeviceThreatTypeName(DeviceThreatType threat) noexcept;
+[[nodiscard]] std::string_view GetDevicePolicyName(DevicePolicy policy) noexcept;
+[[nodiscard]] std::string_view GetMonitorStatusName(MountPointMonitorStatus status) noexcept;
 
 }  // namespace FileSystem
 }  // namespace Core

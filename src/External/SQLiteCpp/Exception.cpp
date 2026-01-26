@@ -1,3 +1,5 @@
+
+
 /**
  * @file    Exception.cpp
  * @ingroup SQLiteCpp

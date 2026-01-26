@@ -569,17 +569,17 @@ using ItemChangeCallback = std::function<void(const StartupChange& change)>;
  * Usage Example:
  * @code
  * auto& analyzer = StartupAnalyzer::Instance();
- * 
+ *
  * // Get all startup items
  * auto items = analyzer.GetStartupItems();
- * 
+ *
  * // Check for malicious items
  * for (const auto& item : items) {
  *     if (item.isMalicious) {
  *         analyzer.DisableItem(item.name);
  *     }
  * }
- * 
+ *
  * // Get optimization recommendations
  * auto plan = analyzer.GetOptimizationPlan();
  * if (plan.isSafe) {
@@ -593,7 +593,23 @@ public:
     // SINGLETON ACCESS
     // ========================================================================
 
-    static StartupAnalyzer& Instance();
+    /**
+     * @brief Get singleton instance.
+     * @return Reference to singleton instance.
+     */
+    [[nodiscard]] static StartupAnalyzer& Instance() noexcept;
+
+    /**
+     * @brief Check if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
+
+    // Delete copy/move
+    StartupAnalyzer(const StartupAnalyzer&) = delete;
+    StartupAnalyzer& operator=(const StartupAnalyzer&) = delete;
+    StartupAnalyzer(StartupAnalyzer&&) = delete;
+    StartupAnalyzer& operator=(StartupAnalyzer&&) = delete;
 
     // ========================================================================
     // LIFECYCLE MANAGEMENT
@@ -604,12 +620,31 @@ public:
      * @param config Configuration settings.
      * @return True if successful.
      */
-    bool Initialize(const StartupAnalyzerConfig& config);
+    [[nodiscard]] bool Initialize(const StartupAnalyzerConfig& config = StartupAnalyzerConfig::CreateDefault());
 
     /**
      * @brief Shuts down and releases resources.
      */
     void Shutdown() noexcept;
+
+    /**
+     * @brief Check if analyzer is initialized.
+     * @return True if initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
+
+    /**
+     * @brief Update configuration.
+     * @param config New configuration.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool UpdateConfig(const StartupAnalyzerConfig& config);
+
+    /**
+     * @brief Get current configuration.
+     * @return Current configuration.
+     */
+    [[nodiscard]] StartupAnalyzerConfig GetConfig() const;
 
     // ========================================================================
     // ITEM ENUMERATION
@@ -731,7 +766,7 @@ public:
      * @param plan Plan to apply.
      * @return True if successful.
      */
-    bool ApplyOptimizationPlan(const OptimizationPlan& plan);
+    [[nodiscard]] bool ApplyOptimizationPlan(const OptimizationPlan& plan);
 
     /**
      * @brief Gets items recommended for delay.
@@ -785,7 +820,7 @@ public:
      * @param changeId Change ID.
      * @return True if successful.
      */
-    bool RollbackChange(uint64_t changeId);
+    [[nodiscard]] bool RollbackChange(uint64_t changeId);
 
     // ========================================================================
     // CALLBACK REGISTRATION
@@ -797,11 +832,37 @@ public:
     bool UnregisterCallback(uint64_t callbackId);
 
     // ========================================================================
-    // STATISTICS
+    // STATISTICS & DIAGNOSTICS
     // ========================================================================
 
+    /**
+     * @brief Get analyzer statistics.
+     * @return Current statistics.
+     */
     [[nodiscard]] const StartupAnalyzerStatistics& GetStatistics() const noexcept;
+
+    /**
+     * @brief Reset statistics.
+     */
     void ResetStatistics() noexcept;
+
+    /**
+     * @brief Get analyzer version.
+     * @return Version string.
+     */
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    /**
+     * @brief Run self-test.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
+
+    /**
+     * @brief Run diagnostics.
+     * @return Diagnostic messages.
+     */
+    [[nodiscard]] std::vector<std::wstring> RunDiagnostics() const;
 
     // ========================================================================
     // EXPORT
@@ -814,11 +875,20 @@ private:
     StartupAnalyzer();
     ~StartupAnalyzer();
 
-    StartupAnalyzer(const StartupAnalyzer&) = delete;
-    StartupAnalyzer& operator=(const StartupAnalyzer&) = delete;
-
     std::unique_ptr<StartupAnalyzerImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetStartupSourceName(StartupSource source) noexcept;
+[[nodiscard]] std::string_view GetStartupStatusName(StartupStatus status) noexcept;
+[[nodiscard]] std::string_view GetItemCategoryName(ItemCategory category) noexcept;
+[[nodiscard]] std::string_view GetImpactLevelName(ImpactLevel level) noexcept;
+[[nodiscard]] std::string_view GetActionResultName(ActionResult result) noexcept;
+[[nodiscard]] std::string_view GetOptimizationRecommendationName(OptimizationRecommendation rec) noexcept;
 
 }  // namespace Registry
 }  // namespace Core

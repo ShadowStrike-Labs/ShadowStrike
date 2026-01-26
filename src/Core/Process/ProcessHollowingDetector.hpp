@@ -91,6 +91,7 @@
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/CryptoUtils.hpp"
 #include "../../Utils/ErrorUtils.hpp"
+#include "../../Utils/Logger.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
 
@@ -735,14 +736,14 @@ using ScanProgressCallback = std::function<void(
  * Usage:
  * @code
  * auto& detector = ProcessHollowingDetector::Instance();
- * 
+ *
  * // Check specific process
  * auto result = detector.ScanProcess(targetPid, ScanMode::Standard);
  * if (result.isHollowed) {
  *     std::wcout << L"Hollowing detected: " << result.processName << std::endl;
  *     // Handle threat...
  * }
- * 
+ *
  * // Enable real-time monitoring
  * detector.StartMonitoring();
  * @endcode
@@ -757,7 +758,13 @@ public:
      * @brief Get singleton instance.
      * @return Reference to the singleton instance.
      */
-    [[nodiscard]] static ProcessHollowingDetector& Instance();
+    [[nodiscard]] static ProcessHollowingDetector& Instance() noexcept;
+
+    /**
+     * @brief Check if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
 
     /**
      * @brief Delete copy constructor.
@@ -785,7 +792,7 @@ public:
     /**
      * @brief Shutdown the detector.
      */
-    void Shutdown();
+    void Shutdown() noexcept;
 
     /**
      * @brief Check if detector is initialized.
@@ -1092,21 +1099,21 @@ public:
      * @param callback Detection callback.
      * @return Callback ID.
      */
-    uint64_t RegisterDetectionCallback(HollowingDetectedCallback callback);
+    [[nodiscard]] uint64_t RegisterDetectionCallback(HollowingDetectedCallback callback);
 
     /**
      * @brief Register callback for suspicious creation patterns.
      * @param callback Creation callback.
      * @return Callback ID.
      */
-    uint64_t RegisterCreationCallback(SuspiciousCreationCallback callback);
+    [[nodiscard]] uint64_t RegisterCreationCallback(SuspiciousCreationCallback callback);
 
     /**
      * @brief Register callback for scan progress.
      * @param callback Progress callback.
      * @return Callback ID.
      */
-    uint64_t RegisterProgressCallback(ScanProgressCallback callback);
+    [[nodiscard]] uint64_t RegisterProgressCallback(ScanProgressCallback callback);
 
     /**
      * @brief Unregister a callback.
@@ -1150,18 +1157,24 @@ public:
      * @brief Get detector statistics.
      * @return Current statistics.
      */
-    [[nodiscard]] HollowingStatistics GetStatistics() const;
+    [[nodiscard]] const HollowingStatistics& GetStatistics() const noexcept;
 
     /**
      * @brief Reset statistics.
      */
-    void ResetStatistics();
+    void ResetStatistics() noexcept;
 
     /**
      * @brief Get detector version.
      * @return Version string.
      */
-    [[nodiscard]] static std::wstring GetVersion() noexcept;
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    /**
+     * @brief Run self-test.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
 
     /**
      * @brief Run self-diagnostics.
@@ -1211,7 +1224,18 @@ private:
     // ========================================================================
 
     std::unique_ptr<ProcessHollowingDetectorImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetHollowingTypeName(HollowingType type) noexcept;
+[[nodiscard]] std::string_view GetConfidenceName(HollowingConfidence confidence) noexcept;
+[[nodiscard]] std::string_view GetDetectionMethodName(DetectionMethod method) noexcept;
+[[nodiscard]] std::string_view GetScanModeName(ScanMode mode) noexcept;
+[[nodiscard]] std::string_view GetMonitorModeName(MonitorMode mode) noexcept;
 
 } // namespace Process
 } // namespace Core

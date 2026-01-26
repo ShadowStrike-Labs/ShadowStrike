@@ -1039,7 +1039,13 @@ public:
      * @brief Gets the singleton instance of NetworkMonitor.
      * @return Reference to the singleton instance.
      */
-    static NetworkMonitor& Instance();
+    [[nodiscard]] static NetworkMonitor& Instance() noexcept;
+
+    /**
+     * @brief Checks if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
 
     // ========================================================================
     // LIFECYCLE MANAGEMENT
@@ -1067,6 +1073,12 @@ public:
      * @brief Shuts down and releases all resources.
      */
     void Shutdown() noexcept;
+
+    /**
+     * @brief Checks if network monitor is initialized.
+     * @return True if initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
 
     /**
      * @brief Checks if monitoring is active.
@@ -1422,6 +1434,18 @@ public:
      */
     bool ExportDiagnostics(const std::wstring& outputPath) const;
 
+    /**
+     * @brief Performs self-test of NetworkMonitor functionality.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
+
+    /**
+     * @brief Gets version string.
+     * @return Version in format "MAJOR.MINOR.PATCH".
+     */
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
     // ========================================================================
     // UTILITY METHODS
     // ========================================================================
@@ -1471,6 +1495,7 @@ private:
     // PIMPL IMPLEMENTATION
     // ========================================================================
     std::unique_ptr<NetworkMonitorImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 
     // ========================================================================
     // LEGACY MEMBERS
@@ -1481,6 +1506,21 @@ private:
     std::vector<IPAddress> m_blockedIps;
     mutable std::shared_mutex m_filterMutex;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetConnectionStateName(ConnectionState state) noexcept;
+[[nodiscard]] std::string_view GetProtocolTypeName(ProtocolType protocol) noexcept;
+[[nodiscard]] std::string_view GetAppProtocolName(ApplicationProtocol protocol) noexcept;
+[[nodiscard]] std::string_view GetConnectionDirectionName(ConnectionDirection direction) noexcept;
+[[nodiscard]] std::string_view GetFilterActionName(FilterAction action) noexcept;
+[[nodiscard]] std::string_view GetBlockReasonName(BlockReason reason) noexcept;
+[[nodiscard]] std::string_view GetThreatIndicatorName(ThreatIndicator indicator) noexcept;
+[[nodiscard]] std::string_view GetIPAddressTypeName(IPAddressType type) noexcept;
+[[nodiscard]] std::string_view GetIPClassificationName(IPClassification classification) noexcept;
+[[nodiscard]] std::string_view GetMonitoringLevelName(MonitoringLevel level) noexcept;
 
 }  // namespace Network
 }  // namespace Core

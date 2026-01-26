@@ -354,6 +354,15 @@
     <ClCompile Include="src\Privacy\MicrophoneGuard.cpp" />
     <ClCompile Include="src\Privacy\PrivacyCleaner.cpp" />
     <ClCompile Include="src\Privacy\WebcamProtector.cpp" />
+    <ClCompile Include="src\Ransomware\BackupProtector.cpp" />
+    <ClCompile Include="src\Ransomware\FileBackupManager.cpp" />
+    <ClCompile Include="src\Ransomware\HoneypotManager.cpp" />
+    <ClCompile Include="src\Ransomware\LockyDetector.cpp" />
+    <ClCompile Include="src\Ransomware\RansomwareDecryptor.cpp" />
+    <ClCompile Include="src\Ransomware\RansomwareDetector.cpp" />
+    <ClCompile Include="src\Ransomware\ShadowCopyProtector.cpp" />
+    <ClCompile Include="src\Ransomware\VolumeSnapshotService.cpp" />
+    <ClCompile Include="src\Ransomware\WannaCryDetector.cpp" />
     <ClCompile Include="src\RealTime\AccessControlManager.cpp" />
     <ClCompile Include="src\RealTime\BehaviorBlocker.cpp" />
     <ClCompile Include="src\RealTime\ExploitPrevention.cpp" />
@@ -644,6 +653,8 @@
     <ClInclude Include="include\yara\yara\types.h" />
     <ClInclude Include="include\yara\yara\unaligned.h" />
     <ClInclude Include="include\yara\yara\utils.h" />
+    <ClInclude Include="src\AntiEvasion\NetworkBasedEvasionDetector.hpp" />
+    <ClInclude Include="src\AntiEvasion\ProcessEvasionDetector.hpp" />
     <ClInclude Include="src\database\ConfigurationDB.hpp" />
     <ClInclude Include="src\database\DatabaseManager.hpp" />
     <ClInclude Include="src\database\LogDB.hpp" />

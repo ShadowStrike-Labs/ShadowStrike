@@ -701,25 +701,32 @@ public:
     void UnregisterCallbacks();
 
     // ========================================================================
+    // CONFIGURATION
+    // ========================================================================
+
+    /// @brief Get current configuration
+    [[nodiscard]] MachineLearningConfiguration GetConfiguration() const;
+
+    /// @brief Set configuration (invalidates cache)
+    void SetConfiguration(const MachineLearningConfiguration& config);
+
+    // ========================================================================
     // STATISTICS
     // ========================================================================
-    
+
     [[nodiscard]] MLStatistics GetStatistics() const;
     void ResetStatistics();
-    
+
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
     MachineLearningDetector();
     ~MachineLearningDetector();
-    
-    FeatureVector ExtractFeaturesInternal(const FileSystem::ExecutableInfo& info);
-    float RunInference(const FeatureVector& features);
-    
-    std::unique_ptr<MachineLearningDetectorImpl> m_impl;
-    ModelConfig m_config;
-    bool m_modelLoaded = false;
+
+    // PIMPL - ALL implementation details in Impl class for ABI stability
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
     static std::atomic<bool> s_instanceCreated;
 };
 

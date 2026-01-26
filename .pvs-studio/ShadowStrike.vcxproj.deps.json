@@ -1,287 +1,750 @@
 [
   {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\DebuggerEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\debuggerevasiondetector.cpp": "d5b2a65f2c4a7862822cc563e6c0f7e12f7d813aec4fc02829b5e5ccb2931780"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\EnvironmentEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\environmentevasiondetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\MetamorphicDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\metamorphicdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\PackerDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\packerdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\SandboxEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\sandboxevasiondetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\TimeBasedEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\timebasedevasiondetector.cpp": "fa2bbacb30e3ce8fb0066ebac4fa2d8ca6f060bb59dfc2e0fc1dc28842846c90"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\VMEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\vmevasiondetector.cpp": "ec7ed07f6b370a6e681ff0c95cfd4ab8e18d9eb6eba5be291afd2f607a00689c"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Backup\\BackupManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\backup\\backupmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Backup\\BackupScheduler.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\backup\\backupscheduler.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Backup\\RestoreManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\backup\\restoremanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\BankingTrojanDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\bankingtrojandetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\CertificatePinning.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\certificatepinning.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\KeyloggerProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\keyloggerprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\ScreenshotBlocker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\screenshotblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\SecureBrowser.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\securebrowser.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\TransactionMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\transactionmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Communication\\AlertSystem.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\communication\\alertsystem.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Communication\\NotificationManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\communication\\notificationmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Communication\\ReportGenerator.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\communication\\reportgenerator.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Communication\\ServiceCommunication.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\communication\\servicecommunication.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Communication\\TelemetryCollector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\communication\\telemetrycollector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Config\\ConfigManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\config\\configmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Config\\PolicyManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\config\\policymanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Config\\ProfileManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\config\\profilemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Config\\SettingsManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\config\\settingsmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\BehaviorAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\behavioranalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\EmulationEngine.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\emulationengine.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\HeuristicAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\heuristicanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\MachineLearningDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\machinelearningdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\PackerUnpacker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\packerunpacker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\PolymorphicDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\polymorphicdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\QuarantineManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\quarantinemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\SandboxAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\sandboxanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\ScanEngine.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\scanengine.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\SignatureDatabase_Manager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\signaturedatabase_manager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\ThreatDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\threatdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\ZeroDayDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\zerodaydetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\ArchiveExtractor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\archiveextractor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\DirectoryMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\directorymonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\DocumentScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\documentscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\ExecutableAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\executableanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileHasher.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filehasher.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileLockManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filelockmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileReputation.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filereputation.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileTypeAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filetypeanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileWatcher.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filewatcher.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\MediaFileScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\mediafilescanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\MountPointMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\mountpointmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\BotnetDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\botnetdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\DDosProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\ddosprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\DNSMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\dnsmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\EmailScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\emailscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\FirewallManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\firewallmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\NetworkMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\networkmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\P2PMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\p2pmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\TorDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\tordetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\TrafficAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\trafficanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\URLAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\urlanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\VPNDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\vpndetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\WebProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\webprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\AtomBombingDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\atombombingdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\MemoryScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\memoryscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessHollowingDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processhollowingdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessKiller.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processkiller.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ReflectiveDLLDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\reflectivedlldetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ThreadHijackDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\threadhijackdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\PersistenceDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\persistencedetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\RegistryAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\registryanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\RegistryMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\registrymonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\StartupAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\startupanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\SystemSettingsMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\systemsettingsmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\BootTimeAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\boottimeanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\CrashHandler.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\crashhandler.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\DriverAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\driveranalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\EventLogger.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\eventlogger.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\HardwareMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\hardwaremonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\PerformanceMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\performancemonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\ServiceManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\servicemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\CryptoMiners\\BrowserMinerDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\cryptominers\\browserminerdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\CryptoMiners\\CPUUsageAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\cryptominers\\cpuusageanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\CryptoMiners\\CryptoMinerDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\cryptominers\\cryptominerdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\CryptoMiners\\GPUMiningDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\cryptominers\\gpuminingdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\CryptoMiners\\PoolConnectionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\cryptominers\\poolconnectiondetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\database\\ConfigurationDB.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-matchers.h": "b82479853a6f5730f5743123632307e715dce7a3606625c23861594151aecd7f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-matchers.h": "427e5eb4414c98f151ecb038f7b635bed2d13e7bf4ff059614b66129a2e7ef40",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-test-part.h": "7d7a28e11bf02c17951253d462d8aa935ae7dc1607f8cdb043f2ed0b476d0a54",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port.h": "4412d53972ef1ca0a0ab5e830814faf4e22285af67aaba413d69d821bebc02c9",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\configurationdb.hpp": "7b90c7a6ef46b3ed0418219165fa44cb1b38cb6e22ccd62881dd49d38dbe6a59",
-      "c:\\shadowstrike\\shadowstrike\\include\\nlohmann\\json.hpp": "caaab734876745dc23430442b2df6d5c9dee99c1705c1c3c42eac110b2ee56b7",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-assertion-result.h": "17cc0d71b94ca30d230c827112fe5cb06442c7fdf98ec42fc0ae441080438b2c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-printers.h": "1349a60a17391f7dd39e9b8ac621b4ac5802326e7189acc25cba15e29e69f29a",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\utils.h": "a77a35b28ce89b1ee03eeae809ac19410e7745a5d41303282cdf27abc1ab327d",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\jsonutils.hpp": "311b29973d56b0241ffb58157424fcddf2de92079f9869aca423f3a8eaf55959",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\databasemanager.hpp": "94ae9cbf526289623e876d89fb412188b0f3a2cbf1116c5f1c91e13a3dc30358",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\statement.h": "3f6ae484b6ca4417f6d13b6ff08ff609ad752ec7fee97ebc0ba4d7cbf5a3befa",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\stringutils.hpp": "48af1faaf3168a6e9eaa18365d36809ce1d537073fce5addb5ec49af46083491",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\xmlutils.hpp": "38775563696799301de570e85a750a951559a0e00a9053afc04ce445aa2577ae",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\column.h": "f04c6c73b964832b34e1f68c853de04b5f4207b49d49c128f6795c7b7ac7735f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\assertion.h": "4d2221a1ab585f8036c0349323aa3c64062e17c16399ba75766ed00a53edf5cf",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\systemutils.hpp": "d182a18146060c940295f723e29d6e30dc13e7eb23b000b17fa30e9ccc402263",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port-arch.h": "770dd3394af57c3cc97d864488bfd2f0df96bfdbf9a2c10c47f65e0ffe76e27a",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-internal-utils.h": "cadc4dff273a265054af53e6ab3226956cc1ce9ea0e8c7591a56d1d14fb49693",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-param-util.h": "dfc86b6f99a40727b5d0d495b7caeae0765db822efca5c4293a8f5fdc73c31b4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-function-mocker.h": "5fb892b51f84652bb6b36692b4ee9861062df0f1354b3b330b64e64d7beeb3f0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\exception.h": "b13f36c70fd8c4e7f73a322f253bdec9fa8e3ad7c9d0212ea144ca86f1e5a935",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-actions.h": "2047afa840dafb420651043396103ab9612a4afdff7ea7bd445efb86ec7580eb",
-      "c:\\shadowstrike\\shadowstrike\\include\\pugixml\\pugiconfig.hpp": "21553a66ce2df9da3ce04295fed00493eb9a70fe46455e4ef996428131234544",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\base64utils.hpp": "9a686133701858549678a607c37f9fbd78cb5aca56c1ca362f99071b875860c7",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\transaction.h": "791f48b2860d14c0426a7ff1063b74901ac2e9ab49335d636c92567246b62b26",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
-      "c:\\shadowstrike\\shadowstrike\\src\\pch.h": "971ef2cf640d3de9a708f0ce75ed1508ebb3fadde499e5812dad503d6ef0c981",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\logger.hpp": "63af379e9494e8d728f06d3ad870f321497ce78159c69a33c07e8b6c45370703",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\database.h": "0819fa216e00cb3525123cca5e2cd40c4701f78312e139513276fa019a02c913",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecpp.h": "bad782aeed4188d37eb069fb71d75d23754f607f84287d8fab33f5c4cf3c40b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecppexport.h": "0ba32f438f24e659bdf356d60199c4356b342b68e9bc079d9e394c64d6d5a51c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-nice-strict.h": "e57aa0c99aae9e86afb68618aeaaa134d064e75538f999289162f425390aaf3e",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\configurationdb.cpp": "c6c791c633c96e5f472124040b287e486d0bd6618fdec5aab3e5456fd7b67102",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\include\\pugixml\\pugixml.hpp": "961685664b5db0ee7ead8f377b8d4ff52fac7f2024f861fd56d2a761a0fff827",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlite3.h": "1247d59c5671d7311eb1db005c210904415cc24738fc948ffe6ebe4f0f03a7eb"
+      "c:\\shadowstrike\\shadowstrike\\src\\database\\configurationdb.cpp": "c038a5c8498efcb2205104a8c8b27b0b4af2d1d5aef64e9b4791fd7f0b10912c"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\database\\DatabaseManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-matchers.h": "b82479853a6f5730f5743123632307e715dce7a3606625c23861594151aecd7f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-matchers.h": "427e5eb4414c98f151ecb038f7b635bed2d13e7bf4ff059614b66129a2e7ef40",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-test-part.h": "7d7a28e11bf02c17951253d462d8aa935ae7dc1607f8cdb043f2ed0b476d0a54",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port.h": "4412d53972ef1ca0a0ab5e830814faf4e22285af67aaba413d69d821bebc02c9",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-assertion-result.h": "17cc0d71b94ca30d230c827112fe5cb06442c7fdf98ec42fc0ae441080438b2c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-printers.h": "1349a60a17391f7dd39e9b8ac621b4ac5802326e7189acc25cba15e29e69f29a",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\utils.h": "a77a35b28ce89b1ee03eeae809ac19410e7745a5d41303282cdf27abc1ab327d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\databasemanager.hpp": "94ae9cbf526289623e876d89fb412188b0f3a2cbf1116c5f1c91e13a3dc30358",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\statement.h": "3f6ae484b6ca4417f6d13b6ff08ff609ad752ec7fee97ebc0ba4d7cbf5a3befa",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\column.h": "f04c6c73b964832b34e1f68c853de04b5f4207b49d49c128f6795c7b7ac7735f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\assertion.h": "4d2221a1ab585f8036c0349323aa3c64062e17c16399ba75766ed00a53edf5cf",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\databasemanager.cpp": "4e539379b003fa727bf0540949dc39892f7902f2d5474d307d669106116dc373",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\systemutils.hpp": "d182a18146060c940295f723e29d6e30dc13e7eb23b000b17fa30e9ccc402263",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port-arch.h": "770dd3394af57c3cc97d864488bfd2f0df96bfdbf9a2c10c47f65e0ffe76e27a",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-internal-utils.h": "cadc4dff273a265054af53e6ab3226956cc1ce9ea0e8c7591a56d1d14fb49693",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-param-util.h": "dfc86b6f99a40727b5d0d495b7caeae0765db822efca5c4293a8f5fdc73c31b4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-function-mocker.h": "5fb892b51f84652bb6b36692b4ee9861062df0f1354b3b330b64e64d7beeb3f0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\exception.h": "b13f36c70fd8c4e7f73a322f253bdec9fa8e3ad7c9d0212ea144ca86f1e5a935",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-actions.h": "2047afa840dafb420651043396103ab9612a4afdff7ea7bd445efb86ec7580eb",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\transaction.h": "791f48b2860d14c0426a7ff1063b74901ac2e9ab49335d636c92567246b62b26",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
-      "c:\\shadowstrike\\shadowstrike\\src\\pch.h": "971ef2cf640d3de9a708f0ce75ed1508ebb3fadde499e5812dad503d6ef0c981",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\logger.hpp": "63af379e9494e8d728f06d3ad870f321497ce78159c69a33c07e8b6c45370703",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\database.h": "0819fa216e00cb3525123cca5e2cd40c4701f78312e139513276fa019a02c913",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecpp.h": "bad782aeed4188d37eb069fb71d75d23754f607f84287d8fab33f5c4cf3c40b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecppexport.h": "0ba32f438f24e659bdf356d60199c4356b342b68e9bc079d9e394c64d6d5a51c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-nice-strict.h": "e57aa0c99aae9e86afb68618aeaaa134d064e75538f999289162f425390aaf3e",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\cryptoutils.hpp": "1cd278ece60fe83fbbd3220b0abb00224a731a4a4340cd0f9d2858321d7e4b74",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlite3.h": "1247d59c5671d7311eb1db005c210904415cc24738fc948ffe6ebe4f0f03a7eb"
+      "c:\\shadowstrike\\shadowstrike\\src\\database\\databasemanager.cpp": "7cede72f56b3a0d208c65a4237428b3e352af7506336cecc9b7cc42bb8be0363"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\database\\LogDB.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-matchers.h": "b82479853a6f5730f5743123632307e715dce7a3606625c23861594151aecd7f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-matchers.h": "427e5eb4414c98f151ecb038f7b635bed2d13e7bf4ff059614b66129a2e7ef40",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-test-part.h": "7d7a28e11bf02c17951253d462d8aa935ae7dc1607f8cdb043f2ed0b476d0a54",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port.h": "4412d53972ef1ca0a0ab5e830814faf4e22285af67aaba413d69d821bebc02c9",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\logdb.hpp": "257fdc0db26bf208c5a48feb473856f390a030de27f5f3c09711105220d82020",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-assertion-result.h": "17cc0d71b94ca30d230c827112fe5cb06442c7fdf98ec42fc0ae441080438b2c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-printers.h": "1349a60a17391f7dd39e9b8ac621b4ac5802326e7189acc25cba15e29e69f29a",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\utils.h": "a77a35b28ce89b1ee03eeae809ac19410e7745a5d41303282cdf27abc1ab327d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\databasemanager.hpp": "94ae9cbf526289623e876d89fb412188b0f3a2cbf1116c5f1c91e13a3dc30358",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\statement.h": "3f6ae484b6ca4417f6d13b6ff08ff609ad752ec7fee97ebc0ba4d7cbf5a3befa",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\column.h": "f04c6c73b964832b34e1f68c853de04b5f4207b49d49c128f6795c7b7ac7735f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\assertion.h": "4d2221a1ab585f8036c0349323aa3c64062e17c16399ba75766ed00a53edf5cf",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\systemutils.hpp": "d182a18146060c940295f723e29d6e30dc13e7eb23b000b17fa30e9ccc402263",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port-arch.h": "770dd3394af57c3cc97d864488bfd2f0df96bfdbf9a2c10c47f65e0ffe76e27a",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-internal-utils.h": "cadc4dff273a265054af53e6ab3226956cc1ce9ea0e8c7591a56d1d14fb49693",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-param-util.h": "dfc86b6f99a40727b5d0d495b7caeae0765db822efca5c4293a8f5fdc73c31b4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-function-mocker.h": "5fb892b51f84652bb6b36692b4ee9861062df0f1354b3b330b64e64d7beeb3f0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\exception.h": "b13f36c70fd8c4e7f73a322f253bdec9fa8e3ad7c9d0212ea144ca86f1e5a935",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-actions.h": "2047afa840dafb420651043396103ab9612a4afdff7ea7bd445efb86ec7580eb",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\transaction.h": "791f48b2860d14c0426a7ff1063b74901ac2e9ab49335d636c92567246b62b26",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
-      "c:\\shadowstrike\\shadowstrike\\src\\pch.h": "971ef2cf640d3de9a708f0ce75ed1508ebb3fadde499e5812dad503d6ef0c981",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\logger.hpp": "63af379e9494e8d728f06d3ad870f321497ce78159c69a33c07e8b6c45370703",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\database.h": "0819fa216e00cb3525123cca5e2cd40c4701f78312e139513276fa019a02c913",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecpp.h": "bad782aeed4188d37eb069fb71d75d23754f607f84287d8fab33f5c4cf3c40b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecppexport.h": "0ba32f438f24e659bdf356d60199c4356b342b68e9bc079d9e394c64d6d5a51c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-nice-strict.h": "e57aa0c99aae9e86afb68618aeaaa134d064e75538f999289162f425390aaf3e",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlite3.h": "1247d59c5671d7311eb1db005c210904415cc24738fc948ffe6ebe4f0f03a7eb",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\logdb.cpp": "4f11a43607e07aa87437939e4edf09e522a96f9058bc48c18546a10f8d125aeb"
+      "c:\\shadowstrike\\shadowstrike\\src\\database\\logdb.cpp": "42de4fcdf1a65cd9966adcadf9118b469dc42958430dee1f13fb26f16fdfb7fa"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\database\\QuarantineDB.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-matchers.h": "b82479853a6f5730f5743123632307e715dce7a3606625c23861594151aecd7f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-matchers.h": "427e5eb4414c98f151ecb038f7b635bed2d13e7bf4ff059614b66129a2e7ef40",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-test-part.h": "7d7a28e11bf02c17951253d462d8aa935ae7dc1607f8cdb043f2ed0b476d0a54",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port.h": "4412d53972ef1ca0a0ab5e830814faf4e22285af67aaba413d69d821bebc02c9",
-      "c:\\shadowstrike\\shadowstrike\\include\\nlohmann\\json.hpp": "caaab734876745dc23430442b2df6d5c9dee99c1705c1c3c42eac110b2ee56b7",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-assertion-result.h": "17cc0d71b94ca30d230c827112fe5cb06442c7fdf98ec42fc0ae441080438b2c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-printers.h": "1349a60a17391f7dd39e9b8ac621b4ac5802326e7189acc25cba15e29e69f29a",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\utils.h": "a77a35b28ce89b1ee03eeae809ac19410e7745a5d41303282cdf27abc1ab327d",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\jsonutils.hpp": "311b29973d56b0241ffb58157424fcddf2de92079f9869aca423f3a8eaf55959",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\databasemanager.hpp": "94ae9cbf526289623e876d89fb412188b0f3a2cbf1116c5f1c91e13a3dc30358",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\statement.h": "3f6ae484b6ca4417f6d13b6ff08ff609ad752ec7fee97ebc0ba4d7cbf5a3befa",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\column.h": "f04c6c73b964832b34e1f68c853de04b5f4207b49d49c128f6795c7b7ac7735f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\quarantinedb.cpp": "3c8e68937e615747ef85c73d50057800323685a107d6990dac2fce72a6cecf58",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\assertion.h": "4d2221a1ab585f8036c0349323aa3c64062e17c16399ba75766ed00a53edf5cf",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port-arch.h": "770dd3394af57c3cc97d864488bfd2f0df96bfdbf9a2c10c47f65e0ffe76e27a",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-internal-utils.h": "cadc4dff273a265054af53e6ab3226956cc1ce9ea0e8c7591a56d1d14fb49693",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-param-util.h": "dfc86b6f99a40727b5d0d495b7caeae0765db822efca5c4293a8f5fdc73c31b4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-function-mocker.h": "5fb892b51f84652bb6b36692b4ee9861062df0f1354b3b330b64e64d7beeb3f0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\exception.h": "b13f36c70fd8c4e7f73a322f253bdec9fa8e3ad7c9d0212ea144ca86f1e5a935",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-actions.h": "2047afa840dafb420651043396103ab9612a4afdff7ea7bd445efb86ec7580eb",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\base64utils.hpp": "9a686133701858549678a607c37f9fbd78cb5aca56c1ca362f99071b875860c7",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\transaction.h": "791f48b2860d14c0426a7ff1063b74901ac2e9ab49335d636c92567246b62b26",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\compressionutils.hpp": "49994b2dfd51ffdfb622a5a308ec177eeb2d7b52eb5e51aa19ef0ae344e9013f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
-      "c:\\shadowstrike\\shadowstrike\\src\\pch.h": "971ef2cf640d3de9a708f0ce75ed1508ebb3fadde499e5812dad503d6ef0c981",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\logger.hpp": "63af379e9494e8d728f06d3ad870f321497ce78159c69a33c07e8b6c45370703",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\database.h": "0819fa216e00cb3525123cca5e2cd40c4701f78312e139513276fa019a02c913",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecpp.h": "bad782aeed4188d37eb069fb71d75d23754f607f84287d8fab33f5c4cf3c40b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlitecppexport.h": "0ba32f438f24e659bdf356d60199c4356b342b68e9bc079d9e394c64d6d5a51c",
-      "c:\\shadowstrike\\shadowstrike\\src\\database\\quarantinedb.hpp": "0e773b4b57224961b65afa34693eff0532d5150ca7d9b341ee3615a7c3367b8f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-nice-strict.h": "e57aa0c99aae9e86afb68618aeaaa134d064e75538f999289162f425390aaf3e",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
-      "c:\\shadowstrike\\shadowstrike\\include\\sqlitecpp\\sqlite3.h": "1247d59c5671d7311eb1db005c210904415cc24738fc948ffe6ebe4f0f03a7eb"
+      "c:\\shadowstrike\\shadowstrike\\src\\database\\quarantinedb.cpp": "f2424e58307f280e560226fb47adcbcbd5e353e663b6ddad465dca468abdd712"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\AttachmentScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\attachmentscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\EmailProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\emailprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\OutlookScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\outlookscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\PhishingEmailDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\phishingemaildetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\SpamDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\spamdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\ThunderbirdScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\thunderbirdscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\BufferOverflowProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\bufferoverflowprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\HeapSprayDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\heapspraydetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\KernelExploitDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\kernelexploitdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\PrivilegeEscalationDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\privilegeescalationdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\ROPProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\ropprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\StackPivotDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\stackpivotdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\pugixml\\pugixml.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\pugixml\\pugixml.cpp": "fa1b493b6f03145fc8f822d9cf62268450f5e23075d6eccc4ccac680354fc4ff"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\pugixml\\pugixml.cpp": "2233c73a1ebeb8d46da3351a93065d6d7b098eb0816b3aae673fb9901d3c3c5d"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Backup.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\backup.cpp": "28331e97e165fe530d95d3bc191dd80adf67cd78cdc8dffd19e426b33dc21c62"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\backup.cpp": "ad613d1b4bbb1ecd09948b4f6e5f7391224bb559001fdaf96e712a55b9730cf1"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Column.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\column.cpp": "3f6a827d88af4f5a03ef3057b4ebf0fe3fafb8f99eef50cea3651b6ed483a0d2"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\column.cpp": "33f3351a42c079cb24dca6cfbb45cb36731f73f4e1a5cdd735307f6cccea3353"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Database.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\database.cpp": "3fab35393c69cd1cc1325938a9a74974d3febab450128a2375931546f629748c"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\database.cpp": "d99aaf65149eddc34843bba3915e387fa256de4a945298b03b6f70d640df4a52"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Exception.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\exception.cpp": "01c9476438de1f597b7d19b696d2b3ea40dc305f93bf529275adf326dcc8310f"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\exception.cpp": "c744a8979c8cd63cac0f38163a512333875394b68f47848c9c5d85f7a9f4bc3c"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Savepoint.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\savepoint.cpp": "371d0d095acafb3775812c2900ee93ce5b64f32ea6c0d691e1b74b5c37788eb2"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\savepoint.cpp": "8639e8d5d6b5a8c9ff43e9d35afdf35fa1e59c7a61ed295e1943276237a7838d"
     },
     "ContainsWarnings": true
   },
@@ -295,14 +758,14 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Statement.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\statement.cpp": "24ceca7f11e0fb00187e542b8b6401ca7c7384093d15cb7313f328b2d6d13b57"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\statement.cpp": "6a53e559a69d64008d4d17b4653d0847f69cda9bec77b98810194c5c041ee253"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\sqlitecpp\\Transaction.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\transaction.cpp": "869017cd36131d870dc153f68e712ea9e78d13bf75652ef49ce5dea9d601e477"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\sqlitecpp\\transaction.cpp": "e5d8d580cbc5d3c4b19498141660df91e601f2c57bd3fed2fd2bf08d370d5379"
     },
     "ContainsWarnings": true
   },
@@ -323,35 +786,105 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\tlsh\\input_desc.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\input_desc.cpp": "39757645a06de18675fe1589d244ca823d09ef55803f16b85910f2889e38fdcb"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\input_desc.cpp": "4fc1050007272e906e83f2013e7ee6629709cdbc6a2894e137ff667fee6930cf"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\tlsh\\shared_file_functions.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\shared_file_functions.cpp": "f3efa306bc1a0028a2ca8b2ded4d77c8e487a6734ef612807ad587373f9cff19"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\shared_file_functions.cpp": "7d82188af98c1e782b0136128ec66708007a1e9abefb86ac37bcfa449ca9a6e7"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\tlsh\\tlsh.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\tlsh.cpp": "0f810affe7ea665b90c9bb16d1bcd15a19db649afd7927d1adfcb5e795dd4fb4"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\tlsh.cpp": "59ad316bafb57219bfd467b880df7a5727e16050f9d90954333e4e5d26dc545a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\tlsh\\tlsh_impl.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\tlsh_impl.cpp": "8cc9c3a488af3d7057246a2af175d0e692d0978e9e1064aa1a9e07c4ce67ea25"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\tlsh_impl.cpp": "136ef2aa75ab26f57913a19b16f7d5694b261e1964c51d2290ecae50c8b6c8b9"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\external\\tlsh\\tlsh_util.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\tlsh_util.cpp": "cd5f48c77016d4010fa9624cef3237314349225ad7f8cbad5cd8b02ca1defab7"
+      "c:\\shadowstrike\\shadowstrike\\src\\external\\tlsh\\tlsh_util.cpp": "40fa96e65675e2ec5032d18b2011d0406cdd2e0e76ade8116e3b0814bcf52d5c"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\ArtifactExtractor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\artifactextractor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\EvidenceCollector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\evidencecollector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\MemoryDumper.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\memorydumper.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\NetworkCapture.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\networkcapture.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\TimelineAnalyzer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\timelineanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\GameCheatDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gamecheatdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\GameModeManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gamemodemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\GameProcessDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gameprocessdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\OverlayProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\overlayprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\PerformanceOptimizer.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\performanceoptimizer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
     },
     "ContainsWarnings": true
   },
@@ -665,44 +1198,7 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Main.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-matchers.h": "b82479853a6f5730f5743123632307e715dce7a3606625c23861594151aecd7f",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-matchers.h": "427e5eb4414c98f151ecb038f7b635bed2d13e7bf4ff059614b66129a2e7ef40",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-test-part.h": "7d7a28e11bf02c17951253d462d8aa935ae7dc1607f8cdb043f2ed0b476d0a54",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port.h": "4412d53972ef1ca0a0ab5e830814faf4e22285af67aaba413d69d821bebc02c9",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-assertion-result.h": "17cc0d71b94ca30d230c827112fe5cb06442c7fdf98ec42fc0ae441080438b2c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-printers.h": "1349a60a17391f7dd39e9b8ac621b4ac5802326e7189acc25cba15e29e69f29a",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port-arch.h": "770dd3394af57c3cc97d864488bfd2f0df96bfdbf9a2c10c47f65e0ffe76e27a",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-internal-utils.h": "cadc4dff273a265054af53e6ab3226956cc1ce9ea0e8c7591a56d1d14fb49693",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-param-util.h": "dfc86b6f99a40727b5d0d495b7caeae0765db822efca5c4293a8f5fdc73c31b4",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-function-mocker.h": "5fb892b51f84652bb6b36692b4ee9861062df0f1354b3b330b64e64d7beeb3f0",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-actions.h": "2047afa840dafb420651043396103ab9612a4afdff7ea7bd445efb86ec7580eb",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
-      "c:\\shadowstrike\\shadowstrike\\src\\main.cpp": "d347156c5d70ab96284e6921ba4ad8158c7fd8354ce6a2661c306a49c8b706c1",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
-      "c:\\shadowstrike\\shadowstrike\\src\\pch.h": "971ef2cf640d3de9a708f0ce75ed1508ebb3fadde499e5812dad503d6ef0c981",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\logger.hpp": "63af379e9494e8d728f06d3ad870f321497ce78159c69a33c07e8b6c45370703",
-      "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-nice-strict.h": "e57aa0c99aae9e86afb68618aeaaa134d064e75538f999289162f425390aaf3e",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15"
+      "c:\\shadowstrike\\shadowstrike\\src\\main.cpp": "0739626f1de506178417700c73a5350e9dc76e825b17236747ad7c2884a154b1"
     },
     "ContainsWarnings": true
   },
@@ -813,6 +1309,293 @@
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\pch.cpp",
     "Dependencies": {
       "c:\\shadowstrike\\shadowstrike\\src\\pch.cpp": "f1a03d6510be0ca46b84609263a9ca9167fbe905a7c07e40bcc0b07658e1eaff"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\CookieManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\cookiemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\DataLeakProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\dataleakprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\DNSLeakProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\dnsleakprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\LocationPrivacy.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\locationprivacy.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\MicrophoneGuard.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\microphoneguard.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\PrivacyCleaner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\privacycleaner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\WebcamProtector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\webcamprotector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\BackupProtector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\backupprotector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\FileBackupManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\filebackupmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\HoneypotManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\honeypotmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\LockyDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\lockydetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\RansomwareDecryptor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\ransomwaredecryptor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\RansomwareDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\ransomwaredetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\ShadowCopyProtector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\shadowcopyprotector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\VolumeSnapshotService.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\volumesnapshotservice.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Ransomware\\WannaCryDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\ransomware\\wannacrydetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\AccessControlManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\accesscontrolmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\BehaviorBlocker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\behaviorblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\ExploitPrevention.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\exploitprevention.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\FileSystemFilter.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\filesystemfilter.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\MemoryProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\memoryprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\NetworkTrafficFilter.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\networktrafficfilter.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\ProcessCreationMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\processcreationmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\RealtTimeProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\realttimeprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\ZeroHourProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\zerohourprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\JavaScriptScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\javascriptscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\MacroDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\macrodetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\PowerShellScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\powershellscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\PythonScriptScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\pythonscriptscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\VBScriptScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\vbscriptscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\AntiDebug.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\antidebug.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\CertificateValidator.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\certificatevalidator.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\CodeObfuscation.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\codeobfuscation.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\CryptoManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\cryptomanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\DigitalSignatureValidator.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\digitalsignaturevalidator.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\FileProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\fileprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\MemoryProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\memoryprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\ProcessProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\processprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\RegistryProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\registryprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\SelfDefense.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\selfdefense.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\TamperProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\tamperprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
     },
     "ContainsWarnings": true
   },
@@ -1811,6 +2594,90 @@
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\DeltaUpdater.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\deltaupdater.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\ProgramUpdater.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\programupdater.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\RollbackManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\rollbackmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\SignatureUpdater.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\signatureupdater.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\UpdateManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\updatemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\UpdateScheduler.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\updatescheduler.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Update\\UpdateVerifier.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\update\\updateverifier.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\USB\\BadUSBDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\usb\\badusbdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\USB\\DeviceControlManager.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\usb\\devicecontrolmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\USB\\USBAutorunBlocker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\usb\\usbautorunblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\USB\\USBDeviceMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\usb\\usbdevicemonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\USB\\USBScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\usb\\usbscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
     },
     "ContainsWarnings": true
   },
@@ -3276,6 +4143,55 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\shadowstrike\\shadowstrike\\include\\pugixml\\pugixml.hpp": "961685664b5db0ee7ead8f377b8d4ff52fac7f2024f861fd56d2a761a0fff827",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\AdBlocker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\adblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\BrowserProtection.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\browserprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\ChromeExtensionScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\chromeextensionscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\FirefoxAddonScanner.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\firefoxaddonscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\MaliciousDownloadBlocker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\maliciousdownloadblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\PhishingDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\phishingdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\WebBrowser\\TrackerBlocker.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\webbrowser\\trackerblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
     },
     "ContainsWarnings": true
   },

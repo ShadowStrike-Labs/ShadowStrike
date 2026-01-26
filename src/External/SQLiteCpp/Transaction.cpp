@@ -1,3 +1,4 @@
+
 /**
  * @file    Transaction.cpp
  * @ingroup SQLiteCpp

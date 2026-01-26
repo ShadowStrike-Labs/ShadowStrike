@@ -886,7 +886,13 @@ public:
      * @brief Gets the singleton instance.
      * @return Reference to the singleton.
      */
-    static DNSMonitor& Instance();
+    [[nodiscard]] static DNSMonitor& Instance() noexcept;
+
+    /**
+     * @brief Checks if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
 
     // ========================================================================
     // LIFECYCLE MANAGEMENT
@@ -913,6 +919,12 @@ public:
      * @brief Shuts down and releases resources.
      */
     void Shutdown() noexcept;
+
+    /**
+     * @brief Checks if DNS monitor is initialized.
+     * @return True if initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
 
     /**
      * @brief Checks if monitoring is active.
@@ -1253,6 +1265,18 @@ public:
      */
     bool ExportDiagnostics(const std::wstring& outputPath) const;
 
+    /**
+     * @brief Performs self-test of DNS monitor functionality.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
+
+    /**
+     * @brief Gets version string.
+     * @return Version in format "MAJOR.MINOR.PATCH".
+     */
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
     // ========================================================================
     // UTILITY METHODS
     // ========================================================================
@@ -1302,7 +1326,21 @@ private:
     // PIMPL IMPLEMENTATION
     // ========================================================================
     std::unique_ptr<DNSMonitorImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetRecordTypeName(DNSRecordType type) noexcept;
+[[nodiscard]] std::string_view GetResponseCodeName(DNSResponseCode code) noexcept;
+[[nodiscard]] std::string_view GetProtocolName(DNSProtocol protocol) noexcept;
+[[nodiscard]] std::string_view GetDomainCategoryName(DomainCategory category) noexcept;
+[[nodiscard]] std::string_view GetThreatTypeName(DNSThreatType threat) noexcept;
+[[nodiscard]] std::string_view GetDGAFamilyName(DGAFamily family) noexcept;
+[[nodiscard]] std::string_view GetFilterActionName(DNSFilterAction action) noexcept;
+[[nodiscard]] std::string_view GetValidationResultName(ValidationResult result) noexcept;
 
 }  // namespace Network
 }  // namespace Core

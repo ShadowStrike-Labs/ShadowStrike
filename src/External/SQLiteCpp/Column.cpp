@@ -1,3 +1,5 @@
+
+
 /**
  * @file    Column.cpp
  * @ingroup SQLiteCpp
