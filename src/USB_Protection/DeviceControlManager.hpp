@@ -318,6 +318,9 @@ struct DeviceCriteria {
     [[nodiscard]] bool Matches(const USBDeviceInfo& device) const;
     [[nodiscard]] std::string ToJson() const;
     [[nodiscard]] std::string ToCriteriaString() const;
+
+    /// @brief Wildcard pattern matching helper
+    [[nodiscard]] static bool MatchWildcard(const std::string& str, const std::string& pattern);
 };
 
 /**
