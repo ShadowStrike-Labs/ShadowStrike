@@ -645,9 +645,17 @@ public:
     
     [[nodiscard]] PhishingStatistics GetStatistics() const;
     void ResetStatistics();
-    
+
     [[nodiscard]] bool SelfTest();
+    [[nodiscard]] std::vector<std::wstring> RunDiagnostics() const;
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // EXPORT
+    // ========================================================================
+
+    /// @brief Export analysis report
+    [[nodiscard]] bool ExportReport(const std::wstring& outputPath) const;
 
 private:
     PhishingEmailDetector();

@@ -351,18 +351,43 @@ public:
     /**
      * @brief Gets singleton instance.
      */
-    static HardwareMonitor& Instance();
-    
+    [[nodiscard]] static HardwareMonitor& Instance() noexcept;
+
+    /**
+     * @brief Check if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
+
     /**
      * @brief Initializes hardware monitor.
      */
-    bool Initialize(const HardwareMonitorConfig& config);
+    [[nodiscard]] bool Initialize(const HardwareMonitorConfig& config = HardwareMonitorConfig::CreateDefault());
     
     /**
      * @brief Shuts down hardware monitor.
      */
     void Shutdown() noexcept;
-    
+
+    /**
+     * @brief Check if monitor is initialized.
+     * @return True if initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
+
+    /**
+     * @brief Update configuration.
+     * @param config New configuration.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool UpdateConfig(const HardwareMonitorConfig& config);
+
+    /**
+     * @brief Get current configuration.
+     * @return Current configuration.
+     */
+    [[nodiscard]] HardwareMonitorConfig GetConfig() const;
+
     /**
      * @brief Starts continuous monitoring.
      */
@@ -511,21 +536,64 @@ public:
     void UnregisterHardwareChangeCallback(uint64_t callbackId);
     
     // ========================================================================
-    // STATISTICS
+    // STATISTICS & DIAGNOSTICS
     // ========================================================================
-    
+
     [[nodiscard]] const HardwareMonitorStatistics& GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
+
+    /**
+     * @brief Get monitor version.
+     * @return Version string.
+     */
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    /**
+     * @brief Run self-test.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
+
+    /**
+     * @brief Run diagnostics.
+     * @return Diagnostic messages.
+     */
+    [[nodiscard]] std::vector<std::wstring> RunDiagnostics() const;
+
+    // ========================================================================
+    // EXPORT
+    // ========================================================================
+
+    /**
+     * @brief Export hardware report.
+     * @param outputPath Output file path.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool ExportReport(const std::wstring& outputPath) const;
 
 private:
     HardwareMonitor();
     ~HardwareMonitor();
     
+    // Delete copy/move
     HardwareMonitor(const HardwareMonitor&) = delete;
     HardwareMonitor& operator=(const HardwareMonitor&) = delete;
-    
+    HardwareMonitor(HardwareMonitor&&) = delete;
+    HardwareMonitor& operator=(HardwareMonitor&&) = delete;
+
     std::unique_ptr<HardwareMonitorImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetDiskTypeName(DiskType type) noexcept;
+[[nodiscard]] std::string_view GetDiskHealthStatusName(DiskHealthStatus status) noexcept;
+[[nodiscard]] std::string_view GetPowerSourceName(PowerSource source) noexcept;
+[[nodiscard]] std::string_view GetBatteryStatusName(BatteryStatus status) noexcept;
+[[nodiscard]] std::string_view GetThermalStatusName(ThermalStatus status) noexcept;
 
 }  // namespace System
 }  // namespace Core

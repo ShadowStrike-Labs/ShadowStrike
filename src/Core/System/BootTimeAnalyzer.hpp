@@ -359,18 +359,43 @@ public:
     /**
      * @brief Gets singleton instance.
      */
-    static BootTimeAnalyzer& Instance();
+    [[nodiscard]] static BootTimeAnalyzer& Instance() noexcept;
+
+    /**
+     * @brief Check if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
     
     /**
      * @brief Initializes boot time analyzer.
      */
-    bool Initialize(const BootTimeAnalyzerConfig& config);
+    [[nodiscard]] bool Initialize(const BootTimeAnalyzerConfig& config = BootTimeAnalyzerConfig::CreateDefault());
     
     /**
      * @brief Shuts down boot time analyzer.
      */
     void Shutdown() noexcept;
-    
+
+    /**
+     * @brief Check if analyzer is initialized.
+     * @return True if initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
+
+    /**
+     * @brief Update configuration.
+     * @param config New configuration.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool UpdateConfig(const BootTimeAnalyzerConfig& config);
+
+    /**
+     * @brief Get current configuration.
+     * @return Current configuration.
+     */
+    [[nodiscard]] BootTimeAnalyzerConfig GetConfig() const;
+
     // ========================================================================
     // BOOT ANALYSIS
     // ========================================================================
@@ -495,21 +520,71 @@ public:
     [[nodiscard]] std::chrono::milliseconds EstimateOptimizationSavings() const;
     
     // ========================================================================
-    // STATISTICS
+    // STATISTICS & DIAGNOSTICS
     // ========================================================================
-    
+
     [[nodiscard]] const BootTimeAnalyzerStatistics& GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
+
+    /**
+     * @brief Get analyzer version.
+     * @return Version string.
+     */
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    /**
+     * @brief Run self-test.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
+
+    /**
+     * @brief Run diagnostics.
+     * @return Diagnostic messages.
+     */
+    [[nodiscard]] std::vector<std::wstring> RunDiagnostics() const;
+
+    // ========================================================================
+    // EXPORT
+    // ========================================================================
+
+    /**
+     * @brief Export boot analysis report.
+     * @param outputPath Output file path.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool ExportReport(const std::wstring& outputPath) const;
+
+    /**
+     * @brief Export optimization suggestions.
+     * @param outputPath Output file path.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool ExportOptimizations(const std::wstring& outputPath) const;
 
 private:
     BootTimeAnalyzer();
     ~BootTimeAnalyzer();
-    
+
+    // Delete copy/move
     BootTimeAnalyzer(const BootTimeAnalyzer&) = delete;
     BootTimeAnalyzer& operator=(const BootTimeAnalyzer&) = delete;
-    
+    BootTimeAnalyzer(BootTimeAnalyzer&&) = delete;
+    BootTimeAnalyzer& operator=(BootTimeAnalyzer&&) = delete;
+
     std::unique_ptr<BootTimeAnalyzerImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetBootPhaseName(BootPhase phase) noexcept;
+[[nodiscard]] std::string_view GetStartupItemTypeName(StartupItemType type) noexcept;
+[[nodiscard]] std::string_view GetStartupItemRiskName(StartupItemRisk risk) noexcept;
+[[nodiscard]] std::string_view GetSecureBootStatusName(SecureBootStatus status) noexcept;
+[[nodiscard]] std::string_view GetELAMDriverStatusName(ELAMDriverStatus status) noexcept;
 
 }  // namespace System
 }  // namespace Core

@@ -359,12 +359,29 @@ public:
     /**
      * @brief Gets singleton instance.
      */
-    static SystemInfo& Instance();
-    
+    [[nodiscard]] static SystemInfo& Instance() noexcept;
+
+    /**
+     * @brief Check if singleton instance has been created.
+     * @return True if instance exists.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
+
     /**
      * @brief Initializes system info (caches static data).
      */
-    bool Initialize();
+    [[nodiscard]] bool Initialize();
+
+    /**
+     * @brief Shuts down system info.
+     */
+    void Shutdown() noexcept;
+
+    /**
+     * @brief Check if system info is initialized.
+     * @return True if initialized.
+     */
+    [[nodiscard]] bool IsInitialized() const noexcept;
     
     /**
      * @brief Refreshes dynamic information.
@@ -502,21 +519,64 @@ public:
     [[nodiscard]] SystemSnapshot GetSnapshot() const;
     
     // ========================================================================
-    // STATISTICS
+    // STATISTICS & DIAGNOSTICS
     // ========================================================================
-    
+
     [[nodiscard]] const SystemInfoStatistics& GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
+
+    /**
+     * @brief Get system info version.
+     * @return Version string.
+     */
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    /**
+     * @brief Run self-test.
+     * @return True if all tests pass.
+     */
+    [[nodiscard]] bool SelfTest();
+
+    /**
+     * @brief Run diagnostics.
+     * @return Diagnostic messages.
+     */
+    [[nodiscard]] std::vector<std::wstring> RunDiagnostics() const;
+
+    // ========================================================================
+    // EXPORT
+    // ========================================================================
+
+    /**
+     * @brief Export system snapshot.
+     * @param outputPath Output file path.
+     * @return True if successful.
+     */
+    [[nodiscard]] bool ExportSnapshot(const std::wstring& outputPath) const;
 
 private:
     SystemInfo();
     ~SystemInfo();
-    
+
+    // Delete copy/move
     SystemInfo(const SystemInfo&) = delete;
     SystemInfo& operator=(const SystemInfo&) = delete;
-    
+    SystemInfo(SystemInfo&&) = delete;
+    SystemInfo& operator=(SystemInfo&&) = delete;
+
     std::unique_ptr<SystemInfoImpl> m_impl;
+    static std::atomic<bool> s_instanceCreated;
 };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+[[nodiscard]] std::string_view GetVirtualizationTypeName(VirtualizationType type) noexcept;
+[[nodiscard]] std::string_view GetSandboxTypeName(SandboxType type) noexcept;
+[[nodiscard]] std::string_view GetBootModeName(BootMode mode) noexcept;
+[[nodiscard]] std::string_view GetProcessorArchitectureName(ProcessorArchitecture arch) noexcept;
+[[nodiscard]] std::string_view GetPowerStateName(PowerState state) noexcept;
 
 }  // namespace System
 }  // namespace Core
