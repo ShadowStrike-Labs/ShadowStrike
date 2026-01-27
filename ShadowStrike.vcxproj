@@ -238,6 +238,11 @@
     <ClCompile Include="src\database\DatabaseManager.cpp" />
     <ClCompile Include="src\database\LogDB.cpp" />
     <ClCompile Include="src\database\QuarantineDB.cpp" />
+    <ClCompile Include="src\Drivers\FileFilterCallbacks.cpp" />
+    <ClCompile Include="src\Drivers\FilterCommunication.cpp" />
+    <ClCompile Include="src\Drivers\FilterDriver.cpp" />
+    <ClCompile Include="src\Drivers\ProcessFilterCallbacks.cpp" />
+    <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp" />
     <ClCompile Include="src\Email\AttachmentScanner.cpp" />
     <ClCompile Include="src\Email\EmailProtection.cpp" />
     <ClCompile Include="src\Email\OutlookScanner.cpp" />
@@ -346,6 +351,11 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\Performance\CPUMonitor.cpp" />
+    <ClCompile Include="src\Performance\DiskMonitor.cpp" />
+    <ClCompile Include="src\Performance\MemoryProfiler.cpp" />
+    <ClCompile Include="src\Performance\NetworkPerformanceMonitor.cpp" />
+    <ClCompile Include="src\Performance\PerformanceProfiler.cpp" />
     <ClCompile Include="src\Privacy\CookieManager.cpp" />
     <ClCompile Include="src\Privacy\DataLeakProtection.cpp" />
     <ClCompile Include="src\Privacy\DNSLeakProtection.cpp" />
@@ -390,6 +400,12 @@
     <ClCompile Include="src\Security\RegistryProtection.cpp" />
     <ClCompile Include="src\Security\SelfDefense.cpp" />
     <ClCompile Include="src\Security\TamperProtection.cpp" />
+    <ClCompile Include="src\Service\AntivirusService.cpp" />
+    <ClCompile Include="src\Service\PerformanceProfiler.cpp" />
+    <ClCompile Include="src\Service\ServiceCommunicator.cpp" />
+    <ClCompile Include="src\Service\ServiceController.cpp" />
+    <ClCompile Include="src\Service\ServiceInstaller.cpp" />
+    <ClCompile Include="src\Service\ServiceMonitor.cpp" />
     <ClCompile Include="src\signaturestore\batch_sig_builder.cpp" />
     <ClCompile Include="src\signaturestore\SignatureBuilder.cpp" />
     <ClCompile Include="src\signaturestore\SignatureFormat.cpp" />
@@ -659,9 +675,24 @@
     <ClInclude Include="src\database\DatabaseManager.hpp" />
     <ClInclude Include="src\database\LogDB.hpp" />
     <ClInclude Include="src\database\QuarantineDB.hpp" />
+    <ClInclude Include="src\Drivers\FileFilterCallbacks.hpp" />
+    <ClInclude Include="src\Drivers\FilterCommunication.hpp" />
+    <ClInclude Include="src\Drivers\FilterDriver.hpp" />
+    <ClInclude Include="src\Drivers\ProcessFilterCallbacks.hpp" />
+    <ClInclude Include="src\Drivers\RegistryFilterCallbacks.hpp" />
     <ClInclude Include="src\hashstore\HashStore.hpp" />
     <ClInclude Include="src\patternstore\PatternStore.hpp" />
     <ClInclude Include="src\pch.h" />
+    <ClInclude Include="src\Performance\CPUMonitor.hpp" />
+    <ClInclude Include="src\Performance\DiskMonitor.hpp" />
+    <ClInclude Include="src\Performance\MemoryProfiler.hpp" />
+    <ClInclude Include="src\Performance\NetworkPerformanceMonitor.hpp" />
+    <ClInclude Include="src\Performance\PerformanceProfiler.hpp" />
+    <ClInclude Include="src\Service\AntivirusService.hpp" />
+    <ClInclude Include="src\Service\ServiceCommunicator.hpp" />
+    <ClInclude Include="src\Service\ServiceController.hpp" />
+    <ClInclude Include="src\Service\ServiceInstaller.hpp" />
+    <ClInclude Include="src\Service\ServiceMonitor.hpp" />
     <ClInclude Include="src\signaturestore\pragma_pack.h" />
     <ClInclude Include="src\signaturestore\SignatureBuilder.hpp" />
     <ClInclude Include="src\signaturestore\SignatureFormat.hpp" />
