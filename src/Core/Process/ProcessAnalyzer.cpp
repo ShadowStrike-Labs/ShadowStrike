@@ -945,11 +945,11 @@ HandleSummary ProcessAnalyzer::ProcessAnalyzerImpl::EnumerateHandlesInternal(uin
     HandleSummary summary;
 
     try {
-        // NOTE: Full handle enumeration requires NtQuerySystemInformation
-        // For production, would enumerate via SystemHandleInformation
-        // This is a simplified implementation showing the structure
+        // KERNEL DRIVER INTEGRATION WILL COME HERE
+        // In production, we use a kernel driver to enumerate handles across all processes
+        // reliably, bypassing user-mode hooks and permission restrictions.
 
-        summary.totalHandles = 0;  // Would get actual count
+        summary.totalHandles = 0;
         m_statistics.handlesEnumerated.fetch_add(summary.totalHandles, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
@@ -970,6 +970,10 @@ MemorySummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32
     try {
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
         if (!hProcess) {
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // Fallback to kernel driver for protected processes (PPL) or when access is denied.
+            // The driver can map the process memory or provide a privileged handle.
+
             m_statistics.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             return summary;
         }

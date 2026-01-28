@@ -490,6 +490,9 @@ namespace ShadowStrike {
             /// @brief RaiseException with DBG_RIPEXCEPTION
             EXCEPTION_RaiseException_RipException = 114,
 
+            /// @brief ICEBP (0xF1) single-step exception
+            EXCEPTION_ICEBP = 115,
+
             // ========================================================================
             // OBJECT HANDLE TECHNIQUES (131-150)
             // ========================================================================
@@ -879,6 +882,7 @@ namespace ShadowStrike {
             case EvasionTechnique::HW_BreakpointRegisters:
             case EvasionTechnique::TIMING_RDTSC:
             case EvasionTechnique::EXCEPTION_INT2D:
+            case EvasionTechnique::EXCEPTION_ICEBP:
             case EvasionTechnique::MEMORY_APIHookDetection:
             case EvasionTechnique::CODE_SectionChecksum:
             case EvasionTechnique::THREAD_TLSCallback:
@@ -1519,7 +1523,7 @@ namespace ShadowStrike {
              * @return Batch analysis result
              */
             [[nodiscard]] BatchAnalysisResult AnalyzeProcesses(
-                const std::vector<uint32_t>& processIds,
+                const std::vector<Utils::ProcessUtils::ProcessId>& processIds,
                 const AnalysisConfig& config = AnalysisConfig{},
                 AnalysisProgressCallback progressCallback = nullptr,
                 Error* err = nullptr

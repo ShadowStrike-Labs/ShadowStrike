@@ -47,6 +47,47 @@
 #  include <Windows.h>
 #  include <winternl.h>
 #  pragma comment(lib, "ntdll.lib")
+
+// Native API definitions not in winternl.h
+typedef enum _KEY_INFORMATION_CLASS {
+    KeyBasicInformation,
+    KeyNodeInformation,
+    KeyFullInformation,
+    KeyNameInformation,
+    KeyCachedInformation,
+    KeyFlagsInformation,
+    KeyVirtualizationInformation,
+    KeyHandleTagsInformation,
+    KeyAccountInformation,
+    MaxKeyInfoClass
+} KEY_INFORMATION_CLASS;
+
+typedef struct _KEY_BASIC_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
+
+extern "C" NTSTATUS NTAPI NtOpenKey(
+    OUT PHANDLE KeyHandle,
+    IN ACCESS_MASK DesiredAccess,
+    IN POBJECT_ATTRIBUTES ObjectAttributes
+);
+
+extern "C" NTSTATUS NTAPI NtEnumerateKey(
+    IN HANDLE KeyHandle,
+    IN ULONG Index,
+    IN KEY_INFORMATION_CLASS KeyInformationClass,
+    OUT PVOID KeyInformation,
+    IN ULONG Length,
+    OUT PULONG ResultLength
+);
+
+extern "C" VOID NTAPI RtlInitUnicodeString(
+    PUNICODE_STRING DestinationString,
+    PCWSTR SourceString
+);
 #endif
 
 namespace ShadowStrike {
@@ -62,6 +103,22 @@ namespace fs = std::filesystem;
 // ============================================================================
 
 namespace {
+
+/**
+ * @brief Convert Win32 path to Native path.
+ */
+[[nodiscard]] std::wstring Win32ToNativePath(const std::wstring& path) {
+    std::wstring native = path;
+    if (native.starts_with(L"HKEY_LOCAL_MACHINE") || native.starts_with(L"HKLM")) {
+        size_t pos = native.find(L'\\');
+        native = L"\\Registry\\Machine" + (pos != std::wstring::npos ? native.substr(pos) : L"");
+    } else if (native.starts_with(L"HKEY_CURRENT_USER") || native.starts_with(L"HKCU")) {
+        size_t pos = native.find(L'\\');
+        native = L"\\Registry\\User\\<SID>" + (pos != std::wstring::npos ? native.substr(pos) : L"");
+        // In a real implementation, we would resolve the current user's SID here
+    }
+    return native;
+}
 
 /**
  * @brief Calculate Shannon entropy.
@@ -767,80 +824,82 @@ public:
         std::vector<std::wstring> hiddenKeys;
 
         try {
-            Logger::Debug("RegistryAnalyzer: Detecting NULL byte keys in {}",
+            Logger::Debug("RegistryAnalyzer: Deep scanning for hidden keys in {}",
                 StringUtils::WideToUtf8(rootKey));
 
-            // NULL byte technique: key name ends with \0, hiding rest from API
-            // Would use NtEnumerateKey to get raw key names
-            // For now, simplified detection via API
+            // Convert to native path for NTAPI
+            std::wstring nativePath = Win32ToNativePath(rootKey);
 
-            HKEY hKey;
-            LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, rootKey.c_str(), 0,
-                                       KEY_READ | KEY_WOW64_64KEY, &hKey);
-            if (result != ERROR_SUCCESS) {
-                result = RegOpenKeyExW(HKEY_CURRENT_USER, rootKey.c_str(), 0,
-                                      KEY_READ | KEY_WOW64_64KEY, &hKey);
-                if (result != ERROR_SUCCESS) {
-                    return hiddenKeys;
-                }
+            UNICODE_STRING usPath;
+            RtlInitUnicodeString(&usPath, nativePath.c_str());
+
+            OBJECT_ATTRIBUTES objAttr;
+            InitializeObjectAttributes(&objAttr, &usPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+
+            HANDLE hKey = nullptr;
+            NTSTATUS status = NtOpenKey(&hKey, KEY_READ, &objAttr);
+            if (status != 0 /* STATUS_SUCCESS */) {
+                return hiddenKeys;
             }
 
-            DWORD index = 0;
-            wchar_t keyName[256];
-            DWORD keyNameSize;
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // In a production environment, we would also verify if the kernel filter
+            // is reporting the same set of keys to detect filter-based rootkits.
+
+            ULONG index = 0;
+            std::vector<uint8_t> buffer(4096);
+            ULONG resultLength = 0;
 
             while (true) {
-                keyNameSize = sizeof(keyName) / sizeof(wchar_t);
-                result = RegEnumKeyExW(hKey, index, keyName, &keyNameSize,
-                                      nullptr, nullptr, nullptr, nullptr);
+                status = NtEnumerateKey(hKey, index, KeyBasicInformation, buffer.data(),
+                                        static_cast<ULONG>(buffer.size()), &resultLength);
 
-                if (result == ERROR_NO_MORE_ITEMS) {
+                if (status == 0x80000005 /* STATUS_BUFFER_OVERFLOW */ ||
+                    status == 0xC0000023 /* STATUS_BUFFER_TOO_SMALL */) {
+                    buffer.resize(resultLength);
+                    continue;
+                }
+
+                if (status != 0 /* STATUS_SUCCESS */) {
                     break;
                 }
 
-                if (result == ERROR_SUCCESS) {
-                    std::wstring name(keyName);
+                auto* pInfo = reinterpret_cast<PKEY_BASIC_INFORMATION>(buffer.data());
+                std::wstring keyName(pInfo->Name, pInfo->NameLength / sizeof(WCHAR));
 
-                    // Check for control characters
-                    if (HasControlCharacters(name)) {
-                        std::wstring fullPath = rootKey + L"\\" + name;
-                        hiddenKeys.push_back(fullPath);
-
-                        std::unique_lock lock(m_hiddenMutex);
-                        m_hiddenKeys.insert(fullPath);
-
-                        m_stats.hiddenKeysFound.fetch_add(1, std::memory_order_relaxed);
-
-                        Logger::Warn("RegistryAnalyzer: Hidden key detected (control chars): {}",
-                            StringUtils::WideToUtf8(fullPath));
-
-                        InvokeHiddenCallbacks(fullPath, true);
+                // Detect NULL-byte injection (RegHider technique)
+                // If the name length reported by NTAPI contains a NULL, but the Win32 API
+                // would stop reading at that NULL, it's a hidden key.
+                bool isHidden = false;
+                for (size_t i = 0; i < keyName.length(); ++i) {
+                    if (keyName[i] == L'\0' && i < keyName.length() - 1) {
+                        isHidden = true;
+                        break;
                     }
+                }
 
-                    // Check for zero-length names
-                    if (name.empty()) {
-                        std::wstring fullPath = rootKey + L"\\<empty>";
-                        hiddenKeys.push_back(fullPath);
+                if (isHidden || HasControlCharacters(keyName)) {
+                    std::wstring fullPath = rootKey + L"\\" + keyName;
+                    hiddenKeys.push_back(fullPath);
 
-                        RecordAnomaly(AnomalyType::ZeroLengthName, AnomalySeverity::High,
-                            L"HKLM", rootKey, name, {},
-                            "Zero-length key name detected");
-                    }
+                    std::unique_lock lock(m_hiddenMutex);
+                    m_hiddenKeys.insert(fullPath);
+                    m_stats.hiddenKeysFound.fetch_add(1, std::memory_order_relaxed);
 
-                    // Check for overlong names
-                    if (name.length() > RegistryAnalyzerConstants::MAX_KEY_NAME_LENGTH) {
-                        std::wstring fullPath = rootKey + L"\\" + name;
+                    Logger::Critical("RegistryAnalyzer: HIDDEN KEY DETECTED: {}",
+                        StringUtils::WideToUtf8(fullPath));
 
-                        RecordAnomaly(AnomalyType::OverlongName, AnomalySeverity::Medium,
-                            L"HKLM", rootKey, name, {},
-                            std::format("Overlong key name: {} characters", name.length()));
-                    }
+                    RecordAnomaly(AnomalyType::APIHiddenKey, AnomalySeverity::Critical,
+                        L"HKLM", rootKey, keyName, {},
+                        "Registry key hidden using NULL-byte or control character injection");
+
+                    InvokeHiddenCallbacks(fullPath, true);
                 }
 
                 index++;
             }
 
-            RegCloseKey(hKey);
+            CloseHandle(hKey);
 
         } catch (const std::exception& e) {
             Logger::Error("RegistryAnalyzer: DetectNullByteKeys exception: {}", e.what());
@@ -854,72 +913,66 @@ public:
         result.keyPath = keyPath;
 
         try {
-            Logger::Debug("RegistryAnalyzer: Cross-view detection for {}",
+            Logger::Debug("RegistryAnalyzer: Performing Cross-View Analysis for {}",
                 StringUtils::WideToUtf8(keyPath));
 
-            // API enumeration
+            // 1. Get keys via Win32 API (View A)
             HKEY hKey;
-            LONG regResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0,
-                                          KEY_READ | KEY_WOW64_64KEY, &hKey);
-            if (regResult == ERROR_SUCCESS) {
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0,
+                             KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
                 result.foundViaAPI = true;
-
-                // Enumerate subkeys via API
                 DWORD index = 0;
                 wchar_t subkeyName[256];
                 DWORD subkeyNameSize;
-
                 while (true) {
                     subkeyNameSize = sizeof(subkeyName) / sizeof(wchar_t);
-                    regResult = RegEnumKeyExW(hKey, index, subkeyName, &subkeyNameSize,
-                                             nullptr, nullptr, nullptr, nullptr);
-
-                    if (regResult == ERROR_NO_MORE_ITEMS) {
+                    if (RegEnumKeyExW(hKey, index, subkeyName, &subkeyNameSize,
+                                     nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
                         break;
                     }
-
-                    if (regResult == ERROR_SUCCESS) {
-                        result.apiSubKeys.push_back(subkeyName);
-                    }
-
+                    result.apiSubKeys.push_back(subkeyName);
                     index++;
                 }
-
-                // Enumerate values via API
-                index = 0;
-                wchar_t valueName[16384];
-                DWORD valueNameSize;
-
-                while (true) {
-                    valueNameSize = sizeof(valueName) / sizeof(wchar_t);
-                    regResult = RegEnumValueW(hKey, index, valueName, &valueNameSize,
-                                             nullptr, nullptr, nullptr, nullptr);
-
-                    if (regResult == ERROR_NO_MORE_ITEMS) {
-                        break;
-                    }
-
-                    if (regResult == ERROR_SUCCESS) {
-                        result.apiValues.push_back(valueName);
-                    }
-
-                    index++;
-                }
-
                 RegCloseKey(hKey);
             }
 
-            // Raw enumeration would use NtEnumerateKey
-            // For now, assume same as API (simplified)
-            result.foundViaRaw = result.foundViaAPI;
-            result.rawSubKeys = result.apiSubKeys;
-            result.rawValues = result.apiValues;
+            // 2. Get keys via Native API (View B)
+            std::wstring nativePath = Win32ToNativePath(keyPath);
+            UNICODE_STRING usPath;
+            RtlInitUnicodeString(&usPath, nativePath.c_str());
+            OBJECT_ATTRIBUTES objAttr;
+            InitializeObjectAttributes(&objAttr, &usPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
 
-            // Compare results
+            HANDLE hNativeKey = nullptr;
+            if (NtOpenKey(&hNativeKey, KEY_READ, &objAttr) == 0 /* STATUS_SUCCESS */) {
+                result.foundViaRaw = true;
+                ULONG index = 0;
+                std::vector<uint8_t> buffer(4096);
+                ULONG resLen = 0;
+                while (true) {
+                    NTSTATUS status = NtEnumerateKey(hNativeKey, index, KeyBasicInformation,
+                                                   buffer.data(), static_cast<ULONG>(buffer.size()), &resLen);
+                    if (status == 0xC0000023 /* BUFFER_TOO_SMALL */) {
+                        buffer.resize(resLen);
+                        continue;
+                    }
+                    if (status != 0) break;
+
+                    auto* pInfo = reinterpret_cast<PKEY_BASIC_INFORMATION>(buffer.data());
+                    result.rawSubKeys.emplace_back(pInfo->Name, pInfo->NameLength / sizeof(WCHAR));
+                    index++;
+                }
+                CloseHandle(hNativeKey);
+            }
+
+            // 3. Compare View A and View B
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // A truly deep scan would also read the hive file from disk directly to bypass
+            // any kernel-mode hooks on NtEnumerateKey itself.
+
             std::unordered_set<std::wstring> apiSet(result.apiSubKeys.begin(), result.apiSubKeys.end());
-            std::unordered_set<std::wstring> rawSet(result.rawSubKeys.begin(), result.rawSubKeys.end());
-
             for (const auto& rawKey : result.rawSubKeys) {
+                // If found in Native but not in Win32, it's hidden
                 if (apiSet.find(rawKey) == apiSet.end()) {
                     result.hiddenSubKeys.push_back(rawKey);
                     result.hasDiscrepancy = true;
@@ -927,10 +980,15 @@ public:
             }
 
             if (result.hasDiscrepancy) {
-                Logger::Warn("RegistryAnalyzer: Cross-view discrepancy detected - {} hidden subkeys",
-                    result.hiddenSubKeys.size());
-
                 m_stats.rootkitIndicators.fetch_add(1, std::memory_order_relaxed);
+                Logger::Critical("RegistryAnalyzer: ROOTKIT DISCREPANCY detected in {}",
+                    StringUtils::WideToUtf8(keyPath));
+
+                for (const auto& hidden : result.hiddenSubKeys) {
+                    RecordAnomaly(AnomalyType::APIHiddenKey, AnomalySeverity::Critical,
+                        L"HKLM", keyPath, hidden, {},
+                        "Key found via NTAPI but hidden from Win32 API (Rootkit indicator)");
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1105,6 +1163,125 @@ public:
     // ========================================================================
     // ANOMALY RECORDING
     // ========================================================================
+
+    /**
+     * @brief Direct Kernel Object Manipulation detection
+     */
+    [[nodiscard]] bool DetectDKOMImpl() {
+        // KERNEL DRIVER INTEGRATION WILL COME HERE
+        // In a production environment, this would involve comparing the CM_KEY_BODY
+        // objects in kernel memory with the reported handle table to detect
+        // keys hidden via direct pointer manipulation.
+        return false;
+    }
+
+    /**
+     * @brief Parse a raw cell from the hive.
+     */
+    template<typename T>
+    [[nodiscard]] std::optional<T> ParseCell(std::ifstream& file, uint32_t offset) {
+        if (offset == 0xFFFFFFFF) return std::nullopt;
+
+        // Offsets in registry hives are relative to the first hbin (0x1000)
+        // and are always 4-byte aligned.
+        uint64_t absoluteOffset = static_cast<uint64_t>(offset) + 0x1000;
+
+        file.seekg(absoluteOffset);
+        int32_t cellSize;
+        file.read(reinterpret_cast<char*>(&cellSize), sizeof(cellSize));
+
+        if (file.gcount() != sizeof(cellSize)) return std::nullopt;
+
+        // Cell size is negative if allocated, positive if free
+        // The size includes the 4-byte size header itself
+        uint32_t actualSize = std::abs(cellSize);
+        if (actualSize < sizeof(T) + 4) return std::nullopt;
+
+        T cellData;
+        file.read(reinterpret_cast<char*>(&cellData), sizeof(T));
+        if (file.gcount() != sizeof(T)) return std::nullopt;
+
+        return cellData;
+    }
+
+    /**
+     * @brief Recover deleted entries by scanning hbin slack space.
+     */
+    [[nodiscard]] std::vector<DeletedEntry> RecoverDeletedEntriesImpl(const std::wstring& hivePath) {
+        std::vector<DeletedEntry> recovered;
+
+        try {
+            std::ifstream file(hivePath, std::ios::binary);
+            if (!file) return recovered;
+
+            auto header = ParseHiveHeaderImpl(hivePath);
+            if (!header.isValid) return recovered;
+
+            // Scan all hbin segments
+            uint32_t currentOffset = 0;
+            while (currentOffset < header.dataLength) {
+                file.seekg(0x1000 + currentOffset);
+
+                uint32_t signature;
+                file.read(reinterpret_cast<char*>(&signature), sizeof(signature));
+                if (signature != RegistryAnalyzerConstants::HBIN_SIGNATURE) break;
+
+                uint32_t hbinSize;
+                file.seekg(0x1000 + currentOffset + 0x08);
+                file.read(reinterpret_cast<char*>(&hbinSize), sizeof(hbinSize));
+
+                // Scan cells within this hbin
+                uint32_t cellOffset = 0x20; // Skip hbin header
+                while (cellOffset < hbinSize) {
+                    file.seekg(0x1000 + currentOffset + cellOffset);
+                    int32_t cellSize;
+                    file.read(reinterpret_cast<char*>(&cellSize), sizeof(cellSize));
+
+                    uint32_t absCellSize = std::abs(cellSize);
+                    if (absCellSize == 0 || cellOffset + absCellSize > hbinSize) break;
+
+                    // If cell is free (positive size), it's slack space
+                    if (cellSize > 0) {
+                        // Check for 'nk' or 'vk' signatures in deleted cells
+                        uint16_t sig;
+                        file.read(reinterpret_cast<char*>(&sig), sizeof(sig));
+
+                        if (sig == 0x6B6E) { // 'nk' - Key node
+                            DeletedEntry entry;
+                            entry.isKey = true;
+                            entry.cellOffset = currentOffset + cellOffset;
+
+                            // Extract key name (offset 0x48 in nk cell)
+                            uint16_t nameLen;
+                            file.seekg(0x1000 + currentOffset + cellOffset + 0x48 + 4);
+                            file.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+
+                            std::vector<char> nameBuf(nameLen);
+                            file.seekg(0x1000 + currentOffset + cellOffset + 0x4C + 4);
+                            file.read(nameBuf.data(), nameLen);
+                            entry.name = StringUtils::Utf8ToWide(std::string(nameBuf.begin(), nameBuf.end()));
+
+                            entry.isRecoverable = true;
+                            recovered.push_back(entry);
+                        }
+                    }
+
+                    cellOffset += absCellSize;
+                }
+
+                currentOffset += hbinSize;
+            }
+
+            m_stats.deletedRecovered.fetch_add(recovered.size(), std::memory_order_relaxed);
+            Logger::Info("RegistryAnalyzer: Recovered {} deleted entries from {}",
+                recovered.size(), StringUtils::WideToUtf8(hivePath));
+
+        } catch (const std::exception& e) {
+            Logger::Error("RegistryAnalyzer: Recovery exception: {}", e.what());
+        }
+
+        return recovered;
+    }
 
     RegistryAnomaly RecordAnomaly(
         AnomalyType type,

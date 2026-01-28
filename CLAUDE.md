@@ -1,3 +1,7 @@
+
+TO BUILD THE PROJECT COMPLETELY RUN THIS :   Bash(powershell.exe -Command "& 'C:\Program Files\Microsoft Visual
+      Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' C:\ShadowStrike\ShadowStrike\ShadowStrike.sln /p:Configuration=Debug /p:Platform=x64 /verbosity:minimal 2>&1")
+
  ShadowStrike NGAV - Enterprise C++ Implementation Agent Guide
 
      # 🛡️ ShadowStrike NGAV - C++ Implementation Standards

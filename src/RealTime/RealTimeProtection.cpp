@@ -191,6 +191,13 @@ public:
     std::deque<ThreatEvent> m_recentThreats;
     static constexpr size_t MAX_RECENT_THREATS = 1000;
 
+    // Anti-Evasion Detectors
+    std::unique_ptr<ShadowStrike::AntiEvasion::DebuggerEvasionDetector> m_debuggerDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::VMEvasionDetector> m_vmDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::SandboxEvasionDetector> m_sandboxDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::ProcessEvasionDetector> m_processDetector;
+    std::unique_ptr<ShadowStrike::AntiEvasion::MetamorphicDetector> m_metamorphicDetector;
+
     // Component Status
     std::array<ComponentStatus, static_cast<size_t>(ComponentType::COMPONENT_COUNT)> m_componentStatus;
 
@@ -218,6 +225,16 @@ public:
         m_stats.lastReset = Now();
         m_protectionStatus.startTime = Now();
         m_protectionStatus.lastUpdate = Now();
+        // Initialize Anti-Evasion Detectors
+        try {
+            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
+            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
+            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
+            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
+            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
+        }
 
         // Initialize component status array
         for (size_t i = 0; i < m_componentStatus.size(); ++i) {
@@ -288,6 +305,16 @@ public:
             // 7. Update protection status
             m_protectionStatus.isProtected = true;
             m_protectionStatus.lastUpdate = Now();
+        // Initialize Anti-Evasion Detectors
+        try {
+            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
+            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
+            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
+            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
+            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
+        }
 
             SetState(ProtectionState::ACTIVE);
             Utils::Logger::Info(L"RealTimeProtection: Started successfully");
@@ -344,6 +371,16 @@ public:
 
         m_protectionStatus.isProtected = false;
         m_protectionStatus.lastUpdate = Now();
+        // Initialize Anti-Evasion Detectors
+        try {
+            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
+            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
+            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
+            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
+            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
+        }
 
         SetState(ProtectionState::UNINITIALIZED);
         Utils::Logger::Info(L"RealTimeProtection: Stopped");
@@ -654,6 +691,16 @@ public:
             m_performanceMetrics.cacheMisses++;
         }
 
+        // Anti-Evasion: Metamorphic Analysis
+        if (m_metamorphicDetector) {
+            auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath);
+            if (metaResult.isEvasive) {
+                Utils::Logger::Warn(L"RealTimeProtection: Blocked metamorphic threat: {}", filePath);
+                m_stats.threatsDetected++;
+                return Communication::KernelVerdict::Block;
+            }
+        }
+
         // 3. Prepare Scan Context
         Core::Engine::ScanContext context;
         context.type = Core::Engine::ScanType::RealTime;
@@ -772,6 +819,47 @@ public:
         std::wstring imagePath(req.imagePath);
 
         // Check exclusions
+        // Anti-Evasion Analysis
+        if (req.isCreation) {
+            bool evasionDetected = false;
+            std::wstring detectionSource;
+
+            // 1. Debugger Evasion
+            if (m_debuggerDetector) {
+                auto result = m_debuggerDetector->AnalyzeProcess(req.processId);
+                if (result.isEvasive) {
+                    evasionDetected = true;
+                    detectionSource = L"Debugger Evasion";
+                }
+            }
+
+            // 2. VM Evasion
+            if (!evasionDetected && m_vmDetector) {
+                ShadowStrike::AntiEvasion::VMEvasionResult result;
+                if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, result)) {
+                    if (result.isEvasive) {
+                        evasionDetected = true;
+                        detectionSource = L"VM Evasion";
+                    }
+                }
+            }
+
+            // 3. Process Evasion
+            if (!evasionDetected && m_processDetector) {
+                auto result = m_processDetector->AnalyzeProcess(req.processId);
+                if (result.isEvasive) {
+                    evasionDetected = true;
+                    detectionSource = L"Process Evasion";
+                }
+            }
+
+            if (evasionDetected) {
+                Utils::Logger::Warn(L"RealTimeProtection: Blocked evasion attempt: {} (PID: {}, Source: {})", 
+                    imagePath, req.processId, detectionSource);
+                m_stats.processesBlocked++;
+                return Communication::KernelVerdict::Block;
+            }
+        }
         if (IsProcessExcluded(imagePath, req.processId)) {
             m_stats.excludedByProcess++;
             return Communication::KernelVerdict::Allow;
@@ -1202,6 +1290,16 @@ public:
         // Update protection status
         m_protectionStatus.hasErrors = !allHealthy;
         m_protectionStatus.lastUpdate = Now();
+        // Initialize Anti-Evasion Detectors
+        try {
+            m_debuggerDetector = std::make_unique<ShadowStrike::AntiEvasion::DebuggerEvasionDetector>();
+            m_vmDetector = std::make_unique<ShadowStrike::AntiEvasion::VMEvasionDetector>();
+            m_sandboxDetector = std::make_unique<ShadowStrike::AntiEvasion::SandboxEvasionDetector>();
+            m_processDetector = std::make_unique<ShadowStrike::AntiEvasion::ProcessEvasionDetector>();
+            m_metamorphicDetector = std::make_unique<ShadowStrike::AntiEvasion::MetamorphicDetector>();
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"Failed to initialize Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
+        }
 
         // Check if we should go to degraded mode
         if (!allHealthy && m_state == ProtectionState::ACTIVE) {

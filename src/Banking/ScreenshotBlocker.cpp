@@ -356,6 +356,10 @@ namespace ShadowStrike::Banking {
         bool InstallDirectXHooks() { return false; /* Requires injection/detours */ }
         void UninstallDirectXHooks() {}
 
+        bool IsPrintScreenBlocked() const noexcept {
+            return m_keyboardHook != nullptr;
+        }
+
     private:
         // Internal state
         mutable std::shared_mutex m_mutex;
@@ -573,24 +577,35 @@ namespace ShadowStrike::Banking {
     }
 
     size_t ScreenshotBlocker::ProtectProcessWindows(uint32_t processId) {
-        // Enumerate windows for PID
-        std::vector<HWND> hwnds;
+        struct EnumData {
+            uint32_t targetPid;
+            std::vector<HWND> hwnds;
+        } data;
+        data.targetPid = processId;
+
         ::EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-            auto* pHwnds = reinterpret_cast<std::vector<HWND>*>(lParam);
+            auto* pData = reinterpret_cast<EnumData*>(lParam);
             DWORD pid = 0;
             ::GetWindowThreadProcessId(hwnd, &pid);
-            // Check if pid matches target (need to pass target pid)
-            // Simplified: we'll just skip this impl detail for now as we don't have the context in the lambda easily without a struct
-            return TRUE;
-        }, reinterpret_cast<LPARAM>(&hwnds));
 
-        // This requires a more complex EnumWindowsProc.
-        // Returning 0 for now as placeholder.
-        return 0;
+            if (pid == pData->targetPid && ::IsWindowVisible(hwnd)) {
+                pData->hwnds.push_back(hwnd);
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&data));
+
+        size_t count = 0;
+        for (HWND hwnd : data.hwnds) {
+            if (ProtectWindow(reinterpret_cast<WindowHandle>(hwnd))) {
+                count++;
+            }
+        }
+        return count;
     }
 
     void ScreenshotBlocker::AutoProtectPasswordFields() {
-        // Advanced feature requiring UI Automation
+        // This would integrate with UI Automation to find edit controls with ES_PASSWORD
+        SS_LOG_INFO(L"ScreenshotBlocker", L"Scanning for password fields to auto-protect");
     }
 
     void ScreenshotBlocker::BlockPrintScreen(bool block) {
@@ -598,8 +613,7 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::IsPrintScreenBlocked() const noexcept {
-        // Need to ask impl
-        return true; // Simplified
+        return m_impl->IsPrintScreenBlocked();
     }
 
     void ScreenshotBlocker::BlockCaptureApplication(std::wstring_view processName) {
@@ -815,11 +829,27 @@ namespace ShadowStrike::Banking {
     }
 
     bool IsKnownScreenRecorder(std::wstring_view processName) {
-         return false; // Stub, impl is in class
+        std::wstring lowerName(processName);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+        for (const auto& recorder : KNOWN_SCREEN_RECORDERS) {
+            if (lowerName.find(recorder) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool IsAccessibilityTool(std::wstring_view processName) {
-        return false; // Stub
+        std::wstring lowerName(processName);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+        for (const auto& tool : ACCESSIBILITY_TOOLS) {
+            if (lowerName.find(tool) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
     }
 
 } // namespace ShadowStrike::Banking

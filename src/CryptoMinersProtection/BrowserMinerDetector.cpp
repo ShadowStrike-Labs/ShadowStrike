@@ -258,8 +258,18 @@ public:
     // WASM analysis
     [[nodiscard]] WASMAnalysisResult AnalyzeWASMBinary(std::span<const uint8_t> wasmBinary);
     [[nodiscard]] bool IsValidWASM(std::span<const uint8_t> data);
-    [[nodiscard]] bool HasCryptoInstructions(std::span<const uint8_t> wasmBinary);
-    [[nodiscard]] double CalculateLoopDensity(std::span<const uint8_t> wasmBinary);
+
+    struct WASMInstructionStats {
+        uint32_t xorCount = 0;
+        uint32_t mulCount = 0;
+        uint32_t rotateCount = 0;
+        uint32_t loopCount = 0;
+        uint32_t totalInstructions = 0;
+        uint32_t sequenceScore = 0;
+    };
+
+    [[nodiscard]] static uint64_t DecodeLEB128(const uint8_t*& ptr, const uint8_t* end) noexcept;
+    [[nodiscard]] WASMInstructionStats AnalyzeCodeSection(std::span<const uint8_t> sectionData);
 
     // Domain management
     [[nodiscard]] bool IsDomainBlockedInternal(const std::string& domain) const;

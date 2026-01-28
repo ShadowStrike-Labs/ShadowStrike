@@ -38,9 +38,12 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <powrprof.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "powrprof.lib")
+#pragma comment(lib, "pdh.lib")
 
 // Standard library
 #include <algorithm>
@@ -121,6 +124,16 @@ uint64_t FileTimeToMs(const FILETIME& ft) {
 }
 
 /**
+ * @brief Convert FILETIME to raw 100ns units
+ */
+uint64_t FileTimeToRaw(const FILETIME& ft) {
+    ULARGE_INTEGER uli;
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    return uli.QuadPart;
+}
+
+/**
  * @brief Get process CPU time
  */
 bool GetProcessCPUTime(HANDLE hProcess, uint64_t& kernelMs, uint64_t& userMs) {
@@ -136,14 +149,35 @@ bool GetProcessCPUTime(HANDLE hProcess, uint64_t& kernelMs, uint64_t& userMs) {
 
 /**
  * @brief Check if process uses large pages
+ * @details Checks for SeLockMemoryPrivilege which is required for large page allocation.
+ *          Miners like RandomX almost always require this privilege.
  */
 bool ProcessUsesLargePages(HANDLE hProcess) {
-    PROCESS_BASIC_INFORMATION pbi = {};
-    ULONG returnLength = 0;
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+        return false;
+    }
 
-    // Simplified - would query for large page usage
-    // This requires NtQueryInformationProcess
-    return false;  // Placeholder
+    // Use RAII for handle cleanup
+    struct HandleGuard { HANDLE h; ~HandleGuard() { if(h) CloseHandle(h); } } guard{hToken};
+
+    LUID luid;
+    if (!LookupPrivilegeValueW(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+        return false;
+    }
+
+    PRIVILEGE_SET privs;
+    privs.PrivilegeCount = 1;
+    privs.Control = PRIVILEGE_SET_ALL_NECESSARY;
+    privs.Privilege[0].Luid = luid;
+    privs.Privilege[0].Attributes = 0;
+
+    BOOL result = FALSE;
+    if (!PrivilegeCheck(hToken, &privs, &result)) {
+        return false;
+    }
+
+    return result == TRUE;
 }
 
 /**
@@ -292,6 +326,15 @@ public:
         if (history.samples.size() > CPUAnalyzerConstants::MAX_SAMPLES_PER_PROCESS) {
             history.samples.pop_front();
         }
+    }
+
+    std::optional<ProcessSample> GetLastSample(uint32_t pid) const {
+        std::shared_lock lock(m_mutex);
+        auto it = m_history.find(pid);
+        if (it != m_history.end() && !it->second.samples.empty()) {
+            return it->second.samples.back();
+        }
+        return std::nullopt;
     }
 
     std::vector<ProcessSample> GetHistory(uint32_t pid, size_t maxSamples) const {
@@ -573,6 +616,7 @@ class CPUUsageAnalyzerImpl {
 public:
     CPUUsageAnalyzerImpl() = default;
     ~CPUUsageAnalyzerImpl() {
+        ShutdownPDH();
         Stop();
     }
 
@@ -610,6 +654,17 @@ public:
             GetSystemInfo(&sysInfo);
             m_processorCount = sysInfo.dwNumberOfProcessors;
 
+            // Initialize PDH
+            InitializePDH();
+
+            // Initialize system times
+            FILETIME idle, kernel, user;
+            if (GetSystemTimes(&idle, &kernel, &user)) {
+                m_prevSysIdle = FileTimeToRaw(idle);
+                m_prevSysKernel = FileTimeToRaw(kernel);
+                m_prevSysUser = FileTimeToRaw(user);
+            }
+
             m_initialized = true;
             m_status = ModuleStatus::Stopped;
 
@@ -625,6 +680,8 @@ public:
 
     void Shutdown() {
         Stop();
+
+        ShutdownPDH();
 
         std::unique_lock lock(m_mutex);
         m_initialized = false;
@@ -732,10 +789,10 @@ public:
 
         try {
             // Collect system-wide CPU
-            const double overallCPU = GetSystemCPUUsage();
+            m_lastOverallCPU = GetSystemCPUUsage();
 
-            // Collect per-core usage
-            std::vector<double> perCoreUsage = GetPerCoreCPUUsage();
+            // Collect per-core usage if available
+            m_lastPerCoreUsage = GetPerCoreCPUUsage();
 
             // Enumerate processes
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1072,9 +1129,19 @@ private:
                 sample.kernelTimeMs = kernelMs;
                 sample.userTimeMs = userMs;
 
-                // Calculate CPU percent (simplified - needs delta calculation)
-                // This is a placeholder - proper implementation needs previous sample
-                sample.cpuPercent = 0.0;  // Would calculate from delta
+                // Calculate CPU percent using previous sample
+                auto prevSample = m_processTracker->GetLastSample(pid);
+                if (prevSample) {
+                    uint64_t deltaProc = (kernelMs - prevSample->kernelTimeMs) +
+                                       (userMs - prevSample->userTimeMs);
+
+                    uint64_t deltaSys = m_lastSysTimeDelta;
+
+                    if (deltaSys > 0) {
+                        sample.cpuPercent = (static_cast<double>(deltaProc) / deltaSys) * 100.0;
+                        sample.cpuPercent = std::min(100.0, std::max(0.0, sample.cpuPercent));
+                    }
+                }
             }
 
             // Get thread count
@@ -1107,19 +1174,81 @@ private:
     }
 
     double GetSystemCPUUsage() {
-        FILETIME idleTime, kernelTime, userTime;
-        if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+        FILETIME idle, kernel, user;
+        if (!GetSystemTimes(&idle, &kernel, &user)) {
             return 0.0;
         }
 
-        // Simplified - proper implementation needs delta calculation
-        return 0.0;  // Placeholder
+        uint64_t idleRaw = FileTimeToRaw(idle);
+        uint64_t kernelRaw = FileTimeToRaw(kernel);
+        uint64_t userRaw = FileTimeToRaw(user);
+
+        uint64_t deltaIdle = idleRaw - m_prevSysIdle;
+        uint64_t deltaKernel = kernelRaw - m_prevSysKernel;
+        uint64_t deltaUser = userRaw - m_prevSysUser;
+
+        m_prevSysIdle = idleRaw;
+        m_prevSysKernel = kernelRaw;
+        m_prevSysUser = userRaw;
+
+        uint64_t totalSys = deltaKernel + deltaUser;
+        m_lastSysTimeDelta = totalSys / 10000; // Store in ms for process calc
+
+        if (totalSys == 0) return 0.0;
+
+        // KernelTime includes IdleTime
+        double cpu = (static_cast<double>(totalSys - deltaIdle) / totalSys) * 100.0;
+        return std::min(100.0, std::max(0.0, cpu));
+    }
+
+    void InitializePDH() {
+        if (PdhOpenQueryA(NULL, 0, &m_pdhQuery) != ERROR_SUCCESS) {
+            Logger::Warn("CPUUsageAnalyzer: Failed to open PDH query");
+            return;
+        }
+
+        // Add counter for each core
+        for (uint32_t i = 0; i < m_processorCount; ++i) {
+            HCOUNTER hCounter;
+            std::string path = std::format("\\Processor({})\\% Processor Time", i);
+
+            if (PdhAddCounterA(m_pdhQuery, path.c_str(), 0, &hCounter) == ERROR_SUCCESS) {
+                m_pdhCounters.push_back(hCounter);
+            }
+        }
+
+        // Initial collection
+        PdhCollectQueryData(m_pdhQuery);
+    }
+
+    void ShutdownPDH() {
+        if (m_pdhQuery) {
+            PdhCloseQuery(m_pdhQuery);
+            m_pdhQuery = NULL;
+        }
+        m_pdhCounters.clear();
     }
 
     std::vector<double> GetPerCoreCPUUsage() {
-        std::vector<double> perCore(m_processorCount, 0.0);
-        // Per-core CPU usage requires PDH (Performance Data Helper) API
-        // Simplified implementation
+        std::vector<double> perCore;
+        perCore.reserve(m_processorCount);
+
+        if (!m_pdhQuery || m_pdhCounters.empty()) {
+            return std::vector<double>(m_processorCount, 0.0);
+        }
+
+        // Collect new data
+        if (PdhCollectQueryData(m_pdhQuery) == ERROR_SUCCESS) {
+            for (auto hCounter : m_pdhCounters) {
+                PDH_FMT_COUNTERVALUE displayValue;
+                if (PdhGetFormattedCounterValue(hCounter, PDH_FMT_DOUBLE, NULL, &displayValue) == ERROR_SUCCESS) {
+                    perCore.push_back(displayValue.doubleValue);
+                } else {
+                    perCore.push_back(0.0);
+                }
+            }
+        }
+
         return perCore;
     }
 
@@ -1192,6 +1321,16 @@ private:
     uint32_t m_processorCount{ 0 };
     double m_lastOverallCPU{ 0.0 };
     std::vector<double> m_lastPerCoreUsage;
+
+    // System CPU time tracking
+    uint64_t m_prevSysIdle{ 0 };
+    uint64_t m_prevSysKernel{ 0 };
+    uint64_t m_prevSysUser{ 0 };
+    uint64_t m_lastSysTimeDelta{ 0 };
+
+    // PDH
+    HQUERY m_pdhQuery{ NULL };
+    std::vector<HCOUNTER> m_pdhCounters;
 
     // Managers
     std::unique_ptr<ProcessTracker> m_processTracker;

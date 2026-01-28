@@ -1009,7 +1009,7 @@ public:
         std::vector<WMISubscription> subscriptions;
 
         try {
-            Logger::Debug("PersistenceDetector: Scanning WMI subscriptions");
+            Logger::Info("PersistenceDetector: Performing deep WMI persistence scan");
 
             IWbemLocator* pLocator = nullptr;
             HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
@@ -1022,7 +1022,7 @@ public:
             IWbemServices* pServices = nullptr;
             hr = pLocator->ConnectServer(_bstr_t(L"ROOT\\subscription"), nullptr, nullptr, nullptr, 0, nullptr, nullptr, &pServices);
             if (FAILED(hr)) {
-                Logger::Error("PersistenceDetector: WMI ConnectServer failed: {:#x}", static_cast<uint32_t>(hr));
+                Logger::Error("PersistenceDetector: WMI ConnectServer(ROOT\\subscription) failed: {:#x}", static_cast<uint32_t>(hr));
                 pLocator->Release();
                 return subscriptions;
             }
@@ -1031,45 +1031,100 @@ public:
             CoSetProxyBlanket(pServices, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
                             RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
 
-            // Query event consumers
-            IEnumWbemClassObject* pEnumerator = nullptr;
+            // 1. Query Bindings: __FilterToConsumerBinding connects triggers to actions
+            IEnumWbemClassObject* pBindingEnum = nullptr;
             hr = pServices->ExecQuery(_bstr_t(L"WQL"),
-                                     _bstr_t(L"SELECT * FROM __EventConsumer"),
+                                     _bstr_t(L"SELECT * FROM __FilterToConsumerBinding"),
                                      WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-                                     nullptr, &pEnumerator);
+                                     nullptr, &pBindingEnum);
+
             if (SUCCEEDED(hr)) {
-                IWbemClassObject* pObject = nullptr;
+                IWbemClassObject* pBindingObj = nullptr;
                 ULONG returned = 0;
 
-                while (pEnumerator) {
-                    hr = pEnumerator->Next(WBEM_INFINITE, 1, &pObject, &returned);
-                    if (returned == 0) break;
-
+                while (SUCCEEDED(pBindingEnum->Next(WBEM_INFINITE, 1, &pBindingObj, &returned)) && returned > 0) {
                     WMISubscription sub{};
 
-                    VARIANT vtName;
-                    VariantInit(&vtName);
-                    if (SUCCEEDED(pObject->Get(L"Name", 0, &vtName, nullptr, nullptr))) {
-                        if (vtName.vt == VT_BSTR) {
-                            sub.consumerName = vtName.bstrVal;
+                    VARIANT vtFilter, vtConsumer;
+                    VariantInit(&vtFilter);
+                    VariantInit(&vtConsumer);
+
+                    // Get relative paths to Filter and Consumer
+                    if (SUCCEEDED(pBindingObj->Get(L"Filter", 0, &vtFilter, nullptr, nullptr)) &&
+                        SUCCEEDED(pBindingObj->Get(L"Consumer", 0, &vtConsumer, nullptr, nullptr))) {
+
+                        if (vtFilter.vt == VT_BSTR && vtConsumer.vt == VT_BSTR) {
+                            sub.bindingName = vtFilter.bstrVal; // Use filter path as identifier
+
+                            // 2. Resolve the Filter (The Trigger)
+                            IWbemClassObject* pFilterObj = nullptr;
+                            if (SUCCEEDED(pServices->GetObject(vtFilter.bstrVal, 0, nullptr, &pFilterObj, nullptr))) {
+                                VARIANT vtQuery, vtName, vtLang;
+                                VariantInit(&vtQuery); VariantInit(&vtName); VariantInit(&vtLang);
+
+                                if (SUCCEEDED(pFilterObj->Get(L"Query", 0, &vtQuery, nullptr, nullptr)) && vtQuery.vt == VT_BSTR)
+                                    sub.filterQuery = vtQuery.bstrVal;
+                                if (SUCCEEDED(pFilterObj->Get(L"Name", 0, &vtName, nullptr, nullptr)) && vtName.vt == VT_BSTR)
+                                    sub.filterName = vtName.bstrVal;
+                                if (SUCCEEDED(pFilterObj->Get(L"QueryLanguage", 0, &vtLang, nullptr, nullptr)) && vtLang.vt == VT_BSTR)
+                                    sub.filterLanguage = vtLang.bstrVal;
+
+                                VariantClear(&vtQuery); VariantClear(&vtName); VariantClear(&vtLang);
+                                pFilterObj->Release();
+                            }
+
+                            // 3. Resolve the Consumer (The Payload)
+                            IWbemClassObject* pConsumerObj = nullptr;
+                            if (SUCCEEDED(pServices->GetObject(vtConsumer.bstrVal, 0, nullptr, &pConsumerObj, nullptr))) {
+                                VARIANT vtCName, vtClass;
+                                VariantInit(&vtCName); VariantInit(&vtClass);
+
+                                if (SUCCEEDED(pConsumerObj->Get(L"Name", 0, &vtCName, nullptr, nullptr)) && vtCName.vt == VT_BSTR)
+                                    sub.consumerName = vtCName.bstrVal;
+
+                                // Determine consumer type and extract payload
+                                VARIANT vtPath; VariantInit(&vtPath);
+                                if (SUCCEEDED(pConsumerObj->Get(L"__CLASS", 0, &vtClass, nullptr, nullptr)) && vtClass.vt == VT_BSTR) {
+                                    sub.consumerType = vtClass.bstrVal;
+
+                                    if (sub.consumerType == L"CommandLineEventConsumer") {
+                                        VARIANT vtCmd; VariantInit(&vtCmd);
+                                        if (SUCCEEDED(pConsumerObj->Get(L"CommandLineTemplate", 0, &vtCmd, nullptr, nullptr)) && vtCmd.vt == VT_BSTR)
+                                            sub.consumerCommand = vtCmd.bstrVal;
+                                        VariantClear(&vtCmd);
+                                    }
+                                    else if (sub.consumerType == L"ActiveScriptEventConsumer") {
+                                        VARIANT vtScript; VariantInit(&vtScript);
+                                        if (SUCCEEDED(pConsumerObj->Get(L"ScriptText", 0, &vtScript, nullptr, nullptr)) && vtScript.vt == VT_BSTR)
+                                            sub.consumerCommand = vtScript.bstrVal; // Script content is the "command"
+                                        VariantClear(&vtScript);
+                                    }
+                                }
+
+                                VariantClear(&vtCName); VariantClear(&vtClass);
+                                pConsumerObj->Release();
+                            }
                         }
-                        VariantClear(&vtName);
                     }
 
-                    subscriptions.push_back(sub);
-                    pObject->Release();
-                }
+                    if (!sub.consumerCommand.empty()) {
+                        subscriptions.push_back(std::move(sub));
+                    }
 
-                pEnumerator->Release();
+                    VariantClear(&vtFilter);
+                    VariantClear(&vtConsumer);
+                    pBindingObj->Release();
+                }
+                pBindingEnum->Release();
             }
 
             pServices->Release();
             pLocator->Release();
 
-            Logger::Info("PersistenceDetector: Found {} WMI subscriptions", subscriptions.size());
+            Logger::Info("PersistenceDetector: WMI scan found {} correlated subscriptions", subscriptions.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("PersistenceDetector: WMI scan exception: {}", e.what());
+            Logger::Error("PersistenceDetector: Deep WMI scan exception: {}", e.what());
         }
 
         return subscriptions;
@@ -1079,146 +1134,158 @@ public:
     // TARGET RESOLUTION
     // ========================================================================
 
-    [[nodiscard]] TargetBinary ResolveTargetImpl(const std::wstring& command) {
-        TargetBinary target{};
-        target.originalPath = command;
+    [[nodiscard]] std::vector<TargetBinary> ResolveComplexCommandImpl(const std::wstring& command) {
+        std::vector<TargetBinary> targets;
+        if (command.empty()) return targets;
 
+        // 1. Initial resolution of the primary command
+        TargetBinary primary = ResolveTargetImpl(command);
+        targets.push_back(primary);
+
+        std::wstring lowerCmd = StringUtils::ToLowerCase(command);
+
+        // 2. Resolve LOLBins (Living Off The Land Binaries)
         try {
-            // Check cache
-            if (m_config.useCache) {
-                std::shared_lock lock(m_cacheMutex);
-                auto it = m_targetCache.find(command);
-                if (it != m_targetCache.end()) {
-                    m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
-                    return it->second;
+            // rundll32.exe resolution
+            if (lowerCmd.find(L"rundll32.exe") != std::wstring::npos) {
+                // Format: rundll32.exe <dllname>,<entrypoint> <args>
+                std::wstring args = primary.arguments;
+                size_t commaPos = args.find(L',');
+                std::wstring dllPath = (commaPos != std::wstring::npos) ? args.substr(0, commaPos) : args;
+                dllPath = StringUtils::Trim(dllPath);
+
+                if (!dllPath.empty()) {
+                    auto dllTarget = ResolveTargetImpl(dllPath);
+                    dllTarget.description = L"Target DLL loaded via rundll32";
+                    targets.push_back(dllTarget);
                 }
             }
+            // regsvr32.exe resolution
+            else if (lowerCmd.find(L"regsvr32.exe") != std::wstring::npos) {
+                // Format: regsvr32.exe [/u] [/s] [/n] [/i[:cmdline]] <dllname>
+                std::vector<std::wstring> tokens = StringUtils::Split(primary.arguments, L' ');
+                for (const auto& token : tokens) {
+                    if (!token.empty() && token[0] != L'/' && token[0] != L'-') {
+                        auto dllTarget = ResolveTargetImpl(token);
+                        dllTarget.description = L"Target DLL registered via regsvr32";
+                        targets.push_back(dllTarget);
+                    }
+                }
+            }
+            // mshta.exe resolution
+            else if (lowerCmd.find(L"mshta.exe") != std::wstring::npos) {
+                // Format: mshta.exe <url/path>
+                if (!primary.arguments.empty()) {
+                    auto htaTarget = ResolveTargetImpl(primary.arguments);
+                    htaTarget.description = L"HTA/Script target executed via mshta";
+                    targets.push_back(htaTarget);
+                }
+            }
+            // cmd.exe / powershell.exe resolution
+            else if (lowerCmd.find(L"cmd.exe") != std::wstring::npos ||
+                     lowerCmd.find(L"powershell.exe") != std::wstring::npos ||
+                     lowerCmd.find(L"pwsh.exe") != std::wstring::npos) {
 
-            // Extract executable path
-            std::wstring exePath = ExtractExecutablePath(command);
+                // Handle Base64 encoded PowerShell commands
+                if (lowerCmd.find(L"-enc") != std::wstring::npos ||
+                    lowerCmd.find(L"-encodedcommand") != std::wstring::npos) {
 
-            // Expand environment variables
-            wchar_t expanded[MAX_PATH * 4];
-            if (ExpandEnvironmentStringsW(exePath.c_str(), expanded, sizeof(expanded) / sizeof(wchar_t))) {
-                exePath = expanded;
+                    std::vector<std::wstring> tokens = StringUtils::Split(primary.arguments, L' ');
+                    for (size_t i = 0; i < tokens.size(); ++i) {
+                        if (StringUtils::EqualsIgnoreCase(tokens[i], L"-enc") ||
+                            StringUtils::EqualsIgnoreCase(tokens[i], L"-encodedcommand")) {
+                            if (i + 1 < tokens.size()) {
+                                std::string encoded = StringUtils::WideToUtf8(tokens[i + 1]);
+                                std::string decoded = CryptoUtils::Base64Decode(encoded);
+                                std::wstring wDecoded = StringUtils::Utf8ToWide(decoded);
+
+                                TargetBinary encTarget;
+                                encTarget.originalPath = tokens[i + 1];
+                                encTarget.path = L"DECODED_SCRIPT";
+                                encTarget.arguments = wDecoded;
+                                encTarget.isScript = true;
+                                encTarget.description = L"De-obfuscated PowerShell command";
+                                targets.push_back(encTarget);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::Error("PersistenceDetector: LOLBin resolution exception: {}", e.what());
+        }
+
+        return targets;
+    }
+
+    [[nodiscard]] std::vector<PersistenceEntry> ScanPathImpl(const std::wstring& targetPath) {
+        std::vector<PersistenceEntry> results;
+        std::wstring lowerTarget = StringUtils::ToLowerCase(targetPath);
+
+        // Perform a standard scan to gather all entries
+        // Note: In a performance-critical production environment, we would implement
+        // specialized index lookups, but for forensic thoroughness, we analyze all ASEPs.
+        ScanResult fullScan = ScanImpl(ScanScope::Extended);
+
+        for (auto& entry : fullScan.entries) {
+            bool match = false;
+
+            // Check primary target
+            if (StringUtils::Contains(StringUtils::ToLowerCase(entry.target.path), lowerTarget)) {
+                match = true;
             }
 
-            target.path = exePath;
-
-            // Check if file exists
-            std::error_code ec;
-            target.exists = fs::exists(exePath, ec);
-
-            if (target.exists) {
-                target.fileSize = fs::file_size(exePath, ec);
-
-                auto lastWriteTime = fs::last_write_time(exePath, ec);
-                if (!ec) {
-                    auto sctp = std::chrono::time_point_cast<system_clock::duration>(
-                        lastWriteTime - fs::file_time_type::clock::now() + system_clock::now()
-                    );
-                    target.modifiedTime = sctp;
-                }
-
-                // Determine file type
-                std::wstring lowerPath = StringUtils::ToLowerCase(exePath);
-                target.isExecutable = lowerPath.ends_with(L".exe") || lowerPath.ends_with(L".com");
-                target.isDLL = lowerPath.ends_with(L".dll");
-                target.isScript = lowerPath.ends_with(L".bat") || lowerPath.ends_with(L".cmd") ||
-                                lowerPath.ends_with(L".vbs") || lowerPath.ends_with(L".ps1") ||
-                                lowerPath.ends_with(L".js");
-
-                // Check location
-                target.inSystemPath = lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos ||
-                                     lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos;
-                target.inTempPath = lowerPath.find(L"\\temp\\") != std::wstring::npos ||
-                                   lowerPath.find(L"\\tmp\\") != std::wstring::npos;
-
-                // Calculate hash
-                if (m_config.checkHashes && target.fileSize < 100 * 1024 * 1024) {  // Max 100MB
-                    target.sha256 = HashUtils::CalculateSHA256File(exePath);
-                    target.sha256Hex = HashUtils::ToHexString(target.sha256);
-                    m_stats.hashesChecked.fetch_add(1, std::memory_order_relaxed);
-                }
-
-                // Verify signature
-                if (m_config.verifySignatures) {
-                    // Would use CertUtils here
-                    // For now, simplified
-                    target.signatureStatus = SignatureStatus::Unknown;
-                    m_stats.signaturesVerified.fetch_add(1, std::memory_order_relaxed);
-                }
-
-                // Calculate entropy (for packed detection)
-                if (target.fileSize > 0 && target.fileSize < 10 * 1024 * 1024) {
-                    std::ifstream file(exePath, std::ios::binary);
-                    if (file) {
-                        std::vector<uint8_t> buffer(std::min<size_t>(target.fileSize, 1024 * 1024));
-                        file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-                        target.entropy = CalculateEntropy(buffer);
-                        target.isPacked = (target.entropy >= PersistenceDetectorConstants::SUSPICIOUS_ENTROPY_THRESHOLD);
+            // Check additional targets (resolved from LOLBins/Scripts)
+            if (!match) {
+                for (const auto& addTarget : entry.additionalTargets) {
+                    if (StringUtils::Contains(StringUtils::ToLowerCase(addTarget.path), lowerTarget)) {
+                        match = true;
+                        break;
                     }
                 }
             }
 
-            // Cache result
-            if (m_config.useCache) {
-                std::unique_lock lock(m_cacheMutex);
-                m_targetCache[command] = target;
+            // Check raw command if no path match yet (for obfuscated entries)
+            if (!match && StringUtils::Contains(StringUtils::ToLowerCase(entry.rawCommand), lowerTarget)) {
+                match = true;
             }
 
-        } catch (const std::exception& e) {
-            Logger::Error("PersistenceDetector: Target resolution exception: {}", e.what());
+            if (match) {
+                results.push_back(std::move(entry));
+            }
         }
 
-        return target;
+        return results;
     }
 
     // ========================================================================
     // RISK ASSESSMENT
     // ========================================================================
 
+    [[nodiscard]] bool IsLOLBin(const std::wstring& path) const noexcept {
+        std::wstring lowerPath = StringUtils::ToLowerCase(path);
+        static const std::vector<std::wstring> lolbins = {
+            L"rundll32.exe", L"regsvr32.exe", L"mshta.exe", L"powershell.exe",
+            L"cmd.exe", L"certutil.exe", L"bitsadmin.exe", L"scrcons.exe",
+            L"wmic.exe", L"msiexec.exe", L"cscript.exe", L"wscript.exe"
+        };
+
+        for (const auto& bin : lolbins) {
+            if (lowerPath.find(bin) != std::wstring::npos) return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] RiskLevel AssessRisk(const PersistenceEntry& entry) const noexcept {
-        uint32_t riskScore = 0;
+        uint32_t riskScore = CalculateRiskScore(entry);
 
-        // Target doesn't exist
-        if (!entry.target.path.empty() && !entry.target.exists) {
-            riskScore += 40;
-        }
+        // Known bad/good overrides
+        if (entry.isKnownBad) return RiskLevel::Malicious;
+        if (entry.isKnownGood || entry.target.isMicrosoftSigned) return RiskLevel::Safe;
 
-        // Suspicious path
-        if (IsSuspiciousPath(entry.target.path)) {
-            riskScore += 30;
-        }
-
-        // Unsigned binary
-        if (entry.target.signatureStatus == SignatureStatus::NotSigned && entry.target.isExecutable) {
-            riskScore += 20;
-        }
-
-        // High entropy (packed)
-        if (entry.target.isPacked) {
-            riskScore += 25;
-        }
-
-        // Temp location
-        if (entry.target.inTempPath) {
-            riskScore += 35;
-        }
-
-        // Known bad hash
-        if (entry.isKnownBad) {
-            return RiskLevel::Malicious;
-        }
-
-        // Known good
-        if (entry.isKnownGood || entry.target.isMicrosoftSigned) {
-            return RiskLevel::Safe;
-        }
-
-        // Calculate final risk
-        if (riskScore >= 70) return RiskLevel::Malicious;
-        if (riskScore >= 40) return RiskLevel::Suspicious;
+        // Calculate final risk level based on score
+        if (riskScore >= 75) return RiskLevel::Malicious;
+        if (riskScore >= 45) return RiskLevel::Suspicious;
         if (riskScore >= 20) return RiskLevel::Unknown;
         if (entry.target.isTrusted) return RiskLevel::Safe;
 
@@ -1228,13 +1295,47 @@ public:
     [[nodiscard]] uint8_t CalculateRiskScore(const PersistenceEntry& entry) const noexcept {
         uint32_t score = 0;
 
-        if (!entry.target.exists) score += 40;
+        // 1. Availability & Pathing (Baseline: 0-40)
+        if (!entry.target.exists && !entry.target.isScript) score += 40;
         if (IsSuspiciousPath(entry.target.path)) score += 30;
-        if (entry.target.signatureStatus == SignatureStatus::NotSigned) score += 20;
-        if (entry.target.isPacked) score += 25;
         if (entry.target.inTempPath) score += 35;
+
+        // 2. Binary Characteristics (Baseline: 0-45)
+        if (entry.target.signatureStatus == SignatureStatus::NotSigned && entry.target.isExecutable) {
+            score += 20;
+        }
+        if (entry.target.isPacked) score += 25;
+
+        // 3. Advanced Persistence Heuristics (Pillar 4 Weights)
+
+        // LOLBin Usage (+25)
+        if (IsLOLBin(entry.target.path)) {
+            score += 25;
+        }
+
+        // WMI Persistence (+40) - High-confidence indicator of advanced threats
+        if (entry.type == PersistenceType::WMI_EventConsumer ||
+            entry.type == PersistenceType::WMI_FilterToConsumer) {
+            score += 40;
+        }
+
+        // Non-Standard Extensions (+15)
+        std::wstring ext = fs::path(entry.target.path).extension().wstring();
+        if (!ext.empty() && entry.target.isExecutable) {
+            std::wstring lowerExt = StringUtils::ToLowerCase(ext);
+            if (lowerExt != L".exe" && lowerExt != L".dll" && lowerExt != L".sys") {
+                score += 15;
+            }
+        }
+
+        // 4. Overrides
         if (entry.isKnownBad) score = 100;
-        if (entry.target.isMicrosoftSigned) score = std::max(score, 10u);
+
+        // Trusted Microsoft binaries should always have a lower floor unless modified
+        if (entry.target.isMicrosoftSigned && score > 10) {
+            // Even signed bins can be used maliciously (LOLBins), so we don't zero it
+            score = std::max(10u, score - 20);
+        }
 
         return static_cast<uint8_t>(std::min(score, 100u));
     }
@@ -1507,10 +1608,12 @@ void PersistenceDetector::CancelScan() {
 }
 
 [[nodiscard]] std::vector<TargetBinary> PersistenceDetector::ResolveComplexCommand(const std::wstring& command) {
-    // Simplified - would parse rundll32, cmd /c, etc.
-    std::vector<TargetBinary> targets;
-    targets.push_back(ResolveTarget(command));
-    return targets;
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        Logger::Error("PersistenceDetector: Not initialized");
+        return {};
+    }
+
+    return m_impl->ResolveComplexCommandImpl(command);
 }
 
 // ============================================================================

@@ -519,17 +519,37 @@ public:
 
         try {
             if (m_addinStatus == AddinStatus::Connected) {
-                Logger::Warn("Already connected to Outlook");
                 return true;
             }
 
             m_addinStatus = AddinStatus::Connecting;
 
-            // In production, would use COM to get Outlook.Application object
-            // via GetActiveObject or CoCreateInstance
-            // For now, just check if Outlook is running
-            if (!IsOutlookRunning()) {
-                Logger::Warn("Outlook is not running");
+            // KERNEL LOGIC WILL BE INTEGRATED INTO HERE
+            // The kernel driver will monitor Outlook.exe process creation and injection
+            // of the protection stub to ensure the COM bridge is secure.
+
+            // Attempt to get the active Outlook instance first
+            CLSID clsid;
+            HRESULT hr = CLSIDFromProgID(L"Outlook.Application", &clsid);
+            if (FAILED(hr)) {
+                Logger::Error("OutlookScanner: Failed to get Outlook CLSID: 0x{:X}", hr);
+                m_addinStatus = AddinStatus::Error;
+                return false;
+            }
+
+            IUnknown* pUnknown = nullptr;
+            hr = GetActiveObject(clsid, nullptr, &pUnknown);
+
+            if (SUCCEEDED(hr)) {
+                hr = pUnknown->QueryInterface(IID_IDispatch, (void**)&m_pOutlookApp);
+                pUnknown->Release();
+            } else {
+                // If not running, attempt to create a new instance
+                hr = CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER, IID_IDispatch, (void**)&m_pOutlookApp);
+            }
+
+            if (FAILED(hr)) {
+                Logger::Warn("OutlookScanner: Could not connect to Outlook instance (0x{:X})", hr);
                 m_addinStatus = AddinStatus::Disconnected;
                 return false;
             }
@@ -537,7 +557,7 @@ public:
             m_addinStatus = AddinStatus::Connected;
             m_status = ModuleStatus::Running;
 
-            Logger::Info("Connected to Outlook");
+            Logger::Info("Connected to Outlook Application instance via COM");
             return true;
 
         } catch (const std::exception& e) {

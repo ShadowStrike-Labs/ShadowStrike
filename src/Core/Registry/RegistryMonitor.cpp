@@ -60,7 +60,8 @@
 // ============================================================================
 #include <Windows.h>
 #include <winternl.h>
-#include <fltUser.h>
+#include "../../Communication/FilterConnection.hpp"
+#include "../../Communication/MessageDispatcher.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -1171,23 +1172,20 @@ private:
 
     [[nodiscard]] bool ConnectToKernelDriver() {
         try {
-            // In production, would use FilterConnectCommunicationPort
-            // For now, simulate connection
-            Logger::Debug("Attempting kernel driver connection...");
+            Logger::Info("Connecting to ShadowStrike Registry Filter port: {}",
+                StringUtils::WideToUtf8(RegistryMonitorConstants::COMMUNICATION_PORT));
 
-            // HRESULT hr = FilterConnectCommunicationPort(
-            //     RegistryMonitorConstants::COMMUNICATION_PORT,
-            //     0,
-            //     nullptr,
-            //     0,
-            //     nullptr,
-            //     &m_filterPort
-            // );
+            m_connection = std::make_unique<Communication::FilterConnection>(
+                RegistryMonitorConstants::COMMUNICATION_PORT);
 
-            // Simulated connection
-            m_filterPort = nullptr;  // Would be valid handle in production
+            if (m_connection->Connect()) {
+                Logger::Info("Successfully connected to kernel registry filter");
+                return true;
+            }
 
-            return false;  // No kernel driver in this implementation
+            Logger::Error("Failed to connect to kernel registry filter: {}",
+                m_connection->GetLastErrorMessage());
+            return false;
 
         } catch (const std::exception& e) {
             Logger::Error("ConnectToKernelDriver - Exception: {}", e.what());
@@ -1217,9 +1215,28 @@ private:
     void WorkerThreadProc() {
         Logger::Debug("Registry worker thread started");
 
+        // Buffer for incoming messages
+        std::vector<uint8_t> messageBuffer(Communication::MAX_MESSAGE_SIZE);
+
         while (!m_stopRequested) {
-            // In production, would process events from kernel queue
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!m_connection || !m_connection->IsConnected()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // The kernel driver sends RegistryNotificationData structures via the Filter Port
+            size_t bytesReceived = m_connection->GetMessage(messageBuffer, 1000); // 1s timeout
+
+            if (bytesReceived >= sizeof(Communication::MessageHeader)) {
+                auto* header = reinterpret_cast<Communication::MessageHeader*>(messageBuffer.data());
+
+                if (header->IsValid() && header->messageType == static_cast<uint16_t>(Communication::MessageType::NotifyRegistrySetValue)) {
+                    // Process the registry notification
+                    // In a full implementation, we would marshal the raw buffer into a RegistryEvent
+                    // and call ProcessEvent(event)
+                }
+            }
         }
 
         Logger::Debug("Registry worker thread stopped");
@@ -1501,7 +1518,7 @@ private:
     RegistryMonitorStatistics m_stats;
 
     // Kernel communication
-    HANDLE m_filterPort{ nullptr };
+    std::unique_ptr<Communication::FilterConnection> m_connection;
 
     // Worker threads
     std::vector<std::thread> m_workerThreads;

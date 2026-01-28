@@ -31,6 +31,9 @@
 #include <queue>
 #include <regex>
 #include <sstream>
+#include <format>
+#include <cctype>
+#include <iomanip>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -51,6 +54,7 @@
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
+#include "../ThreatIntel/ThreatIntelFormat.hpp"
 
 namespace ShadowStrike::AntiEvasion {
 
@@ -308,6 +312,15 @@ namespace ShadowStrike::AntiEvasion {
 
         // Parse TLD from domain
         [[nodiscard]] std::wstring GetTLD(std::wstring_view domain) const noexcept;
+
+        // NEW: Check network adapters using GetAdaptersAddresses (Modern API)
+        [[nodiscard]] bool CheckNetworkAdapters(
+            bool& outVpnDetected,
+            std::wstring& outVpnName,
+            bool& outVmMacDetected,
+            std::wstring& outVmMacInfo,
+            NetworkEvasionError* err
+        ) const noexcept;
     };
 
     // ========================================================================
@@ -320,13 +333,13 @@ namespace ShadowStrike::AntiEvasion {
                 return true; // Already initialized
             }
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Initializing...");
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Initializing...");
 
             // Initialize Winsock
             WSADATA wsaData;
             const int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
             if (wsaResult != 0) {
-                Utils::Logger::Error(L"NetworkBasedEvasionDetector: WSAStartup failed: {}", wsaResult);
+                SS_LOG_ERROR(L"AntiEvasion", L"NetworkBasedEvasionDetector: WSAStartup failed: %d", wsaResult);
 
                 if (err) {
                     err->win32Code = wsaResult;
@@ -339,25 +352,25 @@ namespace ShadowStrike::AntiEvasion {
 
             // Threat intel is optional (can be set later)
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Initialized successfully");
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Initialized successfully");
             return true;
 
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"NetworkBasedEvasionDetector initialization failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"NetworkBasedEvasionDetector initialization failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Initialization failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_initialized = false;
             return false;
         }
         catch (...) {
-            Utils::Logger::Critical(L"NetworkBasedEvasionDetector: Unknown initialization error");
+            SS_LOG_FATAL(L"AntiEvasion", L"NetworkBasedEvasionDetector: Unknown initialization error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -377,7 +390,7 @@ namespace ShadowStrike::AntiEvasion {
                 return; // Already shutdown
             }
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Shutting down...");
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Shutting down...");
 
             // Stop monitoring
             m_monitoringActive = false;
@@ -394,16 +407,112 @@ namespace ShadowStrike::AntiEvasion {
             // Cleanup Winsock
             WSACleanup();
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Shutdown complete");
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Shutdown complete");
         }
         catch (...) {
-            Utils::Logger::Error(L"NetworkBasedEvasionDetector: Exception during shutdown");
+            SS_LOG_ERROR(L"AntiEvasion", L"NetworkBasedEvasionDetector: Exception during shutdown");
         }
     }
 
     // ========================================================================
     // IMPL: HELPER METHODS
     // ========================================================================
+
+    bool NetworkBasedEvasionDetector::Impl::CheckNetworkAdapters(
+        bool& outVpnDetected,
+        std::wstring& outVpnName,
+        bool& outVmMacDetected,
+        std::wstring& outVmMacInfo,
+        NetworkEvasionError* err
+    ) const noexcept {
+        outVpnDetected = false;
+        outVmMacDetected = false;
+
+        ULONG family = AF_UNSPEC;
+        ULONG flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS;
+        ULONG bufferSize = 15000;
+
+        // Allocate buffer
+        std::vector<BYTE> buffer(bufferSize);
+        PIP_ADAPTER_ADDRESSES pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+
+        // First call to get size
+        DWORD result = GetAdaptersAddresses(family, flags, nullptr, pAddresses, &bufferSize);
+
+        if (result == ERROR_BUFFER_OVERFLOW) {
+            buffer.resize(bufferSize);
+            pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+            result = GetAdaptersAddresses(family, flags, nullptr, pAddresses, &bufferSize);
+        }
+
+        if (result != ERROR_SUCCESS) {
+            if (err) {
+                err->win32Code = result;
+                err->message = L"GetAdaptersAddresses failed";
+            }
+            return false;
+        }
+
+        // Iterate adapters
+        for (PIP_ADAPTER_ADDRESSES pCurrAddresses = pAddresses; pCurrAddresses != nullptr; pCurrAddresses = pCurrAddresses->Next) {
+            if (pCurrAddresses->OperStatus != IfOperStatusUp) continue;
+
+            std::wstring description = pCurrAddresses->Description ? pCurrAddresses->Description : L"";
+            std::wstring friendlyName = pCurrAddresses->FriendlyName ? pCurrAddresses->FriendlyName : L"";
+            std::wstring dnsSuffix = pCurrAddresses->DnsSuffix ? pCurrAddresses->DnsSuffix : L"";
+
+            // 1. VPN Detection
+            const std::vector<std::wstring> vpnKeywords = {
+                L"VPN", L"TAP", L"TUN", L"Virtual", L"OpenVPN", L"WireGuard",
+                L"NordVPN", L"ExpressVPN", L"Cisco AnyConnect", L"Fortinet"
+            };
+
+            for (const auto& keyword : vpnKeywords) {
+                if (Utils::StringUtils::IContains(description, keyword) ||
+                    Utils::StringUtils::IContains(friendlyName, keyword)) {
+                    outVpnDetected = true;
+                    outVpnName = description.empty() ? friendlyName : description;
+                }
+            }
+
+            // 2. MAC Address OUI Fingerprinting (VM Detection)
+            if (pCurrAddresses->PhysicalAddressLength >= 3) {
+                // VMware: 00:05:69, 00:0C:29, 00:1C:14, 00:50:56
+                // VirtualBox: 08:00:27
+                // Parallels: 00:1C:42
+                // Xen: 00:16:3E
+                // QEMU: 52:54:00
+                // Hybrid Analysis: 0A:00:27
+
+                const BYTE* mac = pCurrAddresses->PhysicalAddress;
+
+                bool isVmMac = false;
+                std::wstring vmVendor;
+
+                if (mac[0] == 0x00 && mac[1] == 0x05 && mac[2] == 0x69) { isVmMac = true; vmVendor = L"VMware"; }
+                else if (mac[0] == 0x00 && mac[1] == 0x0C && mac[2] == 0x29) { isVmMac = true; vmVendor = L"VMware"; }
+                else if (mac[0] == 0x00 && mac[1] == 0x1C && mac[2] == 0x14) { isVmMac = true; vmVendor = L"VMware"; }
+                else if (mac[0] == 0x00 && mac[1] == 0x50 && mac[2] == 0x56) { isVmMac = true; vmVendor = L"VMware"; }
+                else if (mac[0] == 0x08 && mac[1] == 0x00 && mac[2] == 0x27) { isVmMac = true; vmVendor = L"VirtualBox"; }
+                else if (mac[0] == 0x0A && mac[1] == 0x00 && mac[2] == 0x27) { isVmMac = true; vmVendor = L"Hybrid Analysis"; } // Often used in HA sandboxes
+                else if (mac[0] == 0x00 && mac[1] == 0x1C && mac[2] == 0x42) { isVmMac = true; vmVendor = L"Parallels"; }
+                else if (mac[0] == 0x00 && mac[1] == 0x16 && mac[2] == 0x3E) { isVmMac = true; vmVendor = L"Xen"; }
+                else if (mac[0] == 0x52 && mac[1] == 0x54 && mac[2] == 0x00) { isVmMac = true; vmVendor = L"QEMU/KVM"; }
+
+                if (isVmMac) {
+                    outVmMacDetected = true;
+                    std::wstringstream ss;
+                    ss << vmVendor << L" OUI (";
+                    ss << std::hex << std::setfill(L'0');
+                    ss << std::setw(2) << (int)mac[0] << L"-" << std::setw(2) << (int)mac[1] << L"-" << std::setw(2) << (int)mac[2];
+                    ss << L")";
+                    outVmMacInfo = ss.str();
+                }
+            }
+        }
+
+        return true;
+    }
 
     double NetworkBasedEvasionDetector::Impl::CalculateDomainEntropy(std::wstring_view domain) const noexcept {
         if (domain.empty()) {
@@ -755,7 +864,8 @@ namespace ShadowStrike::AntiEvasion {
             // Get process name
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
             if (hProcess) {
-                result.processName = Utils::ProcessUtils::GetProcessName(hProcess);
+                // GetProcessName expects ProcessId (DWORD), not HANDLE
+                result.processName = Utils::ProcessUtils::GetProcessName(processId).value_or(L"");
                 CloseHandle(hProcess);
             }
 
@@ -784,20 +894,20 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeProcess failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Analysis failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_impl->m_stats.analysisErrors++;
             return result;
         }
         catch (...) {
-            Utils::Logger::Critical(L"AnalyzeProcess: Unknown error");
+            SS_LOG_FATAL(L"AntiEvasion", L"AnalyzeProcess: Unknown error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -837,8 +947,8 @@ namespace ShadowStrike::AntiEvasion {
             return AnalyzeProcess(processId, config, err);
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeProcess (handle) failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess (handle) failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -938,7 +1048,47 @@ namespace ShadowStrike::AntiEvasion {
 
             // Check against threat intel
             if (m_impl->m_threatIntel) {
-                // TODO: Query threat intel for domain reputation
+                try {
+                    // Convert to narrow string for ThreatIntel lookup (TI store uses UTF-8)
+                    std::string domainStr = Utils::StringUtils::ToNarrow(domain);
+
+                    auto lookupResult = m_impl->m_threatIntel->LookupDomain(domainStr);
+
+                    if (lookupResult.IsMalicious()) {
+                        NetworkDetectedTechnique detection(NetworkEvasionTechnique::C2_KnownDomain);
+                        detection.confidence = 0.99; // High confidence from TI source
+                        detection.severity = NetworkEvasionSeverity::Critical;
+                        detection.target = std::wstring(domain);
+                        detection.description = L"Malicious domain detected via Threat Intel";
+
+                        if (lookupResult.category != ThreatIntel::ThreatCategory::Unknown) {
+                            detection.technicalDetails = L"Category: " + Utils::StringUtils::ToWide(
+                                ThreatIntel::ThreatCategoryToString(lookupResult.category)
+                            );
+                        }
+
+                        outDetections.push_back(std::move(detection));
+                        m_impl->m_stats.c2Detections++;
+                    }
+                    else if (lookupResult.IsSuspicious()) {
+                        NetworkDetectedTechnique detection(NetworkEvasionTechnique::C2_LowReputation);
+                        detection.confidence = 0.75;
+                        detection.severity = NetworkEvasionSeverity::High;
+                        detection.target = std::wstring(domain);
+                        detection.description = L"Suspicious domain detected via Threat Intel";
+
+                        if (lookupResult.category != ThreatIntel::ThreatCategory::Unknown) {
+                            detection.technicalDetails = L"Category: " + Utils::StringUtils::ToWide(
+                                ThreatIntel::ThreatCategoryToString(lookupResult.category)
+                            );
+                        }
+
+                        outDetections.push_back(std::move(detection));
+                    }
+                }
+                catch (...) {
+                    // Swallow conversion errors, don't crash analysis
+                }
             }
 
             // Check against custom C2 lists
@@ -959,8 +1109,8 @@ namespace ShadowStrike::AntiEvasion {
             return !outDetections.empty();
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeDomain failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeDomain failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -997,8 +1147,8 @@ namespace ShadowStrike::AntiEvasion {
             return !outDetections.empty();
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeDomains failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeDomains failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1025,8 +1175,8 @@ namespace ShadowStrike::AntiEvasion {
             return outScore >= NetworkEvasionConstants::MIN_DGA_SCORE;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"IsDGADomain failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"IsDGADomain failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1059,8 +1209,8 @@ namespace ShadowStrike::AntiEvasion {
 
             // Try DNS resolution of known domains
             for (const auto& domain : { L"google.com", L"microsoft.com", L"cloudflare.com" }) {
-                std::vector<std::wstring> ips;
-                if (Utils::NetworkUtils::ResolveDNS(domain, ips)) {
+                std::vector<Utils::NetworkUtils::IpAddress> ipAddrs;
+                if (Utils::NetworkUtils::ResolveHostname(domain, ipAddrs)) {
                     return true;
                 }
             }
@@ -1068,8 +1218,8 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckInternetConnectivity failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckInternetConnectivity failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1107,21 +1257,30 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Check Internet Explorer proxy settings
+            // Use ANSI version explicitly to avoid type mismatches with INTERNET_PROXY_INFO
             INTERNET_PROXY_INFO proxyInfo = {};
             DWORD proxyInfoSize = sizeof(proxyInfo);
 
-            if (InternetQueryOptionW(nullptr, INTERNET_OPTION_PROXY, &proxyInfo, &proxyInfoSize)) {
-                if (proxyInfo.lpszProxy && proxyInfo.lpszProxy[0] != L'\0') {
-                    outProxyAddress = proxyInfo.lpszProxy;
-                    return true;
+            if (InternetQueryOptionA(nullptr, INTERNET_OPTION_PROXY, &proxyInfo, &proxyInfoSize)) {
+                bool found = false;
+                if (proxyInfo.lpszProxy && proxyInfo.lpszProxy[0] != '\0') {
+                    // Convert ANSI proxy string to Wide
+                    outProxyAddress = Utils::StringUtils::ToWide(proxyInfo.lpszProxy);
+                    found = true;
                 }
+
+                // Clean up allocated strings
+                if (proxyInfo.lpszProxy) GlobalFree((HGLOBAL)proxyInfo.lpszProxy);
+                if (proxyInfo.lpszProxyBypass) GlobalFree((HGLOBAL)proxyInfo.lpszProxyBypass);
+
+                if (found) return true;
             }
 
             return false;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"DetectProxy failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"DetectProxy failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1143,41 +1302,20 @@ namespace ShadowStrike::AntiEvasion {
         NetworkEvasionError* err
     ) noexcept {
         try {
-            // Get network adapter information
-            ULONG bufferSize = 0;
-            GetAdaptersInfo(nullptr, &bufferSize);
+            bool vpnDetected = false;
+            bool vmMacDetected = false;
+            std::wstring vmMacInfo;
 
-            std::vector<uint8_t> buffer(bufferSize);
-            auto* pAdapterInfo = reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data());
-
-            if (GetAdaptersInfo(pAdapterInfo, &bufferSize) == ERROR_SUCCESS) {
-                auto* pAdapter = pAdapterInfo;
-
-                while (pAdapter) {
-                    const std::string desc(pAdapter->Description);
-
-                    // Common VPN adapter keywords
-                    const std::vector<std::string> vpnKeywords = {
-                        "VPN", "TAP", "TUN", "Virtual", "OpenVPN", "WireGuard",
-                        "NordVPN", "ExpressVPN", "Cisco AnyConnect"
-                    };
-
-                    for (const auto& keyword : vpnKeywords) {
-                        if (desc.find(keyword) != std::string::npos) {
-                            outVPNAdapter = Utils::StringUtils::ToWideString(desc);
-                            return true;
-                        }
-                    }
-
-                    pAdapter = pAdapter->Next;
-                }
+            // Use the new helper that uses GetAdaptersAddresses
+            if (m_impl->CheckNetworkAdapters(vpnDetected, outVPNAdapter, vmMacDetected, vmMacInfo, err)) {
+                return vpnDetected;
             }
 
             return false;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"DetectVPN failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"DetectVPN failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1198,15 +1336,52 @@ namespace ShadowStrike::AntiEvasion {
         NetworkEvasionError* err
     ) noexcept {
         try {
-            // Check for Tor processes
-            const std::vector<std::wstring> torProcesses = {
-                L"tor.exe", L"firefox.exe" // Tor Browser uses Firefox
-            };
+            // Enterprise-grade Tor detection: Check for listening ports via TCP Table
+            // Tor default SOCKS ports: 9050 (Tor Service), 9150 (Tor Browser)
 
-            for (const auto& procName : torProcesses) {
-                if (Utils::ProcessUtils::IsProcessRunning(procName)) {
-                    // Additional validation: check for SOCKS proxy on port 9050/9150
-                    // (Simplified - would need actual port check in production)
+            // 1. Query table size
+            DWORD tableSize = 0;
+            DWORD result = GetExtendedTcpTable(nullptr, &tableSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+
+            if (result != ERROR_INSUFFICIENT_BUFFER) {
+                // If it failed with something other than buffer size, it's an error (or empty table which is unlikely to return success with nullptr)
+                if (result == NO_ERROR) {
+                     // Empty table?
+                     return false;
+                }
+
+                if (err) {
+                    err->win32Code = result;
+                    err->message = L"GetExtendedTcpTable size query failed";
+                }
+                return false;
+            }
+
+            // 2. Allocate buffer
+            std::vector<uint8_t> buffer(tableSize);
+            PMIB_TCPTABLE_OWNER_PID table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buffer.data());
+
+            // 3. Get table
+            result = GetExtendedTcpTable(table, &tableSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            if (result != NO_ERROR) {
+                if (err) {
+                    err->win32Code = result;
+                    err->message = L"GetExtendedTcpTable failed";
+                }
+                return false;
+            }
+
+            // 4. Scan for Tor ports
+            for (DWORD i = 0; i < table->dwNumEntries; i++) {
+                // Ports are in network byte order
+                const uint16_t port = ntohs(static_cast<uint16_t>(table->table[i].dwLocalPort));
+
+                if (port == 9050 || port == 9150) {
+                    // Confirmed Tor SOCKS port listener
+                    // We could also check the PID via table->table[i].dwOwningPid if we wanted to verify the process name,
+                    // but the port itself is a very strong indicator of Tor activity in an enterprise environment.
+
+                    SS_LOG_WARN(L"AntiEvasion", L"Tor listener detected on port %u (PID: %u)", port, table->table[i].dwOwningPid);
                     return true;
                 }
             }
@@ -1214,8 +1389,8 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"DetectTor failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"DetectTor failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1277,8 +1452,8 @@ namespace ShadowStrike::AntiEvasion {
             return outInfo.isBeaconing;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"DetectBeaconing failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"DetectBeaconing failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1309,8 +1484,13 @@ namespace ShadowStrike::AntiEvasion {
             std::unordered_set<std::wstring> uniqueIPs;
 
             for (size_t i = 0; i < numQueries; ++i) {
-                std::vector<std::wstring> ips;
-                if (Utils::NetworkUtils::ResolveDNS(domain, ips)) {
+                std::vector<Utils::NetworkUtils::IpAddress> ipAddrs;
+                if (Utils::NetworkUtils::ResolveHostname(domain, ipAddrs)) {
+                    std::vector<std::wstring> ips;
+                    for (const auto& ip : ipAddrs) {
+                        ips.push_back(ip.ToString());
+                    }
+
                     for (const auto& ip : ips) {
                         if (uniqueIPs.insert(ip).second) {
                             outInfo.observedIPs.push_back(ip);
@@ -1331,8 +1511,8 @@ namespace ShadowStrike::AntiEvasion {
             return outInfo.isFastFlux;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"DetectFastFlux failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"DetectFastFlux failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1372,12 +1552,12 @@ namespace ShadowStrike::AntiEvasion {
             m_impl->m_monitoringProcesses[processId] = config;
             m_impl->m_monitoringActive = true;
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Started monitoring process {}", processId);
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Started monitoring process %u", processId);
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"StartMonitoring failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"StartMonitoring failed: %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1399,10 +1579,10 @@ namespace ShadowStrike::AntiEvasion {
             std::unique_lock lock(m_impl->m_mutex);
             m_impl->m_monitoringProcesses.erase(processId);
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Stopped monitoring process {}", processId);
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Stopped monitoring process %u", processId);
         }
         catch (...) {
-            Utils::Logger::Error(L"StopMonitoring: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"StopMonitoring: Exception");
         }
     }
 
@@ -1412,10 +1592,10 @@ namespace ShadowStrike::AntiEvasion {
             m_impl->m_monitoringProcesses.clear();
             m_impl->m_monitoringActive = false;
 
-            Utils::Logger::Info(L"NetworkBasedEvasionDetector: Stopped all monitoring");
+            SS_LOG_INFO(L"AntiEvasion", L"NetworkBasedEvasionDetector: Stopped all monitoring");
         }
         catch (...) {
-            Utils::Logger::Error(L"StopAllMonitoring: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"StopAllMonitoring: Exception");
         }
     }
 
@@ -1559,7 +1739,7 @@ namespace ShadowStrike::AntiEvasion {
             std::shared_lock lock(m_impl->m_mutex);
             auto it = m_impl->m_dnsTracking.find(processId);
             if (it != m_impl->m_dnsTracking.end()) {
-                CheckDNSEvasion(it->second, result);
+                CheckDNSEvasion(it->second.timestamps, it->second.domainToIPs, result);
             }
         }
 
@@ -1568,7 +1748,7 @@ namespace ShadowStrike::AntiEvasion {
             std::shared_lock lock(m_impl->m_mutex);
             auto it = m_impl->m_connectionTracking.find(processId);
             if (it != m_impl->m_connectionTracking.end()) {
-                CheckTrafficPatterns(it->second, result);
+                CheckTrafficPatterns(it->second.targetTimestamps, result);
             }
         }
 
@@ -1577,7 +1757,7 @@ namespace ShadowStrike::AntiEvasion {
             std::shared_lock lock(m_impl->m_mutex);
             auto it = m_impl->m_connectionTracking.find(processId);
             if (it != m_impl->m_connectionTracking.end()) {
-                CheckBeaconing(it->second, result);
+                CheckBeaconing(it->second.targetTimestamps, result);
             }
         }
 
@@ -1600,25 +1780,26 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckConnectivity: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckConnectivity: Exception");
         }
     }
 
     void NetworkBasedEvasionDetector::CheckDNSEvasion(
-        const Impl::DNSTracker& tracker,
+        const std::vector<std::chrono::system_clock::time_point>& timestamps,
+        const std::unordered_map<std::wstring, std::vector<std::wstring>>& domainToIPs,
         NetworkEvasionResult& result
     ) noexcept {
         try {
-            result.totalDNSQueries = static_cast<uint32_t>(tracker.timestamps.size());
+            result.totalDNSQueries = static_cast<uint32_t>(timestamps.size());
             m_impl->m_stats.totalDNSQueries += result.totalDNSQueries;
 
             // Check for excessive DNS queries
-            if (!tracker.timestamps.empty()) {
+            if (!timestamps.empty()) {
                 const auto now = std::chrono::system_clock::now();
                 const auto oneMinuteAgo = now - std::chrono::minutes(1);
 
                 size_t recentQueries = 0;
-                for (const auto& ts : tracker.timestamps) {
+                for (const auto& ts : timestamps) {
                     if (ts >= oneMinuteAgo) {
                         recentQueries++;
                     }
@@ -1634,7 +1815,7 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Check each domain for DGA, fast flux, etc.
-            for (const auto& [domain, ips] : tracker.domainToIPs) {
+            for (const auto& [domain, ips] : domainToIPs) {
                 std::vector<NetworkDetectedTechnique> domainDetections;
                 AnalyzeDomain(domain, domainDetections, nullptr);
 
@@ -1662,7 +1843,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckDNSEvasion: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckDNSEvasion: Exception");
         }
     }
 
@@ -1683,17 +1864,32 @@ namespace ShadowStrike::AntiEvasion {
                 AddDetection(result, std::move(detection));
             }
 
-            // Check for VPN
-            std::wstring vpnAdapter;
-            if (DetectVPN(vpnAdapter, nullptr)) {
-                result.networkConfig.hasVPN = true;
-                result.networkConfig.vpnAdapter = vpnAdapter;
+            // Check for VPN and VM MAC addresses using unified modern API check
+            bool vpnDetected = false;
+            std::wstring vpnName;
+            bool vmMacDetected = false;
+            std::wstring vmMacInfo;
 
-                NetworkDetectedTechnique detection(NetworkEvasionTechnique::NET_VPNDetection);
-                detection.confidence = 0.7;
-                detection.description = L"VPN detected";
-                detection.detectedValue = vpnAdapter;
-                AddDetection(result, std::move(detection));
+            if (m_impl->CheckNetworkAdapters(vpnDetected, vpnName, vmMacDetected, vmMacInfo, nullptr)) {
+                if (vpnDetected) {
+                    result.networkConfig.hasVPN = true;
+                    result.networkConfig.vpnAdapter = vpnName;
+
+                    NetworkDetectedTechnique detection(NetworkEvasionTechnique::NET_VPNDetection);
+                    detection.confidence = 0.7;
+                    detection.description = L"VPN detected";
+                    detection.detectedValue = vpnName;
+                    AddDetection(result, std::move(detection));
+                }
+
+                if (vmMacDetected) {
+                    NetworkDetectedTechnique detection(NetworkEvasionTechnique::NET_MACRandomization); // Or create specific NET_VMMACDetection
+                    detection.confidence = 0.95;
+                    detection.description = L"Virtual Machine MAC Address OUI detected";
+                    detection.detectedValue = vmMacInfo;
+                    detection.severity = NetworkEvasionSeverity::High;
+                    AddDetection(result, std::move(detection));
+                }
             }
 
             // Check for Tor
@@ -1709,34 +1905,34 @@ namespace ShadowStrike::AntiEvasion {
             result.networkConfig.valid = true;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckNetworkConfiguration: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckNetworkConfiguration: Exception");
         }
     }
 
     void NetworkBasedEvasionDetector::CheckTrafficPatterns(
-        const Impl::ConnectionTracker& tracker,
+        const std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>>& targetTimestamps,
         NetworkEvasionResult& result
     ) noexcept {
         try {
             result.totalConnections = 0;
 
-            for (const auto& [target, timestamps] : tracker.targetTimestamps) {
+            for (const auto& [target, timestamps] : targetTimestamps) {
                 result.totalConnections += static_cast<uint32_t>(timestamps.size());
             }
 
             m_impl->m_stats.totalHTTPRequests += result.totalConnections;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckTrafficPatterns: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckTrafficPatterns: Exception");
         }
     }
 
     void NetworkBasedEvasionDetector::CheckBeaconing(
-        const Impl::ConnectionTracker& tracker,
+        const std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>>& targetTimestamps,
         NetworkEvasionResult& result
     ) noexcept {
         try {
-            for (const auto& [target, timestamps] : tracker.targetTimestamps) {
+            for (const auto& [target, timestamps] : targetTimestamps) {
                 if (timestamps.size() >= 3) {
                     BeaconingInfo beaconInfo;
                     if (DetectBeaconing(timestamps, beaconInfo, nullptr)) {
@@ -1759,7 +1955,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckBeaconing: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckBeaconing: Exception");
         }
     }
 

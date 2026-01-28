@@ -1434,6 +1434,7 @@ namespace ShadowStrike {
 
             struct Statistics {
                 std::atomic<uint64_t> totalAnalyses{ 0 };
+                std::atomic<uint64_t> totalDetections{ 0 };
                 std::atomic<uint64_t> evasiveProcesses{ 0 };
                 std::atomic<uint64_t> totalDNSQueries{ 0 };
                 std::atomic<uint64_t> totalHTTPRequests{ 0 };
@@ -1481,7 +1482,8 @@ namespace ShadowStrike {
             ) noexcept;
 
             void CheckDNSEvasion(
-                const std::vector<std::wstring>& domains,
+                const std::vector<std::chrono::system_clock::time_point>& timestamps,
+                const std::unordered_map<std::wstring, std::vector<std::wstring>>& domainToIPs,
                 NetworkEvasionResult& result
             ) noexcept;
 
@@ -1490,7 +1492,12 @@ namespace ShadowStrike {
             ) noexcept;
 
             void CheckTrafficPatterns(
-                const std::vector<std::chrono::system_clock::time_point>& timestamps,
+                const std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>>& targetTimestamps,
+                NetworkEvasionResult& result
+            ) noexcept;
+
+            void CheckBeaconing(
+                const std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>>& targetTimestamps,
                 NetworkEvasionResult& result
             ) noexcept;
 

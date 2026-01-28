@@ -555,6 +555,11 @@ public:
         try {
             Logger::Info("ProcessMonitor: Taking initial system snapshot");
 
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // For enterprise-grade visibility, we would use NtQuerySystemInformation
+            // or walk the EPROCESS list in the kernel to detect hidden processes (DKOM)
+            // that CreateToolhelp32Snapshot cannot see.
+
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) {
                 Logger::Error("ProcessMonitor: CreateToolhelp32Snapshot failed: {}",
@@ -912,6 +917,11 @@ public:
 
     void OnProcessCreateImpl(const ProcessEvent& event) {
         try {
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // In a production environment, we would use PsSetCreateProcessNotifyRoutine
+            // to get synchronous callbacks from the kernel, ensuring we never miss a
+            // short-lived process and can block execution before the main thread starts.
+
             m_stats.eventsReceived.fetch_add(1, std::memory_order_relaxed);
             m_stats.processCreations.fetch_add(1, std::memory_order_relaxed);
 

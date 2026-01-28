@@ -133,6 +133,11 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
+#include "../../Drivers/Shared/MessageProtocol.h"
+#include "../../Drivers/Shared/MessageTypes.h"
+#include "../../Drivers/Shared/VerdictTypes.h"
+#include "../../Drivers/Shared/PortName.h"
+
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -198,33 +203,12 @@ using SystemTimePoint = std::chrono::system_clock::time_point;
 /**
  * @brief Command type from kernel
  */
-enum class CommandType : uint32_t {
-    None            = 0,
-    Handshake       = 1,        ///< Driver connecting
-    ScanFile        = 2,        ///< File scan request
-    ProcessCreate   = 3,        ///< Process creation
-    ProcessTerminate = 4,       ///< Process termination
-    ImageLoad       = 5,        ///< DLL/Driver load
-    RegistryOp      = 6,        ///< Registry operation
-    NetworkOp       = 7,        ///< Network operation
-    MemoryOp        = 8,        ///< Memory operation
-    ObjectOp        = 9,        ///< Object operation
-    Configure       = 10,       ///< Configuration update
-    Query           = 11,       ///< Status query
-    Heartbeat       = 99        ///< Keep-alive
-};
+// enum class CommandType replaced by SHADOWSTRIKE_MESSAGE_TYPE from shared headers
 
 /**
  * @brief Verdict sent back to kernel
  */
-enum class KernelVerdict : uint32_t {
-    Allow           = 0,        ///< Allow operation
-    Block           = 1,        ///< Block operation
-    Quarantine      = 2,        ///< Block and remediate
-    Pending         = 3,        ///< Hold for async reply
-    Defer           = 4,        ///< Defer to user
-    Log             = 5         ///< Allow but log
-};
+// enum class KernelVerdict replaced by SHADOWSTRIKE_SCAN_VERDICT from shared headers
 
 /**
  * @brief IPC channel type
@@ -281,76 +265,19 @@ enum class IPCStatus : uint8_t {
 /**
  * @brief Kernel request header
  */
-struct KernelRequestHeader {
-    /// @brief Command type
-    CommandType command;
-    
-    /// @brief Process ID
-    uint32_t processId;
-    
-    /// @brief Thread ID
-    uint32_t threadId;
-    
-    /// @brief Timestamp (KeQuerySystemTime)
-    uint64_t timestamp;
-    
-    /// @brief Message ID for reply
-    uint64_t messageId;
-    
-    /// @brief Payload size
-    uint32_t payloadSize;
-    
-    /// @brief Flags
-    uint32_t flags;
-};
+// struct KernelRequestHeader replaced by FILTER_MESSAGE_HEADER
 
 /**
  * @brief File scan request
  */
-struct FileScanRequest {
-    /// @brief Header
-    KernelRequestHeader header;
-    
-    /// @brief Parent process ID
-    uint32_t parentProcessId;
-    
-    /// @brief Desired access
-    uint32_t desiredAccess;
-    
-    /// @brief Share access
-    uint32_t shareAccess;
-    
-    /// @brief Create options
-    uint32_t createOptions;
-    
-    /// @brief File attributes
-    uint32_t fileAttributes;
-    
-    /// @brief File size
-    uint64_t fileSize;
-    
-    /// @brief Is directory
-    uint8_t isDirectory;
-    
-    /// @brief Operation type (0=Pre-Create, 1=Pre-Write, etc.)
-    uint8_t operationType;
-    
-    /// @brief Reserved
-    uint8_t reserved[2];
-    
-    /// @brief File name length
-    uint16_t fileNameLength;
-    
-    /// @brief File name
-    wchar_t fileName[260];
-};
+// struct FileScanRequest replaced by FILE_SCAN_REQUEST
 
 /**
  * @brief Process notification request
  */
 struct ProcessNotifyRequest {
     /// @brief Header
-    KernelRequestHeader header;
+    FILTER_MESSAGE_HEADER header;
     
     /// @brief Parent process ID
     uint32_t parentProcessId;
@@ -391,7 +318,7 @@ struct ProcessNotifyRequest {
  */
 struct ImageLoadRequest {
     /// @brief Header
-    KernelRequestHeader header;
+    FILTER_MESSAGE_HEADER header;
     
     /// @brief Process ID
     uint32_t processId;
@@ -420,7 +347,7 @@ struct ImageLoadRequest {
  */
 struct RegistryOpRequest {
     /// @brief Header
-    KernelRequestHeader header;
+    FILTER_MESSAGE_HEADER header;
     
     /// @brief Operation type
     uint32_t operationType;
@@ -450,19 +377,7 @@ struct RegistryOpRequest {
 /**
  * @brief Kernel reply
  */
-struct KernelReply {
-    /// @brief Verdict
-    KernelVerdict verdict;
-    
-    /// @brief Cache duration (ms)
-    uint32_t cacheDuration;
-    
-    /// @brief Flags
-    uint32_t flags;
-    
-    /// @brief Extended info
-    uint64_t extendedInfo;
-};
+// struct KernelReply replaced by SCAN_VERDICT_REPLY
 
 #pragma pack(pop)
 
@@ -515,7 +430,7 @@ struct PendingMessage {
     uint64_t messageId = 0;
     
     /// @brief Command type
-    CommandType command = CommandType::None;
+    SHADOWSTRIKE_MESSAGE_TYPE command = MessageType_None;
     
     /// @brief Queued time
     TimePoint queuedTime;
@@ -570,7 +485,7 @@ struct IPCStatistics {
     std::atomic<uint64_t> reconnects{0};
     std::atomic<uint64_t> avgLatencyUs{0};
     std::atomic<uint64_t> maxLatencyUs{0};
-    std::array<std::atomic<uint64_t>, 16> byCommandType{};
+    std::array<std::atomic<uint64_t>, 16> bySHADOWSTRIKE_MESSAGE_TYPE{};
     std::array<std::atomic<uint64_t>, 8> byVerdict{};
     TimePoint startTime = Clock::now();
     
@@ -631,11 +546,11 @@ struct IPCConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using FileScanCallback = std::function<KernelVerdict(const FileScanRequest&)>;
-using ProcessNotifyCallback = std::function<KernelVerdict(const ProcessNotifyRequest&)>;
-using ImageLoadCallback = std::function<KernelVerdict(const ImageLoadRequest&)>;
-using RegistryOpCallback = std::function<KernelVerdict(const RegistryOpRequest&)>;
-using GenericMessageCallback = std::function<void(CommandType, const void*, size_t)>;
+using FileScanCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const FILE_SCAN_REQUEST&)>;
+using ProcessNotifyCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const ProcessNotifyRequest&)>;
+using ImageLoadCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const ImageLoadRequest&)>;
+using RegistryOpCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const RegistryOpRequest&)>;
+using GenericMessageCallback = std::function<void(SHADOWSTRIKE_MESSAGE_TYPE, const void*, size_t)>;
 using ConnectionCallback = std::function<void(ChannelType, ConnectionStatus)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
@@ -840,8 +755,8 @@ private:
 // UTILITY FUNCTIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetCommandTypeName(CommandType type) noexcept;
-[[nodiscard]] std::string_view GetVerdictName(KernelVerdict verdict) noexcept;
+[[nodiscard]] std::string_view GetSHADOWSTRIKE_MESSAGE_TYPEName(SHADOWSTRIKE_MESSAGE_TYPE type) noexcept;
+[[nodiscard]] std::string_view GetVerdictName(SHADOWSTRIKE_SCAN_VERDICT verdict) noexcept;
 [[nodiscard]] std::string_view GetChannelTypeName(ChannelType type) noexcept;
 [[nodiscard]] std::string_view GetConnectionStatusName(ConnectionStatus status) noexcept;
 

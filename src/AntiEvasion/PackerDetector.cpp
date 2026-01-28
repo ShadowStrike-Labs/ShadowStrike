@@ -32,6 +32,7 @@
 #include <numeric>
 #include <queue>
 #include <sstream>
+#include <format>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -44,6 +45,7 @@
 // SHADOWSTRIKE INTERNAL INCLUDES
 // ============================================================================
 
+#include"../Utils/HashUtils.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -217,6 +219,16 @@ namespace ShadowStrike::AntiEvasion {
         [[nodiscard]] bool IsPEFile(const uint8_t* buffer, size_t size) const noexcept;
         [[nodiscard]] bool ParsePEHeaders(const uint8_t* buffer, size_t size, IMAGE_DOS_HEADER*& dosHeader, IMAGE_NT_HEADERS*& ntHeaders) const noexcept;
 
+        /**
+         * @brief Convert RVA to File Offset
+         */
+        [[nodiscard]] uint32_t RvaToOffset(
+            uint32_t rva,
+            IMAGE_NT_HEADERS* ntHeaders,
+            const uint8_t* buffer,
+            size_t size
+        ) const noexcept;
+
         // Section analysis
         [[nodiscard]] bool IsSectionNamePackerMatch(std::string_view sectionName, std::string& matchedPacker) const noexcept;
 
@@ -237,30 +249,29 @@ namespace ShadowStrike::AntiEvasion {
                 return true; // Already initialized
             }
 
-            Utils::Logger::Info(L"PackerDetector: Initializing...");
+            SS_LOG_INFO(L"AntiEvasion", L"PackerDetector: Initializing...");
 
             // Infrastructure stores are optional (can be set later)
             // No strict dependency on them for initialization
 
-            Utils::Logger::Info(L"PackerDetector: Initialized successfully");
+            SS_LOG_INFO(L"AntiEvasion", L"PackerDetector: Initialized successfully");
             return true;
 
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"PackerDetector initialization failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"PackerDetector initialization failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Initialization failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_initialized = false;
             return false;
         }
         catch (...) {
-            Utils::Logger::Critical(L"PackerDetector: Unknown initialization error");
+            SS_LOG_FATAL(L"AntiEvasion", L"PackerDetector: Unknown initialization error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -280,7 +291,7 @@ namespace ShadowStrike::AntiEvasion {
                 return; // Already shutdown
             }
 
-            Utils::Logger::Info(L"PackerDetector: Shutting down...");
+            SS_LOG_INFO(L"AntiEvasion", L"PackerDetector: Shutting down...");
 
             // Clear caches
             m_resultCache.clear();
@@ -290,10 +301,10 @@ namespace ShadowStrike::AntiEvasion {
             // Clear callback
             m_detectionCallback = nullptr;
 
-            Utils::Logger::Info(L"PackerDetector: Shutdown complete");
+            SS_LOG_INFO(L"AntiEvasion", L"PackerDetector: Shutdown complete");
         }
         catch (...) {
-            Utils::Logger::Error(L"PackerDetector: Exception during shutdown");
+            SS_LOG_ERROR(L"AntiEvasion", L"PackerDetector: Exception during shutdown");
         }
     }
 
@@ -361,6 +372,34 @@ namespace ShadowStrike::AntiEvasion {
         ntHeaders = const_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<const IMAGE_NT_HEADERS*>(buffer + dosHeader->e_lfanew));
 
         return true;
+    }
+
+    uint32_t PackerDetector::Impl::RvaToOffset(
+        uint32_t rva,
+        IMAGE_NT_HEADERS* ntHeaders,
+        const uint8_t* buffer,
+        size_t size
+    ) const noexcept {
+        if (rva == 0 || !ntHeaders || !buffer) return 0;
+
+        const auto* sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+        const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
+
+        for (WORD i = 0; i < numSections; ++i) {
+            // Check if RVA is within this section's virtual range
+            if (rva >= sectionHeader[i].VirtualAddress &&
+                rva < sectionHeader[i].VirtualAddress + sectionHeader[i].Misc.VirtualSize) {
+
+                // Calculate offset
+                uint32_t offset = sectionHeader[i].PointerToRawData + (rva - sectionHeader[i].VirtualAddress);
+
+                // Validate bounds
+                if (offset >= size) return 0;
+
+                return offset;
+            }
+        }
+        return 0;
     }
 
     bool PackerDetector::Impl::IsSectionNamePackerMatch(
@@ -557,7 +596,7 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Compute SHA256 hash
-            result.sha256Hash = Utils::CryptoUtils::ComputeSHA256(buffer.data(), buffer.size());
+            result.sha256Hash = Utils::HashUtils::Compute(Utils::HashUtils::Algorithm::SHA256, buffer.data(), buffer.size(), nullptr);
 
             // Perform analysis
             AnalyzeFileInternal(buffer.data(), buffer.size(), filePath, config, result);
@@ -585,34 +624,31 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const fs::filesystem_error& e) {
-            Utils::Logger::Error(L"AnalyzeFile filesystem error [{}]: {}",
-                e.code().value(),
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeFile filesystem error [%d]: %ls", e.code().value(), Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = static_cast<DWORD>(e.code().value());
                 err->message = L"Filesystem error";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_impl->m_stats.analysisErrors++;
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeFile failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeFile failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Analysis failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_impl->m_stats.analysisErrors++;
             return result;
         }
         catch (...) {
-            Utils::Logger::Critical(L"AnalyzeFile: Unknown error");
+            SS_LOG_FATAL(L"AntiEvasion", L"AnalyzeFile: Unknown error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -655,7 +691,7 @@ namespace ShadowStrike::AntiEvasion {
             result.analysisStartTime = std::chrono::system_clock::now();
 
             // Compute SHA256 hash
-            result.sha256Hash = Utils::CryptoUtils::ComputeSHA256(buffer, size);
+            result.sha256Hash = Utils::HashUtils::Compute(Utils::HashUtils::Algorithm::SHA256,buffer, size);
 
             // Perform analysis
             AnalyzeFileInternal(buffer, size, L"[Memory Buffer]", config, result);
@@ -678,8 +714,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeBuffer failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeBuffer failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -847,8 +882,7 @@ namespace ShadowStrike::AntiEvasion {
             return CalculateEntropy(buffer.data(), buffer.size());
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CalculateSectionEntropy failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CalculateSectionEntropy failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -953,8 +987,7 @@ namespace ShadowStrike::AntiEvasion {
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeSections failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeSections failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1012,18 +1045,91 @@ namespace ShadowStrike::AntiEvasion {
                 return true;
             }
 
-            // TODO: Parse import directory (simplified stub)
-            // Full implementation would enumerate all imports
-            outImports.totalImports = 0;
-            outImports.dllCount = 0;
-            outImports.hasMinimalImports = false;
-            outImports.valid = true;
+            const uint32_t importOffset = m_impl->RvaToOffset(importRVA, ntHeaders, buffer.data(), buffer.size());
+            if (importOffset == 0 || importOffset + sizeof(IMAGE_IMPORT_DESCRIPTOR) > buffer.size()) {
+                outImports.valid = false;
+                return false;
+            }
 
+            const auto* importDesc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(buffer.data() + importOffset);
+
+            while (importDesc->Name != 0 && outImports.dllCount < PackerConstants::MAX_IMPORTS) {
+                // Get DLL name
+                const uint32_t nameOffset = m_impl->RvaToOffset(importDesc->Name, ntHeaders, buffer.data(), buffer.size());
+                if (nameOffset != 0 && nameOffset < buffer.size()) {
+                    std::string dllName(reinterpret_cast<const char*>(buffer.data() + nameOffset));
+                    outImports.dlls.push_back(dllName);
+
+                    std::string lowerDll = dllName;
+                    std::transform(lowerDll.begin(), lowerDll.end(), lowerDll.begin(), ::tolower);
+
+                    if (lowerDll == "kernel32.dll" || lowerDll == "kernelbase.dll") {
+                        // We'll inspect functions later if needed
+                    }
+                }
+
+                // Process imports
+                uint32_t thunkRVA = (importDesc->OriginalFirstThunk != 0) ? importDesc->OriginalFirstThunk : importDesc->FirstThunk;
+                uint32_t thunkOffset = m_impl->RvaToOffset(thunkRVA, ntHeaders, buffer.data(), buffer.size());
+
+                if (thunkOffset != 0 && thunkOffset < buffer.size()) {
+                    bool is64Bit = (ntHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+
+                    while (true) {
+                        bool isOrdinal = false;
+                        uint64_t functionNameRVA = 0;
+
+                        if (is64Bit) {
+                            if (thunkOffset + sizeof(uint64_t) > buffer.size()) break;
+                            uint64_t thunkData = *reinterpret_cast<const uint64_t*>(buffer.data() + thunkOffset);
+                            if (thunkData == 0) break;
+
+                            isOrdinal = (thunkData & 0x8000000000000000ULL) != 0;
+                            functionNameRVA = thunkData & 0x7FFFFFFF;
+                            thunkOffset += sizeof(uint64_t);
+                        } else {
+                            if (thunkOffset + sizeof(uint32_t) > buffer.size()) break;
+                            uint32_t thunkData = *reinterpret_cast<const uint32_t*>(buffer.data() + thunkOffset);
+                            if (thunkData == 0) break;
+
+                            isOrdinal = (thunkData & 0x80000000) != 0;
+                            functionNameRVA = thunkData & 0x7FFFFFFF;
+                            thunkOffset += sizeof(uint32_t);
+                        }
+
+                        outImports.totalImports++;
+
+                        if (!isOrdinal && functionNameRVA != 0) {
+                            uint32_t nameOffset = m_impl->RvaToOffset(static_cast<uint32_t>(functionNameRVA), ntHeaders, buffer.data(), buffer.size());
+                            if (nameOffset != 0 && nameOffset + 2 < buffer.size()) {
+                                // Skip hint (2 bytes)
+                                std::string funcName(reinterpret_cast<const char*>(buffer.data() + nameOffset + 2));
+
+                                if (funcName == "GetProcAddress") outImports.hasGetProcAddress = true;
+                                else if (funcName == "LoadLibraryA" || funcName == "LoadLibraryW" || funcName == "LoadLibraryExA" || funcName == "LoadLibraryExW") outImports.hasLoadLibrary = true;
+                                else if (funcName.find("VirtualAlloc") != std::string::npos || funcName.find("VirtualProtect") != std::string::npos) outImports.hasVirtualMemoryAPIs = true;
+                                else if (funcName == "ExitProcess") outImports.anomalies.push_back(L"Explicit ExitProcess import");
+                                else if (funcName == "IsDebuggerPresent") outImports.anomalies.push_back(L"IsDebuggerPresent import");
+                            }
+                        }
+
+                        if (outImports.totalImports >= PackerConstants::MAX_IMPORTS) break;
+                    }
+                }
+
+                outImports.dllCount++;
+                importDesc++;
+
+                // Safety bound check for next descriptor
+                if (reinterpret_cast<const uint8_t*>(importDesc) + sizeof(IMAGE_IMPORT_DESCRIPTOR) > buffer.data() + buffer.size()) break;
+            }
+
+            outImports.hasMinimalImports = m_impl->HasMinimalImports(outImports.totalImports);
+            outImports.valid = true;
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeImports failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeImports failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1104,8 +1210,7 @@ namespace ShadowStrike::AntiEvasion {
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeOverlay failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeOverlay failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1189,8 +1294,7 @@ namespace ShadowStrike::AntiEvasion {
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeEntryPoint failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeEntryPoint failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1291,8 +1395,7 @@ namespace ShadowStrike::AntiEvasion {
             return std::nullopt;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"MatchEPSignature failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"MatchEPSignature failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1316,21 +1419,20 @@ namespace ShadowStrike::AntiEvasion {
     ) noexcept {
         try {
             outSignature = SignatureInfo{};
-
+            ShadowStrike::Utils::pe_sig_utils::SignatureInfo verifyResult;
             // Use PE signature verifier from Utils
-            auto verifyResult = m_sigVerifier.VerifyFileSignature(filePath);
+              m_sigVerifier.VerifyPESignature(filePath, verifyResult,nullptr);
 
             outSignature.hasSignature = verifyResult.isSigned;
-            outSignature.isValid = verifyResult.isValid;
-            outSignature.signerName = verifyResult.subjectName;
+            outSignature.isValid = verifyResult.isVerified;
+            outSignature.signerName = verifyResult.signerName;
             outSignature.issuerName = verifyResult.issuerName;
             outSignature.valid = true;
 
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"VerifySignature failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"VerifySignature failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1355,20 +1457,237 @@ namespace ShadowStrike::AntiEvasion {
         try {
             outRichHeader = RichHeaderInfo{};
 
-            // TODO: Implement Rich header parsing
-            // Rich header analysis requires parsing the Rich structure between DOS and NT headers
-            // This is a stub - full implementation would parse CompIDs and build numbers
+            std::ifstream file(filePath, std::ios::binary);
+            if (!file) return false;
 
-            outRichHeader.valid = false;
-            return false;
+            // Read DOS header and stub
+            IMAGE_DOS_HEADER dosHeader{};
+            file.read(reinterpret_cast<char*>(&dosHeader), sizeof(dosHeader));
+            if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE || dosHeader.e_lfanew <= sizeof(IMAGE_DOS_HEADER)) {
+                return false;
+            }
+
+            // Read space between DOS header and NT headers
+            const size_t stubSize = dosHeader.e_lfanew - sizeof(IMAGE_DOS_HEADER);
+            if (stubSize < sizeof(DWORD) * 4) return false;
+
+            std::vector<uint8_t> stub(stubSize);
+            file.read(reinterpret_cast<char*>(stub.data()), stubSize);
+
+            // Scan for "Rich" signature (0x68636952)
+            const uint32_t RICH_SIGNATURE = 0x68636952;
+            const uint32_t DANS_SIGNATURE = 0x536E6144; // "DanS"
+
+            // Search for "Rich"
+            int richOffset = -1;
+            for (size_t i = 0; i < stub.size() - 4; ++i) {
+                if (*reinterpret_cast<const uint32_t*>(stub.data() + i) == RICH_SIGNATURE) {
+                    richOffset = static_cast<int>(i);
+                    break;
+                }
+            }
+
+            if (richOffset == -1 || richOffset + 8 > stub.size()) {
+                outRichHeader.hasRichHeader = false;
+                outRichHeader.valid = true;
+                return true;
+            }
+
+            outRichHeader.hasRichHeader = true;
+            uint32_t xorKey = *reinterpret_cast<const uint32_t*>(stub.data() + richOffset + 4);
+            outRichHeader.checksum = xorKey;
+
+            // Search backwards for "DanS"
+            int dansOffset = -1;
+            for (int i = richOffset - 4; i >= 0; i -= 4) {
+                if ((*reinterpret_cast<const uint32_t*>(stub.data() + i) ^ xorKey) == DANS_SIGNATURE) {
+                    dansOffset = i;
+                    break;
+                }
+            }
+
+            if (dansOffset == -1) {
+                outRichHeader.isCorrupted = true;
+                outRichHeader.valid = true;
+                return true;
+            }
+
+            // Parse entries
+            const uint8_t* start = stub.data() + dansOffset + 16; // Skip DanS + padding
+            const uint8_t* end = stub.data() + richOffset;
+
+            for (const uint8_t* ptr = start; ptr < end; ptr += 8) {
+                uint32_t entryKey = *reinterpret_cast<const uint32_t*>(ptr) ^ xorKey;
+                uint32_t entryCount = *reinterpret_cast<const uint32_t*>(ptr + 4) ^ xorKey;
+
+                uint16_t prodId = (entryKey >> 16) & 0xFFFF;
+                uint16_t buildId = entryKey & 0xFFFF;
+
+                RichHeaderInfo::CompilerEntry entry;
+                entry.productId = prodId;
+                entry.buildNumber = buildId;
+                entry.useCount = entryCount;
+
+                // Identify common Visual Studio versions
+                if (prodId == 0x0104) entry.description = L"Visual Studio 2015 C++";
+                else if (prodId == 0x0103) entry.description = L"Visual Studio 2015 C++";
+                else if (prodId == 0x0102) entry.description = L"Visual Studio 2013 C++";
+                else if (prodId == 0x0101) entry.description = L"Visual Studio 2013 C++";
+                else if (prodId == 0x0100) entry.description = L"Visual Studio 2012 C++";
+                else entry.description = std::format(L"ProdID: {:04X}, Build: {:04X}", prodId, buildId);
+
+                outRichHeader.entries.push_back(entry);
+
+                // Heuristic for compiler detection
+                if (entry.description.find(L"Visual Studio") != std::wstring::npos) {
+                    outRichHeader.detectedCompiler = entry.description;
+                }
+            }
+
+            outRichHeader.valid = true;
+            return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeRichHeader failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeRichHeader failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Rich header analysis failed";
+            }
+            return false;
+        }
+        catch (...) {
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"Unknown error";
+            }
+            return false;
+        }
+    }
+
+    bool PackerDetector::AnalyzeResources(
+        const std::wstring& filePath,
+        ResourceInfo& outResources,
+        PackerError* err
+    ) noexcept {
+        try {
+            outResources = ResourceInfo{};
+
+            // Read file
+            std::ifstream file(filePath, std::ios::binary);
+            if (!file) return false;
+
+            file.seekg(0, std::ios::end);
+            const auto fileSize = file.tellg();
+            file.seekg(0, std::ios::beg);
+
+            std::vector<uint8_t> buffer(fileSize);
+            file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
+
+            if (!file) return false;
+
+            IMAGE_DOS_HEADER* dosHeader = nullptr;
+            IMAGE_NT_HEADERS* ntHeaders = nullptr;
+
+            if (!m_impl->ParsePEHeaders(buffer.data(), buffer.size(), dosHeader, ntHeaders)) {
+                return false;
+            }
+
+            // Get resource directory
+            const DWORD resourceRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+            const DWORD resourceSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+
+            if (resourceRVA == 0 || resourceSize == 0) {
+                // No resources
+                outResources.valid = true;
+                return true;
+            }
+
+            const uint32_t resourceOffset = m_impl->RvaToOffset(resourceRVA, ntHeaders, buffer.data(), buffer.size());
+            if (resourceOffset == 0 || resourceOffset >= buffer.size()) {
+                return false;
+            }
+
+            const uint8_t* resourceBase = buffer.data() + resourceOffset;
+            const auto* rootDir = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(resourceBase);
+
+            // Level 1: Types
+            size_t numTypes = rootDir->NumberOfNamedEntries + rootDir->NumberOfIdEntries;
+            const auto* typeEntries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(rootDir + 1);
+
+            for (size_t i = 0; i < numTypes; ++i) {
+                if (!typeEntries[i].DataIsDirectory) continue;
+
+                // Check for suspicious resource types (often used by packers/droppers)
+                if (!typeEntries[i].NameIsString) {
+                    uint16_t typeId = typeEntries[i].Id;
+                    // RT_RCDATA (10) is commonly used for payloads
+                    // RT_BITMAP (2), RT_ICON (3) are common but huge sizes might be suspicious
+                }
+
+                // Level 2: Names/IDs
+                const auto* typeDir = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(resourceBase + (typeEntries[i].OffsetToDirectory & 0x7FFFFFFF));
+                size_t numNames = typeDir->NumberOfNamedEntries + typeDir->NumberOfIdEntries;
+                const auto* nameEntries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(typeDir + 1);
+
+                for (size_t j = 0; j < numNames; ++j) {
+                    if (!nameEntries[j].DataIsDirectory) continue;
+
+                    // Level 3: Languages
+                    const auto* nameDir = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(resourceBase + (nameEntries[j].OffsetToDirectory & 0x7FFFFFFF));
+                    size_t numLangs = nameDir->NumberOfNamedEntries + nameDir->NumberOfIdEntries;
+                    const auto* langEntries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(nameDir + 1);
+
+                    for (size_t k = 0; k < numLangs; ++k) {
+                        if (langEntries[k].DataIsDirectory) continue; // Should be data entry
+
+                        const auto* dataEntry = reinterpret_cast<const IMAGE_RESOURCE_DATA_ENTRY*>(resourceBase + langEntries[k].OffsetToData);
+
+                        uint32_t dataRVA = dataEntry->OffsetToData;
+                        uint32_t size = dataEntry->Size;
+
+                        if (size > 0) {
+                            uint32_t dataOffset = m_impl->RvaToOffset(dataRVA, ntHeaders, buffer.data(), buffer.size());
+
+                            if (dataOffset != 0 && dataOffset + size <= buffer.size()) {
+                                outResources.count++;
+                                outResources.totalSize += size;
+                                if (size > outResources.largestResourceSize) {
+                                    outResources.largestResourceSize = size;
+                                }
+
+                                // Calculate entropy for resources > 1KB
+                                if (size > 1024) {
+                                    double entropy = m_impl->CalculateEntropy(buffer.data() + dataOffset, size);
+                                    if (entropy > PackerConstants::HIGH_SECTION_ENTROPY) {
+                                        outResources.highEntropyCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (outResources.count > 0) {
+                // Simplified avg entropy (not weighted) - for a real implementation, weight by size would be better
+                // But we didn't store individual entropies to save memory.
+                // We can flag high entropy resources ratio
+                if (static_cast<double>(outResources.highEntropyCount) / outResources.count > 0.5) {
+                    outResources.averageEntropy = 7.0; // Estimate high
+                } else {
+                    outResources.averageEntropy = 5.0; // Estimate medium
+                }
+            }
+
+            outResources.valid = true;
+            return true;
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeResources failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"Resource analysis failed";
             }
             return false;
         }
@@ -1389,17 +1708,43 @@ namespace ShadowStrike::AntiEvasion {
         try {
             outMatches.clear();
 
-            // Use SignatureStore for YARA scanning if available
-            if (m_impl->m_signatureStore) {
-                // TODO: Query signature store for packer YARA rules
-                // This would integrate with the existing YARA infrastructure
+            if (!m_impl->m_signatureStore) {
+                // Not configured
+                return false;
             }
 
-            return !outMatches.empty();
+            SignatureStore::ScanOptions options;
+            options.enableYaraScan = true;
+            options.enableHashLookup = false;
+            options.enablePatternScan = false;
+
+            auto scanResult = m_impl->m_signatureStore->ScanFile(filePath, options);
+
+            if (scanResult.HasDetections()) {
+                for (const auto& yaraMatch : scanResult.yaraMatches) {
+                    PackerMatch match;
+                    match.packerType = PackerType::Custom_Packer; // YARA rules can set tags to refine this
+                    match.method = DetectionMethod::YARARule;
+                    match.confidence = 1.0;
+                    match.packerName = Utils::StringUtils::ToWide(yaraMatch.ruleName);
+
+                    // Parse tags/meta to fill in details if available
+                    for (const auto& tag : yaraMatch.tags) {
+                        if (tag == "packer") match.category = PackerCategory::Custom;
+                        else if (tag == "crypter") match.category = PackerCategory::Crypter;
+                        // Map other tags to types if needed
+                    }
+
+                    match.detectionTime = std::chrono::system_clock::now();
+                    outMatches.push_back(match);
+                }
+                return true;
+            }
+
+            return false;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"ScanWithYARA failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"ScanWithYARA failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1466,8 +1811,7 @@ namespace ShadowStrike::AntiEvasion {
             return true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"GenerateUnpackingHints failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"GenerateUnpackingHints failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1521,8 +1865,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"IsInstaller failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"IsInstaller failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1573,8 +1916,7 @@ namespace ShadowStrike::AntiEvasion {
             return (clrRVA != 0);
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"IsDotNetAssembly failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"IsDotNetAssembly failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1845,7 +2187,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"AnalyzeEntropyDistribution: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeEntropyDistribution: Exception");
         }
     }
 
@@ -1940,7 +2282,7 @@ namespace ShadowStrike::AntiEvasion {
                             .Method(DetectionMethod::SectionName)
                             .Confidence(0.9)
                             .Name(PackerTypeToString(type))
-                            .Pattern(Utils::StringUtils::ToWideString(matchedPacker))
+                            .Pattern(Utils::StringUtils::ToWide(matchedPacker))
                             .Build();
 
                         AddMatch(result, std::move(match));
@@ -1966,7 +2308,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"AnalyzePEStructure: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzePEStructure: Exception");
         }
     }
 
@@ -1976,11 +2318,52 @@ namespace ShadowStrike::AntiEvasion {
         PackingInfo& result
     ) noexcept {
         try {
-            // Section name-based detection is handled in AnalyzePEStructure
-            // This method would integrate with PatternStore for additional signatures
+            // Section name-based detection is handled in AnalyzePEStructure.
+            // This method integrates with PatternStore for byte signature scanning.
+
+            if (!m_impl->m_patternStore || !m_impl->m_patternStore->IsInitialized()) {
+                return;
+            }
+
+            // Configure scan options
+            ShadowStrike::PatternStore::QueryOptions options;
+            options.maxResults = 5; // Limit matches to avoid noise
+            options.earylexit = false;
+
+            // Scan the buffer using PatternStore (Aho-Corasick / SIMD)
+            // We use a span to avoid copying
+            auto matches = m_impl->m_patternStore->Scan(std::span<const uint8_t>(buffer, size), options);
+
+            for (const auto& match : matches) {
+                // Map PatternStore detection to PackerMatch
+                PackerMatch pm;
+                pm.packerType = PackerType::Custom_Packer; // Default, can be refined based on tags
+                pm.packerName = Utils::StringUtils::ToWide(match.signatureName);
+                pm.confidence = 0.95; // Byte signatures are usually high confidence
+                pm.method = DetectionMethod::HashMatch; // Or BytePattern
+                pm.matchLocation = match.offset;
+                pm.details = L"Matched pattern: " + Utils::StringUtils::ToWide(match.signatureName);
+                pm.detectionTime = std::chrono::system_clock::now();
+
+                // Attempt to determine category from tags if available in PatternStore results
+                // (Assuming PatternStore might return tags or we infer from name)
+                if (pm.packerName.find(L"UPX") != std::wstring::npos) {
+                    pm.packerType = PackerType::UPX;
+                    pm.category = PackerCategory::Compression;
+                }
+                else if (pm.packerName.find(L"Themida") != std::wstring::npos) {
+                    pm.packerType = PackerType::Themida;
+                    pm.category = PackerCategory::Protector;
+                }
+
+                AddMatch(result, std::move(pm));
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"AntiEvasion", L"MatchPackerSignatures exception: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
         }
         catch (...) {
-            Utils::Logger::Error(L"MatchPackerSignatures: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"MatchPackerSignatures: Unknown exception");
         }
     }
 
@@ -2014,7 +2397,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"PerformHeuristicAnalysis: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"PerformHeuristicAnalysis: Exception");
         }
     }
 
@@ -2069,7 +2452,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"DeterminePackingVerdict: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"DeterminePackingVerdict: Exception");
         }
     }
 

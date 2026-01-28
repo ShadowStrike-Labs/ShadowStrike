@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(__NEW_LINE_dc9ef7683c389523__ python3 update_cpp.py)",
+      "Bash(read_file:*)"
+    ]
+  }
+}

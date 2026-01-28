@@ -703,6 +703,11 @@ public:
     // Monitor
     std::atomic<bool> m_monitorRunning;
     std::thread m_monitorThread;
+
+    // Security Events Cache
+    mutable std::shared_mutex m_eventMutex;
+    std::deque<SecurityEvent> m_securityEvents;
+    static constexpr size_t MAX_SECURITY_EVENTS = 1000;
 };
 
 // ============================================================================

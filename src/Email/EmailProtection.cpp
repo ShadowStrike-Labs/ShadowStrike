@@ -59,6 +59,18 @@
 #include "../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
+// SYSTEM INCLUDES
+// ============================================================================
+#include <Windows.h>
+#include <bcrypt.h>
+#include <objbase.h>
+#include <ole2.h>
+#include <ntstatus.h>
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ole32.lib")
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <algorithm>

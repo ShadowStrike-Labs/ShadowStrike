@@ -8,7 +8,7 @@
  * @author ShadowStrike Security Team
  * @copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  */
-
+#include "pch.h"
 #include "TimeBasedEvasionDetector.hpp"
 
 // ============================================================================
@@ -18,6 +18,7 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/ThreadPool.hpp"
 #include "../PatternStore/PatternStore.hpp"
+#include "../Utils/NetworkUtils.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -169,14 +170,14 @@ namespace ShadowStrike {
                 std::unique_lock lock(m_mutex);
 
                 if (m_initialized.load(std::memory_order_acquire)) {
-                    Logger::Warn("TimeBasedEvasionDetector already initialized");
+                    SS_LOG_WARN(L"AntiEvasion", L"TimeBasedEvasionDetector already initialized");
                     return true;
                 }
 
                 try {
                     // Validate thread pool
                     if (!threadPool) {
-                        Logger::Error("TimeBasedEvasionDetector: Null thread pool");
+                        SS_LOG_ERROR(L"AntiEvasion", L"TimeBasedEvasionDetector: Null thread pool");
                         return false;
                     }
                     m_threadPool = threadPool;
@@ -201,11 +202,11 @@ namespace ShadowStrike {
                     m_stats.Reset();
 
                     m_initialized.store(true, std::memory_order_release);
-                    Logger::Info("TimeBasedEvasionDetector initialized successfully");
+                    SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector initialized successfully");
                     return true;
 
                 } catch (const std::exception& e) {
-                    Logger::Error("TimeBasedEvasionDetector initialization failed: {}", e.what());
+                    SS_LOG_ERROR(L"AntiEvasion", L"TimeBasedEvasionDetector initialization failed: %hs", e.what());
                     return false;
                 }
             }
@@ -235,7 +236,7 @@ namespace ShadowStrike {
                 m_eventCallbacks.clear();
 
                 m_initialized.store(false, std::memory_order_release);
-                Logger::Info("TimeBasedEvasionDetector shutdown complete");
+                SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector shutdown complete");
             }
 
             /**
@@ -295,7 +296,7 @@ namespace ShadowStrike {
                     );
 
                     if (!hProcess) {
-                        Logger::Warn("Failed to open process {}: {}", processId, GetLastError());
+                        SS_LOG_WARN(L"AntiEvasion", L"Failed to open process %u: %lu", processId, GetLastError());
                         return false;
                     }
 
@@ -337,7 +338,7 @@ namespace ShadowStrike {
                                 hProcess, ProcessBasicInformation,
                                 &pbi, sizeof(pbi), &returnLength))) {
                                 result.parentProcessId = static_cast<uint32_t>(
-                                    reinterpret_cast<uintptr_t>(pbi.InheritedFromUniqueProcessId)
+                                    static_cast<uintptr_t>(pbi.UniqueProcessId)
                                 );
                             }
                         }
@@ -349,7 +350,7 @@ namespace ShadowStrike {
                     return false;
 #endif
                 } catch (const std::exception& e) {
-                    Logger::Error("GetProcessInfo failed for PID {}: {}", processId, e.what());
+                    SS_LOG_ERROR(L"AntiEvasion", L"GetProcessInfo failed for PID %u: %hs", processId, e.what());
                     return false;
                 }
             }
@@ -394,7 +395,7 @@ namespace ShadowStrike {
             const TimingDetectorConfig& config
         ) {
             if (!m_impl) {
-                Logger::Critical("TimeBasedEvasionDetector: Implementation is null");
+                SS_LOG_FATAL(L"AntiEvasion", L"TimeBasedEvasionDetector: Implementation is null");
                 return false;
             }
 
@@ -416,7 +417,7 @@ namespace ShadowStrike {
 
             std::unique_lock lock(m_impl->m_mutex);
             m_impl->m_config = config;
-            Logger::Info("TimeBasedEvasionDetector configuration updated");
+            SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector configuration updated");
         }
 
         TimingDetectorConfig TimeBasedEvasionDetector::GetConfig() const {
@@ -435,7 +436,7 @@ namespace ShadowStrike {
 
             if (!IsInitialized()) {
                 result.errorMessage = L"Detector not initialized";
-                Logger::Error("AnalyzeProcess called but detector not initialized");
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess called but detector not initialized");
                 m_impl->m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
                 return result;
             }
@@ -447,7 +448,7 @@ namespace ShadowStrike {
                 // Check cache first
                 if (auto cached = m_impl->GetCachedResultInternal(processId)) {
                     m_impl->m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
-                    Logger::Info("Returning cached result for PID {}", processId);
+                    SS_LOG_INFO(L"AntiEvasion", L"Returning cached result for PID %u", processId);
                     return *cached;
                 }
                 m_impl->m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
@@ -530,16 +531,16 @@ namespace ShadowStrike {
                     InvokeCallbacks(result);
                 }
 
-                Logger::Info("Analysis complete for PID {} - Evasive: {}, Confidence: {:.1f}%",
+                SS_LOG_INFO(L"AntiEvasion", L"Analysis complete for PID %u - Evasive: %d, Confidence: %.1f%%",
                     processId, result.isEvasive, result.confidence);
 
             } catch (const std::exception& e) {
-                result.errorMessage = StringUtils::ToWideString(
+                result.errorMessage = StringUtils::ToWide(
                     std::string("Analysis exception: ") + e.what()
                 );
                 result.analysisComplete = false;
                 m_impl->m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
-                Logger::Error("AnalyzeProcess exception for PID {}: {}", processId, e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess exception for PID %u: %hs", processId, e.what());
             }
 
             return result;
@@ -550,26 +551,26 @@ namespace ShadowStrike {
             std::function<void(TimingEvasionResult)> callback
         ) {
             if (!IsInitialized() || !m_impl->m_threadPool) {
-                Logger::Error("AnalyzeProcessAsync: Not initialized or no thread pool");
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAsync: Not initialized or no thread pool");
                 return false;
             }
 
             if (!callback) {
-                Logger::Error("AnalyzeProcessAsync: Null callback");
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAsync: Null callback");
                 return false;
             }
 
             try {
                 // Submit to thread pool
-                m_impl->m_threadPool->EnqueueTask([this, processId, cb = std::move(callback)]() {
+                m_impl->m_threadPool->Submit([this, processId, cb = std::move(callback)](const Utils::TaskContext&) {
                     auto result = AnalyzeProcess(processId);
                     cb(std::move(result));
-                });
+                }, Utils::TaskPriority::Normal);
 
                 return true;
 
             } catch (const std::exception& e) {
-                Logger::Error("AnalyzeProcessAsync failed: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAsync failed: %hs", e.what());
                 return false;
             }
         }
@@ -698,7 +699,7 @@ namespace ShadowStrike {
                 analysis.confidence = factorCount > 0 ? confidenceFactors : 0.0f;
 
             } catch (const std::exception& e) {
-                Logger::Error("AnalyzeRDTSC exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeRDTSC exception: %hs", e.what());
             }
 
             return analysis;
@@ -773,7 +774,7 @@ namespace ShadowStrike {
                 analysis.confidence = std::min(confidence, 100.0f);
 
             } catch (const std::exception& e) {
-                Logger::Error("AnalyzeSleep exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeSleep exception: %hs", e.what());
             }
 
             return analysis;
@@ -817,7 +818,7 @@ namespace ShadowStrike {
 #endif
 
             } catch (const std::exception& e) {
-                Logger::Error("AnalyzeAPITiming exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeAPITiming exception: %hs", e.what());
             }
 
             return analysis;
@@ -827,8 +828,41 @@ namespace ShadowStrike {
             NTPAnalysis analysis{};
             analysis.processId = processId;
 
-            // Note: NTP detection requires network monitoring integration
-            // Placeholder implementation - would integrate with NetworkMonitor
+            if (!IsInitialized()) {
+                return analysis;
+            }
+
+            try {
+                // Use NetworkUtils to check for NTP connections (UDP port 123)
+                std::vector<Utils::NetworkUtils::ConnectionInfo> connections;
+                if (Utils::NetworkUtils::GetConnectionsByProcess(processId, connections)) {
+                    for (const auto& conn : connections) {
+                        if (conn.remotePort == 123 && conn.protocol == Utils::NetworkUtils::ProtocolType::UDP) {
+                            analysis.ntpQueryCount++;
+                            analysis.ntpServers.push_back(conn.remoteAddress.ToString());
+                            analysis.ntpEvasionDetected = true;
+                        }
+                    }
+                }
+
+                // If we found NTP servers, calculate confidence
+                if (analysis.ntpEvasionDetected) {
+                    // Enterprise heuristic: Valid NTP usually happens once at startup or at long intervals.
+                    // Evasion attempts might query repeatedly to check for time warping.
+
+                    if (analysis.ntpQueryCount > 1) {
+                        analysis.confidence = 85.0f; // High confidence if multiple queries observed
+                    } else {
+                        // Single query could be legitimate time sync, check context
+                        // If process is not a browser or system service, it's suspicious
+                        // We lack process category info here, so we default to medium confidence
+                        analysis.confidence = 60.0f;
+                    }
+                }
+
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeNTP exception: %hs", e.what());
+            }
 
             return analysis;
         }
@@ -872,7 +906,7 @@ namespace ShadowStrike {
 
         bool TimeBasedEvasionDetector::StartMonitoring(uint32_t processId) {
             if (!IsInitialized()) {
-                Logger::Error("StartMonitoring: Detector not initialized");
+                SS_LOG_ERROR(L"AntiEvasion", L"StartMonitoring: Detector not initialized");
                 return false;
             }
 
@@ -881,7 +915,7 @@ namespace ShadowStrike {
 
                 // Check process limit
                 if (m_impl->m_monitoredProcesses.size() >= m_impl->m_config.maxMonitoredProcesses) {
-                    Logger::Warn("StartMonitoring: Maximum monitored processes reached");
+                    SS_LOG_WARN(L"AntiEvasion", L"StartMonitoring: Maximum monitored processes reached");
                     return false;
                 }
 
@@ -895,11 +929,11 @@ namespace ShadowStrike {
                 m_impl->m_monitoredProcesses[processId] = state;
                 m_impl->m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
 
-                Logger::Info("Started monitoring PID {}", processId);
+                SS_LOG_INFO(L"AntiEvasion", L"Started monitoring PID %u", processId);
                 return true;
 
             } catch (const std::exception& e) {
-                Logger::Error("StartMonitoring failed: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"StartMonitoring failed: %hs", e.what());
                 return false;
             }
         }
@@ -913,7 +947,7 @@ namespace ShadowStrike {
             if (it != m_impl->m_monitoredProcesses.end()) {
                 m_impl->m_monitoredProcesses.erase(it);
                 m_impl->m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
-                Logger::Info("Stopped monitoring PID {}", processId);
+                SS_LOG_INFO(L"AntiEvasion", L"Stopped monitoring PID %u", processId);
             }
         }
 
@@ -926,7 +960,7 @@ namespace ShadowStrike {
             m_impl->m_monitoredProcesses.clear();
             m_impl->m_stats.currentlyMonitoring.store(0, std::memory_order_relaxed);
 
-            Logger::Info("Stopped monitoring all {} processes", count);
+            SS_LOG_INFO(L"AntiEvasion", L"Stopped monitoring all %zu processes", count);
         }
 
         bool TimeBasedEvasionDetector::IsMonitoring(uint32_t processId) const {
@@ -958,7 +992,7 @@ namespace ShadowStrike {
             auto it = m_impl->m_monitoredProcesses.find(processId);
             if (it != m_impl->m_monitoredProcesses.end()) {
                 it->second.state = MonitoringState::Paused;
-                Logger::Info("Paused monitoring PID {}", processId);
+                SS_LOG_INFO(L"AntiEvasion", L"Paused monitoring PID %u", processId);
             }
         }
 
@@ -970,7 +1004,7 @@ namespace ShadowStrike {
             auto it = m_impl->m_monitoredProcesses.find(processId);
             if (it != m_impl->m_monitoredProcesses.end()) {
                 it->second.state = MonitoringState::Active;
-                Logger::Info("Resumed monitoring PID {}", processId);
+                SS_LOG_INFO(L"AntiEvasion", L"Resumed monitoring PID %u", processId);
             }
         }
 
@@ -1003,7 +1037,7 @@ namespace ShadowStrike {
             uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
             m_impl->m_callbacks[id] = std::move(callback);
 
-            Logger::Info("Registered timing evasion callback ID {}", id);
+            SS_LOG_INFO(L"AntiEvasion", L"Registered timing evasion callback ID %llu", id);
             return id;
         }
 
@@ -1015,7 +1049,7 @@ namespace ShadowStrike {
             auto it = m_impl->m_callbacks.find(callbackId);
             if (it != m_impl->m_callbacks.end()) {
                 m_impl->m_callbacks.erase(it);
-                Logger::Info("Unregistered callback ID {}", callbackId);
+                SS_LOG_INFO(L"AntiEvasion", L"Unregistered callback ID %llu", callbackId);
                 return true;
             }
 
@@ -1032,7 +1066,7 @@ namespace ShadowStrike {
             uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
             m_impl->m_eventCallbacks[id] = std::move(callback);
 
-            Logger::Info("Registered timing event callback ID {}", id);
+            SS_LOG_INFO(L"AntiEvasion", L"Registered timing event callback ID %llu", id);
             return id;
         }
 
@@ -1064,7 +1098,7 @@ namespace ShadowStrike {
         void TimeBasedEvasionDetector::ResetStats() {
             if (m_impl) {
                 m_impl->m_stats.Reset();
-                Logger::Info("TimeBasedEvasionDetector statistics reset");
+                SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector statistics reset");
             }
         }
 
@@ -1080,7 +1114,7 @@ namespace ShadowStrike {
 
             std::unique_lock lock(m_impl->m_mutex);
             m_impl->m_resultCache.clear();
-            Logger::Info("Cleared timing evasion result cache");
+            SS_LOG_INFO(L"AntiEvasion", L"Cleared timing evasion result cache");
         }
 
         void TimeBasedEvasionDetector::ClearCacheForProcess(uint32_t processId) {
@@ -1139,7 +1173,7 @@ namespace ShadowStrike {
                     if (analysis.highFrequencyDetected) {
                         finding.type = TimingEvasionType::RDTSCHighFrequency;
                         finding.description = L"High-frequency RDTSC instruction execution detected";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("RDTSC calls/sec: {:.2f}, Threshold: {}",
                                 analysis.callsPerSecond,
                                 m_impl->m_config.rdtscFrequencyThreshold)
@@ -1147,7 +1181,7 @@ namespace ShadowStrike {
                     } else if (analysis.deltaCheckDetected) {
                         finding.type = TimingEvasionType::RDTSCDeltaCheck;
                         finding.description = L"RDTSC delta check for VM/hypervisor detection";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("Max RDTSC delta: {} ns, Threshold: {} ns",
                                 analysis.maxDeltaNs,
                                 m_impl->m_config.rdtscDeltaThresholdNs)
@@ -1155,7 +1189,7 @@ namespace ShadowStrike {
                     } else if (analysis.frequencyMeasurementDetected) {
                         finding.type = TimingEvasionType::TSCFrequencyMeasurement;
                         finding.description = L"TSC frequency measurement for VM detection";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("Delta std dev: {:.2f}", analysis.deltaStdDev)
                         );
                     }
@@ -1174,7 +1208,7 @@ namespace ShadowStrike {
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("CheckRDTSCAbuse exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"CheckRDTSCAbuse exception: %hs", e.what());
             }
         }
 
@@ -1200,7 +1234,7 @@ namespace ShadowStrike {
                     } else if (analysis.qpcAnomalyDetected) {
                         finding.type = TimingEvasionType::QPCAnomaly;
                         finding.description = L"QueryPerformanceCounter frequency anomaly";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("QPC deviation: {:.2f}%", analysis.qpcFrequencyDeviation)
                         );
                     } else if (analysis.crossCheckDetected) {
@@ -1220,7 +1254,7 @@ namespace ShadowStrike {
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("CheckTimeDriftChecks exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"CheckTimeDriftChecks exception: %hs", e.what());
             }
         }
 
@@ -1228,8 +1262,50 @@ namespace ShadowStrike {
             uint32_t processId,
             TimingEvasionResult& result
         ) {
-            // Implemented in CheckTimeDriftChecks for API timing
-            // Additional timer-specific checks can be added here
+            try {
+                // Enterprise implementation: Check for timer resolution manipulation (timeBeginPeriod)
+                // Malware often lowers timer resolution to 1ms to make Sleep(1) faster or more precise
+                // for timing attacks.
+
+                // We check loaded modules for winmm.dll which exports timeBeginPeriod
+                std::vector<ProcessUtils::ProcessModuleInfo> modules;
+                if (ProcessUtils::EnumerateProcessModules(processId, modules)) {
+                    bool winmmLoaded = false;
+                    for (const auto& mod : modules) {
+                        if (StringUtils::ToLower(mod.name) == L"winmm.dll") {
+                            winmmLoaded = true;
+                            break;
+                        }
+                    }
+
+                    if (winmmLoaded) {
+                        // If winmm is loaded, we check if the process exhibits high-frequency sleep patterns
+                        // which would necessitate timer resolution changes.
+                        auto sleepAnalysis = AnalyzeSleep(processId);
+
+                        // If we have many small sleeps and winmm is loaded, it's a potential indicator
+                        // of timer resolution tampering for evasion or evasion-related timing.
+                        if (sleepAnalysis.sleepCallCount > 50 && sleepAnalysis.avgActualDurationMs <= 15) { // 15.625ms is default tick
+                             TimingEvasionFinding finding{};
+                             finding.type = TimingEvasionType::TimeGetTimeCheck; // Re-using existing enum or closest match
+                             finding.description = L"Potential timer resolution manipulation detected";
+                             finding.technicalDetails = L"High frequency small sleeps with winmm.dll loaded. Avg Duration: " +
+                                                      std::to_wstring(sleepAnalysis.avgActualDurationMs) + L"ms";
+                             finding.confidence = 45.0f; // Medium confidence as legitimate games/media apps do this too
+                             finding.severity = TimingEvasionSeverity::Medium;
+                             finding.mitreId = TimingEvasionTypeToMitre(finding.type);
+                             finding.detectionTime = system_clock::now();
+
+                             result.findings.push_back(finding);
+                             result.detectedTypes.set(static_cast<size_t>(finding.type));
+                             m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
+                                 .fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"AntiEvasion", L"CheckTimerAnomalies exception: %hs", e.what());
+            }
         }
 
         void TimeBasedEvasionDetector::CheckSleepEvasion(
@@ -1251,19 +1327,19 @@ namespace ShadowStrike {
                     if (analysis.sleepBombingDetected) {
                         finding.type = TimingEvasionType::SleepBombing;
                         finding.description = L"Sleep bombing detected (extended sleep to timeout analysis)";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("Max sleep duration: {} ms", analysis.maxRequestedDurationMs)
                         );
                     } else if (analysis.accelerationDetected) {
                         finding.type = TimingEvasionType::SleepAccelerationDetect;
                         finding.description = L"Sleep acceleration detection (sandbox fast-forward)";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("Acceleration ratio: {:.3f}", analysis.accelerationRatio)
                         );
                     } else if (analysis.fragmentationDetected) {
                         finding.type = TimingEvasionType::SleepFragmentation;
                         finding.description = L"Fragmented sleeps to evade acceleration";
-                        finding.technicalDetails = StringUtils::ToWideString(
+                        finding.technicalDetails = StringUtils::ToWide(
                             std::format("Fragment count: {}, Avg duration: {} ms",
                                 analysis.fragmentedSleepCount,
                                 analysis.avgFragmentDurationMs)
@@ -1283,7 +1359,7 @@ namespace ShadowStrike {
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("CheckSleepEvasion exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"CheckSleepEvasion exception: %hs", e.what());
             }
         }
 
@@ -1306,6 +1382,13 @@ namespace ShadowStrike {
                     if (analysis.ntpEvasionDetected) {
                         finding.type = TimingEvasionType::NTPQuery;
                         finding.description = L"NTP server query for time validation";
+
+                        if (!analysis.ntpServers.empty()) {
+                             finding.technicalDetails = L"Servers: ";
+                             for(size_t i=0; i < std::min(analysis.ntpServers.size(), (size_t)3); ++i) {
+                                 finding.technicalDetails += analysis.ntpServers[i] + L" ";
+                             }
+                        }
                     } else if (analysis.externalValidationDetected) {
                         finding.type = TimingEvasionType::ExternalTimeValidation;
                         finding.description = L"External time source validation";
@@ -1322,7 +1405,7 @@ namespace ShadowStrike {
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("CheckNTPEvasion exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"CheckNTPEvasion exception: %hs", e.what());
             }
         }
 
@@ -1330,8 +1413,37 @@ namespace ShadowStrike {
             uint32_t processId,
             TimingEvasionResult& result
         ) {
-            // Hardware timer detection would require kernel driver support
-            // Placeholder for future implementation
+             // Basic user-mode check: look for suspicious loaded modules (drivers)
+             // that enable direct hardware access (e.g., WinIo, InpOut)
+             try {
+                 std::vector<ProcessUtils::ProcessModuleInfo> modules;
+                 if (ProcessUtils::EnumerateProcessModules(processId, modules)) {
+                     for (const auto& mod : modules) {
+                         std::wstring nameLower = StringUtils::ToLower(mod.name);
+                         if (nameLower.find(L"winio") != std::wstring::npos ||
+                             nameLower.find(L"inpout") != std::wstring::npos ||
+                             nameLower.find(L"giveio") != std::wstring::npos) {
+
+                             TimingEvasionFinding finding{};
+                             finding.type = TimingEvasionType::HardwareTimerDirect;
+                             finding.severity = TimingEvasionSeverity::High;
+                             finding.confidence = 90.0f;
+                             finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+                             finding.description = L"Suspicious hardware access driver loaded";
+                             finding.technicalDetails = L"Module: " + mod.name;
+                             finding.detectionTime = system_clock::now();
+                             finding.mitreId = TimingEvasionTypeToMitre(finding.type);
+
+                             result.findings.push_back(finding);
+                             result.detectedTypes.set(static_cast<size_t>(finding.type));
+                             m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
+                                 .fetch_add(1, std::memory_order_relaxed);
+                         }
+                     }
+                 }
+             } catch(...) {
+                 SS_LOG_ERROR(L"AntiEvasion", L"CheckHardwareTimers failed to enumerate modules for PID %u", processId);
+             }
         }
 
         void TimeBasedEvasionDetector::CorrelateFindings(TimingEvasionResult& result) {
@@ -1354,7 +1466,7 @@ namespace ShadowStrike {
                     correlatedFinding.confidence = 95.0f;
                     correlatedFinding.detectionMethod = TimingDetectionMethod::BehavioralHeuristics;
                     correlatedFinding.description = L"Multiple timing evasion techniques combined";
-                    correlatedFinding.technicalDetails = StringUtils::ToWideString(
+                    correlatedFinding.technicalDetails = StringUtils::ToWide(
                         std::format("Detected {} distinct timing techniques", uniqueTypes.size())
                     );
                     correlatedFinding.detectionTime = system_clock::now();
@@ -1365,7 +1477,7 @@ namespace ShadowStrike {
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("CorrelateFindings exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"CorrelateFindings exception: %hs", e.what());
             }
         }
 
@@ -1402,12 +1514,12 @@ namespace ShadowStrike {
                 result.confidence = maxConfidence;
                 result.severity = maxSeverity;
 
-                Logger::Info("Calculated threat score: {:.1f}, Confidence: {:.1f}%, Severity: {}",
+                SS_LOG_INFO(L"AntiEvasion", L"Calculated threat score: %.1f, Confidence: %.1f%%, Severity: %hs",
                     result.threatScore, result.confidence,
                     TimingEvasionSeverityToString(result.severity));
 
             } catch (const std::exception& e) {
-                Logger::Error("CalculateThreatScore exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"CalculateThreatScore exception: %hs", e.what());
             }
         }
 
@@ -1425,7 +1537,7 @@ namespace ShadowStrike {
                 std::sort(result.mitreIds.begin(), result.mitreIds.end());
 
             } catch (const std::exception& e) {
-                Logger::Error("AddMitreMappings exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"AddMitreMappings exception: %hs", e.what());
             }
         }
 
@@ -1441,7 +1553,7 @@ namespace ShadowStrike {
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("MonitoringTick exception for PID {}: {}", processId, e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"MonitoringTick exception for PID %u: %hs", processId, e.what());
             }
         }
 
@@ -1455,12 +1567,12 @@ namespace ShadowStrike {
                     try {
                         callback(result);
                     } catch (const std::exception& e) {
-                        Logger::Error("Callback {} exception: {}", id, e.what());
+                        SS_LOG_ERROR(L"AntiEvasion", L"Callback %llu exception: %hs", id, e.what());
                     }
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("InvokeCallbacks exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"InvokeCallbacks exception: %hs", e.what());
             }
         }
 
@@ -1496,7 +1608,7 @@ namespace ShadowStrike {
                 m_impl->m_stats.totalEventsProcessed.fetch_add(1, std::memory_order_relaxed);
 
             } catch (const std::exception& e) {
-                Logger::Error("RecordTimingEvent exception: {}", e.what());
+                SS_LOG_ERROR(L"AntiEvasion", L"RecordTimingEvent exception: %hs", e.what());
             }
         }
 

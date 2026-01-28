@@ -31,6 +31,7 @@
 #include <queue>
 #include <sstream>
 #include <fstream>
+#include <unordered_set>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -44,6 +45,16 @@
 
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
+
+#include <shlobj.h>
+#pragma comment(lib, "shell32.lib")
+
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
+// For EnumDisplayDevices
+#include <winuser.h>
+#pragma comment(lib, "user32.lib")
 
 // ============================================================================
 // SHADOWSTRIKE INTERNAL INCLUDES
@@ -236,6 +247,7 @@ namespace ShadowStrike::AntiEvasion {
         [[nodiscard]] bool CheckLowRAM(uint64_t& ramBytes) const noexcept;
         [[nodiscard]] bool CheckLowCPU(uint32_t& coreCount) const noexcept;
         [[nodiscard]] bool CheckSmallDisk(uint64_t& diskBytes) const noexcept;
+        [[nodiscard]] bool CheckSuspiciousGPU(bool& hasDedicatedGPU, std::wstring& gpuName) const noexcept;
 
         // Timing checks
         [[nodiscard]] bool CheckShortUptime(uint64_t& uptimeMs) const noexcept;
@@ -270,29 +282,33 @@ namespace ShadowStrike::AntiEvasion {
                 return true; // Already initialized
             }
 
-            Utils::Logger::Info(L"SandboxEvasionDetector: Initializing...");
+            SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: Initializing...");
 
             // PatternStore is optional (can be set later)
+            if (m_patternStore) {
+                SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: Initialized with PatternStore");
+            } else {
+                SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: Initialized (PatternStore pending)");
+            }
 
-            Utils::Logger::Info(L"SandboxEvasionDetector: Initialized successfully");
+            SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: Initialized successfully");
             return true;
 
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"SandboxEvasionDetector initialization failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"SandboxEvasionDetector initialization failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Initialization failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_initialized = false;
             return false;
         }
         catch (...) {
-            Utils::Logger::Critical(L"SandboxEvasionDetector: Unknown initialization error");
+            SS_LOG_FATAL(L"AntiEvasion", L"SandboxEvasionDetector: Unknown initialization error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -312,7 +328,7 @@ namespace ShadowStrike::AntiEvasion {
                 return; // Already shutdown
             }
 
-            Utils::Logger::Info(L"SandboxEvasionDetector: Shutting down...");
+            SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: Shutting down...");
 
             // Clear caches
             m_resultCache.clear();
@@ -321,10 +337,10 @@ namespace ShadowStrike::AntiEvasion {
             // Clear callback
             m_detectionCallback = nullptr;
 
-            Utils::Logger::Info(L"SandboxEvasionDetector: Shutdown complete");
+            SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: Shutdown complete");
         }
         catch (...) {
-            Utils::Logger::Error(L"SandboxEvasionDetector: Exception during shutdown");
+            SS_LOG_ERROR(L"AntiEvasion", L"SandboxEvasionDetector: Exception during shutdown");
         }
     }
 
@@ -338,7 +354,7 @@ namespace ShadowStrike::AntiEvasion {
             memInfo.dwLength = sizeof(memInfo);
 
             if (!GlobalMemoryStatusEx(&memInfo)) {
-                Utils::Logger::Warn(L"CheckLowRAM: GlobalMemoryStatusEx failed: {}", GetLastError());
+                SS_LOG_WARN(L"AntiEvasion", L"CheckLowRAM: GlobalMemoryStatusEx failed: %d", GetLastError());
                 return false;
             }
 
@@ -356,7 +372,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckLowRAM: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckLowRAM: Exception");
             return false;
         }
     }
@@ -380,7 +396,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckLowCPU: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckLowCPU: Exception");
             return false;
         }
     }
@@ -404,7 +420,7 @@ namespace ShadowStrike::AntiEvasion {
                 &freeBytesAvailable,
                 &totalNumberOfBytes,
                 &totalNumberOfFreeBytes)) {
-                Utils::Logger::Warn(L"CheckSmallDisk: GetDiskFreeSpaceEx failed: {}", GetLastError());
+                SS_LOG_WARN(L"AntiEvasion", L"CheckSmallDisk: GetDiskFreeSpaceEx failed: %d", GetLastError());
                 return false;
             }
 
@@ -422,7 +438,97 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckSmallDisk: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckSmallDisk: Exception");
+            return false;
+        }
+    }
+
+    bool SandboxEvasionDetector::Impl::CheckSuspiciousGPU(bool& hasDedicatedGPU, std::wstring& gpuName) const noexcept {
+        try {
+            hasDedicatedGPU = false;
+            gpuName.clear();
+
+            DISPLAY_DEVICEW dd = {};
+            dd.cb = sizeof(dd);
+
+            // Enumerate primary display device
+            if (!EnumDisplayDevicesW(nullptr, 0, &dd, 0)) {
+                SS_LOG_WARN(L"AntiEvasion", L"CheckSuspiciousGPU: EnumDisplayDevicesW failed: %d", GetLastError());
+                return false;
+            }
+
+            gpuName = dd.DeviceString;
+            std::wstring lowerName = gpuName;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+            // Check for known VM/Sandbox adapters
+            const std::vector<std::wstring> suspiciousGPUs = {
+                L"vmware",
+                L"virtualbox",
+                L"vbox",
+                L"basic render driver",
+                L"standard vga",
+                L"microsoft basic display adapter",
+                L"citrix",
+                L"parallels",
+                L"qemu",
+                L"red hat",
+                L"bochs",
+                L"xen"
+            };
+
+            bool isSuspicious = false;
+            for (const auto& susp : suspiciousGPUs) {
+                if (lowerName.find(susp) != std::wstring::npos) {
+                    isSuspicious = true;
+                    break;
+                }
+            }
+
+            // Check for known dedicated GPU vendors
+            const std::vector<std::wstring> dedicatedVendors = {
+                L"nvidia",
+                L"amd",
+                L"radeon",
+                L"geforce",
+                L"intel", // Intel Integrated is still better than Basic Render
+                L"iris",
+                L"arc"
+            };
+
+            for (const auto& vendor : dedicatedVendors) {
+                if (lowerName.find(vendor) != std::wstring::npos) {
+                    hasDedicatedGPU = true;
+                    // If it matches a dedicated vendor but ALSO suspicious (rare but possible), prioritize suspicious?
+                    // Usually "VMware SVGA 3D" won't match "nvidia" unless passthrough.
+                    // If passthrough, it's a "good" VM or real hardware.
+                    if (isSuspicious) isSuspicious = false;
+                    break;
+                }
+            }
+
+            // If we didn't find a dedicated vendor, and it's not explicitly suspicious, it might still be suspicious
+            // if it's just "Microsoft Corporation" or similar generic names.
+            if (!hasDedicatedGPU && !isSuspicious) {
+                // Enterprise Grade: Check PCI Vendor IDs in DeviceID string for stronger detection
+                // Format: PCI\VEN_xxxx&DEV_xxxx...
+                std::wstring deviceId = dd.DeviceID;
+                std::transform(deviceId.begin(), deviceId.end(), deviceId.begin(), ::towupper);
+
+                // Known Virtualization Vendor IDs
+                if (deviceId.find(L"VEN_15AD") != std::wstring::npos) isSuspicious = true;      // VMware
+                else if (deviceId.find(L"VEN_80EE") != std::wstring::npos) isSuspicious = true; // VirtualBox
+                else if (deviceId.find(L"VEN_1AF4") != std::wstring::npos) isSuspicious = true; // VirtIO / Red Hat
+                else if (deviceId.find(L"VEN_1AB8") != std::wstring::npos) isSuspicious = true; // Parallels
+                else if (deviceId.find(L"VEN_1414") != std::wstring::npos) isSuspicious = true; // Microsoft Basic Render / RemoteFX
+                else if (deviceId.find(L"VEN_5853") != std::wstring::npos) isSuspicious = true; // Citrix
+                else if (deviceId.find(L"VEN_1234") != std::wstring::npos) isSuspicious = true; // Bochs / QEMU
+            }
+
+            return isSuspicious;
+        }
+        catch (...) {
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckSuspiciousGPU: Exception");
             return false;
         }
     }
@@ -451,7 +557,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckShortUptime: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckShortUptime: Exception");
             return false;
         }
     }
@@ -499,7 +605,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckRecentInstall: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckRecentInstall: Exception");
             return false;
         }
     }
@@ -535,7 +641,7 @@ namespace ShadowStrike::AntiEvasion {
             return count;
         }
         catch (...) {
-            Utils::Logger::Error(L"CountRecentDocuments: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CountRecentDocuments: Exception");
             return 0;
         }
     }
@@ -567,7 +673,7 @@ namespace ShadowStrike::AntiEvasion {
             return count;
         }
         catch (...) {
-            Utils::Logger::Error(L"CountDesktopFiles: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CountDesktopFiles: Exception");
             return 0;
         }
     }
@@ -612,7 +718,7 @@ namespace ShadowStrike::AntiEvasion {
             return count;
         }
         catch (...) {
-            Utils::Logger::Error(L"CountInstalledPrograms: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CountInstalledPrograms: Exception");
             return 0;
         }
     }
@@ -644,7 +750,7 @@ namespace ShadowStrike::AntiEvasion {
             return count;
         }
         catch (...) {
-            Utils::Logger::Error(L"CountTempFiles: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CountTempFiles: Exception");
             return 0;
         }
     }
@@ -675,7 +781,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckSuspiciousScreenResolution: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckSuspiciousScreenResolution: Exception");
             return false;
         }
     }
@@ -698,7 +804,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CheckLowColorDepth: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckLowColorDepth: Exception");
             return false;
         }
     }
@@ -774,7 +880,7 @@ namespace ShadowStrike::AntiEvasion {
             return ratio; // Return ratio as confidence
         }
         catch (...) {
-            Utils::Logger::Error(L"AnalyzeMouseMovements: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeMouseMovements: Exception");
             return 0.0;
         }
     }
@@ -867,20 +973,19 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeSystem failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeSystem failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Analysis failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_impl->m_stats.analysisErrors++;
             return result;
         }
         catch (...) {
-            Utils::Logger::Critical(L"AnalyzeSystem: Unknown error");
+            SS_LOG_FATAL(L"AntiEvasion", L"AnalyzeSystem: Unknown error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -943,8 +1048,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeProcess failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1039,8 +1143,7 @@ namespace ShadowStrike::AntiEvasion {
             return !outInfo.hasHumanInteraction; // True if no human detected (sandbox)
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckHumanInteraction failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckHumanInteraction failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1073,8 +1176,14 @@ namespace ShadowStrike::AntiEvasion {
             // Disk check
             outInfo.hasSmallDisk = m_impl->CheckSmallDisk(outInfo.diskBytes);
 
-            // GPU check (simplified - check for GPU presence)
-            outInfo.hasGPU = false; // Stub - would enumerate display adapters
+            // GPU check (Full implementation)
+            std::wstring gpuName;
+            bool isSuspiciousGPU = m_impl->CheckSuspiciousGPU(outInfo.hasGPU, gpuName);
+
+            // Note: outInfo.hasGPU in the struct might refer to "Has Dedicated/Real GPU"
+            // If we found a dedicated GPU, hasGPU = true.
+            // If we found a generic/VM GPU, hasGPU = false (assuming struct semantics).
+            // If isSuspiciousGPU is true, it strongly implies a sandbox.
 
             outInfo.valid = true;
 
@@ -1082,13 +1191,13 @@ namespace ShadowStrike::AntiEvasion {
             const uint32_t suspiciousFlags = (outInfo.hasLowRAM ? 1 : 0) +
                 (outInfo.hasLowCPUCores ? 1 : 0) +
                 (outInfo.hasSmallDisk ? 1 : 0) +
-                (!outInfo.hasGPU ? 1 : 0);
+                (!outInfo.hasGPU ? 1 : 0) +
+                (isSuspiciousGPU ? 1 : 0);
 
             return (suspiciousFlags >= 2); // 2+ suspicious indicators
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckHardwareProfile failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckHardwareProfile failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1129,8 +1238,7 @@ namespace ShadowStrike::AntiEvasion {
             return outInfo.isPristineSystem;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckSystemWearAndTear failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckSystemWearAndTear failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1165,8 +1273,7 @@ namespace ShadowStrike::AntiEvasion {
             return (outInfo.hasShortUptime || outInfo.isRecentInstall);
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckTimingCharacteristics failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckTimingCharacteristics failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1272,8 +1379,7 @@ namespace ShadowStrike::AntiEvasion {
             return !outArtifacts.empty();
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"DetectSandboxArtifacts failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"DetectSandboxArtifacts failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1306,7 +1412,7 @@ namespace ShadowStrike::AntiEvasion {
             // Color depth check
             outInfo.hasLowColorDepth = m_impl->CheckLowColorDepth(outInfo.colorDepth);
 
-            // Audio device check (simplified)
+            // Audio device check
             outInfo.hasAudioDevice = (waveOutGetNumDevs() > 0);
 
             // Monitor count
@@ -1317,8 +1423,7 @@ namespace ShadowStrike::AntiEvasion {
             return (outInfo.hasSuspiciousScreen || outInfo.hasLowColorDepth || !outInfo.hasAudioDevice);
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckEnvironmentCharacteristics failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"AntiEvasion", L"CheckEnvironmentCharacteristics failed: %ls", Utils::StringUtils::ToWide(e.what()).c_str());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1391,7 +1496,7 @@ namespace ShadowStrike::AntiEvasion {
             return std::nullopt; // Unknown sandbox
         }
         catch (...) {
-            Utils::Logger::Error(L"IdentifySandboxProduct: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"IdentifySandboxProduct: Exception");
             return std::nullopt;
         }
     }
@@ -1488,8 +1593,10 @@ namespace ShadowStrike::AntiEvasion {
 
     void SandboxEvasionDetector::ClearCustomPatterns() noexcept {
         std::unique_lock lock(m_impl->m_mutex);
-        // Don't clear built-in patterns, only reset to defaults
-        // (For this implementation, we keep the hardcoded patterns)
+        // Note: This implementation currently uses a unified list for known DLLs/Processes.
+        // Clearing custom patterns here is a no-op to preserve built-in signatures.
+        // In a future refactor, we should separate Default vs Custom lists.
+        SS_LOG_INFO(L"AntiEvasion", L"SandboxEvasionDetector: ClearCustomPatterns called (Hardcoded patterns preserved)");
     }
 
     // ========================================================================
@@ -1563,7 +1670,7 @@ namespace ShadowStrike::AntiEvasion {
             CalculateSandboxProbability(result);
         }
         catch (...) {
-            Utils::Logger::Error(L"AnalyzeSystemInternal: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeSystemInternal: Exception");
         }
     }
 
@@ -1611,7 +1718,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"CalculateSandboxProbability: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"CalculateSandboxProbability: Exception");
         }
     }
 
@@ -1650,7 +1757,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            Utils::Logger::Error(L"AddIndicator: Exception");
+            SS_LOG_ERROR(L"AntiEvasion", L"AddIndicator: Exception");
         }
     }
 

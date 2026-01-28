@@ -269,3 +269,44 @@ GetLDTSelector PROC
 GetLDTSelector ENDP
 
 END
+
+; ==============================================================================
+; CheckVMwareBackdoor
+; Performs the VMware backdoor I/O port check
+;
+; Arguments:
+;   RCX = uint32_t* pEax (Input/Output)
+;   RDX = uint32_t* pEbx (Input/Output)
+;   R8  = uint32_t* pEcx (Input/Output)
+;   R9  = uint32_t* pEdx (Input/Output)
+;
+; extern "C" void CheckVMwareBackdoor(uint32_t* eax, uint32_t* ebx, uint32_t* ecx, uint32_t* edx) noexcept;
+; ==============================================================================
+CheckVMwareBackdoor PROC FRAME
+    push rbx
+    .pushreg rbx
+    .endprolog
+
+    mov r10, rcx        ; Save pEax
+    mov r11, rdx        ; Save pEbx
+    ; r8 (pEcx) and r9 (pEdx) are safe to keep as they are separate registers from eax-edx
+
+    ; Load input values
+    mov eax, dword ptr [r10]
+    mov ebx, dword ptr [r11]
+    mov ecx, dword ptr [r8]
+    mov edx, dword ptr [r9]
+
+    ; Execute VMware backdoor instruction (IN EAX, DX)
+    ; This will read from I/O port specified in DX.
+    in eax, dx
+
+    ; Store output values
+    mov dword ptr [r10], eax
+    mov dword ptr [r11], ebx
+    mov dword ptr [r8], ecx
+    mov dword ptr [r9], edx
+
+    pop rbx
+    ret
+CheckVMwareBackdoor ENDP

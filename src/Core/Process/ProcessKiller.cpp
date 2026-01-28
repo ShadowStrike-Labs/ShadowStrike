@@ -886,8 +886,16 @@ public:
         result = KillWithMethod(pid, KillMethod::JobObject, options, info);
         if (result == KillResult::Success) return result;
 
-        // Level 5: Token Manipulation (would require more code)
-        // Level 6-8: Kernel methods (would require driver)
+        // Level 5: Token Manipulation
+        // KERNEL DRIVER INTEGRATION WILL COME HERE
+        // We would strip the process token of its privileges here.
+
+        // Level 6-8: Kernel methods
+        // KERNEL DRIVER INTEGRATION WILL COME HERE
+        // For enterprise-grade termination, we would use a kernel driver to:
+        // 1. Clear callbacks (Level 6)
+        // 2. Call ZwTerminateProcess (Level 7)
+        // 3. Zero out process memory/structures (Level 8)
 
         return result;
     }
@@ -1469,7 +1477,9 @@ bool ProcessKiller::IsProtectedProcess(uint32_t pid) {
 }
 
 bool ProcessKiller::RemoveProtection(uint32_t pid) {
-    // Would require kernel driver
+    // KERNEL DRIVER INTEGRATION WILL COME HERE
+    // In production, this requires a kernel driver to manipulate the EPROCESS structure
+    // directly, specifically modifying the Protection/SignatureLevel bits to bypass PPL.
     return false;
 }
 

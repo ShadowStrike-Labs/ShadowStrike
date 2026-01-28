@@ -55,6 +55,7 @@
 // SHADOWSTRIKE INTERNAL INCLUDES
 // ============================================================================
 
+#include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
@@ -467,7 +468,7 @@ namespace ShadowStrike::AntiEvasion {
                 return true; // Already initialized
             }
 
-            Utils::Logger::Info(L"EnvironmentEvasionDetector: Initializing...");
+            SS_LOG_INFO(L"EnvironmentEvasionDetector", L"Initializing...");
 
             // Pre-cache system identity and hardware info for performance
             m_cachedIdentityInfo = SystemIdentityInfo{};
@@ -476,25 +477,24 @@ namespace ShadowStrike::AntiEvasion {
             m_cachedHardwareInfo = HardwareFingerprintInfo{};
             CollectHardwareInfo(*m_cachedHardwareInfo);
 
-            Utils::Logger::Info(L"EnvironmentEvasionDetector: Initialized successfully");
+            SS_LOG_INFO(L"EnvironmentEvasionDetector", L"Initialized successfully");
             return true;
 
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"EnvironmentEvasionDetector initialization failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"Initialization failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
                 err->message = L"Initialization failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
+                err->context = Utils::StringUtils::ToWide(e.what());
             }
 
             m_initialized = false;
             return false;
         }
         catch (...) {
-            Utils::Logger::Critical(L"EnvironmentEvasionDetector: Unknown initialization error");
+            SS_LOG_FATAL(L"EnvironmentEvasionDetector", L"Unknown initialization error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -514,7 +514,7 @@ namespace ShadowStrike::AntiEvasion {
                 return; // Already shutdown
             }
 
-            Utils::Logger::Info(L"EnvironmentEvasionDetector: Shutting down...");
+            SS_LOG_INFO(L"EnvironmentEvasionDetector", L"Shutting down...");
 
             // Clear caches
             m_resultCache.clear();
@@ -529,10 +529,10 @@ namespace ShadowStrike::AntiEvasion {
             // Clear callback
             m_detectionCallback = nullptr;
 
-            Utils::Logger::Info(L"EnvironmentEvasionDetector: Shutdown complete");
+            SS_LOG_INFO(L"EnvironmentEvasionDetector", L"Shutdown complete");
         }
         catch (...) {
-            Utils::Logger::Error(L"EnvironmentEvasionDetector: Exception during shutdown");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"Exception during shutdown");
         }
     }
 
@@ -734,7 +734,7 @@ namespace ShadowStrike::AntiEvasion {
             // Get CPU brand string using assembly function
             char cpuBrand[256] = {};
             GetCPUIDBrandString(cpuBrand, sizeof(cpuBrand));
-            info.cpuBrand = Utils::StringUtils::ToWideString(cpuBrand);
+            info.cpuBrand = Utils::StringUtils::ToWide(cpuBrand);
 
             // Check hypervisor bit using assembly function
             info.hypervisorDetected = CheckCPUIDHypervisorBit();
@@ -767,12 +767,11 @@ namespace ShadowStrike::AntiEvasion {
             info.valid = true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CollectHardwareInfo failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectHardwareInfo failed: %hs", e.what());
             info.valid = false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CollectHardwareInfo: Unknown error");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectHardwareInfo: Unknown error");
             info.valid = false;
         }
     }
@@ -820,12 +819,11 @@ namespace ShadowStrike::AntiEvasion {
             info.valid = true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CollectIdentityInfo failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectIdentityInfo failed: %hs", e.what());
             info.valid = false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CollectIdentityInfo: Unknown error");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectIdentityInfo: Unknown error");
             info.valid = false;
         }
     }
@@ -851,8 +849,8 @@ namespace ShadowStrike::AntiEvasion {
 
                 while (pAdapter) {
                     NetworkConfigInfo::AdapterInfo adapter;
-                    adapter.name = Utils::StringUtils::ToWideString(pAdapter->AdapterName);
-                    adapter.description = Utils::StringUtils::ToWideString(pAdapter->Description);
+                    adapter.name = Utils::StringUtils::ToWide(pAdapter->AdapterName);
+                    adapter.description = Utils::StringUtils::ToWide(pAdapter->Description);
 
                     // Copy MAC address
                     if (pAdapter->AddressLength == 6) {
@@ -876,8 +874,8 @@ namespace ShadowStrike::AntiEvasion {
 
                     // Get IP address
                     if (pAdapter->IpAddressList.IpAddress.String[0] != '\0') {
-                        adapter.ipAddress = Utils::StringUtils::ToWideString(pAdapter->IpAddressList.IpAddress.String);
-                        adapter.subnetMask = Utils::StringUtils::ToWideString(pAdapter->IpAddressList.IpMask.String);
+                        adapter.ipAddress = Utils::StringUtils::ToWide(pAdapter->IpAddressList.IpAddress.String);
+                        adapter.subnetMask = Utils::StringUtils::ToWide(pAdapter->IpAddressList.IpMask.String);
                     }
 
                     // Check if WiFi
@@ -897,12 +895,11 @@ namespace ShadowStrike::AntiEvasion {
             info.valid = true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CollectNetworkInfo failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectNetworkInfo failed: %hs", e.what());
             info.valid = false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CollectNetworkInfo: Unknown error");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectNetworkInfo: Unknown error");
             info.valid = false;
         }
     }
@@ -935,12 +932,11 @@ namespace ShadowStrike::AntiEvasion {
             info.valid = true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CollectUserActivityInfo failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectUserActivityInfo failed: %hs", e.what());
             info.valid = false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CollectUserActivityInfo: Unknown error");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectUserActivityInfo: Unknown error");
             info.valid = false;
         }
     }
@@ -994,12 +990,11 @@ namespace ShadowStrike::AntiEvasion {
             info.valid = true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CollectProcessEnvironmentInfo failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectProcessEnvironmentInfo failed: %hs", e.what());
             info.valid = false;
         }
         catch (...) {
-            Utils::Logger::Error(L"CollectProcessEnvironmentInfo: Unknown error");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CollectProcessEnvironmentInfo: Unknown error");
             info.valid = false;
         }
     }
@@ -1052,12 +1047,11 @@ namespace ShadowStrike::AntiEvasion {
             info.valid = true;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeFileNaming failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeFileNaming failed: %hs", e.what());
             info.valid = false;
         }
         catch (...) {
-            Utils::Logger::Error(L"AnalyzeFileNaming: Unknown error");
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeFileNaming: Unknown error");
             info.valid = false;
         }
     }
@@ -1252,8 +1246,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeProcess failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeProcess failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1264,7 +1257,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (...) {
-            Utils::Logger::Critical(L"AnalyzeProcess: Unknown error");
+            SS_LOG_FATAL(L"EnvironmentEvasionDetector", L"AnalyzeProcess: Unknown error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1307,8 +1300,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeProcess (handle) failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeProcess (handle) failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1349,8 +1341,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"AnalyzeSystemEnvironment failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeSystemEnvironment failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1614,8 +1605,7 @@ namespace ShadowStrike::AntiEvasion {
             return found;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckBlacklistedNames failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CheckBlacklistedNames failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1698,8 +1688,7 @@ namespace ShadowStrike::AntiEvasion {
             return found;
         }
         catch (const std::exception& e) {
-            Utils::Logger::Error(L"CheckHardwareFingerprint failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CheckHardwareFingerprint failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1724,9 +1713,67 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check for VM tools directories, empty user folders, etc.
-        // Implementation omitted for brevity but follows same pattern
-        return false;
+        try {
+            bool found = false;
+            std::shared_lock lock(m_impl->m_mutex);
+
+            // 1. Check for VM Tools directories
+            const std::vector<std::wstring> vmDirs = {
+                L"C:\\Program Files\\VMware\\VMware Tools",
+                L"C:\\Program Files (x86)\\VMware\\VMware Tools",
+                L"C:\\Program Files\\Oracle\\VirtualBox Guest Additions",
+                L"C:\\Program Files\\Qemu-ga",
+                L"C:\\Program Files\\SPICE Guest Tools"
+            };
+
+            for (const auto& dir : vmDirs) {
+                if (fs::exists(dir)) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory);
+                    detection.confidence = 1.0;
+                    detection.detectedValue = dir;
+                    detection.description = L"VM Tools directory detected";
+                    detection.source = L"File System";
+                    outDetections.push_back(detection);
+                    found = true;
+                }
+            }
+
+            // 2. Check for "Lived-in" artifacts (User Activity Info)
+            UserActivityInfo activityInfo;
+            m_impl->CollectUserActivityInfo(activityInfo);
+
+            if (activityInfo.desktopItemsCount == 0) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDesktop);
+                detection.confidence = 0.6;
+                detection.detectedValue = L"0 items";
+                detection.description = L"Empty Desktop folder (typical of fresh sandboxes)";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            if (activityInfo.documentsCount == 0) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDocuments);
+                detection.confidence = 0.6;
+                detection.detectedValue = L"0 items";
+                detection.description = L"Empty Documents folder";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            if (activityInfo.downloadsCount == 0) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDownloads);
+                detection.confidence = 0.6;
+                detection.detectedValue = L"0 items";
+                detection.description = L"Empty Downloads folder";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::CheckRegistryArtifacts(
@@ -1767,6 +1814,25 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            // Check for MRU lists (Recently Used)
+            // If checking current user
+            // HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD subKeyCount = 0;
+                DWORD valueCount = 0;
+                RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, &valueCount, nullptr, nullptr, nullptr, nullptr);
+                RegCloseKey(hKey);
+
+                if (subKeyCount < 2 && valueCount < 2) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
+                    detection.confidence = 0.5;
+                    detection.description = L"Empty/Sparse RecentDocs MRU list";
+                    outDetections.push_back(detection);
+                    found = true;
+                }
+            }
+
             return found;
         }
         catch (...) {
@@ -1779,8 +1845,26 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check for lack of user artifacts
-        return false;
+        try {
+            bool found = false;
+
+            if (!outActivityInfo.valid) {
+                m_impl->CollectUserActivityInfo(outActivityInfo);
+            }
+
+            if (!outActivityInfo.isLivedInSystem) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ACTIVITY_UserIdleDetection);
+                detection.confidence = 0.5;
+                detection.description = L"System lacks typical user activity artifacts (Recent docs, Downloads, Desktop items)";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::CheckNetworkConfiguration(
@@ -1887,32 +1971,138 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check for sandbox-specific environment variables
-        return false;
+        try {
+            bool found = false;
+
+            if (!outEnvInfo.valid) {
+                m_impl->CollectProcessEnvironmentInfo(processId, outEnvInfo);
+            }
+
+            for (const auto& var : outEnvInfo.suspiciousVariables) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ENV_SandboxVariable);
+                detection.confidence = 0.9;
+                detection.detectedValue = var;
+                detection.description = L"Sandbox-specific environment variable detected";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::CheckDisplayConfiguration(
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check display settings
-        return false;
+        try {
+            bool found = false;
+            std::shared_lock lock(m_impl->m_mutex);
+
+            if (!m_impl->m_cachedHardwareInfo || !m_impl->m_cachedHardwareInfo->valid) {
+                return false;
+            }
+
+            const auto& hw = *m_impl->m_cachedHardwareInfo;
+
+            // Check resolution
+            if (hw.screenWidth < 1024 || hw.screenHeight < 768) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::DISPLAY_LowResolution);
+                detection.confidence = 0.6;
+                detection.detectedValue = std::to_wstring(hw.screenWidth) + L"x" + std::to_wstring(hw.screenHeight);
+                detection.expectedValue = L">= 1024x768";
+                detection.description = L"Low screen resolution typical of headless/automated VMs";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            // Check monitor count
+            if (hw.monitorCount < 1) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::DISPLAY_SingleMonitor);
+                detection.confidence = 0.8;
+                detection.detectedValue = std::to_wstring(hw.monitorCount);
+                detection.description = L"No monitors detected (Headless)";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::CheckBrowserArtifacts(
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check browser history, cookies, etc.
-        return false;
+        try {
+            // Basic check for browser history files existence (Chrome/Edge/Firefox)
+            bool historyFound = false;
+            auto expandPath = [](const wchar_t* path) -> std::wstring {
+                wchar_t expanded[MAX_PATH];
+                ExpandEnvironmentStringsW(path, expanded, MAX_PATH);
+                return expanded;
+            };
+
+            std::vector<std::wstring> browserPaths = {
+                expandPath(L"%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\History"),
+                expandPath(L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\\History"),
+                expandPath(L"%APPDATA%\\Mozilla\\Firefox\\Profiles") // Just checking dir existence
+            };
+
+            for (const auto& path : browserPaths) {
+                if (fs::exists(path)) {
+                    historyFound = true;
+                    break;
+                }
+            }
+
+            if (!historyFound) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::BROWSER_NoHistory);
+                detection.confidence = 0.4; // Low confidence as user might use other browsers
+                detection.description = L"No standard browser history found";
+                outDetections.push_back(detection);
+                return true;
+            }
+
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::CheckPeripheralHistory(
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check USB device history, etc.
-        return false;
+        try {
+            // Check USBStor registry key count
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Enum\\USBSTOR", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD subKeyCount = 0;
+                RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                RegCloseKey(hKey);
+
+                if (subKeyCount < 1) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PERIPHERAL_NoUSBHistory);
+                    detection.confidence = 0.7;
+                    detection.detectedValue = std::to_wstring(subKeyCount);
+                    detection.description = L"No USB storage device history found";
+                    outDetections.push_back(detection);
+                    return true;
+                }
+            }
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::CheckFileNaming(
@@ -1921,8 +2111,43 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Analyze file naming patterns
-        return false;
+        try {
+            bool found = false;
+
+            if (!outNamingInfo.valid) {
+                 // Need the file path first. Usually caller populates it or we need to get it from PID.
+                 ProcessEnvironmentInfo pEnv;
+                 m_impl->CollectProcessEnvironmentInfo(processId, pEnv);
+                 if (pEnv.valid && !pEnv.executablePath.empty()) {
+                     m_impl->AnalyzeFileNaming(pEnv.executablePath, outNamingInfo);
+                 } else {
+                     return false;
+                 }
+            }
+
+            if (outNamingInfo.isMD5 || outNamingInfo.isSHA1 || outNamingInfo.isSHA256) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILENAME_MD5Hash);
+                detection.confidence = 0.8;
+                detection.detectedValue = outNamingInfo.fileName;
+                detection.description = L"Filename appears to be a hash (common in malware analysis)";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            if (outNamingInfo.isGeneric) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILENAME_Generic);
+                detection.confidence = 0.6;
+                detection.detectedValue = outNamingInfo.baseName;
+                detection.description = L"Generic filename detected (sample, malware, test)";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     bool EnvironmentEvasionDetector::DetectFileNameHashMatch(
@@ -1930,8 +2155,42 @@ namespace ShadowStrike::AntiEvasion {
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
-        // Check if filename matches file hash
-        return false;
+        try {
+            if (!fs::exists(filePath)) return false;
+
+            // Calculate file hash
+            std::vector<uint8_t> fileHashVector;
+            Utils::HashUtils::Error hashErr; // Define an error object for hash calculation
+            if (!Utils::HashUtils::ComputeFile(Utils::HashUtils::Algorithm::SHA256, filePath, fileHashVector, &hashErr)) {
+				SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"DetectFileNameHashMatch: Failed to compute file hash");
+                return false; // Failed to compute hash
+            }
+
+            // Convert the binary hash to a lowercase hexadecimal string
+            std::string fileHashHexStr = Utils::HashUtils::ToHexLower(fileHashVector);
+            // Convert the hexadecimal string to a wide string for comparison
+            std::wstring fileHashWideStr = ShadowStrike::Utils::StringUtils::ToWide(fileHashHexStr);
+
+            // Get filename without extension
+            fs::path p(filePath);
+            std::wstring stem = p.stem().wstring();
+
+            // Simple case-insensitive compare
+            if (m_impl->ContainsSubstringCI(stem, fileHashWideStr)) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILENAME_SHA256Hash);
+                detection.confidence = 1.0;
+                detection.detectedValue = stem;
+                detection.expectedValue = fileHashWideStr;
+                detection.description = L"Filename matches file content SHA256 hash";
+                outDetections.push_back(detection);
+                return true;
+            }
+
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
     }
 
     // ========================================================================

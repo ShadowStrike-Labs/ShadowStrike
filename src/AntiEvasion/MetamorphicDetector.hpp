@@ -1202,8 +1202,26 @@ namespace ShadowStrike {
             /// @brief Functions with dead code
             size_t deadCodeFunctions = 0;
 
+            /// @brief Anomalies detected
+            std::vector<std::wstring> anomalies;
+
+            /// @brief Branch density
+            double branchDensity = 0.0;
+
+            /// @brief Indirect branch density
+            double indirectBranchDensity = 0.0;
+
+            /// @brief Has unusual control flow
+            bool hasUnusualFlow = false;
+
+            /// @brief Is flattened CFG
+            bool isFlattened = false;
+
             /// @brief Average cyclomatic complexity
             double averageComplexity = 0.0;
+
+            /// @brief Total cyclomatic complexity (sum)
+            uint32_t cyclomaticComplexity = 0;
 
             /// @brief Function details (limited)
             std::vector<FunctionInfo> functions;
@@ -1711,7 +1729,7 @@ namespace ShadowStrike {
              * @param sigStore Signature store for pattern matching
              */
             explicit MetamorphicDetector(
-                std::shared_ptr<SignatureStore::SignatureStore> sigStore
+                std::shared_ptr<ShadowStrike::SignatureStore::SignatureStore> sigStore
             ) noexcept;
 
             /**
@@ -1721,18 +1739,18 @@ namespace ShadowStrike {
              * @param patternStore Pattern store for decoder detection
              */
             MetamorphicDetector(
-                std::shared_ptr<SignatureStore::SignatureStore> sigStore,
-                std::shared_ptr<HashStore::HashStore> hashStore,
-                std::shared_ptr<PatternStore::PatternStore> patternStore
+                std::shared_ptr<ShadowStrike::SignatureStore::SignatureStore> sigStore,
+                std::shared_ptr<ShadowStrike::HashStore::HashStore> hashStore,
+                std::shared_ptr<ShadowStrike::PatternStore::PatternStore> patternStore
             ) noexcept;
 
             /**
              * @brief Constructor with threat intel
              */
             MetamorphicDetector(
-                std::shared_ptr<SignatureStore::SignatureStore> sigStore,
-                std::shared_ptr<HashStore::HashStore> hashStore,
-                std::shared_ptr<PatternStore::PatternStore> patternStore,
+                std::shared_ptr<ShadowStrike::SignatureStore::SignatureStore> sigStore,
+                std::shared_ptr<ShadowStrike::HashStore::HashStore> hashStore,
+                std::shared_ptr<ShadowStrike::PatternStore::PatternStore> patternStore,
                 std::shared_ptr<ThreatIntel::ThreatIntelStore> threatIntel
             ) noexcept;
 
@@ -2031,6 +2049,7 @@ namespace ShadowStrike {
 
             struct Statistics {
                 std::atomic<uint64_t> totalAnalyses{ 0 };
+                std::atomic<uint64_t> detections{ 0 };
                 std::atomic<uint64_t> metamorphicDetections{ 0 };
                 std::atomic<uint64_t> polymorphicDetections{ 0 };
                 std::atomic<uint64_t> packerDetections{ 0 };

@@ -164,10 +164,56 @@ struct NetworkTrafficFilter::Impl {
                 continue;
             }
 
-            // Simulated: Read events from driver
-            // In real implementation: FilterGetMessage / DeviceIoControl
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            /* KERNEL LOGIC WILL BE INTEGRATED INTO HERE */
+            // Process network events from the ShadowStrike WFP Callout driver.
+            // In production, this uses an I/O Completion Port (IOCP) to handle
+            // high-volume network packet inspection notifications.
+
+            struct {
+                FILTER_MESSAGE_HEADER Header;
+                NetworkEventNotification Event;
+            } message;
+
+            HRESULT hr = FilterGetMessage(m_hDriver, &message.Header, sizeof(message), nullptr);
+            if (SUCCEEDED(hr)) {
+                ProcessNetworkEvent(message.Event);
+            } else if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                break;
+            }
         }
+    }
+
+    void ProcessNetworkEvent(const NetworkEventNotification& event) {
+        NetworkConnection conn;
+        conn.connectionId = event.ConnectionId;
+        conn.processId = event.ProcessId;
+        conn.direction = event.Outbound ? ConnectionDirection::Outbound : ConnectionDirection::Inbound;
+        conn.tuple.protocol = static_cast<NetworkProtocol>(event.Protocol);
+
+        // Convert IP addresses
+        if (event.AddressFamily == AF_INET) {
+            conn.tuple.local.address.ipv4 = event.LocalAddrV4;
+            conn.tuple.remote.address.ipv4 = event.RemoteAddrV4;
+        }
+
+        conn.tuple.local.port = event.LocalPort;
+        conn.tuple.remote.port = event.RemotePort;
+
+        // Resolve process name
+        if (auto name = Utils::ProcessUtils::GetProcessName(event.ProcessId)) {
+            conn.processName = *name;
+        }
+
+        // Evaluate and respond to driver
+        FilterAction action = EvaluateRules(conn);
+
+        /* KERNEL LOGIC WILL BE INTEGRATED INTO HERE */
+        // Send verdict back to WFP callout driver to Allow or Block the packet/connection.
+        NetworkVerdictReply reply{};
+        reply.Header.MessageId = event.MessageId;
+        reply.Verdict = static_cast<uint32_t>(action);
+
+        FilterReplyMessage(m_hDriver, &reply.Header, sizeof(reply));
     }
 
     // -------------------------------------------------------------------------

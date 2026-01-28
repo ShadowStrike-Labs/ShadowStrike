@@ -1089,6 +1089,12 @@
     <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\AntiEvasion\NetworkBasedEvasionDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\AntiEvasion\ProcessEvasionDetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
@@ -1640,5 +1646,34 @@
     <ClInclude Include="src\Drivers\RegistryFilterCallbacks.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\AntiEvasion\DebuggerEvasionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\EnvironmentEvasionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\MetamorphicDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\PackerDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\SandboxEvasionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\TimeBasedEvasionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\VMEvasionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="src\AntiEvasion\VMEvasionDetector_x64.asm">
+      <Filter>Source Files</Filter>
+    </None>
   </ItemGroup>
 </Project>

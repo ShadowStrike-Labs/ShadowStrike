@@ -257,6 +257,22 @@ public:
     std::unordered_set<std::string> m_whitelistedPools;
     mutable std::shared_mutex m_whitelistMutex;
 
+    /// @brief Stratum Session State
+    struct StratumSession {
+        ConnectionState state = ConnectionState::Unknown;
+        PoolProtocolType protocol = PoolProtocolType::Unknown;
+        std::string walletAddress;
+        std::string workerName;
+        MinedCryptocurrency crypto = MinedCryptocurrency::Unknown;
+        uint32_t shareCount = 0;
+        uint32_t errorCount = 0;
+        TimePoint lastActivity;
+        std::vector<uint64_t> pendingRequests; // Store IDs of requests to match responses
+    };
+
+    std::unordered_map<std::string, StratumSession> m_sessions;
+    mutable std::shared_mutex m_sessionsMutex;
+
     /// @brief Callbacks
     std::vector<PoolConnectionCallback> m_connectionCallbacks;
     std::vector<StratumDetectedCallback> m_stratumCallbacks;

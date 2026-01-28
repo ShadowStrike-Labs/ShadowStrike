@@ -602,8 +602,7 @@ public:
         std::vector<DriverCallbackInfo> suspicious;
 
         try {
-            // In production, would enumerate kernel callbacks
-            // via NtQuerySystemInformation with SystemModuleInformation
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
             // This is a placeholder implementation
 
         } catch (const std::exception& e) {
@@ -1017,8 +1016,7 @@ private:
             // 2. DKOM detection (Direct Kernel Object Manipulation)
             // 3. Comparison of EnumDeviceDrivers vs manual PsLoadedModuleList walk
 
-            // Placeholder implementation
-            // In production, would require kernel driver for deep scanning
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
 
             m_stats.hiddenDriversFound += static_cast<uint32_t>(hidden.size());
 
@@ -1033,7 +1031,7 @@ private:
         try {
             // SSDT (System Service Descriptor Table) integrity check
             // Requires reading kernel memory to verify SSDT entries
-            // In production, would use kernel driver
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
 
             // Placeholder: assume intact
             return true;
@@ -1048,7 +1046,7 @@ private:
         try {
             // IDT (Interrupt Descriptor Table) integrity check
             // Requires reading kernel structures
-            // In production, would use kernel driver
+            // KERNEL DRIVER INTEGRATION WILL COME HERE
 
             // Placeholder: assume intact
             return true;

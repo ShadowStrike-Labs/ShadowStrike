@@ -20,12 +20,17 @@
  * - Process analysis for anti-VM behavior detection
  * - Performance: <1ms quick check, <50ms standard, <200ms deep analysis
  */
-
+#include"pch.h"
 #include "VMEvasionDetector.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
+#include "../Utils/Logger.hpp"
+#include "../Utils/ProcessUtils.hpp"
+#include "../Utils/SystemUtils.hpp"
+#include "../Utils/NetworkUtils.hpp"
+#include "../Utils/RegistryUtils.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -36,6 +41,7 @@
 #include <SetupAPI.h>
 #include <devguid.h>
 #include <cfgmgr32.h>
+#include <psapi.h>
 
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "SetupAPI.lib")
@@ -60,10 +66,49 @@ extern "C" {
 
     /// @brief Retrieves SLDT (Local Descriptor Table) selector
     uint16_t GetLDTSelector() noexcept;
+
+    /// @brief Checks VMware backdoor port 0x5658 (implemented in ASM)
+    void CheckVMwareBackdoor(uint32_t* rax, uint32_t* rbx, uint32_t* rcx, uint32_t* rdx) noexcept;
 }
 
 namespace ShadowStrike {
 namespace AntiEvasion {
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+namespace {
+    struct WindowSearchContext {
+        std::vector<std::pair<std::wstring, std::wstring>> matches;
+    };
+
+    BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+        WindowSearchContext* context = reinterpret_cast<WindowSearchContext*>(lParam);
+
+        // Get class name
+        wchar_t className[256] = { 0 };
+        if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) == 0) {
+            return TRUE;
+        }
+
+        std::wstring classStr(className);
+
+        // Check against known VM window classes
+        for (const auto& knownClass : VMConstants::KNOWN_VM_WINDOW_CLASSES) {
+            if (classStr == knownClass) {
+                // Get window title for context (optional but useful)
+                wchar_t windowTitle[256] = { 0 };
+                GetWindowTextW(hwnd, windowTitle, ARRAYSIZE(windowTitle));
+
+                context->matches.emplace_back(classStr, std::wstring(windowTitle));
+                break; // Found a match, stop checking other classes for this window
+            }
+        }
+
+        return TRUE;
+    }
+}
 
 // ============================================================================
 // VMEvasionResult Implementation
@@ -280,7 +325,7 @@ VMEvasionDetector::VMEvasionDetector(
     : m_impl(std::make_unique<Impl>(std::move(threatStore), nullptr, config))
 {
     Initialize();
-    Utils::Logger::Info(L"VMEvasionDetector initialized with default configuration");
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector initialized with default configuration");
 }
 
 VMEvasionDetector::VMEvasionDetector(
@@ -291,11 +336,11 @@ VMEvasionDetector::VMEvasionDetector(
     : m_impl(std::make_unique<Impl>(std::move(threatStore), std::move(signatureStore), config))
 {
     Initialize();
-    Utils::Logger::Info(L"VMEvasionDetector initialized with ThreatIntel and SignatureStore");
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector initialized with ThreatIntel and SignatureStore");
 }
 
 VMEvasionDetector::~VMEvasionDetector() {
-    Utils::Logger::Info(L"VMEvasionDetector shutting down");
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector shutting down");
 }
 
 VMEvasionDetector::VMEvasionDetector(VMEvasionDetector&&) noexcept = default;
@@ -303,7 +348,7 @@ VMEvasionDetector& VMEvasionDetector::operator=(VMEvasionDetector&&) noexcept = 
 
 void VMEvasionDetector::Initialize() {
     // Initialization already done in Impl constructor
-    Utils::Logger::Info(L"VMEvasionDetector: Artifact database loaded - {} processes, {} services, {} registry keys",
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Artifact database loaded - %zu processes, %zu services, %zu registry keys",
                         m_impl->m_knownVMProcesses.size(),
                         m_impl->m_knownVMServices.size(),
                         m_impl->m_knownVMRegKeys.size());
@@ -322,7 +367,7 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
     if (m_impl->m_config.enableCaching) {
         if (auto cached = m_impl->GetCachedResult()) {
             m_impl->m_statistics.cacheHits.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Info(L"VMEvasionDetector: Returning cached result (VM: {})", cached->isVM);
+            SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Returning cached result (VM: %d)", cached->isVM);
             return *cached;
         }
         m_impl->m_statistics.cacheMisses.fetch_add(1, std::memory_order_relaxed);
@@ -392,10 +437,9 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
         result.completed = true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"VMEvasionDetector: Detection failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"VMEvasionDetector: Detection failed - %hs", e.what());
         result.completed = false;
-        result.errorMessage = Utils::StringUtils::Utf8ToWide(e.what());
+        result.errorMessage = Utils::StringUtils::ToWide(e.what());
     }
 
     const auto endTime = std::chrono::high_resolution_clock::now();
@@ -409,12 +453,12 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
 
     if (result.isVM) {
         m_impl->m_statistics.vmDetectedCount.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Warn(L"VMEvasionDetector: VM DETECTED - {} (confidence: {:.1f}%, duration: {}ms)",
-                           VMTypeToString(result.detectedType),
+        SS_LOG_WARN(L"AntiEvasion", L"VMEvasionDetector: VM DETECTED - %ls (confidence: %.1f%%, duration: %lldms)",
+                           VMTypeToString(result.detectedType).c_str(),
                            result.confidenceScore,
                            result.detectionDuration.count() / 1000000);
     } else {
-        Utils::Logger::Info(L"VMEvasionDetector: No VM detected (duration: {}ms)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: No VM detected (duration: %lldms)",
                           result.detectionDuration.count() / 1000000);
     }
 
@@ -458,13 +502,13 @@ CPUIDInfo VMEvasionDetector::QuickDetectCPUID() {
             info.detectedType = ParseHypervisorVendor(info.vendorString);
             info.isReliable = (info.detectedType != VMType::Unknown && info.detectedType != VMType::None);
 
-            Utils::Logger::Info(L"QuickDetectCPUID: Hypervisor detected - Vendor: {}, Type: {}",
-                              Utils::StringUtils::Utf8ToWide(info.vendorString),
-                              VMTypeToString(info.detectedType));
+            SS_LOG_INFO(L"AntiEvasion", L"QuickDetectCPUID: Hypervisor detected - Vendor: %ls, Type: %ls",
+                              Utils::StringUtils::ToWide(info.vendorString).c_str(),
+                              VMTypeToString(info.detectedType).c_str());
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"QuickDetectCPUID failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"QuickDetectCPUID failed: %hs", e.what());
         info.Clear();
     }
 
@@ -497,7 +541,7 @@ void VMEvasionDetector::CheckCPUID(VMEvasionResult& result) {
                 result.cpuidInfo.detectedType,
                 95.0f,  // Very high confidence
                 L"CPUID hypervisor bit set (leaf 0x1, ECX bit 31)",
-                Utils::StringUtils::Utf8ToWide(result.cpuidInfo.vendorString),
+                Utils::StringUtils::ToWide(result.cpuidInfo.vendorString),
                 L"CPUID.0x1.ECX[31]"
             );
 
@@ -508,7 +552,7 @@ void VMEvasionDetector::CheckCPUID(VMEvasionResult& result) {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckCPUID failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckCPUID failed: %hs", e.what());
     }
 }
 
@@ -563,11 +607,11 @@ void VMEvasionDetector::CheckRegistryArtifacts(VMEvasionResult& result) {
             result.categoryScores[VMDetectionCategory::Registry] = categoryScore;
             m_impl->m_statistics.categoryTriggerCounts[1].fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"CheckRegistryArtifacts: Found {} VM registry keys", foundCount);
+            SS_LOG_INFO(L"AntiEvasion", L"CheckRegistryArtifacts: Found %zu VM registry keys", foundCount);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckRegistryArtifacts failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckRegistryArtifacts failed: %hs", e.what());
     }
 }
 
@@ -577,7 +621,7 @@ void VMEvasionDetector::CheckFileArtifacts(VMEvasionResult& result) {
         size_t foundCount = 0;
 
         for (const auto& filePath : m_impl->m_knownVMFiles) {
-            if (Utils::FileUtils::FileExists(filePath)) {
+            if (Utils::FileUtils::Exists(filePath)) {
                 foundCount++;
 
                 // Determine VM type from file path
@@ -617,17 +661,18 @@ void VMEvasionDetector::CheckFileArtifacts(VMEvasionResult& result) {
             result.categoryScores[VMDetectionCategory::FileSystem] = categoryScore;
             m_impl->m_statistics.categoryTriggerCounts[2].fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"CheckFileArtifacts: Found {} VM files", foundCount);
+            SS_LOG_INFO(L"AntiEvasion", L"CheckFileArtifacts: Found %zu VM files", foundCount);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckFileArtifacts failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckFileArtifacts failed: %hs", e.what());
     }
 }
 
 void VMEvasionDetector::CheckNetworkAdapters(VMEvasionResult& result) {
     try {
-        auto adapters = Utils::NetworkUtils::GetNetworkAdapters();
+        std::vector<Utils::NetworkUtils::NetworkAdapterInfo> adapters;
+        Utils::NetworkUtils::GetNetworkAdapters(adapters);
         float categoryScore = 0.0f;
 
         for (const auto& adapter : adapters) {
@@ -637,7 +682,7 @@ void VMEvasionDetector::CheckNetworkAdapters(VMEvasionResult& result) {
             if (vmType != VMType::None) {
                 VMNetworkInfo netInfo;
                 netInfo.macAddress = mac;
-                netInfo.adapterName = adapter.adapterName;
+                netInfo.adapterName = adapter.friendlyName;
                 netInfo.associatedVMType = vmType;
                 netInfo.confidence = 80.0f;
                 netInfo.isVirtualAdapter = true;
@@ -658,7 +703,7 @@ void VMEvasionDetector::CheckNetworkAdapters(VMEvasionResult& result) {
                     80.0f,
                     L"VM-specific MAC OUI detected",
                     macStr.str(),
-                    adapter.adapterName
+                    adapter.friendlyName
                 );
 
                 categoryScore = std::max(categoryScore, 80.0f);
@@ -670,21 +715,23 @@ void VMEvasionDetector::CheckNetworkAdapters(VMEvasionResult& result) {
             result.categoryScores[VMDetectionCategory::Network] = categoryScore;
             m_impl->m_statistics.categoryTriggerCounts[3].fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"CheckNetworkAdapters: Found {} VM network adapters", result.networkIndicators.size());
+            SS_LOG_INFO(L"AntiEvasion", L"CheckNetworkAdapters: Found %zu VM network adapters", result.networkIndicators.size());
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckNetworkAdapters failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckNetworkAdapters failed: %hs", e.what());
     }
 }
 
 void VMEvasionDetector::CheckFirmwareTables(VMEvasionResult& result) {
     try {
-        // Query SMBIOS tables using WMI
-        auto biosVendor = Utils::SystemUtils::GetBIOSInfo(L"Manufacturer");
-        auto biosVersion = Utils::SystemUtils::GetBIOSInfo(L"Version");
-        auto systemManufacturer = Utils::SystemUtils::GetSystemInfo(L"Manufacturer");
-        auto systemModel = Utils::SystemUtils::GetSystemInfo(L"Model");
+        // Query BIOS info from Registry as a fallback since SystemUtils doesn't provide direct SMBIOS access
+        std::wstring biosVendor, biosVersion, systemManufacturer, systemModel;
+
+        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"BIOSVendor", biosVendor);
+        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"BIOSVersion", biosVersion);
+        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemManufacturer", systemManufacturer);
+        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemProductName", systemModel);
 
         result.firmwareInfo.biosVendor = biosVendor;
         result.firmwareInfo.biosVersion = biosVersion;
@@ -758,22 +805,23 @@ void VMEvasionDetector::CheckFirmwareTables(VMEvasionResult& result) {
             result.categoryScores[VMDetectionCategory::Firmware] = categoryScore;
             m_impl->m_statistics.categoryTriggerCounts[4].fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"CheckFirmwareTables: VM firmware detected - {}", VMTypeToString(detectedType));
+            SS_LOG_INFO(L"AntiEvasion", L"CheckFirmwareTables: VM firmware detected - %ls", VMTypeToString(detectedType).c_str());
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckFirmwareTables failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckFirmwareTables failed: %hs", e.what());
     }
 }
 
 void VMEvasionDetector::CheckRunningProcesses(VMEvasionResult& result) {
     try {
-        auto processes = Utils::ProcessUtils::EnumerateProcesses();
+        std::vector<Utils::ProcessUtils::ProcessBasicInfo> processes;
+        Utils::ProcessUtils::EnumerateProcesses(processes);
         float categoryScore = 0.0f;
         size_t foundCount = 0;
 
         for (const auto& proc : processes) {
-            std::wstring procNameLower = Utils::StringUtils::ToLower(proc.processName);
+            std::wstring procNameLower = Utils::StringUtils::ToLowerCopy(proc.name);
 
             if (m_impl->m_knownVMProcesses.count(procNameLower) > 0) {
                 foundCount++;
@@ -814,8 +862,8 @@ void VMEvasionDetector::CheckRunningProcesses(VMEvasionResult& result) {
                     vmType,
                     confidence,
                     L"VM-specific process detected",
-                    proc.processName,
-                    L"PID: " + std::to_wstring(proc.processId)
+                    proc.name,
+                    L"PID: " + std::to_wstring(proc.pid)
                 );
 
                 categoryScore = std::max(categoryScore, confidence);
@@ -827,11 +875,11 @@ void VMEvasionDetector::CheckRunningProcesses(VMEvasionResult& result) {
             result.categoryScores[VMDetectionCategory::Process] = categoryScore;
             m_impl->m_statistics.categoryTriggerCounts[5].fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"CheckRunningProcesses: Found {} VM processes", foundCount);
+            SS_LOG_INFO(L"AntiEvasion", L"CheckRunningProcesses: Found %zu VM processes", foundCount);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckRunningProcesses failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckRunningProcesses failed: %hs", e.what());
     }
 }
 
@@ -866,27 +914,30 @@ void VMEvasionDetector::CheckTiming(VMEvasionResult& result) {
             result.categoryScores[VMDetectionCategory::Timing] = 60.0f;
             m_impl->m_statistics.categoryTriggerCounts[6].fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"CheckTiming: Timing anomaly detected - avg {} cycles", result.timingInfo.averageDelta);
+            SS_LOG_INFO(L"AntiEvasion", L"CheckTiming: Timing anomaly detected - avg %llu cycles", result.timingInfo.averageDelta);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckTiming failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckTiming failed: %hs", e.what());
     }
 }
 
 void VMEvasionDetector::CheckIOPorts(VMEvasionResult& result) {
-    try {
-        // Note: I/O port probing is dangerous and may cause issues
-        // Only attempt if explicitly enabled
+// 1. VMware Check    uint32_t vmwareResponse = 0;    if (TryVMwareBackdoor(vmwareResponse)) {        AddArtifact(result, VMDetectionCategory::IOPort, VMType::VMware, 95.0f,                   L"VMware Backdoor port communication successful",                   L"Magic: 0x" + std::to_wstring(vmwareResponse), L"I/O Port Probe");        result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::IOPort;        result.categoryScores[VMDetectionCategory::IOPort] = 95.0f;        m_impl->m_statistics.categoryTriggerCounts[7].fetch_add(1, std::memory_order_relaxed);                SS_LOG_INFO(L"AntiEvasion", L"CheckIOPorts: VMware backdoor detected");    }
+    __try {
+        // VirtualBox uses port 0x4042 (and others)
+        uint16_t val = __inword(VMConstants::VBOX_IO_PORT_START);
 
-        Utils::Logger::Warn(L"CheckIOPorts: I/O port probing skipped (requires kernel privileges)");
+        AddArtifact(result, VMDetectionCategory::IOPort, VMType::VirtualBox, 90.0f,
+                   L"VirtualBox I/O Port (0x4042) accessed without exception",
+                   L"No Exception", L"I/O Port Probe");
 
-        // In a real implementation, this would attempt to communicate with
-        // VM backdoor ports (VMware 0x5658, VirtualBox 0x4042, etc.)
-        // This requires kernel-mode drivers or special privileges
+        result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::IOPort;
+        result.categoryScores[VMDetectionCategory::IOPort] = 90.0f;
+        m_impl->m_statistics.categoryTriggerCounts[7].fetch_add(1, std::memory_order_relaxed);
 
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckIOPorts failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Normal behavior on bare metal
     }
 }
 
@@ -894,8 +945,6 @@ void VMEvasionDetector::CheckMemoryArtifacts(VMEvasionResult& result) {
     try {
         // Check descriptor tables (IDT, GDT, LDT) using assembly functions
         uint64_t idtBase = GetIDTBase();
-        uint64_t gdtBase = GetGDTBase();
-        uint16_t ldtSelector = GetLDTSelector();
 
         // On bare metal, IDT/GDT are typically in low memory
         // In VMs, they're often relocated to higher addresses
@@ -908,7 +957,7 @@ void VMEvasionDetector::CheckMemoryArtifacts(VMEvasionResult& result) {
                 VMType::GenericHypervisor,
                 55.0f,
                 L"IDT base address anomaly (typical of VM)",
-                L"0x" + Utils::StringUtils::ToHex(idtBase),
+                L"0x" + Utils::StringUtils::Format(L"%llX", idtBase),
                 L"SIDT"
             );
 
@@ -918,61 +967,323 @@ void VMEvasionDetector::CheckMemoryArtifacts(VMEvasionResult& result) {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckMemoryArtifacts failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckMemoryArtifacts failed: %hs", e.what());
     }
 }
 
 void VMEvasionDetector::CheckDevices(VMEvasionResult& result) {
-    try {
-        // Enumerate PCI devices looking for VM-specific vendor IDs
-        // This would require SetupAPI or WMI queries
+    SS_LOG_INFO(L"AntiEvasion", L"CheckDevices: Starting device enumeration");
 
-        // For now, we'll use a simplified check via registry
-        const std::wstring deviceEnumKey = L"SYSTEM\\CurrentControlSet\\Enum\\PCI";
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(
+        nullptr,                    // No specific enumerator
+        nullptr,                    // No specific device instance ID
+        nullptr,                    // No specific window
+        DIGCF_ALLCLASSES | DIGCF_PRESENT // All classes, present devices only
+    );
+
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckDevices: SetupDiGetClassDevsW failed with error %lu", GetLastError());
+        return;
+    }
+
+    try {
+        SP_DEVINFO_DATA devInfoData = { 0 };
+        devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
 
         float categoryScore = 0.0f;
         size_t foundCount = 0;
+        std::vector<wchar_t> buffer;
+        const DWORD INITIAL_BUFFER_SIZE = 1024;
+        buffer.resize(INITIAL_BUFFER_SIZE);
 
-        for (const auto& deviceID : m_impl->m_knownVMDeviceIDs) {
-            // Check if device ID exists in registry
-            if (deviceID.find(L"VEN_15AD") != std::wstring::npos) {  // VMware
-                // Would check registry here
-                Utils::Logger::Info(L"Checking for VMware device: {}", deviceID);
+        for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); i++) {
+            DWORD dataType = 0;
+            DWORD requiredSize = 0;
+
+            // Get Hardware ID property
+            BOOL success = SetupDiGetDeviceRegistryPropertyW(
+                hDevInfo,
+                &devInfoData,
+                SPDRP_HARDWAREID,
+                &dataType,
+                reinterpret_cast<PBYTE>(buffer.data()),
+                static_cast<DWORD>(buffer.size() * sizeof(wchar_t)),
+                &requiredSize
+            );
+
+            if (!success && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                // Resize buffer and try again
+                buffer.resize((requiredSize / sizeof(wchar_t)) + 2); // +2 for safety
+                success = SetupDiGetDeviceRegistryPropertyW(
+                    hDevInfo,
+                    &devInfoData,
+                    SPDRP_HARDWAREID,
+                    &dataType,
+                    reinterpret_cast<PBYTE>(buffer.data()),
+                    static_cast<DWORD>(buffer.size() * sizeof(wchar_t)),
+                    &requiredSize
+                );
+            }
+
+            if (success) {
+                // Hardware IDs are REG_MULTI_SZ (list of null-terminated strings, double-null terminated)
+                wchar_t* currentId = buffer.data();
+                bool deviceMatch = false;
+
+                while (*currentId && !deviceMatch) {
+                    std::wstring idStr(currentId);
+                    // Normalize to lower case for comparison (ToUpper not available, checking against ToUpper constants requires adjustment)
+                    // Note: We'll compare lower-to-lower since ToUpper isn't in Utils
+                    std::wstring idStrLower = Utils::StringUtils::ToLowerCopy(idStr);
+
+                    // Check against known VM device IDs
+                    for (const auto& knownId : m_impl->m_knownVMDeviceIDs) {
+                        std::wstring knownIdLower = Utils::StringUtils::ToLowerCopy(knownId);
+
+                        if (idStrLower.find(knownIdLower) != std::wstring::npos) {
+                            foundCount++;
+                            deviceMatch = true;
+
+                            // Determine VM type based on vendor IDs - checking against lower case
+                            VMType vmType = VMType::Unknown;
+                            if (idStrLower.find(L"ven_15ad") != std::wstring::npos) vmType = VMType::VMware;
+                            else if (idStrLower.find(L"ven_80ee") != std::wstring::npos) vmType = VMType::VirtualBox;
+                            else if (idStrLower.find(L"ven_1414") != std::wstring::npos || idStrLower.find(L"vmbus") != std::wstring::npos) vmType = VMType::HyperV;
+                            else if (idStrLower.find(L"ven_1af4") != std::wstring::npos) vmType = VMType::KVM; // Red Hat VirtIO
+                            else if (idStrLower.find(L"ven_1234") != std::wstring::npos) vmType = VMType::QEMU;
+                            else vmType = VMType::GenericHypervisor;
+
+                            AddArtifact(
+                                result,
+                                VMDetectionCategory::Device,
+                                vmType,
+                                85.0f, // High confidence for hardware ID match
+                                L"VM-specific hardware device detected",
+                                idStr,
+                                L"SetupAPI: " + idStr
+                            );
+
+                            categoryScore = std::max(categoryScore, 85.0f);
+                            break;
+                        }
+                    }
+
+                    // Move to next string in MULTI_SZ
+                    currentId += wcslen(currentId) + 1;
+                }
             }
         }
 
         if (foundCount > 0) {
             result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::Device;
             result.categoryScores[VMDetectionCategory::Device] = categoryScore;
-            m_impl->m_statistics.categoryTriggerCounts[9].fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_statistics.categoryTriggerCounts[9].fetch_add(1, std::memory_order_relaxed); // Index 9 is Device
+
+            SS_LOG_INFO(L"AntiEvasion", L"CheckDevices: Found %zu VM devices", foundCount);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckDevices failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckDevices failed with exception: %hs", e.what());
     }
+
+    SetupDiDestroyDeviceInfoList(hDevInfo);
 }
 
 void VMEvasionDetector::CheckWMI(VMEvasionResult& result) {
-    try {
-        // WMI queries are already done in CheckFirmwareTables
-        // This method would do additional WMI-specific checks
+    HRESULT hres;
 
-        Utils::Logger::Info(L"CheckWMI: Additional WMI checks (see CheckFirmwareTables)");
+    // Initialize COM
+    hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+    bool coInitialized = SUCCEEDED(hres);
+
+    if (FAILED(hres) && hres != RPC_E_CHANGED_MODE) {
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckWMI: Failed to initialize COM library. Error code = 0x%X", static_cast<uint32_t>(hres));
+        return;
+    }
+
+    IWbemLocator* pLoc = nullptr;
+    IWbemServices* pSvc = nullptr;
+
+    try {
+        // Obtain the initial locator to WMI
+        hres = CoCreateInstance(
+            CLSID_WbemLocator,
+            0,
+            CLSCTX_INPROC_SERVER,
+            IID_IWbemLocator, (LPVOID*)&pLoc);
+
+        if (FAILED(hres)) {
+            throw std::runtime_error("Failed to create IWbemLocator object");
+        }
+
+        // Connect to WMI through the IWbemLocator::ConnectServer method
+        hres = pLoc->ConnectServer(
+             _bstr_t(L"ROOT\\CIMV2"), // Object path of WMI namespace
+             NULL,                    // User name. NULL = current user
+             NULL,                    // User password. NULL = current
+             0,                       // Locale. NULL indicates current
+             NULL,                    // Security flags.
+             0,                       // Authority (for example, Kerberos)
+             0,                       // Context object
+             &pSvc                    // pointer to IWbemServices proxy
+        );
+
+        if (FAILED(hres)) {
+            throw std::runtime_error("Could not connect to WMI server");
+        }
+
+        // Set security levels on the proxy
+        hres = CoSetProxyBlanket(
+           pSvc,                        // Indicates the proxy to set
+           RPC_C_AUTHN_WINNT,           // RPC_C_AUTHN_xxx
+           RPC_C_AUTHZ_NONE,            // RPC_C_AUTHZ_xxx
+           NULL,                        // Server principal name
+           RPC_C_AUTHN_LEVEL_CALL,      // RPC_C_AUTHN_LEVEL_xxx
+           RPC_C_IMP_LEVEL_IMPERSONATE, // RPC_C_IMP_LEVEL_xxx
+           NULL,                        // client identity
+           EOAC_NONE                    // proxy capabilities
+        );
+
+        if (FAILED(hres)) {
+            throw std::runtime_error("Could not set proxy blanket");
+        }
+
+        // Helper lambda to query and check properties
+        auto CheckWMIClass = [&](const wchar_t* query, const wchar_t* className) {
+             IEnumWbemClassObject* pEnum = nullptr;
+             hres = pSvc->ExecQuery(
+                bstr_t("WQL"),
+                bstr_t(query),
+                WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                NULL,
+                &pEnum);
+
+             if (FAILED(hres)) return;
+
+             IWbemClassObject* pclsObj = nullptr;
+             ULONG uReturn = 0;
+
+             while (pEnum) {
+                HRESULT hr = pEnum->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+                if (0 == uReturn) break;
+
+                VARIANT vtProp;
+
+                // Check Manufacturer
+                if (SUCCEEDED(pclsObj->Get(L"Manufacturer", 0, &vtProp, 0, 0))) {
+                    if (vtProp.vt == VT_BSTR) {
+                         std::wstring manufacturer(vtProp.bstrVal, SysStringLen(vtProp.bstrVal));
+
+                         for (const auto& known : VMConstants::KNOWN_FIRMWARE_STRINGS) {
+                             // Case insensitive check
+                             std::wstring mfgLower = Utils::StringUtils::ToLowerCopy(manufacturer);
+                             std::wstring knownLower = Utils::StringUtils::ToLowerCopy(std::wstring(known));
+
+                             if (mfgLower.find(knownLower) != std::wstring::npos) {
+                                  VMType type = VMType::GenericHypervisor;
+                                  if (mfgLower.find(L"vmware") != std::wstring::npos) type = VMType::VMware;
+                                  else if (mfgLower.find(L"virtualbox") != std::wstring::npos || mfgLower.find(L"vbox") != std::wstring::npos) type = VMType::VirtualBox;
+                                  else if (mfgLower.find(L"hyper-v") != std::wstring::npos) type = VMType::HyperV;
+                                  else if (mfgLower.find(L"xen") != std::wstring::npos) type = VMType::Xen;
+                                  else if (mfgLower.find(L"qemu") != std::wstring::npos) type = VMType::QEMU;
+
+                                  AddArtifact(result, VMDetectionCategory::WMI, type, 85.0f,
+                                      L"WMI Manufacturer string indicates VM", manufacturer, className);
+
+                                  result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::WMI;
+                                  result.categoryScores[VMDetectionCategory::WMI] = std::max(result.categoryScores[VMDetectionCategory::WMI], 85.0f);
+                                  m_impl->m_statistics.categoryTriggerCounts[10].fetch_add(1, std::memory_order_relaxed);
+                             }
+                         }
+                    }
+                    VariantClear(&vtProp);
+                }
+
+                // Check Model
+                if (SUCCEEDED(pclsObj->Get(L"Model", 0, &vtProp, 0, 0))) {
+                     if (vtProp.vt == VT_BSTR) {
+                         std::wstring model(vtProp.bstrVal, SysStringLen(vtProp.bstrVal));
+
+                         for (const auto& known : VMConstants::KNOWN_FIRMWARE_STRINGS) {
+                             std::wstring modelLower = Utils::StringUtils::ToLowerCopy(model);
+                             std::wstring knownLower = Utils::StringUtils::ToLowerCopy(std::wstring(known));
+
+                             if (modelLower.find(knownLower) != std::wstring::npos) {
+                                  AddArtifact(result, VMDetectionCategory::WMI, VMType::GenericHypervisor, 85.0f,
+                                      L"WMI Model string indicates VM", model, className);
+                                  result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::WMI;
+                                  result.categoryScores[VMDetectionCategory::WMI] = std::max(result.categoryScores[VMDetectionCategory::WMI], 85.0f);
+                                  m_impl->m_statistics.categoryTriggerCounts[10].fetch_add(1, std::memory_order_relaxed);
+                             }
+                         }
+                     }
+                     VariantClear(&vtProp);
+                }
+
+                pclsObj->Release();
+             }
+             if (pEnum) pEnum->Release();
+        };
+
+        CheckWMIClass(L"SELECT * FROM Win32_ComputerSystem", L"Win32_ComputerSystem");
+        CheckWMIClass(L"SELECT * FROM Win32_BaseBoard", L"Win32_BaseBoard");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckWMI failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+         SS_LOG_ERROR(L"AntiEvasion", L"CheckWMI failed: %hs", e.what());
     }
+
+    if (pSvc) pSvc->Release();
+    if (pLoc) pLoc->Release();
+    if (coInitialized) CoUninitialize();
 }
 
 void VMEvasionDetector::CheckWindows(VMEvasionResult& result) {
     try {
-        // Enumerate top-level windows and check for VM tool window classes
-        // This would use EnumWindows API
+        WindowSearchContext context;
 
-        Utils::Logger::Info(L"CheckWindows: Window class enumeration");
+        // Enumerate all top-level windows
+        if (!EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&context))) {
+            SS_LOG_WARN(L"AntiEvasion", L"CheckWindows: EnumWindows returned false (last error: %lu)", GetLastError());
+            // Continue processing any found windows anyway
+        }
+
+        if (!context.matches.empty()) {
+            float categoryScore = 0.0f;
+
+            for (const auto& match : context.matches) {
+                const std::wstring& className = match.first;
+                const std::wstring& windowTitle = match.second;
+
+                // Determine VM type based on class name
+                VMType vmType = VMType::Unknown;
+                if (className.find(L"VMware") != std::wstring::npos || className == L"VMSwitchUserControlClass") vmType = VMType::VMware;
+                else if (className.find(L"VBox") != std::wstring::npos) vmType = VMType::VirtualBox;
+                else if (className.find(L"Parallels") != std::wstring::npos || className.find(L"Prl") != std::wstring::npos) vmType = VMType::Parallels;
+                else if (className.find(L"Hyper-V") != std::wstring::npos || className == L"VMBusHidWindow") vmType = VMType::HyperV;
+                else if (className.find(L"Sandboxie") != std::wstring::npos) vmType = VMType::Sandboxie;
+
+                AddArtifact(
+                    result,
+                    VMDetectionCategory::Window,
+                    vmType,
+                    75.0f, // Good confidence but windows can be spoofed
+                    L"VM-specific window class detected",
+                    className,
+                    windowTitle.empty() ? className : (className + L" (" + windowTitle + L")")
+                );
+
+                categoryScore = std::max(categoryScore, 75.0f);
+            }
+
+            result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::Window;
+            result.categoryScores[VMDetectionCategory::Window] = categoryScore;
+            m_impl->m_statistics.categoryTriggerCounts[12].fetch_add(1, std::memory_order_relaxed); // Index 12 is Window
+
+            SS_LOG_INFO(L"AntiEvasion", L"CheckWindows: Found %zu VM windows", context.matches.size());
+        }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"CheckWindows failed: {}", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"AntiEvasion", L"CheckWindows failed: %hs", e.what());
     }
 }
 
@@ -986,31 +1297,186 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
     const ProcessAnalysisConfig& config
 ) {
     const auto startTime = std::chrono::high_resolution_clock::now();
-
     result.processId = processId;
     result.completed = false;
+    result.hasAntiVMBehavior = false;
+    result.evasionScore = 0.0f;
+    result.detectedTechniques = AntiVMTechnique::None;
 
     try {
-        auto procInfo = Utils::ProcessUtils::GetProcessInfo(processId);
-        if (!procInfo.has_value()) {
-            result.errorMessage = L"Failed to get process information";
+        // 1. Get process info
+        Utils::ProcessUtils::ProcessInfo procInfo;
+        if (Utils::ProcessUtils::GetProcessInfo(processId, procInfo)) {
+            result.processName = procInfo.basic.name;
+            result.executablePath = procInfo.basic.executablePath;
+        }
+
+        // Increment stats
+        if (m_impl) {
+            m_impl->m_statistics.totalProcessesAnalyzed.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // 2. Open Process with VM_READ permissions
+        HANDLE rawHandle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, processId);
+        if (!rawHandle) {
+            result.errorMessage = L"Access Denied: Cannot open process for scanning";
             return false;
         }
 
-        result.processName = procInfo->processName;
-        result.executablePath = procInfo->executablePath;
+        // RAII closer
+        std::shared_ptr<void> hProcess(rawHandle, [](void* h) { CloseHandle((HANDLE)h); });
 
-        m_impl->m_statistics.totalProcessesAnalyzed.fetch_add(1, std::memory_order_relaxed);
+        // 3. Scan Memory Regions
+        // Focus on MEM_COMMIT, PAGE_EXECUTE_*, MEM_IMAGE (likely .text sections)
 
-        // TODO: Implement actual code pattern scanning using SignatureStore
-        // This would scan process memory for anti-VM code patterns
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+
+        uint8_t* pAddr = (uint8_t*)sysInfo.lpMinimumApplicationAddress;
+        uint8_t* pMax = (uint8_t*)sysInfo.lpMaximumApplicationAddress;
+
+        const size_t MAX_SCAN_SIZE = config.maxMemoryToScan > 0 ? config.maxMemoryToScan : 64 * 1024 * 1024;
+        size_t totalScanned = 0;
+
+        MEMORY_BASIC_INFORMATION mbi = { 0 };
+
+        while (pAddr < pMax && totalScanned < MAX_SCAN_SIZE) {
+            if (VirtualQueryEx((HANDLE)hProcess.get(), pAddr, &mbi, sizeof(mbi)) == 0) {
+                pAddr += sysInfo.dwPageSize; // Skip if query fails
+                continue;
+            }
+
+            // Check for executable code
+            bool isExecutable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+
+            // Only scan committed, executable image pages (code sections)
+            if (mbi.State == MEM_COMMIT && isExecutable && mbi.Type == MEM_IMAGE) {
+
+                std::vector<uint8_t> buffer;
+                buffer.resize(mbi.RegionSize);
+                SIZE_T bytesRead = 0;
+
+                if (ReadProcessMemory((HANDLE)hProcess.get(), mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytesRead)) {
+                    // Scan buffer for Anti-VM patterns
+
+                    for (size_t i = 0; i < bytesRead - 4; ++i) {
+                        // Pattern 1: SIDT (Red Pill)
+                        // x86: 0F 01 0D
+                        // x64: 0F 01 4C 24 (SIDT [RSP+...]) or just 0F 01 (SIDT/SGDT)
+
+                        bool redPillFound = false;
+
+                        // Check for SIDT (0F 01 0D...)
+                        if (buffer[i] == 0x0F && buffer[i+1] == 0x01 && buffer[i+2] == 0x0D) {
+                            redPillFound = true;
+                        }
+                        // Check for x64 SIDT (0F 01 4C 24)
+                        else if (buffer[i] == 0x0F && buffer[i+1] == 0x01 && buffer[i+2] == 0x4C && buffer[i+3] == 0x24) {
+                            redPillFound = true;
+                        }
+
+                        if (redPillFound) {
+                            DetectedAntiVMTechnique tech;
+                            tech.technique = AntiVMTechnique::RedPillTest;
+                            tech.category = VMDetectionCategory::BehaviorAnalysis;
+                            tech.description = L"Red Pill (SIDT) instruction sequence detected";
+                            tech.address = (uint64_t)mbi.BaseAddress + i;
+                            tech.severity = 90.0f;
+                            tech.isActive = true;
+
+                            // Check for duplicates
+                            bool isDuplicate = false;
+                            for(const auto& existing : result.techniqueDetails) {
+                                if (existing.technique == tech.technique && existing.address == tech.address) {
+                                    isDuplicate = true; break;
+                                }
+                            }
+                            if(!isDuplicate) {
+                                result.techniqueDetails.push_back(tech);
+                                result.detectedTechniques = result.detectedTechniques | AntiVMTechnique::RedPillTest;
+                            }
+                        }
+
+                        // Pattern 2: SLDT (No Pill) - 0F 00 00
+                        if (buffer[i] == 0x0F && buffer[i+1] == 0x00 && buffer[i+2] == 0x00) {
+                            DetectedAntiVMTechnique tech;
+                            tech.technique = AntiVMTechnique::NoPillTest;
+                            tech.category = VMDetectionCategory::BehaviorAnalysis;
+                            tech.description = L"No Pill (SLDT) instruction sequence detected";
+                            tech.address = (uint64_t)mbi.BaseAddress + i;
+                            tech.severity = 80.0f;
+                            tech.isActive = true;
+
+                            bool isDuplicate = false;
+                            for(const auto& existing : result.techniqueDetails) {
+                                if (existing.technique == tech.technique && existing.address == tech.address) {
+                                    isDuplicate = true; break;
+                                }
+                            }
+                            if(!isDuplicate) {
+                                result.techniqueDetails.push_back(tech);
+                                result.detectedTechniques = result.detectedTechniques | AntiVMTechnique::NoPillTest;
+                            }
+                        }
+
+                        // Pattern 3: CPUID Loops (0F A2)
+                        if (buffer[i] == 0x0F && buffer[i+1] == 0xA2) {
+                            // Check for another CPUID within small window
+                            bool loopDetected = false;
+                            for (size_t k = 1; k < 32 && (i + k + 1) < bytesRead; ++k) {
+                                if (buffer[i+k] == 0x0F && buffer[i+k+1] == 0xA2) {
+                                    loopDetected = true;
+                                    break;
+                                }
+                            }
+
+                            if (loopDetected) {
+                                DetectedAntiVMTechnique tech;
+                                tech.technique = AntiVMTechnique::CPUIDHypervisorCheck;
+                                tech.category = VMDetectionCategory::BehaviorAnalysis;
+                                tech.description = L"CPUID instruction loop detected (Timing/Fuzzing)";
+                                tech.address = (uint64_t)mbi.BaseAddress + i;
+                                tech.severity = 70.0f;
+                                tech.isActive = true;
+
+                                bool isDuplicate = false;
+                                for(const auto& existing : result.techniqueDetails) {
+                                    if (existing.technique == tech.technique &&
+                                       (existing.address > tech.address - 64 && existing.address < tech.address + 64)) {
+                                        isDuplicate = true; break;
+                                    }
+                                }
+                                if(!isDuplicate) {
+                                    result.techniqueDetails.push_back(tech);
+                                    result.detectedTechniques = result.detectedTechniques | AntiVMTechnique::CPUIDHypervisorCheck;
+                                }
+
+                                i += 32; // Skip to avoid flood
+                            }
+                        }
+                    }
+                }
+
+                totalScanned += bytesRead;
+            }
+
+            pAddr += mbi.RegionSize;
+        }
+
+        if (!result.techniqueDetails.empty()) {
+            result.hasAntiVMBehavior = true;
+            result.evasionScore = 100.0f;
+            if (m_impl) {
+                m_impl->m_statistics.antiVMBehaviorDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
         result.completed = true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"AnalyzeProcessAntiVMBehavior failed for PID {}: {}",
-                            processId, Utils::StringUtils::Utf8ToWide(e.what()));
-        result.errorMessage = Utils::StringUtils::Utf8ToWide(e.what());
+        SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAntiVMBehavior failed for PID %u: %hs",
+                            processId, e.what());
+        result.errorMessage = Utils::StringUtils::ToWide(e.what());
         return false;
     }
 
@@ -1042,12 +1508,13 @@ size_t VMEvasionDetector::ScanAllProcesses(
     std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult>& results,
     const ProcessAnalysisConfig& config
 ) {
-    auto processes = Utils::ProcessUtils::EnumerateProcesses();
+    std::vector<Utils::ProcessUtils::ProcessBasicInfo> processes;
+    Utils::ProcessUtils::EnumerateProcesses(processes);
     std::vector<Utils::ProcessUtils::ProcessId> pids;
     pids.reserve(processes.size());
 
     for (const auto& proc : processes) {
-        pids.push_back(proc.processId);
+        pids.push_back(proc.pid);
     }
 
     return AnalyzeProcessesBatch(pids, results, config);
@@ -1067,7 +1534,7 @@ void VMEvasionDetector::SetConfig(const VMDetectionConfig& config) {
     m_impl->m_config = config;
     m_impl->InvalidateCache();
 
-    Utils::Logger::Info(L"VMEvasionDetector: Configuration updated");
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Configuration updated");
 }
 
 void VMEvasionDetector::SetCategoryWeight(VMDetectionCategory category, float weight) {
@@ -1095,7 +1562,7 @@ void VMEvasionDetector::SetCategoryEnabled(VMDetectionCategory category, bool en
 
 void VMEvasionDetector::InvalidateCache() {
     m_impl->InvalidateCache();
-    Utils::Logger::Info(L"VMEvasionDetector: Cache invalidated");
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Cache invalidated");
 }
 
 std::optional<VMEvasionResult> VMEvasionDetector::GetCachedResult() const {
@@ -1116,7 +1583,7 @@ const VMDetectionStatistics& VMEvasionDetector::GetStatistics() const {
 
 void VMEvasionDetector::ResetStatistics() {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"VMEvasionDetector: Statistics reset");
+    SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Statistics reset");
 }
 
 // ============================================================================
@@ -1393,6 +1860,101 @@ void VMEvasionDetector::UpdateStatistics(const VMEvasionResult& result, std::chr
             break;
         }
     }
+}
+
+// ============================================================================
+// Private Helper Implementations
+// ============================================================================
+
+bool VMEvasionDetector::IsKnownVMArtifact(const std::wstring& name, const std::wstring& type) {
+    if (m_impl && m_impl->m_threatIntel) {
+        // Convert to narrow string for ThreatIntel API
+        std::string nameUtf8 = Utils::StringUtils::ToNarrow(name);
+
+        // Map string type to IOCType
+        ThreatIntel::IOCType iocType = ThreatIntel::IOCType::ProcessName; // Default
+        bool typeSupported = false;
+
+        if (type == L"Process") {
+            iocType = ThreatIntel::IOCType::ProcessName;
+            typeSupported = true;
+        }
+        else if (type == L"Registry") {
+            iocType = ThreatIntel::IOCType::RegistryKey;
+            typeSupported = true;
+        }
+        else if (type == L"Mutex") {
+            iocType = ThreatIntel::IOCType::MutexName;
+            typeSupported = true;
+        }
+        else if (type == L"NamedPipe") {
+            iocType = ThreatIntel::IOCType::NamedPipe;
+            typeSupported = true;
+        }
+
+        if (typeSupported) {
+            auto result = m_impl->m_threatIntel->LookupIOC(iocType, nameUtf8);
+            return result.IsMalicious();
+        }
+    }
+    return false;
+}
+
+bool VMEvasionDetector::SafeCPUID(uint32_t leaf, uint32_t subleaf, int32_t* regs) {
+    if (!regs) return false;
+
+    // Initialize regs to 0
+    memset(regs, 0, 4 * sizeof(int32_t));
+
+    bool success = false;
+    __try {
+        __cpuidex(regs, leaf, subleaf);
+        success = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Catch Illegal Instruction or Privileged Instruction if restricted
+        SS_LOG_WARN(L"AntiEvasion", L"SafeCPUID: Exception executing CPUID(0x%08X, 0x%08X)", leaf, subleaf);
+        success = false;
+    }
+    return success;
+}
+
+bool VMEvasionDetector::TryVMwareBackdoor(uint32_t& response) {
+    // VMware Backdoor Check
+    // I/O Port: 0x5658 ("VX")
+    // Magic: 0x564D5868 ("VMXh")
+
+    bool detected = false;
+    response = 0;
+
+    __try {
+        uint32_t rax = VMConstants::VMWARE_MAGIC; // Magic
+        uint32_t rbx = 0;                         // Output buffer
+        uint32_t rcx = 0x0A;                      // Command: Get Version
+        uint32_t rdx = VMConstants::VMWARE_IO_PORT; // Port
+
+        // Execute the I/O instruction via external ASM helper
+        CheckVMwareBackdoor(&rax, &rbx, &rcx, &rdx);
+
+        // Check if magic matches in RBX (successful backdoor communication)
+        // or if we got a valid version response
+        if (rbx == VMConstants::VMWARE_MAGIC) {
+            response = rax; // Version usually in RAX or related
+            detected = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Exception expected on non-VMware systems (Privileged Instruction)
+        // This is safe to ignore
+        detected = false;
+    }
+
+    return detected;
+}
+
+uint64_t VMEvasionDetector::MeasureRDTSCDelta(uint32_t iterations) {
+    // Call the optimized assembly implementation
+    return MeasureRDTSCTimingDelta(iterations);
 }
 
 // ============================================================================

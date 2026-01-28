@@ -861,26 +861,97 @@ private:
 
     [[nodiscard]] bool InitializeNVML() {
         try {
-            // In production, would use LoadLibrary/GetProcAddress for nvml.dll
-            // and initialize NVML (nvmlInit_v2)
-            // Placeholder: assume not available
-            return false;
+            // NVIDIA NVML is typically in the System32 directory or DriverStore
+            m_nvml.hModule = LoadLibraryW(L"nvml.dll");
+            if (!m_nvml.hModule) {
+                // Try specific path if not in system path
+                m_nvml.hModule = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+            }
+
+            if (!m_nvml.hModule) {
+                return false;
+            }
+
+            // Resolve functions
+            m_nvml.Init = (f_nvmlInit)GetProcAddress(m_nvml.hModule, "nvmlInit_v2");
+            m_nvml.Shutdown = (f_nvmlShutdown)GetProcAddress(m_nvml.hModule, "nvmlShutdown");
+            m_nvml.GetCount = (f_nvmlDeviceGetCount)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetCount");
+            m_nvml.GetHandleByIndex = (f_nvmlDeviceGetHandleByIndex)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetHandleByIndex");
+            m_nvml.GetName = (f_nvmlDeviceGetName)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetName");
+            m_nvml.GetUtilization = (f_nvmlDeviceGetUtilizationRates)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetUtilizationRates");
+            m_nvml.GetMemoryInfo = (f_nvmlDeviceGetMemoryInfo)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetMemoryInfo");
+            m_nvml.GetTemperature = (f_nvmlDeviceGetTemperature)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetTemperature");
+            m_nvml.GetPowerUsage = (f_nvmlDeviceGetPowerUsage)GetProcAddress(m_nvml.hModule, "nvmlDeviceGetPowerUsage");
+
+            if (!m_nvml.Init || !m_nvml.Shutdown || !m_nvml.GetCount || !m_nvml.GetHandleByIndex) {
+                Logger::Error("GPUMiningDetector: Failed to resolve core NVML functions");
+                FreeLibrary(m_nvml.hModule);
+                m_nvml.hModule = nullptr;
+                return false;
+            }
+
+            if (m_nvml.Init() != 0) { // NVML_SUCCESS = 0
+                Logger::Error("GPUMiningDetector: nvmlInit failed");
+                FreeLibrary(m_nvml.hModule);
+                m_nvml.hModule = nullptr;
+                return false;
+            }
+
+            return true;
 
         } catch (const std::exception& e) {
             Logger::Warn("NVML initialization failed: {}", e.what());
+            if (m_nvml.hModule) {
+                FreeLibrary(m_nvml.hModule);
+                m_nvml.hModule = nullptr;
+            }
             return false;
         }
     }
 
     [[nodiscard]] bool InitializeADL() {
         try {
-            // In production, would use LoadLibrary/GetProcAddress for atiadlxx.dll
-            // and initialize ADL (ADL_Main_Control_Create)
-            // Placeholder: assume not available
-            return false;
+            m_adl.hModule = LoadLibraryW(L"atiadlxx.dll");
+            if (!m_adl.hModule) {
+                m_adl.hModule = LoadLibraryW(L"atiadlxy.dll"); // 32-bit version sometimes
+            }
+
+            if (!m_adl.hModule) {
+                return false;
+            }
+
+            // Resolve functions
+            m_adl.Create = (f_ADL_Main_Control_Create)GetProcAddress(m_adl.hModule, "ADL_Main_Control_Create");
+            m_adl.Destroy = (f_ADL_Main_Control_Destroy)GetProcAddress(m_adl.hModule, "ADL_Main_Control_Destroy");
+            m_adl.GetCount = (f_ADL_Adapter_NumberOfAdapters_Get)GetProcAddress(m_adl.hModule, "ADL_Adapter_NumberOfAdapters_Get");
+            m_adl.GetInfo = (f_ADL_Adapter_AdapterInfo_Get)GetProcAddress(m_adl.hModule, "ADL_Adapter_AdapterInfo_Get");
+            m_adl.GetActivity = (f_ADL_Overdrive5_CurrentActivity_Get)GetProcAddress(m_adl.hModule, "ADL_Overdrive5_CurrentActivity_Get");
+            m_adl.GetTemperature = (f_ADL_Overdrive5_Temperature_Get)GetProcAddress(m_adl.hModule, "ADL_Overdrive5_Temperature_Get");
+
+            if (!m_adl.Create || !m_adl.Destroy || !m_adl.GetCount) {
+                Logger::Error("GPUMiningDetector: Failed to resolve core ADL functions");
+                FreeLibrary(m_adl.hModule);
+                m_adl.hModule = nullptr;
+                return false;
+            }
+
+            // ADL initialization requires a malloc callback
+            auto adl_malloc = [](int size) -> void* { return malloc(size); };
+            if (m_adl.Create(adl_malloc, 1) != 0) { // ADL_OK = 0
+                Logger::Error("GPUMiningDetector: ADL_Main_Control_Create failed");
+                FreeLibrary(m_adl.hModule);
+                m_adl.hModule = nullptr;
+                return false;
+            }
+
+            return true;
 
         } catch (const std::exception& e) {
             Logger::Warn("ADL initialization failed: {}", e.what());
+            if (m_adl.hModule) {
+                FreeLibrary(m_adl.hModule);
+                m_adl.hModule = nullptr;
+            }
             return false;
         }
     }
@@ -1098,6 +1169,81 @@ private:
     // ========================================================================
     // MEMBER VARIABLES
     // ========================================================================
+
+    // ========================================================================
+    // NVML (NVIDIA) DEFINITIONS
+    // ========================================================================
+
+    typedef int (*nvmlReturn_t);
+    typedef struct nvmlDevice_st* nvmlDevice_t;
+
+    struct nvmlUtilization_t {
+        unsigned int gpu;
+        unsigned int memory;
+    };
+
+    struct nvmlMemory_t {
+        unsigned long long total;
+        unsigned long long free;
+        unsigned long long used;
+    };
+
+    typedef nvmlReturn_t (*f_nvmlInit)(void);
+    typedef nvmlReturn_t (*f_nvmlShutdown)(void);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetCount)(unsigned int*);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
+    typedef nvmlReturn_t (*f_nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int*);
+
+    struct NVMLFunctions {
+        HMODULE hModule = nullptr;
+        f_nvmlInit Init = nullptr;
+        f_nvmlShutdown Shutdown = nullptr;
+        f_nvmlDeviceGetCount GetCount = nullptr;
+        f_nvmlDeviceGetHandleByIndex GetHandleByIndex = nullptr;
+        f_nvmlDeviceGetName GetName = nullptr;
+        f_nvmlDeviceGetUtilizationRates GetUtilization = nullptr;
+        f_nvmlDeviceGetMemoryInfo GetMemoryInfo = nullptr;
+        f_nvmlDeviceGetTemperature GetTemperature = nullptr;
+        f_nvmlDeviceGetPowerUsage GetPowerUsage = nullptr;
+    } m_nvml;
+
+    // ========================================================================
+    // ADL (AMD) DEFINITIONS
+    // ========================================================================
+
+    typedef struct ADLMemoryInfo {
+        long long iTotalBytes;
+        long long iFreeBytes;
+        long long iUsedBytes;
+    } ADLMemoryInfo;
+
+    typedef struct ADLPMLogDataOutput {
+        int iSize;
+        int iType;
+        double fValue;
+    } ADLPMLogDataOutput;
+
+    typedef void* (*ADL_MAIN_MALLOC_CALLBACK)(int);
+    typedef int (*f_ADL_Main_Control_Create)(ADL_MAIN_MALLOC_CALLBACK, int);
+    typedef int (*f_ADL_Main_Control_Destroy)();
+    typedef int (*f_ADL_Adapter_NumberOfAdapters_Get)(int*);
+    typedef int (*f_ADL_Adapter_AdapterInfo_Get)(void*, int);
+    typedef int (*f_ADL_Overdrive5_CurrentActivity_Get)(int, void*);
+    typedef int (*f_ADL_Overdrive5_Temperature_Get)(int, int, int*);
+
+    struct ADLFunctions {
+        HMODULE hModule = nullptr;
+        f_ADL_Main_Control_Create Create = nullptr;
+        f_ADL_Main_Control_Destroy Destroy = nullptr;
+        f_ADL_Adapter_NumberOfAdapters_Get GetCount = nullptr;
+        f_ADL_Adapter_AdapterInfo_Get GetInfo = nullptr;
+        f_ADL_Overdrive5_CurrentActivity_Get GetActivity = nullptr;
+        f_ADL_Overdrive5_Temperature_Get GetTemperature = nullptr;
+    } m_adl;
 
     mutable std::shared_mutex m_mutex;
     bool m_initialized{ false };

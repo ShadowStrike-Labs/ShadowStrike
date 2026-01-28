@@ -2,112 +2,126 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\DebuggerEvasionDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\debuggerevasiondetector.cpp": "d5b2a65f2c4a7862822cc563e6c0f7e12f7d813aec4fc02829b5e5ccb2931780"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\debuggerevasiondetector.cpp": "998a3555606c2656551e28df0fe61047f3f2458361b6e69207928c99396ceb6a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\EnvironmentEvasionDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\environmentevasiondetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\environmentevasiondetector.cpp": "11db5bc81507b6dc2eb77b523c3d814b1fc2487e8bbdd2ccbec0e90a8e298a1a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\MetamorphicDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\metamorphicdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\metamorphicdetector.cpp": "2a652bf0bbef23db729138d69137e2bb5d7d67fad126d0ab18092440a5f605d7"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\NetworkBasedEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\networkbasedevasiondetector.cpp": "3c70a12619e9580a67b40458d16a6a85fcac75382d0fc7ab795c02966d7042bf"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\PackerDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\packerdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\packerdetector.cpp": "b4a9aed9d307b12c32dee8def1f47dcbe2a4c7b139855fcd267ebabdbac73457"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\ProcessEvasionDetector.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\processevasiondetector.cpp": "73d05d9c2cde547599f01d5d386af7800eae2c3e94aba77e5c41798a64a34023"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\SandboxEvasionDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\sandboxevasiondetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\sandboxevasiondetector.cpp": "a506782d7cc4a58da92e8375d4ffaf8cbb2adbbe9fbb39df914e621d9d77fd4a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\TimeBasedEvasionDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\timebasedevasiondetector.cpp": "fa2bbacb30e3ce8fb0066ebac4fa2d8ca6f060bb59dfc2e0fc1dc28842846c90"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\timebasedevasiondetector.cpp": "355f971abcb21939e2096f5126a6137bd16af5b20948906570d9a214e7ff1370"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\AntiEvasion\\VMEvasionDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\vmevasiondetector.cpp": "ec7ed07f6b370a6e681ff0c95cfd4ab8e18d9eb6eba5be291afd2f607a00689c"
+      "c:\\shadowstrike\\shadowstrike\\src\\antievasion\\vmevasiondetector.cpp": "126591db5200d12ab2addbe8ff684f8a312730f459fa84adfd521a4e5a692d46"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Backup\\BackupManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\backup\\backupmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\backup\\backupmanager.cpp": "b1288e412f9f64b5942f257bbeccd4b1c27e2fe8ae66832ade0be13bb6ab4478"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Backup\\BackupScheduler.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\backup\\backupscheduler.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\backup\\backupscheduler.cpp": "36045068e9b9f1ceccb35440d5f13b9008d7a0a69d71cc1f63f796d28c16147d"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Backup\\RestoreManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\backup\\restoremanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\backup\\restoremanager.cpp": "a41997c472ce852a1a574c8c0260bab41bb7b1fbaef5593a0ff92225266d4e9d"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\BankingTrojanDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\banking\\bankingtrojandetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\bankingtrojandetector.cpp": "563baaaaef6f64c3752df6dd55d52564e2387af97d10256a1a5e8ad6f3ffefa4"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\CertificatePinning.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\banking\\certificatepinning.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\certificatepinning.cpp": "b43cada44b32751f92f0a1fe9bd49f11cec3e1f301dac964f560be877bae1ce2"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\KeyloggerProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\banking\\keyloggerprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\keyloggerprotection.cpp": "83ea11aa53c78583f75b523211ae5b3cfa86fae8a6c12c63c2ba863483fb8a6e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\ScreenshotBlocker.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\banking\\screenshotblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\screenshotblocker.cpp": "1fac3905904d0048610a8e00437eb32d2f0f93065243934d812b5b49f919679e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\SecureBrowser.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\banking\\securebrowser.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\securebrowser.cpp": "8066a2566818cc7141970b619f63da732e9e59cb529569ceaa0dc8acd65e5c99"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Banking\\TransactionMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\banking\\transactionmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\banking\\transactionmonitor.cpp": "7c622d5efe94985ac8ebfe5df91024885ea1a7225064b5e7a8d835b6c488a53b"
     },
     "ContainsWarnings": true
   },
@@ -177,63 +191,63 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\BehaviorAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\behavioranalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\behavioranalyzer.cpp": "7299e24835ed26fc82a033f1871c395d4ee39fa836d59b39e579a0dce80b041c"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\EmulationEngine.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\emulationengine.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\emulationengine.cpp": "31f8fac5009ab02a3b7a7f6f6aa934cd996e94a9f5d9affde435c71e12673d52"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\HeuristicAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\heuristicanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\heuristicanalyzer.cpp": "db9aa20fe53ac408a362ffde1b5295266b1d6267a71c09a8771ddc7f2c05f7bd"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\MachineLearningDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\machinelearningdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\machinelearningdetector.cpp": "e28f3f4bc9ef930699a87fbcb5fca7c07282eb1c7ac787c86178a02012e0cbe6"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\PackerUnpacker.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\packerunpacker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\packerunpacker.cpp": "f1d7545e66bd853dc8efa8ce61104bf5cfb08845c1a6aa68436502ff894a979e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\PolymorphicDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\polymorphicdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\polymorphicdetector.cpp": "6e795ebee31e1e6a4d211eabe7672c5897d267f21bf2bacc64066de8a317b81a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\QuarantineManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\quarantinemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\quarantinemanager.cpp": "b16c651b10bc132ad27ff6302e2e6550d2cf9f8d53adbfb66dd2ce96ee2e94c2"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\SandboxAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\sandboxanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\sandboxanalyzer.cpp": "b097bf0bd636dce0a2ff072f1ecaf92af417df648a3be8e503ad4f89e62aa8c1"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\ScanEngine.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\scanengine.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\scanengine.cpp": "87459295ca3a2ad4e1d1490703ae3e339a9fc1b38ae372f37fd75fdc32e2235e"
     },
     "ContainsWarnings": true
   },
@@ -247,315 +261,315 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\ThreatDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\threatdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\threatdetector.cpp": "bc6754f6ba362f3e71dec740c0aaea19d70584fe75a104ae5525a25e28535652"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Engine\\ZeroDayDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\zerodaydetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\engine\\zerodaydetector.cpp": "c2bbe362e3db091ec2cc151b12c892494319f2e2b8cbc3778cb1ce2719cc0687"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\ArchiveExtractor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\archiveextractor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\archiveextractor.cpp": "d3d910c135c4c94febde2794c14330784d2153bde110fb6e32188166399536f6"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\DirectoryMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\directorymonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\directorymonitor.cpp": "d02f8dde6339ef7f8b0e5abf092becd2bf943c87b779aa2778f9dcae3dec10ce"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\DocumentScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\documentscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\documentscanner.cpp": "042d9e57d5fdd3c174382fc85154dbe20c370c44610974b76eaabf7152445a17"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\ExecutableAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\executableanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\executableanalyzer.cpp": "4b4bd4dd49142d28312d4c7e4b07134eababcbf369fc94f501241649d3881afd"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileHasher.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filehasher.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filehasher.cpp": "4a1fd5cb7c6f2e696d0fb1feb3e6f612f7117e5ee10c7a014f29da16f4ab6adb"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileLockManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filelockmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filelockmanager.cpp": "e28249d70b599978d74128b8002d2e2d265aab932b1a213a29619ec2580f05cc"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileReputation.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filereputation.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filereputation.cpp": "1f5f1c10f04d667264fbe10af0876b6526bb8d4ac76972b297cbb321fad01b7e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileTypeAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filetypeanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filetypeanalyzer.cpp": "47d0574ffe1f162c8a172828f277f57f39cdd64ec2da74ca3b7744a1e5373cd8"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\FileWatcher.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filewatcher.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\filewatcher.cpp": "9b94aec423730715d42b47f52ea7978071bc6e4d42c2e578ced8d73f637d58a2"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\MediaFileScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\mediafilescanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\mediafilescanner.cpp": "75f725bbb71873ab42901bb0c10f2a587f8ace3a17eaa4c10bc830b6d2dff965"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\FileSystem\\MountPointMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\mountpointmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\filesystem\\mountpointmonitor.cpp": "912a0c1740807c33b8bfa605d6a27e4efcfb93c134556dca84ef8906f080b358"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\BotnetDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\botnetdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\botnetdetector.cpp": "d5dbb532399c1f22f132d8686da3d36c429d9e6d53e9de4f9b08feca6b220cf0"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\DDosProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\ddosprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\ddosprotection.cpp": "bd6eaea6c9a25123637f2257fd768a175e08c188deffee4ffe8bf813df199f4b"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\DNSMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\dnsmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\dnsmonitor.cpp": "635335d6deee7c1db908e243b5fb19df27003863f88d21e72bee12f5d7d758ad"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\EmailScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\emailscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\emailscanner.cpp": "94714ba0c10468a8eb1cf1b360850ced99f838b065595119e4ebc09abe3f8137"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\FirewallManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\firewallmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\firewallmanager.cpp": "7be23bd7f0233dfa89f91dec268e44f454cfc229f1af2d36394ac6d9e8c09cbc"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\NetworkMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\networkmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\networkmonitor.cpp": "bbb6d9a7acc9745c123c4553296f00f76fa4938508633e0bb59235709c26e93e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\P2PMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\p2pmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\p2pmonitor.cpp": "193d62b66c06024256a0e529fc5cc7c3812e7168d3cf55dd18167e0835cc8492"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\TorDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\tordetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\tordetector.cpp": "2125913f7a8d5e5c7b67ede5b905a01d174e9d7e6cff071a5395007ee3dbecd6"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\TrafficAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\trafficanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\trafficanalyzer.cpp": "b000ab87ef5807d7489d2aaa3fb99afa2ea995a96cdd8936e90fab7f8eb8dd96"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\URLAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\urlanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\urlanalyzer.cpp": "c93829bf4b0415334de9daf461c5d46a29058260c5c159e3a1db90cdb9a06106"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\VPNDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\vpndetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\vpndetector.cpp": "a6f65c427c291aff85287ef36b88fbd91de2836da000821a36c6c235dba77fd4"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Network\\WebProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\webprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\network\\webprotection.cpp": "9918a687be6a50358cc4c537525083d2d94b0076b62af78d5abe69320453d445"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\AtomBombingDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\atombombingdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\atombombingdetector.cpp": "eaec535725de990088c28484481038e0a9fcb06d89a9d4c8896902f8b7ca7185"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\MemoryScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\memoryscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\memoryscanner.cpp": "d0f79810a8678208f5a77e14369b1746c595d3f52429538a57c1347fea51531a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processanalyzer.cpp": "2494792d45c888200cbac0c0cea895d1aabace754677df4fa8c4e8fe308055eb"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessHollowingDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processhollowingdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processhollowingdetector.cpp": "49b0ba3d8129203f1662b2d0db62a0937aa857b3b9faf0287e1a0e937128c813"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessKiller.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processkiller.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processkiller.cpp": "df55050dc88050ad0efc6c4e457bb4e0489c4207ce38f157e62805aae4e40f0b"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ProcessMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\processmonitor.cpp": "84ea574350bb08d2e3777522825c210d225bcadbcf6ebf2f66700dff9ae9db3c"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ReflectiveDLLDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\reflectivedlldetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\reflectivedlldetector.cpp": "a178fbf4d011559a49db3dab330e83035ad7be2085af0887d5344d6e0ba0ffd7"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Process\\ThreadHijackDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\threadhijackdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\process\\threadhijackdetector.cpp": "ffe068461bdcdf68ced0370a9ab79691e644ea0986205724087050779f006ea9"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\PersistenceDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\persistencedetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\persistencedetector.cpp": "247bbcca86e5bf3113da8c31e35946b0d963c4f94b66ede9cd6373fb0d537cd3"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\RegistryAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\registryanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\registryanalyzer.cpp": "109fa44ec21c2ada5f511e0ffb5418ee672e997b30e262c8578de77a3d4eefba"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\RegistryMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\registrymonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\registrymonitor.cpp": "bd6c5c71f5fcee9971bb188e04b926b490eaf07d666b093264253cd47c5ba7f4"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\StartupAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\startupanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\startupanalyzer.cpp": "f2b234caf46b123428b18084ba18f8ba5ad9cc5626ffcf58083a4440bded0cc4"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\Registry\\SystemSettingsMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\systemsettingsmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\registry\\systemsettingsmonitor.cpp": "ab07a61b9fe83a818bc94fe6dab8396ff020a4a28afd5f3dd1f29da9b3d9b380"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\BootTimeAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\boottimeanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\boottimeanalyzer.cpp": "1324c44a749cc2c23a586139397a2863de531e54b666cefb0e58b1ee508b843f"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\CrashHandler.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\crashhandler.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\crashhandler.cpp": "22fe9d048c87e223a509531aff1a8727209487ddb63fcf4e99b4da4a550879dc"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\DriverAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\driveranalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\driveranalyzer.cpp": "9c19f6af4f8378976091a09759ca76067567ae7ec1a90629b1831cf03d67e070"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\EventLogger.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\eventlogger.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\eventlogger.cpp": "c0e83762ba115e4eaf8d0189ce467cbf124fd61e540eee48215bb7e0bc8dfd29"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\HardwareMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\hardwaremonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\hardwaremonitor.cpp": "e643a112bd9ffeda597e00a2c6bd0c8b502ecaf51e38699b0aa4982264fb5551"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\PerformanceMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\performancemonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\performancemonitor.cpp": "1a558f39c0bef0025a8417a4a93ba9819051cbc220c7b209c0f76b85c67a005b"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Core\\System\\ServiceManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\servicemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\core\\system\\servicemanager.cpp": "961bfd4a9e0582a58e39625f442b3422545d66ee618262b31b7244c5022f242d"
     },
     "ContainsWarnings": true
   },
@@ -625,84 +639,84 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\AttachmentScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\email\\attachmentscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\attachmentscanner.cpp": "c44241db5698f274f6926a59eb1f48f1b6a93397aff0801b68a6fae379a93c01"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\EmailProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\email\\emailprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\emailprotection.cpp": "1ba53b82e41f20a7caafdbff30dd9fe804f127426514c64f97f2f127722650a5"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\OutlookScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\email\\outlookscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\outlookscanner.cpp": "1b95d55898797863de006c8b15e27e744c4e92aa1982f0d0b339b03b34c5259a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\PhishingEmailDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\email\\phishingemaildetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\phishingemaildetector.cpp": "3f97714e761dc3194f6eacc0bc7a10e3b10cdf86e281ac62f36832c67a2e78ad"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\SpamDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\email\\spamdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\spamdetector.cpp": "1273197f14ebdd29b59b880acfe4c03a2b8b5ece363e432e8b7bc269430d0882"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Email\\ThunderbirdScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\email\\thunderbirdscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\email\\thunderbirdscanner.cpp": "dc91762344180da9277ffb146341f931cfd24b0c828fd9a8adc9fa7546e6c729"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\BufferOverflowProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\bufferoverflowprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\bufferoverflowprotection.cpp": "d0eea6e210675bf32d0cf1fdb8d10a97a19afe566cf60783796608c69eeee80a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\HeapSprayDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\heapspraydetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\heapspraydetector.cpp": "5ecf324ad9b90598c6fc0e58a52cb0867211016e0933b5b671f8ab96ffca059e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\KernelExploitDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\kernelexploitdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\kernelexploitdetector.cpp": "255ccb9052e28a8256b1d434d52f72e1f0e59851d41237030460df5988a9afdd"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\PrivilegeEscalationDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\privilegeescalationdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\privilegeescalationdetector.cpp": "ebe0b34ec5ac5521beee45ae06b1d37e202e629491b37d5a05a34b9dd8fffb35"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\ROPProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\ropprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\ropprotection.cpp": "b60051d83edf1001d5863e0276f1cc017b6643a4cb3e5310afc3ac205a98aa9c"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Exploits\\StackPivotDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\stackpivotdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\exploits\\stackpivotdetector.cpp": "c61c3a93c948448463695307938b5de302cf1285821df01b17f72deaa0554778"
     },
     "ContainsWarnings": true
   },
@@ -821,70 +835,70 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\ArtifactExtractor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\artifactextractor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\artifactextractor.cpp": "fdcf64f2b25ea7cf50080d09f53d1966480f9279d66873263089e8dabe7330df"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\EvidenceCollector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\evidencecollector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\evidencecollector.cpp": "897da7cb31c10bac4c49ab0ec05fe667709608faadd1165bffb71b6451a8fa73"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\MemoryDumper.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\memorydumper.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\memorydumper.cpp": "a24f9b329239521fe57636b608cbbaf7e7a3e997e64875b904d42f4bb12b488a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\NetworkCapture.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\networkcapture.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\networkcapture.cpp": "4110aa75eef0dbee9a6551295e24119b0f807e48c1a5ccbddc2226a0a8a203ec"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Forensics\\TimelineAnalyzer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\timelineanalyzer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\forensics\\timelineanalyzer.cpp": "cc76bdcd19d5d7b4bcae4564cd22df0817a4b093eda123f11f7f805c90c0e908"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\GameCheatDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gamecheatdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gamecheatdetector.cpp": "4d87649d7fb3723d6d3734ebc5c792856d126ae9e4639092e6863a23ee22104a"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\GameModeManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gamemodemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gamemodemanager.cpp": "638cf9efa823cbeb4be7cbd55376974ee836568430b59afede4c11b327436f56"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\GameProcessDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gameprocessdetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\gameprocessdetector.cpp": "0478a810c72ca7fde6c7b75f30aeb9ebd3899f8977981576e474fb789767dd9f"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\OverlayProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\overlayprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\overlayprotection.cpp": "91e5455b72cb4d81a9d10e05e3d50d857428ddc00c963356654dec4b0947b9db"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\GameMode\\PerformanceOptimizer.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\performanceoptimizer.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\gamemode\\performanceoptimizer.cpp": "d6a453a129b2fbfb78663c2804d3055c8565ab5cfb48bba71df8ea074f78b371"
     },
     "ContainsWarnings": true
   },
@@ -908,7 +922,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
@@ -930,7 +944,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -958,9 +972,9 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
@@ -982,7 +996,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -1011,9 +1025,9 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
@@ -1035,7 +1049,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\tlsh\\tlsh_win_version.h": "cb494505c6bbd649112aaa6ff8b09b07f986643fbcb6adf68f033e25a82087eb",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\include\\tlsh\\tlsh_compat.h": "c008f37b32921f804cb2735ae1b3d1c5de7b096ffc75088b6f0d6891b70f7392",
@@ -1066,7 +1080,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
@@ -1078,7 +1092,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore_import_export.cpp": "adc2d6cb3d57691b79e4681f6cfbc385d97b915b8d18dc165a45cd588f86fac0",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore_import_export.cpp": "2b0065e6bdf0aa694c8be8ed60eb589a54a85c1257cb94b024926c7d39a2eb5f",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
@@ -1088,7 +1102,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -1101,8 +1115,10 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-matchers.h": "427e5eb4414c98f151ecb038f7b635bed2d13e7bf4ff059614b66129a2e7ef40",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-test-part.h": "7d7a28e11bf02c17951253d462d8aa935ae7dc1607f8cdb043f2ed0b476d0a54",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-port.h": "4412d53972ef1ca0a0ab5e830814faf4e22285af67aaba413d69d821bebc02c9",
+      "c:\\shadowstrike\\shadowstrike\\include\\nlohmann\\json.hpp": "caaab734876745dc23430442b2df6d5c9dee99c1705c1c3c42eac110b2ee56b7",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-assertion-result.h": "17cc0d71b94ca30d230c827112fe5cb06442c7fdf98ec42fc0ae441080438b2c",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-printers.h": "1349a60a17391f7dd39e9b8ac621b4ac5802326e7189acc25cba15e29e69f29a",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\jsonutils.hpp": "311b29973d56b0241ffb58157424fcddf2de92079f9869aca423f3a8eaf55959",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
@@ -1114,7 +1130,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
@@ -1124,7 +1140,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-function-mocker.h": "5fb892b51f84652bb6b36692b4ee9861062df0f1354b3b330b64e64d7beeb3f0",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-actions.h": "2047afa840dafb420651043396103ab9612a4afdff7ea7bd445efb86ec7580eb",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-more-matchers.h": "440172498892ae0eef0be37249ef507727a7600251a1956600f8d095a6aa3cb3",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore_mgnmnt.cpp": "7704d8dae94eb343ddee919b739e00c49534096f4bf09902f405d5a7c8d4b34a",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore_mgnmnt.cpp": "88d0587bf4bfeefab6b910ce1f44f7f9dcd68b1e1027f7b72a376a0f4c2912d0",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-typed-test.h": "228fbae43924d47fefa51c93c917b2d370ab7e7ad8c4ee092e7a5de80b87d396",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
@@ -1136,7 +1152,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -1165,7 +1181,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-filepath.h": "36128ff75261bdb9d5e733ad0bf5311c1940e734007e4b6eeb2fa53279fe4b1c",
@@ -1186,7 +1202,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\tlsh\\tlsh_win_version.h": "cb494505c6bbd649112aaa6ff8b09b07f986643fbcb6adf68f033e25a82087eb",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\include\\tlsh\\tlsh_compat.h": "c008f37b32921f804cb2735ae1b3d1c5de7b096ffc75088b6f0d6891b70f7392",
@@ -1216,12 +1232,12 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\aho_crsck_impl.cpp": "1e4adfca44879747d07a6f2a7815abbc805f1255a715f127b1196475476c62f8",
@@ -1244,7 +1260,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -1271,13 +1287,13 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.cpp": "e27bd84968fb1e42f9423aaff88ad33bb95ddb85ea9ef1f3894e9ded60f1a308",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -1299,7 +1315,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -1313,51 +1329,86 @@
     "ContainsWarnings": true
   },
   {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Performance\\CPUMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\performance\\cpumonitor.cpp": "9aa4690fb0edbacda45a1d215b1ca9f14a8243b30587b5e92ce8232061c26352"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Performance\\DiskMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\performance\\diskmonitor.cpp": "31dacf40755257bba98d5a31d939cf117611de8844361c06e8cb98ed601320af"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Performance\\MemoryProfiler.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\performance\\memoryprofiler.cpp": "9e080986d87c2e4ffc42af42738470963215450399727778298f829358db0096"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Performance\\NetworkPerformanceMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\performance\\networkperformancemonitor.cpp": "a47512b694f6feb2dc17d0c51251097f4caefc0332b30df24cf9ff77eed158f8"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Performance\\PerformanceProfiler.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\performance\\performanceprofiler.cpp": "0f01c726b0025be0077abe356f9d0ae79df990bc6d9d68eec0936c8ee73faa11"
+    },
+    "ContainsWarnings": true
+  },
+  {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\CookieManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\cookiemanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\cookiemanager.cpp": "d1489afce7e139a7e6128b049d6b842f62d67aead9a5d73b73e44df1343b8ba8"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\DataLeakProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\dataleakprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\dataleakprotection.cpp": "60b312506f9a2a9a5ee8ddaa6fe42f8f1d4a6b95590cfa2ce33839c3e7ff31f5"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\DNSLeakProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\dnsleakprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\dnsleakprotection.cpp": "353babf355c48d42d69f576e2c3dc9dd36c390ef621ccda6b87f3b09afa6b3d8"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\LocationPrivacy.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\locationprivacy.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\locationprivacy.cpp": "ea07d4ccd2e9647ebad315a8e06bb589dce1c18ada3c9e72c0e8fe59007e18d9"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\MicrophoneGuard.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\microphoneguard.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\microphoneguard.cpp": "ef1055beb3f60ca43c20579677b331ed229633203e2cdf75b2494089f3b00801"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\PrivacyCleaner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\privacycleaner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\privacycleaner.cpp": "42c793e042b7dd850332c306e39d73feda2b92e9f687069bfee286db027d3684"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Privacy\\WebcamProtector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\webcamprotector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\privacy\\webcamprotector.cpp": "026d0162d0e824f7caa3a2eb2ee45af1200b9951682bc124563b8bf00b900ef6"
     },
     "ContainsWarnings": true
   },
@@ -1427,49 +1478,49 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\AccessControlManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\accesscontrolmanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\accesscontrolmanager.cpp": "54bbe39a087dab52b001c7e1c53371d233ec7f83763bb8211014c8b4fbf4cd7f"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\BehaviorBlocker.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\behaviorblocker.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\behaviorblocker.cpp": "b1c3fafe4f72888b438c04198a1e7cc9061bb3d9e03fbc950382fa6e34dcdabb"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\ExploitPrevention.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\exploitprevention.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\exploitprevention.cpp": "b003f1679f3c14fc8a5207368a14d5a5288d7f7abe36c4c8fd2b81a7c46d9feb"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\FileSystemFilter.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\filesystemfilter.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\filesystemfilter.cpp": "0237981c5119a4afcb6c557348cc70c759caa2a879f2d36cd3f7743f1050d002"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\MemoryProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\memoryprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\memoryprotection.cpp": "afbee7ffeb51a1d5756c4c9d9ba56ffffd6475f1905aca7c089cc49a5af241bc"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\NetworkTrafficFilter.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\networktrafficfilter.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\networktrafficfilter.cpp": "b2e3b075efa9eeeaf089eb64392a2d69ee0f577f8a4e4484e0d26df02250d7bc"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\ProcessCreationMonitor.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\processcreationmonitor.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\processcreationmonitor.cpp": "ccf71d149d2f70227fd93fc0c2b48e02e64d2d97fb6d7e88cff9dd5a1d002f07"
     },
     "ContainsWarnings": true
   },
@@ -1483,56 +1534,56 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\RealTime\\ZeroHourProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\zerohourprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\realtime\\zerohourprotection.cpp": "9e9193a3f14d46acb74506272c57af1cd2702cdba91cd6b14d02aa80d86a1645"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\JavaScriptScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\javascriptscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\javascriptscanner.cpp": "209c282bb0ccab6143d96b38db3824a0c27e204cf10c699ff99eac6970788f3e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\MacroDetector.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\macrodetector.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\macrodetector.cpp": "aaedf5a80f4555b87f47c3b916a9a38752a343d572163f856b9d48845d04d334"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\PowerShellScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\powershellscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\powershellscanner.cpp": "7bfd827271c00c9260239c2a08179a7674c178c49e79a206577c3975a994d4c0"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\PythonScriptScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\pythonscriptscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\pythonscriptscanner.cpp": "56bd4b42c2a4c57a3c5f9f5f6a678326f247c8b72f358a2d26853915d5513567"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Scripts\\VBScriptScanner.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\vbscriptscanner.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\scripts\\vbscriptscanner.cpp": "38711d705ead38ba48a4e900bc27752c3e59f87e00ad8a68479849e6b969dce5"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\AntiDebug.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\antidebug.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\antidebug.cpp": "562683c33099163a7c846f0bb73f42651a247d16671900e5daacea48e538cdf4"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\CertificateValidator.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\certificatevalidator.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\certificatevalidator.cpp": "0477ff80e113b0d69b674132e1a2700a69b73f257dae66c0d09912d4ba4666f9"
     },
     "ContainsWarnings": true
   },
@@ -1546,42 +1597,42 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\CryptoManager.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\cryptomanager.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\cryptomanager.cpp": "db13111b1e52b4e3d13e65a1a4a1babf8b2a3e20265144c90f9ac4b23dd8ff3d"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\DigitalSignatureValidator.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\digitalsignaturevalidator.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\digitalsignaturevalidator.cpp": "1fe09622a150d40b2542a080c31812dd52a0bcb0bb0681c2b3d62d832f80beef"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\FileProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\fileprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\fileprotection.cpp": "6ee809f82d5b6ea8f68d2b6bb865e3b21b2b6ed1bb9d7a68bf9418a0f81bee0e"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\MemoryProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\memoryprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\memoryprotection.cpp": "9d67d75ab539f1b5dd0dc13079b4637484e2b24430f39c14f04be1bd512822c3"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\ProcessProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\processprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\processprotection.cpp": "29e42e5e308d6f1d91799e9358fdb3d0e56b76fc20f014dee5d5e9f87abbb912"
     },
     "ContainsWarnings": true
   },
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\RegistryProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\registryprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\registryprotection.cpp": "ecbd2265b259ef29d3da1905ec4058b8696932288891c6bc555e7a4fb0780d61"
     },
     "ContainsWarnings": true
   },
@@ -1595,7 +1646,35 @@
   {
     "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Security\\TamperProtection.cpp",
     "Dependencies": {
-      "c:\\shadowstrike\\shadowstrike\\src\\security\\tamperprotection.cpp": "585b75b955427164bb64a674b24670cfac724d9057c6da9fb96c21948ab34ab8"
+      "c:\\shadowstrike\\shadowstrike\\src\\security\\tamperprotection.cpp": "1179c8d8099efbd4e302bf24f822de4a30e5807397a2f72d6ebe5742f4becc38"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Service\\AntivirusService.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\service\\antivirusservice.cpp": "2244cd06c0c3e336fc42a55686e41c7e18b65391c385c82a45667eaaa9b02ba3"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Service\\ServiceCommunicator.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\service\\servicecommunicator.cpp": "754c1a3c32187bf385498daecaa31158feb31a236aec8cac804f8c5aaf5f3dc9"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Service\\ServiceController.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\service\\servicecontroller.cpp": "9bd1d1144917b9936f9ec998d07956bf4e5e13307500ad864bd14f9d6a5164e6"
+    },
+    "ContainsWarnings": true
+  },
+  {
+    "TranslationUnit": "C:\\ShadowStrike\\ShadowStrike\\src\\Service\\ServiceMonitor.cpp",
+    "Dependencies": {
+      "c:\\shadowstrike\\shadowstrike\\src\\service\\servicemonitor.cpp": "af1a2aa87cc4cea20c1582e30a0a6a8c9738f1ad3c3595f4eccb7daa12fcd13e"
     },
     "ContainsWarnings": true
   },
@@ -1622,7 +1701,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -1636,7 +1715,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -1655,7 +1734,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-type-util.h": "dc31e0488034ecca4e9e6ee567431265dcbceaa4e59b9f266a7b00ddd8834ea5",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\utils.h": "61a2ec3d354e45c0fe016eaca791f442f9eb105dd689f672a001d0ea46311e6d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\stopwatch.h": "44a63485a2e012f329cd8f795e92c97bf9b5201a6f776dd8716c3625208c13bd",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\batch_sig_builder.cpp": "bdd3ec6f276ed897ff40539ffeb3ab28ccdb86b40ddb7ffb90794620bec81116",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\batch_sig_builder.cpp": "38759dbc82ef0f5fce4f26523d807f1b9f6a08f5365449b5458c70b065c5bf65",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-spec-builders.h": "7f76f94f3245746ca1b9f431758c793235b14ca87cfad86eb08c87ce71af0646",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_prod.h": "c364db32f50f5ddee880016ce59e8b47ca9535a9b5574771435550dd91bfa2a1",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest.h": "8f5ba021f8bca40acca7dda1df50fe6e391c7323f2bf25f849daebec2b4d73ef",
@@ -1674,7 +1753,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -1704,7 +1783,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -1718,7 +1797,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -1756,7 +1835,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -1786,7 +1865,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -1800,7 +1879,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -1838,7 +1917,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -1868,7 +1947,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -1882,7 +1961,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -1920,7 +1999,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -1950,7 +2029,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -1965,7 +2044,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -2002,7 +2081,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -2069,7 +2148,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\strutils.h": "df73f341f271c89c0169f73b4a7ae65c53e665a2c76cd52ad0151d6fa992781f",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\jsonutils.hpp": "311b29973d56b0241ffb58157424fcddf2de92079f9869aca423f3a8eaf55959",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock.h": "5ee7a0fb1a5831004003308c07f4d4413ad6a7541539470446490ff7e63332a4",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturebuilder.cpp": "7356333e3c8c005a2d7d20fde28ef9ffb42de13519e5a3aa4147341b1b363f0b",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturebuilder.cpp": "7195c5c3a7bd96de61c333d6be0cc25807ac426f228ba7ebc9654cfea0cd7ccf",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\error.h": "aa74aedc2d6e61544d67e738283c2d9d92d5f546ae0b6b200d07ee4c9855be8b",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-port.h": "95c13ff10646bc9939c49546aed12ecf7f04e7e9840d691f7939ff46902767cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
@@ -2079,7 +2158,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -2091,10 +2170,10 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\libyara.h": "aaac49da31ada81133709d8cadfeba9ea68204698657f175e0103e16dbbe7fc5",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -2131,7 +2210,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -2206,7 +2285,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -2216,14 +2295,14 @@
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\yararulestore.hpp": "b088163f124305bafcfdf61618f8bb8b8fa7dc862f3024704b8012c273c2c214",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\threading.h": "62496e30d11a1e249275b5c81de66dd9ae6c0f7eacd0178f300e1942019e96e4",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\libyara.h": "aaac49da31ada81133709d8cadfeba9ea68204698657f175e0103e16dbbe7fc5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "c8e0f2a87184f6c66c542c9aa91ba079376c2a64dfa795f881530f198b4ee1ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "a1eab317d8b28f0269b0d8e44e86cd1a2083783e15e838b5092ff800d7b9b3ea",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.cpp": "046da9cbcce0340952e329c9c5fdcbe97916cb8b5a3e5e1249ffc1b78cc666f5",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -2260,7 +2339,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -2291,7 +2370,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -2301,13 +2380,13 @@
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\yararulestore.hpp": "b088163f124305bafcfdf61618f8bb8b8fa7dc862f3024704b8012c273c2c214",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\threading.h": "62496e30d11a1e249275b5c81de66dd9ae6c0f7eacd0178f300e1942019e96e4",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\libyara.h": "aaac49da31ada81133709d8cadfeba9ea68204698657f175e0103e16dbbe7fc5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "c8e0f2a87184f6c66c542c9aa91ba079376c2a64dfa795f881530f198b4ee1ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "a1eab317d8b28f0269b0d8e44e86cd1a2083783e15e838b5092ff800d7b9b3ea",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
-      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "d1d268d5bbb9f2ca3ae6c60bbd2229675fd3f3f5c480c9557900d152d9c9a982",
+      "c:\\shadowstrike\\shadowstrike\\src\\utils\\fileutils.hpp": "edaa4064f2293a60a19814ddd0c44c9828ae70f32eb70adb5d0ae6d048798cac",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -2344,7 +2423,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -2375,7 +2454,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore_query.cpp": "65b57c1a42f40d40bb388ee0135bc04ac0961093261f17be94ea665b772f7dff",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -2385,12 +2464,12 @@
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\yararulestore.hpp": "b088163f124305bafcfdf61618f8bb8b8fa7dc862f3024704b8012c273c2c214",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\threading.h": "62496e30d11a1e249275b5c81de66dd9ae6c0f7eacd0178f300e1942019e96e4",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\libyara.h": "aaac49da31ada81133709d8cadfeba9ea68204698657f175e0103e16dbbe7fc5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "c8e0f2a87184f6c66c542c9aa91ba079376c2a64dfa795f881530f198b4ee1ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "a1eab317d8b28f0269b0d8e44e86cd1a2083783e15e838b5092ff800d7b9b3ea",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -2427,7 +2506,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -2457,7 +2536,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -2467,12 +2546,12 @@
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\yararulestore.hpp": "b088163f124305bafcfdf61618f8bb8b8fa7dc862f3024704b8012c273c2c214",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\threading.h": "62496e30d11a1e249275b5c81de66dd9ae6c0f7eacd0178f300e1942019e96e4",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\libyara.h": "aaac49da31ada81133709d8cadfeba9ea68204698657f175e0103e16dbbe7fc5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "c8e0f2a87184f6c66c542c9aa91ba079376c2a64dfa795f881530f198b4ee1ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "a1eab317d8b28f0269b0d8e44e86cd1a2083783e15e838b5092ff800d7b9b3ea",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -2509,7 +2588,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore_scan.cpp": "fe9cda9e946b87cc82e1df2293da2be1304658d309579cd8efc43bf92afee173",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
@@ -4628,7 +4707,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
@@ -4654,7 +4733,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -4674,7 +4753,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
@@ -4700,7 +4779,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -4726,7 +4805,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\shadowstrike\\shadowstrike\\tests\\unit\\database_systems\\sig_store\\hashstoretests.cpp": "2a7a386a2df11318124d73c907befd0df104daab932509502ad4cc8078e3e3c6",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -4748,7 +4827,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -4768,7 +4847,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-message.h": "cec45664a3b0aa91109b27efd03d883d4ba84689f8234edcc7a62782f4b91642",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-printers.h": "586b08412b833833288049dbc20ed851549379b1a63005a1c52ab7454a0d8893",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-matchers.h": "e203500e13714f498075261cfb72fa25fb516f27e103e8d6e86bb9190dd98975",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\gmock-pp.h": "316b06f3c51c22b8c18d11b3e8d930b67a41c3abc7b6052396cf9b57600da5b0",
@@ -4794,7 +4873,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-death-test-internal.h": "8d24493e2e84fb9849e2e589905b5ac7ec5646c602490ed59f4d1397200160b2",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-param-test.h": "bd020980c99fd9a360338d8fecff20e7f6ffe54e714ae755ace8f8adef77c7cc",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": ""
     },
@@ -4823,7 +4902,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -4837,7 +4916,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -4875,7 +4954,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -4905,7 +4984,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -4919,7 +4998,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -4957,7 +5036,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -4987,7 +5066,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -5001,7 +5080,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -5039,7 +5118,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -5069,7 +5148,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -5083,7 +5162,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -5121,7 +5200,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\shadowstrike\\shadowstrike\\tests\\unit\\database_systems\\sig_store\\sig_builder_serialization_tests.cpp": "823e36bd45bd46798371371f74a65942b99f2d73836cea2bc1188fba49ea901e",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"
@@ -5151,7 +5230,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -5165,7 +5244,7 @@
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -5202,7 +5281,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\tests\\unit\\database_systems\\sig_store\\sig_builder_utils_tests.cpp": "7fbd80a8810dc9b8d68a2354d3144f6a254017ac57265aa917a3d13b986ec653",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
@@ -5324,7 +5403,7 @@
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\rules.h": "b728da96c62adc685898497e2f2c281f212bf79af71684291644a7321165d081",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\arena.h": "5e36573ae07d478b144816c207322b38c7f1a7da6eb9455af03f27832a3fbb48",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-cardinalities.h": "8f5ac8971337988cc101df84363b552c80ecb6247b59f1e4e5ca1bb645ddf37d",
-      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "68df57b7b715816aec23c71a1e55ed970204e22a9e40d6faddf622284fda28ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\patternstore\\patternstore.hpp": "2179b662cb742bcf5f20899980d3038633bdd715052ac5abc26173d7c2e9e5fd",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\gtest-string.h": "6fbfe113788b635af08ab575a3a5e330aed653d1ea07364de210e21382aff2cd",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\mem.h": "5644fa958e4f531626fac9991098e3625f12ce592eb20d7acbb133c293eed9e1",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\atoms.h": "8f973ad37b6088ef1747dae2b055c59683622f06eb012df37d3617f1a3e29bfd",
@@ -5334,12 +5413,12 @@
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\yararulestore.hpp": "b088163f124305bafcfdf61618f8bb8b8fa7dc862f3024704b8012c273c2c214",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\threading.h": "62496e30d11a1e249275b5c81de66dd9ae6c0f7eacd0178f300e1942019e96e4",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\libyara.h": "aaac49da31ada81133709d8cadfeba9ea68204698657f175e0103e16dbbe7fc5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "c8e0f2a87184f6c66c542c9aa91ba079376c2a64dfa795f881530f198b4ee1ea",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signaturestore.hpp": "a1eab317d8b28f0269b0d8e44e86cd1a2083783e15e838b5092ff800d7b9b3ea",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-generated-actions.h": "f1f5c0888900d7a3f0878c3d700bde70cac647c936e021529e4b6b7459e1eacf",
       "c:\\shadowstrike\\shadowstrike\\src\\utils\\hashutils.hpp": "a98fbd4df771584f1a4fd0f5c7d67d61f6a794b22307f08a9f1850623593190c",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\modules.h": "672ceda4a1643df849d10fda41c76a2c2df090744e4b22688590605cc738da94",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest_pred_impl.h": "6d18a89e0431995fd915cfc2f41ccf8e31dc4c5540227117947a7b251a3bec63",
-      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "2ebed8562f50685193b30f9ee887c5baa2f626243e2694059366193252cb5a51",
+      "c:\\shadowstrike\\shadowstrike\\src\\hashstore\\hashstore.hpp": "bd29e7edabe0e758e02091d2c3013ff8466b0c7406615b93b7b0eb622eb7027d",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\gmock-actions.h": "2ccf6f634cc6c4350a3deb7a80e6f7606e4e71eea3b4bf0de1604fe88253456b",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\compiler.h": "36345fba2f860ac2f6dc0975df52ae5015df1eb45e974ddd4fbd8fcaa08e4567",
       "c:\\shadowstrike\\shadowstrike\\include\\gmock\\internal\\custom\\gmock-port.h": "6f2ee328147895dec9d138bd3aa8e73c705e77321329a419ad4c9a880165e5c4",
@@ -5376,7 +5455,7 @@
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\gtest-death-test.h": "2294a5cdb0b48827a577fcf2525d383ffc68ed062aa737780711f11d6d0ddf4d",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\bitmask.h": "b279318f043869a21944e84926a31e81233e0b5eaac29811e63a2c9e3a2d4518",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\hash.h": "a54b207f80b4b9b45434cd1974ca8b1d980ee7eb285216eccfee2fa880ee71f5",
-      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "d305f66858532f01a9774bb70a5cf3f69ffd268dfac66a591a19d8eb1c94078a",
+      "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureformat.hpp": "5e25984a0d0e33e741982a9a9649cbc92c3979e61e1a736a6aec40a2c653f209",
       "c:\\shadowstrike\\shadowstrike\\include\\gtest\\internal\\custom\\gtest-port.h": "b30a82f19994b7c109e3e50fad161bbe4816af623a282dc5f4d3413c9e866b15",
       "c:\\shadowstrike\\shadowstrike\\src\\signaturestore\\signatureındex.hpp": "",
       "c:\\users\\rtx40\\source\\repos\\shadowstrike\\vcpkg\\vcpkg\\installed\\x64-windows\\include\\yara\\exec.h": "457d5846faed9e0c2ae4f9d387f99db82dddbd6633938b1d6982c51dd681a109"

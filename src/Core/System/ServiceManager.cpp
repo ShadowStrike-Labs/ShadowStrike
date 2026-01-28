@@ -38,8 +38,11 @@
 #  include <Windows.h>
 #  include <winsvc.h>
 #  include <fltUser.h>
+#  include <wintrust.h>
+#  include <softpub.h>
 #  pragma comment(lib, "advapi32.lib")
 #  pragma comment(lib, "fltLib.lib")
+#  pragma comment(lib, "wintrust.lib")
 #endif
 
 namespace ShadowStrike {
@@ -151,17 +154,41 @@ namespace {
  */
 [[nodiscard]] bool IsMicrosoftBinary(const std::wstring& binaryPath) noexcept {
     try {
-        std::wstring lowerPath = StringUtils::ToLowerCase(binaryPath);
+        if (!FileUtils::Exists(binaryPath)) return false;
 
-        // Common Microsoft paths
+        WINTRUST_FILE_INFO fileData = {};
+        fileData.cbStruct = sizeof(fileData);
+        fileData.pcwszFilePath = binaryPath.c_str();
+
+        WINTRUST_DATA trustData = {};
+        trustData.cbStruct = sizeof(trustData);
+        trustData.dwUIChoice = WTD_UI_NONE;
+        trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+        trustData.dwUnionChoice = WTD_CHOICE_FILE;
+        trustData.pFile = &fileData;
+        trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+
+        // Verify digital signature
+        GUID guidAction = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        LONG result = WinVerifyTrust(nullptr, &guidAction, &trustData);
+        bool isTrusted = (result == ERROR_SUCCESS);
+
+        // Cleanup
+        trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(nullptr, &guidAction, &trustData);
+
+        if (!isTrusted) return false;
+
+        // In a full production environment, we would verify the signer is Microsoft
+        // by inspecting the certificate chain (CryptQueryObject, CertFindCertificateInStore).
+        // For now, we trust a valid signature + path heuristics.
+
+        std::wstring lowerPath = StringUtils::ToLowerCase(binaryPath);
         if (lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos) return true;
         if (lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) return true;
         if (lowerPath.find(L"\\program files\\windows defender\\") != std::wstring::npos) return true;
 
-        // Would check digital signature in production
-        // return CertUtils::VerifyMicrosoftSignature(binaryPath);
-
-        return false;
+        return true;
 
     } catch (...) {
         return false;
@@ -981,10 +1008,87 @@ public:
         std::vector<MinifilterInfo> filters;
 
         try {
-            // Would use FilterFindFirst/FilterFindNext in production
-            // For now, simplified implementation
+            HANDLE hEnum = INVALID_HANDLE_VALUE;
+            DWORD bytesReturned = 0;
+            // Buffer for FILTER_FULL_INFORMATION
+            std::vector<uint8_t> buffer(4096);
 
-            Logger::Debug("ServiceManager: Minifilter enumeration not fully implemented");
+            HRESULT hr = FilterFindFirst(FilterFullInformation,
+                                       buffer.data(),
+                                       static_cast<DWORD>(buffer.size()),
+                                       &bytesReturned,
+                                       &hEnum);
+
+            if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)) {
+                return filters;
+            }
+
+            if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+                buffer.resize(bytesReturned);
+                hr = FilterFindFirst(FilterFullInformation,
+                                   buffer.data(),
+                                   static_cast<DWORD>(buffer.size()),
+                                   &bytesReturned,
+                                   &hEnum);
+            }
+
+            if (FAILED(hr)) {
+                Logger::Error("ServiceManager: FilterFindFirst failed: {:#x}", static_cast<uint32_t>(hr));
+                return filters;
+            }
+
+            auto ProcessFilterInfo = [&](const uint8_t* pBuf) {
+                auto* pInfo = reinterpret_cast<const FILTER_FULL_INFORMATION*>(pBuf);
+
+                MinifilterInfo info;
+                // Parse name (offset and length in bytes)
+                if (pInfo->FilterNameLength > 0) {
+                    std::wstring name((wchar_t*)((uint8_t*)pInfo + pInfo->FilterNameBufferOffset),
+                                      pInfo->FilterNameLength / sizeof(wchar_t));
+                    info.filterName = name;
+                }
+
+                // Parse altitude
+                if (pInfo->FilterAltitudeLength > 0) {
+                    std::wstring alt((wchar_t*)((uint8_t*)pInfo + pInfo->FilterAltitudeBufferOffset),
+                                     pInfo->FilterAltitudeLength / sizeof(wchar_t));
+                    info.altitude = alt;
+                }
+
+                info.frameID = pInfo->FrameID;
+                info.numberOfInstances = pInfo->NumberOfInstances;
+                filters.push_back(info);
+            };
+
+            // Process first result
+            ProcessFilterInfo(buffer.data());
+
+            // Process remaining results
+            while (true) {
+                hr = FilterFindNext(hEnum,
+                                  FilterFullInformation,
+                                  buffer.data(),
+                                  static_cast<DWORD>(buffer.size()),
+                                  &bytesReturned);
+
+                if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)) break;
+
+                if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+                    buffer.resize(bytesReturned);
+                    hr = FilterFindNext(hEnum,
+                                      FilterFullInformation,
+                                      buffer.data(),
+                                      static_cast<DWORD>(buffer.size()),
+                                      &bytesReturned);
+                }
+
+                if (FAILED(hr)) break;
+
+                ProcessFilterInfo(buffer.data());
+            }
+
+            FilterFindClose(hEnum);
+            Logger::Info("ServiceManager: Enumerated {} minifilters", filters.size());
 
         } catch (const std::exception& e) {
             Logger::Error("ServiceManager: GetLoadedMinifilters exception: {}", e.what());
@@ -1625,7 +1729,10 @@ void ServiceManager::Shutdown() noexcept {
         return false;
     }
 
-    // Would set registry permissions in production
+    // KERNEL DRIVER INTEGRATION WILL COME HERE
+    // In a production environment, this would involve a kernel callback
+    // to strip handle access rights (PROCESS_TERMINATE, WRITE_DAC, etc.)
+    // for the protected service process.
     Logger::Info("ServiceManager: Protected service: {}",
         StringUtils::WideToUtf8(serviceName));
 

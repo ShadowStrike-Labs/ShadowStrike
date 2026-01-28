@@ -1342,6 +1342,35 @@ namespace ShadowStrike {
         };
 
         /**
+         * @brief Resource analysis information
+         */
+        struct ResourceInfo {
+            /// @brief Total number of resources
+            size_t count = 0;
+
+            /// @brief Number of resources with high entropy
+            size_t highEntropyCount = 0;
+
+            /// @brief Total size of all resources
+            size_t totalSize = 0;
+
+            /// @brief Largest resource size
+            size_t largestResourceSize = 0;
+
+            /// @brief Average entropy of resources
+            double averageEntropy = 0.0;
+
+            /// @brief Detected resource languages
+            std::vector<uint16_t> languages;
+
+            /// @brief Suspicious resource names/types
+            std::vector<std::wstring> suspiciousResources;
+
+            /// @brief Valid analysis
+            bool valid = false;
+        };
+
+        /**
          * @brief Comprehensive packer detection result
          */
         struct PackingInfo {
@@ -1423,6 +1452,9 @@ namespace ShadowStrike {
             /// @brief Rich header analysis
             RichHeaderInfo richHeaderInfo;
 
+            /// @brief Resource analysis
+            ResourceInfo resourceInfo;
+
             /// @brief Unpacking hints
             UnpackingHints unpackingHints;
 
@@ -1432,6 +1464,12 @@ namespace ShadowStrike {
 
             /// @brief Overall file entropy (0.0 - 8.0)
             double fileEntropy = 0.0;
+
+            /// @brief Chi-squared distribution score
+            double chiSquared = 0.0;
+
+            /// @brief Monte Carlo Pi approximation error
+            double monteCarloPiError = 0.0;
 
             /// @brief Code section entropy
             double codeSectionEntropy = 0.0;
@@ -1576,6 +1614,7 @@ namespace ShadowStrike {
                 entryPointInfo = {};
                 signatureInfo = {};
                 richHeaderInfo = {};
+                resourceInfo = {};
                 unpackingHints = {};
                 fileEntropy = 0.0;
                 codeSectionEntropy = 0.0;
@@ -1858,6 +1897,15 @@ namespace ShadowStrike {
             [[nodiscard]] bool AnalyzeRichHeader(
                 const std::wstring& filePath,
                 RichHeaderInfo& outRichHeader,
+                PackerError* err = nullptr
+            ) noexcept;
+
+            /**
+             * @brief Analyze PE resources
+             */
+            [[nodiscard]] bool AnalyzeResources(
+                const std::wstring& filePath,
+                ResourceInfo& outResources,
                 PackerError* err = nullptr
             ) noexcept;
 

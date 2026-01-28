@@ -29,6 +29,7 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
+#include "../Core/Engine/ScanEngine.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -554,12 +555,73 @@ struct FileSystemFilter::Impl {
         // 2. Use integrated scan engine if available
         if (m_scanEngine) {
             try {
-                // TODO: Call scan engine when available
-                // auto result = m_scanEngine->ScanFile(event.filePath, context);
-                // return MapScanResult(result);
+                Core::Engine::ScanContext context;
+                context.type = Core::Engine::ScanType::RealTime;
+
+                // Map priority
+                switch (event.priority) {
+                    case RequestPriority::Critical:
+                        context.priority = Core::Engine::ScanPriority::Critical;
+                        break;
+                    case RequestPriority::High:
+                        context.priority = Core::Engine::ScanPriority::High;
+                        break;
+                    case RequestPriority::Background:
+                        context.priority = Core::Engine::ScanPriority::Low;
+                        break;
+                    default:
+                        context.priority = Core::Engine::ScanPriority::Normal;
+                        break;
+                }
+
+                context.processId = event.processId;
+                context.filePath = event.filePath;
+                context.isNetworkPath = event.isNetworkFile;
+                context.isRemovableMedia = event.isRemovableMedia;
+                context.timeout = std::chrono::milliseconds(m_config.scanTimeoutMs);
+
+                // Perform the scan
+                auto result = m_scanEngine->ScanFile(event.filePath, context);
+
+                // Handle results
+                switch (result.verdict) {
+                    case Core::Engine::ScanVerdict::Clean:
+                    case Core::Engine::ScanVerdict::Whitelisted:
+                        return ScanVerdict::Allow;
+
+                    case Core::Engine::ScanVerdict::Infected:
+                        InvokeThreatCallbacks(event,
+                            Utils::StringUtils::Utf8ToWide(result.threatName),
+                            result.threatScore);
+                        return ScanVerdict::BlockAndQuarantine;
+
+                    case Core::Engine::ScanVerdict::Suspicious:
+                    case Core::Engine::ScanVerdict::PUA:
+                    case Core::Engine::ScanVerdict::Adware:
+                    case Core::Engine::ScanVerdict::Riskware:
+                        InvokeThreatCallbacks(event,
+                            Utils::StringUtils::Utf8ToWide(result.threatName),
+                            result.threatScore);
+                        return ScanVerdict::Block;
+
+                    case Core::Engine::ScanVerdict::Timeout:
+                        return m_config.blockOnTimeout ? ScanVerdict::Block : ScanVerdict::Timeout;
+
+                    case Core::Engine::ScanVerdict::Error:
+                        return m_config.blockOnError ? ScanVerdict::Block : ScanVerdict::Error;
+
+                    case Core::Engine::ScanVerdict::Cancelled:
+                        return ScanVerdict::Error;
+
+                    default:
+                        return ScanVerdict::Allow;
+                }
+
             } catch (const std::exception& e) {
                 Utils::Logger::Error(L"FileSystemFilter: ScanEngine exception: {}",
                     Utils::StringUtils::Utf8ToWide(e.what()));
+
+                if (m_config.blockOnError) return ScanVerdict::Block;
             }
         }
 

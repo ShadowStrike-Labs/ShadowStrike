@@ -47,7 +47,10 @@
 #include <bitset>
 
 namespace ShadowStrike {
-namespace SignatureStore {
+namespace HashStore {
+
+    // Import types from SignatureStore namespace
+    using namespace ShadowStrike::SignatureStore;
 
 // ============================================================================
 // BLOOM FILTER (Fast Negative Lookups)

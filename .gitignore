@@ -361,3 +361,14 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# --- ShadowStrike Special Blockings ---
+.vscode/
+.github/
+.pvs-studio/
+# PVS-Studio log files
+*.pvslog
+*.plog
+
+
+NUL
