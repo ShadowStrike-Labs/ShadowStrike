@@ -364,12 +364,15 @@ FodyWeavers.xsd
 
 # --- ShadowStrike Special Blockings ---
 .vscode/
+.claude/
+.gemini/
 .github/
 .pvs-studio/
+NUL
+CLAUDE.md
+
+
 # PVS-Studio log files
 *.pvslog
 *.plog
 
-
-NUL
-CLAUDE.md
