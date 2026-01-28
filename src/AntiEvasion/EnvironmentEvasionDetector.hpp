@@ -236,7 +236,7 @@ namespace ShadowStrike {
             // ========================================================================
 
             /// @brief Known sandbox/analysis usernames
-            inline constexpr std::array<std::wstring_view, 64> BLACKLISTED_USERNAMES = { {
+            inline constexpr std::array<std::wstring_view, 70> BLACKLISTED_USERNAMES = { {
                     // Generic analysis names
                     L"admin", L"administrator", L"user", L"test", L"sandbox",
                     L"malware", L"virus", L"sample", L"analysis", L"analyzer",
@@ -261,7 +261,7 @@ namespace ShadowStrike {
                 } };
 
             /// @brief Known sandbox/analysis computer names
-            inline constexpr std::array<std::wstring_view, 64> BLACKLISTED_COMPUTER_NAMES = { {
+            inline constexpr std::array<std::wstring_view, 70> BLACKLISTED_COMPUTER_NAMES = { {
                     // Generic analysis names
                     L"sandbox", L"malware", L"virus", L"sample", L"analysis",
                     L"test", L"testpc", L"testmachine", L"virtual", L"vm",

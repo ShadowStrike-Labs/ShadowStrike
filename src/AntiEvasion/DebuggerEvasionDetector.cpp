@@ -22,8 +22,8 @@
 
 #include "pch.h"
 #include "DebuggerEvasionDetector.hpp"
-#include"Zydis/Zydis.h"
-#include<format>
+#include "Zydis/Zydis.h"
+#include <format>
 
 // ============================================================================
 // WINDOWS INTERNAL STRUCTURES
@@ -59,6 +59,14 @@ extern "C" {
         DWORD ThreadInformationClass,
         PVOID ThreadInformation,
         ULONG ThreadInformationLength
+    );
+
+    typedef NTSTATUS(NTAPI* PFN_NtQueryInformationThread)(
+        HANDLE ThreadHandle,
+        DWORD ThreadInformationClass,
+        PVOID ThreadInformation,
+        ULONG ThreadInformationLength,
+        PULONG ReturnLength
     );
 }
 
@@ -97,6 +105,13 @@ typedef struct _SYSTEM_HANDLE_INFORMATION {
     ULONG NumberOfHandles;
     SYSTEM_HANDLE_TABLE_ENTRY_INFO Handles[1];
 } SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+
+// ProcessInstrumentationCallback Information
+typedef struct _PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION {
+    ULONG Version;
+    ULONG Reserved;
+    PVOID Callback;
+} PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION, *PPROCESS_INSTRUMENTATION_CALLBACK_INFORMATION;
 
 #ifndef SystemHandleInformation
 #define SystemHandleInformation 16
@@ -220,6 +235,11 @@ namespace ShadowStrike::AntiEvasion {
         PFN_NtQuerySystemInformation m_NtQuerySystemInformation = nullptr;
         PFN_NtQueryObject m_NtQueryObject = nullptr;
         PFN_NtSetInformationThread m_NtSetInformationThread = nullptr;
+        PFN_NtQueryInformationThread m_NtQueryInformationThread = nullptr;
+
+        // Zydis Decoder (initialized once for performance)
+        ZydisDecoder m_decoder;
+        bool m_zydisInitialized = false;
 
         Impl() = default;
 
@@ -245,10 +265,19 @@ namespace ShadowStrike::AntiEvasion {
                 m_NtQuerySystemInformation = (PFN_NtQuerySystemInformation)GetProcAddress(m_hNtDll, "NtQuerySystemInformation");
                 m_NtQueryObject = (PFN_NtQueryObject)GetProcAddress(m_hNtDll, "NtQueryObject");
                 m_NtSetInformationThread = (PFN_NtSetInformationThread)GetProcAddress(m_hNtDll, "NtSetInformationThread");
+                m_NtQueryInformationThread = (PFN_NtQueryInformationThread)GetProcAddress(m_hNtDll, "NtQueryInformationThread");
 
                 if (!m_NtQueryInformationProcess || !m_NtQuerySystemInformation) {
                     if (err) *err = Error::FromWin32(ERROR_PROC_NOT_FOUND, L"Failed to resolve NT functions");
                     return false;
+                }
+
+                // Initialize Zydis Decoder (64-bit)
+                if (ZYAN_SUCCESS(ZydisDecoderInit(&m_decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+                    m_zydisInitialized = true;
+                } else {
+                    SS_LOG_ERROR(L"AntiEvasion", L"Failed to initialize Zydis decoder");
+                    // Not fatal, but disassembly features will be disabled
                 }
 
                 // Add default known debuggers
@@ -435,9 +464,6 @@ namespace ShadowStrike::AntiEvasion {
                     result.pebInfo.pebAddress = (uintptr_t)pbi.PebBaseAddress;
 
                     // Read PEB
-                    // PEB Layout is complex and varies by OS/Arch.
-                    // Simplified offsets for BeingDebugged (byte at offset 2)
-
                     uint8_t pebBuffer[512] = {}; // Enough for start of PEB
                     SIZE_T bytesRead = 0;
 
@@ -456,8 +482,7 @@ namespace ShadowStrike::AntiEvasion {
                         }
 
                         // PEB.NtGlobalFlag check
-                        // Offset varies (0x68 on x86, 0xBC on x64 usually, need precise offsets for enterprise)
-                        // Using hardcoded offsets for standard Windows 10/11 x64
+                        // Offset 0xBC (x64), 0x68 (x86) for modern Windows
                         size_t ntGlobalFlagOffset = result.is64Bit ? 0xBC : 0x68;
                         if (ntGlobalFlagOffset < bytesRead - 4) {
                             uint32_t ntGlobalFlag = *reinterpret_cast<uint32_t*>(&pebBuffer[ntGlobalFlagOffset]);
@@ -475,7 +500,6 @@ namespace ShadowStrike::AntiEvasion {
                         }
 
                         // PEB.ProcessHeap Analysis (Flags and ForceFlags)
-                        // This requires dereferencing the ProcessHeap pointer from the PEB
                         size_t heapOffset = result.is64Bit ? 0x18 : 0x0C; // ProcessHeap pointer offset
                         if (heapOffset + (result.is64Bit ? 8 : 4) <= bytesRead) {
                             uintptr_t processHeapAddr = 0;
@@ -517,7 +541,6 @@ namespace ShadowStrike::AntiEvasion {
                                         }
 
                                         // Check Flags (specific debug flags)
-                                        // HEAP_TAIL_CHECKING_ENABLED (0x20) | HEAP_FREE_CHECKING_ENABLED (0x40)
                                         if ((heapFlags & 0x60) != 0) {
                                             AddDetection(result, DetectionPatternBuilder()
                                                 .Technique(EvasionTechnique::PEB_HeapFlags)
@@ -643,48 +666,6 @@ namespace ShadowStrike::AntiEvasion {
         CloseHandle(hSnapshot);
     }
 
-    void DebuggerEvasionDetector::ScanMemory(
-        HANDLE hProcess,
-        uint32_t processId,
-        DebuggerEvasionResult& result
-    ) noexcept {
-        // Enterprise Implementation: Scan for software breakpoints (0xCC) in executable code
-        // This is expensive, so we limit scan size or target specific regions (entry point)
-
-        MEMORY_BASIC_INFORMATION mbi = {};
-        uint8_t* address = nullptr;
-        std::vector<uint8_t> buffer(4096);
-
-        // Limit number of regions to avoid timeout
-        size_t regionsScanned = 0;
-
-        while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            if (regionsScanned++ > result.config.maxMemoryRegions) break;
-
-            if (mbi.State == MEM_COMMIT &&
-                (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-
-                // Read first page of executable region
-                SIZE_T bytesRead = 0;
-                if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), buffer.size(), &bytesRead)) {
-                    // Look for 0xCC (INT 3)
-                    // Note: 0xCC can be valid in some data, but rare in prologues.
-                    // Enterprise heuristic: Look for 0xCC at function starts or multiple 0xCCs
-
-                    int ccCount = 0;
-                    for (size_t i = 0; i < bytesRead; i++) {
-                        if (buffer[i] == 0xCC) ccCount++;
-                    }
-
-                    // Heuristic: If we see a lot of INT 3s, it might be padding (align 16),
-                    // but isolated ones in code flow are suspicious.
-                    // For now, we just flag if we see abnormal patterns (omitted for brevity, assume simple threshold)
-                }
-            }
-            address = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
-        }
-    }
-
     void DebuggerEvasionDetector::AnalyzeProcessRelationships(
         uint32_t processId,
         DebuggerEvasionResult& result
@@ -760,13 +741,8 @@ namespace ShadowStrike::AntiEvasion {
         PSYSTEM_HANDLE_INFORMATION handleInfo = (PSYSTEM_HANDLE_INFORMATION)buffer.data();
 
         // 1. Identify Kernel Object Address of the target process
-        // We look for the handle 'hProcess' which belongs to us (GetCurrentProcessId())
         PVOID targetObjectAddress = nullptr;
         DWORD myPid = GetCurrentProcessId();
-        // Handle values in the snapshot are USHORT (older struct) or need extended struct.
-        // SYSTEM_HANDLE_INFORMATION uses USHORT HandleValue which might be truncated on x64?
-        // Actually for x64 one should use SystemExtendedHandleInformation (64), but SystemHandleInformation works for many cases.
-        // Let's rely on PVOID Object which is pointer-sized.
 
         for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
             if (handleInfo->Handles[i].UniqueProcessId == myPid &&
@@ -845,8 +821,7 @@ namespace ShadowStrike::AntiEvasion {
         m_impl->m_resultCache[processId] = entry;
     }
 
-    // Pass-throughs for remaining stubbed methods to ensure compilation
-    // (These would have full implementations in the final specialized modules)
+    // Pass-throughs
     void DebuggerEvasionDetector::SetDetectionCallback(DetectionCallback callback) noexcept {
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_detectionCallback = callback;
@@ -911,7 +886,7 @@ namespace ShadowStrike::AntiEvasion {
         m_impl->m_customWindowClasses.clear();
     }
 
-    // Batch analysis stubs (calling single process analysis)
+    // Batch analysis
     BatchAnalysisResult DebuggerEvasionDetector::AnalyzeProcesses(
         const std::vector<Utils::ProcessUtils::ProcessId>& processIds,
         const AnalysisConfig& config,
@@ -948,246 +923,64 @@ namespace ShadowStrike::AntiEvasion {
         return AnalyzeProcesses(pidList, config, progressCallback, err);
     }
 
-    // Specific technique wrappers
-    bool DebuggerEvasionDetector::CheckPEBFlags(uint32_t processId, PEBAnalysisInfo& outPebInfo, Error* err) noexcept {
-        DebuggerEvasionResult result;
-        // Simplified usage: full analysis but just return PEB part
-        result = AnalyzeProcess(processId);
-        outPebInfo = result.pebInfo;
-        return result.HasCategory(EvasionCategory::PEBBased);
-    }
-
-    bool DebuggerEvasionDetector::CheckHardwareBreakpoints(uint32_t processId, std::vector<HardwareBreakpointInfo>& outBreakpoints, Error* err) noexcept {
-        DebuggerEvasionResult result;
-        result = AnalyzeProcess(processId);
-        outBreakpoints = result.hardwareBreakpoints;
-        return result.HasCategory(EvasionCategory::HardwareDebugRegisters);
-    }
-
-    // (Other specific checks delegate similarly to AnalyzeProcess or use cached results)
-    bool DebuggerEvasionDetector::CheckTimingTechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        // Implement scan for RDTSC/RDTSCP instructions at the entry point of the process.
-        // This is a static analysis of the dynamic memory.
-
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-        if (!hProcess) return false;
-
-        bool detected = false;
-
-        // Locate Entry Point
-        // We need the base address of the main module and the entry point RVA
-        HMODULE hMods[1];
-        DWORD cbNeeded;
-        if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-            MODULEINFO modInfo;
-            if (GetModuleInformation(hProcess, hMods[0], &modInfo, sizeof(modInfo))) {
-                // Read headers to find EP
-                uint8_t headers[4096];
-                SIZE_T read = 0;
-                if (ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, headers, sizeof(headers), &read)) {
-                     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)headers;
-                     if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew < read) {
-                         PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(headers + dos->e_lfanew);
-                         if (nt->Signature == IMAGE_NT_SIGNATURE) {
-                             DWORD epRva = nt->OptionalHeader.AddressOfEntryPoint;
-
-                             // Read code at entry point (e.g., 256 bytes)
-                             uint8_t epCode[256];
-                             if (ReadProcessMemory(hProcess, (PBYTE)modInfo.lpBaseOfDll + epRva, epCode, sizeof(epCode), &read)) {
-                                 // Simple scan for RDTSC (0F 31) and RDTSCP (0F 01 F9)
-                                 for (size_t i = 0; i < read - 2; i++) {
-                                     if (epCode[i] == 0x0F && epCode[i+1] == 0x31) {
-                                         detected = true;
-                                         DetectedTechnique tech(EvasionTechnique::TIMING_RDTSC);
-                                         tech.description = L"RDTSC instruction found near Entry Point";
-                                         tech.confidence = 0.9;
-                                         tech.severity = EvasionSeverity::High;
-                                         tech.technicalDetails = std::format(L"Offset: +0x{:X}", i);
-                                         outDetections.push_back(tech);
-                                         break; // Report once
-                                     }
-                                     if (i < read - 3 && epCode[i] == 0x0F && epCode[i+1] == 0x01 && epCode[i+2] == 0xF9) {
-                                         detected = true;
-                                         DetectedTechnique tech(EvasionTechnique::TIMING_RDTSCP);
-                                         tech.description = L"RDTSCP instruction found near Entry Point";
-                                         tech.confidence = 0.9;
-                                         tech.severity = EvasionSeverity::High;
-                                         outDetections.push_back(tech);
-                                         break;
-                                     }
-                                 }
-                             }
-                         }
-                     }
-                }
-            }
-        }
-
-        CloseHandle(hProcess);
-        return detected;
-    }
-
-    bool DebuggerEvasionDetector::CheckAPITechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        DebuggerEvasionResult result = AnalyzeProcess(processId);
-        if (result.HasCategory(EvasionCategory::APIBased)) {
-            outDetections = result.detectedTechniques;
-            return true;
-        }
-        return false;
-    }
-
-    bool DebuggerEvasionDetector::CheckExceptionTechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-        if (!hProcess) return false;
-
-        bool detected = false;
-
-        // Check for ProcessExceptionPort (8)
-        // If non-zero, an exception port is registered (often by debugger)
-        if (m_impl->m_NtQueryInformationProcess) {
-            DWORD_PTR exceptionPort = 0;
-            ULONG len = 0;
-            // ProcessExceptionPort = 8
-            NTSTATUS status = m_impl->m_NtQueryInformationProcess(
-                hProcess, 8, &exceptionPort, sizeof(exceptionPort), &len
-            );
-
-            if (status >= 0 && exceptionPort != 0) {
-                detected = true;
-                DetectedTechnique tech(EvasionTechnique::EXCEPTION_VectoredHandlerChain); // Closest mapping
-                tech.description = L"ProcessExceptionPort is set (Potential Debugger/ErrorHandler)";
-                tech.severity = EvasionSeverity::Medium; // Can be legitimate (WER), but suspicious if analyzing malware
-                tech.confidence = 0.8;
-                tech.technicalDetails = std::format(L"ExceptionPort: 0x{:X}", exceptionPort);
-                outDetections.push_back(tech);
-            }
-        }
-
-        CloseHandle(hProcess);
-        return detected;
-    }
-
-    bool DebuggerEvasionDetector::CheckParentProcess(uint32_t processId, ParentProcessInfo& outParentInfo, Error* err) noexcept {
-        DebuggerEvasionResult result = AnalyzeProcess(processId);
-        outParentInfo = result.parentInfo;
-        return result.HasCategory(EvasionCategory::ProcessRelationship);
-    }
-
-    bool DebuggerEvasionDetector::ScanMemoryArtifacts(uint32_t processId, std::vector<MemoryRegionInfo>& outRegions, Error* err) noexcept {
-        DebuggerEvasionResult result = AnalyzeProcess(processId);
-        outRegions = result.memoryRegions;
-        return result.HasCategory(EvasionCategory::MemoryArtifacts);
-    }
-
     // ========================================================================
-    // ADVANCED TECHNIQUE IMPLEMENTATIONS
+    // INTERNAL HELPERS WITH HANDLE REUSE
     // ========================================================================
 
-    bool DebuggerEvasionDetector::CheckDebugObjectHandles(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+    bool DebuggerEvasionDetector::CheckTimingTechniquesInternal(
+        HANDLE hProcess,
+        uint32_t processId,
+        std::vector<DetectedTechnique>& outDetections,
+        Error* err
+    ) noexcept {
         if (!hProcess) return false;
-
         bool detected = false;
 
-        // Check for ProcessDebugObjectHandle (30)
-        if (m_impl->m_NtQueryInformationProcess) {
-            HANDLE hDebugObj = NULL;
-            ULONG len = 0;
-            NTSTATUS status = m_impl->m_NtQueryInformationProcess(
-                hProcess, ProcessDebugObjectHandle, &hDebugObj, sizeof(hDebugObj), &len
-            );
+        // Use pre-initialized Zydis Decoder from Impl
+        if (!m_impl->m_zydisInitialized) return false;
 
-            if (status >= 0 && hDebugObj != NULL) {
-                detected = true;
-                DetectedTechnique tech(EvasionTechnique::OBJECT_DebugObjectHandle);
-                tech.severity = EvasionSeverity::High;
-                tech.confidence = 1.0;
-                tech.description = L"Valid DebugObject handle found via NtQueryInformationProcess";
-                outDetections.push_back(tech);
-            }
-        }
-
-        CloseHandle(hProcess);
-        return detected;
-    }
-
-    bool DebuggerEvasionDetector::CheckSelfDebugging(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        // Technique: Try to attach as a debugger.
-        // If it fails with ERROR_ACCESS_DENIED (and we are admin) or specific error, it might already be debugged.
-        // Note: This is invasive. A passive check is checking PEB.BeingDebugged.
-
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-        if (!hProcess) return false;
-
-        bool detected = false;
-
-        // Passive check first
-        if (m_impl->m_NtQueryInformationProcess) {
-            PROCESS_BASIC_INFORMATION pbi = {};
-            if (m_impl->m_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL) >= 0 && pbi.PebBaseAddress) {
-                uint8_t beingDebugged = 0;
-                SIZE_T read = 0;
-                if (ReadProcessMemory(hProcess, (PBYTE)pbi.PebBaseAddress + 2, &beingDebugged, 1, &read) && beingDebugged) {
-                    detected = true;
-                    DetectedTechnique tech(EvasionTechnique::PEB_BeingDebugged);
-                    tech.severity = EvasionSeverity::Medium;
-                    tech.confidence = 1.0;
-                    tech.description = L"Process is self-flagged as being debugged (PEB)";
-                    outDetections.push_back(tech);
-                }
-            }
-        }
-
-        CloseHandle(hProcess);
-        return detected;
-    }
-
-    bool DebuggerEvasionDetector::CheckTLSCallbacks(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        // Parse remote PE header to find TLS callbacks
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-        if (!hProcess) return false;
-
-        bool detected = false;
         HMODULE hMods[1024];
         DWORD cbNeeded;
-
         if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-            // Check main module
-            HMODULE hModule = hMods[0];
-            MODULEINFO modInfo;
-            if (GetModuleInformation(hProcess, hModule, &modInfo, sizeof(modInfo))) {
+            MODULEINFO modInfo = {};
+            if (GetModuleInformation(hProcess, hMods[0], &modInfo, sizeof(modInfo))) {
                 // Read DOS Header
-                IMAGE_DOS_HEADER dosHeader;
-                SIZE_T read;
+                IMAGE_DOS_HEADER dosHeader = {};
+                SIZE_T read = 0;
                 if (ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, &dosHeader, sizeof(dosHeader), &read) && dosHeader.e_magic == IMAGE_DOS_SIGNATURE) {
-                    // Read NT Header
-                    uint8_t ntHeaderBuf[1024]; // Sufficient for 32/64 bit headers
-                    if (ReadProcessMemory(hProcess, (PBYTE)modInfo.lpBaseOfDll + dosHeader.e_lfanew, ntHeaderBuf, sizeof(ntHeaderBuf), &read)) {
-                        PIMAGE_NT_HEADERS64 pNtHeaders = (PIMAGE_NT_HEADERS64)ntHeaderBuf;
+                    // Read NT Headers
+                    uint8_t ntHeadersBuf[1024];
+                    if (ReadProcessMemory(hProcess, (PBYTE)modInfo.lpBaseOfDll + dosHeader.e_lfanew, ntHeadersBuf, sizeof(ntHeadersBuf), &read)) {
+                        PIMAGE_NT_HEADERS64 pNtHeaders = (PIMAGE_NT_HEADERS64)ntHeadersBuf;
                         if (pNtHeaders->Signature == IMAGE_NT_SIGNATURE) {
+                            DWORD epRva = pNtHeaders->OptionalHeader.AddressOfEntryPoint;
+                            if (epRva != 0) {
+                                PVOID pEntryPoint = (PBYTE)modInfo.lpBaseOfDll + epRva;
 
-                            // Get TLS Directory RVA
-                            DWORD tlsRva = 0;
-                            if (pNtHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-                                tlsRva = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
-                            } else {
-                                PIMAGE_NT_HEADERS32 pNtHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaderBuf;
-                                tlsRva = pNtHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
-                            }
+                                // Scan 1KB at Entry Point
+                                uint8_t codeBuffer[1024];
+                                if (ReadProcessMemory(hProcess, pEntryPoint, codeBuffer, sizeof(codeBuffer), &read)) {
+                                    ZydisDecodedInstruction instruction;
+                                    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                                    size_t offset = 0;
 
-                            if (tlsRva != 0) {
-                                // Read TLS Directory
-                                IMAGE_TLS_DIRECTORY64 tlsDir; // Use 64-bit struct, works for 32 if we handle carefully, but sizes differ.
-                                // Simplified for 64-bit primarily or robust check
-                                if (ReadProcessMemory(hProcess, (PBYTE)modInfo.lpBaseOfDll + tlsRva, &tlsDir, sizeof(IMAGE_TLS_DIRECTORY32), &read)) { // Read minimal size
-                                    if (tlsDir.AddressOfCallBacks != 0) {
-                                        // TLS Callbacks exist. This is suspicious in regular apps but used in protection/malware.
-                                        detected = true;
-                                        DetectedTechnique tech(EvasionTechnique::THREAD_TLSCallback); // We need a TLS enum, using generic for now or closest match
-                                        tech.description = L"TLS Callbacks detected (Potential Anti-Debug/Injection)";
-                                        tech.severity = EvasionSeverity::Medium; // Valid apps use it too, but rare
-                                        tech.confidence = 0.6;
-                                        outDetections.push_back(tech);
+                                    while (offset + 15 <= read) {
+                                        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_impl->m_decoder, codeBuffer + offset, read - offset, &instruction, operands))) {
+                                            if (instruction.mnemonic == ZYDIS_MNEMONIC_RDTSC ||
+                                                instruction.mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+
+                                                detected = true;
+                                                DetectedTechnique tech(EvasionTechnique::TIMING_RDTSC);
+                                                tech.description = L"High-Resolution Timing Instruction Detected (RDTSC/RDTSCP)";
+                                                tech.technicalDetails = std::format(L"Found at EntryPoint + 0x{:X}", offset);
+                                                tech.severity = EvasionSeverity::High;
+                                                tech.confidence = 0.95;
+                                                outDetections.push_back(tech);
+                                            }
+                                            offset += instruction.length;
+                                        } else {
+                                            offset++;
+                                        }
                                     }
                                 }
                             }
@@ -1196,15 +989,49 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
         }
-
-        CloseHandle(hProcess);
         return detected;
     }
 
-    bool DebuggerEvasionDetector::CheckHiddenThreads(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        if (!m_impl->m_NtQuerySystemInformation) return false;
+    bool DebuggerEvasionDetector::CheckExceptionTechniquesInternal(
+        HANDLE hProcess,
+        uint32_t processId,
+        std::vector<DetectedTechnique>& outDetections,
+        Error* err
+    ) noexcept {
+        if (!hProcess) return false;
+        bool detected = false;
 
-        // 1. Get User-Mode Snapshot (Toolhelp)
+        // Check for ProcessExceptionPort (8)
+        if (m_impl->m_NtQueryInformationProcess) {
+            DWORD_PTR exceptionPort = 0;
+            ULONG len = 0;
+            NTSTATUS status = m_impl->m_NtQueryInformationProcess(
+                hProcess, 8, &exceptionPort, sizeof(exceptionPort), &len
+            );
+
+            if (status >= 0 && exceptionPort != 0) {
+                detected = true;
+                DetectedTechnique tech(EvasionTechnique::EXCEPTION_VectoredHandlerChain);
+                tech.description = L"ProcessExceptionPort is set (Potential Debugger/ErrorHandler)";
+                tech.severity = EvasionSeverity::Medium;
+                tech.confidence = 0.8;
+                tech.technicalDetails = std::format(L"ExceptionPort: 0x{:X}", exceptionPort);
+                outDetections.push_back(tech);
+            }
+        }
+        return detected;
+    }
+
+    bool DebuggerEvasionDetector::CheckHiddenThreadsInternal(
+        HANDLE hProcess,
+        uint32_t processId,
+        std::vector<DetectedTechnique>& outDetections,
+        Error* err
+    ) noexcept {
+        if (!hProcess || !m_impl->m_NtQuerySystemInformation) return false;
+        bool hiddenFound = false;
+
+        // 1. Snapshot Method
         std::unordered_set<uint32_t> snapshotThreads;
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (hSnapshot != INVALID_HANDLE_VALUE) {
@@ -1220,59 +1047,272 @@ namespace ShadowStrike::AntiEvasion {
             CloseHandle(hSnapshot);
         }
 
-        // 2. Get Kernel-Mode Snapshot (SystemProcessInformation)
+        // 2. Kernel Query Method (SystemProcessInformation)
         ULONG size = 1024 * 1024;
         std::vector<uint8_t> buffer(size);
         ULONG returnLength = 0;
 
         NTSTATUS status = m_impl->m_NtQuerySystemInformation(SystemProcessInformation, buffer.data(), size, &returnLength);
-        while (status == 0xC0000004) { // STATUS_INFO_LENGTH_MISMATCH
+        while (status == 0xC0000004) {
             size = returnLength + (128 * 1024);
             buffer.resize(size);
             status = m_impl->m_NtQuerySystemInformation(SystemProcessInformation, buffer.data(), size, &returnLength);
         }
 
-        if (status < 0) return false;
+        if (status >= 0) {
+            PSYSTEM_PROCESS_INFORMATION_EX processInfo = (PSYSTEM_PROCESS_INFORMATION_EX)buffer.data();
+            while (true) {
+                if ((uintptr_t)processInfo->UniqueProcessId == (uintptr_t)processId) {
+                    for (ULONG i = 0; i < processInfo->NumberOfThreads; i++) {
+                        uint32_t tid = (uint32_t)(uintptr_t)processInfo->Threads[i].ClientId.UniqueThread;
+                        if (snapshotThreads.find(tid) == snapshotThreads.end()) {
+                            hiddenFound = true;
+                            DetectedTechnique tech(EvasionTechnique::THREAD_HiddenThread);
+                            tech.description = L"Hidden thread detected (Thread hiding)";
+                            tech.technicalDetails = std::format(L"TID: {} visible in kernel, hidden from snapshot", tid);
+                            tech.severity = EvasionSeverity::High;
+                            tech.confidence = 0.85;
+                            outDetections.push_back(tech);
+                        }
 
-        // Iterate processes to find target
-        PSYSTEM_PROCESS_INFORMATION_EX processInfo = (PSYSTEM_PROCESS_INFORMATION_EX)buffer.data();
-        while (true) {
-            if ((uintptr_t)processInfo->UniqueProcessId == (uintptr_t)processId) {
-                // Check threads
-                bool hiddenFound = false;
-                for (ULONG i = 0; i < processInfo->NumberOfThreads; i++) {
-                    uint32_t tid = (uint32_t)(uintptr_t)processInfo->Threads[i].ClientId.UniqueThread;
-                    if (snapshotThreads.find(tid) == snapshotThreads.end()) {
-                        // Thread exists in kernel view but not user snapshot
-                        hiddenFound = true;
+                        // Check ThreadHideFromDebugger using NtQueryInformationThread
+                        if (m_impl->m_NtQueryInformationThread) {
+                            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+                            if (hThread) {
+                                BOOLEAN hideFromDebugger = FALSE;
+                                NTSTATUS tStatus = m_impl->m_NtQueryInformationThread(
+                                    hThread, ThreadHideFromDebugger,
+                                    &hideFromDebugger, sizeof(hideFromDebugger), NULL
+                                );
 
-                        DetectedTechnique tech(EvasionTechnique::THREAD_HiddenThread);
-                        tech.description = L"Hidden thread detected (Thread hiding)";
-                        tech.technicalDetails = std::format(L"TID: {} visible in kernel, hidden from snapshot", tid);
-                        tech.severity = EvasionSeverity::High;
-                        tech.confidence = 0.85;
+                                if (tStatus >= 0 && hideFromDebugger) {
+                                    hiddenFound = true;
+                                    DetectedTechnique tech(EvasionTechnique::API_NtSetInformationThread_HideFromDebugger);
+                                    tech.description = L"Thread marked with ThreadHideFromDebugger";
+                                    tech.technicalDetails = std::format(L"TID: {}", tid);
+                                    tech.severity = EvasionSeverity::Critical;
+                                    tech.confidence = 1.0;
+                                    outDetections.push_back(tech);
+                                }
+                                CloseHandle(hThread);
+                            }
+                        }
+                    }
+                    break;
+                }
+                if (processInfo->NextEntryOffset == 0) break;
+                processInfo = (PSYSTEM_PROCESS_INFORMATION_EX)((uint8_t*)processInfo + processInfo->NextEntryOffset);
+            }
+        }
+        return hiddenFound;
+    }
+
+    bool DebuggerEvasionDetector::CheckTLSCallbacksInternal(
+        HANDLE hProcess,
+        uint32_t processId,
+        std::vector<DetectedTechnique>& outDetections,
+        Error* err
+    ) noexcept {
+        if (!hProcess) return false;
+        bool detected = false;
+        HMODULE hMods[1024];
+        DWORD cbNeeded;
+
+        if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+            HMODULE hModule = hMods[0];
+            MODULEINFO modInfo;
+            if (GetModuleInformation(hProcess, hModule, &modInfo, sizeof(modInfo))) {
+                IMAGE_DOS_HEADER dosHeader;
+                SIZE_T read;
+                if (ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, &dosHeader, sizeof(dosHeader), &read) && dosHeader.e_magic == IMAGE_DOS_SIGNATURE) {
+                    uint8_t ntHeaderBuf[1024];
+                    if (ReadProcessMemory(hProcess, (PBYTE)modInfo.lpBaseOfDll + dosHeader.e_lfanew, ntHeaderBuf, sizeof(ntHeaderBuf), &read)) {
+                        PIMAGE_NT_HEADERS64 pNtHeaders = (PIMAGE_NT_HEADERS64)ntHeaderBuf;
+                        if (pNtHeaders->Signature == IMAGE_NT_SIGNATURE) {
+                            DWORD tlsRva = 0;
+                            if (pNtHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                                tlsRva = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+                            } else {
+                                PIMAGE_NT_HEADERS32 pNtHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaderBuf;
+                                tlsRva = pNtHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+                            }
+
+                            if (tlsRva != 0) {
+                                IMAGE_TLS_DIRECTORY64 tlsDir;
+                                if (ReadProcessMemory(hProcess, (PBYTE)modInfo.lpBaseOfDll + tlsRva, &tlsDir, sizeof(IMAGE_TLS_DIRECTORY32), &read)) {
+                                    if (tlsDir.AddressOfCallBacks != 0) {
+                                        detected = true;
+                                        DetectedTechnique tech(EvasionTechnique::THREAD_TLSCallback);
+                                        tech.description = L"TLS Callbacks detected (Potential Anti-Debug/Injection)";
+                                        tech.severity = EvasionSeverity::Medium;
+                                        tech.confidence = 0.6;
+                                        outDetections.push_back(tech);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return detected;
+    }
+
+    bool DebuggerEvasionDetector::CheckAPIHookDetectionInternal(
+        HANDLE hProcess,
+        uint32_t processId,
+        std::vector<DetectedTechnique>& outDetections,
+        Error* err
+    ) noexcept {
+        if (!hProcess) return false;
+        bool detected = false;
+        HMODULE hLocalNtDll = GetModuleHandleW(L"ntdll.dll");
+        if (hLocalNtDll) {
+            void* pLocalFunc = (void*)GetProcAddress(hLocalNtDll, "NtQueryInformationProcess");
+            if (pLocalFunc) {
+                uint8_t localBytes[16];
+                memcpy(localBytes, pLocalFunc, 16);
+
+                uint8_t remoteBytes[16];
+                SIZE_T read;
+                if (ReadProcessMemory(hProcess, pLocalFunc, remoteBytes, 16, &read)) {
+                    if (memcmp(localBytes, remoteBytes, 16) != 0) {
+                        detected = true;
+                        DetectedTechnique tech(EvasionTechnique::CODE_InlineHooks);
+                        tech.description = L"Inline Hook detected on NtQueryInformationProcess";
+                        tech.severity = EvasionSeverity::Critical;
+                        tech.confidence = 0.95;
+                        tech.technicalDetails = L"Function prologue mismatch (Potential Anti-AV/EDR)";
                         outDetections.push_back(tech);
                     }
                 }
-                return hiddenFound;
             }
-
-            if (processInfo->NextEntryOffset == 0) break;
-            processInfo = (PSYSTEM_PROCESS_INFORMATION_EX)((uint8_t*)processInfo + processInfo->NextEntryOffset);
         }
+        return detected;
+    }
 
+    // ========================================================================
+    // SPECIFIC TECHNIQUE WRAPPERS (PUBLIC)
+    // ========================================================================
+
+    bool DebuggerEvasionDetector::CheckPEBFlags(uint32_t processId, PEBAnalysisInfo& outPebInfo, Error* err) noexcept {
+        DebuggerEvasionResult result = AnalyzeProcess(processId);
+        outPebInfo = result.pebInfo;
+        return result.HasCategory(EvasionCategory::PEBBased);
+    }
+
+    bool DebuggerEvasionDetector::CheckHardwareBreakpoints(uint32_t processId, std::vector<HardwareBreakpointInfo>& outBreakpoints, Error* err) noexcept {
+        DebuggerEvasionResult result = AnalyzeProcess(processId);
+        outBreakpoints = result.hardwareBreakpoints;
+        return result.HasCategory(EvasionCategory::HardwareDebugRegisters);
+    }
+
+    bool DebuggerEvasionDetector::CheckTimingTechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) return false;
+        bool result = CheckTimingTechniquesInternal(hProcess, processId, outDetections, err);
+        CloseHandle(hProcess);
+        return result;
+    }
+
+    bool DebuggerEvasionDetector::CheckAPITechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        DebuggerEvasionResult result = AnalyzeProcess(processId);
+        if (result.HasCategory(EvasionCategory::APIBased)) {
+            outDetections = result.detectedTechniques;
+            return true;
+        }
         return false;
     }
 
+    bool DebuggerEvasionDetector::CheckExceptionTechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) return false;
+        bool result = CheckExceptionTechniquesInternal(hProcess, processId, outDetections, err);
+        CloseHandle(hProcess);
+        return result;
+    }
+
+    bool DebuggerEvasionDetector::CheckParentProcess(uint32_t processId, ParentProcessInfo& outParentInfo, Error* err) noexcept {
+        DebuggerEvasionResult result = AnalyzeProcess(processId);
+        outParentInfo = result.parentInfo;
+        return result.HasCategory(EvasionCategory::ProcessRelationship);
+    }
+
+    bool DebuggerEvasionDetector::ScanMemoryArtifacts(uint32_t processId, std::vector<MemoryRegionInfo>& outRegions, Error* err) noexcept {
+        DebuggerEvasionResult result = AnalyzeProcess(processId);
+        outRegions = result.memoryRegions;
+        return result.HasCategory(EvasionCategory::MemoryArtifacts);
+    }
+
+    bool DebuggerEvasionDetector::CheckDebugObjectHandles(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) return false;
+        bool detected = false;
+        if (m_impl->m_NtQueryInformationProcess) {
+            HANDLE hDebugObj = NULL;
+            ULONG len = 0;
+            NTSTATUS status = m_impl->m_NtQueryInformationProcess(
+                hProcess, ProcessDebugObjectHandle, &hDebugObj, sizeof(hDebugObj), &len
+            );
+            if (status >= 0 && hDebugObj != NULL) {
+                detected = true;
+                DetectedTechnique tech(EvasionTechnique::OBJECT_DebugObjectHandle);
+                tech.severity = EvasionSeverity::High;
+                tech.confidence = 1.0;
+                tech.description = L"Valid DebugObject handle found via NtQueryInformationProcess";
+                outDetections.push_back(tech);
+            }
+        }
+        CloseHandle(hProcess);
+        return detected;
+    }
+
+    bool DebuggerEvasionDetector::CheckSelfDebugging(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) return false;
+        bool detected = false;
+        if (m_impl->m_NtQueryInformationProcess) {
+            PROCESS_BASIC_INFORMATION pbi = {};
+            if (m_impl->m_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL) >= 0 && pbi.PebBaseAddress) {
+                uint8_t beingDebugged = 0;
+                SIZE_T read = 0;
+                if (ReadProcessMemory(hProcess, (PBYTE)pbi.PebBaseAddress + 2, &beingDebugged, 1, &read) && beingDebugged) {
+                    detected = true;
+                    DetectedTechnique tech(EvasionTechnique::PEB_BeingDebugged);
+                    tech.severity = EvasionSeverity::Medium;
+                    tech.confidence = 1.0;
+                    tech.description = L"Process is self-flagged as being debugged (PEB)";
+                    outDetections.push_back(tech);
+                }
+            }
+        }
+        CloseHandle(hProcess);
+        return detected;
+    }
+
+    bool DebuggerEvasionDetector::CheckTLSCallbacks(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) return false;
+        bool result = CheckTLSCallbacksInternal(hProcess, processId, outDetections, err);
+        CloseHandle(hProcess);
+        return result;
+    }
+
+    bool DebuggerEvasionDetector::CheckHiddenThreads(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) return false;
+        bool result = CheckHiddenThreadsInternal(hProcess, processId, outDetections, err);
+        CloseHandle(hProcess);
+        return result;
+    }
+
     bool DebuggerEvasionDetector::CheckKernelDebugInfo(std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        // SYSTEM_KERNEL_DEBUGGER_INFORMATION
         struct SYSTEM_KERNEL_DEBUGGER_INFORMATION {
             BOOLEAN KernelDebuggerEnabled;
             BOOLEAN KernelDebuggerNotPresent;
         } debugInfo = {};
 
         if (m_impl->m_NtQuerySystemInformation) {
-            // SystemKernelDebuggerInformation = 35
             NTSTATUS status = m_impl->m_NtQuerySystemInformation(35, &debugInfo, sizeof(debugInfo), NULL);
             if (status >= 0) {
                 if (debugInfo.KernelDebuggerEnabled && !debugInfo.KernelDebuggerNotPresent) {
@@ -1289,40 +1329,11 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckAPIHookDetection(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        // Check if critical APIs (ntdll) are hooked in the target process (inline hooks).
-        // Read first 16 bytes of NtQueryInformationProcess from target and compare with local (clean) ntdll.
-
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
         if (!hProcess) return false;
-
-        bool detected = false;
-        HMODULE hLocalNtDll = GetModuleHandleW(L"ntdll.dll");
-        if (hLocalNtDll) {
-            void* pLocalFunc = (void*)GetProcAddress(hLocalNtDll, "NtQueryInformationProcess");
-            if (pLocalFunc) {
-                uint8_t localBytes[16];
-                memcpy(localBytes, pLocalFunc, 16);
-
-                uint8_t remoteBytes[16];
-                SIZE_T read;
-                // Need address of function in remote process. For ntdll, it's usually at same address (ASLR system-wide per boot usually, but not guaranteed across WOW64).
-                // Assuming 64-bit to 64-bit.
-                if (ReadProcessMemory(hProcess, pLocalFunc, remoteBytes, 16, &read)) {
-                    if (memcmp(localBytes, remoteBytes, 16) != 0) {
-                        detected = true;
-                        DetectedTechnique tech(EvasionTechnique::CODE_InlineHooks); // Re-using enum
-                        tech.description = L"Inline Hook detected on NtQueryInformationProcess";
-                        tech.severity = EvasionSeverity::Critical;
-                        tech.confidence = 0.95;
-                        tech.technicalDetails = L"Function prologue mismatch (Potential Anti-AV/EDR)";
-                        outDetections.push_back(tech);
-                    }
-                }
-            }
-        }
-
+        bool result = CheckAPIHookDetectionInternal(hProcess, processId, outDetections, err);
         CloseHandle(hProcess);
-        return detected;
+        return result;
     }
 
     bool DebuggerEvasionDetector::CheckCodeIntegrity(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
@@ -1330,34 +1341,90 @@ namespace ShadowStrike::AntiEvasion {
         if (!hProcess) return false;
 
         bool detected = false;
-
         // Check for ProcessInstrumentationCallback (40)
-        // This is often used by AV/EDR, but if found in a user process that isn't known to use it,
-        // it might be an attempt to handle exceptions or instrumentation for evasion.
         if (m_impl->m_NtQueryInformationProcess) {
              PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION callbackInfo = {};
              ULONG len = 0;
-             // ProcessInstrumentationCallback = 40
              NTSTATUS status = m_impl->m_NtQueryInformationProcess(
                  hProcess, 40, &callbackInfo, sizeof(callbackInfo), &len
              );
 
-             // Note: Windows 10+ only
              if (status >= 0 && callbackInfo.Callback != 0) {
-                 // To reduce false positives, we could check if it points to a known system module or unknown code.
-                 // For now, we flag it as an advanced technique.
                  detected = true;
-                 DetectedTechnique tech(EvasionTechnique::ADVANCED_MultiTechniqueCheck); // Mapping to Advanced
+                 DetectedTechnique tech(EvasionTechnique::ADVANCED_MultiTechniqueCheck);
                  tech.description = L"ProcessInstrumentationCallback is set";
-                 tech.confidence = 0.7; // Moderate confidence, valid software uses this too
+                 tech.confidence = 0.7;
                  tech.severity = EvasionSeverity::Medium;
-                 tech.technicalDetails = std::format(L"Callback: 0x{:p}",  callbackInfo.code);
+                 tech.technicalDetails = std::format(L"Callback: 0x{:X}", (uintptr_t)callbackInfo.Callback);
                  outDetections.push_back(tech);
              }
         }
-
         CloseHandle(hProcess);
         return detected;
+    }
+
+    void DebuggerEvasionDetector::ScanMemory(
+        HANDLE hProcess,
+        uint32_t processId,
+        DebuggerEvasionResult& result
+    ) noexcept {
+        // Use Zydis from Impl
+        if (!m_impl->m_zydisInitialized) return;
+
+        MEMORY_BASIC_INFORMATION mbi = {};
+        uint8_t* address = nullptr;
+
+        size_t regionsScanned = 0;
+        const size_t MAX_REGIONS = result.config.maxMemoryRegions > 0 ? result.config.maxMemoryRegions : 50;
+        const size_t SCAN_SIZE = 4096;
+
+        while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            if (regionsScanned >= MAX_REGIONS) break;
+
+            bool isExecutable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+            if (mbi.State == MEM_COMMIT && isExecutable) {
+                regionsScanned++;
+
+                std::vector<uint8_t> buffer(SCAN_SIZE);
+                SIZE_T bytesRead = 0;
+
+                if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), SCAN_SIZE, &bytesRead) && bytesRead > 0) {
+                    ZydisDecodedInstruction instruction;
+                    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                    size_t offset = 0;
+                    bool suspiciousFound = false;
+
+                    while (offset + 15 <= bytesRead) {
+                        ZyanUSize len = bytesRead - offset;
+                        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_impl->m_decoder, buffer.data() + offset, len, &instruction, operands))) {
+                            if (instruction.mnemonic == ZYDIS_MNEMONIC_INT3) {
+                                bool isPadding = false;
+                                if (offset + 1 < bytesRead && buffer[offset + 1] == 0xCC) {
+                                    isPadding = true;
+                                }
+
+                                if (!isPadding) {
+                                    AddDetection(result, DetectionPatternBuilder()
+                                        .Technique(EvasionTechnique::MEMORY_SoftwareBreakpoints)
+                                        .Description(L"Software Breakpoint (INT 3) detected in executable code")
+                                        .TechnicalDetails(std::format(L"Address: 0x{:X}, Mnemonic: INT3", (uintptr_t)mbi.BaseAddress + offset))
+                                        .Confidence(0.95)
+                                        .Severity(EvasionSeverity::High)
+                                        .Build());
+
+                                    suspiciousFound = true;
+                                    break; // Stop scanning this region
+                                }
+                            }
+                            offset += instruction.length;
+                        } else {
+                            offset++;
+                        }
+                    }
+                }
+            }
+            address = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
+        }
     }
 
     // ========================================================================
@@ -1367,7 +1434,6 @@ namespace ShadowStrike::AntiEvasion {
     bool DebuggerEvasionDetector::IsKnownDebugger(std::wstring_view processName) const noexcept {
         std::wstring lowerName(processName);
         std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
-
         std::shared_lock lock(m_impl->m_mutex);
         return m_impl->m_customDebuggerNames.count(lowerName) > 0;
     }
@@ -1375,13 +1441,12 @@ namespace ShadowStrike::AntiEvasion {
     bool DebuggerEvasionDetector::IsKnownDebuggerWindow(std::wstring_view className) const noexcept {
         std::wstring lowerClass(className);
         std::transform(lowerClass.begin(), lowerClass.end(), lowerClass.begin(), ::towlower);
-
         std::shared_lock lock(m_impl->m_mutex);
         return m_impl->m_customWindowClasses.count(lowerClass) > 0;
     }
 
     // ========================================================================
-    // INTERNAL ANALYSIS METHODS
+    // INTERNAL ANALYSIS METHODS (ORCHESTRATION)
     // ========================================================================
 
     void DebuggerEvasionDetector::AnalyzeProcessInternal(
@@ -1404,7 +1469,17 @@ namespace ShadowStrike::AntiEvasion {
 
             // 3. Thread Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanThreadTechniques) || HasFlag(config.flags, AnalysisFlags::ScanHardwareBreakpoints)) {
-                AnalyzeThreads(hProcess, processId, result);
+                AnalyzeThreadContexts(processId, result);
+
+                std::vector<DetectedTechnique> detections;
+                if (CheckHiddenThreadsInternal(hProcess, processId, detections, nullptr)) {
+                    for(const auto& det : detections) AddDetection(result, det);
+                }
+
+                detections.clear();
+                if (CheckTLSCallbacksInternal(hProcess, processId, detections, nullptr)) {
+                    for(const auto& det : detections) AddDetection(result, det);
+                }
             }
 
             // 4. Memory Analysis
@@ -1419,17 +1494,31 @@ namespace ShadowStrike::AntiEvasion {
 
             // 6. Timing Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanTimingTechniques)) {
-                AnalyzeTimingPatterns(hProcess, processId, result);
+                std::vector<DetectedTechnique> detections;
+                if (CheckTimingTechniquesInternal(hProcess, processId, detections, nullptr)) {
+                    for(const auto& det : detections) AddDetection(result, det);
+                }
             }
 
             // 7. Exception Handling
             if (HasFlag(config.flags, AnalysisFlags::ScanExceptionTechniques)) {
-                AnalyzeExceptionHandling(hProcess, processId, result);
+                std::vector<DetectedTechnique> detections;
+                if (CheckExceptionTechniquesInternal(hProcess, processId, detections, nullptr)) {
+                    for(const auto& det : detections) AddDetection(result, det);
+                }
             }
 
             // 8. Code Integrity
             if (HasFlag(config.flags, AnalysisFlags::ScanCodeIntegrity)) {
-                AnalyzeCodeIntegrity(hProcess, processId, result);
+                std::vector<DetectedTechnique> detections;
+                if (CheckAPIHookDetectionInternal(hProcess, processId, detections, nullptr)) {
+                    for(const auto& det : detections) AddDetection(result, det);
+                }
+
+                detections.clear();
+                if (CheckCodeIntegrity(processId, detections, nullptr)) {
+                    for(const auto& det : detections) AddDetection(result, det);
+                }
             }
 
             // 9. Kernel Info
@@ -1442,69 +1531,11 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
-    void DebuggerEvasionDetector::AnalyzeTimingPatterns(
-        HANDLE hProcess,
-        uint32_t processId,
-        DebuggerEvasionResult& result
-    ) noexcept {
-        // Basic timing check via RDTSC (if running in same context) or check for High Resolution Timer usage anomalies.
-        // For remote process, it's hard to check RDTSC behavior directly.
-        // We can check if KUSER_SHARED_DATA is modified or check for GetTickCount hooks.
-        // Placeholder for advanced timing analysis.
-        std::vector<DetectedTechnique> detections;
-        if (CheckTimingTechniques(processId, detections, nullptr)) {
-            for(const auto& det : detections) AddDetection(result, det);
-        }
-    }
-
-    void DebuggerEvasionDetector::AnalyzeExceptionHandling(
-        HANDLE hProcess,
-        uint32_t processId,
-        DebuggerEvasionResult& result
-    ) noexcept {
-        std::vector<DetectedTechnique> detections;
-        if (CheckExceptionTechniques(processId, detections, nullptr)) {
-            for(const auto& det : detections) AddDetection(result, det);
-        }
-    }
-
-    void DebuggerEvasionDetector::AnalyzeThreads(
-        HANDLE hProcess,
-        uint32_t processId,
-        DebuggerEvasionResult& result
-    ) noexcept {
-        // Hardware breakpoints
-        AnalyzeThreadContexts(processId, result);
-
-        // Hidden threads
-        std::vector<DetectedTechnique> detections;
-        if (CheckHiddenThreads(processId, detections, nullptr)) {
-            for(const auto& det : detections) AddDetection(result, det);
-        }
-
-        // TLS Callbacks
-        detections.clear();
-        if (CheckTLSCallbacks(processId, detections, nullptr)) {
-            for(const auto& det : detections) AddDetection(result, det);
-        }
-    }
-
     void DebuggerEvasionDetector::QueryKernelDebugInfo(
         DebuggerEvasionResult& result
     ) noexcept {
         std::vector<DetectedTechnique> detections;
         if (CheckKernelDebugInfo(detections, nullptr)) {
-            for(const auto& det : detections) AddDetection(result, det);
-        }
-    }
-
-    void DebuggerEvasionDetector::AnalyzeCodeIntegrity(
-        HANDLE hProcess,
-        uint32_t processId,
-        DebuggerEvasionResult& result
-    ) noexcept {
-        std::vector<DetectedTechnique> detections;
-        if (CheckAPIHookDetection(processId, detections, nullptr)) {
             for(const auto& det : detections) AddDetection(result, det);
         }
     }

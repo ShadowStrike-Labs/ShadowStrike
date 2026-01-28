@@ -1886,6 +1886,42 @@ namespace ShadowStrike {
                 DebuggerEvasionResult& result
             ) noexcept;
 
+            // Internal helpers with HANDLE reuse for performance
+            [[nodiscard]] bool CheckTimingTechniquesInternal(
+                HANDLE hProcess,
+                uint32_t processId,
+                std::vector<DetectedTechnique>& outDetections,
+                Error* err
+            ) noexcept;
+
+            [[nodiscard]] bool CheckExceptionTechniquesInternal(
+                HANDLE hProcess,
+                uint32_t processId,
+                std::vector<DetectedTechnique>& outDetections,
+                Error* err
+            ) noexcept;
+
+            [[nodiscard]] bool CheckHiddenThreadsInternal(
+                HANDLE hProcess,
+                uint32_t processId,
+                std::vector<DetectedTechnique>& outDetections,
+                Error* err
+            ) noexcept;
+
+            [[nodiscard]] bool CheckTLSCallbacksInternal(
+                HANDLE hProcess,
+                uint32_t processId,
+                std::vector<DetectedTechnique>& outDetections,
+                Error* err
+            ) noexcept;
+
+            [[nodiscard]] bool CheckAPIHookDetectionInternal(
+                HANDLE hProcess,
+                uint32_t processId,
+                std::vector<DetectedTechnique>& outDetections,
+                Error* err
+            ) noexcept;
+
             /**
              * @brief Analyze PEB structures
              */
