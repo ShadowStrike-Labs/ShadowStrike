@@ -59,16 +59,78 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
+#include "../Utils/HashUtils.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 
 // ============================================================================
+// PEPARSER AND ZYDIS INTEGRATION
+// Enterprise-grade PE analysis and disassembly for hook detection
+// ============================================================================
+
+#include "../PEParser/PEParser.hpp"
+#include <Zydis/Zydis.h>
+
+// ============================================================================
 // EXTERNAL ASSEMBLY FUNCTIONS
+// Defined in EnvironmentEvasionDetector.asm
+// High-precision CPU detection that cannot be reliably performed in C++
 // ============================================================================
 
 extern "C" {
-    // Defined in EnvironmentEvasionDetector_x64.asm
-    bool CheckCPUIDHypervisorBit();
+    /// @brief Check CPUID hypervisor bit (leaf 1, ECX bit 31)
+    /// @return 1 if hypervisor detected, 0 otherwise
+    uint64_t CheckCPUIDHypervisorBit();
+
+    /// @brief Get 48-byte CPU brand string from CPUID leaves 0x80000002-0x80000004
+    /// @param buffer Output buffer (must be at least 49 bytes)
+    /// @param bufferSize Size of buffer
     void GetCPUIDBrandString(char* buffer, size_t bufferSize);
+
+    /// @brief Check if CPU supports VMX (VT-x) virtualization
+    /// @return 1 if VMX supported, 0 otherwise
+    uint64_t CheckCPUIDVMXSupport();
+
+    /// @brief Get 12-byte CPU vendor string from CPUID leaf 0
+    /// @param buffer Output buffer (must be at least 13 bytes)
+    /// @param bufferSize Size of buffer
+    void GetCPUIDVendorString(char* buffer, size_t bufferSize);
+
+    /// @brief Get hypervisor vendor string if hypervisor present (CPUID 0x40000000)
+    /// @param buffer Output buffer (must be at least 13 bytes)
+    /// @param bufferSize Size of buffer
+    /// @return 1 if hypervisor vendor retrieved, 0 otherwise
+    uint64_t CheckCPUIDHypervisorVendor(char* buffer, size_t bufferSize);
+
+    /// @brief Measure RDTSC instruction latency for VM detection
+    /// @return Delta TSC cycles (high values indicate VM overhead)
+    uint64_t MeasureRDTSCLatency();
+
+    /// @brief Read DR7 debug control register (requires Ring 0)
+    /// @return DR7 value
+    uint64_t CheckDebugRegistersASM();
+
+    /// @brief Get CPU feature flags from CPUID leaf 1
+    /// @param ecxFeatures Pointer to store ECX features
+    /// @param edxFeatures Pointer to store EDX features
+    /// @return 1 on success
+    uint64_t GetCPUIDFeatureFlags(uint32_t* ecxFeatures, uint32_t* edxFeatures);
+
+    /// @brief Get maximum extended CPUID leaf
+    /// @return Max extended leaf (e.g., 0x80000008)
+    uint64_t GetExtendedCPUIDMaxLeaf();
+
+    /// @brief Perform RDTSCP measurement with processor ID
+    /// @param processorId Pointer to store processor ID (can be NULL)
+    /// @return TSC value
+    uint64_t PerformRDTSCPMeasurement(uint32_t* processorId);
+
+    /// @brief Check SSE2 support via CPUID
+    /// @return 1 if SSE2 supported, 0 otherwise
+    uint64_t CheckSSE2Support();
+
+    /// @brief Get processor core count from CPUID
+    /// @return Logical processor count
+    uint64_t GetProcessorCoreCount();
 }
 
 namespace fs = std::filesystem;
@@ -4147,6 +4209,517 @@ namespace ShadowStrike::AntiEvasion {
 
     void EnvironmentEvasionDetector::ResetStatistics() noexcept {
         m_impl->m_stats.Reset();
+    }
+
+    // ========================================================================
+    // PUBLIC API WRAPPERS FOR HELPER METHODS
+    // These methods expose Impl functionality to external callers
+    // ========================================================================
+
+    bool EnvironmentEvasionDetector::IsBlacklistedUsername(std::wstring_view name) const noexcept {
+        return m_impl->IsBlacklistedUsername(name);
+    }
+
+    bool EnvironmentEvasionDetector::IsBlacklistedComputerName(std::wstring_view name) const noexcept {
+        return m_impl->IsBlacklistedComputerName(name);
+    }
+
+    bool EnvironmentEvasionDetector::IsAnalysisToolProcess(std::wstring_view name) const noexcept {
+        return m_impl->IsAnalysisToolProcess(name);
+    }
+
+    bool EnvironmentEvasionDetector::IsVMMACAddress(const std::array<uint8_t, 6>& mac) const noexcept {
+        return m_impl->IsVMMACAddress(mac);
+    }
+
+    bool EnvironmentEvasionDetector::LooksLikeHash(std::wstring_view name, std::wstring& hashType) const noexcept {
+        return m_impl->LooksLikeHash(name, hashType);
+    }
+
+    // ========================================================================
+    // ADVANCED CPUID-BASED VM DETECTION
+    // Uses assembly functions for high-precision CPU interrogation
+    // ========================================================================
+
+    bool EnvironmentEvasionDetector::CheckAdvancedCPUIDIndicators(
+        std::vector<EnvironmentDetectedTechnique>& outDetections,
+        EnvironmentError* err
+    ) noexcept {
+        try {
+            bool found = false;
+
+            // ================================================================
+            // 1. HYPERVISOR BIT CHECK (CPUID leaf 1, ECX bit 31)
+            // ================================================================
+            if (CheckCPUIDHypervisorBit() != 0) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
+                detection.confidence = 0.98;
+                detection.detectedValue = L"Hypervisor bit set in CPUID";
+                detection.description = L"CPUID indicates hypervisor presence (ECX bit 31)";
+                detection.source = L"CPUID Leaf 1";
+                detection.severity = EnvironmentEvasionSeverity::High;
+                outDetections.push_back(detection);
+                found = true;
+
+                // Get hypervisor vendor string
+                char hvVendor[16] = {};
+                if (CheckCPUIDHypervisorVendor(hvVendor, sizeof(hvVendor)) != 0) {
+                    std::wstring hvVendorW = Utils::StringUtils::ToWide(hvVendor);
+
+                    // Identify specific hypervisor
+                    std::wstring hvName = L"Unknown";
+                    if (hvVendorW.find(L"VMwareVMware") != std::wstring::npos) {
+                        hvName = L"VMware";
+                    } else if (hvVendorW.find(L"Microsoft Hv") != std::wstring::npos) {
+                        hvName = L"Hyper-V";
+                    } else if (hvVendorW.find(L"KVMKVMKVM") != std::wstring::npos) {
+                        hvName = L"KVM";
+                    } else if (hvVendorW.find(L"XenVMMXenVMM") != std::wstring::npos) {
+                        hvName = L"Xen";
+                    } else if (hvVendorW.find(L"VBoxVBoxVBox") != std::wstring::npos) {
+                        hvName = L"VirtualBox";
+                    } else if (hvVendorW.find(L"prl hyperv") != std::wstring::npos) {
+                        hvName = L"Parallels";
+                    }
+
+                    EnvironmentDetectedTechnique hvDetection(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
+                    hvDetection.confidence = 0.99;
+                    hvDetection.detectedValue = hvVendorW;
+                    hvDetection.description = hvName + L" hypervisor identified via CPUID 0x40000000";
+                    hvDetection.source = L"CPUID Hypervisor Vendor";
+                    hvDetection.severity = EnvironmentEvasionSeverity::Critical;
+                    outDetections.push_back(hvDetection);
+                }
+            }
+
+            // ================================================================
+            // 2. CPU VENDOR STRING ANALYSIS
+            // ================================================================
+            char vendorStr[16] = {};
+            GetCPUIDVendorString(vendorStr, sizeof(vendorStr));
+            std::wstring vendorW = Utils::StringUtils::ToWide(vendorStr);
+
+            // Check for non-standard vendor strings
+            if (vendorW != L"GenuineIntel" && vendorW != L"AuthenticAMD") {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMCPUBrand);
+                detection.confidence = 0.85;
+                detection.detectedValue = vendorW;
+                detection.expectedValue = L"GenuineIntel or AuthenticAMD";
+                detection.description = L"Non-standard CPU vendor string detected";
+                detection.source = L"CPUID Leaf 0";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            // ================================================================
+            // 3. CPU BRAND STRING ANALYSIS
+            // ================================================================
+            char brandStr[64] = {};
+            GetCPUIDBrandString(brandStr, sizeof(brandStr));
+            std::wstring brandW = Utils::StringUtils::ToWide(brandStr);
+
+            // Check for VM-related keywords in brand string
+            const std::vector<std::pair<std::wstring, std::wstring>> vmBrandPatterns = {
+                {L"QEMU", L"QEMU"},
+                {L"Virtual", L"Generic VM"},
+                {L"VMware", L"VMware"},
+                {L"VirtualBox", L"VirtualBox"},
+                {L"Xen", L"Xen"},
+                {L"KVM", L"KVM"},
+                {L"Hyper-V", L"Hyper-V"},
+            };
+
+            for (const auto& [pattern, vendor] : vmBrandPatterns) {
+                if (m_impl->ContainsSubstringCI(brandW, pattern)) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMCPUBrand);
+                    detection.confidence = 0.92;
+                    detection.detectedValue = brandW;
+                    detection.description = vendor + L" signature in CPU brand string";
+                    detection.source = L"CPUID Extended Leaves";
+                    detection.severity = EnvironmentEvasionSeverity::High;
+                    outDetections.push_back(detection);
+                    found = true;
+                    break;
+                }
+            }
+
+            // ================================================================
+            // 4. RDTSC TIMING ANALYSIS
+            // ================================================================
+            uint64_t rdtscLatency = MeasureRDTSCLatency();
+
+            // Typical bare-metal RDTSC latency is 20-100 cycles
+            // VMs often show 500+ cycles due to VMEXIT overhead
+            if (rdtscLatency > 500) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_AcceleratedTime);
+                detection.confidence = 0.75;
+                detection.detectedValue = std::to_wstring(rdtscLatency) + L" cycles";
+                detection.expectedValue = L"< 100 cycles on bare metal";
+                detection.description = L"High RDTSC latency indicates VM exit overhead";
+                detection.source = L"RDTSC Timing Analysis";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            // ================================================================
+            // 5. VMX/VT-x CAPABILITY CHECK
+            // ================================================================
+            if (CheckCPUIDVMXSupport() != 0) {
+                // VMX support on its own isn't suspicious, but combined with
+                // hypervisor bit it confirms nested virtualization
+                if (CheckCPUIDHypervisorBit() != 0) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
+                    detection.confidence = 0.70;
+                    detection.detectedValue = L"VMX + Hypervisor bit set";
+                    detection.description = L"Nested virtualization environment detected";
+                    detection.source = L"CPUID Feature Flags";
+                    outDetections.push_back(detection);
+                    found = true;
+                }
+            }
+
+            // ================================================================
+            // 6. PROCESSOR CORE COUNT CONSISTENCY
+            // ================================================================
+            uint64_t cpuidCoreCount = GetProcessorCoreCount();
+            SYSTEM_INFO sysInfo = {};
+            GetSystemInfo(&sysInfo);
+
+            // Mismatch between CPUID and Windows API can indicate VM
+            if (cpuidCoreCount > 0 && cpuidCoreCount != sysInfo.dwNumberOfProcessors) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_LowProcessorCount);
+                detection.confidence = 0.55;
+                detection.detectedValue = L"CPUID: " + std::to_wstring(cpuidCoreCount) +
+                    L", Windows: " + std::to_wstring(sysInfo.dwNumberOfProcessors);
+                detection.description = L"Processor count mismatch between CPUID and OS";
+                detection.source = L"CPU Core Count Analysis";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CheckAdvancedCPUIDIndicators failed: %hs", e.what());
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"Advanced CPUID check failed";
+            }
+            return false;
+        }
+        catch (...) {
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"Unknown error in advanced CPUID check";
+            }
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // ADVANCED HOOK DETECTION USING ZYDIS DISASSEMBLER
+    // Detects API hooking commonly used by sandboxes and analysis tools
+    // ========================================================================
+
+    bool EnvironmentEvasionDetector::CheckAPIHookingIndicators(
+        std::vector<EnvironmentDetectedTechnique>& outDetections,
+        EnvironmentError* err
+    ) noexcept {
+        try {
+            bool found = false;
+
+            // Initialize Zydis decoder for x64
+            ZydisDecoder decoder;
+            if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+                return false;
+            }
+
+            // Critical API functions to check for hooks
+            const std::vector<std::pair<const char*, const char*>> criticalAPIs = {
+                {"ntdll.dll", "NtQuerySystemInformation"},
+                {"ntdll.dll", "NtQueryInformationProcess"},
+                {"ntdll.dll", "NtSetInformationThread"},
+                {"ntdll.dll", "NtQueryVirtualMemory"},
+                {"ntdll.dll", "NtCreateFile"},
+                {"ntdll.dll", "NtOpenProcess"},
+                {"ntdll.dll", "NtAllocateVirtualMemory"},
+                {"ntdll.dll", "NtProtectVirtualMemory"},
+                {"ntdll.dll", "NtWriteVirtualMemory"},
+                {"kernel32.dll", "IsDebuggerPresent"},
+                {"kernel32.dll", "CheckRemoteDebuggerPresent"},
+                {"kernel32.dll", "GetTickCount"},
+                {"kernel32.dll", "QueryPerformanceCounter"},
+                {"kernel32.dll", "CreateProcessW"},
+                {"kernel32.dll", "VirtualProtect"},
+                {"user32.dll", "GetAsyncKeyState"},
+                {"user32.dll", "GetCursorPos"},
+            };
+
+            std::vector<std::wstring> hookedAPIs;
+
+            for (const auto& [dllName, funcName] : criticalAPIs) {
+                HMODULE hModule = GetModuleHandleA(dllName);
+                if (!hModule) continue;
+
+                FARPROC funcAddr = GetProcAddress(hModule, funcName);
+                if (!funcAddr) continue;
+
+                // Read first 16 bytes of function
+                uint8_t funcBytes[16] = {};
+                SIZE_T bytesRead = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), funcAddr, funcBytes, sizeof(funcBytes), &bytesRead)) {
+                    continue;
+                }
+
+                // Decode first instruction
+                ZydisDecodedInstruction instruction;
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+
+                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, funcBytes, sizeof(funcBytes),
+                    &instruction, operands))) {
+
+                    bool isHooked = false;
+                    std::wstring hookType;
+
+                    // Check for common hook patterns:
+                    // 1. JMP rel32 (E9 xx xx xx xx)
+                    if (instruction.mnemonic == ZYDIS_MNEMONIC_JMP) {
+                        isHooked = true;
+                        hookType = L"JMP hook";
+                    }
+                    // 2. PUSH + RET (68 xx xx xx xx C3) - push/ret hook
+                    else if (funcBytes[0] == 0x68 && funcBytes[5] == 0xC3) {
+                        isHooked = true;
+                        hookType = L"PUSH/RET hook";
+                    }
+                    // 3. MOV RAX, addr + JMP RAX (48 B8 + FF E0)
+                    else if (funcBytes[0] == 0x48 && funcBytes[1] == 0xB8) {
+                        isHooked = true;
+                        hookType = L"MOV RAX + JMP hook";
+                    }
+                    // 4. INT 3 (CC) - breakpoint hook
+                    else if (funcBytes[0] == 0xCC) {
+                        isHooked = true;
+                        hookType = L"INT3 breakpoint";
+                    }
+                    // 5. MOV R10, RCX should be first instruction for Nt* syscalls
+                    else if (strncmp(funcName, "Nt", 2) == 0 || strncmp(funcName, "Zw", 2) == 0) {
+                        // Expected: 4C 8B D1 (mov r10, rcx)
+                        if (!(funcBytes[0] == 0x4C && funcBytes[1] == 0x8B && funcBytes[2] == 0xD1)) {
+                            isHooked = true;
+                            hookType = L"Syscall stub modified";
+                        }
+                    }
+
+                    if (isHooked) {
+                        std::wstring apiFull = Utils::StringUtils::ToWide(dllName) + L"!" +
+                            Utils::StringUtils::ToWide(funcName);
+                        hookedAPIs.push_back(apiFull + L" (" + hookType + L")");
+                    }
+                }
+            }
+
+            if (!hookedAPIs.empty()) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_HookingDLLs);
+                detection.confidence = 0.92;
+
+                std::wstring hookList;
+                for (size_t i = 0; i < std::min(hookedAPIs.size(), size_t(5)); ++i) {
+                    if (!hookList.empty()) hookList += L", ";
+                    hookList += hookedAPIs[i];
+                }
+                if (hookedAPIs.size() > 5) {
+                    hookList += L" (+" + std::to_wstring(hookedAPIs.size() - 5) + L" more)";
+                }
+
+                detection.detectedValue = std::to_wstring(hookedAPIs.size()) + L" hooked APIs";
+                detection.technicalDetails = hookList;
+                detection.description = L"API hooks detected (sandbox/analysis tool indicator)";
+                detection.source = L"Zydis Disassembly Analysis";
+                detection.severity = EnvironmentEvasionSeverity::Critical;
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            return found;
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"CheckAPIHookingIndicators failed: %hs", e.what());
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"API hook detection failed";
+            }
+            return false;
+        }
+        catch (...) {
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"Unknown error in API hook detection";
+            }
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // PE ANALYSIS FOR ENVIRONMENT EVASION PATTERNS
+    // Uses PEParser to analyze executable for sandbox detection code
+    // ========================================================================
+
+    bool EnvironmentEvasionDetector::AnalyzeProcessPEForEvasion(
+        uint32_t processId,
+        std::vector<EnvironmentDetectedTechnique>& outDetections,
+        EnvironmentError* err
+    ) noexcept {
+        try {
+            bool found = false;
+
+            // Get process executable path
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+            if (!hProcess) return false;
+
+            wchar_t exePath[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            BOOL pathResult = QueryFullProcessImageNameW(hProcess, 0, exePath, &pathSize);
+            CloseHandle(hProcess);
+
+            if (!pathResult) return false;
+
+            // Parse the PE file
+            PEParser::PEParser parser;
+            PEParser::ParseError parseErr;
+            if (!parser.Parse(exePath, &parseErr)) {
+                return false;
+            }
+
+            const auto& peInfo = parser.GetPEInfo();
+            if (!peInfo) return false;
+
+            // ================================================================
+            // 1. CHECK IMPORTS FOR EVASION-RELATED APIS
+            // ================================================================
+            std::vector<std::wstring> suspiciousImports;
+
+            const std::vector<std::pair<std::wstring, std::wstring>> evasionAPIs = {
+                {L"IsDebuggerPresent", L"Debugger detection"},
+                {L"CheckRemoteDebuggerPresent", L"Remote debugger detection"},
+                {L"NtQueryInformationProcess", L"Process info query (can detect debugging)"},
+                {L"GetTickCount", L"Timing-based evasion"},
+                {L"QueryPerformanceCounter", L"High-resolution timing"},
+                {L"GetSystemInfo", L"Hardware fingerprinting"},
+                {L"GlobalMemoryStatusEx", L"RAM size check"},
+                {L"GetDiskFreeSpaceExW", L"Disk size check"},
+                {L"EnumDisplayDevicesW", L"Display enumeration"},
+                {L"GetAdaptersInfo", L"Network adapter enumeration"},
+                {L"CreateToolhelp32Snapshot", L"Process enumeration"},
+                {L"GetUserNameW", L"Username retrieval"},
+                {L"GetComputerNameW", L"Computer name retrieval"},
+                {L"RegQueryValueExW", L"Registry query"},
+                {L"FindWindowW", L"Window detection"},
+                {L"GetCursorPos", L"Mouse position check"},
+                {L"GetAsyncKeyState", L"Keyboard state check"},
+                {L"Sleep", L"Time delay (anti-sandbox)"},
+                {L"SleepEx", L"Extended time delay"},
+                {L"NtDelayExecution", L"Native time delay"},
+                {L"OutputDebugStringW", L"Debug output"},
+                {L"SetUnhandledExceptionFilter", L"Exception handling manipulation"},
+            };
+
+            for (const auto& import : peInfo->imports) {
+                for (const auto& func : import.functions) {
+                    std::wstring funcName = Utils::StringUtils::ToWide(func.name);
+
+                    for (const auto& [apiName, apiDesc] : evasionAPIs) {
+                        if (funcName == apiName) {
+                            suspiciousImports.push_back(apiName);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // High count of evasion-related APIs is suspicious
+            if (suspiciousImports.size() >= 5) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ADVANCED_SophisticatedFingerprinting);
+                detection.confidence = 0.65 + (std::min(suspiciousImports.size(), size_t(10)) * 0.03);
+                detection.detectedValue = std::to_wstring(suspiciousImports.size()) + L" evasion-related imports";
+
+                std::wstring importList;
+                for (size_t i = 0; i < std::min(suspiciousImports.size(), size_t(5)); ++i) {
+                    if (!importList.empty()) importList += L", ";
+                    importList += suspiciousImports[i];
+                }
+                detection.technicalDetails = importList;
+                detection.description = L"Multiple environment fingerprinting APIs imported";
+                detection.source = L"PE Import Analysis";
+                outDetections.push_back(detection);
+                found = true;
+            }
+
+            // ================================================================
+            // 2. CHECK FOR ANTI-DEBUG SECTION NAMES
+            // ================================================================
+            const std::vector<std::pair<std::wstring, std::wstring>> suspiciousSections = {
+                {L".themida", L"Themida packer (anti-debug)"},
+                {L".vmp", L"VMProtect packer"},
+                {L".enigma", L"Enigma packer"},
+                {L".aspack", L"ASPack packer"},
+                {L".upx", L"UPX packer"},
+                {L".nsp", L"NSPack packer"},
+            };
+
+            for (const auto& section : peInfo->sections) {
+                std::wstring sectionName = Utils::StringUtils::ToWide(section.name);
+                std::transform(sectionName.begin(), sectionName.end(), sectionName.begin(), ::towlower);
+
+                for (const auto& [pattern, desc] : suspiciousSections) {
+                    if (sectionName.find(pattern) != std::wstring::npos) {
+                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ADVANCED_PolymorphicCheck);
+                        detection.confidence = 0.80;
+                        detection.detectedValue = Utils::StringUtils::ToWide(section.name);
+                        detection.description = desc + L" section detected";
+                        detection.source = L"PE Section Analysis";
+                        detection.severity = EnvironmentEvasionSeverity::High;
+                        outDetections.push_back(detection);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            // ================================================================
+            // 3. CHECK ENTROPY FOR PACKED/ENCRYPTED SECTIONS
+            // ================================================================
+            for (const auto& section : peInfo->sections) {
+                // High entropy (> 7.0) suggests encryption/packing
+                if (section.entropy > 7.0 && section.virtualSize > 1024) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ADVANCED_EncryptedCheck);
+                    detection.confidence = 0.70;
+                    detection.detectedValue = Utils::StringUtils::ToWide(section.name) +
+                        L" entropy: " + std::to_wstring(section.entropy);
+                    detection.description = L"High entropy section (possible encryption/packing)";
+                    detection.source = L"PE Entropy Analysis";
+                    outDetections.push_back(detection);
+                    found = true;
+                }
+            }
+
+            return found;
+        }
+        catch (const std::exception& e) {
+            SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeProcessPEForEvasion failed: %hs", e.what());
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"PE analysis failed";
+            }
+            return false;
+        }
+        catch (...) {
+            if (err) {
+                err->win32Code = ERROR_INTERNAL_ERROR;
+                err->message = L"Unknown error in PE analysis";
+            }
+            return false;
+        }
     }
 
 } // namespace ShadowStrike::AntiEvasion
