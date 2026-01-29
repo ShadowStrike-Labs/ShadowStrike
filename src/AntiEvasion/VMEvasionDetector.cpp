@@ -24,6 +24,7 @@
 #include "VMEvasionDetector.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#include "../Utils/MemoryUtils.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../Utils/Logger.hpp"
@@ -31,11 +32,16 @@
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/RegistryUtils.hpp"
+#include "../PEParser/PEParser.hpp"
+
+// Zydis Disassembler Integration
+#include <Zydis/Zydis.h>
 
 #include <algorithm>
 #include <numeric>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
 #include <wbemidl.h>
 #include <comdef.h>
 #include <SetupAPI.h>
@@ -46,6 +52,7 @@
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "SetupAPI.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "Zydis.lib")
 
 // External assembly functions (implemented in VMEvasionDetector_x64.asm)
 extern "C" {
@@ -69,6 +76,46 @@ extern "C" {
 
     /// @brief Checks VMware backdoor port 0x5658 (implemented in ASM)
     void CheckVMwareBackdoor(uint32_t* rax, uint32_t* rbx, uint32_t* rcx, uint32_t* rdx) noexcept;
+
+    // ========================================================================
+    // Enterprise Enhancement Assembly Functions
+    // ========================================================================
+
+    /// @brief Retrieves Task Register selector via STR instruction (SWIZZ test)
+    uint16_t GetTRSelector() noexcept;
+
+    /// @brief Measures CPUID instruction timing for VM exit detection
+    uint64_t MeasureCPUIDTiming(uint32_t iterations) noexcept;
+
+    /// @brief Checks for Hyper-V specific interface signature
+    uint32_t CheckHyperVBackdoor() noexcept;
+
+    /// @brief Extended CPUID query with all output registers
+    bool GetExtendedCPUIDInfo(uint32_t leaf, uint32_t subleaf,
+                               uint32_t* eax, uint32_t* ebx,
+                               uint32_t* ecx, uint32_t* edx) noexcept;
+
+    /// @brief Checks segment descriptor limits for VM detection
+    bool CheckSegmentLimits(uint32_t* csLimit, uint32_t* dsLimit, uint32_t* ssLimit) noexcept;
+
+    /// @brief Generic instruction timing measurement
+    uint64_t MeasureInstructionTiming(uint32_t iterations, uint32_t instructionType) noexcept;
+
+    /// @brief Intel VT-x hypercall detection (causes #UD on non-VM)
+    bool DetectVMCALL() noexcept;
+
+    /// @brief AMD-V hypercall detection (causes #UD on non-VM)
+    bool DetectVMMCALL() noexcept;
+
+    /// @brief Validates hypervisor CPUID leaf range
+    uint32_t CheckCPUIDLeafRange() noexcept;
+
+    /// @brief Retrieves both IDT and GDT information in single call
+    bool GetIDTAndGDTInfo(uint64_t* idtBase, uint16_t* idtLimit,
+                          uint64_t* gdtBase, uint16_t* gdtLimit) noexcept;
+
+    /// @brief Measures RDTSCP timing (serializing version)
+    uint64_t MeasureRDTSCPTiming(uint32_t iterations) noexcept;
 }
 
 namespace ShadowStrike {

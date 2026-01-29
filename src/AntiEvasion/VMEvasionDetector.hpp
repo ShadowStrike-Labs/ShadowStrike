@@ -175,6 +175,13 @@ namespace ShadowStrike::ThreatIntel {
     class ThreatIntelStore;
 }
 
+namespace ShadowStrike::PEParser {
+    class PEParser;
+    struct PEInfo;
+    struct ImportInfo;
+    struct SectionInfo;
+}
+
 namespace ShadowStrike {
     namespace AntiEvasion {
 
@@ -546,6 +553,164 @@ namespace ShadowStrike {
             inline constexpr uint32_t ACPI_SIGNATURE_XEN = 0x004E4558;  // "XEN\0"
             inline constexpr uint32_t ACPI_SIGNATURE_PTLTD = 0x44544C54;  // "PTLTD" (QEMU)
 
+            // -------------------------------------------------------------------------
+            // Extended Hypervisor Vendor Strings (Enterprise Cloud Platforms)
+            // -------------------------------------------------------------------------
+
+            /// @brief Firecracker (AWS microVM)
+            inline constexpr std::string_view VENDOR_FIRECRACKER = "Firecracker\0";
+
+            /// @brief Cloud Hypervisor (Intel)
+            inline constexpr std::string_view VENDOR_CLOUD_HV = "CloudHV\0\0\0\0\0";
+
+            /// @brief crosvm (Chrome OS VM)
+            inline constexpr std::string_view VENDOR_CROSVM = "crosvmcrosvm";
+
+            /// @brief Apple Virtualization Framework
+            inline constexpr std::string_view VENDOR_APPLE_VZ = "Apple VZ\0\0\0\0";
+
+            /// @brief Nutanix AHV
+            inline constexpr std::string_view VENDOR_NUTANIX = "NutanixAHV\0\0";
+
+            // -------------------------------------------------------------------------
+            // Anti-VM API Indicators (for Import Analysis)
+            // -------------------------------------------------------------------------
+
+            /// @brief APIs commonly used for VM detection by malware
+            inline constexpr std::array<std::string_view, 32> ANTI_VM_IMPORT_APIS = {{
+                // Debugger detection (often paired with VM detection)
+                "IsDebuggerPresent",
+                "CheckRemoteDebuggerPresent",
+                "NtQueryInformationProcess",
+                "NtQuerySystemInformation",
+                "NtSetInformationThread",
+                "OutputDebugStringA",
+                "OutputDebugStringW",
+
+                // Timing-based detection
+                "GetTickCount",
+                "GetTickCount64",
+                "QueryPerformanceCounter",
+                "QueryPerformanceFrequency",
+                "timeGetTime",
+                "GetSystemTimeAsFileTime",
+
+                // Hardware/System information
+                "GetSystemInfo",
+                "GetNativeSystemInfo",
+                "GetSystemFirmwareTable",
+                "EnumSystemFirmwareTables",
+                "GetComputerNameA",
+                "GetComputerNameW",
+                "GetVolumeInformationA",
+                "GetVolumeInformationW",
+
+                // Process/Thread manipulation
+                "CreateToolhelp32Snapshot",
+                "Process32First",
+                "Process32Next",
+                "Module32First",
+                "Module32Next",
+
+                // WMI (often used for VM detection)
+                "CoCreateInstance",
+                "CoInitializeEx",
+
+                // Low-level hardware access
+                "__cpuid",
+                "__cpuidex",
+                "__rdtsc"
+            }};
+
+            /// @brief Suspicious DLL imports indicating anti-VM behavior
+            inline constexpr std::array<std::string_view, 12> ANTI_VM_IMPORT_DLLS = {{
+                "ntdll.dll",
+                "kernel32.dll",
+                "wbemuuid.dll",
+                "setupapi.dll",
+                "cfgmgr32.dll",
+                "wmi.dll",
+                "ole32.dll",
+                "oleaut32.dll",
+                "advapi32.dll",
+                "user32.dll",
+                "winmm.dll",
+                "powrprof.dll"
+            }};
+
+            // -------------------------------------------------------------------------
+            // Instruction Patterns for Zydis-based Analysis
+            // -------------------------------------------------------------------------
+
+            /// @brief x86/x64 mnemonics indicative of anti-VM behavior
+            inline constexpr std::array<std::string_view, 24> ANTI_VM_MNEMONICS = {{
+                "cpuid",      // Hypervisor detection
+                "rdtsc",      // Timing attacks
+                "rdtscp",     // Timing attacks (serializing)
+                "sidt",       // Red Pill (IDT base)
+                "sgdt",       // No Pill (GDT base)
+                "sldt",       // LDT selector
+                "str",        // Task Register (SWIZZ test)
+                "in",         // I/O port access (VMware backdoor)
+                "out",        // I/O port output
+                "vmcall",     // Intel VT-x hypercall
+                "vmmcall",    // AMD-V hypercall
+                "vmread",     // VMCS read
+                "vmwrite",    // VMCS write
+                "vmlaunch",   // Launch VM
+                "vmresume",   // Resume VM
+                "vmxoff",     // Exit VMX operation
+                "vmxon",      // Enter VMX operation
+                "invd",       // Invalidate cache (privileged)
+                "wbinvd",     // Write-back and invalidate
+                "rdmsr",      // Read MSR (model-specific register)
+                "wrmsr",      // Write MSR
+                "smsw",       // Store Machine Status Word
+                "lmsw",       // Load Machine Status Word
+                "int"         // Software interrupt (INT 2E, etc.)
+            }};
+
+            /// @brief Timing threshold for RDTSC-based VM detection (cycles)
+            inline constexpr uint64_t RDTSC_VM_THRESHOLD_MIN = 500;
+            inline constexpr uint64_t RDTSC_VM_THRESHOLD_MAX = 5000;
+
+            /// @brief CPUID timing threshold (cycles) - VMs have higher latency
+            inline constexpr uint64_t CPUID_VM_THRESHOLD = 1500;
+
+            /// @brief Maximum code size to analyze per function (bytes)
+            inline constexpr size_t MAX_FUNCTION_ANALYSIS_SIZE = 0x10000;  // 64KB
+
+            /// @brief Maximum instructions to disassemble per analysis
+            inline constexpr size_t MAX_INSTRUCTIONS_TO_ANALYZE = 10000;
+
+            /// @brief Minimum entropy threshold for packed/encrypted sections
+            inline constexpr double PACKED_SECTION_ENTROPY_THRESHOLD = 7.0;
+
+            // -------------------------------------------------------------------------
+            // Cloud-Specific VM Identifiers
+            // -------------------------------------------------------------------------
+
+            inline constexpr std::array<std::wstring_view, 16> CLOUD_VM_IDENTIFIERS = {{
+                // AWS
+                L"Amazon EC2", L"aws", L"Xen", L"HVM domU",
+                // Azure
+                L"Microsoft Corporation Virtual Machine", L"Hyper-V UEFI",
+                // GCP
+                L"Google Compute Engine", L"Google",
+                // Oracle Cloud
+                L"OracleCloud", L"Oracle Corporation",
+                // Alibaba Cloud
+                L"Alibaba Cloud ECS",
+                // DigitalOcean
+                L"DigitalOcean Droplet",
+                // Linode
+                L"Linode",
+                // Vultr
+                L"Vultr",
+                // Hetzner
+                L"Hetzner"
+            }};
+
         }  // namespace VMConstants
 
         // ============================================================================
@@ -842,6 +1007,158 @@ namespace ShadowStrike {
             uint32_t sampleCount = 0;             ///< Number of timing samples taken
             uint64_t averageDelta = 0;            ///< Average timing delta
             uint64_t stdDeviation = 0;            ///< Standard deviation of timing
+        };
+
+        // ============================================================================
+        // ZYDIS DISASSEMBLY STRUCTURES (Enterprise Enhancement)
+        // ============================================================================
+
+        /**
+         * @brief Result of disassembling a single instruction
+         */
+        struct DisassembledInstruction {
+            uint64_t address = 0;                      ///< Virtual address of instruction
+            size_t length = 0;                         ///< Instruction length in bytes
+            std::string mnemonic;                      ///< Instruction mnemonic (e.g., "cpuid")
+            std::string operands;                      ///< Formatted operand string
+            std::string fullText;                      ///< Complete disassembly text
+            std::array<uint8_t, 15> rawBytes{};        ///< Raw instruction bytes (max 15 for x64)
+            bool isAntiVM = false;                     ///< True if this is an anti-VM instruction
+            AntiVMTechnique associatedTechnique = AntiVMTechnique::None;
+        };
+
+        /**
+         * @brief Result of Zydis-based code analysis
+         */
+        struct CodeAnalysisResult {
+            std::vector<DisassembledInstruction> antiVMInstructions;  ///< Anti-VM instructions found
+            size_t totalInstructionsAnalyzed = 0;      ///< Total instructions disassembled
+            size_t cpuidCount = 0;                     ///< CPUID instruction count
+            size_t rdtscCount = 0;                     ///< RDTSC/RDTSCP count
+            size_t sidtCount = 0;                      ///< SIDT instruction count
+            size_t sgdtCount = 0;                      ///< SGDT instruction count
+            size_t sldtCount = 0;                      ///< SLDT instruction count
+            size_t strCount = 0;                       ///< STR instruction count
+            size_t ioPortAccessCount = 0;              ///< IN/OUT instruction count
+            size_t vmInstructionCount = 0;             ///< VMCALL/VMMCALL/VMX count
+            size_t timingInstructionCount = 0;         ///< Total timing-related instructions
+            bool hasCpuidLoop = false;                 ///< Multiple CPUIDs in tight loop
+            bool hasRdtscSandwich = false;             ///< RDTSC before/after instruction pattern
+            bool hasPrivilegedInstructions = false;    ///< Contains ring-0 only instructions
+            float evasionScore = 0.0f;                 ///< Overall evasion likelihood (0-100)
+            std::chrono::nanoseconds analysisTime{0};  ///< Time taken for analysis
+        };
+
+        // ============================================================================
+        // PE ANALYSIS STRUCTURES (Enterprise Enhancement)
+        // ============================================================================
+
+        /**
+         * @brief Suspicious import detected in PE file
+         */
+        struct SuspiciousImport {
+            std::string dllName;                       ///< Source DLL name
+            std::string functionName;                  ///< Imported function name
+            uint16_t ordinal = 0;                      ///< Ordinal (if by ordinal)
+            AntiVMTechnique associatedTechnique = AntiVMTechnique::None;
+            float suspicionScore = 0.0f;               ///< How suspicious (0-100)
+            std::wstring reason;                       ///< Why this is suspicious
+        };
+
+        /**
+         * @brief Result of PE-based anti-VM analysis
+         */
+        struct PEAnalysisResult {
+            bool isPE = false;                         ///< True if valid PE file
+            bool is64Bit = false;                      ///< True if PE32+
+            bool isDotNet = false;                     ///< True if .NET assembly
+            bool isSigned = false;                     ///< True if has Authenticode signature
+            bool isPacked = false;                     ///< True if likely packed/encrypted
+
+            // Import analysis
+            std::vector<SuspiciousImport> suspiciousImports;
+            size_t totalImportedFunctions = 0;         ///< Total import count
+            size_t antiVMImportCount = 0;              ///< Anti-VM related imports
+
+            // Section analysis
+            size_t executableSectionCount = 0;         ///< Number of executable sections
+            size_t writableExecutableSections = 0;     ///< W+X sections (suspicious)
+            double highestSectionEntropy = 0.0;        ///< Highest entropy value
+            std::wstring highEntropySection;           ///< Name of high-entropy section
+
+            // Entry point analysis
+            bool entryPointInWritableSection = false;  ///< EP in writable section
+            bool entryPointOutsideCode = false;        ///< EP not in .text
+            uint32_t entryPointRva = 0;
+
+            // TLS callbacks (often used for anti-debug/VM)
+            size_t tlsCallbackCount = 0;
+            std::vector<uint64_t> tlsCallbackAddresses;
+
+            // Anomalies detected
+            std::vector<std::wstring> anomalies;
+
+            float overallSuspicionScore = 0.0f;        ///< Combined score (0-100)
+            std::chrono::nanoseconds analysisTime{0};
+        };
+
+        /**
+         * @brief Extended process analysis result with Zydis and PE integration
+         */
+        struct ExtendedProcessAnalysis {
+            Utils::ProcessUtils::ProcessId processId = 0;
+            std::wstring processName;
+            std::wstring executablePath;
+
+            // Code analysis (Zydis)
+            CodeAnalysisResult codeAnalysis;
+
+            // PE analysis
+            PEAnalysisResult peAnalysis;
+
+            // Combined results
+            bool hasAntiVMBehavior = false;
+            float combinedEvasionScore = 0.0f;         ///< Weighted combination of all scores
+            AntiVMTechnique detectedTechniques = AntiVMTechnique::None;
+
+            // Memory regions analyzed
+            size_t executableRegionsScanned = 0;
+            size_t totalBytesScanned = 0;
+
+            bool completed = false;
+            std::wstring errorMessage;
+            std::chrono::nanoseconds totalAnalysisTime{0};
+        };
+
+        /**
+         * @brief Configuration for extended analysis with Zydis/PE
+         */
+        struct ExtendedAnalysisConfig {
+            // Zydis options
+            bool enableDisassembly = true;             ///< Enable instruction-level analysis
+            bool analyzeAllExecutableRegions = true;   ///< Scan all executable memory
+            bool detectCpuidLoops = true;              ///< Detect CPUID timing loops
+            bool detectRdtscPatterns = true;           ///< Detect RDTSC sandwiches
+            size_t maxInstructionsPerRegion = VMConstants::MAX_INSTRUCTIONS_TO_ANALYZE;
+            size_t maxRegionsToAnalyze = 64;
+
+            // PE options
+            bool enablePEAnalysis = true;              ///< Enable PE header analysis
+            bool analyzeImports = true;                ///< Check import table
+            bool analyzeSections = true;               ///< Check section characteristics
+            bool analyzeEntropy = true;                ///< Calculate section entropy
+            bool analyzeTLS = true;                    ///< Check TLS callbacks
+            bool detectAnomalies = true;               ///< Check for PE anomalies
+
+            // Thresholds
+            double entropyThreshold = VMConstants::PACKED_SECTION_ENTROPY_THRESHOLD;
+            size_t minSuspiciousImports = 3;           ///< Min imports to flag as suspicious
+            float minEvasionScoreToReport = 25.0f;     ///< Min score to report
+
+            // Timeout and limits
+            uint32_t timeoutMs = 30000;
+            size_t maxMemoryToScan = 128 * 1024 * 1024; // 128MB
+            const std::atomic<bool>* cancelFlag = nullptr;
         };
 
         /**
@@ -1331,6 +1648,108 @@ namespace ShadowStrike {
                 std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult>& results,
                 const ProcessAnalysisConfig& config = {}
             );
+
+            // ========================================================================
+            // Extended Analysis API (Zydis + PEParser Integration)
+            // ========================================================================
+
+            /**
+             * @brief Performs extended process analysis with Zydis disassembly and PE parsing
+             *
+             * This is the enterprise-grade analysis method that combines:
+             * - Zydis-based instruction-level anti-VM detection
+             * - PEParser-based import and section analysis
+             * - Entropy calculation for packed code detection
+             * - TLS callback analysis
+             *
+             * @param processId Target process ID
+             * @param result Output: Extended analysis results
+             * @param config Analysis configuration
+             * @return true if analysis completed successfully
+             */
+            [[nodiscard]] bool AnalyzeProcessExtended(
+                Utils::ProcessUtils::ProcessId processId,
+                ExtendedProcessAnalysis& result,
+                const ExtendedAnalysisConfig& config = {}
+            );
+
+            /**
+             * @brief Analyzes a PE file for anti-VM indicators
+             *
+             * Performs static analysis of a PE file without executing it:
+             * - Import table analysis for anti-VM APIs
+             * - Section entropy analysis for packing detection
+             * - Entry point anomaly detection
+             * - TLS callback enumeration
+             *
+             * @param filePath Path to PE file
+             * @param result Output: PE analysis results
+             * @param config Analysis configuration
+             * @return true if analysis completed successfully
+             */
+            [[nodiscard]] bool AnalyzePEFile(
+                const std::wstring& filePath,
+                PEAnalysisResult& result,
+                const ExtendedAnalysisConfig& config = {}
+            );
+
+            /**
+             * @brief Analyzes a memory buffer for anti-VM code patterns using Zydis
+             *
+             * Disassembles the provided buffer and identifies anti-VM instructions:
+             * - CPUID, RDTSC, SIDT, SGDT, SLDT, STR
+             * - IN/OUT port access instructions
+             * - VMCALL, VMMCALL, VMX instructions
+             * - Timing attack patterns (RDTSC sandwiches)
+             *
+             * @param buffer Memory buffer to analyze
+             * @param virtualAddress Base VA for disassembly (for proper addressing)
+             * @param is64Bit True for x64 code, false for x86
+             * @param result Output: Code analysis results
+             * @param config Analysis configuration
+             * @return true if analysis completed successfully
+             */
+            [[nodiscard]] bool AnalyzeCodeBuffer(
+                std::span<const uint8_t> buffer,
+                uint64_t virtualAddress,
+                bool is64Bit,
+                CodeAnalysisResult& result,
+                const ExtendedAnalysisConfig& config = {}
+            );
+
+            /**
+             * @brief Batch analysis of multiple PE files
+             *
+             * @param filePaths List of PE file paths
+             * @param results Output: Map of path to analysis result
+             * @param config Analysis configuration
+             * @return Number of files successfully analyzed
+             */
+            [[nodiscard]] size_t AnalyzePEFilesBatch(
+                std::span<const std::wstring> filePaths,
+                std::unordered_map<std::wstring, PEAnalysisResult>& results,
+                const ExtendedAnalysisConfig& config = {}
+            );
+
+            /**
+             * @brief Checks if a specific import is associated with anti-VM behavior
+             *
+             * @param dllName Source DLL name
+             * @param functionName Imported function name
+             * @return Associated technique, or AntiVMTechnique::None
+             */
+            [[nodiscard]] static AntiVMTechnique ClassifyImport(
+                std::string_view dllName,
+                std::string_view functionName
+            );
+
+            /**
+             * @brief Gets the evasion score for a specific instruction mnemonic
+             *
+             * @param mnemonic Instruction mnemonic (lowercase)
+             * @return Score contribution (0-100), 0 if not anti-VM related
+             */
+            [[nodiscard]] static float GetInstructionEvasionScore(std::string_view mnemonic);
 
             // ========================================================================
             // Individual Detection Methods

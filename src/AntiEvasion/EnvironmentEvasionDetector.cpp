@@ -72,65 +72,181 @@
 
 // ============================================================================
 // EXTERNAL ASSEMBLY FUNCTIONS
-// Defined in EnvironmentEvasionDetector.asm
+// Defined in EnvironmentEvasionDetector_x64.asm
 // High-precision CPU detection that cannot be reliably performed in C++
 // ============================================================================
 
 extern "C" {
+    // ========================================================================
+    // CPUID-BASED DETECTION
+    // ========================================================================
+
     /// @brief Check CPUID hypervisor bit (leaf 1, ECX bit 31)
     /// @return 1 if hypervisor detected, 0 otherwise
-    uint64_t CheckCPUIDHypervisorBit();
+    uint64_t CheckCPUIDHypervisorBit() noexcept;
 
     /// @brief Get 48-byte CPU brand string from CPUID leaves 0x80000002-0x80000004
     /// @param buffer Output buffer (must be at least 49 bytes)
     /// @param bufferSize Size of buffer
-    void GetCPUIDBrandString(char* buffer, size_t bufferSize);
+    void GetCPUIDBrandString(char* buffer, size_t bufferSize) noexcept;
 
     /// @brief Check if CPU supports VMX (VT-x) virtualization
     /// @return 1 if VMX supported, 0 otherwise
-    uint64_t CheckCPUIDVMXSupport();
+    uint64_t CheckCPUIDVMXSupport() noexcept;
 
     /// @brief Get 12-byte CPU vendor string from CPUID leaf 0
     /// @param buffer Output buffer (must be at least 13 bytes)
     /// @param bufferSize Size of buffer
-    void GetCPUIDVendorString(char* buffer, size_t bufferSize);
+    void GetCPUIDVendorString(char* buffer, size_t bufferSize) noexcept;
 
     /// @brief Get hypervisor vendor string if hypervisor present (CPUID 0x40000000)
     /// @param buffer Output buffer (must be at least 13 bytes)
     /// @param bufferSize Size of buffer
     /// @return 1 if hypervisor vendor retrieved, 0 otherwise
-    uint64_t CheckCPUIDHypervisorVendor(char* buffer, size_t bufferSize);
-
-    /// @brief Measure RDTSC instruction latency for VM detection
-    /// @return Delta TSC cycles (high values indicate VM overhead)
-    uint64_t MeasureRDTSCLatency();
-
-    /// @brief Read DR7 debug control register (requires Ring 0)
-    /// @return DR7 value
-    uint64_t CheckDebugRegistersASM();
+    uint64_t CheckCPUIDHypervisorVendor(char* buffer, size_t bufferSize) noexcept;
 
     /// @brief Get CPU feature flags from CPUID leaf 1
     /// @param ecxFeatures Pointer to store ECX features
     /// @param edxFeatures Pointer to store EDX features
     /// @return 1 on success
-    uint64_t GetCPUIDFeatureFlags(uint32_t* ecxFeatures, uint32_t* edxFeatures);
+    uint64_t GetCPUIDFeatureFlags(uint32_t* ecxFeatures, uint32_t* edxFeatures) noexcept;
 
     /// @brief Get maximum extended CPUID leaf
     /// @return Max extended leaf (e.g., 0x80000008)
-    uint64_t GetExtendedCPUIDMaxLeaf();
+    uint64_t GetExtendedCPUIDMaxLeaf() noexcept;
+
+    /// @brief Check SSE2 support via CPUID
+    /// @return 1 if SSE2 supported, 0 otherwise
+    uint64_t CheckSSE2Support() noexcept;
+
+    /// @brief Get processor core count from CPUID
+    /// @return Logical processor count
+    uint64_t GetProcessorCoreCount() noexcept;
+
+    // ========================================================================
+    // TIMING-BASED DETECTION
+    // ========================================================================
+
+    /// @brief Measure RDTSC timing delta for VM/sandbox detection
+    /// @param iterations Number of measurement iterations (max 65536)
+    /// @return Total delta cycles across all iterations
+    uint64_t MeasureRDTSCTimingDelta(uint32_t iterations) noexcept;
+
+    /// @brief Measure RDTSCP timing (serializing variant)
+    /// @param iterations Number of measurement iterations (max 65536)
+    /// @return Average delta cycles per iteration
+    uint64_t MeasureRDTSCPTiming(uint32_t iterations) noexcept;
+
+    /// @brief Measure CPUID instruction timing for VM detection
+    /// @param iterations Number of CPUID executions to measure
+    /// @return Total cycles for all CPUID executions
+    uint64_t MeasureCPUIDTiming(uint32_t iterations) noexcept;
+
+    /// @brief Measure INT instruction timing for exception-based detection
+    /// @param iterations Number of samples
+    /// @return Total cycles (0 if exception occurred)
+    uint64_t MeasureINTTimingDelta(uint32_t iterations) noexcept;
+
+    /// @brief Measure exception handler timing
+    /// @param iterations Number of iterations
+    /// @return Timing indicator (cycles per exception simulation)
+    uint64_t MeasureExceptionTiming(uint32_t iterations) noexcept;
+
+    /// @brief Measure RDTSC instruction latency for VM detection (single measurement)
+    /// @return Delta TSC cycles (high values indicate VM overhead)
+    uint64_t MeasureRDTSCLatency() noexcept;
 
     /// @brief Perform RDTSCP measurement with processor ID
     /// @param processorId Pointer to store processor ID (can be NULL)
     /// @return TSC value
-    uint64_t PerformRDTSCPMeasurement(uint32_t* processorId);
+    uint64_t PerformRDTSCPMeasurement(uint32_t* processorId) noexcept;
 
-    /// @brief Check SSE2 support via CPUID
-    /// @return 1 if SSE2 supported, 0 otherwise
-    uint64_t CheckSSE2Support();
+    /// @brief Generic instruction timing measurement
+    /// @param iterations Number of iterations
+    /// @return Total cycles
+    uint64_t MeasureInstructionTiming(uint32_t iterations) noexcept;
 
-    /// @brief Get processor core count from CPUID
-    /// @return Logical processor count
-    uint64_t GetProcessorCoreCount();
+    /// @brief Measure POPF instruction timing for TF manipulation detection
+    /// @param iterations Number of iterations
+    /// @return Total cycles
+    uint64_t DetectPopfTiming(uint32_t iterations) noexcept;
+
+    // ========================================================================
+    // DESCRIPTOR TABLE ANALYSIS
+    // ========================================================================
+
+    /// @brief Get IDT base address via SIDT instruction
+    /// @return IDT base address (64-bit)
+    uint64_t GetIDTBase() noexcept;
+
+    /// @brief Get GDT base address via SGDT instruction
+    /// @return GDT base address (64-bit)
+    uint64_t GetGDTBase() noexcept;
+
+    /// @brief Get LDT selector via SLDT instruction
+    /// @return LDT selector (16-bit value)
+    uint16_t GetLDTSelector() noexcept;
+
+    /// @brief Get Task Register selector via STR instruction (SWIZZ test)
+    /// @return TR selector (16-bit value)
+    uint16_t GetTRSelector() noexcept;
+
+    /// @brief Check segment limits for CS, DS, SS segments
+    /// @param csLimit Output for CS limit
+    /// @param dsLimit Output for DS limit
+    /// @param ssLimit Output for SS limit
+    /// @return 1 if successful, 0 if failed
+    uint64_t CheckSegmentLimits(uint32_t* csLimit, uint32_t* dsLimit, uint32_t* ssLimit) noexcept;
+
+    /// @brief Get both IDT and GDT information including limits
+    /// @param idtBase Output for IDT base
+    /// @param idtLimit Output for IDT limit
+    /// @param gdtBase Output for GDT base
+    /// @param gdtLimit Output for GDT limit
+    /// @return 1 if successful
+    uint64_t GetIDTAndGDTInfo(uint64_t* idtBase, uint16_t* idtLimit,
+                              uint64_t* gdtBase, uint16_t* gdtLimit) noexcept;
+
+    // ========================================================================
+    // DEBUG DETECTION
+    // ========================================================================
+
+    /// @brief Attempt to read debug registers (stub - requires ring 0)
+    /// @return 1 if successful, 0 if access denied
+    uint64_t GetDebugRegisters(uint64_t* dr0, uint64_t* dr1, uint64_t* dr2,
+                               uint64_t* dr3, uint64_t* dr6, uint64_t* dr7) noexcept;
+
+    /// @brief Detect hardware breakpoints using timing-based detection
+    /// @return 1 if hardware breakpoints detected, 0 otherwise
+    uint64_t DetectHardwareBreakpoints() noexcept;
+
+    /// @brief Detect single-stepping by checking timing anomalies
+    /// @return 1 if single-step detected, 0 otherwise
+    uint64_t DetectSingleStep() noexcept;
+
+    /// @brief Check if Trap Flag is set in EFLAGS
+    /// @return 1 if TF is set, 0 otherwise
+    uint64_t CheckTrapFlag() noexcept;
+
+    /// @brief Read DR7 debug control register (requires Ring 0, stub in user mode)
+    /// @return DR7 value or 0 if access denied
+    uint64_t CheckDebugRegistersASM() noexcept;
+
+    // ========================================================================
+    // MEMORY/PEB ANALYSIS
+    // ========================================================================
+
+    /// @brief Check NtGlobalFlag in PEB for debug indicators
+    /// @return NtGlobalFlag value (non-zero indicates debugger)
+    uint32_t CheckNtGlobalFlag() noexcept;
+
+    /// @brief Get process heap flags for debug detection
+    /// @return Heap Flags value
+    uint32_t GetProcessHeapFlags() noexcept;
+
+    /// @brief Check BeingDebugged flag in PEB
+    /// @return 1 if BeingDebugged is set, 0 otherwise
+    uint64_t CheckBeingDebugged() noexcept;
 }
 
 namespace fs = std::filesystem;
@@ -4234,6 +4350,114 @@ namespace ShadowStrike::AntiEvasion {
 
     bool EnvironmentEvasionDetector::LooksLikeHash(std::wstring_view name, std::wstring& hashType) const noexcept {
         return m_impl->LooksLikeHash(name, hashType);
+    }
+
+    // ========================================================================
+    // PRIVATE INTERNAL METHOD WRAPPERS
+    // These delegate to Impl for data collection operations
+    // ========================================================================
+
+    void EnvironmentEvasionDetector::CollectHardwareInfo(HardwareFingerprintInfo& info) noexcept {
+        m_impl->CollectHardwareInfo(info);
+    }
+
+    void EnvironmentEvasionDetector::CollectIdentityInfo(SystemIdentityInfo& info) noexcept {
+        m_impl->CollectIdentityInfo(info);
+    }
+
+    void EnvironmentEvasionDetector::CollectNetworkInfo(NetworkConfigInfo& info) noexcept {
+        m_impl->CollectNetworkInfo(info);
+    }
+
+    void EnvironmentEvasionDetector::CollectUserActivityInfo(UserActivityInfo& info) noexcept {
+        m_impl->CollectUserActivityInfo(info);
+    }
+
+    void EnvironmentEvasionDetector::AnalyzeFileNaming(std::wstring_view filePath, FileNamingInfo& info) noexcept {
+        m_impl->AnalyzeFileNaming(filePath, info);
+    }
+
+    void EnvironmentEvasionDetector::CalculateEvasionScore(EnvironmentEvasionResult& result) noexcept {
+        // Calculate weighted evasion score based on detected techniques
+        double totalScore = 0.0;
+        double maxPossibleScore = 0.0;
+
+        for (const auto& detection : result.detectedTechniques) {
+            double weight = detection.weight;
+            double confidence = detection.confidence;
+
+            // Apply severity multiplier
+            double severityMultiplier = 1.0;
+            switch (detection.severity) {
+            case EnvironmentEvasionSeverity::Low:
+                severityMultiplier = 1.0;
+                break;
+            case EnvironmentEvasionSeverity::Medium:
+                severityMultiplier = 1.5;
+                break;
+            case EnvironmentEvasionSeverity::High:
+                severityMultiplier = 2.0;
+                break;
+            case EnvironmentEvasionSeverity::Critical:
+                severityMultiplier = 3.0;
+                break;
+            }
+
+            totalScore += weight * confidence * severityMultiplier;
+            maxPossibleScore += weight * severityMultiplier;
+
+            // Update max severity
+            if (detection.severity > result.maxSeverity) {
+                result.maxSeverity = detection.severity;
+            }
+
+            // Update detected categories bitfield
+            result.detectedCategories |= (1u << static_cast<uint32_t>(detection.category));
+        }
+
+        // Normalize to 0-100 scale
+        if (maxPossibleScore > 0) {
+            result.evasionScore = (totalScore / maxPossibleScore) * 100.0;
+        } else {
+            result.evasionScore = 0.0;
+        }
+
+        // Cap at 100
+        if (result.evasionScore > 100.0) {
+            result.evasionScore = 100.0;
+        }
+
+        // Determine if evasive based on threshold
+        result.isEvasive = result.evasionScore >= EnvironmentConstants::HIGH_EVASION_THRESHOLD ||
+                          result.maxSeverity >= EnvironmentEvasionSeverity::High;
+
+        result.totalDetections = static_cast<uint32_t>(result.detectedTechniques.size());
+    }
+
+    void EnvironmentEvasionDetector::AddDetection(
+        EnvironmentEvasionResult& result,
+        EnvironmentDetectedTechnique detection
+    ) noexcept {
+        // Add detection to result
+        result.detectedTechniques.push_back(std::move(detection));
+
+        // Invoke callback if set
+        std::shared_lock lock(m_impl->m_mutex);
+        if (m_impl->m_detectionCallback) {
+            try {
+                m_impl->m_detectionCallback(result.targetPid, result.detectedTechniques.back());
+            }
+            catch (...) {
+                // Callback failure is non-fatal
+            }
+        }
+
+        // Update statistics
+        m_impl->m_stats.totalDetections++;
+        auto category = static_cast<size_t>(detection.category);
+        if (category < m_impl->m_stats.categoryDetections.size()) {
+            m_impl->m_stats.categoryDetections[category]++;
+        }
     }
 
     // ========================================================================

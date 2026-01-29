@@ -1490,6 +1490,569 @@ namespace ShadowStrike {
             bool valid = false;
         };
 
+        // ============================================================================
+        // ANTI-DEBUG TECHNIQUE ENUMERATION (Enterprise Enhancement)
+        // ============================================================================
+
+        /**
+         * @brief Specific anti-debugging technique identifiers for code analysis
+         *
+         * These are used by the Zydis integration to identify anti-debug patterns
+         * in process code. Categorized by detection method.
+         */
+        enum class AntiDebugTechnique : uint32_t {
+            None = 0x00000000,
+
+            // ====================================================================
+            // API-BASED DETECTION (0x01xxxxxx)
+            // ====================================================================
+
+            /// @brief IsDebuggerPresent() API call
+            IsDebuggerPresent = 0x01000001,
+
+            /// @brief CheckRemoteDebuggerPresent() API call
+            CheckRemoteDebuggerPresent = 0x01000002,
+
+            /// @brief NtQueryInformationProcess with ProcessDebugPort/ProcessDebugFlags
+            NtQueryInformationProcess = 0x01000004,
+
+            /// @brief NtQuerySystemInformation for debugger detection
+            NtQuerySystemInformation = 0x01000008,
+
+            /// @brief OutputDebugString for debugger detection
+            OutputDebugString = 0x01000010,
+
+            /// @brief NtClose with invalid handle
+            NtCloseInvalidHandle = 0x01000020,
+
+            /// @brief CloseHandle with protected handle
+            CloseHandleProtected = 0x01000040,
+
+            /// @brief NtQueryObject for debug object detection
+            NtQueryObject = 0x01000080,
+
+            /// @brief FindWindow for debugger windows
+            FindWindowDebugger = 0x01000100,
+
+            /// @brief EnumWindows for analysis tools
+            EnumWindowsAnalysis = 0x01000200,
+
+            // ====================================================================
+            // TIMING-BASED DETECTION (0x02xxxxxx)
+            // ====================================================================
+
+            /// @brief RDTSC timing delta check
+            RDTSCDelta = 0x02000001,
+
+            /// @brief RDTSCP timing check
+            RDTSCPDelta = 0x02000002,
+
+            /// @brief GetTickCount/GetTickCount64 delta
+            GetTickCountDelta = 0x02000004,
+
+            /// @brief QueryPerformanceCounter delta
+            QueryPerformanceCounterDelta = 0x02000008,
+
+            /// @brief timeGetTime delta check
+            TimeGetTimeDelta = 0x02000010,
+
+            /// @brief CPUID timing measurement
+            CPUIDTiming = 0x02000020,
+
+            /// @brief Sleep timing verification
+            SleepTiming = 0x02000040,
+
+            /// @brief NtDelayExecution timing
+            NtDelayExecutionTiming = 0x02000080,
+
+            // ====================================================================
+            // EXCEPTION-BASED DETECTION (0x03xxxxxx)
+            // ====================================================================
+
+            /// @brief INT 3 (breakpoint) exception
+            INT3Exception = 0x03000001,
+
+            /// @brief INT 2D (kernel debugger) exception
+            INT2DException = 0x03000002,
+
+            /// @brief INT 1 (single-step) exception
+            INT1Exception = 0x03000004,
+
+            /// @brief RaiseException for debugger detection
+            RaiseException = 0x03000008,
+
+            /// @brief SetUnhandledExceptionFilter manipulation
+            UnhandledExceptionFilter = 0x03000010,
+
+            /// @brief VEH (Vectored Exception Handler) tricks
+            VectoredExceptionHandler = 0x03000020,
+
+            /// @brief ICE breakpoint (0xF1)
+            ICEBreakpoint = 0x03000040,
+
+            /// @brief UD2 instruction for exception
+            UD2Exception = 0x03000080,
+
+            /// @brief BOUND instruction exception
+            BOUNDException = 0x03000100,
+
+            // ====================================================================
+            // HARDWARE-BASED DETECTION (0x04xxxxxx)
+            // ====================================================================
+
+            /// @brief Hardware breakpoint detection (DR0-DR3)
+            HardwareBreakpoints = 0x04000001,
+
+            /// @brief Debug register (DR7) check
+            DebugRegisters = 0x04000002,
+
+            /// @brief Single-step flag detection
+            SingleStep = 0x04000004,
+
+            /// @brief Trap flag (TF) manipulation
+            TrapFlag = 0x04000008,
+
+            /// @brief GetThreadContext for DR check
+            GetThreadContextDR = 0x04000010,
+
+            /// @brief SetThreadContext to clear DRs
+            SetThreadContextDR = 0x04000020,
+
+            /// @brief NtGetContextThread for DR check
+            NtGetContextThread = 0x04000040,
+
+            /// @brief NtSetContextThread to modify DRs
+            NtSetContextThread = 0x04000080,
+
+            // ====================================================================
+            // MEMORY/PEB-BASED DETECTION (0x05xxxxxx)
+            // ====================================================================
+
+            /// @brief PEB.BeingDebugged flag check
+            PEBBeingDebugged = 0x05000001,
+
+            /// @brief PEB.NtGlobalFlag check (heap flags)
+            NtGlobalFlag = 0x05000002,
+
+            /// @brief Process heap flags check
+            HeapFlags = 0x05000004,
+
+            /// @brief ProcessHeap.ForceFlags check
+            HeapForceFlags = 0x05000008,
+
+            /// @brief Heap tail checking detection
+            HeapTailCheck = 0x05000010,
+
+            /// @brief NtQueryInformationProcess ProcessBasicInformation
+            ProcessBasicInformation = 0x05000020,
+
+            /// @brief Memory breakpoint detection
+            MemoryBreakpoints = 0x05000040,
+
+            /// @brief Page guard detection
+            PageGuardDetection = 0x05000080,
+
+            // ====================================================================
+            // ADVANCED TECHNIQUES (0x06xxxxxx)
+            // ====================================================================
+
+            /// @brief ThreadHideFromDebugger
+            ThreadHideFromDebugger = 0x06000001,
+
+            /// @brief NtSetInformationThread to hide
+            NtSetInformationThread = 0x06000002,
+
+            /// @brief BlockInput to prevent interaction
+            BlockInput = 0x06000004,
+
+            /// @brief Self-debugging (debug own process)
+            SelfDebugging = 0x06000008,
+
+            /// @brief Parent process check
+            ParentProcessCheck = 0x06000010,
+
+            /// @brief Debug object handle check
+            DebugObjectHandle = 0x06000020,
+
+            /// @brief NtCreateDebugObject detection
+            NtCreateDebugObject = 0x06000040,
+
+            /// @brief Process job object check
+            ProcessJobCheck = 0x06000080,
+
+            /// @brief TLS callback anti-debug
+            TLSCallbackAntiDebug = 0x06000100,
+
+            /// @brief Timing attack using WaitForDebugEvent
+            WaitForDebugEvent = 0x06000200,
+
+            /// @brief Process instrumentation callback
+            InstrumentationCallback = 0x06000400,
+
+            /// @brief Syscall-based detection
+            DirectSyscall = 0x06000800,
+        };
+
+        // Bitwise operators for AntiDebugTechnique
+        inline constexpr AntiDebugTechnique operator|(AntiDebugTechnique a, AntiDebugTechnique b) noexcept {
+            return static_cast<AntiDebugTechnique>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+        }
+
+        inline constexpr AntiDebugTechnique operator&(AntiDebugTechnique a, AntiDebugTechnique b) noexcept {
+            return static_cast<AntiDebugTechnique>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+        }
+
+        inline constexpr bool HasAntiDebugTechnique(AntiDebugTechnique flags, AntiDebugTechnique flag) noexcept {
+            return (static_cast<uint32_t>(flags) & static_cast<uint32_t>(flag)) != 0;
+        }
+
+        // ============================================================================
+        // ZYDIS INTEGRATION STRUCTURES (Enterprise Enhancement)
+        // ============================================================================
+
+        /**
+         * @brief Disassembled instruction with anti-debug context
+         */
+        struct DisassembledInstruction {
+            /// @brief Virtual address of instruction
+            uint64_t address = 0;
+
+            /// @brief Instruction length in bytes
+            size_t length = 0;
+
+            /// @brief Raw instruction bytes
+            std::array<uint8_t, 15> bytes{};
+
+            /// @brief Disassembled mnemonic (e.g., "RDTSC", "CPUID")
+            std::string mnemonic;
+
+            /// @brief Full instruction text
+            std::string instructionText;
+
+            /// @brief Is this a privileged instruction?
+            bool isPrivileged = false;
+
+            /// @brief Is this a timing-related instruction?
+            bool isTimingInstruction = false;
+
+            /// @brief Is this an anti-debug instruction?
+            bool isAntiDebugInstruction = false;
+
+            /// @brief Associated anti-debug technique (if any)
+            AntiDebugTechnique technique = AntiDebugTechnique::None;
+
+            /// @brief Confidence score (0.0 - 1.0)
+            double confidence = 0.0;
+
+            /// @brief Context (surrounding instructions summary)
+            std::string context;
+        };
+
+        /**
+         * @brief Result of Zydis-based code pattern analysis
+         */
+        struct EnvironmentCodeAnalysisResult {
+            /// @brief Instructions identified as anti-debug
+            std::vector<DisassembledInstruction> antiDebugInstructions;
+
+            /// @brief Instructions identified as anti-sandbox
+            std::vector<DisassembledInstruction> antiSandboxInstructions;
+
+            /// @brief Total instructions analyzed
+            size_t totalInstructionsAnalyzed = 0;
+
+            /// @brief RDTSC instruction count
+            size_t rdtscCount = 0;
+
+            /// @brief RDTSCP instruction count
+            size_t rdtscpCount = 0;
+
+            /// @brief CPUID instruction count
+            size_t cpuidCount = 0;
+
+            /// @brief INT instruction count (INT 1, INT 2D, INT 3)
+            size_t intCount = 0;
+
+            /// @brief IN/OUT instruction count (I/O port access)
+            size_t ioInstructionCount = 0;
+
+            /// @brief Debug API call count
+            size_t debugApiCount = 0;
+
+            /// @brief Suspicious call count (to known anti-debug APIs)
+            size_t suspiciousCallCount = 0;
+
+            /// @brief SIDT/SGDT/SLDT/STR instruction count
+            size_t descriptorTableAccessCount = 0;
+
+            /// @brief Has timing loop pattern detected
+            bool hasTimingLoop = false;
+
+            /// @brief Has exception-based anti-debug pattern
+            bool hasExceptionAbuse = false;
+
+            /// @brief Has PEB/TEB access pattern
+            bool hasPEBAccess = false;
+
+            /// @brief Has debug register access pattern
+            bool hasDebugRegisterAccess = false;
+
+            /// @brief Has self-modifying code detected
+            bool hasSelfModifyingCode = false;
+
+            /// @brief Combined anti-debug techniques detected
+            AntiDebugTechnique detectedTechniques = AntiDebugTechnique::None;
+
+            /// @brief Overall evasion score from code analysis (0.0 - 100.0)
+            float evasionScore = 0.0f;
+
+            /// @brief Analysis was successful
+            bool valid = false;
+
+            /// @brief Error message if analysis failed
+            std::wstring errorMessage;
+
+            /// @brief Analysis duration in microseconds
+            uint64_t analysisDurationUs = 0;
+        };
+
+        // ============================================================================
+        // PEPARSER INTEGRATION STRUCTURES (Enterprise Enhancement)
+        // ============================================================================
+
+        /**
+         * @brief Suspicious import for anti-debug detection
+         */
+        struct SuspiciousAntiDebugImport {
+            /// @brief DLL name (e.g., "kernel32.dll", "ntdll.dll")
+            std::string dllName;
+
+            /// @brief Function name (e.g., "IsDebuggerPresent")
+            std::string functionName;
+
+            /// @brief Import address table entry RVA
+            uint32_t iatRva = 0;
+
+            /// @brief Associated anti-debug technique
+            AntiDebugTechnique technique = AntiDebugTechnique::None;
+
+            /// @brief Risk level (0.0 - 1.0)
+            double riskLevel = 0.0;
+
+            /// @brief Description of why this import is suspicious
+            std::string description;
+        };
+
+        /**
+         * @brief Suspicious import for anti-sandbox detection
+         */
+        struct SuspiciousAntiSandboxImport {
+            /// @brief DLL name
+            std::string dllName;
+
+            /// @brief Function name
+            std::string functionName;
+
+            /// @brief Import address table entry RVA
+            uint32_t iatRva = 0;
+
+            /// @brief Associated environment technique
+            EnvironmentEvasionTechnique technique = EnvironmentEvasionTechnique::None;
+
+            /// @brief Risk level (0.0 - 1.0)
+            double riskLevel = 0.0;
+
+            /// @brief Description
+            std::string description;
+        };
+
+        /**
+         * @brief Result of PE import/section analysis
+         */
+        struct EnvironmentPEAnalysisResult {
+            /// @brief Anti-debug imports found
+            std::vector<SuspiciousAntiDebugImport> antiDebugImports;
+
+            /// @brief Anti-sandbox imports found
+            std::vector<SuspiciousAntiSandboxImport> antiSandboxImports;
+
+            /// @brief IsDebuggerPresent import count
+            size_t isDebuggerPresentCount = 0;
+
+            /// @brief CheckRemoteDebuggerPresent import count
+            size_t checkRemoteDebuggerPresentCount = 0;
+
+            /// @brief NtQueryInformationProcess import count
+            size_t ntQueryInformationProcessCount = 0;
+
+            /// @brief NtQuerySystemInformation import count
+            size_t ntQuerySystemInformationCount = 0;
+
+            /// @brief GetTickCount/GetTickCount64 import count
+            size_t getTickCountCount = 0;
+
+            /// @brief QueryPerformanceCounter import count
+            size_t queryPerformanceCounterCount = 0;
+
+            /// @brief GetSystemInfo import count
+            size_t getSystemInfoCount = 0;
+
+            /// @brief Total suspicious import count
+            size_t totalSuspiciousImports = 0;
+
+            /// @brief Has TLS callbacks
+            bool hasTLSCallbacks = false;
+
+            /// @brief Number of TLS callbacks
+            size_t tlsCallbackCount = 0;
+
+            /// @brief Has anti-debug section (suspicious section names)
+            bool hasAntiDebugSection = false;
+
+            /// @brief Suspicious section names found
+            std::vector<std::string> suspiciousSectionNames;
+
+            /// @brief Has executable .data section
+            bool hasExecutableDataSection = false;
+
+            /// @brief Has writable .text section
+            bool hasWritableCodeSection = false;
+
+            /// @brief Entry point is outside .text section
+            bool entryPointOutsideCode = false;
+
+            /// @brief Has overlay data
+            bool hasOverlay = false;
+
+            /// @brief Overlay size if present
+            size_t overlaySize = 0;
+
+            /// @brief Combined anti-debug techniques detected from imports
+            AntiDebugTechnique detectedTechniques = AntiDebugTechnique::None;
+
+            /// @brief Overall risk score (0.0 - 100.0)
+            float riskScore = 0.0f;
+
+            /// @brief Analysis was successful
+            bool valid = false;
+
+            /// @brief Error message if analysis failed
+            std::wstring errorMessage;
+        };
+
+        // ============================================================================
+        // EXTENDED ANALYSIS CONFIGURATION (Enterprise Enhancement)
+        // ============================================================================
+
+        /**
+         * @brief Extended configuration for Zydis/PEParser analysis
+         */
+        struct ExtendedEnvironmentAnalysisConfig {
+            /// @brief Enable Zydis disassembly analysis
+            bool enableZydisAnalysis = true;
+
+            /// @brief Enable PE import/section analysis
+            bool enablePEAnalysis = true;
+
+            /// @brief Enable advanced timing analysis (assembly-level)
+            bool enableTimingAnalysis = true;
+
+            /// @brief Enable hardware breakpoint detection
+            bool enableHardwareBreakpointDetection = true;
+
+            /// @brief Enable PEB/TEB flag detection
+            bool enablePEBFlagDetection = true;
+
+            /// @brief Enable exception-based detection
+            bool enableExceptionDetection = true;
+
+            /// @brief Maximum instructions to analyze per region
+            size_t maxInstructionsToAnalyze = 50000;
+
+            /// @brief Maximum code regions to scan
+            size_t maxCodeRegions = 64;
+
+            /// @brief Maximum import entries to analyze
+            size_t maxImportsToAnalyze = 10000;
+
+            /// @brief Analysis timeout in milliseconds
+            uint32_t timeoutMs = 60000;
+
+            /// @brief Minimum instruction confidence to report
+            double minInstructionConfidence = 0.5;
+
+            /// @brief Minimum import risk level to report
+            double minImportRiskLevel = 0.3;
+
+            /// @brief Follow indirect calls for analysis
+            bool followIndirectCalls = false;
+
+            /// @brief Analyze only entry point region
+            bool analyzeEntryPointOnly = false;
+
+            /// @brief Include API hook detection
+            bool detectAPIHooks = true;
+
+            /// @brief Include inline hook detection
+            bool detectInlineHooks = true;
+        };
+
+        /**
+         * @brief Combined extended analysis result
+         */
+        struct ExtendedEnvironmentAnalysisResult {
+            /// @brief Code analysis result (Zydis)
+            EnvironmentCodeAnalysisResult codeAnalysis;
+
+            /// @brief PE analysis result (PEParser)
+            EnvironmentPEAnalysisResult peAnalysis;
+
+            /// @brief Descriptor table analysis results
+            struct DescriptorTableInfo {
+                uint64_t idtBase = 0;
+                uint16_t idtLimit = 0;
+                uint64_t gdtBase = 0;
+                uint16_t gdtLimit = 0;
+                uint16_t ldtSelector = 0;
+                uint16_t trSelector = 0;
+                bool idtRelocated = false;  ///< IDT at unusual address
+                bool gdtRelocated = false;  ///< GDT at unusual address
+                bool valid = false;
+            } descriptorTables;
+
+            /// @brief Debug detection results
+            struct DebugDetectionInfo {
+                bool beingDebugged = false;             ///< PEB.BeingDebugged
+                uint32_t ntGlobalFlag = 0;              ///< PEB.NtGlobalFlag
+                uint32_t heapFlags = 0;                 ///< Process heap flags
+                bool hardwareBreakpointsDetected = false;
+                bool singleStepDetected = false;
+                bool trapFlagSet = false;
+                uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0, dr6 = 0, dr7 = 0;
+                bool valid = false;
+            } debugDetection;
+
+            /// @brief Timing analysis results
+            struct TimingAnalysisInfo {
+                uint64_t rdtscDelta = 0;            ///< RDTSC timing delta
+                uint64_t rdtscpDelta = 0;           ///< RDTSCP timing delta
+                uint64_t cpuidTiming = 0;           ///< CPUID instruction timing
+                uint64_t exceptionTiming = 0;       ///< Exception handling timing
+                bool timingAnomalyDetected = false; ///< Abnormal timing detected
+                double averageCyclesPerMeasurement = 0.0;
+                bool valid = false;
+            } timingAnalysis;
+
+            /// @brief Combined score from all analyses (0.0 - 100.0)
+            double combinedEvasionScore = 0.0;
+
+            /// @brief Analysis completed successfully
+            bool valid = false;
+
+            /// @brief Total analysis duration in milliseconds
+            uint64_t totalDurationMs = 0;
+        };
+
         /**
          * @brief File naming analysis
          */
