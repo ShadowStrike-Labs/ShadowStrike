@@ -14,7 +14,8 @@
  * - Exception-safe with comprehensive error handling
  * - Statistics tracking for all operations
  * - Memory-safe with smart pointers only
- * - Infrastructure reuse (Utils/, PatternStore)
+ * - Infrastructure reuse (Utils/, PatternStore, PEParser)
+ * - Zydis disassembler for advanced code analysis
  */
 
 #include "pch.h"
@@ -45,6 +46,12 @@
 #pragma comment(lib, "wintrust.lib")
 
 // ============================================================================
+// ZYDIS DISASSEMBLER
+// ============================================================================
+
+#include <Zydis/Zydis.h>
+
+// ============================================================================
 // SHADOWSTRIKE INTERNAL INCLUDES
 // ============================================================================
 
@@ -53,14 +60,28 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#include "../Utils/MemoryUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
+#include "../PEParser/PEParser.hpp"
 
 // ============================================================================
-// INTERNAL DEFINITIONS (NtQueryInformationThread)
+// INTERNAL DEFINITIONS
 // ============================================================================
 
 #ifndef ThreadQuerySetWin32StartAddress
 #define ThreadQuerySetWin32StartAddress 9
+#endif
+
+#ifndef ProcessDebugPort
+#define ProcessDebugPort 7
+#endif
+
+#ifndef ProcessDebugObjectHandle
+#define ProcessDebugObjectHandle 30
+#endif
+
+#ifndef ProcessDebugFlags
+#define ProcessDebugFlags 31
 #endif
 
 typedef NTSTATUS(WINAPI* NtQueryInformationThreadPtr)(
@@ -69,9 +90,99 @@ typedef NTSTATUS(WINAPI* NtQueryInformationThreadPtr)(
     PVOID ThreadInformation,
     ULONG ThreadInformationLength,
     PULONG ReturnLength
-    );
+);
+
+typedef NTSTATUS(WINAPI* NtQueryInformationProcessPtr)(
+    HANDLE ProcessHandle,
+    PROCESSINFOCLASS ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength
+);
 
 namespace ShadowStrike::AntiEvasion {
+
+    // ========================================================================
+    // LOGGING CATEGORY
+    // ========================================================================
+
+    static constexpr const wchar_t* LOG_CATEGORY = L"ProcessEvasion";
+
+    // ========================================================================
+    // INTERNAL CONSTANTS
+    // ========================================================================
+
+    namespace {
+        /// Maximum bytes to read for hook analysis
+        constexpr size_t MAX_HOOK_SCAN_BYTES = 64;
+
+        /// Maximum instructions to disassemble per function
+        constexpr size_t MAX_INSTRUCTIONS_PER_FUNCTION = 32;
+
+        /// Memory scan buffer size
+        constexpr size_t MEMORY_SCAN_BUFFER_SIZE = 4096;
+
+        /// Maximum modules to enumerate
+        constexpr size_t MAX_MODULES = 2048;
+
+        /// Suspicious API patterns for anti-debug detection
+        const std::vector<std::string> ANTI_DEBUG_APIS = {
+            "IsDebuggerPresent",
+            "CheckRemoteDebuggerPresent",
+            "NtQueryInformationProcess",
+            "NtSetInformationThread",
+            "NtQuerySystemInformation",
+            "OutputDebugStringA",
+            "OutputDebugStringW",
+            "GetTickCount",
+            "GetTickCount64",
+            "QueryPerformanceCounter",
+            "rdtsc"
+        };
+
+        /// Suspicious API patterns for injection detection
+        const std::vector<std::string> INJECTION_APIS = {
+            "VirtualAllocEx",
+            "VirtualProtectEx",
+            "WriteProcessMemory",
+            "CreateRemoteThread",
+            "CreateRemoteThreadEx",
+            "NtCreateThreadEx",
+            "RtlCreateUserThread",
+            "QueueUserAPC",
+            "NtQueueApcThread",
+            "SetThreadContext",
+            "NtSetContextThread",
+            "NtMapViewOfSection",
+            "NtUnmapViewOfSection"
+        };
+
+        /// Suspicious API patterns for privilege escalation
+        const std::vector<std::string> PRIVILEGE_APIS = {
+            "AdjustTokenPrivileges",
+            "LookupPrivilegeValueW",
+            "OpenProcessToken",
+            "DuplicateTokenEx",
+            "ImpersonateLoggedOnUser",
+            "SetTokenInformation",
+            "CreateProcessAsUserW",
+            "CreateProcessWithTokenW"
+        };
+
+        /// Known shellcode byte patterns (common prologues)
+        const std::vector<std::vector<uint8_t>> SHELLCODE_PATTERNS = {
+            // GetPC via CALL $+5
+            {0xE8, 0x00, 0x00, 0x00, 0x00, 0x58},           // call $+5; pop eax
+            {0xE8, 0x00, 0x00, 0x00, 0x00, 0x5B},           // call $+5; pop ebx
+            // Windows API hash resolution pattern
+            {0x60, 0xFC, 0x31, 0xD2, 0x64, 0x8B},           // pushad; cld; xor edx,edx; mov ... fs:[...]
+            // Metasploit-style patterns
+            {0xFC, 0xE8, 0x82, 0x00, 0x00, 0x00},           // cld; call $+0x87
+            {0xFC, 0xE8, 0x89, 0x00, 0x00, 0x00},           // cld; call $+0x8e
+            // Cobalt Strike beacon patterns
+            {0x4D, 0x5A, 0x41, 0x52, 0x55, 0x48},           // MZ header in memory (reflective)
+        };
+    }
 
     // ========================================================================
     // HELPER FUNCTIONS
@@ -160,6 +271,49 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
+    /**
+     * @brief Get MITRE ATT&CK ID for technique
+     */
+    [[nodiscard]] const char* ProcessEvasionTechniqueToMitre(ProcessEvasionTechnique technique) noexcept {
+        switch (technique) {
+        case ProcessEvasionTechnique::INJ_ClassicDLLInjection:
+        case ProcessEvasionTechnique::INJ_ReflectiveDLLInjection:
+            return "T1055.001";  // DLL Injection
+        case ProcessEvasionTechnique::INJ_ProcessHollowing:
+            return "T1055.012";  // Process Hollowing
+        case ProcessEvasionTechnique::INJ_ThreadHijacking:
+            return "T1055.003";  // Thread Execution Hijacking
+        case ProcessEvasionTechnique::INJ_APCInjection:
+            return "T1055.004";  // Asynchronous Procedure Call
+        case ProcessEvasionTechnique::INJ_AtomBombing:
+            return "T1055";      // Process Injection
+        case ProcessEvasionTechnique::INJ_ProcessDoppelganging:
+            return "T1055.013";  // Process Doppelgänging
+        case ProcessEvasionTechnique::INJ_ProcessHerpaderping:
+            return "T1055";      // Process Injection
+        case ProcessEvasionTechnique::MASK_LegitProcessNameAbuse:
+        case ProcessEvasionTechnique::MASK_PathAnomaly:
+            return "T1036.005";  // Masquerading: Match Legitimate Name
+        case ProcessEvasionTechnique::MASK_ParentProcessSpoofing:
+            return "T1134.004";  // Parent PID Spoofing
+        case ProcessEvasionTechnique::ANTI_IsDebuggerPresent:
+        case ProcessEvasionTechnique::ANTI_CheckRemoteDebugger:
+        case ProcessEvasionTechnique::ANTI_NtQueryInformationProcess:
+        case ProcessEvasionTechnique::ANTI_HardwareBreakpointDetection:
+        case ProcessEvasionTechnique::ANTI_SoftwareBreakpointDetection:
+        case ProcessEvasionTechnique::ANTI_TimingBasedDebuggerDetection:
+            return "T1622";      // Debugger Evasion
+        case ProcessEvasionTechnique::PRIV_SeDebugPrivilege:
+        case ProcessEvasionTechnique::PRIV_TokenManipulation:
+        case ProcessEvasionTechnique::PRIV_ImpersonationToken:
+            return "T1134";      // Access Token Manipulation
+        case ProcessEvasionTechnique::PRIV_UACBypass:
+            return "T1548.002";  // Bypass User Account Control
+        default:
+            return "T1055";      // Process Injection (generic)
+        }
+    }
+
     // ========================================================================
     // PIMPL IMPLEMENTATION CLASS
     // ========================================================================
@@ -170,29 +324,47 @@ namespace ShadowStrike::AntiEvasion {
         // MEMBERS
         // ====================================================================
 
-        /// @brief Thread synchronization
+        /// Thread synchronization
         mutable std::shared_mutex m_mutex;
 
-        /// @brief Initialization state
+        /// Initialization state
         std::atomic<bool> m_initialized{ false };
 
-        /// @brief Detection callback
+        /// Detection callback
         ProcessDetectionCallback m_detectionCallback;
 
-        /// @brief Statistics
+        /// Statistics
         ProcessEvasionDetector::Statistics m_stats;
 
-        /// @brief Result cache
+        /// Result cache
         struct CacheEntry {
             ProcessEvasionResult result;
             std::chrono::steady_clock::time_point timestamp;
         };
         std::unordered_map<uint32_t, CacheEntry> m_resultCache;
 
-        /// @brief Pattern Store for shellcode detection
+        /// Pattern Store for shellcode detection
         std::shared_ptr<ShadowStrike::PatternStore::PatternStore> m_patternStore;
 
-        /// @brief Known legitimate process paths (for masquerading detection)
+        /// Zydis decoder for 64-bit code
+        ZydisDecoder m_decoder64{};
+
+        /// Zydis decoder for 32-bit code
+        ZydisDecoder m_decoder32{};
+
+        /// Zydis formatter
+        ZydisFormatter m_formatter{};
+
+        /// Zydis initialized flag
+        bool m_zydisInitialized = false;
+
+        /// NtQueryInformationProcess function pointer
+        NtQueryInformationProcessPtr m_pNtQueryInformationProcess = nullptr;
+
+        /// NtQueryInformationThread function pointer
+        NtQueryInformationThreadPtr m_pNtQueryInformationThread = nullptr;
+
+        /// Known legitimate process paths (for masquerading detection)
         std::unordered_map<std::wstring, std::wstring> m_legitimateProcessPaths = {
             {L"svchost.exe", L"C:\\Windows\\System32\\svchost.exe"},
             {L"explorer.exe", L"C:\\Windows\\explorer.exe"},
@@ -202,15 +374,28 @@ namespace ShadowStrike::AntiEvasion {
             {L"services.exe", L"C:\\Windows\\System32\\services.exe"},
             {L"smss.exe", L"C:\\Windows\\System32\\smss.exe"},
             {L"wininit.exe", L"C:\\Windows\\System32\\wininit.exe"},
+            {L"spoolsv.exe", L"C:\\Windows\\System32\\spoolsv.exe"},
+            {L"lsm.exe", L"C:\\Windows\\System32\\lsm.exe"},
+            {L"conhost.exe", L"C:\\Windows\\System32\\conhost.exe"},
+            {L"taskhost.exe", L"C:\\Windows\\System32\\taskhost.exe"},
+            {L"taskhostw.exe", L"C:\\Windows\\System32\\taskhostw.exe"},
+            {L"dwm.exe", L"C:\\Windows\\System32\\dwm.exe"},
+            {L"RuntimeBroker.exe", L"C:\\Windows\\System32\\RuntimeBroker.exe"},
         };
 
-        /// @brief Expected parent processes (for parent spoofing detection)
-        std::unordered_map<std::wstring, std::wstring> m_expectedParents = {
-            {L"services.exe", L"wininit.exe"},
-            {L"svchost.exe", L"services.exe"},
-            {L"lsass.exe", L"wininit.exe"},
-            {L"csrss.exe", L"smss.exe"},
-            {L"winlogon.exe", L"smss.exe"},
+        /// Expected parent processes (for parent spoofing detection)
+        std::unordered_map<std::wstring, std::vector<std::wstring>> m_expectedParents = {
+            {L"services.exe", {L"wininit.exe"}},
+            {L"svchost.exe", {L"services.exe"}},
+            {L"lsass.exe", {L"wininit.exe"}},
+            {L"csrss.exe", {L"smss.exe"}},
+            {L"winlogon.exe", {L"smss.exe"}},
+            {L"wininit.exe", {L"smss.exe"}},
+            {L"smss.exe", {L"System"}},
+            {L"explorer.exe", {L"userinit.exe", L"winlogon.exe"}},
+            {L"taskhost.exe", {L"svchost.exe"}},
+            {L"taskhostw.exe", {L"svchost.exe"}},
+            {L"RuntimeBroker.exe", {L"svchost.exe"}},
         };
 
         // ====================================================================
@@ -222,19 +407,40 @@ namespace ShadowStrike::AntiEvasion {
 
         [[nodiscard]] bool Initialize(ProcessEvasionError* err) noexcept;
         void Shutdown() noexcept;
+        void InitializeZydis() noexcept;
+        void InitializeNtFunctions() noexcept;
 
         // Process information helpers
         [[nodiscard]] std::wstring GetProcessName(uint32_t processId) const noexcept;
         [[nodiscard]] std::wstring GetProcessPath(uint32_t processId) const noexcept;
         [[nodiscard]] uint32_t GetParentProcessId(uint32_t processId) const noexcept;
+        [[nodiscard]] bool IsProcess64Bit(HANDLE hProcess) const noexcept;
 
         // Memory scanning
         [[nodiscard]] bool ScanProcessMemory(HANDLE hProcess, std::vector<MemoryRegionInfo>& regions) const noexcept;
         [[nodiscard]] bool IsMemoryRegionSuspicious(const MEMORY_BASIC_INFORMATION& mbi) const noexcept;
+        [[nodiscard]] bool DetectShellcodePatterns(const uint8_t* data, size_t size, std::wstring& patternName) const noexcept;
 
         // Injection detection helpers
-        [[nodiscard]] bool HasRemoteThreads(HANDLE hProcess, uint32_t& threadCount) const noexcept;
+        [[nodiscard]] bool HasRemoteThreads(HANDLE hProcess, uint32_t& threadCount, std::vector<std::wstring>& details) const noexcept;
         [[nodiscard]] bool HasSuspiciousDLLs(HANDLE hProcess, std::vector<std::wstring>& suspiciousDLLs) const noexcept;
+        [[nodiscard]] bool DetectProcessHollowing(HANDLE hProcess, uint32_t processId) const noexcept;
+        [[nodiscard]] bool DetectReflectiveDLLInjection(HANDLE hProcess, std::vector<MemoryRegionInfo>& regions) const noexcept;
+
+        // Hook detection using Zydis
+        [[nodiscard]] bool DetectInlineHooks(HANDLE hProcess, bool is64Bit, std::vector<std::wstring>& hookedFunctions) const noexcept;
+        [[nodiscard]] bool DetectIATHooks(HANDLE hProcess, const std::wstring& modulePath, std::vector<std::wstring>& hookedImports) const noexcept;
+        [[nodiscard]] bool AnalyzeFunctionPrologue(const uint8_t* code, size_t size, bool is64Bit, std::wstring& hookType) const noexcept;
+
+        // Anti-debug detection using Zydis
+        [[nodiscard]] bool DetectAntiDebugInstructions(HANDLE hProcess, const std::wstring& modulePath, std::vector<std::wstring>& techniques) const noexcept;
+        [[nodiscard]] bool HasAntiDebugAPIs(const std::wstring& modulePath, std::vector<std::wstring>& apis) const noexcept;
+
+        // TLS callback analysis using PEParser
+        [[nodiscard]] bool AnalyzeTLSCallbacks(const std::wstring& modulePath, std::vector<uint64_t>& callbacks) const noexcept;
+
+        // Import analysis using PEParser
+        [[nodiscard]] bool AnalyzeSuspiciousImports(const std::wstring& modulePath, std::vector<std::wstring>& suspiciousImports) const noexcept;
 
         // Masquerading detection helpers
         [[nodiscard]] bool IsPathAnomaly(std::wstring_view processName, std::wstring_view actualPath) const noexcept;
@@ -244,6 +450,17 @@ namespace ShadowStrike::AntiEvasion {
         // Anti-debugging detection helpers
         [[nodiscard]] bool CheckDebuggerPresent(HANDLE hProcess) const noexcept;
         [[nodiscard]] bool CheckHardwareBreakpoints(HANDLE hProcess) const noexcept;
+        [[nodiscard]] bool CheckDebugPort(HANDLE hProcess) const noexcept;
+        [[nodiscard]] bool CheckDebugFlags(HANDLE hProcess) const noexcept;
+
+        // Privilege analysis
+        [[nodiscard]] bool CheckSeDebugPrivilege(HANDLE hProcess) const noexcept;
+        [[nodiscard]] bool CheckTokenIntegrity(HANDLE hProcess, std::wstring& integrityLevel) const noexcept;
+
+        // Zydis decoder access
+        [[nodiscard]] ZydisDecoder* GetDecoder(bool is64Bit) noexcept {
+            return is64Bit ? &m_decoder64 : &m_decoder32;
+        }
     };
 
     // ========================================================================
@@ -256,28 +473,33 @@ namespace ShadowStrike::AntiEvasion {
                 return true; // Already initialized
             }
 
-            SS_LOG_INFO(L"AntiEvasion", L"ProcessEvasionDetector: Initializing...");
+            SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Initializing...");
+
+            // Initialize Zydis disassembler
+            InitializeZydis();
+
+            // Initialize NT function pointers
+            InitializeNtFunctions();
 
             // Initialize PatternStore for shellcode detection
             m_patternStore = std::make_shared<ShadowStrike::PatternStore::PatternStore>();
 
             // Enterprise: Attempt to load signature database if present
-            // We use a relative path to the module or a fixed system path
             std::wstring sigPath = L"signatures.db";
             if (ShadowStrike::Utils::FileUtils::Exists(sigPath)) {
                 m_patternStore->Initialize(sigPath);
-                SS_LOG_INFO(L"AntiEvasion", L"Loaded shellcode signatures from %ls", sigPath.c_str());
-            } else {
-                SS_LOG_WARN(L"AntiEvasion", L"Signature database %ls not found, running with heuristics only", sigPath.c_str());
+                SS_LOG_INFO(LOG_CATEGORY, L"Loaded shellcode signatures from %ls", sigPath.c_str());
+            }
+            else {
+                SS_LOG_WARN(LOG_CATEGORY, L"Signature database %ls not found, running with heuristics only", sigPath.c_str());
             }
 
-            SS_LOG_INFO(L"AntiEvasion", L"ProcessEvasionDetector: Initialized successfully");
+            SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Initialized successfully");
             return true;
 
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"ProcessEvasionDetector initialization failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ProcessEvasionDetector initialization failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -289,7 +511,7 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
         catch (...) {
-            SS_LOG_FATAL(L"AntiEvasion", L"ProcessEvasionDetector: Unknown initialization error");
+            SS_LOG_FATAL(LOG_CATEGORY, L"ProcessEvasionDetector: Unknown initialization error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -301,6 +523,36 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
+    void ProcessEvasionDetector::Impl::InitializeZydis() noexcept {
+        if (m_zydisInitialized) return;
+
+        // Initialize 64-bit decoder (primary platform)
+        ZydisDecoderInit(&m_decoder64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+        // Initialize 32-bit decoder (for WoW64 processes)
+        ZydisDecoderInit(&m_decoder32, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
+
+        // Initialize formatter for disassembly output
+        ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+
+        m_zydisInitialized = true;
+        SS_LOG_DEBUG(LOG_CATEGORY, L"Zydis disassembler initialized (64-bit and 32-bit modes)");
+    }
+
+    void ProcessEvasionDetector::Impl::InitializeNtFunctions() noexcept {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            m_pNtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcessPtr>(
+                GetProcAddress(hNtdll, "NtQueryInformationProcess"));
+
+            m_pNtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadPtr>(
+                GetProcAddress(hNtdll, "NtQueryInformationThread"));
+
+            SS_LOG_DEBUG(LOG_CATEGORY, L"NT functions resolved: NtQueryInformationProcess=%p, NtQueryInformationThread=%p",
+                m_pNtQueryInformationProcess, m_pNtQueryInformationThread);
+        }
+    }
+
     void ProcessEvasionDetector::Impl::Shutdown() noexcept {
         try {
             std::unique_lock lock(m_mutex);
@@ -309,7 +561,7 @@ namespace ShadowStrike::AntiEvasion {
                 return; // Already shutdown
             }
 
-            SS_LOG_INFO(L"AntiEvasion", L"ProcessEvasionDetector: Shutting down...");
+            SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Shutting down...");
 
             // Clear caches
             m_resultCache.clear();
@@ -317,10 +569,13 @@ namespace ShadowStrike::AntiEvasion {
             // Clear callback
             m_detectionCallback = nullptr;
 
-            SS_LOG_INFO(L"AntiEvasion", L"ProcessEvasionDetector: Shutdown complete");
+            // Clear pattern store
+            m_patternStore.reset();
+
+            SS_LOG_INFO(LOG_CATEGORY, L"ProcessEvasionDetector: Shutdown complete");
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"ProcessEvasionDetector: Exception during shutdown");
+            SS_LOG_ERROR(LOG_CATEGORY, L"ProcessEvasionDetector: Exception during shutdown");
         }
     }
 
@@ -406,6 +661,20 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
+    bool ProcessEvasionDetector::Impl::IsProcess64Bit(HANDLE hProcess) const noexcept {
+        BOOL isWow64 = FALSE;
+        if (IsWow64Process(hProcess, &isWow64)) {
+            // If running as WoW64, it's a 32-bit process on 64-bit Windows
+            return !isWow64;
+        }
+        // Default to matching our architecture
+#ifdef _WIN64
+        return true;
+#else
+        return false;
+#endif
+    }
+
     // ========================================================================
     // IMPL: MEMORY SCANNING
     // ========================================================================
@@ -421,9 +690,7 @@ namespace ShadowStrike::AntiEvasion {
             uint8_t* address = nullptr;
 
             // Buffer for memory content scanning
-            // We limit scan to first 4KB of region for performance
-            constexpr size_t SCAN_BUFFER_SIZE = 4096;
-            std::vector<uint8_t> buffer(SCAN_BUFFER_SIZE);
+            std::vector<uint8_t> buffer(MEMORY_SCAN_BUFFER_SIZE);
 
             while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
                 if (mbi.State == MEM_COMMIT) {
@@ -433,13 +700,16 @@ namespace ShadowStrike::AntiEvasion {
                     region.protection = mbi.Protect;
                     region.type = mbi.Type;
 
-                    region.isExecutable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-                    region.isWritable = (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-                    region.isReadable = (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                    region.isExecutable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                    region.isWritable = (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                    region.isReadable = (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 
                     region.isSuspicious = IsMemoryRegionSuspicious(mbi);
 
-                    // If region is suspicious (RWX or Private Executable), scan content for shellcode
+                    // If region is suspicious, scan content
                     if (region.isSuspicious) {
                         if (region.isExecutable && region.isWritable) {
                             region.description = L"RWX memory (Write + Execute) - highly suspicious";
@@ -450,29 +720,41 @@ namespace ShadowStrike::AntiEvasion {
 
                         // Content Scan
                         SIZE_T bytesRead = 0;
-                        if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), SCAN_BUFFER_SIZE, &bytesRead)) {
-                            std::span<const uint8_t> data(buffer.data(), bytesRead);
-
+                        size_t scanSize = std::min(static_cast<size_t>(mbi.RegionSize), MEMORY_SCAN_BUFFER_SIZE);
+                        if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), scanSize, &bytesRead)) {
                             // 1. Check PatternStore
                             if (m_patternStore) {
+                                std::span<const uint8_t> data(buffer.data(), bytesRead);
                                 auto matches = m_patternStore->Scan(data);
                                 if (!matches.empty()) {
-                                    region.description += L" [MALWARE SIGNATURE DETECTED: ";
-                                    for (size_t k = 0; k < matches.size(); ++k) {
+                                    region.description += L" [MALWARE SIGNATURE: ";
+                                    for (size_t k = 0; k < matches.size() && k < 3; ++k) {
                                         region.description += Utils::StringUtils::ToWide(matches[k].signatureName);
-                                        if (k < matches.size() - 1) region.description += L", ";
+                                        if (k < matches.size() - 1 && k < 2) region.description += L", ";
                                     }
                                     region.description += L"]";
                                 }
                             }
 
-                            // 2. Heuristic: NOP Sled (0x90 0x90 ...)
+                            // 2. Check for shellcode patterns
+                            std::wstring patternName;
+                            if (DetectShellcodePatterns(buffer.data(), bytesRead, patternName)) {
+                                region.description += L" [" + patternName + L"]";
+                            }
+
+                            // 3. Check for MZ header (Reflective DLL/floating PE)
+                            if (bytesRead > 2 && buffer[0] == 'M' && buffer[1] == 'Z') {
+                                region.description += L" [Floating PE Header Detected]";
+                            }
+
+                            // 4. NOP Sled detection
                             int nopCount = 0;
                             int maxNopRun = 0;
                             for (size_t i = 0; i < bytesRead; ++i) {
-                                if (data[i] == 0x90) {
+                                if (buffer[i] == 0x90) {
                                     nopCount++;
-                                } else {
+                                }
+                                else {
                                     maxNopRun = std::max(maxNopRun, nopCount);
                                     nopCount = 0;
                                 }
@@ -481,19 +763,6 @@ namespace ShadowStrike::AntiEvasion {
 
                             if (maxNopRun > 16) {
                                 region.description += L" [NOP Sled Detected]";
-                            }
-
-                            // 3. Heuristic: High Entropy (Packed/Encrypted)
-                            // (Simplified entropy calculation for performance)
-                            // Skip strictly 0x00 blocks
-                            bool nonZero = false;
-                            for(auto b : data) if(b != 0) nonZero = true;
-
-                            if (nonZero) {
-                                // Simple check for MZ header (Reflective DLL injection)
-                                if (bytesRead > 2 && data[0] == 'M' && data[1] == 'Z') {
-                                    region.description += L" [Floating PE Header Detected]";
-                                }
                             }
                         }
                     }
@@ -507,12 +776,11 @@ namespace ShadowStrike::AntiEvasion {
             return true;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"ScanProcessMemory failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ScanProcessMemory failed: %hs", e.what());
             return false;
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"ScanProcessMemory: Unknown error");
+            SS_LOG_ERROR(LOG_CATEGORY, L"ScanProcessMemory: Unknown error");
             return false;
         }
     }
@@ -531,13 +799,58 @@ namespace ShadowStrike::AntiEvasion {
         return false;
     }
 
+    bool ProcessEvasionDetector::Impl::DetectShellcodePatterns(
+        const uint8_t* data,
+        size_t size,
+        std::wstring& patternName
+    ) const noexcept {
+        for (const auto& pattern : SHELLCODE_PATTERNS) {
+            if (size >= pattern.size()) {
+                for (size_t i = 0; i <= size - pattern.size(); ++i) {
+                    bool match = true;
+                    for (size_t j = 0; j < pattern.size(); ++j) {
+                        if (data[i + j] != pattern[j]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        // Determine pattern type
+                        if (pattern[0] == 0xE8 && pattern[1] == 0x00) {
+                            patternName = L"GetPC via CALL $+5";
+                        }
+                        else if (pattern[0] == 0x60 && pattern[1] == 0xFC) {
+                            patternName = L"Windows API Hash Resolution";
+                        }
+                        else if (pattern[0] == 0xFC && pattern[1] == 0xE8) {
+                            patternName = L"Metasploit Shellcode Pattern";
+                        }
+                        else if (pattern[0] == 0x4D && pattern[1] == 0x5A) {
+                            patternName = L"Reflective PE/DLL Pattern";
+                        }
+                        else {
+                            patternName = L"Known Shellcode Pattern";
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     // ========================================================================
     // IMPL: INJECTION DETECTION HELPERS
     // ========================================================================
 
-    bool ProcessEvasionDetector::Impl::HasRemoteThreads(HANDLE hProcess, uint32_t& threadCount) const noexcept {
+    bool ProcessEvasionDetector::Impl::HasRemoteThreads(
+        HANDLE hProcess,
+        uint32_t& threadCount,
+        std::vector<std::wstring>& details
+    ) const noexcept {
         try {
             threadCount = 0;
+            details.clear();
             uint32_t suspiciousThreads = 0;
 
             const DWORD processId = GetProcessId(hProcess);
@@ -545,14 +858,7 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            // Resolve NtQueryInformationThread
-            HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-            if (!hNtdll) return false;
-
-            auto NtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadPtr>(
-                GetProcAddress(hNtdll, "NtQueryInformationThread"));
-
-            if (!NtQueryInformationThread) return false;
+            if (!m_pNtQueryInformationThread) return false;
 
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) {
@@ -562,16 +868,20 @@ namespace ShadowStrike::AntiEvasion {
             THREADENTRY32 te32 = {};
             te32.dwSize = sizeof(te32);
 
+            // Get LoadLibrary addresses for comparison
+            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+            FARPROC pLoadLibraryA = hKernel32 ? GetProcAddress(hKernel32, "LoadLibraryA") : nullptr;
+            FARPROC pLoadLibraryW = hKernel32 ? GetProcAddress(hKernel32, "LoadLibraryW") : nullptr;
+
             if (Thread32First(hSnapshot, &te32)) {
                 do {
                     if (te32.th32OwnerProcessID == processId) {
-                        // We need to check the thread start address
                         HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
                         if (hThread) {
                             PVOID startAddress = nullptr;
                             ULONG returnLength = 0;
 
-                            NTSTATUS status = NtQueryInformationThread(
+                            NTSTATUS status = m_pNtQueryInformationThread(
                                 hThread,
                                 (THREADINFOCLASS)ThreadQuerySetWin32StartAddress,
                                 &startAddress,
@@ -580,29 +890,21 @@ namespace ShadowStrike::AntiEvasion {
                             );
 
                             if (status >= 0 && startAddress) {
-                                // Check memory attributes of start address
                                 MEMORY_BASIC_INFORMATION mbi = {};
                                 if (VirtualQueryEx(hProcess, startAddress, &mbi, sizeof(mbi))) {
-                                    // Suspicious if start address is in MEM_PRIVATE (shellcode)
-                                    // or points to LoadLibrary (classic injection)
-
+                                    // Thread starting in private RWX memory is suspicious
                                     if (mbi.Type == MEM_PRIVATE && (mbi.Protect & PAGE_EXECUTE_READWRITE)) {
                                         suspiciousThreads++;
+                                        details.push_back(std::format(L"Thread {} starts in private RWX memory at 0x{:X}",
+                                            te32.th32ThreadID, reinterpret_cast<uintptr_t>(startAddress)));
                                     }
 
-                                    // Check if address matches LoadLibraryA/W (Classic DLL Injection)
-                                    // We get the addresses from our own process (kernel32 is mapped at same address in all processes)
-                                    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-                                    if (hKernel32) {
-                                        FARPROC pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
-                                        FARPROC pLoadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
-
-                                        if ((pLoadLibraryA && startAddress == (PVOID)pLoadLibraryA) ||
-                                            (pLoadLibraryW && startAddress == (PVOID)pLoadLibraryW)) {
-                                            suspiciousThreads++;
-                                            // High confidence injection indicator
-                                            // We assume this is suspicious unless it's a known legitimate loader (which is rare for standard threads)
-                                        }
+                                    // Thread starting at LoadLibrary indicates DLL injection
+                                    if ((pLoadLibraryA && startAddress == (PVOID)pLoadLibraryA) ||
+                                        (pLoadLibraryW && startAddress == (PVOID)pLoadLibraryW)) {
+                                        suspiciousThreads++;
+                                        details.push_back(std::format(L"Thread {} starts at LoadLibrary (DLL injection indicator)",
+                                            te32.th32ThreadID));
                                     }
                                 }
                             }
@@ -616,11 +918,7 @@ namespace ShadowStrike::AntiEvasion {
 
             CloseHandle(hSnapshot);
 
-            // If we found any threads starting in private RWX memory, it's definitely injection
-            if (suspiciousThreads > 0) return true;
-
-            // Fallback: If significantly more threads than expected, may indicate injection
-            return (threadCount > 100);
+            return (suspiciousThreads > 0);
         }
         catch (...) {
             return false;
@@ -634,7 +932,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             suspiciousDLLs.clear();
 
-            HMODULE hModules[1024] = {};
+            HMODULE hModules[MAX_MODULES] = {};
             DWORD cbNeeded = 0;
 
             if (!EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded)) {
@@ -643,12 +941,10 @@ namespace ShadowStrike::AntiEvasion {
 
             const DWORD moduleCount = cbNeeded / sizeof(HMODULE);
 
-            for (DWORD i = 0; i < moduleCount; ++i) {
+            for (DWORD i = 0; i < moduleCount && i < MAX_MODULES; ++i) {
                 wchar_t modulePath[MAX_PATH] = {};
                 if (GetModuleFileNameExW(hProcess, hModules[i], modulePath, MAX_PATH) > 0) {
                     std::wstring modulePathStr(modulePath);
-
-                    // Check for suspicious DLL locations
                     std::wstring lowerPath = modulePathStr;
                     std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
 
@@ -656,18 +952,646 @@ namespace ShadowStrike::AntiEvasion {
                     if (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
                         lowerPath.find(L"\\tmp\\") != std::wstring::npos ||
                         lowerPath.find(L"\\appdata\\local\\temp\\") != std::wstring::npos) {
-                        suspiciousDLLs.push_back(modulePathStr);
+                        suspiciousDLLs.push_back(modulePathStr + L" [Loaded from temp directory]");
                     }
 
-                    // DLLs without proper path (injected)
+                    // DLLs with unusual paths
                     if (lowerPath.find(L"\\windows\\") == std::wstring::npos &&
-                        lowerPath.find(L"\\program files") == std::wstring::npos) {
-                        // Potentially injected DLL
+                        lowerPath.find(L"\\program files") == std::wstring::npos &&
+                        lowerPath.find(L"\\winsxs\\") == std::wstring::npos) {
+                        // Check if it's an unsigned DLL from user directory
+                        if (lowerPath.find(L"\\users\\") != std::wstring::npos) {
+                            if (!IsSignatureValid(modulePathStr)) {
+                                suspiciousDLLs.push_back(modulePathStr + L" [Unsigned DLL from user directory]");
+                            }
+                        }
                     }
                 }
             }
 
             return !suspiciousDLLs.empty();
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::DetectProcessHollowing(HANDLE hProcess, uint32_t processId) const noexcept {
+        try {
+            // Get the main module's base address
+            HMODULE hModules[1] = {};
+            DWORD cbNeeded = 0;
+
+            if (!EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded) || cbNeeded == 0) {
+                return false;
+            }
+
+            // Read the PE header from memory
+            uint8_t headerBuffer[4096] = {};
+            SIZE_T bytesRead = 0;
+
+            if (!ReadProcessMemory(hProcess, hModules[0], headerBuffer, sizeof(headerBuffer), &bytesRead)) {
+                return false;
+            }
+
+            if (bytesRead < sizeof(PEParser::DosHeader)) {
+                return false;
+            }
+
+            // Validate DOS header
+            const auto* dosHeader = reinterpret_cast<const PEParser::DosHeader*>(headerBuffer);
+            if (dosHeader->e_magic != 0x5A4D) { // "MZ"
+                // No MZ header - could be hollowed
+                return true;
+            }
+
+            // Get expected path and compare
+            std::wstring processPath = GetProcessPath(processId);
+            if (processPath.empty()) {
+                return false;
+            }
+
+            // Parse the file on disk
+            PEParser::PEParser diskParser;
+            PEParser::PEInfo diskInfo;
+            if (!diskParser.ParseFile(processPath, diskInfo, nullptr)) {
+                return false;
+            }
+
+            // Compare entry points
+            if (bytesRead > static_cast<size_t>(dosHeader->e_lfanew) + sizeof(uint32_t) + sizeof(PEParser::FileHeader) + 16) {
+                const auto* peSignature = reinterpret_cast<const uint32_t*>(headerBuffer + dosHeader->e_lfanew);
+                if (*peSignature != 0x00004550) { // "PE\0\0"
+                    // Invalid PE signature - hollowed
+                    return true;
+                }
+
+                const auto* fileHeader = reinterpret_cast<const PEParser::FileHeader*>(headerBuffer + dosHeader->e_lfanew + 4);
+                const auto* optHeader = reinterpret_cast<const uint16_t*>(headerBuffer + dosHeader->e_lfanew + 4 + sizeof(PEParser::FileHeader));
+
+                uint32_t memoryEntryPoint = 0;
+                if (*optHeader == 0x20B) { // PE32+
+                    const auto* opt64 = reinterpret_cast<const PEParser::OptionalHeader64*>(optHeader);
+                    memoryEntryPoint = opt64->AddressOfEntryPoint;
+                }
+                else if (*optHeader == 0x10B) { // PE32
+                    const auto* opt32 = reinterpret_cast<const PEParser::OptionalHeader32*>(optHeader);
+                    memoryEntryPoint = opt32->AddressOfEntryPoint;
+                }
+
+                // Compare with disk entry point
+                if (memoryEntryPoint != 0 && memoryEntryPoint != diskInfo.entryPointRva) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Process hollowing detected: Entry point mismatch (memory: 0x%X, disk: 0x%X)",
+                        memoryEntryPoint, diskInfo.entryPointRva);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::DetectReflectiveDLLInjection(
+        HANDLE hProcess,
+        std::vector<MemoryRegionInfo>& regions
+    ) const noexcept {
+        // Already detected in ScanProcessMemory - check for floating PE headers
+        for (const auto& region : regions) {
+            if (region.description.find(L"Floating PE Header") != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ========================================================================
+    // IMPL: HOOK DETECTION USING ZYDIS
+    // ========================================================================
+
+    bool ProcessEvasionDetector::Impl::DetectInlineHooks(
+        HANDLE hProcess,
+        bool is64Bit,
+        std::vector<std::wstring>& hookedFunctions
+    ) const noexcept {
+        try {
+            hookedFunctions.clear();
+
+            if (!m_zydisInitialized) {
+                return false;
+            }
+
+            // Check critical APIs in ntdll and kernel32
+            const std::pair<const wchar_t*, std::vector<const char*>> criticalModules[] = {
+                {L"ntdll.dll", {"NtQueryInformationProcess", "NtCreateThreadEx", "NtAllocateVirtualMemory",
+                               "NtProtectVirtualMemory", "NtWriteVirtualMemory", "NtReadVirtualMemory",
+                               "NtOpenProcess", "NtClose", "NtQuerySystemInformation"}},
+                {L"kernel32.dll", {"VirtualAlloc", "VirtualProtect", "CreateRemoteThread",
+                                  "WriteProcessMemory", "ReadProcessMemory", "OpenProcess",
+                                  "IsDebuggerPresent", "GetTickCount"}}
+            };
+
+            for (const auto& [moduleName, functions] : criticalModules) {
+                HMODULE hMod = GetModuleHandleW(moduleName);
+                if (!hMod) continue;
+
+                for (const char* funcName : functions) {
+                    FARPROC proc = GetProcAddress(hMod, funcName);
+                    if (!proc) continue;
+
+                    // Read function prologue from target process
+                    uint8_t codeBuffer[MAX_HOOK_SCAN_BYTES] = {};
+                    SIZE_T bytesRead = 0;
+
+                    if (!ReadProcessMemory(hProcess, proc, codeBuffer, MAX_HOOK_SCAN_BYTES, &bytesRead)) {
+                        continue;
+                    }
+
+                    // Analyze prologue with Zydis
+                    std::wstring hookType;
+                    if (AnalyzeFunctionPrologue(codeBuffer, bytesRead, is64Bit, hookType)) {
+                        std::wstring funcInfo = std::format(L"{}!{} - {}",
+                            moduleName,
+                            Utils::StringUtils::ToWide(funcName),
+                            hookType);
+                        hookedFunctions.push_back(funcInfo);
+                    }
+                }
+            }
+
+            return !hookedFunctions.empty();
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::AnalyzeFunctionPrologue(
+        const uint8_t* code,
+        size_t size,
+        bool is64Bit,
+        std::wstring& hookType
+    ) const noexcept {
+        if (!m_zydisInitialized || size == 0) {
+            return false;
+        }
+
+        ZydisDecoder* decoder = is64Bit ?
+            const_cast<ZydisDecoder*>(&m_decoder64) :
+            const_cast<ZydisDecoder*>(&m_decoder32);
+
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+
+        // Decode the first instruction
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code, size, &instruction, operands))) {
+            return false;
+        }
+
+        // Check for common hook patterns
+        switch (instruction.mnemonic) {
+        case ZYDIS_MNEMONIC_JMP:
+            // Any JMP as first instruction is suspicious
+            if (instruction.length == 5 && code[0] == 0xE9) {
+                hookType = L"JMP rel32 (5-byte inline hook)";
+            }
+            else if (instruction.length == 6 && code[0] == 0xFF && code[1] == 0x25) {
+                hookType = L"JMP [RIP+disp32] (indirect hook)";
+            }
+            else if (instruction.length == 2 && code[0] == 0xEB) {
+                hookType = L"JMP rel8 (short jump hook)";
+            }
+            else {
+                hookType = L"JMP instruction (inline hook)";
+            }
+            return true;
+
+        case ZYDIS_MNEMONIC_CALL:
+            // CALL as first instruction is suspicious
+            hookType = L"CALL instruction (detour hook)";
+            return true;
+
+        case ZYDIS_MNEMONIC_PUSH:
+            // Check for PUSH addr; RET pattern
+            if (instruction.operand_count > 0 &&
+                operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                // Decode next instruction
+                ZydisDecodedInstruction nextInstr;
+                ZydisDecodedOperand nextOps[ZYDIS_MAX_OPERAND_COUNT];
+                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                    decoder,
+                    code + instruction.length,
+                    size - instruction.length,
+                    &nextInstr,
+                    nextOps))) {
+                    if (nextInstr.mnemonic == ZYDIS_MNEMONIC_RET) {
+                        hookType = L"PUSH/RET gadget (trampoline hook)";
+                        return true;
+                    }
+                }
+            }
+            break;
+
+        case ZYDIS_MNEMONIC_INT3:
+            hookType = L"INT3 (breakpoint hook)";
+            return true;
+
+        case ZYDIS_MNEMONIC_INT:
+            if (instruction.operand_count > 0 &&
+                operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                operands[0].imm.value.u == 0x2D) {
+                hookType = L"INT 2D (debug hook)";
+                return true;
+            }
+            break;
+
+        case ZYDIS_MNEMONIC_MOV:
+            // Check for MOV RAX, imm64; JMP RAX pattern
+            if (is64Bit && instruction.operand_count >= 2 &&
+                operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                operands[0].reg.value == ZYDIS_REGISTER_RAX &&
+                operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                // Look for subsequent JMP RAX
+                size_t offset = instruction.length;
+                for (int i = 0; i < 3 && offset < size; ++i) {
+                    ZydisDecodedInstruction scanInstr;
+                    ZydisDecodedOperand scanOps[ZYDIS_MAX_OPERAND_COUNT];
+                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                        decoder, code + offset, size - offset, &scanInstr, scanOps))) {
+                        break;
+                    }
+                    if (scanInstr.mnemonic == ZYDIS_MNEMONIC_JMP &&
+                        scanOps[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        scanOps[0].reg.value == ZYDIS_REGISTER_RAX) {
+                        hookType = L"MOV RAX, imm64; JMP RAX (12-byte trampoline)";
+                        return true;
+                    }
+                    offset += scanInstr.length;
+                }
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    bool ProcessEvasionDetector::Impl::DetectIATHooks(
+        HANDLE hProcess,
+        const std::wstring& modulePath,
+        std::vector<std::wstring>& hookedImports
+    ) const noexcept {
+        try {
+            hookedImports.clear();
+
+            // Parse the PE file to get expected IAT entries
+            PEParser::PEParser parser;
+            PEParser::PEInfo peInfo;
+
+            if (!parser.ParseFile(modulePath, peInfo, nullptr)) {
+                return false;
+            }
+
+            std::vector<PEParser::ImportInfo> imports;
+            if (!parser.ParseImports(imports, nullptr)) {
+                return false;
+            }
+
+            // Get the module base in the target process
+            HMODULE hModules[MAX_MODULES] = {};
+            DWORD cbNeeded = 0;
+
+            if (!EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded)) {
+                return false;
+            }
+
+            HMODULE targetModule = nullptr;
+            const DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+
+            for (DWORD i = 0; i < moduleCount && i < MAX_MODULES; ++i) {
+                wchar_t modPath[MAX_PATH] = {};
+                if (GetModuleFileNameExW(hProcess, hModules[i], modPath, MAX_PATH)) {
+                    if (_wcsicmp(modPath, modulePath.c_str()) == 0) {
+                        targetModule = hModules[i];
+                        break;
+                    }
+                }
+            }
+
+            if (!targetModule) {
+                return false;
+            }
+
+            // For each imported DLL, check if IAT entries point to expected modules
+            for (const auto& importDll : imports) {
+                HMODULE hImportDll = GetModuleHandleW(importDll.dllName.c_str());
+                if (!hImportDll) continue;
+
+                MODULEINFO modInfo = {};
+                if (!GetModuleInformation(GetCurrentProcess(), hImportDll, &modInfo, sizeof(modInfo))) {
+                    continue;
+                }
+
+                for (const auto& func : importDll.functions) {
+                    if (func.byOrdinal) continue;
+
+                    // Read IAT entry from target process
+                    uint64_t iatValue = 0;
+                    SIZE_T bytesRead = 0;
+
+                    void* iatAddress = reinterpret_cast<void*>(
+                        reinterpret_cast<uintptr_t>(targetModule) + func.iatRva);
+
+                    if (!ReadProcessMemory(hProcess, iatAddress, &iatValue,
+                        peInfo.is64Bit ? 8 : 4, &bytesRead)) {
+                        continue;
+                    }
+
+                    // Check if IAT value points outside the expected module
+                    uintptr_t modBase = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
+                    uintptr_t modEnd = modBase + modInfo.SizeOfImage;
+
+                    if (iatValue != 0 && (iatValue < modBase || iatValue >= modEnd)) {
+                        std::wstring hookInfo = std::format(L"{}!{} -> 0x{:X} (outside {})",
+                            importDll.dllName,
+                            Utils::StringUtils::ToWide(func.name),
+                            iatValue,
+                            importDll.dllName);
+                        hookedImports.push_back(hookInfo);
+                    }
+                }
+            }
+
+            return !hookedImports.empty();
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // IMPL: ANTI-DEBUG DETECTION USING ZYDIS
+    // ========================================================================
+
+    bool ProcessEvasionDetector::Impl::DetectAntiDebugInstructions(
+        HANDLE hProcess,
+        const std::wstring& modulePath,
+        std::vector<std::wstring>& techniques
+    ) const noexcept {
+        try {
+            techniques.clear();
+
+            if (!m_zydisInitialized) {
+                return false;
+            }
+
+            // Parse PE to find code sections
+            PEParser::PEParser parser;
+            PEParser::PEInfo peInfo;
+
+            if (!parser.ParseFile(modulePath, peInfo, nullptr)) {
+                return false;
+            }
+
+            // Get module base in target process
+            HMODULE hModules[1] = {};
+            DWORD cbNeeded = 0;
+
+            if (!EnumProcessModules(hProcess, hModules, sizeof(hModules), &cbNeeded) || cbNeeded == 0) {
+                return false;
+            }
+
+            // Scan code sections for anti-debug instructions
+            for (const auto& section : peInfo.sections) {
+                if (!section.hasCode) continue;
+
+                size_t scanSize = std::min(section.rawSize, static_cast<uint32_t>(1024 * 1024)); // Max 1MB
+                std::vector<uint8_t> codeBuffer(scanSize);
+                SIZE_T bytesRead = 0;
+
+                void* sectionAddress = reinterpret_cast<void*>(
+                    reinterpret_cast<uintptr_t>(hModules[0]) + section.virtualAddress);
+
+                if (!ReadProcessMemory(hProcess, sectionAddress, codeBuffer.data(), scanSize, &bytesRead)) {
+                    continue;
+                }
+
+                // Use Zydis to scan for suspicious instructions
+                ZydisDecoder* decoder = peInfo.is64Bit ?
+                    const_cast<ZydisDecoder*>(&m_decoder64) :
+                    const_cast<ZydisDecoder*>(&m_decoder32);
+
+                ZydisDecodedInstruction instruction;
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                ZyanUSize offset = 0;
+                size_t instructionCount = 0;
+                constexpr size_t MAX_INSTRUCTIONS = 100000;
+
+                uint32_t rdtscCount = 0;
+                uint32_t int2dCount = 0;
+                uint32_t int3Count = 0;
+
+                while (offset < bytesRead && instructionCount < MAX_INSTRUCTIONS) {
+                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder,
+                        codeBuffer.data() + offset, bytesRead - offset,
+                        &instruction, operands))) {
+                        ++offset;
+                        continue;
+                    }
+
+                    switch (instruction.mnemonic) {
+                    case ZYDIS_MNEMONIC_RDTSC:
+                    case ZYDIS_MNEMONIC_RDTSCP:
+                        ++rdtscCount;
+                        break;
+
+                    case ZYDIS_MNEMONIC_INT3:
+                        ++int3Count;
+                        break;
+
+                    case ZYDIS_MNEMONIC_INT:
+                        if (instruction.operand_count > 0 &&
+                            operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                            if (operands[0].imm.value.u == 0x2D) {
+                                ++int2dCount;
+                            }
+                        }
+                        break;
+
+                    default:
+                        break;
+                    }
+
+                    offset += instruction.length;
+                    ++instructionCount;
+                }
+
+                // Report findings
+                if (rdtscCount > 5) {
+                    techniques.push_back(std::format(L"RDTSC/RDTSCP instructions detected: {} occurrences (timing-based anti-debug)",
+                        rdtscCount));
+                }
+                if (int2dCount > 0) {
+                    techniques.push_back(std::format(L"INT 2D instructions detected: {} occurrences (debugger detection)",
+                        int2dCount));
+                }
+                if (int3Count > 10) {
+                    techniques.push_back(std::format(L"Excessive INT3 instructions: {} occurrences (possible anti-debug or obfuscation)",
+                        int3Count));
+                }
+            }
+
+            return !techniques.empty();
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::HasAntiDebugAPIs(
+        const std::wstring& modulePath,
+        std::vector<std::wstring>& apis
+    ) const noexcept {
+        try {
+            apis.clear();
+
+            PEParser::PEParser parser;
+            PEParser::PEInfo peInfo;
+
+            if (!parser.ParseFile(modulePath, peInfo, nullptr)) {
+                return false;
+            }
+
+            std::vector<PEParser::ImportInfo> imports;
+            if (!parser.ParseImports(imports, nullptr)) {
+                return false;
+            }
+
+            for (const auto& dll : imports) {
+                for (const auto& func : dll.functions) {
+                    for (const auto& antiDbgApi : ANTI_DEBUG_APIS) {
+                        if (func.name == antiDbgApi) {
+                            apis.push_back(std::format(L"{}!{}",
+                                dll.dllName,
+                                Utils::StringUtils::ToWide(func.name)));
+                        }
+                    }
+                }
+            }
+
+            return !apis.empty();
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // IMPL: TLS CALLBACK ANALYSIS
+    // ========================================================================
+
+    bool ProcessEvasionDetector::Impl::AnalyzeTLSCallbacks(
+        const std::wstring& modulePath,
+        std::vector<uint64_t>& callbacks
+    ) const noexcept {
+        try {
+            callbacks.clear();
+
+            PEParser::PEParser parser;
+            PEParser::PEInfo peInfo;
+
+            if (!parser.ParseFile(modulePath, peInfo, nullptr)) {
+                return false;
+            }
+
+            PEParser::TLSInfo tlsInfo;
+            if (!parser.ParseTLS(tlsInfo, nullptr)) {
+                return false; // No TLS
+            }
+
+            callbacks = tlsInfo.callbacks;
+
+            // TLS callbacks are often used by malware for anti-debug
+            return !callbacks.empty();
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // IMPL: IMPORT ANALYSIS
+    // ========================================================================
+
+    bool ProcessEvasionDetector::Impl::AnalyzeSuspiciousImports(
+        const std::wstring& modulePath,
+        std::vector<std::wstring>& suspiciousImports
+    ) const noexcept {
+        try {
+            suspiciousImports.clear();
+
+            PEParser::PEParser parser;
+            PEParser::PEInfo peInfo;
+
+            if (!parser.ParseFile(modulePath, peInfo, nullptr)) {
+                return false;
+            }
+
+            std::vector<PEParser::ImportInfo> imports;
+            if (!parser.ParseImports(imports, nullptr)) {
+                return false;
+            }
+
+            uint32_t injectionApiCount = 0;
+            uint32_t antiDebugApiCount = 0;
+            uint32_t privilegeApiCount = 0;
+
+            for (const auto& dll : imports) {
+                for (const auto& func : dll.functions) {
+                    // Check injection APIs
+                    for (const auto& injApi : INJECTION_APIS) {
+                        if (func.name == injApi) {
+                            suspiciousImports.push_back(std::format(L"[INJECTION] {}!{}",
+                                dll.dllName, Utils::StringUtils::ToWide(func.name)));
+                            ++injectionApiCount;
+                        }
+                    }
+
+                    // Check anti-debug APIs
+                    for (const auto& antiApi : ANTI_DEBUG_APIS) {
+                        if (func.name == antiApi) {
+                            suspiciousImports.push_back(std::format(L"[ANTI-DEBUG] {}!{}",
+                                dll.dllName, Utils::StringUtils::ToWide(func.name)));
+                            ++antiDebugApiCount;
+                        }
+                    }
+
+                    // Check privilege APIs
+                    for (const auto& privApi : PRIVILEGE_APIS) {
+                        if (func.name == privApi) {
+                            suspiciousImports.push_back(std::format(L"[PRIVILEGE] {}!{}",
+                                dll.dllName, Utils::StringUtils::ToWide(func.name)));
+                            ++privilegeApiCount;
+                        }
+                    }
+                }
+            }
+
+            // High counts indicate potential malware
+            if (injectionApiCount >= 3) {
+                suspiciousImports.insert(suspiciousImports.begin(),
+                    std::format(L"[WARNING] {} injection-related APIs detected", injectionApiCount));
+            }
+            if (antiDebugApiCount >= 2) {
+                suspiciousImports.insert(suspiciousImports.begin(),
+                    std::format(L"[WARNING] {} anti-debug APIs detected", antiDebugApiCount));
+            }
+
+            return !suspiciousImports.empty();
         }
         catch (...) {
             return false;
@@ -721,10 +1645,17 @@ namespace ShadowStrike::AntiEvasion {
             // Check against expected parents
             auto it = m_expectedParents.find(lowerName);
             if (it != m_expectedParents.end()) {
-                std::wstring expectedParent = it->second;
-                std::transform(expectedParent.begin(), expectedParent.end(), expectedParent.begin(), ::towlower);
-
-                if (lowerParent != expectedParent) {
+                const auto& expectedParents = it->second;
+                bool found = false;
+                for (const auto& expected : expectedParents) {
+                    std::wstring lowerExpected = expected;
+                    std::transform(lowerExpected.begin(), lowerExpected.end(), lowerExpected.begin(), ::towlower);
+                    if (lowerParent == lowerExpected) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
                     return true; // Parent spoofing detected
                 }
             }
@@ -791,6 +1722,62 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
+    bool ProcessEvasionDetector::Impl::CheckDebugPort(HANDLE hProcess) const noexcept {
+        if (!m_pNtQueryInformationProcess) {
+            return false;
+        }
+
+        try {
+            DWORD_PTR debugPort = 0;
+            ULONG returnLength = 0;
+
+            NTSTATUS status = m_pNtQueryInformationProcess(
+                hProcess,
+                (PROCESSINFOCLASS)ProcessDebugPort,
+                &debugPort,
+                sizeof(debugPort),
+                &returnLength
+            );
+
+            if (status >= 0 && debugPort != 0) {
+                return true; // Debug port is set
+            }
+
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::CheckDebugFlags(HANDLE hProcess) const noexcept {
+        if (!m_pNtQueryInformationProcess) {
+            return false;
+        }
+
+        try {
+            DWORD debugFlags = 0;
+            ULONG returnLength = 0;
+
+            NTSTATUS status = m_pNtQueryInformationProcess(
+                hProcess,
+                (PROCESSINFOCLASS)ProcessDebugFlags,
+                &debugFlags,
+                sizeof(debugFlags),
+                &returnLength
+            );
+
+            if (status >= 0 && debugFlags == 0) {
+                return true; // NoDebugInherit flag is cleared (being debugged)
+            }
+
+            return false;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
     bool ProcessEvasionDetector::Impl::CheckHardwareBreakpoints(HANDLE hProcess) const noexcept {
         try {
             DWORD processId = GetProcessId(hProcess);
@@ -807,11 +1794,8 @@ namespace ShadowStrike::AntiEvasion {
             if (Thread32First(hSnapshot, &te32)) {
                 do {
                     if (te32.th32OwnerProcessID == processId) {
-                        // We need to open the thread to get its context
-                        // Note: Requires minimal privileges, might fail for higher privileged processes
                         HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
                         if (hThread) {
-                            // Suspend thread to get consistent context
                             if (SuspendThread(hThread) != (DWORD)-1) {
                                 CONTEXT ctx = {};
                                 ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -831,6 +1815,104 @@ namespace ShadowStrike::AntiEvasion {
 
             CloseHandle(hSnapshot);
             return detected;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::CheckSeDebugPrivilege(HANDLE hProcess) const noexcept {
+        try {
+            HANDLE hToken = nullptr;
+            if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+                return false;
+            }
+
+            DWORD returnLength = 0;
+            GetTokenInformation(hToken, TokenPrivileges, nullptr, 0, &returnLength);
+
+            if (returnLength == 0) {
+                CloseHandle(hToken);
+                return false;
+            }
+
+            std::vector<uint8_t> buffer(returnLength);
+            TOKEN_PRIVILEGES* privileges = reinterpret_cast<TOKEN_PRIVILEGES*>(buffer.data());
+
+            if (!GetTokenInformation(hToken, TokenPrivileges, privileges, returnLength, &returnLength)) {
+                CloseHandle(hToken);
+                return false;
+            }
+
+            LUID luid;
+            if (!LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &luid)) {
+                CloseHandle(hToken);
+                return false;
+            }
+
+            bool hasDebugPrivilege = false;
+            for (DWORD i = 0; i < privileges->PrivilegeCount; i++) {
+                if (privileges->Privileges[i].Luid.LowPart == luid.LowPart &&
+                    privileges->Privileges[i].Luid.HighPart == luid.HighPart) {
+                    if (privileges->Privileges[i].Attributes & (SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
+                        hasDebugPrivilege = true;
+                    }
+                    break;
+                }
+            }
+
+            CloseHandle(hToken);
+            return hasDebugPrivilege;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool ProcessEvasionDetector::Impl::CheckTokenIntegrity(HANDLE hProcess, std::wstring& integrityLevel) const noexcept {
+        try {
+            HANDLE hToken = nullptr;
+            if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+                return false;
+            }
+
+            DWORD returnLength = 0;
+            GetTokenInformation(hToken, TokenIntegrityLevel, nullptr, 0, &returnLength);
+
+            if (returnLength == 0) {
+                CloseHandle(hToken);
+                return false;
+            }
+
+            std::vector<uint8_t> buffer(returnLength);
+            TOKEN_MANDATORY_LABEL* tml = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer.data());
+
+            if (!GetTokenInformation(hToken, TokenIntegrityLevel, tml, returnLength, &returnLength)) {
+                CloseHandle(hToken);
+                return false;
+            }
+
+            DWORD integrityLevelValue = *GetSidSubAuthority(tml->Label.Sid,
+                (DWORD)(UCHAR)(*GetSidSubAuthorityCount(tml->Label.Sid) - 1));
+
+            if (integrityLevelValue >= SECURITY_MANDATORY_SYSTEM_RID) {
+                integrityLevel = L"System";
+            }
+            else if (integrityLevelValue >= SECURITY_MANDATORY_HIGH_RID) {
+                integrityLevel = L"High";
+            }
+            else if (integrityLevelValue >= SECURITY_MANDATORY_MEDIUM_RID) {
+                integrityLevel = L"Medium";
+            }
+            else if (integrityLevelValue >= SECURITY_MANDATORY_LOW_RID) {
+                integrityLevel = L"Low";
+            }
+            else {
+                integrityLevel = L"Untrusted";
+            }
+
+            CloseHandle(hToken);
+            return true;
         }
         catch (...) {
             return false;
@@ -968,8 +2050,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeProcess failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -981,7 +2062,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (...) {
-            SS_LOG_FATAL(L"AntiEvasion", L"AnalyzeProcess: Unknown error");
+            SS_LOG_FATAL(LOG_CATEGORY, L"AnalyzeProcess: Unknown error");
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1050,8 +2131,7 @@ namespace ShadowStrike::AntiEvasion {
             return result;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess (by handle) failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeProcess (by handle) failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1108,9 +2188,12 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
+            bool is64Bit = m_impl->IsProcess64Bit(hProcess);
+
             // Check for remote threads
             uint32_t threadCount = 0;
-            if (m_impl->HasRemoteThreads(hProcess, threadCount)) {
+            std::vector<std::wstring> threadDetails;
+            if (m_impl->HasRemoteThreads(hProcess, threadCount, threadDetails)) {
                 outInfo.hasInjection = true;
                 outInfo.injectedThreadCount = threadCount;
                 outInfo.hasRemoteThreads = true;
@@ -1131,11 +2214,31 @@ namespace ShadowStrike::AntiEvasion {
                 if (outInfo.suspiciousMemoryRegions > 0) {
                     outInfo.hasInjection = true;
                 }
+
+                // Check for reflective DLL injection
+                if (m_impl->DetectReflectiveDLLInjection(hProcess, regions)) {
+                    outInfo.hasInjection = true;
+                    outInfo.method = InjectionMethod::ReflectiveDLL;
+                }
             }
 
             // Check for suspicious DLLs
             if (m_impl->HasSuspiciousDLLs(hProcess, outInfo.injectedDLLs)) {
                 outInfo.hasInjection = true;
+            }
+
+            // Check for process hollowing
+            if (m_impl->DetectProcessHollowing(hProcess, processId)) {
+                outInfo.hasInjection = true;
+                outInfo.hasHollowedImage = true;
+                outInfo.method = InjectionMethod::ProcessHollowing;
+            }
+
+            // Check for inline hooks
+            std::vector<std::wstring> hookedFunctions;
+            if (m_impl->DetectInlineHooks(hProcess, is64Bit, hookedFunctions)) {
+                outInfo.hasInjection = true;
+                // Could add hook details to outInfo if needed
             }
 
             CloseHandle(hProcess);
@@ -1149,8 +2252,7 @@ namespace ShadowStrike::AntiEvasion {
             return outInfo.hasInjection;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"DetectInjection failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"DetectInjection failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1188,7 +2290,9 @@ namespace ShadowStrike::AntiEvasion {
                 outInfo.isMasquerading = true;
                 outInfo.hasPathAnomaly = true;
 
-                auto it = m_impl->m_legitimateProcessPaths.find(processName);
+                std::wstring lowerName = processName;
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                auto it = m_impl->m_legitimateProcessPaths.find(lowerName);
                 if (it != m_impl->m_legitimateProcessPaths.end()) {
                     outInfo.expectedPath = it->second;
                 }
@@ -1199,9 +2303,11 @@ namespace ShadowStrike::AntiEvasion {
                 outInfo.isMasquerading = true;
                 outInfo.hasParentSpoof = true;
 
-                auto it = m_impl->m_expectedParents.find(processName);
-                if (it != m_impl->m_expectedParents.end()) {
-                    outInfo.expectedParent = it->second;
+                std::wstring lowerName = processName;
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                auto it = m_impl->m_expectedParents.find(lowerName);
+                if (it != m_impl->m_expectedParents.end() && !it->second.empty()) {
+                    outInfo.expectedParent = it->second[0];
                 }
             }
 
@@ -1209,7 +2315,7 @@ namespace ShadowStrike::AntiEvasion {
             if (!m_impl->IsSignatureValid(processPath)) {
                 outInfo.hasSignatureFailure = true;
 
-                // If it's masquerading as a system process but unsigned, that's very suspicious
+                // If masquerading as system process but unsigned
                 if (outInfo.hasPathAnomaly || outInfo.hasParentSpoof) {
                     outInfo.isMasquerading = true;
                 }
@@ -1224,8 +2330,7 @@ namespace ShadowStrike::AntiEvasion {
             return outInfo.isMasquerading;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"DetectMasquerading failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"DetectMasquerading failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1250,7 +2355,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             outInfo = AntiDebugInfo{};
 
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, processId);
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
             if (!hProcess) {
                 if (err) {
                     err->win32Code = GetLastError();
@@ -1266,30 +2371,22 @@ namespace ShadowStrike::AntiEvasion {
                 outInfo.detectedTechniques.push_back(L"Debugger detected via CheckRemoteDebuggerPresent");
             }
 
+            // Check debug port
+            if (m_impl->CheckDebugPort(hProcess)) {
+                outInfo.hasAntiDebug = true;
+                outInfo.detectedTechniques.push_back(L"Debug port detected via NtQueryInformationProcess");
+            }
+
+            // Check debug flags
+            if (m_impl->CheckDebugFlags(hProcess)) {
+                outInfo.hasAntiDebug = true;
+                outInfo.detectedTechniques.push_back(L"Debug flags indicate debugging via NtQueryInformationProcess");
+            }
+
             // Check for debug privileges
-            HANDLE hToken = nullptr;
-            if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
-                TOKEN_PRIVILEGES privileges = {};
-                DWORD returnLength = 0;
-
-                if (GetTokenInformation(hToken, TokenPrivileges, &privileges, sizeof(privileges), &returnLength)) {
-                    // Check for SeDebugPrivilege
-                    LUID luid;
-                    if (LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &luid)) {
-                        for (DWORD i = 0; i < privileges.PrivilegeCount; i++) {
-                            if (privileges.Privileges[i].Luid.LowPart == luid.LowPart &&
-                                privileges.Privileges[i].Luid.HighPart == luid.HighPart) {
-                                if (privileges.Privileges[i].Attributes & (SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
-                                    outInfo.hasDebugPrivilege = true;
-                                    outInfo.detectedTechniques.push_back(L"SeDebugPrivilege enabled");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                CloseHandle(hToken);
+            if (m_impl->CheckSeDebugPrivilege(hProcess)) {
+                outInfo.hasDebugPrivilege = true;
+                outInfo.detectedTechniques.push_back(L"SeDebugPrivilege enabled");
             }
 
             // Check for hardware breakpoints
@@ -1297,6 +2394,35 @@ namespace ShadowStrike::AntiEvasion {
                 outInfo.hasAntiDebug = true;
                 outInfo.hasHardwareBreakpoints = true;
                 outInfo.detectedTechniques.push_back(L"Hardware breakpoints detected");
+            }
+
+            // Check for anti-debug APIs in imports
+            std::wstring processPath = m_impl->GetProcessPath(processId);
+            if (!processPath.empty()) {
+                std::vector<std::wstring> antiDebugApis;
+                if (m_impl->HasAntiDebugAPIs(processPath, antiDebugApis)) {
+                    outInfo.hasAntiDebug = true;
+                    for (const auto& api : antiDebugApis) {
+                        outInfo.detectedTechniques.push_back(L"Anti-debug API imported: " + api);
+                    }
+                }
+
+                // Check for anti-debug instructions
+                std::vector<std::wstring> asmTechniques;
+                if (m_impl->DetectAntiDebugInstructions(hProcess, processPath, asmTechniques)) {
+                    outInfo.hasAntiDebug = true;
+                    for (const auto& tech : asmTechniques) {
+                        outInfo.detectedTechniques.push_back(tech);
+                    }
+                }
+
+                // Check for TLS callbacks (often used for anti-debug)
+                std::vector<uint64_t> tlsCallbacks;
+                if (m_impl->AnalyzeTLSCallbacks(processPath, tlsCallbacks)) {
+                    outInfo.hasAntiDebug = true;
+                    outInfo.detectedTechniques.push_back(
+                        std::format(L"TLS callbacks detected: {} callbacks (potential anti-debug)", tlsCallbacks.size()));
+                }
             }
 
             CloseHandle(hProcess);
@@ -1310,8 +2436,7 @@ namespace ShadowStrike::AntiEvasion {
             return outInfo.hasAntiDebug;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"DetectAntiDebug failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"DetectAntiDebug failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1352,8 +2477,7 @@ namespace ShadowStrike::AntiEvasion {
             return success;
         }
         catch (const std::exception& e) {
-            SS_LOG_ERROR(L"AntiEvasion", L"ScanMemory failed: %hs",
-                e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ScanMemory failed: %hs", e.what());
 
             if (err) {
                 err->win32Code = ERROR_INTERNAL_ERROR;
@@ -1437,6 +2561,8 @@ namespace ShadowStrike::AntiEvasion {
         ProcessEvasionResult& result
     ) noexcept {
         try {
+            bool is64Bit = m_impl->IsProcess64Bit(hProcess);
+
             // Injection detection
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckInjection)) {
                 if (DetectInjection(processId, result.injectionInfo, nullptr)) {
@@ -1463,11 +2589,44 @@ namespace ShadowStrike::AntiEvasion {
                 ScanMemory(processId, result.suspiciousMemoryRegions, nullptr);
             }
 
+            // Deep analysis - additional checks
+            if (config.enableDeepScan || HasFlag(config.flags, ProcessAnalysisFlags::DeepAnalysis)) {
+                // Check for inline hooks
+                std::vector<std::wstring> hookedFunctions;
+                if (m_impl->DetectInlineHooks(hProcess, is64Bit, hookedFunctions)) {
+                    for (const auto& hook : hookedFunctions) {
+                        DetectedTechnique detection(ProcessEvasionTechnique::CODE_InlineHooking);
+                        detection.severity = ProcessEvasionSeverity::High;
+                        detection.confidence = 0.85;
+                        detection.description = L"Inline hook detected";
+                        detection.technicalDetails = hook;
+                        AddDetection(result, std::move(detection));
+                    }
+                }
+
+                // Analyze suspicious imports
+                if (!result.processPath.empty()) {
+                    std::vector<std::wstring> suspiciousImports;
+                    if (m_impl->AnalyzeSuspiciousImports(result.processPath, suspiciousImports)) {
+                        for (const auto& imp : suspiciousImports) {
+                            if (imp.find(L"[INJECTION]") != std::wstring::npos) {
+                                DetectedTechnique detection(ProcessEvasionTechnique::CODE_CrossProcessWrite);
+                                detection.severity = ProcessEvasionSeverity::Medium;
+                                detection.confidence = 0.6;
+                                detection.description = L"Injection-related API imported";
+                                detection.technicalDetails = imp;
+                                AddDetection(result, std::move(detection));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Calculate final evasion score
             CalculateEvasionScore(result);
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessInternal: Exception");
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeProcessInternal: Exception");
         }
     }
 
@@ -1476,9 +2635,7 @@ namespace ShadowStrike::AntiEvasion {
         ProcessEvasionResult& result
     ) noexcept {
         try {
-            // Detect specific injection methods based on evidence
-
-            // Classic DLL injection: Remote threads + suspicious DLLs
+            // Classic DLL injection
             if (result.injectionInfo.hasRemoteThreads && !result.injectionInfo.injectedDLLs.empty()) {
                 DetectedTechnique detection(ProcessEvasionTechnique::INJ_ClassicDLLInjection);
                 detection.severity = ProcessEvasionSeverity::High;
@@ -1503,7 +2660,7 @@ namespace ShadowStrike::AntiEvasion {
                 AddDetection(result, std::move(detection));
             }
 
-            // Process hollowing: Hollowed image
+            // Process hollowing
             if (result.injectionInfo.hasHollowedImage) {
                 DetectedTechnique detection(ProcessEvasionTechnique::INJ_ProcessHollowing);
                 detection.severity = ProcessEvasionSeverity::Critical;
@@ -1513,9 +2670,20 @@ namespace ShadowStrike::AntiEvasion {
 
                 AddDetection(result, std::move(detection));
             }
+
+            // Reflective DLL injection
+            if (result.injectionInfo.method == InjectionMethod::ReflectiveDLL) {
+                DetectedTechnique detection(ProcessEvasionTechnique::INJ_ReflectiveDLLInjection);
+                detection.severity = ProcessEvasionSeverity::Critical;
+                detection.confidence = 0.9;
+                detection.description = L"Reflective DLL injection detected";
+                detection.technicalDetails = L"Floating PE header found in private memory";
+
+                AddDetection(result, std::move(detection));
+            }
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"CheckInjectionTechniques: Exception");
+            SS_LOG_ERROR(LOG_CATEGORY, L"CheckInjectionTechniques: Exception");
         }
     }
 
@@ -1562,7 +2730,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"CheckMasqueradingTechniques: Exception");
+            SS_LOG_ERROR(LOG_CATEGORY, L"CheckMasqueradingTechniques: Exception");
         }
     }
 
@@ -1600,9 +2768,29 @@ namespace ShadowStrike::AntiEvasion {
 
                 AddDetection(result, std::move(detection));
             }
+
+            // Add detected techniques from deep analysis
+            for (const auto& tech : result.antiDebugInfo.detectedTechniques) {
+                if (tech.find(L"RDTSC") != std::wstring::npos) {
+                    DetectedTechnique detection(ProcessEvasionTechnique::ANTI_TimingBasedDebuggerDetection);
+                    detection.severity = ProcessEvasionSeverity::High;
+                    detection.confidence = 0.8;
+                    detection.description = L"Timing-based debugger detection";
+                    detection.technicalDetails = tech;
+                    AddDetection(result, std::move(detection));
+                }
+                else if (tech.find(L"TLS callbacks") != std::wstring::npos) {
+                    DetectedTechnique detection(ProcessEvasionTechnique::ANTI_SEHAntiDebug);
+                    detection.severity = ProcessEvasionSeverity::Medium;
+                    detection.confidence = 0.7;
+                    detection.description = L"TLS callbacks detected (potential anti-debug)";
+                    detection.technicalDetails = tech;
+                    AddDetection(result, std::move(detection));
+                }
+            }
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"CheckAntiDebugTechniques: Exception");
+            SS_LOG_ERROR(LOG_CATEGORY, L"CheckAntiDebugTechniques: Exception");
         }
     }
 
@@ -1649,7 +2837,7 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"CalculateEvasionScore: Exception");
+            SS_LOG_ERROR(LOG_CATEGORY, L"CalculateEvasionScore: Exception");
         }
     }
 
@@ -1660,7 +2848,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             // Set category bit
             const auto techIdx = static_cast<uint32_t>(detection.technique);
-            if (techIdx < 32) {
+            if (techIdx < 256) {
                 result.detectedCategories |= (1u << (techIdx / 50)); // Category index
             }
 
@@ -1683,7 +2871,7 @@ namespace ShadowStrike::AntiEvasion {
             result.detectedTechniques.push_back(std::move(detection));
         }
         catch (...) {
-            SS_LOG_ERROR(L"AntiEvasion", L"AddDetection: Exception");
+            SS_LOG_ERROR(LOG_CATEGORY, L"AddDetection: Exception");
         }
     }
 

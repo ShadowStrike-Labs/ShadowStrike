@@ -2009,7 +2009,7 @@ namespace ShadowStrike {
             void AddCustomEPSignature(
                 std::wstring_view packerName,
                 const std::vector<uint8_t>& signature,
-                PackerType type = PackerType::Custom
+                PackerType type = PackerType::Custom_Packer
             ) noexcept;
 
             /**

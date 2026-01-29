@@ -1,1625 +1,1914 @@
 /**
  * @file TimeBasedEvasionDetector.cpp
- * @brief Enterprise implementation of timing-based sandbox/analysis evasion detection.
+ * @brief Enterprise-grade detection of timing-based sandbox/analysis evasion techniques
  *
- * Detects malware techniques: RDTSC abuse, sleep bombing, timing API checks,
- * NTP evasion, hardware timer abuse, and side-channel timing attacks.
+ * ShadowStrike AntiEvasion - Time-Based Evasion Detection Module
+ * Copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
  *
- * @author ShadowStrike Security Team
- * @copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
+ * ============================================================================
+ * IMPLEMENTATION OVERVIEW
+ * ============================================================================
+ *
+ * This module implements comprehensive detection of timing attacks:
+ *
+ * 1. RDTSC/RDTSCP ANALYSIS
+ *    - Instruction pattern scanning via Zydis disassembler
+ *    - High-frequency RDTSC detection
+ *    - RDTSC delta checks for VM detection
+ *    - RDTSC+CPUID serialization patterns
+ *
+ * 2. SLEEP EVASION DETECTION
+ *    - Sleep bombing (extended delays)
+ *    - Sleep acceleration detection
+ *    - Sleep fragmentation patterns
+ *    - NtDelayExecution abuse
+ *
+ * 3. API TIMING ANALYSIS
+ *    - GetTickCount/GetTickCount64 monitoring
+ *    - QueryPerformanceCounter patterns
+ *    - System time API cross-checking
+ *
+ * 4. NTP/NETWORK TIME EVASION
+ *    - NTP server query detection
+ *    - HTTP Date header checks
+ *    - External time validation
+ *
+ * 5. HARDWARE TIMER ABUSE
+ *    - HPET access detection
+ *    - ACPI PM Timer queries
+ *    - Direct hardware timer access
+ *
+ * ============================================================================
+ * THREAD SAFETY
+ * ============================================================================
+ *
+ * All public methods are thread-safe. Uses:
+ * - std::shared_mutex for read/write separation
+ * - std::atomic for statistics counters
+ * - Thread-local storage for per-thread analysis buffers
+ *
+ * ============================================================================
  */
+
 #include "pch.h"
 #include "TimeBasedEvasionDetector.hpp"
 
 // ============================================================================
-// INFRASTRUCTURE INCLUDES
-// ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ThreadPool.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../Utils/NetworkUtils.hpp"
-
-// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <format>
-#include <map>
-#include <numeric>
-#include <unordered_set>
 
-#ifdef _WIN32
-#  include <intrin.h>
-#  include <winternl.h>
-#  include <Psapi.h>
-#  pragma comment(lib, "ntdll.lib")
-#  pragma comment(lib, "psapi.lib")
-#endif
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <queue>
+#include <sstream>
+#include <thread>
+#include <future>
+
+// ============================================================================
+// WINDOWS SDK INCLUDES
+// ============================================================================
+
+#include <TlHelp32.h>
+#include <intrin.h>
+
+// ============================================================================
+// SHADOWSTRIKE INTERNAL INCLUDES
+// ============================================================================
+
+#include "../Utils/Logger.hpp"
+#include "../Utils/StringUtils.hpp"
+#include "../Utils/ProcessUtils.hpp"
+#include "../Utils/SystemUtils.hpp"
+#include "../Utils/MemoryUtils.hpp"
+#include "../PEParser/PEParser.hpp"
+
+#include <Zydis/Zydis.h>
 
 namespace ShadowStrike {
-    namespace AntiEvasion {
+namespace AntiEvasion {
 
-        using namespace std::chrono;
-        using namespace Utils;
+// ============================================================================
+// INTERNAL CONSTANTS
+// ============================================================================
 
-        // ====================================================================
-        // IMPLEMENTATION STRUCTURES
-        // ====================================================================
+namespace {
 
-        /**
-         * @brief Cache entry for analysis results with TTL.
-         */
-        struct CacheEntry {
-            TimingEvasionResult result{};
-            steady_clock::time_point cacheTime{};
+    /// @brief Log category for this module
+    constexpr const wchar_t* LOG_CATEGORY = L"TimeEvasion";
 
-            [[nodiscard]] bool IsExpired(milliseconds ttl) const noexcept {
-                return (steady_clock::now() - cacheTime) > ttl;
-            }
-        };
+    /// @brief Maximum code bytes to scan for RDTSC patterns
+    constexpr size_t MAX_CODE_SCAN_SIZE = 1024 * 1024;  // 1MB
 
-        /**
-         * @brief Process monitoring state.
-         */
-        struct ProcessMonitorState {
-            uint32_t processId = 0;
-            MonitoringState state = MonitoringState::Inactive;
-            steady_clock::time_point startTime{};
-            steady_clock::time_point lastTickTime{};
-            std::vector<TimingEventRecord> eventHistory;
+    /// @brief Maximum instructions to disassemble per function
+    constexpr size_t MAX_INSTRUCTIONS_PER_SCAN = 10000;
 
-            // Timing baselines for anomaly detection
-            uint64_t baselineTickCount = 0;
-            uint64_t baselineQPC = 0;
-            steady_clock::time_point baselineTime{};
-        };
+    /// @brief Minimum RDTSC call count to consider suspicious
+    constexpr uint64_t MIN_RDTSC_FOR_SUSPICION = 5;
 
-        /**
-         * @brief RDTSC tracking data for a process.
-         */
-        struct RDTSCTracker {
-            uint64_t callCount = 0;
-            uint64_t lastValue = 0;
-            std::vector<uint64_t> deltas;
-            steady_clock::time_point firstCall{};
-            steady_clock::time_point lastCall{};
-        };
+    /// @brief Default callback ID counter start
+    constexpr uint64_t CALLBACK_ID_START = 1000;
 
-        /**
-         * @brief Sleep call tracking.
-         */
-        struct SleepTracker {
-            uint32_t callCount = 0;
-            uint64_t totalRequestedMs = 0;
-            uint64_t totalActualMs = 0;
-            std::vector<uint64_t> durations;
-            std::vector<steady_clock::time_point> timestamps;
-        };
+    /// @brief Timing API import names for detection
+    const std::vector<std::string> TIMING_API_IMPORTS = {
+        "GetTickCount",
+        "GetTickCount64",
+        "QueryPerformanceCounter",
+        "QueryPerformanceFrequency",
+        "GetSystemTimeAsFileTime",
+        "GetSystemTimePreciseAsFileTime",
+        "timeGetTime",
+        "NtQuerySystemTime",
+        "RtlGetSystemTimePrecise"
+    };
 
-        // ====================================================================
-        // PIMPL IMPLEMENTATION
-        // ====================================================================
+    /// @brief Sleep-related API imports
+    const std::vector<std::string> SLEEP_API_IMPORTS = {
+        "Sleep",
+        "SleepEx",
+        "NtDelayExecution",
+        "WaitForSingleObject",
+        "WaitForSingleObjectEx",
+        "WaitForMultipleObjects",
+        "WaitForMultipleObjectsEx",
+        "MsgWaitForMultipleObjects",
+        "MsgWaitForMultipleObjectsEx",
+        "SetWaitableTimer",
+        "SetWaitableTimerEx"
+    };
 
-        /**
-         * @brief Private implementation (PIMPL pattern for ABI stability).
-         */
-        class TimeBasedEvasionDetector::Impl {
-        public:
-            // Thread safety
-            mutable std::shared_mutex m_mutex;
+    /// @brief NTP-related patterns in strings
+    const std::vector<std::wstring> NTP_PATTERNS = {
+        L"time.windows.com",
+        L"time.nist.gov",
+        L"pool.ntp.org",
+        L"time.google.com",
+        L"ntp.ubuntu.com",
+        L"time.apple.com",
+        L"clock.isc.org"
+    };
 
-            // Initialization state
-            std::atomic<bool> m_initialized{ false };
+} // anonymous namespace
 
-            // Configuration
-            TimingDetectorConfig m_config{};
+// ============================================================================
+// TIMING INSTRUCTION PATTERNS
+// ============================================================================
 
-            // Thread pool for async operations
-            std::shared_ptr<Utils::ThreadPool> m_threadPool;
+namespace TimingPatterns {
 
-            // Pattern store for timing patterns
-            std::shared_ptr<PatternStore::PatternStore> m_patternStore;
+    /// @brief Pattern for RDTSC instruction (0F 31)
+    static const std::vector<uint8_t> RDTSC_PATTERN = { 0x0F, 0x31 };
 
-            // Statistics
-            TimingDetectorStats m_stats{};
+    /// @brief Pattern for RDTSCP instruction (0F 01 F9)
+    static const std::vector<uint8_t> RDTSCP_PATTERN = { 0x0F, 0x01, 0xF9 };
 
-            // Result cache (process ID -> cache entry)
-            std::unordered_map<uint32_t, CacheEntry> m_resultCache;
+    /// @brief Pattern for CPUID instruction (0F A2)
+    static const std::vector<uint8_t> CPUID_PATTERN = { 0x0F, 0xA2 };
 
-            // Monitored processes
-            std::unordered_map<uint32_t, ProcessMonitorState> m_monitoredProcesses;
-
-            // RDTSC tracking per process
-            std::unordered_map<uint32_t, RDTSCTracker> m_rdtscTrackers;
-
-            // Sleep tracking per process
-            std::unordered_map<uint32_t, SleepTracker> m_sleepTrackers;
-
-            // Callbacks
-            std::atomic<uint64_t> m_nextCallbackId{ 1 };
-            std::map<uint64_t, TimingEvasionCallback> m_callbacks;
-            std::map<uint64_t, TimingEventCallback> m_eventCallbacks;
-
-            // Monitoring control
-            std::atomic<bool> m_shutdownRequested{ false };
-
-            // System timing baseline (captured at init)
-            uint64_t m_systemQPCFrequency = 0;
-            steady_clock::time_point m_initTime{};
-
-            /**
-             * @brief Constructor.
-             */
-            Impl() = default;
-
-            /**
-             * @brief Destructor.
-             */
-            ~Impl() = default;
-
-            /**
-             * @brief Initialize implementation.
-             */
-            [[nodiscard]] bool Initialize(
-                std::shared_ptr<Utils::ThreadPool> threadPool,
-                const TimingDetectorConfig& config
-            ) {
-                std::unique_lock lock(m_mutex);
-
-                if (m_initialized.load(std::memory_order_acquire)) {
-                    SS_LOG_WARN(L"AntiEvasion", L"TimeBasedEvasionDetector already initialized");
-                    return true;
-                }
-
-                try {
-                    // Validate thread pool
-                    if (!threadPool) {
-                        SS_LOG_ERROR(L"AntiEvasion", L"TimeBasedEvasionDetector: Null thread pool");
-                        return false;
-                    }
-                    m_threadPool = threadPool;
-
-                    // Store configuration
-                    m_config = config;
-
-                    // Initialize pattern store for timing patterns
-                    m_patternStore = std::make_shared<PatternStore::PatternStore>();
-
-                    // Capture system timing baselines
-                    m_initTime = steady_clock::now();
-
-#ifdef _WIN32
-                    LARGE_INTEGER freq{};
-                    if (QueryPerformanceFrequency(&freq)) {
-                        m_systemQPCFrequency = static_cast<uint64_t>(freq.QuadPart);
-                    }
-#endif
-
-                    // Reset statistics
-                    m_stats.Reset();
-
-                    m_initialized.store(true, std::memory_order_release);
-                    SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector initialized successfully");
-                    return true;
-
-                } catch (const std::exception& e) {
-                    SS_LOG_ERROR(L"AntiEvasion", L"TimeBasedEvasionDetector initialization failed: %hs", e.what());
-                    return false;
-                }
-            }
-
-            /**
-             * @brief Shutdown implementation.
-             */
-            void Shutdown() {
-                std::unique_lock lock(m_mutex);
-
-                if (!m_initialized.load(std::memory_order_acquire)) {
-                    return;
-                }
-
-                m_shutdownRequested.store(true, std::memory_order_release);
-
-                // Stop all monitoring
-                m_monitoredProcesses.clear();
-
-                // Clear caches
-                m_resultCache.clear();
-                m_rdtscTrackers.clear();
-                m_sleepTrackers.clear();
-
-                // Clear callbacks
-                m_callbacks.clear();
-                m_eventCallbacks.clear();
-
-                m_initialized.store(false, std::memory_order_release);
-                SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector shutdown complete");
-            }
-
-            /**
-             * @brief Check if cached result exists and is valid.
-             */
-            [[nodiscard]] std::optional<TimingEvasionResult> GetCachedResultInternal(
-                uint32_t processId
-            ) const {
-                std::shared_lock lock(m_mutex);
-
-                if (!m_config.enableResultCache) {
-                    return std::nullopt;
-                }
-
-                auto it = m_resultCache.find(processId);
-                if (it == m_resultCache.end()) {
-                    return std::nullopt;
-                }
-
-                if (it->second.IsExpired(m_config.resultCacheTTL)) {
-                    return std::nullopt;
-                }
-
-                return it->second.result;
-            }
-
-            /**
-             * @brief Update result cache.
-             */
-            void UpdateCacheInternal(uint32_t processId, const TimingEvasionResult& result) {
-                std::unique_lock lock(m_mutex);
-
-                if (!m_config.enableResultCache) {
-                    return;
-                }
-
-                CacheEntry entry{};
-                entry.result = result;
-                entry.cacheTime = steady_clock::now();
-
-                m_resultCache[processId] = entry;
-            }
-
-            /**
-             * @brief Get process information.
-             */
-            [[nodiscard]] bool GetProcessInfo(
-                uint32_t processId,
-                TimingEvasionResult& result
-            ) {
-                try {
-#ifdef _WIN32
-                    HANDLE hProcess = OpenProcess(
-                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                        FALSE,
-                        processId
-                    );
-
-                    if (!hProcess) {
-                        SS_LOG_WARN(L"AntiEvasion", L"Failed to open process %u: %lu", processId, GetLastError());
-                        return false;
-                    }
-
-                    // RAII wrapper for process handle
-                    struct ProcessHandleGuard {
-                        HANDLE handle;
-                        ~ProcessHandleGuard() { if (handle) CloseHandle(handle); }
-                    } guard{ hProcess };
-
-                    // Get process name
-                    wchar_t processPath[MAX_PATH] = {};
-                    DWORD pathLen = MAX_PATH;
-                    if (QueryFullProcessImageNameW(hProcess, 0, processPath, &pathLen)) {
-                        result.processPath = processPath;
-
-                        // Extract process name from path
-                        std::wstring path(processPath);
-                        size_t lastSlash = path.find_last_of(L"\\/");
-                        if (lastSlash != std::wstring::npos) {
-                            result.processName = path.substr(lastSlash + 1);
-                        }
-                    }
-
-                    // Get parent process ID
-                    PROCESS_BASIC_INFORMATION pbi{};
-                    ULONG returnLength = 0;
-
-                    typedef NTSTATUS(WINAPI* NtQueryInformationProcessPtr)(
-                        HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
-
-                    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-                    if (ntdll) {
-                        auto NtQueryInformationProcess =
-                            reinterpret_cast<NtQueryInformationProcessPtr>(
-                                GetProcAddress(ntdll, "NtQueryInformationProcess"));
-
-                        if (NtQueryInformationProcess) {
-                            if (NT_SUCCESS(NtQueryInformationProcess(
-                                hProcess, ProcessBasicInformation,
-                                &pbi, sizeof(pbi), &returnLength))) {
-                                result.parentProcessId = static_cast<uint32_t>(
-                                    static_cast<uintptr_t>(pbi.UniqueProcessId)
-                                );
-                            }
-                        }
-                    }
-
-                    result.processId = processId;
-                    return true;
-#else
-                    return false;
-#endif
-                } catch (const std::exception& e) {
-                    SS_LOG_ERROR(L"AntiEvasion", L"GetProcessInfo failed for PID %u: %hs", processId, e.what());
-                    return false;
-                }
-            }
-        };
-
-        // ====================================================================
-        // SINGLETON INSTANCE
-        // ====================================================================
-
-        TimeBasedEvasionDetector& TimeBasedEvasionDetector::Instance() {
-            static TimeBasedEvasionDetector instance;
-            return instance;
+    /// @brief Match pattern in buffer
+    [[nodiscard]] bool MatchPattern(
+        const uint8_t* buffer,
+        size_t bufferSize,
+        size_t offset,
+        const std::vector<uint8_t>& pattern) noexcept
+    {
+        if (offset + pattern.size() > bufferSize) {
+            return false;
         }
 
-        // ====================================================================
-        // CONSTRUCTOR / DESTRUCTOR
-        // ====================================================================
-
-        TimeBasedEvasionDetector::TimeBasedEvasionDetector()
-            : m_impl(std::make_unique<Impl>())
-        {
-        }
-
-        TimeBasedEvasionDetector::~TimeBasedEvasionDetector() {
-            if (m_impl) {
-                m_impl->Shutdown();
-            }
-        }
-
-        // ====================================================================
-        // LIFECYCLE MANAGEMENT
-        // ====================================================================
-
-        bool TimeBasedEvasionDetector::Initialize(
-            std::shared_ptr<Utils::ThreadPool> threadPool
-        ) {
-            return Initialize(threadPool, TimingDetectorConfig::CreateDefault());
-        }
-
-        bool TimeBasedEvasionDetector::Initialize(
-            std::shared_ptr<Utils::ThreadPool> threadPool,
-            const TimingDetectorConfig& config
-        ) {
-            if (!m_impl) {
-                SS_LOG_FATAL(L"AntiEvasion", L"TimeBasedEvasionDetector: Implementation is null");
+        for (size_t i = 0; i < pattern.size(); ++i) {
+            if (buffer[offset + i] != pattern[i]) {
                 return false;
             }
-
-            return m_impl->Initialize(threadPool, config);
         }
+        return true;
+    }
 
-        void TimeBasedEvasionDetector::Shutdown() {
-            if (m_impl) {
-                m_impl->Shutdown();
+    /// @brief Count pattern occurrences in buffer
+    [[nodiscard]] size_t CountPatternOccurrences(
+        const uint8_t* buffer,
+        size_t bufferSize,
+        const std::vector<uint8_t>& pattern) noexcept
+    {
+        size_t count = 0;
+        for (size_t i = 0; i + pattern.size() <= bufferSize; ++i) {
+            if (MatchPattern(buffer, bufferSize, i, pattern)) {
+                ++count;
+                i += pattern.size() - 1;  // Skip past matched pattern
             }
         }
+        return count;
+    }
 
-        bool TimeBasedEvasionDetector::IsInitialized() const noexcept {
-            return m_impl && m_impl->m_initialized.load(std::memory_order_acquire);
+} // namespace TimingPatterns
+
+// ============================================================================
+// PROCESS MONITORING STATE
+// ============================================================================
+
+struct ProcessMonitoringContext {
+    uint32_t processId = 0;
+    MonitoringState state = MonitoringState::Inactive;
+    std::chrono::steady_clock::time_point startTime{};
+    std::chrono::steady_clock::time_point lastUpdate{};
+
+    // Accumulated statistics
+    uint64_t rdtscCount = 0;
+    uint64_t sleepTotalMs = 0;
+    uint32_t sleepCallCount = 0;
+    uint32_t getTickCountCalls = 0;
+    uint32_t qpcCalls = 0;
+
+    // Event history (ring buffer)
+    std::vector<TimingEventRecord> events;
+    size_t eventWriteIndex = 0;
+    size_t eventCount = 0;
+
+    // Detection flags
+    bool rdtscHighFrequencyDetected = false;
+    bool sleepBombingDetected = false;
+    bool sleepAccelerationDetected = false;
+
+    void AddEvent(const TimingEventRecord& event, size_t maxEvents) {
+        if (events.size() < maxEvents) {
+            events.push_back(event);
+            ++eventCount;
+        } else {
+            events[eventWriteIndex] = event;
+            eventWriteIndex = (eventWriteIndex + 1) % maxEvents;
+            if (eventCount < maxEvents) ++eventCount;
+        }
+    }
+};
+
+// ============================================================================
+// IMPLEMENTATION CLASS
+// ============================================================================
+
+struct TimeBasedEvasionDetector::Impl {
+    // ========================================================================
+    // MEMBER VARIABLES
+    // ========================================================================
+
+    std::atomic<bool> m_initialized{ false };
+    mutable std::shared_mutex m_mutex;
+    mutable std::shared_mutex m_monitorMutex;
+    mutable std::shared_mutex m_callbackMutex;
+    mutable std::shared_mutex m_cacheMutex;
+
+    TimingDetectorConfig m_config;
+    TimingDetectorStats m_stats;
+
+    std::shared_ptr<Utils::ThreadPool> m_threadPool;
+
+    // Zydis disassembler contexts
+    ZydisDecoder m_decoder32{};
+    ZydisDecoder m_decoder64{};
+    ZydisFormatter m_formatter{};
+
+    // Process monitoring contexts
+    std::unordered_map<uint32_t, std::unique_ptr<ProcessMonitoringContext>> m_monitoredProcesses;
+
+    // Callbacks
+    std::atomic<uint64_t> m_nextCallbackId{ CALLBACK_ID_START };
+    std::unordered_map<uint64_t, TimingEvasionCallback> m_callbacks;
+    std::unordered_map<uint64_t, TimingEventCallback> m_eventCallbacks;
+
+    // Result cache
+    struct CacheEntry {
+        TimingEvasionResult result;
+        std::chrono::steady_clock::time_point timestamp;
+    };
+    std::unordered_map<uint32_t, CacheEntry> m_resultCache;
+
+    // Monitoring thread control
+    std::atomic<bool> m_monitoringActive{ false };
+    std::thread m_monitoringThread;
+    std::condition_variable m_monitoringCv;
+    std::mutex m_monitoringCvMutex;
+
+    // ========================================================================
+    // CONSTRUCTOR / DESTRUCTOR
+    // ========================================================================
+
+    Impl() {
+        // Initialize Zydis decoders
+        ZydisDecoderInit(&m_decoder32, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
+        ZydisDecoderInit(&m_decoder64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+        ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+    }
+
+    ~Impl() {
+        Shutdown();
+    }
+
+    // ========================================================================
+    // INITIALIZATION
+    // ========================================================================
+
+    [[nodiscard]] bool Initialize(
+        std::shared_ptr<Utils::ThreadPool> threadPool,
+        const TimingDetectorConfig& config)
+    {
+        std::unique_lock lock(m_mutex);
+
+        if (m_initialized.load(std::memory_order_acquire)) {
+            return true;
         }
 
-        void TimeBasedEvasionDetector::UpdateConfig(const TimingDetectorConfig& config) {
-            if (!m_impl) return;
+        m_threadPool = std::move(threadPool);
+        m_config = config;
 
-            std::unique_lock lock(m_impl->m_mutex);
-            m_impl->m_config = config;
-            SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector configuration updated");
+        // Validate configuration
+        if (m_config.sampleInterval < TimingConstants::MIN_SAMPLE_INTERVAL) {
+            m_config.sampleInterval = TimingConstants::MIN_SAMPLE_INTERVAL;
+        }
+        if (m_config.sampleInterval > TimingConstants::MAX_SAMPLE_INTERVAL) {
+            m_config.sampleInterval = TimingConstants::MAX_SAMPLE_INTERVAL;
         }
 
-        TimingDetectorConfig TimeBasedEvasionDetector::GetConfig() const {
-            if (!m_impl) return TimingDetectorConfig{};
+        m_initialized.store(true, std::memory_order_release);
 
-            std::shared_lock lock(m_impl->m_mutex);
-            return m_impl->m_config;
+        SS_LOG_INFO(LOG_CATEGORY, L"TimeBasedEvasionDetector initialized");
+
+        return true;
+    }
+
+    void Shutdown() {
+        if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
+            return;
         }
 
-        // ====================================================================
-        // SINGLE PROCESS ANALYSIS
-        // ====================================================================
+        // Stop monitoring thread
+        StopAllMonitoring();
 
-        TimingEvasionResult TimeBasedEvasionDetector::AnalyzeProcess(uint32_t processId) {
-            TimingEvasionResult result{};
+        // Clear state
+        {
+            std::unique_lock lock(m_mutex);
+            m_threadPool.reset();
+        }
 
-            if (!IsInitialized()) {
-                result.errorMessage = L"Detector not initialized";
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess called but detector not initialized");
-                m_impl->m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
-                return result;
+        {
+            std::unique_lock lock(m_monitorMutex);
+            m_monitoredProcesses.clear();
+        }
+
+        {
+            std::unique_lock lock(m_callbackMutex);
+            m_callbacks.clear();
+            m_eventCallbacks.clear();
+        }
+
+        {
+            std::unique_lock lock(m_cacheMutex);
+            m_resultCache.clear();
+        }
+
+        SS_LOG_INFO(LOG_CATEGORY, L"TimeBasedEvasionDetector shut down");
+    }
+
+    [[nodiscard]] bool IsInitialized() const noexcept {
+        return m_initialized.load(std::memory_order_acquire);
+    }
+
+    // ========================================================================
+    // CONFIGURATION
+    // ========================================================================
+
+    void UpdateConfig(const TimingDetectorConfig& config) {
+        std::unique_lock lock(m_mutex);
+        m_config = config;
+
+        // Validate bounds
+        if (m_config.sampleInterval < TimingConstants::MIN_SAMPLE_INTERVAL) {
+            m_config.sampleInterval = TimingConstants::MIN_SAMPLE_INTERVAL;
+        }
+        if (m_config.sampleInterval > TimingConstants::MAX_SAMPLE_INTERVAL) {
+            m_config.sampleInterval = TimingConstants::MAX_SAMPLE_INTERVAL;
+        }
+    }
+
+    [[nodiscard]] TimingDetectorConfig GetConfig() const {
+        std::shared_lock lock(m_mutex);
+        return m_config;
+    }
+
+    // ========================================================================
+    // PROCESS ANALYSIS
+    // ========================================================================
+
+    [[nodiscard]] TimingEvasionResult AnalyzeProcess(uint32_t processId) {
+        TimingEvasionResult result;
+        result.processId = processId;
+        result.analysisStartTime = std::chrono::system_clock::now();
+
+        // Check cache first
+        if (m_config.enableResultCache) {
+            auto cached = GetCachedResult(processId);
+            if (cached) {
+                m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                return *cached;
             }
+            m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+        }
 
-            const auto analysisStart = steady_clock::now();
-            result.analysisStartTime = system_clock::now();
-
-            try {
-                // Check cache first
-                if (auto cached = m_impl->GetCachedResultInternal(processId)) {
-                    m_impl->m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_INFO(L"AntiEvasion", L"Returning cached result for PID %u", processId);
-                    return *cached;
-                }
-                m_impl->m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
-
-                // Get process information
-                if (!m_impl->GetProcessInfo(processId, result)) {
-                    result.errorMessage = L"Failed to open process or access denied";
-                    m_impl->m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
-                    return result;
-                }
-
-                // Perform detection checks based on configuration
-                if (m_impl->m_config.detectRDTSC) {
-                    CheckRDTSCAbuse(processId, result);
-                }
-
-                if (m_impl->m_config.detectSleepEvasion) {
-                    CheckSleepEvasion(processId, result);
-                }
-
-                if (m_impl->m_config.detectAPITiming) {
-                    CheckTimerAnomalies(processId, result);
-                    CheckTimeDriftChecks(processId, result);
-                }
-
-                if (m_impl->m_config.detectNTPEvasion) {
-                    CheckNTPEvasion(processId, result);
-                }
-
-                if (m_impl->m_config.detectHardwareTimers) {
-                    CheckHardwareTimers(processId, result);
-                }
-
-                // Correlate findings if enabled
-                if (m_impl->m_config.enableCorrelation) {
-                    CorrelateFindings(result);
-                }
-
-                // Calculate threat score
-                CalculateThreatScore(result);
-
-                // Add MITRE mappings
-                if (m_impl->m_config.enableMitreMapping) {
-                    AddMitreMappings(result);
-                }
-
-                // Mark analysis complete
-                result.analysisEndTime = system_clock::now();
-                result.analysisDurationMs = duration_cast<milliseconds>(
-                    result.analysisEndTime - result.analysisStartTime
-                ).count();
-                result.analysisComplete = true;
-
-                // Determine if evasive
-                result.isEvasive = !result.findings.empty() &&
-                    result.confidence >= m_impl->m_config.minReportableConfidence;
-
-                // Update statistics
-                m_impl->m_stats.totalProcessesAnalyzed.fetch_add(1, std::memory_order_relaxed);
-                if (result.isEvasive) {
-                    m_impl->m_stats.totalEvasionsDetected.fetch_add(1, std::memory_order_relaxed);
-                }
-
-                const auto analysisDuration = duration_cast<microseconds>(
-                    steady_clock::now() - analysisStart
-                ).count();
-                m_impl->m_stats.avgAnalysisDurationUs.store(
-                    analysisDuration, std::memory_order_relaxed
-                );
-                m_impl->m_stats.lastAnalysisTimestamp.store(
-                    duration_cast<seconds>(system_clock::now().time_since_epoch()).count(),
-                    std::memory_order_relaxed
-                );
-
-                // Update cache
-                UpdateCache(processId, result);
-
-                // Invoke callbacks if evasive
-                if (result.isEvasive) {
-                    InvokeCallbacks(result);
-                }
-
-                SS_LOG_INFO(L"AntiEvasion", L"Analysis complete for PID %u - Evasive: %d, Confidence: %.1f%%",
-                    processId, result.isEvasive, result.confidence);
-
-            } catch (const std::exception& e) {
-                result.errorMessage = StringUtils::ToWide(
-                    std::string("Analysis exception: ") + e.what()
-                );
-                result.analysisComplete = false;
-                m_impl->m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcess exception for PID %u: %hs", processId, e.what());
-            }
-
+        // Get process info
+        Utils::ProcessUtils::ProcessBasicInfo procInfo;
+        Utils::ProcessUtils::Error err;
+        if (!Utils::ProcessUtils::GetProcessBasicInfo(processId, procInfo, &err)) {
+            result.errorMessage = L"Failed to get process info: " + err.message;
+            result.analysisComplete = false;
+            m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        bool TimeBasedEvasionDetector::AnalyzeProcessAsync(
-            uint32_t processId,
-            std::function<void(TimingEvasionResult)> callback
-        ) {
-            if (!IsInitialized() || !m_impl->m_threadPool) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAsync: Not initialized or no thread pool");
-                return false;
-            }
+        result.processName = procInfo.name;
+        result.processPath = procInfo.executablePath;
+        result.commandLine = procInfo.commandLine;
+        result.parentProcessId = procInfo.parentPid;
 
-            if (!callback) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAsync: Null callback");
-                return false;
-            }
-
-            try {
-                // Submit to thread pool
-                m_impl->m_threadPool->Submit([this, processId, cb = std::move(callback)](const Utils::TaskContext&) {
-                    auto result = AnalyzeProcess(processId);
-                    cb(std::move(result));
-                }, Utils::TaskPriority::Normal);
-
-                return true;
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAsync failed: %hs", e.what());
-                return false;
-            }
+        // Get parent process name
+        Utils::ProcessUtils::ProcessBasicInfo parentInfo;
+        if (Utils::ProcessUtils::GetProcessBasicInfo(procInfo.parentPid, parentInfo, nullptr)) {
+            result.parentProcessName = parentInfo.name;
         }
 
-        bool TimeBasedEvasionDetector::QuickScanProcess(uint32_t processId) {
-            if (!IsInitialized()) {
-                return false;
-            }
-
-            try {
-                // Quick checks - just look for obvious indicators
-                TimingEvasionResult result{};
-
-                if (!m_impl->GetProcessInfo(processId, result)) {
-                    return false;
-                }
-
-                // Quick RDTSC check
-                CheckRDTSCAbuse(processId, result);
-                if (!result.findings.empty()) {
-                    return true;
-                }
-
-                // Quick sleep check
-                CheckSleepEvasion(processId, result);
-                if (!result.findings.empty()) {
-                    return true;
-                }
-
-                return false;
-
-            } catch (...) {
-                return false;
-            }
+        // Run detection checks
+        TimingDetectorConfig config;
+        {
+            std::shared_lock lock(m_mutex);
+            config = m_config;
         }
 
-        // ====================================================================
-        // SPECIFIC ANALYSIS METHODS
-        // ====================================================================
-
-        RDTSCAnalysis TimeBasedEvasionDetector::AnalyzeRDTSC(uint32_t processId) {
-            RDTSCAnalysis analysis{};
-            analysis.processId = processId;
-
-            if (!IsInitialized()) {
-                return analysis;
-            }
-
-            try {
-                std::shared_lock lock(m_impl->m_mutex);
-
-                auto it = m_impl->m_rdtscTrackers.find(processId);
-                if (it == m_impl->m_rdtscTrackers.end()) {
-                    return analysis;
-                }
-
-                const auto& tracker = it->second;
-                analysis.rdtscCount = tracker.callCount;
-
-                if (!tracker.deltas.empty()) {
-                    // Calculate statistics
-                    analysis.avgDeltaNs = std::accumulate(
-                        tracker.deltas.begin(), tracker.deltas.end(), 0ULL
-                    ) / tracker.deltas.size();
-
-                    analysis.minDeltaNs = *std::min_element(
-                        tracker.deltas.begin(), tracker.deltas.end()
-                    );
-
-                    analysis.maxDeltaNs = *std::max_element(
-                        tracker.deltas.begin(), tracker.deltas.end()
-                    );
-
-                    // Calculate standard deviation
-                    double sum = 0.0;
-                    for (auto delta : tracker.deltas) {
-                        double diff = static_cast<double>(delta) - analysis.avgDeltaNs;
-                        sum += diff * diff;
-                    }
-                    analysis.deltaStdDev = std::sqrt(sum / tracker.deltas.size());
-                }
-
-                // Calculate calls per second
-                if (tracker.firstCall != tracker.lastCall) {
-                    auto duration = duration_cast<milliseconds>(
-                        tracker.lastCall - tracker.firstCall
-                    ).count();
-                    if (duration > 0) {
-                        analysis.callsPerSecond = (tracker.callCount * 1000.0) / duration;
-                    }
-                }
-
-                analysis.observationDurationMs = duration_cast<milliseconds>(
-                    steady_clock::now() - tracker.firstCall
-                ).count();
-
-                // Detect high frequency
-                analysis.highFrequencyDetected =
-                    analysis.callsPerSecond > m_impl->m_config.rdtscFrequencyThreshold;
-
-                // Detect delta checking (VM detection)
-                analysis.deltaCheckDetected =
-                    analysis.maxDeltaNs > m_impl->m_config.rdtscDeltaThresholdNs;
-
-                // Detect frequency measurement
-                analysis.frequencyMeasurementDetected =
-                    tracker.deltas.size() > 10 && analysis.deltaStdDev > 100.0;
-
-                // Calculate confidence
-                float confidenceFactors = 0.0f;
-                int factorCount = 0;
-
-                if (analysis.highFrequencyDetected) {
-                    confidenceFactors += 40.0f;
-                    factorCount++;
-                }
-                if (analysis.deltaCheckDetected) {
-                    confidenceFactors += 35.0f;
-                    factorCount++;
-                }
-                if (analysis.frequencyMeasurementDetected) {
-                    confidenceFactors += 25.0f;
-                    factorCount++;
-                }
-
-                analysis.confidence = factorCount > 0 ? confidenceFactors : 0.0f;
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeRDTSC exception: %hs", e.what());
-            }
-
-            return analysis;
+        if (config.detectRDTSC) {
+            CheckRDTSCAbuse(processId, procInfo.is64Bit, result);
         }
 
-        SleepAnalysis TimeBasedEvasionDetector::AnalyzeSleep(uint32_t processId) {
-            SleepAnalysis analysis{};
-            analysis.processId = processId;
-
-            if (!IsInitialized()) {
-                return analysis;
-            }
-
-            try {
-                std::shared_lock lock(m_impl->m_mutex);
-
-                auto it = m_impl->m_sleepTrackers.find(processId);
-                if (it == m_impl->m_sleepTrackers.end()) {
-                    return analysis;
-                }
-
-                const auto& tracker = it->second;
-                analysis.sleepCallCount = tracker.callCount;
-                analysis.totalRequestedDurationMs = tracker.totalRequestedMs;
-                analysis.totalActualDurationMs = tracker.totalActualMs;
-
-                if (tracker.callCount > 0) {
-                    analysis.avgRequestedDurationMs = tracker.totalRequestedMs / tracker.callCount;
-                    analysis.avgActualDurationMs = tracker.totalActualMs / tracker.callCount;
-                }
-
-                if (!tracker.durations.empty()) {
-                    analysis.maxRequestedDurationMs = *std::max_element(
-                        tracker.durations.begin(), tracker.durations.end()
-                    );
-                    analysis.sleepDurations = tracker.durations;
-                }
-
-                // Calculate acceleration ratio
-                if (tracker.totalRequestedMs > 0) {
-                    analysis.accelerationRatio = static_cast<double>(tracker.totalActualMs) /
-                        static_cast<double>(tracker.totalRequestedMs);
-                }
-
-                // Detect sleep bombing
-                analysis.sleepBombingDetected =
-                    analysis.maxRequestedDurationMs > m_impl->m_config.sleepEvasionThresholdMs;
-
-                // Detect acceleration (sandbox fast-forward)
-                analysis.accelerationDetected =
-                    analysis.accelerationRatio < m_impl->m_config.sleepAccelerationThreshold &&
-                    tracker.callCount >= 3;
-
-                // Detect fragmentation
-                if (tracker.durations.size() >= m_impl->m_config.minSleepFragments) {
-                    // Check if many small sleeps that sum to a large value
-                    uint64_t avgDuration = tracker.totalRequestedMs / tracker.durations.size();
-
-                    if (avgDuration < 1000 && tracker.totalRequestedMs > 10000) {
-                        analysis.fragmentationDetected = true;
-                        analysis.fragmentedSleepCount = static_cast<uint32_t>(tracker.durations.size());
-                        analysis.avgFragmentDurationMs = avgDuration;
-                    }
-                }
-
-                // Calculate confidence
-                float confidence = 0.0f;
-                if (analysis.sleepBombingDetected) confidence += 30.0f;
-                if (analysis.accelerationDetected) confidence += 45.0f;
-                if (analysis.fragmentationDetected) confidence += 25.0f;
-
-                analysis.confidence = std::min(confidence, 100.0f);
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeSleep exception: %hs", e.what());
-            }
-
-            return analysis;
+        if (config.detectSleepEvasion) {
+            CheckSleepEvasion(processId, result);
         }
 
-        APITimingAnalysis TimeBasedEvasionDetector::AnalyzeAPITiming(uint32_t processId) {
-            APITimingAnalysis analysis{};
-            analysis.processId = processId;
-
-            if (!IsInitialized()) {
-                return analysis;
-            }
-
-            try {
-#ifdef _WIN32
-                // Measure current QPC frequency
-                LARGE_INTEGER freq{};
-                if (QueryPerformanceFrequency(&freq)) {
-                    analysis.qpcFrequencyHz = static_cast<uint64_t>(freq.QuadPart);
-                    analysis.expectedQpcFrequencyHz = m_impl->m_systemQPCFrequency;
-
-                    if (analysis.expectedQpcFrequencyHz > 0) {
-                        double deviation = std::abs(
-                            static_cast<double>(analysis.qpcFrequencyHz) -
-                            static_cast<double>(analysis.expectedQpcFrequencyHz)
-                        ) / static_cast<double>(analysis.expectedQpcFrequencyHz) * 100.0;
-
-                        analysis.qpcFrequencyDeviation = deviation;
-                        analysis.qpcAnomalyDetected =
-                            deviation > m_impl->m_config.qpcAnomalyPercent;
-                    }
-                }
-
-                // Calculate confidence
-                float confidence = 0.0f;
-                if (analysis.qpcAnomalyDetected) confidence += 40.0f;
-                if (analysis.tickCountAnomalyDetected) confidence += 35.0f;
-                if (analysis.crossCheckDetected) confidence += 25.0f;
-
-                analysis.confidence = std::min(confidence, 100.0f);
-#endif
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeAPITiming exception: %hs", e.what());
-            }
-
-            return analysis;
+        if (config.detectAPITiming) {
+            CheckTimerAnomalies(processId, result);
+            CheckTimeDriftChecks(processId, result);
         }
 
-        NTPAnalysis TimeBasedEvasionDetector::AnalyzeNTP(uint32_t processId) {
-            NTPAnalysis analysis{};
-            analysis.processId = processId;
-
-            if (!IsInitialized()) {
-                return analysis;
-            }
-
-            try {
-                // Use NetworkUtils to check for NTP connections (UDP port 123)
-                std::vector<Utils::NetworkUtils::ConnectionInfo> connections;
-                if (Utils::NetworkUtils::GetConnectionsByProcess(processId, connections)) {
-                    for (const auto& conn : connections) {
-                        if (conn.remotePort == 123 && conn.protocol == Utils::NetworkUtils::ProtocolType::UDP) {
-                            analysis.ntpQueryCount++;
-                            analysis.ntpServers.push_back(conn.remoteAddress.ToString());
-                            analysis.ntpEvasionDetected = true;
-                        }
-                    }
-                }
-
-                // If we found NTP servers, calculate confidence
-                if (analysis.ntpEvasionDetected) {
-                    // Enterprise heuristic: Valid NTP usually happens once at startup or at long intervals.
-                    // Evasion attempts might query repeatedly to check for time warping.
-
-                    if (analysis.ntpQueryCount > 1) {
-                        analysis.confidence = 85.0f; // High confidence if multiple queries observed
-                    } else {
-                        // Single query could be legitimate time sync, check context
-                        // If process is not a browser or system service, it's suspicious
-                        // We lack process category info here, so we default to medium confidence
-                        analysis.confidence = 60.0f;
-                    }
-                }
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeNTP exception: %hs", e.what());
-            }
-
-            return analysis;
+        if (config.detectNTPEvasion) {
+            CheckNTPEvasion(processId, result);
         }
 
-        bool TimeBasedEvasionDetector::DetectSleepAcceleration(uint32_t processId) {
-            auto sleepAnalysis = AnalyzeSleep(processId);
-            return sleepAnalysis.accelerationDetected;
+        if (config.detectHardwareTimers) {
+            CheckHardwareTimers(processId, result);
         }
 
-        bool TimeBasedEvasionDetector::DetectTimingAntiDebug(uint32_t processId) {
-            if (!IsInitialized()) {
-                return false;
-            }
-
-            try {
-                // Detect timing-based anti-debugging by checking for:
-                // 1. High-frequency timing calls in tight loops
-                // 2. Delta checks between timing calls
-                // 3. Multiple timing API cross-checks
-
-                auto rdtscAnalysis = AnalyzeRDTSC(processId);
-                if (rdtscAnalysis.highFrequencyDetected && rdtscAnalysis.deltaCheckDetected) {
-                    return true;
-                }
-
-                auto apiAnalysis = AnalyzeAPITiming(processId);
-                if (apiAnalysis.crossCheckDetected) {
-                    return true;
-                }
-
-                return false;
-
-            } catch (...) {
-                return false;
-            }
+        // Correlate findings
+        if (config.enableCorrelation) {
+            CorrelateFindings(result);
         }
 
-        // ====================================================================
-        // CONTINUOUS MONITORING
-        // ====================================================================
+        // Calculate threat score
+        CalculateThreatScore(result);
 
-        bool TimeBasedEvasionDetector::StartMonitoring(uint32_t processId) {
-            if (!IsInitialized()) {
-                SS_LOG_ERROR(L"AntiEvasion", L"StartMonitoring: Detector not initialized");
-                return false;
-            }
-
-            try {
-                std::unique_lock lock(m_impl->m_mutex);
-
-                // Check process limit
-                if (m_impl->m_monitoredProcesses.size() >= m_impl->m_config.maxMonitoredProcesses) {
-                    SS_LOG_WARN(L"AntiEvasion", L"StartMonitoring: Maximum monitored processes reached");
-                    return false;
-                }
-
-                // Create monitoring state
-                ProcessMonitorState state{};
-                state.processId = processId;
-                state.state = MonitoringState::Active;
-                state.startTime = steady_clock::now();
-                state.lastTickTime = steady_clock::now();
-
-                m_impl->m_monitoredProcesses[processId] = state;
-                m_impl->m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
-
-                SS_LOG_INFO(L"AntiEvasion", L"Started monitoring PID %u", processId);
-                return true;
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"StartMonitoring failed: %hs", e.what());
-                return false;
-            }
+        // Add MITRE mappings
+        if (config.enableMitreMapping) {
+            AddMitreMappings(result);
         }
 
-        void TimeBasedEvasionDetector::StopMonitoring(uint32_t processId) {
-            if (!m_impl) return;
+        // Finalize
+        result.analysisEndTime = std::chrono::system_clock::now();
+        result.analysisDurationMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                result.analysisEndTime - result.analysisStartTime
+            ).count()
+        );
+        result.analysisComplete = true;
 
-            std::unique_lock lock(m_impl->m_mutex);
-
-            auto it = m_impl->m_monitoredProcesses.find(processId);
-            if (it != m_impl->m_monitoredProcesses.end()) {
-                m_impl->m_monitoredProcesses.erase(it);
-                m_impl->m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
-                SS_LOG_INFO(L"AntiEvasion", L"Stopped monitoring PID %u", processId);
-            }
+        // Update statistics
+        m_stats.totalProcessesAnalyzed.fetch_add(1, std::memory_order_relaxed);
+        if (result.isEvasive) {
+            m_stats.totalEvasionsDetected.fetch_add(1, std::memory_order_relaxed);
         }
 
-        void TimeBasedEvasionDetector::StopAllMonitoring() {
-            if (!m_impl) return;
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            size_t count = m_impl->m_monitoredProcesses.size();
-            m_impl->m_monitoredProcesses.clear();
-            m_impl->m_stats.currentlyMonitoring.store(0, std::memory_order_relaxed);
-
-            SS_LOG_INFO(L"AntiEvasion", L"Stopped monitoring all %zu processes", count);
+        // Update cache
+        if (config.enableResultCache) {
+            UpdateCache(processId, result);
         }
 
-        bool TimeBasedEvasionDetector::IsMonitoring(uint32_t processId) const {
-            if (!m_impl) return false;
+        return result;
+    }
 
-            std::shared_lock lock(m_impl->m_mutex);
-            return m_impl->m_monitoredProcesses.find(processId) !=
-                m_impl->m_monitoredProcesses.end();
+    [[nodiscard]] bool AnalyzeProcessAsync(
+        uint32_t processId,
+        std::function<void(TimingEvasionResult)> callback)
+    {
+        if (!m_threadPool) {
+            // Run synchronously if no thread pool
+            callback(AnalyzeProcess(processId));
+            return true;
         }
 
-        MonitoringState TimeBasedEvasionDetector::GetMonitoringState(uint32_t processId) const {
-            if (!m_impl) return MonitoringState::Inactive;
+        // Queue async task
+        // Note: In production, this would use the thread pool
+        std::thread([this, processId, callback = std::move(callback)]() {
+            auto result = AnalyzeProcess(processId);
+            callback(std::move(result));
+        }).detach();
 
-            std::shared_lock lock(m_impl->m_mutex);
+        return true;
+    }
 
-            auto it = m_impl->m_monitoredProcesses.find(processId);
-            if (it != m_impl->m_monitoredProcesses.end()) {
-                return it->second.state;
-            }
+    [[nodiscard]] bool QuickScanProcess(uint32_t processId) {
+        // Quick check for obvious timing evasion
+        Utils::ProcessUtils::ProcessHandle hProcess(processId,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
 
-            return MonitoringState::Inactive;
-        }
-
-        void TimeBasedEvasionDetector::PauseMonitoring(uint32_t processId) {
-            if (!m_impl) return;
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            auto it = m_impl->m_monitoredProcesses.find(processId);
-            if (it != m_impl->m_monitoredProcesses.end()) {
-                it->second.state = MonitoringState::Paused;
-                SS_LOG_INFO(L"AntiEvasion", L"Paused monitoring PID %u", processId);
-            }
-        }
-
-        void TimeBasedEvasionDetector::ResumeMonitoring(uint32_t processId) {
-            if (!m_impl) return;
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            auto it = m_impl->m_monitoredProcesses.find(processId);
-            if (it != m_impl->m_monitoredProcesses.end()) {
-                it->second.state = MonitoringState::Active;
-                SS_LOG_INFO(L"AntiEvasion", L"Resumed monitoring PID %u", processId);
-            }
-        }
-
-        std::vector<uint32_t> TimeBasedEvasionDetector::GetMonitoredProcesses() const {
-            if (!m_impl) return {};
-
-            std::shared_lock lock(m_impl->m_mutex);
-
-            std::vector<uint32_t> processes;
-            processes.reserve(m_impl->m_monitoredProcesses.size());
-
-            for (const auto& [pid, state] : m_impl->m_monitoredProcesses) {
-                processes.push_back(pid);
-            }
-
-            return processes;
-        }
-
-        // ====================================================================
-        // CALLBACKS
-        // ====================================================================
-
-        uint64_t TimeBasedEvasionDetector::RegisterCallback(TimingEvasionCallback callback) {
-            if (!m_impl || !callback) {
-                return 0;
-            }
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
-            m_impl->m_callbacks[id] = std::move(callback);
-
-            SS_LOG_INFO(L"AntiEvasion", L"Registered timing evasion callback ID %llu", id);
-            return id;
-        }
-
-        bool TimeBasedEvasionDetector::UnregisterCallback(uint64_t callbackId) {
-            if (!m_impl) return false;
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            auto it = m_impl->m_callbacks.find(callbackId);
-            if (it != m_impl->m_callbacks.end()) {
-                m_impl->m_callbacks.erase(it);
-                SS_LOG_INFO(L"AntiEvasion", L"Unregistered callback ID %llu", callbackId);
-                return true;
-            }
-
+        if (!hProcess.IsValid()) {
             return false;
         }
 
-        uint64_t TimeBasedEvasionDetector::RegisterEventCallback(TimingEventCallback callback) {
-            if (!m_impl || !callback) {
-                return 0;
-            }
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
-            m_impl->m_eventCallbacks[id] = std::move(callback);
-
-            SS_LOG_INFO(L"AntiEvasion", L"Registered timing event callback ID %llu", id);
-            return id;
-        }
-
-        bool TimeBasedEvasionDetector::UnregisterEventCallback(uint64_t callbackId) {
-            if (!m_impl) return false;
-
-            std::unique_lock lock(m_impl->m_mutex);
-
-            auto it = m_impl->m_eventCallbacks.find(callbackId);
-            if (it != m_impl->m_eventCallbacks.end()) {
-                m_impl->m_eventCallbacks.erase(it);
-                return true;
-            }
-
+        // Get process modules and check for timing API imports
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(processId, modules)) {
             return false;
         }
 
-        // ====================================================================
-        // STATISTICS & DIAGNOSTICS
-        // ====================================================================
-
-        TimingDetectorStats TimeBasedEvasionDetector::GetStats() const {
-            if (!m_impl) return TimingDetectorStats{};
-
-            // Atomic loads - no lock needed
-            return m_impl->m_stats;
+        // Check main module for suspicious patterns
+        if (modules.empty()) {
+            return false;
         }
 
-        void TimeBasedEvasionDetector::ResetStats() {
-            if (m_impl) {
-                m_impl->m_stats.Reset();
-                SS_LOG_INFO(L"AntiEvasion", L"TimeBasedEvasionDetector statistics reset");
-            }
-        }
+        const auto& mainModule = modules[0];
 
-        std::optional<TimingEvasionResult> TimeBasedEvasionDetector::GetCachedResult(
-            uint32_t processId
-        ) const {
-            if (!m_impl) return std::nullopt;
-            return m_impl->GetCachedResultInternal(processId);
-        }
+        // Check if high number of timing-related imports
+        size_t timingImportCount = 0;
 
-        void TimeBasedEvasionDetector::ClearCache() {
-            if (!m_impl) return;
-
-            std::unique_lock lock(m_impl->m_mutex);
-            m_impl->m_resultCache.clear();
-            SS_LOG_INFO(L"AntiEvasion", L"Cleared timing evasion result cache");
-        }
-
-        void TimeBasedEvasionDetector::ClearCacheForProcess(uint32_t processId) {
-            if (!m_impl) return;
-
-            std::unique_lock lock(m_impl->m_mutex);
-            m_impl->m_resultCache.erase(processId);
-        }
-
-        std::vector<TimingEventRecord> TimeBasedEvasionDetector::GetEventHistory(
-            uint32_t processId,
-            size_t maxEvents
-        ) const {
-            if (!m_impl) return {};
-
-            std::shared_lock lock(m_impl->m_mutex);
-
-            auto it = m_impl->m_monitoredProcesses.find(processId);
-            if (it == m_impl->m_monitoredProcesses.end()) {
-                return {};
-            }
-
-            const auto& history = it->second.eventHistory;
-
-            if (maxEvents == 0 || maxEvents >= history.size()) {
-                return history;
-            }
-
-            // Return most recent events
-            return std::vector<TimingEventRecord>(
-                history.end() - maxEvents,
-                history.end()
-            );
-        }
-
-        // ====================================================================
-        // INTERNAL ANALYSIS METHODS
-        // ====================================================================
-
-        void TimeBasedEvasionDetector::CheckRDTSCAbuse(
-            uint32_t processId,
-            TimingEvasionResult& result
-        ) {
-            try {
-                auto analysis = AnalyzeRDTSC(processId);
-
-                if (analysis.HasRDTSCEvasion() &&
-                    analysis.confidence >= m_impl->m_config.minReportableConfidence) {
-
-                    TimingEvasionFinding finding{};
-                    finding.detectionTime = system_clock::now();
-                    finding.detectionMethod = TimingDetectionMethod::HardwareCounters;
-                    finding.confidence = analysis.confidence;
-                    finding.severity = ConfidenceToSeverity(analysis.confidence);
-
-                    if (analysis.highFrequencyDetected) {
-                        finding.type = TimingEvasionType::RDTSCHighFrequency;
-                        finding.description = L"High-frequency RDTSC instruction execution detected";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("RDTSC calls/sec: {:.2f}, Threshold: {}",
-                                analysis.callsPerSecond,
-                                m_impl->m_config.rdtscFrequencyThreshold)
-                        );
-                    } else if (analysis.deltaCheckDetected) {
-                        finding.type = TimingEvasionType::RDTSCDeltaCheck;
-                        finding.description = L"RDTSC delta check for VM/hypervisor detection";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("Max RDTSC delta: {} ns, Threshold: {} ns",
-                                analysis.maxDeltaNs,
-                                m_impl->m_config.rdtscDeltaThresholdNs)
-                        );
-                    } else if (analysis.frequencyMeasurementDetected) {
-                        finding.type = TimingEvasionType::TSCFrequencyMeasurement;
-                        finding.description = L"TSC frequency measurement for VM detection";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("Delta std dev: {:.2f}", analysis.deltaStdDev)
-                        );
-                    }
-
-                    finding.mitreId = TimingEvasionTypeToMitre(finding.type);
-                    result.findings.push_back(finding);
-                    result.detectedTypes.set(static_cast<size_t>(finding.type));
-
-                    // Update result statistics
-                    result.rdtscCallCount = analysis.rdtscCount;
-                    result.avgRdtscDeltaNs = analysis.avgDeltaNs;
-                    result.maxRdtscDeltaNs = analysis.maxDeltaNs;
-
-                    m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
-                        .fetch_add(1, std::memory_order_relaxed);
-                }
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CheckRDTSCAbuse exception: %hs", e.what());
-            }
-        }
-
-        void TimeBasedEvasionDetector::CheckTimeDriftChecks(
-            uint32_t processId,
-            TimingEvasionResult& result
-        ) {
-            try {
-                auto analysis = AnalyzeAPITiming(processId);
-
-                if (analysis.HasAPITimingEvasion() &&
-                    analysis.confidence >= m_impl->m_config.minReportableConfidence) {
-
-                    TimingEvasionFinding finding{};
-                    finding.detectionTime = system_clock::now();
-                    finding.detectionMethod = TimingDetectionMethod::APIHooking;
-                    finding.confidence = analysis.confidence;
-                    finding.severity = ConfidenceToSeverity(analysis.confidence);
-
-                    if (analysis.tickCountAnomalyDetected) {
-                        finding.type = TimingEvasionType::GetTickCountDelta;
-                        finding.description = L"GetTickCount anomaly detected";
-                    } else if (analysis.qpcAnomalyDetected) {
-                        finding.type = TimingEvasionType::QPCAnomaly;
-                        finding.description = L"QueryPerformanceCounter frequency anomaly";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("QPC deviation: {:.2f}%", analysis.qpcFrequencyDeviation)
-                        );
-                    } else if (analysis.crossCheckDetected) {
-                        finding.type = TimingEvasionType::TimingAPICrossCheck;
-                        finding.description = L"Multiple timing API cross-validation detected";
-                    }
-
-                    finding.mitreId = TimingEvasionTypeToMitre(finding.type);
-                    result.findings.push_back(finding);
-                    result.detectedTypes.set(static_cast<size_t>(finding.type));
-
-                    result.getTickCountCalls = analysis.getTickCountCalls;
-                    result.qpcCallCount = analysis.qpcCalls;
-
-                    m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
-                        .fetch_add(1, std::memory_order_relaxed);
-                }
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CheckTimeDriftChecks exception: %hs", e.what());
-            }
-        }
-
-        void TimeBasedEvasionDetector::CheckTimerAnomalies(
-            uint32_t processId,
-            TimingEvasionResult& result
-        ) {
-            try {
-                // Enterprise implementation: Check for timer resolution manipulation (timeBeginPeriod)
-                // Malware often lowers timer resolution to 1ms to make Sleep(1) faster or more precise
-                // for timing attacks.
-
-                // We check loaded modules for winmm.dll which exports timeBeginPeriod
-                std::vector<ProcessUtils::ProcessModuleInfo> modules;
-                if (ProcessUtils::EnumerateProcessModules(processId, modules)) {
-                    bool winmmLoaded = false;
-                    for (const auto& mod : modules) {
-                        if (StringUtils::ToLower(mod.name) == L"winmm.dll") {
-                            winmmLoaded = true;
-                            break;
-                        }
-                    }
-
-                    if (winmmLoaded) {
-                        // If winmm is loaded, we check if the process exhibits high-frequency sleep patterns
-                        // which would necessitate timer resolution changes.
-                        auto sleepAnalysis = AnalyzeSleep(processId);
-
-                        // If we have many small sleeps and winmm is loaded, it's a potential indicator
-                        // of timer resolution tampering for evasion or evasion-related timing.
-                        if (sleepAnalysis.sleepCallCount > 50 && sleepAnalysis.avgActualDurationMs <= 15) { // 15.625ms is default tick
-                             TimingEvasionFinding finding{};
-                             finding.type = TimingEvasionType::TimeGetTimeCheck; // Re-using existing enum or closest match
-                             finding.description = L"Potential timer resolution manipulation detected";
-                             finding.technicalDetails = L"High frequency small sleeps with winmm.dll loaded. Avg Duration: " +
-                                                      std::to_wstring(sleepAnalysis.avgActualDurationMs) + L"ms";
-                             finding.confidence = 45.0f; // Medium confidence as legitimate games/media apps do this too
-                             finding.severity = TimingEvasionSeverity::Medium;
-                             finding.mitreId = TimingEvasionTypeToMitre(finding.type);
-                             finding.detectionTime = system_clock::now();
-
-                             result.findings.push_back(finding);
-                             result.detectedTypes.set(static_cast<size_t>(finding.type));
-                             m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
-                                 .fetch_add(1, std::memory_order_relaxed);
+        // Parse PE to check imports
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        if (parser.ParseFile(mainModule.path, peInfo, nullptr)) {
+            std::vector<PEParser::ImportInfo> imports;
+            if (parser.ParseImports(imports, nullptr)) {
+                for (const auto& dll : imports) {
+                    for (const auto& func : dll.functions) {
+                        for (const auto& timingApi : TIMING_API_IMPORTS) {
+                            if (func.name == timingApi) {
+                                ++timingImportCount;
+                            }
                         }
                     }
                 }
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CheckTimerAnomalies exception: %hs", e.what());
             }
         }
 
-        void TimeBasedEvasionDetector::CheckSleepEvasion(
-            uint32_t processId,
-            TimingEvasionResult& result
-        ) {
-            try {
-                auto analysis = AnalyzeSleep(processId);
+        // More than 4 timing APIs is suspicious
+        return timingImportCount > 4;
+    }
 
-                if (analysis.HasSleepEvasion() &&
-                    analysis.confidence >= m_impl->m_config.minReportableConfidence) {
+    // ========================================================================
+    // RDTSC ANALYSIS
+    // ========================================================================
 
-                    TimingEvasionFinding finding{};
-                    finding.detectionTime = system_clock::now();
-                    finding.detectionMethod = TimingDetectionMethod::DynamicMonitoring;
-                    finding.confidence = analysis.confidence;
-                    finding.severity = ConfidenceToSeverity(analysis.confidence);
+    [[nodiscard]] RDTSCAnalysis AnalyzeRDTSC(uint32_t processId) {
+        RDTSCAnalysis analysis;
+        analysis.processId = processId;
 
-                    if (analysis.sleepBombingDetected) {
-                        finding.type = TimingEvasionType::SleepBombing;
-                        finding.description = L"Sleep bombing detected (extended sleep to timeout analysis)";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("Max sleep duration: {} ms", analysis.maxRequestedDurationMs)
-                        );
-                    } else if (analysis.accelerationDetected) {
-                        finding.type = TimingEvasionType::SleepAccelerationDetect;
-                        finding.description = L"Sleep acceleration detection (sandbox fast-forward)";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("Acceleration ratio: {:.3f}", analysis.accelerationRatio)
-                        );
-                    } else if (analysis.fragmentationDetected) {
-                        finding.type = TimingEvasionType::SleepFragmentation;
-                        finding.description = L"Fragmented sleeps to evade acceleration";
-                        finding.technicalDetails = StringUtils::ToWide(
-                            std::format("Fragment count: {}, Avg duration: {} ms",
-                                analysis.fragmentedSleepCount,
-                                analysis.avgFragmentDurationMs)
-                        );
-                    }
+        auto startTime = std::chrono::steady_clock::now();
 
-                    finding.mitreId = TimingEvasionTypeToMitre(finding.type);
-                    result.findings.push_back(finding);
-                    result.detectedTypes.set(static_cast<size_t>(finding.type));
+        Utils::ProcessUtils::ProcessHandle hProcess(processId,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
 
-                    result.sleepCallCount = analysis.sleepCallCount;
-                    result.totalSleepDurationMs = analysis.totalRequestedDurationMs;
-                    result.actualSleepDurationMs = analysis.totalActualDurationMs;
+        if (!hProcess.IsValid()) {
+            return analysis;
+        }
 
-                    m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
-                        .fetch_add(1, std::memory_order_relaxed);
-                }
+        // Get executable module
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(processId, modules) || modules.empty()) {
+            return analysis;
+        }
 
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CheckSleepEvasion exception: %hs", e.what());
+        const auto& mainModule = modules[0];
+        bool is64Bit = false;
+
+        // Check if 64-bit process
+        Utils::ProcessUtils::IsProcess64Bit(processId);
+
+        // Read code section and scan for RDTSC patterns
+        if (mainModule.baseAddress && mainModule.size > 0) {
+            size_t scanSize = std::min(mainModule.size, MAX_CODE_SCAN_SIZE);
+            std::vector<uint8_t> codeBuffer(scanSize);
+
+            SIZE_T bytesRead = 0;
+            if (Utils::ProcessUtils::ReadProcessMemory(processId,
+                mainModule.baseAddress, codeBuffer.data(), scanSize, &bytesRead)) {
+
+                // Count RDTSC instructions
+                analysis.rdtscCount = TimingPatterns::CountPatternOccurrences(
+                    codeBuffer.data(), bytesRead, TimingPatterns::RDTSC_PATTERN);
+
+                // Count RDTSCP instructions
+                analysis.rdtscpCount = TimingPatterns::CountPatternOccurrences(
+                    codeBuffer.data(), bytesRead, TimingPatterns::RDTSCP_PATTERN);
+
+                // Check for RDTSC+CPUID combinations
+                analysis.rdtscCpuidComboCount = CountRDTSCCPUIDCombos(
+                    codeBuffer.data(), bytesRead);
+
+                // Analyze using Zydis for more accurate detection
+                AnalyzeCodeWithZydis(codeBuffer.data(), bytesRead, is64Bit, analysis);
             }
         }
 
-        void TimeBasedEvasionDetector::CheckNTPEvasion(
-            uint32_t processId,
-            TimingEvasionResult& result
-        ) {
-            try {
-                auto analysis = AnalyzeNTP(processId);
+        auto endTime = std::chrono::steady_clock::now();
+        analysis.observationDurationMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count()
+        );
 
-                if (analysis.HasNTPEvasion() &&
-                    analysis.confidence >= m_impl->m_config.minReportableConfidence) {
-
-                    TimingEvasionFinding finding{};
-                    finding.detectionTime = system_clock::now();
-                    finding.detectionMethod = TimingDetectionMethod::DynamicMonitoring;
-                    finding.confidence = analysis.confidence;
-                    finding.severity = ConfidenceToSeverity(analysis.confidence);
-
-                    if (analysis.ntpEvasionDetected) {
-                        finding.type = TimingEvasionType::NTPQuery;
-                        finding.description = L"NTP server query for time validation";
-
-                        if (!analysis.ntpServers.empty()) {
-                             finding.technicalDetails = L"Servers: ";
-                             for(size_t i=0; i < std::min(analysis.ntpServers.size(), (size_t)3); ++i) {
-                                 finding.technicalDetails += analysis.ntpServers[i] + L" ";
-                             }
-                        }
-                    } else if (analysis.externalValidationDetected) {
-                        finding.type = TimingEvasionType::ExternalTimeValidation;
-                        finding.description = L"External time source validation";
-                    }
-
-                    finding.mitreId = TimingEvasionTypeToMitre(finding.type);
-                    result.findings.push_back(finding);
-                    result.detectedTypes.set(static_cast<size_t>(finding.type));
-
-                    result.ntpQueryCount = analysis.ntpQueryCount;
-
-                    m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
-                        .fetch_add(1, std::memory_order_relaxed);
-                }
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CheckNTPEvasion exception: %hs", e.what());
-            }
+        // Determine detection flags
+        TimingDetectorConfig config;
+        {
+            std::shared_lock lock(m_mutex);
+            config = m_config;
         }
 
-        void TimeBasedEvasionDetector::CheckHardwareTimers(
-            uint32_t processId,
-            TimingEvasionResult& result
-        ) {
-             // Basic user-mode check: look for suspicious loaded modules (drivers)
-             // that enable direct hardware access (e.g., WinIo, InpOut)
-             try {
-                 std::vector<ProcessUtils::ProcessModuleInfo> modules;
-                 if (ProcessUtils::EnumerateProcessModules(processId, modules)) {
-                     for (const auto& mod : modules) {
-                         std::wstring nameLower = StringUtils::ToLower(mod.name);
-                         if (nameLower.find(L"winio") != std::wstring::npos ||
-                             nameLower.find(L"inpout") != std::wstring::npos ||
-                             nameLower.find(L"giveio") != std::wstring::npos) {
-
-                             TimingEvasionFinding finding{};
-                             finding.type = TimingEvasionType::HardwareTimerDirect;
-                             finding.severity = TimingEvasionSeverity::High;
-                             finding.confidence = 90.0f;
-                             finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
-                             finding.description = L"Suspicious hardware access driver loaded";
-                             finding.technicalDetails = L"Module: " + mod.name;
-                             finding.detectionTime = system_clock::now();
-                             finding.mitreId = TimingEvasionTypeToMitre(finding.type);
-
-                             result.findings.push_back(finding);
-                             result.detectedTypes.set(static_cast<size_t>(finding.type));
-                             m_impl->m_stats.detectionsByType[static_cast<size_t>(finding.type)]
-                                 .fetch_add(1, std::memory_order_relaxed);
-                         }
-                     }
-                 }
-             } catch(...) {
-                 SS_LOG_ERROR(L"AntiEvasion", L"CheckHardwareTimers failed to enumerate modules for PID %u", processId);
-             }
+        if (analysis.rdtscCount >= MIN_RDTSC_FOR_SUSPICION) {
+            analysis.highFrequencyDetected = true;
+            analysis.confidence = std::min(100.0f,
+                static_cast<float>(analysis.rdtscCount) / 10.0f * 100.0f);
         }
 
-        void TimeBasedEvasionDetector::CorrelateFindings(TimingEvasionResult& result) {
-            if (result.findings.size() < 2) {
-                return;
-            }
-
-            try {
-                // Check for multi-technique evasion
-                std::unordered_set<TimingEvasionType> uniqueTypes;
-                for (const auto& finding : result.findings) {
-                    uniqueTypes.insert(finding.type);
-                }
-
-                if (uniqueTypes.size() >= 3) {
-                    // Multiple different techniques - strong indicator
-                    TimingEvasionFinding correlatedFinding{};
-                    correlatedFinding.type = TimingEvasionType::MultiTechniqueEvasion;
-                    correlatedFinding.severity = TimingEvasionSeverity::Critical;
-                    correlatedFinding.confidence = 95.0f;
-                    correlatedFinding.detectionMethod = TimingDetectionMethod::BehavioralHeuristics;
-                    correlatedFinding.description = L"Multiple timing evasion techniques combined";
-                    correlatedFinding.technicalDetails = StringUtils::ToWide(
-                        std::format("Detected {} distinct timing techniques", uniqueTypes.size())
-                    );
-                    correlatedFinding.detectionTime = system_clock::now();
-                    correlatedFinding.mitreId = TimingEvasionTypeToMitre(correlatedFinding.type);
-
-                    result.findings.push_back(correlatedFinding);
-                    result.detectedTypes.set(static_cast<size_t>(correlatedFinding.type));
-                }
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CorrelateFindings exception: %hs", e.what());
-            }
+        if (analysis.rdtscCpuidComboCount >= 2) {
+            analysis.deltaCheckDetected = true;
+            analysis.confidence = std::max(analysis.confidence, 70.0f);
         }
 
-        void TimeBasedEvasionDetector::CalculateThreatScore(TimingEvasionResult& result) {
-            if (result.findings.empty()) {
-                result.threatScore = 0.0f;
-                result.confidence = 0.0f;
-                result.severity = TimingEvasionSeverity::Info;
-                return;
-            }
+        return analysis;
+    }
 
-            try {
-                // Calculate weighted threat score
-                float totalScore = 0.0f;
-                float maxConfidence = 0.0f;
-                TimingEvasionSeverity maxSeverity = TimingEvasionSeverity::Info;
+    // ========================================================================
+    // SLEEP ANALYSIS
+    // ========================================================================
 
-                for (const auto& finding : result.findings) {
-                    // Weight by severity
-                    float severityWeight = static_cast<float>(finding.severity) / 100.0f;
-                    float findingScore = finding.confidence * severityWeight;
+    [[nodiscard]] SleepAnalysis AnalyzeSleep(uint32_t processId) {
+        SleepAnalysis analysis;
+        analysis.processId = processId;
 
-                    totalScore += findingScore;
-                    maxConfidence = std::max(maxConfidence, finding.confidence);
+        // Get process modules
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(processId, modules) || modules.empty()) {
+            return analysis;
+        }
 
-                    if (finding.severity > maxSeverity) {
-                        maxSeverity = finding.severity;
-                        result.primaryEvasionType = finding.type;
+        // Parse PE imports for sleep-related APIs
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        if (!parser.ParseFile(modules[0].path, peInfo, nullptr)) {
+            return analysis;
+        }
+
+        std::vector<PEParser::ImportInfo> imports;
+        if (!parser.ParseImports(imports, nullptr)) {
+            return analysis;
+        }
+
+        // Check for sleep-related imports
+        for (const auto& dll : imports) {
+            std::string dllNameLower = Utils::StringUtils::ToNarrow(dll.dllName);
+            std::transform(dllNameLower.begin(), dllNameLower.end(),
+                dllNameLower.begin(), ::tolower);
+
+            for (const auto& func : dll.functions) {
+                for (const auto& sleepApi : SLEEP_API_IMPORTS) {
+                    if (func.name == sleepApi) {
+                        analysis.sleepAPIsUsed.push_back(
+                            Utils::StringUtils::ToWide(func.name));
                     }
                 }
-
-                // Normalize threat score (0-100)
-                result.threatScore = std::min(totalScore, 100.0f);
-                result.confidence = maxConfidence;
-                result.severity = maxSeverity;
-
-                SS_LOG_INFO(L"AntiEvasion", L"Calculated threat score: %.1f, Confidence: %.1f%%, Severity: %hs",
-                    result.threatScore, result.confidence,
-                    TimingEvasionSeverityToString(result.severity));
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"CalculateThreatScore exception: %hs", e.what());
             }
         }
 
-        void TimeBasedEvasionDetector::AddMitreMappings(TimingEvasionResult& result) {
-            try {
-                std::unordered_set<std::string> uniqueMitreIds;
+        // Check monitoring context for runtime data
+        {
+            std::shared_lock lock(m_monitorMutex);
+            auto it = m_monitoredProcesses.find(processId);
+            if (it != m_monitoredProcesses.end()) {
+                const auto& ctx = *it->second;
+                analysis.sleepCallCount = ctx.sleepCallCount;
+                analysis.totalRequestedDurationMs = ctx.sleepTotalMs;
+                analysis.sleepBombingDetected = ctx.sleepBombingDetected;
+                analysis.accelerationDetected = ctx.sleepAccelerationDetected;
+            }
+        }
 
-                for (const auto& finding : result.findings) {
-                    if (!finding.mitreId.empty()) {
-                        uniqueMitreIds.insert(finding.mitreId);
+        // Detect sleep bombing (many sleep APIs + high import count)
+        if (analysis.sleepAPIsUsed.size() >= 3) {
+            analysis.sleepBombingDetected = true;
+            analysis.confidence = 60.0f;
+        }
+
+        return analysis;
+    }
+
+    // ========================================================================
+    // API TIMING ANALYSIS
+    // ========================================================================
+
+    [[nodiscard]] APITimingAnalysis AnalyzeAPITiming(uint32_t processId) {
+        APITimingAnalysis analysis;
+        analysis.processId = processId;
+
+        // Get expected QPC frequency
+        LARGE_INTEGER freq;
+        if (QueryPerformanceFrequency(&freq)) {
+            analysis.expectedQpcFrequencyHz = static_cast<uint64_t>(freq.QuadPart);
+        }
+
+        // Get process modules
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(processId, modules) || modules.empty()) {
+            return analysis;
+        }
+
+        // Parse PE imports
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        if (!parser.ParseFile(modules[0].path, peInfo, nullptr)) {
+            return analysis;
+        }
+
+        std::vector<PEParser::ImportInfo> imports;
+        if (!parser.ParseImports(imports, nullptr)) {
+            return analysis;
+        }
+
+        // Count timing API imports
+        for (const auto& dll : imports) {
+            for (const auto& func : dll.functions) {
+                if (func.name == "GetTickCount" || func.name == "GetTickCount64") {
+                    ++analysis.getTickCountCalls;
+                }
+                if (func.name == "QueryPerformanceCounter") {
+                    ++analysis.qpcCalls;
+                }
+                if (func.name == "GetSystemTimeAsFileTime") {
+                    ++analysis.systemTimeCalls;
+                }
+                if (func.name == "timeGetTime") {
+                    ++analysis.timeGetTimeCalls;
+                }
+                if (func.name == "GetSystemTimePreciseAsFileTime") {
+                    ++analysis.preciseTimeCalls;
+                }
+            }
+        }
+
+        // Detect cross-checking (multiple timing APIs used together)
+        uint32_t timingApiCount = 0;
+        if (analysis.getTickCountCalls > 0) ++timingApiCount;
+        if (analysis.qpcCalls > 0) ++timingApiCount;
+        if (analysis.systemTimeCalls > 0) ++timingApiCount;
+        if (analysis.timeGetTimeCalls > 0) ++timingApiCount;
+        if (analysis.preciseTimeCalls > 0) ++timingApiCount;
+
+        if (timingApiCount >= 3) {
+            analysis.crossCheckDetected = true;
+            analysis.crossCheckCount = timingApiCount;
+            analysis.confidence = 70.0f;
+        }
+
+        return analysis;
+    }
+
+    // ========================================================================
+    // NTP ANALYSIS
+    // ========================================================================
+
+    [[nodiscard]] NTPAnalysis AnalyzeNTP(uint32_t processId) {
+        NTPAnalysis analysis;
+        analysis.processId = processId;
+
+        // Get process command line and search for NTP server references
+        auto cmdLine = Utils::ProcessUtils::GetProcessCommandLine(processId);
+        if (cmdLine) {
+            std::wstring cmdLower = *cmdLine;
+            std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::towlower);
+
+            for (const auto& pattern : NTP_PATTERNS) {
+                if (cmdLower.find(pattern) != std::wstring::npos) {
+                    analysis.ntpServers.push_back(pattern);
+                    ++analysis.ntpQueryCount;
+                }
+            }
+        }
+
+        // Check network connections for NTP port (123)
+        // This would require network monitoring which is beyond scope here
+        // For now, we check imports for network-related APIs
+
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(processId, modules) || modules.empty()) {
+            return analysis;
+        }
+
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        if (parser.ParseFile(modules[0].path, peInfo, nullptr)) {
+            std::vector<PEParser::ImportInfo> imports;
+            if (parser.ParseImports(imports, nullptr)) {
+                for (const auto& dll : imports) {
+                    std::string dllNameLower = Utils::StringUtils::ToNarrow(dll.dllName);
+                    std::transform(dllNameLower.begin(), dllNameLower.end(),
+                        dllNameLower.begin(), ::tolower);
+
+                    // Check for WinHTTP/WinInet (used for HTTP time checks)
+                    if (dllNameLower.find("winhttp") != std::string::npos ||
+                        dllNameLower.find("wininet") != std::string::npos) {
+                        ++analysis.httpTimeCheckCount;
+                    }
+
+                    // Check for ws2_32 (UDP for NTP)
+                    if (dllNameLower.find("ws2_32") != std::string::npos) {
+                        // Could be NTP client
+                        ++analysis.externalTimeAPICalls;
                     }
                 }
-
-                result.mitreIds.assign(uniqueMitreIds.begin(), uniqueMitreIds.end());
-                std::sort(result.mitreIds.begin(), result.mitreIds.end());
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"AddMitreMappings exception: %hs", e.what());
             }
         }
 
-        void TimeBasedEvasionDetector::MonitoringTick(uint32_t processId) {
-            if (!m_impl) return;
+        if (analysis.ntpQueryCount > 0 || analysis.httpTimeCheckCount > 0) {
+            analysis.externalValidationDetected = true;
+            analysis.confidence = 50.0f;
+        }
 
-            try {
-                // Perform periodic analysis for monitored process
-                auto result = AnalyzeProcess(processId);
+        return analysis;
+    }
 
-                if (result.isEvasive) {
-                    InvokeCallbacks(result);
+    // ========================================================================
+    // DETECTION CHECKS
+    // ========================================================================
+
+    void CheckRDTSCAbuse(uint32_t processId, bool is64Bit, TimingEvasionResult& result) {
+        auto rdtscAnalysis = AnalyzeRDTSC(processId);
+
+        if (rdtscAnalysis.HasRDTSCEvasion()) {
+            TimingEvasionFinding finding;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+
+            if (rdtscAnalysis.highFrequencyDetected) {
+                finding.type = TimingEvasionType::RDTSCHighFrequency;
+                finding.severity = TimingEvasionSeverity::High;
+                finding.confidence = rdtscAnalysis.confidence;
+                finding.description = L"High-frequency RDTSC instruction usage detected";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"RDTSC count: %llu, RDTSCP count: %llu",
+                    rdtscAnalysis.rdtscCount, rdtscAnalysis.rdtscpCount);
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::RDTSCHighFrequency));
+                result.rdtscCallCount = rdtscAnalysis.rdtscCount;
+            }
+
+            if (rdtscAnalysis.deltaCheckDetected) {
+                finding.type = TimingEvasionType::RDTSCDeltaCheck;
+                finding.severity = TimingEvasionSeverity::High;
+                finding.confidence = 80.0f;
+                finding.description = L"RDTSC delta checking pattern detected (VM detection)";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"RDTSC+CPUID combos: %llu", rdtscAnalysis.rdtscCpuidComboCount);
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::RDTSCDeltaCheck));
+            }
+
+            if (rdtscAnalysis.rdtscpCount > 0) {
+                finding.type = TimingEvasionType::RDTSCPUsage;
+                finding.severity = TimingEvasionSeverity::Medium;
+                finding.confidence = 60.0f;
+                finding.description = L"RDTSCP instruction usage detected";
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::RDTSCPUsage));
+            }
+
+            result.isEvasive = true;
+        }
+    }
+
+    void CheckSleepEvasion(uint32_t processId, TimingEvasionResult& result) {
+        auto sleepAnalysis = AnalyzeSleep(processId);
+
+        if (sleepAnalysis.HasSleepEvasion()) {
+            TimingEvasionFinding finding;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+
+            if (sleepAnalysis.sleepBombingDetected) {
+                finding.type = TimingEvasionType::SleepBombing;
+                finding.severity = TimingEvasionSeverity::High;
+                finding.confidence = sleepAnalysis.confidence;
+                finding.description = L"Sleep bombing pattern detected (sandbox timeout attempt)";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"Sleep APIs used: %zu, Total sleep: %llu ms",
+                    sleepAnalysis.sleepAPIsUsed.size(),
+                    sleepAnalysis.totalRequestedDurationMs);
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::SleepBombing));
+                result.totalSleepDurationMs = sleepAnalysis.totalRequestedDurationMs;
+                result.sleepCallCount = sleepAnalysis.sleepCallCount;
+            }
+
+            if (sleepAnalysis.accelerationDetected) {
+                finding.type = TimingEvasionType::SleepAccelerationDetect;
+                finding.severity = TimingEvasionSeverity::Critical;
+                finding.confidence = 90.0f;
+                finding.description = L"Sleep acceleration detection attempt";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"Acceleration ratio: %.2f", sleepAnalysis.accelerationRatio);
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::SleepAccelerationDetect));
+            }
+
+            if (sleepAnalysis.fragmentationDetected) {
+                finding.type = TimingEvasionType::SleepFragmentation;
+                finding.severity = TimingEvasionSeverity::High;
+                finding.confidence = 75.0f;
+                finding.description = L"Sleep fragmentation pattern detected";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"Fragment count: %u, Avg fragment: %llu ms",
+                    sleepAnalysis.fragmentedSleepCount,
+                    sleepAnalysis.avgFragmentDurationMs);
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::SleepFragmentation));
+            }
+
+            result.isEvasive = true;
+        }
+    }
+
+    void CheckTimeDriftChecks(uint32_t processId, TimingEvasionResult& result) {
+        // Check for patterns that indicate time drift detection
+        auto apiAnalysis = AnalyzeAPITiming(processId);
+
+        if (apiAnalysis.crossCheckDetected) {
+            TimingEvasionFinding finding;
+            finding.type = TimingEvasionType::TimingAPICrossCheck;
+            finding.severity = TimingEvasionSeverity::High;
+            finding.confidence = apiAnalysis.confidence;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+            finding.description = L"Multiple timing API cross-check pattern detected";
+            finding.technicalDetails = Utils::StringUtils::Format(
+                L"Timing APIs detected: %u (GetTickCount: %u, QPC: %u, SystemTime: %u)",
+                apiAnalysis.crossCheckCount,
+                apiAnalysis.getTickCountCalls,
+                apiAnalysis.qpcCalls,
+                apiAnalysis.systemTimeCalls);
+            finding.mitreId = "T1497.003";
+
+            result.findings.push_back(finding);
+            result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::TimingAPICrossCheck));
+            result.getTickCountCalls = apiAnalysis.getTickCountCalls;
+            result.qpcCallCount = apiAnalysis.qpcCalls;
+            result.isEvasive = true;
+        }
+    }
+
+    void CheckTimerAnomalies(uint32_t processId, TimingEvasionResult& result) {
+        auto apiAnalysis = AnalyzeAPITiming(processId);
+
+        // High GetTickCount usage
+        if (apiAnalysis.getTickCountCalls > 5) {
+            TimingEvasionFinding finding;
+            finding.type = TimingEvasionType::GetTickCountDelta;
+            finding.severity = TimingEvasionSeverity::Medium;
+            finding.confidence = 50.0f;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+            finding.description = L"Excessive GetTickCount usage detected";
+            finding.technicalDetails = Utils::StringUtils::Format(
+                L"GetTickCount import count: %u", apiAnalysis.getTickCountCalls);
+            finding.mitreId = "T1497.003";
+
+            result.findings.push_back(finding);
+            result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::GetTickCountDelta));
+        }
+
+        // High QPC usage
+        if (apiAnalysis.qpcCalls > 3) {
+            TimingEvasionFinding finding;
+            finding.type = TimingEvasionType::QPCAnomaly;
+            finding.severity = TimingEvasionSeverity::Medium;
+            finding.confidence = 45.0f;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+            finding.description = L"QueryPerformanceCounter usage pattern detected";
+            finding.technicalDetails = Utils::StringUtils::Format(
+                L"QPC import count: %u", apiAnalysis.qpcCalls);
+            finding.mitreId = "T1497.003";
+
+            result.findings.push_back(finding);
+            result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::QPCAnomaly));
+        }
+
+        // Precise time API usage (suspicious)
+        if (apiAnalysis.preciseTimeCalls > 0) {
+            TimingEvasionFinding finding;
+            finding.type = TimingEvasionType::PreciseTimeCheck;
+            finding.severity = TimingEvasionSeverity::Medium;
+            finding.confidence = 55.0f;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+            finding.description = L"GetSystemTimePreciseAsFileTime usage detected";
+            finding.mitreId = "T1497.003";
+
+            result.findings.push_back(finding);
+            result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::PreciseTimeCheck));
+        }
+    }
+
+    void CheckNTPEvasion(uint32_t processId, TimingEvasionResult& result) {
+        auto ntpAnalysis = AnalyzeNTP(processId);
+
+        if (ntpAnalysis.HasNTPEvasion()) {
+            TimingEvasionFinding finding;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+
+            if (ntpAnalysis.ntpQueryCount > 0) {
+                finding.type = TimingEvasionType::NTPQuery;
+                finding.severity = TimingEvasionSeverity::High;
+                finding.confidence = ntpAnalysis.confidence;
+                finding.description = L"NTP server query pattern detected";
+
+                std::wstring servers;
+                for (const auto& server : ntpAnalysis.ntpServers) {
+                    if (!servers.empty()) servers += L", ";
+                    servers += server;
                 }
+                finding.technicalDetails = L"NTP servers: " + servers;
+                finding.mitreId = "T1497.003";
 
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"MonitoringTick exception for PID %u: %hs", processId, e.what());
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::NTPQuery));
+                result.ntpQueryCount = ntpAnalysis.ntpQueryCount;
             }
+
+            if (ntpAnalysis.externalValidationDetected) {
+                finding.type = TimingEvasionType::ExternalTimeValidation;
+                finding.severity = TimingEvasionSeverity::High;
+                finding.confidence = 65.0f;
+                finding.description = L"External time validation attempt detected";
+                finding.technicalDetails = Utils::StringUtils::Format(
+                    L"HTTP time checks: %u, External API calls: %u",
+                    ntpAnalysis.httpTimeCheckCount,
+                    ntpAnalysis.externalTimeAPICalls);
+                finding.mitreId = "T1497.003";
+
+                result.findings.push_back(finding);
+                result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::ExternalTimeValidation));
+            }
+
+            result.isEvasive = true;
+        }
+    }
+
+    void CheckHardwareTimers(uint32_t processId, TimingEvasionResult& result) {
+        // Check for direct hardware timer access patterns
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(processId, modules) || modules.empty()) {
+            return;
         }
 
-        void TimeBasedEvasionDetector::InvokeCallbacks(const TimingEvasionResult& result) {
-            if (!m_impl) return;
+        // Look for kernel32/ntdll timing functions that might access hardware
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        if (!parser.ParseFile(modules[0].path, peInfo, nullptr)) {
+            return;
+        }
 
-            try {
-                std::shared_lock lock(m_impl->m_mutex);
+        std::vector<PEParser::ImportInfo> imports;
+        if (!parser.ParseImports(imports, nullptr)) {
+            return;
+        }
 
-                for (const auto& [id, callback] : m_impl->m_callbacks) {
-                    try {
-                        callback(result);
-                    } catch (const std::exception& e) {
-                        SS_LOG_ERROR(L"AntiEvasion", L"Callback %llu exception: %hs", id, e.what());
+        bool hasNtQueryTimerResolution = false;
+        bool hasNtSetTimerResolution = false;
+
+        for (const auto& dll : imports) {
+            std::string dllNameLower = Utils::StringUtils::ToNarrow(dll.dllName);
+            std::transform(dllNameLower.begin(), dllNameLower.end(),
+                dllNameLower.begin(), ::tolower);
+
+            if (dllNameLower.find("ntdll") != std::string::npos) {
+                for (const auto& func : dll.functions) {
+                    if (func.name == "NtQueryTimerResolution") {
+                        hasNtQueryTimerResolution = true;
+                    }
+                    if (func.name == "NtSetTimerResolution") {
+                        hasNtSetTimerResolution = true;
                     }
                 }
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"InvokeCallbacks exception: %hs", e.what());
             }
         }
 
-        void TimeBasedEvasionDetector::RecordTimingEvent(const TimingEventRecord& event) {
-            if (!m_impl) return;
+        if (hasNtQueryTimerResolution || hasNtSetTimerResolution) {
+            TimingEvasionFinding finding;
+            finding.type = TimingEvasionType::HardwareTimerDirect;
+            finding.severity = TimingEvasionSeverity::Medium;
+            finding.confidence = 55.0f;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
+            finding.description = L"Direct timer resolution manipulation detected";
+            finding.technicalDetails = Utils::StringUtils::Format(
+                L"NtQueryTimerResolution: %s, NtSetTimerResolution: %s",
+                hasNtQueryTimerResolution ? L"yes" : L"no",
+                hasNtSetTimerResolution ? L"yes" : L"no");
+            finding.mitreId = "T1497.003";
 
-            try {
-                std::unique_lock lock(m_impl->m_mutex);
+            result.findings.push_back(finding);
+            result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::HardwareTimerDirect));
+        }
+    }
 
-                // Add to process event history
-                auto it = m_impl->m_monitoredProcesses.find(event.processId);
-                if (it != m_impl->m_monitoredProcesses.end()) {
-                    auto& history = it->second.eventHistory;
+    // ========================================================================
+    // CORRELATION AND SCORING
+    // ========================================================================
 
-                    // Enforce size limit
-                    if (history.size() >= m_impl->m_config.maxEventsPerProcess) {
-                        // Remove oldest event
-                        history.erase(history.begin());
-                    }
+    void CorrelateFindings(TimingEvasionResult& result) {
+        if (result.findings.size() < 2) {
+            return;
+        }
 
-                    history.push_back(event);
+        // Check for multi-technique evasion
+        size_t rdtscCount = 0;
+        size_t sleepCount = 0;
+        size_t apiCount = 0;
+        size_t ntpCount = 0;
+
+        for (const auto& finding : result.findings) {
+            auto typeVal = static_cast<uint8_t>(finding.type);
+            if (typeVal >= 1 && typeVal <= 19) ++rdtscCount;
+            else if (typeVal >= 20 && typeVal <= 39) ++sleepCount;
+            else if (typeVal >= 40 && typeVal <= 59) ++apiCount;
+            else if (typeVal >= 60 && typeVal <= 79) ++ntpCount;
+        }
+
+        size_t categoryCount = 0;
+        if (rdtscCount > 0) ++categoryCount;
+        if (sleepCount > 0) ++categoryCount;
+        if (apiCount > 0) ++categoryCount;
+        if (ntpCount > 0) ++categoryCount;
+
+        if (categoryCount >= 2) {
+            TimingEvasionFinding finding;
+            finding.type = TimingEvasionType::MultiTechniqueEvasion;
+            finding.severity = TimingEvasionSeverity::Critical;
+            finding.confidence = 90.0f;
+            finding.detectionTime = std::chrono::system_clock::now();
+            finding.detectionMethod = TimingDetectionMethod::BehavioralHeuristics;
+            finding.description = L"Multiple timing evasion techniques detected";
+            finding.technicalDetails = Utils::StringUtils::Format(
+                L"Categories: %zu (RDTSC: %zu, Sleep: %zu, API: %zu, NTP: %zu)",
+                categoryCount, rdtscCount, sleepCount, apiCount, ntpCount);
+            finding.mitreId = "T1497.003";
+
+            result.findings.push_back(finding);
+            result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::MultiTechniqueEvasion));
+        }
+    }
+
+    void CalculateThreatScore(TimingEvasionResult& result) {
+        if (result.findings.empty()) {
+            result.threatScore = 0.0f;
+            result.confidence = 0.0f;
+            result.severity = TimingEvasionSeverity::Info;
+            result.isEvasive = false;
+            return;
+        }
+
+        // Calculate weighted threat score
+        float totalScore = 0.0f;
+        float maxConfidence = 0.0f;
+        TimingEvasionSeverity maxSeverity = TimingEvasionSeverity::Info;
+        TimingEvasionType primaryType = TimingEvasionType::None;
+
+        for (const auto& finding : result.findings) {
+            // Weight by severity
+            float severityWeight = 1.0f;
+            switch (finding.severity) {
+                case TimingEvasionSeverity::Critical: severityWeight = 4.0f; break;
+                case TimingEvasionSeverity::High: severityWeight = 3.0f; break;
+                case TimingEvasionSeverity::Medium: severityWeight = 2.0f; break;
+                case TimingEvasionSeverity::Low: severityWeight = 1.0f; break;
+                default: severityWeight = 0.5f; break;
+            }
+
+            totalScore += finding.confidence * severityWeight;
+
+            if (finding.confidence > maxConfidence) {
+                maxConfidence = finding.confidence;
+                primaryType = finding.type;
+            }
+
+            if (finding.severity > maxSeverity) {
+                maxSeverity = finding.severity;
+            }
+        }
+
+        // Normalize score
+        result.threatScore = std::min(100.0f, totalScore / 4.0f);
+        result.confidence = maxConfidence;
+        result.severity = maxSeverity;
+        result.primaryEvasionType = primaryType;
+        result.isEvasive = (result.threatScore >= 20.0f ||
+            maxSeverity >= TimingEvasionSeverity::Medium);
+    }
+
+    void AddMitreMappings(TimingEvasionResult& result) {
+        std::unordered_set<std::string> mitreIds;
+
+        for (const auto& finding : result.findings) {
+            const char* mitreId = TimingEvasionTypeToMitre(finding.type);
+            if (mitreId && *mitreId) {
+                mitreIds.insert(mitreId);
+            }
+        }
+
+        result.mitreIds.assign(mitreIds.begin(), mitreIds.end());
+        result.mitreTactic = "TA0005";  // Defense Evasion
+    }
+
+    // ========================================================================
+    // SLEEP ACCELERATION DETECTION
+    // ========================================================================
+
+    [[nodiscard]] bool DetectSleepAcceleration(uint32_t processId) {
+        // This would require runtime monitoring
+        // For static analysis, we can only detect patterns
+        auto sleepAnalysis = AnalyzeSleep(processId);
+        return sleepAnalysis.accelerationDetected;
+    }
+
+    // ========================================================================
+    // TIMING ANTI-DEBUG DETECTION
+    // ========================================================================
+
+    [[nodiscard]] bool DetectTimingAntiDebug(uint32_t processId) {
+        auto rdtscAnalysis = AnalyzeRDTSC(processId);
+
+        // RDTSC delta checks are commonly used for anti-debugging
+        if (rdtscAnalysis.deltaCheckDetected || rdtscAnalysis.rdtscCpuidComboCount > 0) {
+            return true;
+        }
+
+        // High QPC usage can also indicate timing-based anti-debug
+        auto apiAnalysis = AnalyzeAPITiming(processId);
+        if (apiAnalysis.qpcCalls > 5 && apiAnalysis.crossCheckDetected) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ========================================================================
+    // MONITORING
+    // ========================================================================
+
+    [[nodiscard]] bool StartMonitoring(uint32_t processId) {
+        std::unique_lock lock(m_monitorMutex);
+
+        if (m_monitoredProcesses.size() >= m_config.maxMonitoredProcesses) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Maximum monitored processes reached");
+            return false;
+        }
+
+        auto& ctx = m_monitoredProcesses[processId];
+        if (!ctx) {
+            ctx = std::make_unique<ProcessMonitoringContext>();
+            ctx->processId = processId;
+            ctx->events.reserve(m_config.maxEventsPerProcess);
+        }
+
+        ctx->state = MonitoringState::Active;
+        ctx->startTime = std::chrono::steady_clock::now();
+        ctx->lastUpdate = ctx->startTime;
+
+        m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
+
+        // Start monitoring thread if not running
+        if (!m_monitoringActive.exchange(true)) {
+            StartMonitoringThread();
+        }
+
+        return true;
+    }
+
+    void StopMonitoring(uint32_t processId) {
+        std::unique_lock lock(m_monitorMutex);
+
+        auto it = m_monitoredProcesses.find(processId);
+        if (it != m_monitoredProcesses.end()) {
+            it->second->state = MonitoringState::Completed;
+            m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    void StopAllMonitoring() {
+        {
+            std::unique_lock lock(m_monitorMutex);
+            for (auto& [pid, ctx] : m_monitoredProcesses) {
+                ctx->state = MonitoringState::Completed;
+            }
+            m_stats.currentlyMonitoring.store(0, std::memory_order_relaxed);
+        }
+
+        // Stop monitoring thread
+        m_monitoringActive.store(false, std::memory_order_release);
+        m_monitoringCv.notify_all();
+
+        if (m_monitoringThread.joinable()) {
+            m_monitoringThread.join();
+        }
+    }
+
+    [[nodiscard]] bool IsMonitoring(uint32_t processId) const {
+        std::shared_lock lock(m_monitorMutex);
+        auto it = m_monitoredProcesses.find(processId);
+        if (it != m_monitoredProcesses.end()) {
+            return it->second->state == MonitoringState::Active;
+        }
+        return false;
+    }
+
+    [[nodiscard]] MonitoringState GetMonitoringState(uint32_t processId) const {
+        std::shared_lock lock(m_monitorMutex);
+        auto it = m_monitoredProcesses.find(processId);
+        if (it != m_monitoredProcesses.end()) {
+            return it->second->state;
+        }
+        return MonitoringState::Inactive;
+    }
+
+    void PauseMonitoring(uint32_t processId) {
+        std::unique_lock lock(m_monitorMutex);
+        auto it = m_monitoredProcesses.find(processId);
+        if (it != m_monitoredProcesses.end() &&
+            it->second->state == MonitoringState::Active) {
+            it->second->state = MonitoringState::Paused;
+        }
+    }
+
+    void ResumeMonitoring(uint32_t processId) {
+        std::unique_lock lock(m_monitorMutex);
+        auto it = m_monitoredProcesses.find(processId);
+        if (it != m_monitoredProcesses.end() &&
+            it->second->state == MonitoringState::Paused) {
+            it->second->state = MonitoringState::Active;
+        }
+    }
+
+    [[nodiscard]] std::vector<uint32_t> GetMonitoredProcesses() const {
+        std::shared_lock lock(m_monitorMutex);
+        std::vector<uint32_t> pids;
+        pids.reserve(m_monitoredProcesses.size());
+        for (const auto& [pid, ctx] : m_monitoredProcesses) {
+            if (ctx->state == MonitoringState::Active ||
+                ctx->state == MonitoringState::Paused) {
+                pids.push_back(pid);
+            }
+        }
+        return pids;
+    }
+
+    // ========================================================================
+    // CALLBACKS
+    // ========================================================================
+
+    [[nodiscard]] uint64_t RegisterCallback(TimingEvasionCallback callback) {
+        std::unique_lock lock(m_callbackMutex);
+        uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+        m_callbacks[id] = std::move(callback);
+        return id;
+    }
+
+    bool UnregisterCallback(uint64_t callbackId) {
+        std::unique_lock lock(m_callbackMutex);
+        return m_callbacks.erase(callbackId) > 0;
+    }
+
+    [[nodiscard]] uint64_t RegisterEventCallback(TimingEventCallback callback) {
+        std::unique_lock lock(m_callbackMutex);
+        uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+        m_eventCallbacks[id] = std::move(callback);
+        return id;
+    }
+
+    bool UnregisterEventCallback(uint64_t callbackId) {
+        std::unique_lock lock(m_callbackMutex);
+        return m_eventCallbacks.erase(callbackId) > 0;
+    }
+
+    void InvokeCallbacks(const TimingEvasionResult& result) {
+        std::shared_lock lock(m_callbackMutex);
+        for (const auto& [id, callback] : m_callbacks) {
+            if (callback) {
+                try {
+                    callback(result);
+                } catch (...) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Exception in timing evasion callback");
                 }
+            }
+        }
+    }
 
-                // Invoke event callbacks
-                for (const auto& [id, callback] : m_impl->m_eventCallbacks) {
+    // ========================================================================
+    // STATISTICS & CACHE
+    // ========================================================================
+
+    [[nodiscard]] const TimingDetectorStats& GetStats() const {
+        return m_stats;
+    }
+
+    void ResetStats() {
+        m_stats.Reset();
+    }
+
+    [[nodiscard]] std::optional<TimingEvasionResult> GetCachedResult(uint32_t processId) const {
+        std::shared_lock lock(m_cacheMutex);
+
+        auto it = m_resultCache.find(processId);
+        if (it == m_resultCache.end()) {
+            return std::nullopt;
+        }
+
+        // Check TTL
+        auto now = std::chrono::steady_clock::now();
+        auto age = std::chrono::duration_cast<std::chrono::minutes>(
+            now - it->second.timestamp);
+
+        if (age > m_config.resultCacheTTL) {
+            return std::nullopt;
+        }
+
+        return it->second.result;
+    }
+
+    void ClearCache() {
+        std::unique_lock lock(m_cacheMutex);
+        m_resultCache.clear();
+    }
+
+    void ClearCacheForProcess(uint32_t processId) {
+        std::unique_lock lock(m_cacheMutex);
+        m_resultCache.erase(processId);
+    }
+
+    void UpdateCache(uint32_t processId, const TimingEvasionResult& result) {
+        std::unique_lock lock(m_cacheMutex);
+
+        // Limit cache size
+        while (m_resultCache.size() >= 1000) {
+            // Remove oldest entry
+            auto oldest = m_resultCache.begin();
+            for (auto it = m_resultCache.begin(); it != m_resultCache.end(); ++it) {
+                if (it->second.timestamp < oldest->second.timestamp) {
+                    oldest = it;
+                }
+            }
+            m_resultCache.erase(oldest);
+        }
+
+        m_resultCache[processId] = { result, std::chrono::steady_clock::now() };
+    }
+
+    [[nodiscard]] std::vector<TimingEventRecord> GetEventHistory(
+        uint32_t processId,
+        size_t maxEvents) const
+    {
+        std::shared_lock lock(m_monitorMutex);
+
+        auto it = m_monitoredProcesses.find(processId);
+        if (it == m_monitoredProcesses.end()) {
+            return {};
+        }
+
+        const auto& ctx = *it->second;
+        size_t count = (maxEvents == 0) ? ctx.eventCount : std::min(maxEvents, ctx.eventCount);
+
+        std::vector<TimingEventRecord> result;
+        result.reserve(count);
+
+        // Get events in order
+        for (size_t i = 0; i < count; ++i) {
+            size_t idx = (ctx.events.size() + ctx.eventWriteIndex - count + i) % ctx.events.size();
+            if (idx < ctx.events.size()) {
+                result.push_back(ctx.events[idx]);
+            }
+        }
+
+        return result;
+    }
+
+private:
+    // ========================================================================
+    // INTERNAL HELPERS
+    // ========================================================================
+
+    void StartMonitoringThread() {
+        m_monitoringThread = std::thread([this]() {
+            while (m_monitoringActive.load(std::memory_order_acquire)) {
+                MonitoringLoop();
+
+                // Sleep for sample interval
+                std::unique_lock lock(m_monitoringCvMutex);
+                m_monitoringCv.wait_for(lock, m_config.sampleInterval, [this]() {
+                    return !m_monitoringActive.load(std::memory_order_acquire);
+                });
+            }
+        });
+    }
+
+    void MonitoringLoop() {
+        std::vector<uint32_t> activeProcesses;
+
+        {
+            std::shared_lock lock(m_monitorMutex);
+            for (const auto& [pid, ctx] : m_monitoredProcesses) {
+                if (ctx->state == MonitoringState::Active) {
+                    activeProcesses.push_back(pid);
+                }
+            }
+        }
+
+        for (uint32_t pid : activeProcesses) {
+            MonitoringTick(pid);
+        }
+    }
+
+    void MonitoringTick(uint32_t processId) {
+        // Check if process is still running
+        if (!Utils::ProcessUtils::IsProcessRunning(processId)) {
+            std::unique_lock lock(m_monitorMutex);
+            auto it = m_monitoredProcesses.find(processId);
+            if (it != m_monitoredProcesses.end()) {
+                it->second->state = MonitoringState::Completed;
+                m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+
+        // Perform quick analysis
+        auto result = AnalyzeProcess(processId);
+
+        if (result.isEvasive) {
+            // Invoke callbacks
+            InvokeCallbacks(result);
+        }
+
+        // Update context
+        {
+            std::unique_lock lock(m_monitorMutex);
+            auto it = m_monitoredProcesses.find(processId);
+            if (it != m_monitoredProcesses.end()) {
+                it->second->lastUpdate = std::chrono::steady_clock::now();
+                it->second->rdtscCount = result.rdtscCallCount;
+            }
+        }
+    }
+
+    void RecordTimingEvent(const TimingEventRecord& event) {
+        {
+            std::unique_lock lock(m_monitorMutex);
+            auto it = m_monitoredProcesses.find(event.processId);
+            if (it != m_monitoredProcesses.end()) {
+                it->second->AddEvent(event, m_config.maxEventsPerProcess);
+            }
+        }
+
+        // Invoke event callbacks
+        {
+            std::shared_lock lock(m_callbackMutex);
+            for (const auto& [id, callback] : m_eventCallbacks) {
+                if (callback) {
                     try {
                         callback(event);
                     } catch (...) {
-                        // Ignore callback exceptions
+                        SS_LOG_ERROR(LOG_CATEGORY, L"Exception in timing event callback");
                     }
                 }
-
-                m_impl->m_stats.totalEventsProcessed.fetch_add(1, std::memory_order_relaxed);
-
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"AntiEvasion", L"RecordTimingEvent exception: %hs", e.what());
             }
         }
 
-        void TimeBasedEvasionDetector::UpdateCache(
-            uint32_t processId,
-            const TimingEvasionResult& result
-        ) {
-            if (m_impl) {
-                m_impl->UpdateCacheInternal(processId, result);
+        m_stats.totalEventsProcessed.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t CountRDTSCCPUIDCombos(
+        const uint8_t* buffer,
+        size_t bufferSize) const
+    {
+        size_t count = 0;
+        const size_t MAX_DISTANCE = 20;  // Max bytes between CPUID and RDTSC
+
+        for (size_t i = 0; i + TimingPatterns::CPUID_PATTERN.size() <= bufferSize; ++i) {
+            if (TimingPatterns::MatchPattern(buffer, bufferSize, i, TimingPatterns::CPUID_PATTERN)) {
+                // Look for RDTSC within MAX_DISTANCE bytes
+                for (size_t j = i + TimingPatterns::CPUID_PATTERN.size();
+                     j < std::min(i + MAX_DISTANCE, bufferSize - 1); ++j) {
+                    if (TimingPatterns::MatchPattern(buffer, bufferSize, j, TimingPatterns::RDTSC_PATTERN)) {
+                        ++count;
+                        i = j;  // Skip past this combo
+                        break;
+                    }
+                }
             }
         }
 
-    } // namespace AntiEvasion
+        return count;
+    }
+
+    void AnalyzeCodeWithZydis(
+        const uint8_t* code,
+        size_t codeSize,
+        bool is64Bit,
+        RDTSCAnalysis& analysis)
+    {
+        ZydisDecoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
+
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        ZyanUSize offset = 0;
+        size_t instructionCount = 0;
+
+        uint64_t rdtscCount = 0;
+        uint64_t rdtscpCount = 0;
+        bool seenCpuid = false;
+
+        while (offset < codeSize && instructionCount < MAX_INSTRUCTIONS_PER_SCAN) {
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset,
+                codeSize - offset, &instruction, operands))) {
+                ++offset;
+                continue;
+            }
+
+            switch (instruction.mnemonic) {
+                case ZYDIS_MNEMONIC_RDTSC:
+                    ++rdtscCount;
+                    if (seenCpuid) {
+                        // CPUID+RDTSC combo for serialization
+                        ++analysis.rdtscCpuidComboCount;
+                    }
+                    seenCpuid = false;
+                    break;
+
+                case ZYDIS_MNEMONIC_RDTSCP:
+                    ++rdtscpCount;
+                    break;
+
+                case ZYDIS_MNEMONIC_CPUID:
+                    seenCpuid = true;
+                    break;
+
+                default:
+                    // Reset CPUID tracking after non-RDTSC instruction
+                    if (instruction.mnemonic != ZYDIS_MNEMONIC_MOV &&
+                        instruction.mnemonic != ZYDIS_MNEMONIC_PUSH &&
+                        instruction.mnemonic != ZYDIS_MNEMONIC_XOR) {
+                        seenCpuid = false;
+                    }
+                    break;
+            }
+
+            offset += instruction.length;
+            ++instructionCount;
+        }
+
+        analysis.rdtscCount = std::max(analysis.rdtscCount, rdtscCount);
+        analysis.rdtscpCount = std::max(analysis.rdtscpCount, rdtscpCount);
+    }
+};
+
+// ============================================================================
+// PUBLIC INTERFACE IMPLEMENTATION
+// ============================================================================
+
+TimeBasedEvasionDetector& TimeBasedEvasionDetector::Instance() {
+    static TimeBasedEvasionDetector instance;
+    return instance;
+}
+
+TimeBasedEvasionDetector::TimeBasedEvasionDetector()
+    : m_impl(std::make_unique<Impl>())
+{}
+
+TimeBasedEvasionDetector::~TimeBasedEvasionDetector() = default;
+
+bool TimeBasedEvasionDetector::Initialize(std::shared_ptr<Utils::ThreadPool> threadPool) {
+    return m_impl->Initialize(std::move(threadPool), TimingDetectorConfig::CreateDefault());
+}
+
+bool TimeBasedEvasionDetector::Initialize(
+    std::shared_ptr<Utils::ThreadPool> threadPool,
+    const TimingDetectorConfig& config)
+{
+    return m_impl->Initialize(std::move(threadPool), config);
+}
+
+void TimeBasedEvasionDetector::Shutdown() {
+    m_impl->Shutdown();
+}
+
+bool TimeBasedEvasionDetector::IsInitialized() const noexcept {
+    return m_impl->IsInitialized();
+}
+
+void TimeBasedEvasionDetector::UpdateConfig(const TimingDetectorConfig& config) {
+    m_impl->UpdateConfig(config);
+}
+
+TimingDetectorConfig TimeBasedEvasionDetector::GetConfig() const {
+    return m_impl->GetConfig();
+}
+
+TimingEvasionResult TimeBasedEvasionDetector::AnalyzeProcess(uint32_t processId) {
+    return m_impl->AnalyzeProcess(processId);
+}
+
+bool TimeBasedEvasionDetector::AnalyzeProcessAsync(
+    uint32_t processId,
+    std::function<void(TimingEvasionResult)> callback)
+{
+    return m_impl->AnalyzeProcessAsync(processId, std::move(callback));
+}
+
+bool TimeBasedEvasionDetector::QuickScanProcess(uint32_t processId) {
+    return m_impl->QuickScanProcess(processId);
+}
+
+RDTSCAnalysis TimeBasedEvasionDetector::AnalyzeRDTSC(uint32_t processId) {
+    return m_impl->AnalyzeRDTSC(processId);
+}
+
+SleepAnalysis TimeBasedEvasionDetector::AnalyzeSleep(uint32_t processId) {
+    return m_impl->AnalyzeSleep(processId);
+}
+
+APITimingAnalysis TimeBasedEvasionDetector::AnalyzeAPITiming(uint32_t processId) {
+    return m_impl->AnalyzeAPITiming(processId);
+}
+
+NTPAnalysis TimeBasedEvasionDetector::AnalyzeNTP(uint32_t processId) {
+    return m_impl->AnalyzeNTP(processId);
+}
+
+bool TimeBasedEvasionDetector::DetectSleepAcceleration(uint32_t processId) {
+    return m_impl->DetectSleepAcceleration(processId);
+}
+
+bool TimeBasedEvasionDetector::DetectTimingAntiDebug(uint32_t processId) {
+    return m_impl->DetectTimingAntiDebug(processId);
+}
+
+bool TimeBasedEvasionDetector::StartMonitoring(uint32_t processId) {
+    return m_impl->StartMonitoring(processId);
+}
+
+void TimeBasedEvasionDetector::StopMonitoring(uint32_t processId) {
+    m_impl->StopMonitoring(processId);
+}
+
+void TimeBasedEvasionDetector::StopAllMonitoring() {
+    m_impl->StopAllMonitoring();
+}
+
+bool TimeBasedEvasionDetector::IsMonitoring(uint32_t processId) const {
+    return m_impl->IsMonitoring(processId);
+}
+
+MonitoringState TimeBasedEvasionDetector::GetMonitoringState(uint32_t processId) const {
+    return m_impl->GetMonitoringState(processId);
+}
+
+void TimeBasedEvasionDetector::PauseMonitoring(uint32_t processId) {
+    m_impl->PauseMonitoring(processId);
+}
+
+void TimeBasedEvasionDetector::ResumeMonitoring(uint32_t processId) {
+    m_impl->ResumeMonitoring(processId);
+}
+
+std::vector<uint32_t> TimeBasedEvasionDetector::GetMonitoredProcesses() const {
+    return m_impl->GetMonitoredProcesses();
+}
+
+uint64_t TimeBasedEvasionDetector::RegisterCallback(TimingEvasionCallback callback) {
+    return m_impl->RegisterCallback(std::move(callback));
+}
+
+bool TimeBasedEvasionDetector::UnregisterCallback(uint64_t callbackId) {
+    return m_impl->UnregisterCallback(callbackId);
+}
+
+uint64_t TimeBasedEvasionDetector::RegisterEventCallback(TimingEventCallback callback) {
+    return m_impl->RegisterEventCallback(std::move(callback));
+}
+
+bool TimeBasedEvasionDetector::UnregisterEventCallback(uint64_t callbackId) {
+    return m_impl->UnregisterEventCallback(callbackId);
+}
+
+TimingDetectorStats TimeBasedEvasionDetector::GetStats() const {
+    return m_impl->GetStats();
+}
+
+void TimeBasedEvasionDetector::ResetStats() {
+    m_impl->ResetStats();
+}
+
+std::optional<TimingEvasionResult> TimeBasedEvasionDetector::GetCachedResult(uint32_t processId) const {
+    return m_impl->GetCachedResult(processId);
+}
+
+void TimeBasedEvasionDetector::ClearCache() {
+    m_impl->ClearCache();
+}
+
+void TimeBasedEvasionDetector::ClearCacheForProcess(uint32_t processId) {
+    m_impl->ClearCacheForProcess(processId);
+}
+
+std::vector<TimingEventRecord> TimeBasedEvasionDetector::GetEventHistory(
+    uint32_t processId,
+    size_t maxEvents) const
+{
+    return m_impl->GetEventHistory(processId, maxEvents);
+}
+
+// ============================================================================
+// PRIVATE METHOD IMPLEMENTATIONS
+// ============================================================================
+
+void TimeBasedEvasionDetector::CheckRDTSCAbuse(uint32_t processId, TimingEvasionResult& result) {
+    bool is64Bit = Utils::ProcessUtils::IsProcess64Bit(processId);
+    m_impl->CheckRDTSCAbuse(processId, is64Bit, result);
+}
+
+void TimeBasedEvasionDetector::CheckTimeDriftChecks(uint32_t processId, TimingEvasionResult& result) {
+    m_impl->CheckTimeDriftChecks(processId, result);
+}
+
+void TimeBasedEvasionDetector::CheckTimerAnomalies(uint32_t processId, TimingEvasionResult& result) {
+    m_impl->CheckTimerAnomalies(processId, result);
+}
+
+void TimeBasedEvasionDetector::CheckSleepEvasion(uint32_t processId, TimingEvasionResult& result) {
+    m_impl->CheckSleepEvasion(processId, result);
+}
+
+void TimeBasedEvasionDetector::CheckNTPEvasion(uint32_t processId, TimingEvasionResult& result) {
+    m_impl->CheckNTPEvasion(processId, result);
+}
+
+void TimeBasedEvasionDetector::CheckHardwareTimers(uint32_t processId, TimingEvasionResult& result) {
+    m_impl->CheckHardwareTimers(processId, result);
+}
+
+void TimeBasedEvasionDetector::CorrelateFindings(TimingEvasionResult& result) {
+    m_impl->CorrelateFindings(result);
+}
+
+void TimeBasedEvasionDetector::CalculateThreatScore(TimingEvasionResult& result) {
+    m_impl->CalculateThreatScore(result);
+}
+
+void TimeBasedEvasionDetector::AddMitreMappings(TimingEvasionResult& result) {
+    m_impl->AddMitreMappings(result);
+}
+
+void TimeBasedEvasionDetector::MonitoringTick(uint32_t processId) {
+    m_impl->MonitoringTick(processId);
+}
+
+void TimeBasedEvasionDetector::InvokeCallbacks(const TimingEvasionResult& result) {
+    m_impl->InvokeCallbacks(result);
+}
+
+void TimeBasedEvasionDetector::RecordTimingEvent(const TimingEventRecord& event) {
+    m_impl->RecordTimingEvent(event);
+}
+
+void TimeBasedEvasionDetector::UpdateCache(uint32_t processId, const TimingEvasionResult& result) {
+    m_impl->UpdateCache(processId, result);
+}
+
+} // namespace AntiEvasion
 } // namespace ShadowStrike
