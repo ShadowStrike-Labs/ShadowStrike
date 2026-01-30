@@ -11,7 +11,7 @@ A from-scratch implementation of an enterprise-grade endpoint protection platfor
 | Component | Status |
 |-----------|--------|
 | **Architecture** | Designed |
-| **Core Infrastructure** | In Development |
+| **Core Infrastructure** | Completed |
 | **Kernel Driver** | In Development |
 | **User-Mode Service** | In Development |
 | **GUI** | Not Started |
