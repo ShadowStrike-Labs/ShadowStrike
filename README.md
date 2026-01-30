@@ -2,7 +2,7 @@
 
 **Next-Generation Antivirus Engine for Windows**
 
-A from-scratch implementation of an enterprise-grade endpoint protection platform, built with the same architectural principles as industry leaders. This is not a wrapper around existing tools—it's a complete antivirus engine with custom kernel drivers, memory-mapped databases, YARA integration, and real-time threat detection.
+A from-scratch implementation of an enterprise-grade endpoint protection platform for Windows 10/11 64-bit Operating Systems , built with the same architectural principles as industry leaders. This is not a wrapper around existing tools—it's a complete antivirus engine with custom kernel drivers, memory-mapped databases, YARA integration, and real-time threat detection.
 
 ---
 
