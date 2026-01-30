@@ -1,4 +1,5 @@
 #include "ThreadNotify.h"
+#include "../../Core/Globals.h"
 #include "../../Communication/ScanBridge.h"
 
 //
@@ -88,6 +89,13 @@ ThreadCreateNotifyRoutine(
     BOOLEAN IsRemote = FALSE;
 
     PAGED_CODE();
+
+    //
+    // Check if driver is ready to process requests
+    //
+    if (!SHADOWSTRIKE_IS_READY()) {
+        return;
+    }
 
     if (!Create) {
         return; // We only care about creation for injection detection

@@ -19,6 +19,11 @@
 #include "DriverEntry.h"
 #include "FilterRegistration.h"
 #include "../Communication/CommPort.h"
+#include "../Cache/ScanCache.h"
+#include "../Exclusions/ExclusionManager.h"
+#include "../SelfProtection/SelfProtect.h"
+#include "../Callbacks/Registry/RegistryCallback.h"
+#include "../Utilities/HashUtils.h"
 #include "../Shared/SharedDefs.h"
 #include "../Shared/PortName.h"
 
@@ -107,6 +112,9 @@ DriverEntry(
     BOOLEAN filterRegistered = FALSE;
     BOOLEAN portCreated = FALSE;
     BOOLEAN lookasideInitialized = FALSE;
+    BOOLEAN cacheInitialized = FALSE;
+    BOOLEAN exclusionsInitialized = FALSE;
+    BOOLEAN hashUtilsInitialized = FALSE;
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
@@ -180,7 +188,52 @@ DriverEntry(
     ShadowStrikeLogInitStatus("Communication Port", status);
 
     //
-    // Step 5: Register process/thread notification callbacks
+    // Step 5: Initialize scan cache
+    //
+    status = ShadowStrikeCacheInitialize(g_DriverData.Config.CacheTTLSeconds);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Failed to initialize scan cache: 0x%08X\n",
+                   status);
+        // Non-fatal - continue without caching
+        status = STATUS_SUCCESS;
+    } else {
+        cacheInitialized = TRUE;
+        ShadowStrikeLogInitStatus("Scan Cache", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 6: Initialize exclusion manager
+    //
+    status = ShadowStrikeExclusionInitialize();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Failed to initialize exclusion manager: 0x%08X\n",
+                   status);
+        // Non-fatal - continue without exclusions
+        status = STATUS_SUCCESS;
+    } else {
+        exclusionsInitialized = TRUE;
+        ShadowStrikeLogInitStatus("Exclusion Manager", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 7: Initialize hash utilities (CNG provider)
+    //
+    status = ShadowStrikeInitializeHashUtils();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Failed to initialize hash utilities: 0x%08X\n",
+                   status);
+        // Non-fatal - continue without kernel-side hashing
+        status = STATUS_SUCCESS;
+    } else {
+        hashUtilsInitialized = TRUE;
+        ShadowStrikeLogInitStatus("Hash Utilities", STATUS_SUCCESS);
+    }
+
+    //
+    // Step 8: Register process/thread notification callbacks
     //
     status = ShadowStrikeRegisterProcessCallbacks();
     if (!NT_SUCCESS(status)) {
@@ -192,7 +245,7 @@ DriverEntry(
     }
 
     //
-    // Step 6: Register registry callback
+    // Step 9: Register registry callback
     //
     status = ShadowStrikeRegisterRegistryCallback();
     if (!NT_SUCCESS(status)) {
@@ -204,7 +257,7 @@ DriverEntry(
     }
 
     //
-    // Step 7: Register object callbacks for self-protection
+    // Step 9: Register object callbacks for self-protection
     //
     status = ShadowStrikeRegisterObjectCallbacks();
     if (!NT_SUCCESS(status)) {
@@ -216,7 +269,7 @@ DriverEntry(
     }
 
     //
-    // Step 8: Start filtering
+    // Step 10: Start filtering
     //
     status = FltStartFiltering(g_DriverData.FilterHandle);
     if (!NT_SUCCESS(status)) {
@@ -248,6 +301,10 @@ Cleanup:
     ShadowStrikeUnregisterObjectCallbacks();
     ShadowStrikeUnregisterRegistryCallback();
     ShadowStrikeUnregisterProcessCallbacks();
+
+    if (hashUtilsInitialized) {
+        ShadowStrikeCleanupHashUtils();
+    }
 
     if (portCreated) {
         ShadowStrikeCloseCommunicationPort();
@@ -312,6 +369,16 @@ ShadowStrikeUnload(
     ShadowStrikeUnregisterObjectCallbacks();
     ShadowStrikeUnregisterRegistryCallback();
     ShadowStrikeUnregisterProcessCallbacks();
+
+    //
+    // Shutdown exclusion manager
+    //
+    ShadowStrikeExclusionShutdown();
+
+    //
+    // Cleanup hash utilities
+    //
+    ShadowStrikeCleanupHashUtils();
 
     //
     // Close communication port (disconnects all clients)
@@ -566,9 +633,9 @@ OB_OPERATION_REGISTRATION g_ObjectOperations[] = {
     }
 };
 
-// Forward declare the pre-operation callback
+// Forward declare the pre-operation callback from SelfProtect.c
 OB_PREOP_CALLBACK_STATUS
-ShadowStrikeObPreOperationCallback(
+ShadowStrikeObjectPreCallback(
     _In_ PVOID RegistrationContext,
     _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
     );
@@ -587,8 +654,8 @@ ShadowStrikeRegisterObjectCallbacks(
     //
     // Setup operation registrations with callbacks
     //
-    g_ObjectOperations[0].PreOperation = ShadowStrikeObPreOperationCallback;
-    g_ObjectOperations[1].PreOperation = ShadowStrikeObPreOperationCallback;
+    g_ObjectOperations[0].PreOperation = ShadowStrikeObjectPreCallback;
+    g_ObjectOperations[1].PreOperation = ShadowStrikeObjectPreCallback;
 
     RtlInitUnicodeString(&altitude, SHADOWSTRIKE_ALTITUDE_W);
 

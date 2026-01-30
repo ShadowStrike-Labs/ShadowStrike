@@ -940,6 +940,132 @@ ShadowStrikeFreeMessageBuffer(
 }
 
 // ============================================================================
+// GENERIC MESSAGE SENDING
+// ============================================================================
+
+/**
+ * @brief Send a message to user-mode via the communication port.
+ *
+ * This is the core message sending function used by all notification
+ * and scan request functions. It handles client port selection, timeout
+ * management, and statistics tracking.
+ *
+ * @param InputBuffer       Message to send.
+ * @param InputBufferSize   Size of the input message.
+ * @param OutputBuffer      Optional buffer for reply (NULL for fire-and-forget).
+ * @param OutputBufferSize  Size of output buffer / receives actual reply size.
+ * @param Timeout           Optional timeout (NULL for no wait, negative for relative).
+ * @return STATUS_SUCCESS on success, STATUS_TIMEOUT on timeout, or error.
+ */
+NTSTATUS
+ShadowStrikeSendMessage(
+    _In_ PVOID InputBuffer,
+    _In_ ULONG InputBufferSize,
+    _Out_opt_ PVOID OutputBuffer,
+    _Inout_opt_ PULONG OutputBufferSize,
+    _In_opt_ PLARGE_INTEGER Timeout
+    )
+{
+    NTSTATUS status;
+    PFLT_PORT clientPort = NULL;
+    ULONG replySize = 0;
+    LONG pendingCount;
+
+    //
+    // Validate parameters
+    //
+    if (InputBuffer == NULL || InputBufferSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check if driver is ready
+    //
+    if (!SHADOWSTRIKE_IS_READY()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Check if user-mode is connected
+    //
+    if (!ShadowStrikeIsUserModeConnected()) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    //
+    // Get primary scanner port
+    //
+    clientPort = ShadowStrikeGetPrimaryScannerPort();
+    if (clientPort == NULL) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    //
+    // Track pending requests if expecting a reply
+    //
+    if (OutputBuffer != NULL && OutputBufferSize != NULL) {
+        pendingCount = InterlockedIncrement(&g_DriverData.Stats.PendingRequests);
+        if (pendingCount > g_DriverData.Stats.PeakPendingRequests) {
+            InterlockedExchange(&g_DriverData.Stats.PeakPendingRequests, pendingCount);
+        }
+
+        //
+        // Check pending request limit
+        //
+        if ((ULONG)pendingCount > g_DriverData.Config.MaxPendingRequests) {
+            InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+            SHADOWSTRIKE_INC_STAT(MessagesDropped);
+            return SHADOWSTRIKE_ERROR_QUEUE_FULL;
+        }
+
+        replySize = *OutputBufferSize;
+    }
+
+    //
+    // Send message via Filter Manager
+    //
+    status = FltSendMessage(
+        g_DriverData.FilterHandle,
+        &clientPort,
+        InputBuffer,
+        InputBufferSize,
+        OutputBuffer,
+        OutputBuffer ? &replySize : NULL,
+        Timeout
+    );
+
+    //
+    // Update pending count if we were tracking
+    //
+    if (OutputBuffer != NULL && OutputBufferSize != NULL) {
+        InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+        *OutputBufferSize = replySize;
+    }
+
+    //
+    // Update statistics based on result
+    //
+    if (NT_SUCCESS(status)) {
+        SHADOWSTRIKE_INC_STAT(MessagesSent);
+        if (OutputBuffer != NULL) {
+            SHADOWSTRIKE_INC_STAT(RepliesReceived);
+        }
+    } else if (status == STATUS_TIMEOUT) {
+        SHADOWSTRIKE_INC_STAT(ScanTimeouts);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ShadowStrikeSendMessage timeout\n");
+    } else if (status == STATUS_PORT_DISCONNECTED) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ShadowStrikeSendMessage: port disconnected\n");
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ShadowStrikeSendMessage failed: 0x%08X\n", status);
+    }
+
+    return status;
+}
+
+// ============================================================================
 // MESSAGE CONSTRUCTION HELPERS
 // ============================================================================
 

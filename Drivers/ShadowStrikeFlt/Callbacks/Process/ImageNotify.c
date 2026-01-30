@@ -1,4 +1,5 @@
 #include "ImageNotify.h"
+#include "../../Core/Globals.h"
 #include "../../Communication/ScanBridge.h"
 
 //
@@ -85,6 +86,13 @@ ImageLoadNotifyRoutine(
     )
 {
     PAGED_CODE();
+
+    //
+    // Check if driver is ready to process requests
+    //
+    if (!SHADOWSTRIKE_IS_READY()) {
+        return;
+    }
 
     //
     // Filter out minimal events to reduce noise if needed.

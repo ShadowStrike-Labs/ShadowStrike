@@ -31,6 +31,13 @@ ShadowStrikePreWrite(
     UNREFERENCED_PARAMETER(CompletionContext);
     UNREFERENCED_PARAMETER(FltObjects);
 
+    //
+    // Check if driver is ready
+    //
+    if (!SHADOWSTRIKE_IS_READY()) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
     if (Data->RequestorMode == KernelMode) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }

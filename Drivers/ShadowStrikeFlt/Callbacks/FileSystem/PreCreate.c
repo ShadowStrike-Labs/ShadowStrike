@@ -29,6 +29,7 @@
 #include "../../Communication/ScanBridge.h"
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Cache/ScanCache.h"
+#include "../../Exclusions/ExclusionManager.h"
 
 // ============================================================================
 // IMPLEMENTATION
@@ -121,7 +122,35 @@ ShadowStrikePreCreate(
     }
 
     //
-    // 5. SELF PROTECTION CHECK
+    // 5. EXCLUSION CHECKS
+    //
+    // Check if file/process is excluded from scanning.
+    // This is done BEFORE self-protection to allow performance optimization,
+    // but AFTER directory check since we don't scan directories anyway.
+    //
+    if (!isDir && ShadowStrikeExclusionIsEnabled()) {
+        //
+        // Check path exclusion (includes extension check internally)
+        //
+        if (ShadowStrikeIsPathExcluded(&nameInfo->Name, &nameInfo->Extension)) {
+            // Path or extension is excluded - skip scanning
+            SHADOWSTRIKE_INC_STAT(ExclusionMatches);
+            goto Cleanup;
+        }
+
+        //
+        // Check process exclusion
+        // If the requesting process is excluded, skip scanning for this file access.
+        //
+        if (ShadowStrikeIsProcessExcluded(requestorPid, NULL)) {
+            // Requesting process is excluded - skip scanning
+            SHADOWSTRIKE_INC_STAT(ExclusionMatches);
+            goto Cleanup;
+        }
+    }
+
+    //
+    // 6. SELF PROTECTION CHECK
     //
     // Block access to our protected files if necessary
     //

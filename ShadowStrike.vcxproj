@@ -675,6 +675,7 @@
     <ClInclude Include="src\AntiEvasion\EnvironmentEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\MetamorphicDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\NetworkBasedEvasionDetector.hpp" />
+    <ClInclude Include="src\AntiEvasion\nt_undocumented.h" />
     <ClInclude Include="src\AntiEvasion\PackerDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\ProcessEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\SandboxEvasionDetector.hpp" />
@@ -749,6 +750,7 @@
     <ClInclude Include="src\whitelist\WhiteListStore.hpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="src\AntiEvasion\EnvironmentEvasionDetector.asm" />
     <None Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm" />
     <None Include="src\AntiEvasion\VMEvasionDetector_x64.asm" />
   </ItemGroup>

@@ -202,8 +202,14 @@ typedef struct _SHADOWSTRIKE_SCAN_CACHE {
     /// @brief Cleanup DPC
     KDPC CleanupDpc;
 
-    /// @brief Cleanup work item
-    PIO_WORKITEM CleanupWorkItem;
+    /// @brief Cleanup work item (legacy style - no DeviceObject required)
+    WORK_QUEUE_ITEM CleanupWorkItem;
+
+    /// @brief Work item initialized flag
+    BOOLEAN WorkItemInitialized;
+
+    /// @brief Reserved for alignment
+    BOOLEAN Reserved2[3];
 
     /// @brief Cleanup in progress flag
     volatile LONG CleanupInProgress;

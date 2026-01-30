@@ -4,7 +4,14 @@
  * ============================================================================
  *
  * @file ScanBridge.c
- * @brief Implementation of scan request building and sending.
+ * @brief Bridge functions for sending scan-related notifications to user-mode.
+ *
+ * This file provides convenience wrappers for sending various notification
+ * types (process, thread, image, registry) to the user-mode service.
+ *
+ * NOTE: ShadowStrikeBuildFileScanRequest is defined in CommPort.c to avoid
+ * duplicate symbol errors. This file uses ShadowStrikeSendMessage from
+ * CommPort.c for all message sending operations.
  *
  * @author ShadowStrike Security Team
  * @version 1.0.0
@@ -21,163 +28,15 @@
 #include "../Utilities/StringUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, ShadowStrikeBuildFileScanRequest)
-#pragma alloc_text(PAGE, ShadowStrikeSendScanRequest)
 #pragma alloc_text(PAGE, ShadowStrikeSendProcessNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendThreadNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendImageNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendRegistryNotification)
-#pragma alloc_text(PAGE, ShadowStrikeAllocateMessageBuffer)
-#pragma alloc_text(PAGE, ShadowStrikeFreeMessageBuffer)
 #endif
 
-NTSTATUS
-ShadowStrikeBuildFileScanRequest(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType,
-    _Outptr_ PSHADOWSTRIKE_MESSAGE_HEADER* Request,
-    _Out_ PULONG RequestSize
-    )
-{
-    NTSTATUS Status;
-    PFLT_FILE_NAME_INFORMATION NameInfo = NULL;
-    PFILE_SCAN_REQUEST ScanRequest = NULL;
-    PSHADOWSTRIKE_MESSAGE_HEADER Header = NULL;
-    ULONG TotalSize = 0;
-    UNICODE_STRING FileName = {0};
-    UNICODE_STRING ProcessName = {0};
-    UNICODE_STRING EmptyString = RTL_CONSTANT_STRING(L"");
-    UCHAR ProcessNameBuffer[512]; // Temp buffer for process name
-
-    PAGED_CODE();
-
-    *Request = NULL;
-    *RequestSize = 0;
-
-    //
-    // 1. Get File Name
-    //
-    Status = FltGetFileNameInformation(Data,
-                                     FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-                                     &NameInfo);
-    if (!NT_SUCCESS(Status)) {
-        return Status;
-    }
-
-    Status = FltParseFileNameInformation(NameInfo);
-    if (!NT_SUCCESS(Status)) {
-        FltReleaseFileNameInformation(NameInfo);
-        return Status;
-    }
-
-    FileName = NameInfo->Name;
-
-    //
-    // 2. Get Process Name
-    //
-    RtlInitEmptyUnicodeString(&ProcessName, (PWCHAR)ProcessNameBuffer, sizeof(ProcessNameBuffer));
-    if (!NT_SUCCESS(ShadowStrikeGetProcessImageName(PsGetCurrentProcessId(), &ProcessName))) {
-        ProcessName = EmptyString;
-    }
-
-    //
-    // 3. Calculate Size
-    //
-    TotalSize = sizeof(FILTER_MESSAGE_HEADER) + sizeof(FILE_SCAN_REQUEST) +
-                FileName.Length + sizeof(WCHAR) +
-                ProcessName.Length + sizeof(WCHAR);
-
-    if (TotalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        // Truncate path if needed
-        TotalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
-    }
-
-    //
-    // 4. Allocate Buffer
-    //
-    Header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(TotalSize);
-    if (Header == NULL) {
-        FltReleaseFileNameInformation(NameInfo);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // 5. Fill Header
-    //
-    Header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Header->MessageType = FilterMessageType_ScanRequest;
-    Header->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
-    Header->TotalSize = TotalSize;
-    Header->DataSize = TotalSize - sizeof(FILTER_MESSAGE_HEADER);
-    KeQuerySystemTime((PLARGE_INTEGER)&Header->Timestamp);
-    Header->Flags = 0;
-
-    //
-    // 6. Fill Scan Request
-    //
-    ScanRequest = (PFILE_SCAN_REQUEST)(Header + 1);
-    ScanRequest->MessageId = Header->MessageId;
-    ScanRequest->AccessType = (UINT8)AccessType;
-    ScanRequest->ProcessId = HandleToULong(PsGetCurrentProcessId());
-    ScanRequest->ThreadId = HandleToULong(PsGetCurrentThreadId());
-
-    // Fill file info
-    ScanRequest->PathLength = FileName.Length;
-    ScanRequest->ProcessNameLength = ProcessName.Length;
-
-    // Copy strings
-    PUCHAR StringPtr = (PUCHAR)(ScanRequest + 1);
-
-    // Safety check for buffer overflow
-    ULONG RemainingSize = TotalSize - (ULONG)((PUCHAR)StringPtr - (PUCHAR)Header);
-
-    if (RemainingSize >= FileName.Length) {
-        RtlCopyMemory(StringPtr, FileName.Buffer, FileName.Length);
-        StringPtr += FileName.Length;
-        RemainingSize -= FileName.Length;
-    }
-
-    if (RemainingSize >= ProcessName.Length) {
-        RtlCopyMemory(StringPtr, ProcessName.Buffer, ProcessName.Length);
-    }
-
-    FltReleaseFileNameInformation(NameInfo);
-
-    *Request = Header;
-    *RequestSize = TotalSize;
-
-    return STATUS_SUCCESS;
-}
-
-NTSTATUS
-ShadowStrikeSendScanRequest(
-    _In_ PSHADOWSTRIKE_MESSAGE_HEADER Request,
-    _In_ ULONG RequestSize,
-    _Out_ PSHADOWSTRIKE_SCAN_VERDICT_REPLY Reply,
-    _Inout_ PULONG ReplySize,
-    _In_ ULONG TimeoutMs
-    )
-{
-    NTSTATUS Status;
-    LARGE_INTEGER Timeout;
-
-    PAGED_CODE();
-
-    // Convert ms to 100ns units (negative for relative time)
-    Timeout.QuadPart = -(LONGLONG)TimeoutMs * 10000;
-
-    Status = ShadowStrikeSendMessage(
-        Request,
-        RequestSize,
-        Reply,
-        ReplySize,
-        &Timeout
-    );
-
-    return Status;
-}
+// ============================================================================
+// PROCESS NOTIFICATION
+// ============================================================================
 
 NTSTATUS
 ShadowStrikeSendProcessNotification(
@@ -188,71 +47,108 @@ ShadowStrikeSendProcessNotification(
     _In_opt_ PUNICODE_STRING CommandLine
     )
 {
-    NTSTATUS Status;
-    PSHADOWSTRIKE_MESSAGE_HEADER Header = NULL;
-    PSHADOWSTRIKE_PROCESS_NOTIFICATION Notification = NULL;
-    ULONG TotalSize = 0;
-    ULONG ImageNameLen = ImageName ? ImageName->Length : 0;
-    ULONG CmdLineLen = CommandLine ? CommandLine->Length : 0;
+    NTSTATUS status;
+    PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
+    PSHADOWSTRIKE_PROCESS_NOTIFICATION notification = NULL;
+    ULONG totalSize = 0;
+    ULONG imageNameLen = ImageName ? ImageName->Length : 0;
+    ULONG cmdLineLen = CommandLine ? CommandLine->Length : 0;
 
     PAGED_CODE();
 
-    TotalSize = sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) +
-                ImageNameLen + sizeof(WCHAR) +
-                CmdLineLen + sizeof(WCHAR);
-
-    if (TotalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        TotalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+    //
+    // Check if notifications are enabled
+    //
+    if (!g_DriverData.Config.NotificationsEnabled) {
+        return STATUS_SUCCESS;
     }
 
-    Header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(TotalSize);
-    if (!Header) {
+    //
+    // Check if user-mode is connected
+    //
+    if (!ShadowStrikeIsUserModeConnected()) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    //
+    // Calculate total message size
+    //
+    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) +
+                imageNameLen + sizeof(WCHAR) +
+                cmdLineLen + sizeof(WCHAR);
+
+    if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
+        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+    }
+
+    //
+    // Allocate message buffer from lookaside list
+    //
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    Header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Header->MessageType = FilterMessageType_ProcessNotify;
-    Header->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
-    Header->TotalSize = TotalSize;
-    Header->DataSize = TotalSize - sizeof(FILTER_MESSAGE_HEADER);
-    KeQuerySystemTime((PLARGE_INTEGER)&Header->Timestamp);
-    Header->Flags = 0; // Async
+    //
+    // Initialize header
+    //
+    ShadowStrikeInitMessageHeader(
+        header,
+        ShadowStrikeMessageProcessNotify,
+        totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+    );
 
-    Notification = (PSHADOWSTRIKE_PROCESS_NOTIFICATION)(Header + 1);
-    Notification->ProcessId = HandleToULong(ProcessId);
-    Notification->ParentProcessId = HandleToULong(ParentId);
-    Notification->CreatingProcessId = HandleToULong(PsGetCurrentProcessId());
-    Notification->CreatingThreadId = HandleToULong(PsGetCurrentThreadId());
-    Notification->Create = Create;
-    Notification->ImagePathLength = (UINT16)ImageNameLen;
-    Notification->CommandLineLength = (UINT16)CmdLineLen;
+    //
+    // Fill notification payload
+    //
+    notification = (PSHADOWSTRIKE_PROCESS_NOTIFICATION)((PUCHAR)header + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    notification->ProcessId = HandleToULong(ProcessId);
+    notification->ParentProcessId = HandleToULong(ParentId);
+    notification->CreatingProcessId = HandleToULong(PsGetCurrentProcessId());
+    notification->CreatingThreadId = HandleToULong(PsGetCurrentThreadId());
+    notification->Create = Create;
+    notification->ImagePathLength = (UINT16)imageNameLen;
+    notification->CommandLineLength = (UINT16)cmdLineLen;
 
-    PUCHAR StringPtr = (PUCHAR)(Notification + 1);
-    ULONG Remaining = TotalSize - (ULONG)((PUCHAR)StringPtr - (PUCHAR)Header);
+    //
+    // Copy variable-length strings
+    //
+    PUCHAR stringPtr = (PUCHAR)(notification + 1);
+    ULONG remaining = totalSize - (ULONG)((PUCHAR)stringPtr - (PUCHAR)header);
 
-    if (ImageName && ImageNameLen > 0 && Remaining >= ImageNameLen) {
-        RtlCopyMemory(StringPtr, ImageName->Buffer, ImageNameLen);
-        StringPtr += ImageNameLen;
-        Remaining -= ImageNameLen;
+    if (ImageName && imageNameLen > 0 && remaining >= imageNameLen) {
+        RtlCopyMemory(stringPtr, ImageName->Buffer, imageNameLen);
+        stringPtr += imageNameLen;
+        remaining -= imageNameLen;
     }
 
-    if (CommandLine && CmdLineLen > 0 && Remaining >= CmdLineLen) {
-        RtlCopyMemory(StringPtr, CommandLine->Buffer, CmdLineLen);
+    if (CommandLine && cmdLineLen > 0 && remaining >= cmdLineLen) {
+        RtlCopyMemory(stringPtr, CommandLine->Buffer, cmdLineLen);
     }
 
-    // Fire and forget - NULL timeout/reply
-    Status = ShadowStrikeSendMessage(
-        Header,
-        TotalSize,
+    //
+    // Send fire-and-forget notification (no reply expected)
+    //
+    status = ShadowStrikeSendMessage(
+        header,
+        totalSize,
         NULL,
         NULL,
         NULL
     );
 
-    ShadowStrikeFreeMessageBuffer(Header);
-    return Status;
+    //
+    // Free message buffer back to lookaside list
+    //
+    ShadowStrikeFreeMessageBuffer(header);
+
+    return status;
 }
+
+// ============================================================================
+// THREAD NOTIFICATION
+// ============================================================================
 
 NTSTATUS
 ShadowStrikeSendThreadNotification(
@@ -262,45 +158,74 @@ ShadowStrikeSendThreadNotification(
     _In_ BOOLEAN IsRemote
     )
 {
-    NTSTATUS Status;
-    PSHADOWSTRIKE_MESSAGE_HEADER Header = NULL;
-    PSHADOWSTRIKE_THREAD_NOTIFICATION Notification = NULL;
-    ULONG TotalSize = sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION);
+    NTSTATUS status;
+    PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
+    PSHADOWSTRIKE_THREAD_NOTIFICATION notification = NULL;
+    ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                      sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION);
 
     PAGED_CODE();
 
-    Header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(TotalSize);
-    if (!Header) {
+    //
+    // Check if notifications are enabled
+    //
+    if (!g_DriverData.Config.NotificationsEnabled) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Check if user-mode is connected
+    //
+    if (!ShadowStrikeIsUserModeConnected()) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    //
+    // Allocate message buffer
+    //
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    Header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Header->MessageType = FilterMessageType_ThreadNotify;
-    Header->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
-    Header->TotalSize = TotalSize;
-    Header->DataSize = TotalSize - sizeof(FILTER_MESSAGE_HEADER);
-    KeQuerySystemTime((PLARGE_INTEGER)&Header->Timestamp);
-    Header->Flags = 0;
+    //
+    // Initialize header
+    //
+    ShadowStrikeInitMessageHeader(
+        header,
+        ShadowStrikeMessageThreadNotify,
+        sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)
+    );
 
-    Notification = (PSHADOWSTRIKE_THREAD_NOTIFICATION)(Header + 1);
-    Notification->ProcessId = HandleToULong(ProcessId);
-    Notification->ThreadId = HandleToULong(ThreadId);
-    Notification->CreatorProcessId = HandleToULong(PsGetCurrentProcessId());
-    Notification->CreatorThreadId = HandleToULong(PsGetCurrentThreadId());
-    Notification->IsRemote = IsRemote;
+    //
+    // Fill notification payload
+    //
+    notification = (PSHADOWSTRIKE_THREAD_NOTIFICATION)((PUCHAR)header + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    notification->ProcessId = HandleToULong(ProcessId);
+    notification->ThreadId = HandleToULong(ThreadId);
+    notification->CreatorProcessId = HandleToULong(PsGetCurrentProcessId());
+    notification->CreatorThreadId = HandleToULong(PsGetCurrentThreadId());
+    notification->IsRemote = IsRemote;
 
-    Status = ShadowStrikeSendMessage(
-        Header,
-        TotalSize,
+    //
+    // Send notification
+    //
+    status = ShadowStrikeSendMessage(
+        header,
+        totalSize,
         NULL,
         NULL,
         NULL
     );
 
-    ShadowStrikeFreeMessageBuffer(Header);
-    return Status;
+    ShadowStrikeFreeMessageBuffer(header);
+
+    return status;
 }
+
+// ============================================================================
+// IMAGE LOAD NOTIFICATION
+// ============================================================================
 
 NTSTATUS
 ShadowStrikeSendImageNotification(
@@ -309,67 +234,101 @@ ShadowStrikeSendImageNotification(
     _In_ PIMAGE_INFO ImageInfo
     )
 {
-    NTSTATUS Status;
-    PSHADOWSTRIKE_MESSAGE_HEADER Header = NULL;
-    PSHADOWSTRIKE_IMAGE_NOTIFICATION Notification = NULL;
-    ULONG ImageNameLen = FullImageName ? FullImageName->Length : 0;
-    ULONG TotalSize = sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION) +
-                      ImageNameLen + sizeof(WCHAR);
+    NTSTATUS status;
+    PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
+    PSHADOWSTRIKE_IMAGE_NOTIFICATION notification = NULL;
+    ULONG imageNameLen = FullImageName ? FullImageName->Length : 0;
+    ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                      sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION) +
+                      imageNameLen + sizeof(WCHAR);
 
     PAGED_CODE();
 
-    if (TotalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        TotalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+    //
+    // Check if notifications are enabled
+    //
+    if (!g_DriverData.Config.NotificationsEnabled) {
+        return STATUS_SUCCESS;
     }
 
-    Header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(TotalSize);
-    if (!Header) {
+    //
+    // Check if user-mode is connected
+    //
+    if (!ShadowStrikeIsUserModeConnected()) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
+        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+    }
+
+    //
+    // Allocate message buffer
+    //
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    Header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Header->MessageType = FilterMessageType_ImageLoad;
-    Header->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
-    Header->TotalSize = TotalSize;
-    Header->DataSize = TotalSize - sizeof(FILTER_MESSAGE_HEADER);
-    KeQuerySystemTime((PLARGE_INTEGER)&Header->Timestamp);
-    Header->Flags = 0;
+    //
+    // Initialize header
+    //
+    ShadowStrikeInitMessageHeader(
+        header,
+        ShadowStrikeMessageImageLoad,
+        totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+    );
 
-    Notification = (PSHADOWSTRIKE_IMAGE_NOTIFICATION)(Header + 1);
-    Notification->ProcessId = HandleToULong(ProcessId);
-    Notification->ImageBase = (UINT64)ImageInfo->ImageBase;
-    Notification->ImageSize = (UINT64)ImageInfo->ImageSize;
-    Notification->IsSystemImage = (BOOLEAN)ImageInfo->SystemModeImage;
+    //
+    // Fill notification payload
+    //
+    notification = (PSHADOWSTRIKE_IMAGE_NOTIFICATION)((PUCHAR)header + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    notification->ProcessId = HandleToULong(ProcessId);
+    notification->ImageBase = (UINT64)ImageInfo->ImageBase;
+    notification->ImageSize = (UINT64)ImageInfo->ImageSize;
+    notification->IsSystemImage = (BOOLEAN)ImageInfo->SystemModeImage;
 
-    // Extended Info for signature level if available
+    //
+    // Get signature information from extended info if available
+    //
     if (ImageInfo->ExtendedInfoPresent) {
-        PIMAGE_INFO_EX ImageInfoEx = (PIMAGE_INFO_EX)ImageInfo;
-        Notification->SignatureLevel = ImageInfoEx->ImageSignatureLevel;
-        Notification->SignatureType = ImageInfoEx->ImageSignatureType;
+        PIMAGE_INFO_EX imageInfoEx = CONTAINING_RECORD(ImageInfo, IMAGE_INFO_EX, ImageInfo);
+        notification->SignatureLevel = imageInfoEx->ImageSignatureLevel;
+        notification->SignatureType = imageInfoEx->ImageSignatureType;
     } else {
-        Notification->SignatureLevel = 0;
-        Notification->SignatureType = 0;
+        notification->SignatureLevel = 0;
+        notification->SignatureType = 0;
     }
 
-    Notification->ImageNameLength = (UINT16)ImageNameLen;
+    notification->ImageNameLength = (UINT16)imageNameLen;
 
-    PUCHAR StringPtr = (PUCHAR)(Notification + 1);
-    if (FullImageName && ImageNameLen > 0) {
-        RtlCopyMemory(StringPtr, FullImageName->Buffer, ImageNameLen);
+    //
+    // Copy image name
+    //
+    PUCHAR stringPtr = (PUCHAR)(notification + 1);
+    if (FullImageName && imageNameLen > 0) {
+        RtlCopyMemory(stringPtr, FullImageName->Buffer, imageNameLen);
     }
 
-    Status = ShadowStrikeSendMessage(
-        Header,
-        TotalSize,
+    //
+    // Send notification
+    //
+    status = ShadowStrikeSendMessage(
+        header,
+        totalSize,
         NULL,
         NULL,
         NULL
     );
 
-    ShadowStrikeFreeMessageBuffer(Header);
-    return Status;
+    ShadowStrikeFreeMessageBuffer(header);
+
+    return status;
 }
+
+// ============================================================================
+// REGISTRY NOTIFICATION
+// ============================================================================
 
 NTSTATUS
 ShadowStrikeSendRegistryNotification(
@@ -383,122 +342,118 @@ ShadowStrikeSendRegistryNotification(
     _In_ ULONG DataType
     )
 {
-    NTSTATUS Status;
-    PSHADOWSTRIKE_MESSAGE_HEADER Header = NULL;
-    PSHADOWSTRIKE_REGISTRY_NOTIFICATION Notification = NULL;
-    ULONG KeyPathLen = KeyPath ? KeyPath->Length : 0;
-    ULONG ValueNameLen = ValueName ? ValueName->Length : 0;
-
-    // We limit data size to avoid huge messages
-    ULONG SafeDataSize = (Data && DataSize > 0) ? DataSize : 0;
-    if (SafeDataSize > 1024) SafeDataSize = 1024; // Cap captured data at 1KB
-
-    ULONG TotalSize = sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION) +
-                      KeyPathLen + sizeof(WCHAR) +
-                      ValueNameLen + sizeof(WCHAR) +
-                      SafeDataSize;
+    NTSTATUS status;
+    PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
+    PSHADOWSTRIKE_REGISTRY_NOTIFICATION notification = NULL;
+    ULONG keyPathLen = KeyPath ? KeyPath->Length : 0;
+    ULONG valueNameLen = ValueName ? ValueName->Length : 0;
 
     PAGED_CODE();
 
-    if (TotalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        TotalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
-        // Truncate if still too big? For now just cap.
+    //
+    // Check if notifications are enabled
+    //
+    if (!g_DriverData.Config.NotificationsEnabled) {
+        return STATUS_SUCCESS;
     }
 
-    Header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(TotalSize);
-    if (!Header) {
+    //
+    // Check if user-mode is connected
+    //
+    if (!ShadowStrikeIsUserModeConnected()) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    //
+    // Limit captured data size to prevent huge messages
+    //
+    ULONG safeDataSize = (Data && DataSize > 0) ? DataSize : 0;
+    if (safeDataSize > MAX_REGISTRY_DATA_SIZE) {
+        safeDataSize = MAX_REGISTRY_DATA_SIZE;
+    }
+
+    ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                      sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION) +
+                      keyPathLen + sizeof(WCHAR) +
+                      valueNameLen + sizeof(WCHAR) +
+                      safeDataSize;
+
+    if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
+        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
+    }
+
+    //
+    // Allocate message buffer
+    //
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)ShadowStrikeAllocateMessageBuffer(totalSize);
+    if (header == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    Header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-    Header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Header->MessageType = FilterMessageType_RegistryNotify;
-    Header->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
-    Header->TotalSize = TotalSize;
-    Header->DataSize = TotalSize - sizeof(FILTER_MESSAGE_HEADER);
-    KeQuerySystemTime((PLARGE_INTEGER)&Header->Timestamp);
-    Header->Flags = 0;
+    //
+    // Initialize header
+    //
+    ShadowStrikeInitMessageHeader(
+        header,
+        ShadowStrikeMessageRegistryNotify,
+        totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+    );
 
-    Notification = (PSHADOWSTRIKE_REGISTRY_NOTIFICATION)(Header + 1);
-    Notification->ProcessId = HandleToULong(ProcessId);
-    Notification->ThreadId = HandleToULong(ThreadId);
-    Notification->Operation = Operation;
-    Notification->KeyPathLength = (UINT16)KeyPathLen;
-    Notification->ValueNameLength = (UINT16)ValueNameLen;
-    Notification->DataSize = SafeDataSize;
-    Notification->DataType = DataType;
+    //
+    // Fill notification payload
+    //
+    notification = (PSHADOWSTRIKE_REGISTRY_NOTIFICATION)((PUCHAR)header + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    notification->ProcessId = HandleToULong(ProcessId);
+    notification->ThreadId = HandleToULong(ThreadId);
+    notification->Operation = Operation;
+    notification->KeyPathLength = (UINT16)keyPathLen;
+    notification->ValueNameLength = (UINT16)valueNameLen;
+    notification->DataSize = safeDataSize;
+    notification->DataType = DataType;
 
-    PUCHAR StringPtr = (PUCHAR)(Notification + 1);
-    ULONG Remaining = TotalSize - (ULONG)((PUCHAR)StringPtr - (PUCHAR)Header);
+    //
+    // Copy variable-length data
+    //
+    PUCHAR stringPtr = (PUCHAR)(notification + 1);
+    ULONG remaining = totalSize - (ULONG)((PUCHAR)stringPtr - (PUCHAR)header);
 
-    // Copy Key Path
-    if (KeyPath && KeyPathLen > 0 && Remaining >= KeyPathLen) {
-        RtlCopyMemory(StringPtr, KeyPath->Buffer, KeyPathLen);
-        StringPtr += KeyPathLen;
-        Remaining -= KeyPathLen;
+    // Copy key path
+    if (KeyPath && keyPathLen > 0 && remaining >= keyPathLen) {
+        RtlCopyMemory(stringPtr, KeyPath->Buffer, keyPathLen);
+        stringPtr += keyPathLen;
+        remaining -= keyPathLen;
     }
 
-    // Copy Value Name
-    if (ValueName && ValueNameLen > 0 && Remaining >= ValueNameLen) {
-        RtlCopyMemory(StringPtr, ValueName->Buffer, ValueNameLen);
-        StringPtr += ValueNameLen;
-        Remaining -= ValueNameLen;
+    // Copy value name
+    if (ValueName && valueNameLen > 0 && remaining >= valueNameLen) {
+        RtlCopyMemory(stringPtr, ValueName->Buffer, valueNameLen);
+        stringPtr += valueNameLen;
+        remaining -= valueNameLen;
     }
 
-    // Copy Data
-    if (Data && SafeDataSize > 0 && Remaining >= SafeDataSize) {
-        // Need to be careful with reading user pointers?
-        // Assuming Data came from kernel capture or trusted source in RegistryCallback.
-        // In RegistryCallback, 'Data' comes from PREG_SET_VALUE_KEY_INFORMATION which is kernel memory (usually).
-        // But let's use try/except if we were paranoid, but here we assume caller (RegistryCallback) handled probing if needed.
-        // Actually RegistryCallback gets it from CmCallback, which provides kernel pointers for system space or user pointers.
-        // We should assume it might be user memory?
-        // CmCallback data is usually valid in context.
-        RtlCopyMemory(StringPtr, Data, SafeDataSize);
+    // Copy data (with exception handling for potentially invalid user pointers)
+    if (Data && safeDataSize > 0 && remaining >= safeDataSize) {
+        __try {
+            RtlCopyMemory(stringPtr, Data, safeDataSize);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Failed to copy data, zero it out
+            RtlZeroMemory(stringPtr, safeDataSize);
+            notification->DataSize = 0;
+        }
     }
 
-    Status = ShadowStrikeSendMessage(
-        Header,
-        TotalSize,
+    //
+    // Send notification
+    //
+    status = ShadowStrikeSendMessage(
+        header,
+        totalSize,
         NULL,
         NULL,
         NULL
     );
 
-    ShadowStrikeFreeMessageBuffer(Header);
-    return Status;
-}
+    ShadowStrikeFreeMessageBuffer(header);
 
-PVOID
-ShadowStrikeAllocateMessageBuffer(
-    _In_ ULONG Size
-    )
-{
-    PVOID Buffer = NULL;
-
-    PAGED_CODE();
-
-    if (Size <= SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        Buffer = ExAllocateFromNPagedLookasideList(&g_DriverData.MessageLookaside);
-    }
-
-    if (Buffer == NULL) {
-        Buffer = ShadowStrikeAllocate(Size);
-    } else {
-        RtlZeroMemory(Buffer, Size);
-    }
-
-    return Buffer;
-}
-
-VOID
-ShadowStrikeFreeMessageBuffer(
-    _In_ PVOID Buffer
-    )
-{
-    PAGED_CODE();
-
-    if (Buffer) {
-        ShadowStrikeFreePool(Buffer);
-    }
+    return status;
 }

@@ -53,8 +53,7 @@ ShadowStrikeCacheCleanupDpc(
 static
 VOID
 ShadowStrikeCacheCleanupWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+    _In_ PVOID Context
     );
 
 static
@@ -139,11 +138,16 @@ ShadowStrikeCacheInitialize(
     KeInitializeDpc(&g_ScanCache.CleanupDpc, ShadowStrikeCacheCleanupDpc, NULL);
 
     //
-    // Allocate work item for cleanup (runs at PASSIVE_LEVEL)
+    // Initialize work item for cleanup (runs at PASSIVE_LEVEL)
+    // Using legacy ExInitializeWorkItem which doesn't require a DeviceObject
+    // (minifilters don't have a DeviceObject)
     //
-    if (g_DriverData.DriverObject != NULL) {
-        g_ScanCache.CleanupWorkItem = IoAllocateWorkItem(g_DriverData.DriverObject->DeviceObject);
-    }
+    ExInitializeWorkItem(
+        &g_ScanCache.CleanupWorkItem,
+        ShadowStrikeCacheCleanupWorker,
+        NULL
+    );
+    g_ScanCache.WorkItemInitialized = TRUE;
 
     //
     // Start cleanup timer (periodic)
@@ -194,12 +198,10 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Free work item
+    // Mark work item as not initialized (ExInitializeWorkItem doesn't allocate,
+    // so there's nothing to free - just prevent further queuing)
     //
-    if (g_ScanCache.CleanupWorkItem != NULL) {
-        IoFreeWorkItem(g_ScanCache.CleanupWorkItem);
-        g_ScanCache.CleanupWorkItem = NULL;
-    }
+    g_ScanCache.WorkItemInitialized = FALSE;
 
     //
     // Clear all entries
@@ -878,25 +880,28 @@ ShadowStrikeCacheCleanupDpc(
 
     //
     // Queue work item to run cleanup at PASSIVE_LEVEL
+    // Using legacy ExQueueWorkItem which doesn't require a DeviceObject
     //
-    if (g_ScanCache.CleanupWorkItem != NULL && g_ScanCache.Initialized) {
-        IoQueueWorkItem(
-            g_ScanCache.CleanupWorkItem,
+    if (g_ScanCache.WorkItemInitialized && g_ScanCache.Initialized) {
+        //
+        // Re-initialize the work item before each queue
+        // (required for ExQueueWorkItem - work items are single-use)
+        //
+        ExInitializeWorkItem(
+            &g_ScanCache.CleanupWorkItem,
             ShadowStrikeCacheCleanupWorker,
-            DelayedWorkQueue,
             NULL
         );
+        ExQueueWorkItem(&g_ScanCache.CleanupWorkItem, DelayedWorkQueue);
     }
 }
 
 static
 VOID
 ShadowStrikeCacheCleanupWorker(
-    _In_ PDEVICE_OBJECT DeviceObject,
-    _In_opt_ PVOID Context
+    _In_ PVOID Context
     )
 {
-    UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
     ShadowStrikeCacheCleanup();
