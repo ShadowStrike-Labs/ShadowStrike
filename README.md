@@ -83,7 +83,7 @@ This is a 3-5 year development effort. The goal is a production-ready beta by 20
 
 ## Core Technologies
 
-### Kernel Driver (ShadowStrikeFlt)
+### Kernel Driver (Shadow Sensor)
 - Windows Filter Manager minifilter for file system interception
 - `CmRegisterCallbackEx` for registry monitoring
 - `PsSetCreateProcessNotifyRoutineEx` for process creation tracking
