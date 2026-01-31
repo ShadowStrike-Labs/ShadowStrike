@@ -981,7 +981,7 @@ public:
                 uint16_t type = entry >> 12;
                 uint16_t off = entry & 0x0FFF;
 
-                if (type != RelocationType::ABSOLUTE) {  // Skip padding
+                if (type != RelocationType::RELOC_ABSOLUTE) {  // Skip padding
                     RelocationEntry reloc;
                     reloc.rva = block.VirtualAddress + off;
                     reloc.type = type;

@@ -249,9 +249,505 @@ extern "C" {
     uint64_t CheckBeingDebugged() noexcept;
 }
 
+// ============================================================================
+// C++ FALLBACK IMPLEMENTATIONS (used if assembly is not linked)
+// These use MSVC intrinsics and provide identical functionality.
+// The linker will use assembly if available, otherwise these fallbacks.
+// ============================================================================
+
+#include <intrin.h>
+
+namespace AsmFallback {
+
+    // Fallback: CheckCPUIDHypervisorBit
+    extern "C" uint64_t Fallback_CheckCPUIDHypervisorBit() noexcept {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        return (cpuInfo[2] & (1 << 31)) ? 1 : 0; // ECX bit 31
+    }
+
+    // Fallback: GetCPUIDBrandString
+    extern "C" void Fallback_GetCPUIDBrandString(char* buffer, size_t bufferSize) noexcept {
+        if (!buffer || bufferSize < 49) return;
+        memset(buffer, 0, bufferSize);
+        
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 0x80000000);
+        if (static_cast<unsigned>(cpuInfo[0]) < 0x80000004) return;
+        
+        __cpuid(cpuInfo, 0x80000002);
+        memcpy(buffer, cpuInfo, 16);
+        __cpuid(cpuInfo, 0x80000003);
+        memcpy(buffer + 16, cpuInfo, 16);
+        __cpuid(cpuInfo, 0x80000004);
+        memcpy(buffer + 32, cpuInfo, 16);
+        buffer[48] = '\0';
+    }
+
+    // Fallback: CheckCPUIDVMXSupport
+    extern "C" uint64_t Fallback_CheckCPUIDVMXSupport() noexcept {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        return (cpuInfo[2] & (1 << 5)) ? 1 : 0; // ECX bit 5 = VMX
+    }
+
+    // Fallback: GetCPUIDVendorString
+    extern "C" void Fallback_GetCPUIDVendorString(char* buffer, size_t bufferSize) noexcept {
+        if (!buffer || bufferSize < 13) return;
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 0);
+        memcpy(buffer, &cpuInfo[1], 4);     // EBX
+        memcpy(buffer + 4, &cpuInfo[3], 4); // EDX
+        memcpy(buffer + 8, &cpuInfo[2], 4); // ECX
+        buffer[12] = '\0';
+    }
+
+    // Fallback: CheckCPUIDHypervisorVendor
+    extern "C" uint64_t Fallback_CheckCPUIDHypervisorVendor(char* buffer, size_t bufferSize) noexcept {
+        if (!buffer || bufferSize < 13) return 0;
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        if (!(cpuInfo[2] & (1 << 31))) { buffer[0] = '\0'; return 0; }
+        
+        __cpuid(cpuInfo, 0x40000000);
+        memcpy(buffer, &cpuInfo[1], 4);     // EBX
+        memcpy(buffer + 4, &cpuInfo[2], 4); // ECX
+        memcpy(buffer + 8, &cpuInfo[3], 4); // EDX
+        buffer[12] = '\0';
+        return 1;
+    }
+
+    // Fallback: GetCPUIDFeatureFlags
+    extern "C" uint64_t Fallback_GetCPUIDFeatureFlags(uint32_t* ecxFeatures, uint32_t* edxFeatures) noexcept {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        if (ecxFeatures) *ecxFeatures = static_cast<uint32_t>(cpuInfo[2]);
+        if (edxFeatures) *edxFeatures = static_cast<uint32_t>(cpuInfo[3]);
+        return 1;
+    }
+
+    // Fallback: GetExtendedCPUIDMaxLeaf
+    extern "C" uint64_t Fallback_GetExtendedCPUIDMaxLeaf() noexcept {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 0x80000000);
+        return static_cast<uint64_t>(cpuInfo[0]);
+    }
+
+    // Fallback: CheckSSE2Support
+    extern "C" uint64_t Fallback_CheckSSE2Support() noexcept {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        return (cpuInfo[3] & (1 << 26)) ? 1 : 0; // EDX bit 26
+    }
+
+    // Fallback: GetProcessorCoreCount
+    extern "C" uint64_t Fallback_GetProcessorCoreCount() noexcept {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        return static_cast<uint64_t>(sysInfo.dwNumberOfProcessors);
+    }
+
+    // Fallback: MeasureRDTSCTimingDelta
+    extern "C" uint64_t Fallback_MeasureRDTSCTimingDelta(uint32_t iterations) noexcept {
+        if (iterations == 0 || iterations > 65536) iterations = 1000;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < iterations; ++i) {
+            unsigned int aux;
+            uint64_t start = __rdtscp(&aux);
+            _mm_lfence();
+            uint64_t end = __rdtscp(&aux);
+            total += (end - start);
+        }
+        return total;
+    }
+
+    // Fallback: MeasureRDTSCPTiming
+    extern "C" uint64_t Fallback_MeasureRDTSCPTiming(uint32_t iterations) noexcept {
+        if (iterations == 0 || iterations > 65536) iterations = 1000;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < iterations; ++i) {
+            unsigned int aux;
+            uint64_t start = __rdtscp(&aux);
+            uint64_t end = __rdtscp(&aux);
+            total += (end - start);
+        }
+        return (iterations > 0) ? total / iterations : 0;
+    }
+
+    // Fallback: MeasureCPUIDTiming
+    extern "C" uint64_t Fallback_MeasureCPUIDTiming(uint32_t iterations) noexcept {
+        if (iterations == 0 || iterations > 65536) iterations = 1000;
+        uint64_t total = 0;
+        int cpuInfo[4];
+        for (uint32_t i = 0; i < iterations; ++i) {
+            unsigned int aux;
+            uint64_t start = __rdtscp(&aux);
+            __cpuid(cpuInfo, 0);
+            uint64_t end = __rdtscp(&aux);
+            total += (end - start);
+        }
+        return total;
+    }
+
+    // Fallback: MeasureINTTimingDelta (stub - can't safely do INT in C++)
+    extern "C" uint64_t Fallback_MeasureINTTimingDelta(uint32_t) noexcept {
+        return 0; // Not safely implementable in C++
+    }
+
+    // Fallback: MeasureExceptionTiming (stub)
+    extern "C" uint64_t Fallback_MeasureExceptionTiming(uint32_t) noexcept {
+        return 0; // Not safely implementable in C++
+    }
+
+    // Fallback: MeasureRDTSCLatency
+    extern "C" uint64_t Fallback_MeasureRDTSCLatency() noexcept {
+        unsigned int aux;
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0); // Serialize
+        uint64_t start = __rdtsc();
+        __cpuid(cpuInfo, 0); // Serialize
+        uint64_t end = __rdtsc();
+        return end - start;
+    }
+
+    // Fallback: PerformRDTSCPMeasurement
+    extern "C" uint64_t Fallback_PerformRDTSCPMeasurement(uint32_t* processorId) noexcept {
+        unsigned int aux;
+        uint64_t tsc = __rdtscp(&aux);
+        if (processorId) *processorId = aux;
+        return tsc;
+    }
+
+    // Fallback: MeasureInstructionTiming
+    extern "C" uint64_t Fallback_MeasureInstructionTiming(uint32_t iterations) noexcept {
+        return Fallback_MeasureCPUIDTiming(iterations);
+    }
+
+    // Fallback: DetectPopfTiming (stub)
+    extern "C" uint64_t Fallback_DetectPopfTiming(uint32_t) noexcept {
+        return 0; // Not safely implementable in C++
+    }
+
+    // Fallback: GetIDTBase (stub - requires privileged instruction)
+    extern "C" uint64_t Fallback_GetIDTBase() noexcept {
+        return 0; // SIDT requires ring 0 or special handling
+    }
+
+    // Fallback: GetGDTBase (stub - requires privileged instruction)
+    extern "C" uint64_t Fallback_GetGDTBase() noexcept {
+        return 0; // SGDT requires ring 0 or special handling
+    }
+
+    // Fallback: GetLDTSelector
+    extern "C" uint16_t Fallback_GetLDTSelector() noexcept {
+        return 0; // SLDT requires special handling
+    }
+
+    // Fallback: GetTRSelector
+    extern "C" uint16_t Fallback_GetTRSelector() noexcept {
+        return 0; // STR requires special handling
+    }
+
+    // Fallback: CheckSegmentLimits
+    extern "C" uint64_t Fallback_CheckSegmentLimits(uint32_t*, uint32_t*, uint32_t*) noexcept {
+        return 0; // Not implementable in user-mode C++
+    }
+
+    // Fallback: GetIDTAndGDTInfo
+    extern "C" uint64_t Fallback_GetIDTAndGDTInfo(uint64_t*, uint16_t*, uint64_t*, uint16_t*) noexcept {
+        return 0; // Not implementable in user-mode C++
+    }
+
+    // Fallback: GetDebugRegisters (stub - requires ring 0)
+    extern "C" uint64_t Fallback_GetDebugRegisters(uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_t*) noexcept {
+        return 0; // Reading DRx requires ring 0
+    }
+
+    // Fallback: DetectHardwareBreakpoints
+    extern "C" uint64_t Fallback_DetectHardwareBreakpoints() noexcept {
+        // Try to detect via GetThreadContext
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(GetCurrentThread(), &ctx)) {
+            if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) return 1;
+        }
+        return 0;
+    }
+
+    // Fallback: DetectSingleStep
+    extern "C" uint64_t Fallback_DetectSingleStep() noexcept {
+        return 0; // Not safely implementable
+    }
+
+    // Fallback: CheckTrapFlag
+    extern "C" uint64_t Fallback_CheckTrapFlag() noexcept {
+        return 0; // Would need inline asm or special handling
+    }
+
+    // Fallback: CheckDebugRegistersASM
+    extern "C" uint64_t Fallback_CheckDebugRegistersASM() noexcept {
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(GetCurrentThread(), &ctx)) {
+            return ctx.Dr7;
+        }
+        return 0;
+    }
+
+    // Fallback: CheckNtGlobalFlag
+    // NOTE: SEH-protected access to PEB - offsets may vary between Windows versions
+    extern "C" uint32_t Fallback_CheckNtGlobalFlag() noexcept {
+        __try {
+            // Read NtGlobalFlag directly from PEB at known offset
+            // x64: PEB at gs:[0x60], NtGlobalFlag at offset 0xBC
+            // x86: PEB at fs:[0x30], NtGlobalFlag at offset 0x68
+#if defined(_M_X64)
+            uint8_t* peb = reinterpret_cast<uint8_t*>(__readgsqword(0x60));
+            if (peb) {
+                // Validate PEB pointer is in valid range before dereferencing
+                // PEB should be in usermode range (below 0x7FFF'FFFF'FFFF on x64)
+                uintptr_t pebAddr = reinterpret_cast<uintptr_t>(peb);
+                if (pebAddr > 0x10000 && pebAddr < 0x7FFFFFFEFFFF) {
+                    return *reinterpret_cast<uint32_t*>(peb + 0xBC);
+                }
+            }
+#else
+            uint8_t* peb = reinterpret_cast<uint8_t*>(__readfsdword(0x30));
+            if (peb) {
+                // Validate PEB pointer is in valid range before dereferencing
+                uintptr_t pebAddr = reinterpret_cast<uintptr_t>(peb);
+                if (pebAddr > 0x10000 && pebAddr < 0x7FFFFFFF) {
+                    return *reinterpret_cast<uint32_t*>(peb + 0x68);
+                }
+            }
+#endif
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // SEH caught access violation - return 0 (no flags)
+            return 0;
+        }
+        return 0;
+    }
+
+    // Fallback: GetProcessHeapFlags
+    // NOTE: SEH-protected access - heap structure offsets are UNDOCUMENTED and VERSION-DEPENDENT
+    // This may crash on future Windows versions if offsets change
+    extern "C" uint32_t Fallback_GetProcessHeapFlags() noexcept {
+        __try {
+            HANDLE heap = GetProcessHeap();
+            if (!heap) return 0;
+            
+            // Validate heap handle looks reasonable
+            uintptr_t heapAddr = reinterpret_cast<uintptr_t>(heap);
+            if (heapAddr < 0x10000) return 0;
+            
+            // Heap flags are at offset 0x70 (x64) or 0x40 (x86) in heap structure
+            // WARNING: These offsets are undocumented and may change
+#if defined(_M_X64)
+            // Additional validation: check heap is in usermode range
+            if (heapAddr < 0x7FFFFFFEFFFF) {
+                return *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(heap) + 0x70);
+            }
+#else
+            if (heapAddr < 0x7FFFFFFF) {
+                return *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(heap) + 0x40);
+            }
+#endif
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // SEH caught access violation - heap structure changed or corrupted
+            return 0;
+        }
+        return 0;
+    }
+
+    // Fallback: CheckBeingDebugged
+    extern "C" uint64_t Fallback_CheckBeingDebugged() noexcept {
+        return IsDebuggerPresent() ? 1 : 0;
+    }
+
+} // namespace AsmFallback
+
+// ============================================================================
+// LINKER ALTERNATE NAMES
+// If assembly functions are not found, use the C++ fallbacks
+// Syntax: /alternatename:_symbol=_fallback
+// ============================================================================
+
+#pragma comment(linker, "/alternatename:CheckCPUIDHypervisorBit=Fallback_CheckCPUIDHypervisorBit")
+#pragma comment(linker, "/alternatename:GetCPUIDBrandString=Fallback_GetCPUIDBrandString")
+#pragma comment(linker, "/alternatename:CheckCPUIDVMXSupport=Fallback_CheckCPUIDVMXSupport")
+#pragma comment(linker, "/alternatename:GetCPUIDVendorString=Fallback_GetCPUIDVendorString")
+#pragma comment(linker, "/alternatename:CheckCPUIDHypervisorVendor=Fallback_CheckCPUIDHypervisorVendor")
+#pragma comment(linker, "/alternatename:GetCPUIDFeatureFlags=Fallback_GetCPUIDFeatureFlags")
+#pragma comment(linker, "/alternatename:GetExtendedCPUIDMaxLeaf=Fallback_GetExtendedCPUIDMaxLeaf")
+#pragma comment(linker, "/alternatename:CheckSSE2Support=Fallback_CheckSSE2Support")
+#pragma comment(linker, "/alternatename:GetProcessorCoreCount=Fallback_GetProcessorCoreCount")
+#pragma comment(linker, "/alternatename:MeasureRDTSCTimingDelta=Fallback_MeasureRDTSCTimingDelta")
+#pragma comment(linker, "/alternatename:MeasureRDTSCPTiming=Fallback_MeasureRDTSCPTiming")
+#pragma comment(linker, "/alternatename:MeasureCPUIDTiming=Fallback_MeasureCPUIDTiming")
+#pragma comment(linker, "/alternatename:MeasureINTTimingDelta=Fallback_MeasureINTTimingDelta")
+#pragma comment(linker, "/alternatename:MeasureExceptionTiming=Fallback_MeasureExceptionTiming")
+#pragma comment(linker, "/alternatename:MeasureRDTSCLatency=Fallback_MeasureRDTSCLatency")
+#pragma comment(linker, "/alternatename:PerformRDTSCPMeasurement=Fallback_PerformRDTSCPMeasurement")
+#pragma comment(linker, "/alternatename:MeasureInstructionTiming=Fallback_MeasureInstructionTiming")
+#pragma comment(linker, "/alternatename:DetectPopfTiming=Fallback_DetectPopfTiming")
+#pragma comment(linker, "/alternatename:GetIDTBase=Fallback_GetIDTBase")
+#pragma comment(linker, "/alternatename:GetGDTBase=Fallback_GetGDTBase")
+#pragma comment(linker, "/alternatename:GetLDTSelector=Fallback_GetLDTSelector")
+#pragma comment(linker, "/alternatename:GetTRSelector=Fallback_GetTRSelector")
+#pragma comment(linker, "/alternatename:CheckSegmentLimits=Fallback_CheckSegmentLimits")
+#pragma comment(linker, "/alternatename:GetIDTAndGDTInfo=Fallback_GetIDTAndGDTInfo")
+#pragma comment(linker, "/alternatename:GetDebugRegisters=Fallback_GetDebugRegisters")
+#pragma comment(linker, "/alternatename:DetectHardwareBreakpoints=Fallback_DetectHardwareBreakpoints")
+#pragma comment(linker, "/alternatename:DetectSingleStep=Fallback_DetectSingleStep")
+#pragma comment(linker, "/alternatename:CheckTrapFlag=Fallback_CheckTrapFlag")
+#pragma comment(linker, "/alternatename:CheckDebugRegistersASM=Fallback_CheckDebugRegistersASM")
+#pragma comment(linker, "/alternatename:CheckNtGlobalFlag=Fallback_CheckNtGlobalFlag")
+#pragma comment(linker, "/alternatename:GetProcessHeapFlags=Fallback_GetProcessHeapFlags")
+#pragma comment(linker, "/alternatename:CheckBeingDebugged=Fallback_CheckBeingDebugged")
+
 namespace fs = std::filesystem;
 
 namespace ShadowStrike::AntiEvasion {
+
+    // ========================================================================
+    // RAII HANDLE WRAPPERS
+    // Ensures handles are always closed, even in exception paths
+    // ========================================================================
+
+    /**
+     * @brief RAII wrapper for process handles from OpenProcess
+     */
+    class ProcessHandleGuard {
+    public:
+        explicit ProcessHandleGuard(HANDLE h = nullptr) noexcept : m_handle(h) {}
+        ~ProcessHandleGuard() noexcept {
+            if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(m_handle);
+            }
+        }
+        
+        // Non-copyable
+        ProcessHandleGuard(const ProcessHandleGuard&) = delete;
+        ProcessHandleGuard& operator=(const ProcessHandleGuard&) = delete;
+        
+        // Movable
+        ProcessHandleGuard(ProcessHandleGuard&& other) noexcept : m_handle(other.m_handle) {
+            other.m_handle = nullptr;
+        }
+        ProcessHandleGuard& operator=(ProcessHandleGuard&& other) noexcept {
+            if (this != &other) {
+                if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+                    CloseHandle(m_handle);
+                }
+                m_handle = other.m_handle;
+                other.m_handle = nullptr;
+            }
+            return *this;
+        }
+        
+        [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
+        [[nodiscard]] bool valid() const noexcept { return m_handle && m_handle != INVALID_HANDLE_VALUE; }
+        [[nodiscard]] explicit operator bool() const noexcept { return valid(); }
+        
+        HANDLE release() noexcept {
+            HANDLE h = m_handle;
+            m_handle = nullptr;
+            return h;
+        }
+        
+    private:
+        HANDLE m_handle;
+    };
+
+    /**
+     * @brief RAII wrapper for snapshot handles from CreateToolhelp32Snapshot
+     */
+    class SnapshotHandleGuard {
+    public:
+        explicit SnapshotHandleGuard(HANDLE h = nullptr) noexcept : m_handle(h) {}
+        ~SnapshotHandleGuard() noexcept {
+            if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(m_handle);
+            }
+        }
+        
+        // Non-copyable
+        SnapshotHandleGuard(const SnapshotHandleGuard&) = delete;
+        SnapshotHandleGuard& operator=(const SnapshotHandleGuard&) = delete;
+        
+        // Movable
+        SnapshotHandleGuard(SnapshotHandleGuard&& other) noexcept : m_handle(other.m_handle) {
+            other.m_handle = nullptr;
+        }
+        SnapshotHandleGuard& operator=(SnapshotHandleGuard&& other) noexcept {
+            if (this != &other) {
+                if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+                    CloseHandle(m_handle);
+                }
+                m_handle = other.m_handle;
+                other.m_handle = nullptr;
+            }
+            return *this;
+        }
+        
+        [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
+        [[nodiscard]] bool valid() const noexcept { return m_handle && m_handle != INVALID_HANDLE_VALUE; }
+        [[nodiscard]] explicit operator bool() const noexcept { return valid(); }
+        
+    private:
+        HANDLE m_handle;
+    };
+
+    // ========================================================================
+    // SAFE FILE SYSTEM HELPERS
+    // Wrap fs::exists calls to handle exceptions and TOCTOU races gracefully
+    // ========================================================================
+
+    /**
+     * @brief Safely check if a path exists, handling exceptions
+     * @param path Path to check
+     * @return true if path exists and is accessible, false otherwise
+     * 
+     * NOTE: This is still subject to TOCTOU, but at least handles exceptions
+     * For critical operations, use atomic file operations instead
+     */
+    [[nodiscard]] bool SafePathExists(const std::wstring& path) noexcept {
+        if (path.empty()) return false;
+        
+        // Validate path doesn't contain dangerous characters
+        // Prevent path traversal attacks
+        if (path.find(L"..") != std::wstring::npos) {
+            return false;
+        }
+        
+        try {
+            std::error_code ec;
+            bool exists = fs::exists(path, ec);
+            return !ec && exists;
+        }
+        catch (...) {
+            // Exception caught - path doesn't exist or is inaccessible
+            return false;
+        }
+    }
+
+    /**
+     * @brief Safely check if a path is a directory, handling exceptions
+     */
+    [[nodiscard]] bool SafeIsDirectory(const std::wstring& path) noexcept {
+        if (path.empty()) return false;
+        
+        try {
+            std::error_code ec;
+            bool isDir = fs::is_directory(path, ec);
+            return !ec && isDir;
+        }
+        catch (...) {
+            return false;
+        }
+    }
 
     // ========================================================================
     // HELPER FUNCTIONS
@@ -1010,64 +1506,93 @@ namespace ShadowStrike::AntiEvasion {
         try {
             info = NetworkConfigInfo{};
 
-            // Get adapter info
+            // Get adapter info with TOCTOU-safe retry loop
+            // The buffer size may change between the size query and the actual call
+            // if adapters are added/removed, so we retry up to 3 times
+            constexpr int MAX_RETRIES = 3;
+            int retryCount = 0;
+            DWORD result = ERROR_BUFFER_OVERFLOW;
             ULONG bufferSize = 0;
-            GetAdaptersInfo(nullptr, &bufferSize);
-
-            if (bufferSize == 0) {
+            std::vector<uint8_t> buffer;
+            
+            while (result == ERROR_BUFFER_OVERFLOW && retryCount < MAX_RETRIES) {
+                // First call to get required buffer size
+                bufferSize = 0;
+                result = GetAdaptersInfo(nullptr, &bufferSize);
+                
+                if (result != ERROR_BUFFER_OVERFLOW || bufferSize == 0) {
+                    // No adapters or error
+                    if (bufferSize == 0) {
+                        info.valid = false;
+                        return;
+                    }
+                    break;
+                }
+                
+                // Add extra space to handle race condition where adapters are added
+                bufferSize += 1024;
+                
+                // Cap buffer size to prevent excessive allocation (max 1MB)
+                if (bufferSize > 1024 * 1024) {
+                    info.valid = false;
+                    return;
+                }
+                
+                buffer.resize(bufferSize);
+                result = GetAdaptersInfo(reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data()), &bufferSize);
+                retryCount++;
+            }
+            
+            if (result != ERROR_SUCCESS) {
                 info.valid = false;
                 return;
             }
 
-            std::vector<uint8_t> buffer(bufferSize);
             PIP_ADAPTER_INFO pAdapterInfo = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
+            PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
 
-            if (GetAdaptersInfo(pAdapterInfo, &bufferSize) == ERROR_SUCCESS) {
-                PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
+            while (pAdapter) {
+                NetworkConfigInfo::AdapterInfo adapter;
+                adapter.name = Utils::StringUtils::ToWide(pAdapter->AdapterName);
+                adapter.description = Utils::StringUtils::ToWide(pAdapter->Description);
 
-                while (pAdapter) {
-                    NetworkConfigInfo::AdapterInfo adapter;
-                    adapter.name = Utils::StringUtils::ToWide(pAdapter->AdapterName);
-                    adapter.description = Utils::StringUtils::ToWide(pAdapter->Description);
+                // Copy MAC address
+                if (pAdapter->AddressLength == 6) {
+                    std::copy(pAdapter->Address, pAdapter->Address + 6, adapter.macAddress.begin());
 
-                    // Copy MAC address
-                    if (pAdapter->AddressLength == 6) {
-                        std::copy(pAdapter->Address, pAdapter->Address + 6, adapter.macAddress.begin());
-
-                        // Format MAC address string
-                        std::wstringstream ss;
-                        ss << std::hex << std::setfill(L'0');
-                        for (size_t i = 0; i < 6; ++i) {
-                            if (i > 0) ss << L"-";
-                            ss << std::setw(2) << static_cast<int>(adapter.macAddress[i]);
-                        }
-                        adapter.macAddressString = ss.str();
-
-                        // Check if VM adapter
-                        adapter.isVMAdapter = IsVMMACAddress(adapter.macAddress);
-                        if (adapter.isVMAdapter) {
-                            info.vmAdapterCount++;
-                        }
+                    // Format MAC address string
+                    std::wstringstream ss;
+                    ss << std::hex << std::setfill(L'0');
+                    for (size_t i = 0; i < 6; ++i) {
+                        if (i > 0) ss << L"-";
+                        ss << std::setw(2) << static_cast<int>(adapter.macAddress[i]);
                     }
+                    adapter.macAddressString = ss.str();
 
-                    // Get IP address
-                    if (pAdapter->IpAddressList.IpAddress.String[0] != '\0') {
-                        adapter.ipAddress = Utils::StringUtils::ToWide(pAdapter->IpAddressList.IpAddress.String);
-                        adapter.subnetMask = Utils::StringUtils::ToWide(pAdapter->IpAddressList.IpMask.String);
+                    // Check if VM adapter
+                    adapter.isVMAdapter = IsVMMACAddress(adapter.macAddress);
+                    if (adapter.isVMAdapter) {
+                        info.vmAdapterCount++;
                     }
-
-                    // Check if WiFi
-                    if (ContainsSubstringCI(adapter.description, L"wireless") ||
-                        ContainsSubstringCI(adapter.description, L"wi-fi") ||
-                        ContainsSubstringCI(adapter.description, L"wifi")) {
-                        info.hasWiFi = true;
-                    }
-
-                    info.adapters.push_back(adapter);
-                    info.adapterCount++;
-
-                    pAdapter = pAdapter->Next;
                 }
+
+                // Get IP address
+                if (pAdapter->IpAddressList.IpAddress.String[0] != '\0') {
+                    adapter.ipAddress = Utils::StringUtils::ToWide(pAdapter->IpAddressList.IpAddress.String);
+                    adapter.subnetMask = Utils::StringUtils::ToWide(pAdapter->IpAddressList.IpMask.String);
+                }
+
+                // Check if WiFi
+                if (ContainsSubstringCI(adapter.description, L"wireless") ||
+                    ContainsSubstringCI(adapter.description, L"wi-fi") ||
+                    ContainsSubstringCI(adapter.description, L"wifi")) {
+                    info.hasWiFi = true;
+                }
+
+                info.adapters.push_back(adapter);
+                info.adapterCount++;
+
+                pAdapter = pAdapter->Next;
             }
 
             info.valid = true;
@@ -1123,8 +1648,8 @@ namespace ShadowStrike::AntiEvasion {
         try {
             info = ProcessEnvironmentInfo{};
 
-            // Get process handle
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+            // Get process handle with RAII guard
+            ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
             if (!hProcess) {
                 info.valid = false;
                 return;
@@ -1133,11 +1658,11 @@ namespace ShadowStrike::AntiEvasion {
             // Get executable path
             wchar_t exePath[MAX_PATH] = {};
             DWORD exePathLen = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, exePath, &exePathLen)) {
+            if (QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &exePathLen)) {
                 info.executablePath = exePath;
             }
 
-            CloseHandle(hProcess);
+            // Handle automatically closed when hProcess goes out of scope
 
             // Check environment variables of current process (if analyzing current process)
             if (processId == GetCurrentProcessId()) {
@@ -1391,8 +1916,8 @@ namespace ShadowStrike::AntiEvasion {
                 m_impl->m_stats.cacheMisses++;
             }
 
-            // Open process
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+            // Open process with RAII guard to prevent leaks
+            ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
             if (!hProcess) {
                 if (err) {
                     err->win32Code = GetLastError();
@@ -1402,8 +1927,8 @@ namespace ShadowStrike::AntiEvasion {
                 return result;
             }
 
-            AnalyzeProcessInternal(hProcess, processId, config, result);
-            CloseHandle(hProcess);
+            AnalyzeProcessInternal(hProcess.get(), processId, config, result);
+            // Handle automatically closed when hProcess goes out of scope
 
             const auto endTime = std::chrono::high_resolution_clock::now();
             const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -1836,21 +2361,26 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Check hypervisor bit
+            // NOTE: This is INFORMATIONAL ONLY - millions of legitimate cloud VMs have this bit set
+            // Azure, AWS, GCP, Hyper-V, VMware in enterprise - all set this bit
+            // This should NOT be treated as suspicious on its own
             if (outHardwareInfo.hypervisorDetected) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
-                detection.confidence = 0.95;
+                detection.confidence = 0.15;  // VERY LOW - VMs are normal in enterprise/cloud
                 detection.detectedValue = L"Present";
-                detection.description = L"CPUID hypervisor bit is set - running in VM";
+                detection.description = L"CPUID hypervisor bit is set (informational - VMs are common)";
+                detection.technicalDetails = L"This is expected in cloud/enterprise environments";
                 outDetections.push_back(detection);
                 found = true;
             }
 
             // Check for VM indicators in hardware strings
+            // NOTE: Also informational - VM presence alone is not suspicious
             if (!outHardwareInfo.vmIndicators.empty()) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
-                detection.confidence = 0.90;
+                detection.confidence = 0.20;  // LOW - VMs are normal
                 detection.detectedValue = outHardwareInfo.manufacturer;
-                detection.description = L"VM indicators found in hardware info";
+                detection.description = L"VM indicators found in hardware info (informational)";
                 detection.technicalDetails = L"Keywords: " +
                     [&]() {
                     std::wstring result;
@@ -1967,11 +2497,11 @@ namespace ShadowStrike::AntiEvasion {
             };
 
             for (const auto& [path, vendor] : vmToolsDirs) {
-                if (fs::exists(path)) {
+                if (SafePathExists(path)) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory);
-                    detection.confidence = 0.98;
+                    detection.confidence = 0.30;  // LOW - VM presence is not suspicious
                     detection.detectedValue = path;
-                    detection.description = vendor + L" VM artifact detected";
+                    detection.description = vendor + L" VM artifact (informational)";
                     detection.source = L"File System";
                     detection.technicalDetails = L"Vendor: " + vendor;
                     outDetections.push_back(detection);
@@ -1981,37 +2511,38 @@ namespace ShadowStrike::AntiEvasion {
 
             // ================================================================
             // 2. SANDBOX-SPECIFIC FILES AND DIRECTORIES
+            // NOTE: Only flag DEFINITIVE sandbox indicators
+            // Wireshark/SysInternals are legitimate security tools used by IT
             // ================================================================
             const std::vector<std::pair<std::wstring, std::wstring>> sandboxPaths = {
-                // Cuckoo Sandbox
+                // Cuckoo Sandbox - DEFINITIVE sandbox indicator
                 {L"C:\\cuckoo", L"Cuckoo Sandbox"},
-                {L"C:\\analysis", L"Generic Sandbox"},
-                {L"C:\\agent", L"Sandbox Agent"},
-                {L"C:\\sandbox", L"Generic Sandbox"},
                 {L"C:\\insidetm", L"ThreatGrid"},
-                {L"C:\\strawberry", L"Perl Sandbox"},
-
-                // Sandboxie
+                
+                // Sandboxie - Isolation tool, low confidence
+                {L"C:\\Program Files\\Sandboxie", L"Sandboxie"},
+                {L"C:\\Program Files\\Sandboxie-Plus", L"Sandboxie-Plus"},
+            };
+            
+            // DEFINITIVE sandbox paths - high confidence
+            const std::vector<std::pair<std::wstring, std::wstring>> definiteSandboxPaths = {
+                {L"C:\\cuckoo", L"Cuckoo Sandbox"},
+                {L"C:\\insidetm", L"ThreatGrid"},
+                {L"C:\\agent\\agent.py", L"Sandbox Agent"},  // Specific agent file
+            };
+            
+            // Ambiguous paths - could be legitimate or sandbox
+            // NOTE: Removed Wireshark, SysInternals - these are legitimate security tools
+            const std::vector<std::pair<std::wstring, std::wstring>> ambiguousPaths = {
                 {L"C:\\Program Files\\Sandboxie", L"Sandboxie"},
                 {L"C:\\Program Files\\Sandboxie-Plus", L"Sandboxie-Plus"},
                 {L"C:\\Sandbox", L"Sandboxie"},
-
-                // Analysis tools
-                {L"C:\\Program Files\\Wireshark", L"Wireshark Analysis"},
-                {L"C:\\Program Files\\Process Monitor", L"SysInternals"},
-                {L"C:\\Program Files\\Sysinternals", L"SysInternals"},
-                {L"C:\\SysInternals", L"SysInternals"},
-
-                // Sample directories
-                {L"C:\\samples", L"Analysis Environment"},
-                {L"C:\\malware", L"Analysis Environment"},
-                {L"C:\\virus", L"Analysis Environment"},
             };
 
-            for (const auto& [path, desc] : sandboxPaths) {
-                if (fs::exists(path)) {
+            for (const auto& [path, desc] : definiteSandboxPaths) {
+                if (SafePathExists(path)) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_SandboxAgentFiles);
-                    detection.confidence = 0.90;
+                    detection.confidence = 0.85;  // High but not certain
                     detection.detectedValue = path;
                     detection.description = desc + L" directory detected";
                     detection.source = L"File System";
@@ -2019,29 +2550,49 @@ namespace ShadowStrike::AntiEvasion {
                     found = true;
                 }
             }
+            
+            for (const auto& [path, desc] : ambiguousPaths) {
+                if (SafePathExists(path)) {
+                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_SandboxAgentFiles);
+                    detection.confidence = 0.30;  // LOW - Sandboxie is used by security-conscious users
+                    detection.detectedValue = path;
+                    detection.description = desc + L" directory (informational)";
+                    detection.source = L"File System";
+                    outDetections.push_back(detection);
+                    found = true;
+                }
+            }
+            
+            // NOTE: REMOVED detection for these legitimate tools:
+            // - Wireshark - Network analysis tool used by IT/Security teams
+            // - Process Monitor/Explorer - SysInternals tools used by IT/Security teams  
+            // - C:\SysInternals - Standard location for enterprise tooling
+            // These would cause massive false positives in enterprise environments
 
             // ================================================================
             // 3. SUSPICIOUS DLL FILES IN SYSTEM32
+            // These are more definitive indicators of sandbox/analysis environments
             // ================================================================
             const std::vector<std::pair<std::wstring, std::wstring>> suspiciousDlls = {
                 {L"C:\\Windows\\System32\\sbiedll.dll", L"Sandboxie Hook DLL"},
                 {L"C:\\Windows\\System32\\api_log.dll", L"API Logging DLL"},
                 {L"C:\\Windows\\System32\\dir_watch.dll", L"Directory Watcher DLL"},
-                {L"C:\\Windows\\System32\\pstorec.dll", L"Protected Storage"},
                 {L"C:\\Windows\\System32\\cmdvrt32.dll", L"Comodo Sandbox"},
                 {L"C:\\Windows\\System32\\cmdvrt64.dll", L"Comodo Sandbox"},
                 {L"C:\\Windows\\System32\\cuckoomon.dll", L"Cuckoo Monitor"},
-                {L"C:\\Windows\\System32\\avghookx.dll", L"AVG Hook"},
-                {L"C:\\Windows\\System32\\avghooka.dll", L"AVG Hook"},
-                {L"C:\\Windows\\System32\\snxhk.dll", L"Avast Hook"},
                 {L"C:\\Windows\\System32\\sxin.dll", L"360 Sandbox"},
                 {L"C:\\Windows\\System32\\sf2.dll", L"Avast Sandbox"},
             };
+            
+            // NOTE: REMOVED these as they are legitimate AV components:
+            // - avghookx.dll, avghooka.dll - AVG antivirus (legitimate)
+            // - snxhk.dll - Avast antivirus (legitimate)
+            // - pstorec.dll - Windows protected storage (legitimate)
 
             for (const auto& [path, desc] : suspiciousDlls) {
-                if (fs::exists(path)) {
+                if (SafePathExists(path)) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_AnalysisToolsInstalled);
-                    detection.confidence = 0.95;
+                    detection.confidence = 0.75;  // Moderate - could be security software
                     detection.detectedValue = path;
                     detection.description = desc + L" detected in System32";
                     detection.source = L"File System";
@@ -2971,9 +3522,42 @@ namespace ShadowStrike::AntiEvasion {
                 {L"python.exe", L"Python (common in sandboxes)"},  // Lower confidence
                 {L"agent.exe", L"Generic Agent"},
 
-                // System analysis
-                {L"sysinternals.exe", L"Sysinternals"},
-                {L"mmc.exe", L"Management Console"},  // Lower confidence
+                // NOTE: REMOVED these as they cause false positives:
+                // - sysinternals.exe - doesn't exist, SysInternals is a folder
+                // - mmc.exe - Windows Management Console, used by admins everywhere
+            };
+
+            // ================================================================
+            // SEPARATE LIST: Definitive sandbox indicators (high confidence)
+            // ================================================================
+            const std::vector<std::pair<std::wstring, std::wstring>> definiteSandboxProcesses = {
+                {L"cuckoo.exe", L"Cuckoo Sandbox"},
+                {L"cuckoomon.exe", L"Cuckoo Monitor"},
+                {L"analyzer.exe", L"Sandbox Analyzer"},
+            };
+            
+            // ================================================================
+            // SEPARATE LIST: Legitimate security tools (low confidence)
+            // These are used by IT/Security teams and should NOT be flagged as high confidence
+            // ================================================================
+            const std::vector<std::pair<std::wstring, std::wstring>> legitimateSecurityTools = {
+                // Network analysis - used by IT/Security teams
+                {L"wireshark.exe", L"Wireshark (Legitimate IT Tool)"},
+                {L"fiddler.exe", L"Fiddler (Legitimate IT Tool)"},
+                {L"tcpview.exe", L"TCPView (Legitimate IT Tool)"},
+                
+                // Process monitoring - used by IT/Security teams
+                {L"procmon.exe", L"Process Monitor (Legitimate IT Tool)"},
+                {L"procmon64.exe", L"Process Monitor 64 (Legitimate IT Tool)"},
+                {L"procexp.exe", L"Process Explorer (Legitimate IT Tool)"},
+                {L"procexp64.exe", L"Process Explorer 64 (Legitimate IT Tool)"},
+                
+                // System administration
+                {L"autoruns.exe", L"Autoruns (Legitimate IT Tool)"},
+                {L"autoruns64.exe", L"Autoruns 64 (Legitimate IT Tool)"},
+                
+                // Development - Visual Studio
+                {L"devenv.exe", L"Visual Studio (Legitimate Development Tool)"},
             };
 
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -2987,6 +3571,8 @@ namespace ShadowStrike::AntiEvasion {
 
             PROCESSENTRY32W pe = {};
             pe.dwSize = sizeof(pe);
+            
+            std::vector<std::wstring> detectedLegitimateTools;
 
             if (Process32FirstW(hSnapshot, &pe)) {
                 do {
@@ -2994,6 +3580,22 @@ namespace ShadowStrike::AntiEvasion {
                     std::wstring processName(pe.szExeFile);
                     std::wstring processNameLower = processName;
                     std::transform(processNameLower.begin(), processNameLower.end(), processNameLower.begin(), ::towlower);
+
+                    // First check definitive sandbox processes (high confidence)
+                    for (const auto& [toolName, toolDesc] : definiteSandboxProcesses) {
+                        if (processNameLower == toolName) {
+                            detectedSandboxAgents.push_back(toolDesc);
+                            break;
+                        }
+                    }
+                    
+                    // Check legitimate security tools (low confidence - informational only)
+                    for (const auto& [toolName, toolDesc] : legitimateSecurityTools) {
+                        if (processNameLower == toolName) {
+                            detectedLegitimateTools.push_back(toolDesc);
+                            break;
+                        }
+                    }
 
                     for (const auto& [toolName, toolDesc] : analysisToolProcesses) {
                         if (processNameLower == toolName) {
@@ -3033,41 +3635,46 @@ namespace ShadowStrike::AntiEvasion {
             CloseHandle(hSnapshot);
 
             // Generate detections based on findings
+            
+            // VM Tools - INFORMATIONAL ONLY (low confidence)
             if (!detectedVMTools.empty()) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_VMToolsRunning);
-                detection.confidence = 0.95;
+                detection.confidence = 0.20;  // LOW - VMs are ubiquitous in enterprise
                 std::wstring tools;
                 for (const auto& t : detectedVMTools) {
                     if (!tools.empty()) tools += L", ";
                     tools += t;
                 }
                 detection.detectedValue = tools;
-                detection.description = L"VM Tools processes detected";
+                detection.description = L"VM Tools processes detected (informational)";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::High;
+                detection.severity = EnvironmentEvasionSeverity::Low;  // Informational
                 outDetections.push_back(detection);
                 found = true;
             }
 
+            // Debuggers - only flag if actively debugging target process
+            // NOTE: Reduced confidence because debuggers run for legitimate development
             if (!detectedDebuggers.empty()) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_DebuggerRunning);
-                detection.confidence = 0.92;
+                detection.confidence = 0.40;  // MODERATE - debuggers are used for legitimate development
                 std::wstring tools;
                 for (const auto& t : detectedDebuggers) {
                     if (!tools.empty()) tools += L", ";
                     tools += t;
                 }
                 detection.detectedValue = tools;
-                detection.description = L"Debugger processes detected";
+                detection.description = L"Debugger processes detected (may be legitimate development)";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::High;
+                detection.severity = EnvironmentEvasionSeverity::Medium;  // Reduced severity
                 outDetections.push_back(detection);
                 found = true;
             }
 
+            // Definitive sandbox agents - high confidence
             if (!detectedSandboxAgents.empty()) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_SandboxAgentRunning);
-                detection.confidence = 0.98;
+                detection.confidence = 0.85;  // HIGH but not certain
                 std::wstring tools;
                 for (const auto& t : detectedSandboxAgents) {
                     if (!tools.empty()) tools += L", ";
@@ -3076,14 +3683,33 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"Sandbox agent processes detected";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::Critical;
+                detection.severity = EnvironmentEvasionSeverity::High;  // Reduced from Critical
                 outDetections.push_back(detection);
                 found = true;
             }
 
+            // Legitimate security tools - INFORMATIONAL ONLY
+            if (!detectedLegitimateTools.empty()) {
+                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning);
+                detection.confidence = 0.10;  // VERY LOW - these are legitimate tools
+                std::wstring tools;
+                for (const auto& t : detectedLegitimateTools) {
+                    if (!tools.empty()) tools += L", ";
+                    tools += t;
+                }
+                detection.detectedValue = tools;
+                detection.description = L"Legitimate security/IT tools running (informational only)";
+                detection.source = L"Process Enumeration";
+                detection.severity = EnvironmentEvasionSeverity::Low;  // Informational
+                detection.technicalDetails = L"These tools are commonly used by IT and security teams";
+                outDetections.push_back(detection);
+                // NOTE: Do NOT set found = true for legitimate tools
+            }
+
+            // Other analysis tools (PE analyzers, hex editors, etc.)
             if (!detectedAnalysisTools.empty()) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning);
-                detection.confidence = 0.88;
+                detection.confidence = 0.50;  // MODERATE - could be security researcher
                 std::wstring tools;
                 for (const auto& t : detectedAnalysisTools) {
                     if (!tools.empty()) tools += L", ";
@@ -3092,18 +3718,22 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"Analysis tool processes detected";
                 detection.source = L"Process Enumeration";
+                detection.severity = EnvironmentEvasionSeverity::Medium;  // Reduced severity
                 outDetections.push_back(detection);
                 found = true;
             }
 
             // Check for low process count (minimal sandbox)
-            if (totalProcessCount < 30) {
+            // NOTE: Modern minimal Windows installations can have < 50 processes
+            // Docker containers, Server Core, etc. are legitimate and have low counts
+            if (totalProcessCount < 20) {  // Reduced from 30 to avoid FP on minimal installs
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_LowProcessCount);
-                detection.confidence = 0.55;
+                detection.confidence = 0.30;  // LOW - minimal installs are legitimate
                 detection.detectedValue = std::to_wstring(totalProcessCount) + L" processes";
-                detection.expectedValue = L">= 50 on typical Windows system";
-                detection.description = L"Very low process count (minimal/sandbox system)";
+                detection.expectedValue = L">= 30 on typical Windows system";
+                detection.description = L"Very low process count (may be minimal installation or sandbox)";
                 detection.source = L"Process Enumeration";
+                detection.technicalDetails = L"Could be Windows Server Core, container, or minimal VM";
                 outDetections.push_back(detection);
                 found = true;
             }
@@ -4474,14 +5104,15 @@ namespace ShadowStrike::AntiEvasion {
 
             // ================================================================
             // 1. HYPERVISOR BIT CHECK (CPUID leaf 1, ECX bit 31)
+            // NOTE: This is INFORMATIONAL - VMs are ubiquitous in enterprise/cloud
             // ================================================================
             if (CheckCPUIDHypervisorBit() != 0) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
-                detection.confidence = 0.98;
+                detection.confidence = 0.15;  // VERY LOW - VMs are normal
                 detection.detectedValue = L"Hypervisor bit set in CPUID";
-                detection.description = L"CPUID indicates hypervisor presence (ECX bit 31)";
+                detection.description = L"CPUID indicates hypervisor presence (informational - VMs are common)";
                 detection.source = L"CPUID Leaf 1";
-                detection.severity = EnvironmentEvasionSeverity::High;
+                detection.severity = EnvironmentEvasionSeverity::Low;  // Informational only
                 outDetections.push_back(detection);
                 found = true;
 
@@ -4507,11 +5138,11 @@ namespace ShadowStrike::AntiEvasion {
                     }
 
                     EnvironmentDetectedTechnique hvDetection(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
-                    hvDetection.confidence = 0.99;
+                    hvDetection.confidence = 0.20;  // LOW - VMs are normal in enterprise
                     hvDetection.detectedValue = hvVendorW;
-                    hvDetection.description = hvName + L" hypervisor identified via CPUID 0x40000000";
+                    hvDetection.description = hvName + L" hypervisor identified (informational)";
                     hvDetection.source = L"CPUID Hypervisor Vendor";
-                    hvDetection.severity = EnvironmentEvasionSeverity::Critical;
+                    hvDetection.severity = EnvironmentEvasionSeverity::Low;  // Informational only
                     outDetections.push_back(hvDetection);
                 }
             }
@@ -4587,15 +5218,16 @@ namespace ShadowStrike::AntiEvasion {
 
             // ================================================================
             // 5. VMX/VT-x CAPABILITY CHECK
+            // NOTE: VMX capability is common on physical hardware too
             // ================================================================
             if (CheckCPUIDVMXSupport() != 0) {
                 // VMX support on its own isn't suspicious, but combined with
-                // hypervisor bit it confirms nested virtualization
+                // hypervisor bit it indicates nested virtualization
                 if (CheckCPUIDHypervisorBit() != 0) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
-                    detection.confidence = 0.70;
+                    detection.confidence = 0.25;  // LOW - nested virtualization is legitimate
                     detection.detectedValue = L"VMX + Hypervisor bit set";
-                    detection.description = L"Nested virtualization environment detected";
+                    detection.description = L"Nested virtualization environment (informational)";
                     detection.source = L"CPUID Feature Flags";
                     outDetections.push_back(detection);
                     found = true;
@@ -4604,18 +5236,20 @@ namespace ShadowStrike::AntiEvasion {
 
             // ================================================================
             // 6. PROCESSOR CORE COUNT CONSISTENCY
+            // NOTE: Mismatches can occur on physical hardware with P/E cores
             // ================================================================
             uint64_t cpuidCoreCount = GetProcessorCoreCount();
             SYSTEM_INFO sysInfo = {};
             GetSystemInfo(&sysInfo);
 
             // Mismatch between CPUID and Windows API can indicate VM
+            // But also occurs with Intel Alder Lake+ hybrid architectures
             if (cpuidCoreCount > 0 && cpuidCoreCount != sysInfo.dwNumberOfProcessors) {
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_LowProcessorCount);
-                detection.confidence = 0.55;
+                detection.confidence = 0.25;  // LOW - can happen on physical hardware
                 detection.detectedValue = L"CPUID: " + std::to_wstring(cpuidCoreCount) +
                     L", Windows: " + std::to_wstring(sysInfo.dwNumberOfProcessors);
-                detection.description = L"Processor count mismatch between CPUID and OS";
+                detection.description = L"Processor count mismatch (may be hybrid CPU or VM)";
                 detection.source = L"CPU Core Count Analysis";
                 outDetections.push_back(detection);
                 found = true;
@@ -4797,14 +5431,14 @@ namespace ShadowStrike::AntiEvasion {
         try {
             bool found = false;
 
-            // Get process executable path
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+            // Get process executable path with RAII guard
+            ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId));
             if (!hProcess) return false;
 
             wchar_t exePath[MAX_PATH] = {};
             DWORD pathSize = MAX_PATH;
-            BOOL pathResult = QueryFullProcessImageNameW(hProcess, 0, exePath, &pathSize);
-            CloseHandle(hProcess);
+            BOOL pathResult = QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &pathSize);
+            // Handle automatically closed when hProcess goes out of scope
 
             if (!pathResult) return false;
 

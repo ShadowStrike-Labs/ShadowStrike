@@ -163,6 +163,10 @@ namespace ShadowStrike {
             // ========================================================================
             // EVASION THRESHOLDS
             // ========================================================================
+            // HARDWARE THRESHOLDS (CONSERVATIVE - avoid false positives on cloud VMs)
+            // NOTE: Modern cloud infrastructure commonly uses 1 CPU, 512MB RAM instances
+            // These thresholds are INFORMATIONAL ONLY - do NOT flag as high confidence
+            // ========================================================================
 
             /// @brief Minimum uptime considered suspicious (5 minutes)
             inline constexpr uint64_t MIN_SUSPICIOUS_UPTIME_MS = 5 * 60 * 1000;
@@ -171,19 +175,23 @@ namespace ShadowStrike {
             inline constexpr uint64_t MAX_FRESH_BOOT_UPTIME_MS = 30 * 60 * 1000;
 
             /// @brief Minimum processor count for non-suspicious system
-            inline constexpr uint32_t MIN_NORMAL_PROCESSOR_COUNT = 2;
+            /// NOTE: Many legitimate cloud VMs have 1 CPU - this is INFORMATIONAL ONLY
+            inline constexpr uint32_t MIN_NORMAL_PROCESSOR_COUNT = 1;
 
-            /// @brief Minimum RAM size considered normal (2 GB)
-            inline constexpr uint64_t MIN_NORMAL_RAM_BYTES = 2ULL * 1024 * 1024 * 1024;
+            /// @brief Minimum RAM size considered normal (512 MB - cloud micro instances)
+            /// NOTE: AWS t2.nano has 512MB, this is legitimate - INFORMATIONAL ONLY
+            inline constexpr uint64_t MIN_NORMAL_RAM_BYTES = 512ULL * 1024 * 1024;
 
-            /// @brief Minimum disk size considered normal (40 GB)
-            inline constexpr uint64_t MIN_NORMAL_DISK_BYTES = 40ULL * 1024 * 1024 * 1024;
+            /// @brief Minimum disk size considered normal (8 GB - container/minimal VMs)
+            /// NOTE: Many legitimate containers/VMs use 8-10GB - INFORMATIONAL ONLY
+            inline constexpr uint64_t MIN_NORMAL_DISK_BYTES = 8ULL * 1024 * 1024 * 1024;
 
-            /// @brief Minimum screen resolution width
-            inline constexpr uint32_t MIN_NORMAL_SCREEN_WIDTH = 800;
+            /// @brief Minimum screen resolution width (0 = headless server is OK)
+            /// NOTE: Headless servers have 0x0 resolution - this is legitimate
+            inline constexpr uint32_t MIN_NORMAL_SCREEN_WIDTH = 0;
 
-            /// @brief Minimum screen resolution height
-            inline constexpr uint32_t MIN_NORMAL_SCREEN_HEIGHT = 600;
+            /// @brief Minimum screen resolution height (0 = headless server is OK)
+            inline constexpr uint32_t MIN_NORMAL_SCREEN_HEIGHT = 0;
 
             /// @brief Minimum number of recent documents for "lived-in" system
             inline constexpr size_t MIN_RECENT_DOCUMENTS = 5;
@@ -233,59 +241,61 @@ namespace ShadowStrike {
 
             // ========================================================================
             // BLACKLISTED NAMES (commonly used in sandboxes/analysis)
+            // NOTE: These must be SPECIFIC sandbox names, NOT generic enterprise names
+            // Avoid names like "admin", "user", "server", "azure" - too many false positives
             // ========================================================================
 
             /// @brief Known sandbox/analysis usernames
-            inline constexpr std::array<std::wstring_view, 70> BLACKLISTED_USERNAMES = { {
-                    // Generic analysis names
-                    L"admin", L"administrator", L"user", L"test", L"sandbox",
-                    L"malware", L"virus", L"sample", L"analysis", L"analyzer",
-                    L"analyst", L"honey", L"honeypot", L"currentuser", L"vmware",
-                    L"virtual", L"guest", L"john", L"johndoe", L"jane",
-
-                    // Vendor-specific sandbox names
+            /// IMPORTANT: Only include names that are DEFINITIVE sandbox indicators
+            /// Generic names like "admin", "user", "john" cause massive false positives
+            inline constexpr std::array<std::wstring_view, 45> BLACKLISTED_USERNAMES = { {
+                    // Definitive sandbox/analysis names (high confidence)
                     L"cuckoo", L"cuckoosandbox", L"cape", L"any.run", L"anyrun",
-                    L"triage", L"hybrid", L"vxstream", L"falcon", L"crowdstrike",
-                    L"wilbert", L"harley", L"abby", L"peter wilson", L"hwiteman",
-                    L"user-pc", L"john doe", L"hal9th", L"habib", L"hong lee",
-                    L"timmy", L"emily", L"eric johns", L"jerry", L"johnson",
-                    L"miller", L"mueller", L"phil", L"walker", L"fred",
-
-                    // Security researcher names
-                    L"malwareresearcher", L"researcher", L"debug", L"debugger",
-                    L"reverse", L"reverser", L"analysis", L"lab", L"labuser",
-                    L"vbox", L"virtualbox", L"qemu", L"parallels", L"hyperv",
-
-                    // Automated systems
-                    L"system", L"defaultuser", L"defaultaccount", L"wdagutilityaccount"
+                    L"triage", L"vxstream", L"sandboxuser", L"malwareuser",
+                    L"virususer", L"analysisuser", L"sampleuser",
+                    
+                    // Known sandbox-specific usernames (vendor-specific)
+                    L"wilbert", L"harley", L"abby", L"hal9th", L"hwiteman",
+                    L"emily", L"timmy", L"phil", L"walker", L"miller",
+                    L"mueller", L"johnson", L"hong lee", L"habib",
+                    L"peter wilson", L"eric johns", L"jerry",
+                    
+                    // Security research environments (definitive)
+                    L"malwareresearcher", L"reverseengineer", L"virusanalyst",
+                    L"labuser", L"debuguser", L"sandboxadmin",
+                    
+                    // Virtualization-specific (only if combined with other indicators)
+                    L"vboxuser", L"vmwareuser", L"qemuuser", L"parallelsuser",
+                    
+                    // Windows special accounts that indicate automation
+                    L"wdagutilityaccount", L"defaultuser0", L"defaultaccount"
                 } };
 
             /// @brief Known sandbox/analysis computer names
-            inline constexpr std::array<std::wstring_view, 70> BLACKLISTED_COMPUTER_NAMES = { {
-                    // Generic analysis names
-                    L"sandbox", L"malware", L"virus", L"sample", L"analysis",
-                    L"test", L"testpc", L"testmachine", L"virtual", L"vm",
-                    L"vmware", L"virtualbox", L"vbox", L"qemu", L"xen",
-
-                    // Vendor sandbox names
-                    L"cuckoo", L"cape", L"anyrun", L"hybrid-analysis", L"vxstream",
-                    L"threatgrid", L"joe-sandbox", L"joesandbox", L"joebox",
-                    L"sandcastle", L"deepguard", L"bitdefender", L"kaspersky",
-                    L"fireye", L"fireeye", L"lastline", L"intezer", L"unpac.me",
-
-                    // Common VM names
-                    L"win-sandbox", L"windows-sandbox", L"desktop-", L"pc-",
-                    L"workstation", L"server", L"dc", L"domaincontroller",
-                    L"tequilaboomboom", L"klone_x64-pc", L"computer", L"comp",
-
-                    // Specific sandbox patterns
-                    L"hal9th", L"johnson-pc", L"miller-pc", L"phil-pc",
-                    L"win7-pc", L"win10-pc", L"win11-pc", L"win7-analysis",
-                    L"analysis-vm", L"malware-vm", L"sandbox-vm", L"test-vm",
-
-                    // Automated systems
-                    L"azure", L"aws", L"gcp", L"cloud", L"instance",
-                    L"default", L"template", L"base", L"master", L"golden"
+            /// IMPORTANT: Only include names that are DEFINITIVE sandbox indicators
+            /// Generic names like "server", "workstation", "azure" cause massive false positives
+            inline constexpr std::array<std::wstring_view, 40> BLACKLISTED_COMPUTER_NAMES = { {
+                    // Definitive sandbox names (high confidence)
+                    L"cuckoo", L"cape-sandbox", L"anyrun-vm", L"hybrid-analysis",
+                    L"vxstream-sandbox", L"threatgrid-vm", L"joe-sandbox",
+                    L"joesandbox", L"joebox", L"sandcastle-vm",
+                    
+                    // Vendor-specific sandbox patterns
+                    L"deepguard-vm", L"lastline-analysis", L"intezer-vm",
+                    L"fireye-sandbox", L"fireeye-ax", L"bitdefender-lab",
+                    L"kaspersky-lab", L"unpacme-sandbox",
+                    
+                    // Known honeypot/deception patterns
+                    L"tequilaboomboom", L"klone_x64-pc", L"hal9th-pc",
+                    L"johnson-pc", L"miller-pc", L"phil-pc",
+                    
+                    // Analysis environment patterns
+                    L"malware-vm", L"sandbox-vm", L"analysis-vm", L"virus-vm",
+                    L"sample-vm", L"test-sandbox", L"win-sandbox-analysis",
+                    
+                    // Specific known patterns (definitive)
+                    L"win7-analysis", L"win10-sandbox", L"malware-analysis-pc",
+                    L"reverse-engineering-vm", L"debug-vm"
                 } };
 
             /// @brief Known sandbox MAC address prefixes (OUI)

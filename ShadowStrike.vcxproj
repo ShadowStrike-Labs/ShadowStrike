@@ -47,6 +47,8 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
+    <!-- Enable MASM assembler support -->
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
   </ImportGroup>
   <ImportGroup Label="Shared">
   </ImportGroup>
@@ -750,11 +752,16 @@
     <ClInclude Include="src\whitelist\WhiteListStore.hpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="src\AntiEvasion\EnvironmentEvasionDetector.asm" />
-    <None Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm" />
-    <None Include="src\AntiEvasion\VMEvasionDetector_x64.asm" />
+    <!-- x64 Assembly files - compiled with ml64.exe -->
+    <MASM Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </MASM>
+    <MASM Include="src\AntiEvasion\VMEvasionDetector_x64.asm">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </MASM>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
   </ImportGroup>
 </Project>

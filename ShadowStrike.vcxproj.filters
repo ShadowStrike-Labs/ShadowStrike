@@ -1672,14 +1672,11 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <None Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
+    <MASM Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\AntiEvasion\VMEvasionDetector_x64.asm">
+    </MASM>
+    <MASM Include="src\AntiEvasion\VMEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
-    </None>
-    <None Include="src\AntiEvasion\EnvironmentEvasionDetector.asm">
-      <Filter>Source Files</Filter>
-    </None>
+    </MASM>
   </ItemGroup>
 </Project>

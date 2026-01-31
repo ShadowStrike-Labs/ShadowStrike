@@ -219,18 +219,20 @@ namespace DataDirectory {
 // Relocation Types
 // ============================================================================
 
+// NOTE: Windows SDK wingdi.h defines ABSOLUTE, HIGH, LOW as macros.
+// We use RELOC_ prefix to avoid conflicts.
 namespace RelocationType {
-    inline constexpr uint16_t ABSOLUTE       = 0;
-    inline constexpr uint16_t HIGH           = 1;
-    inline constexpr uint16_t LOW            = 2;
-    inline constexpr uint16_t HIGHLOW        = 3;
-    inline constexpr uint16_t HIGHADJ        = 4;
-    inline constexpr uint16_t MACHINE_SPECIFIC_5 = 5;
-    inline constexpr uint16_t RESERVED       = 6;
-    inline constexpr uint16_t MACHINE_SPECIFIC_7 = 7;
-    inline constexpr uint16_t MACHINE_SPECIFIC_8 = 8;
-    inline constexpr uint16_t MACHINE_SPECIFIC_9 = 9;
-    inline constexpr uint16_t DIR64          = 10;  // x64
+    inline constexpr uint16_t RELOC_ABSOLUTE       = 0;
+    inline constexpr uint16_t RELOC_HIGH           = 1;
+    inline constexpr uint16_t RELOC_LOW            = 2;
+    inline constexpr uint16_t RELOC_HIGHLOW        = 3;
+    inline constexpr uint16_t RELOC_HIGHADJ        = 4;
+    inline constexpr uint16_t RELOC_MACHINE_SPECIFIC_5 = 5;
+    inline constexpr uint16_t RELOC_RESERVED       = 6;
+    inline constexpr uint16_t RELOC_MACHINE_SPECIFIC_7 = 7;
+    inline constexpr uint16_t RELOC_MACHINE_SPECIFIC_8 = 8;
+    inline constexpr uint16_t RELOC_MACHINE_SPECIFIC_9 = 9;
+    inline constexpr uint16_t RELOC_DIR64          = 10;  // x64
 } // namespace RelocationType
 
 // ============================================================================

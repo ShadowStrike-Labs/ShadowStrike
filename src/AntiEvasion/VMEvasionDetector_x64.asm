@@ -34,6 +34,39 @@
 ; - Callee-saved: RBX, RBP, RDI, RSI, RSP, R12-R15
 ; ==============================================================================
 
+; ==============================================================================
+; PUBLIC SYMBOL EXPORTS
+; 
+; These PUBLIC declarations are REQUIRED for the linker to find these functions.
+; Without PUBLIC, MASM treats procedures as internal-only symbols.
+; ==============================================================================
+
+; CPUID-based detection
+PUBLIC CheckCPUIDHypervisorBit
+PUBLIC GetCPUIDVendorString
+PUBLIC GetExtendedCPUIDInfo
+PUBLIC CheckCPUIDLeafRange
+
+; Timing-based detection
+PUBLIC MeasureRDTSCTimingDelta
+PUBLIC MeasureRDTSCPTiming
+PUBLIC MeasureCPUIDTiming
+PUBLIC MeasureInstructionTiming
+
+; Descriptor table analysis
+PUBLIC GetIDTBase
+PUBLIC GetGDTBase
+PUBLIC GetLDTSelector
+PUBLIC GetTRSelector
+PUBLIC GetIDTAndGDTInfo
+PUBLIC CheckSegmentLimits
+
+; VM-specific backdoor detection
+PUBLIC CheckVMwareBackdoor
+PUBLIC CheckHyperVBackdoor
+PUBLIC DetectVMCALL
+PUBLIC DetectVMMCALL
+
 .CODE
 
 ; ==============================================================================

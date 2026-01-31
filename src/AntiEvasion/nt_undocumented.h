@@ -20,7 +20,7 @@ typedef struct _KUSER_SHARED_DATA {
     volatile KSYSTEM_TIME         SystemTime;
     volatile KSYSTEM_TIME         TimeZoneOffset;
 
-}KUSER_SHARED_DATA, *KUSER_SHARED_DATA;
+} KUSER_SHARED_DATA, *PKUSER_SHARED_DATA;
 
 
 

@@ -1245,12 +1245,12 @@ namespace ShadowStrike::AntiEvasion {
                     break;
                     
                 case StubState::ExpectJneOrSyscall:
-                    // After test, expect: jne (to int 2e path) OR syscall
+                    // After test, expect: jne/jnz (to int 2e path) OR syscall
+                    // NOTE: JNE and JNZ are the same opcode. Zydis uses ZYDIS_MNEMONIC_JNZ for both.
                     if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
                         state = StubState::FoundSyscall;
                     }
-                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JNE ||
-                        instr.mnemonic == ZYDIS_MNEMONIC_JNZ) {
+                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JNZ) {
                         // Valid - conditional jump to int 2e fallback
                         state = StubState::ExpectSyscall;
                     }
@@ -2851,7 +2851,7 @@ namespace ShadowStrike::AntiEvasion {
             // Windows PE spec: max 96 sections, but be paranoid
             const WORD numberOfSections = ntHeaders->FileHeader.NumberOfSections;
             if (numberOfSections > 96) {
-                SS_LOG_WARNING(LOG_CATEGORY, L"Suspicious number of sections: {}", numberOfSections);
+                SS_LOG_WARN(LOG_CATEGORY, L"Suspicious number of sections: {}", numberOfSections);
                 return;
             }
             
