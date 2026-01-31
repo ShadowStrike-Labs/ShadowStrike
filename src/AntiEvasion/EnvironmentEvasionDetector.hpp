@@ -2764,6 +2764,45 @@ namespace ShadowStrike {
             [[nodiscard]] size_t GetCacheSize() const noexcept;
 
             // ========================================================================
+           // ADVANCED FEATURES
+           // ========================================================================
+            /**
+             * @brief Check advanced CPUID indicators
+             * @param outDetections Output detections
+             * @param err Optional error output
+             * @return true if advanced CPUID anomalies found
+             */
+            [[nodiscard]] bool CheckAdvancedCPUIDIndicators(
+                std::vector<EnvironmentDetectedTechnique>& outDetections,
+                EnvironmentError* err
+            ) noexcept;
+
+            /**
+             * @brief Check API hooking indicators
+             * @param outDetections Output detections
+             * @param err Optional error output
+             * @return true if API hooking detected
+             */
+            [[nodiscard]] bool CheckAPIHookingIndicators(
+                std::vector<EnvironmentDetectedTechnique>& outDetections,
+                EnvironmentError* err
+            ) noexcept;
+
+			/**
+             * @brief Analyze process PE structure for evasion indicators
+             * @param processId Process ID
+             * @param outDetections Output detections
+             * @param err Optional error output
+             * @return true if PE evasion indicators found
+             */
+            [[nodiscard]] bool AnalyzeProcessPeForEvasion(
+                uint32_t processId,
+                std::vector<EnvironmentDetectedTechnique>& outDetections,
+                EnvironmentError* err
+            ) noexcept;
+
+
+            // ========================================================================
             // CONFIGURATION
             // ========================================================================
 

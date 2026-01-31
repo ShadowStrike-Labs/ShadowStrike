@@ -4789,7 +4789,7 @@ namespace ShadowStrike::AntiEvasion {
     // Uses PEParser to analyze executable for sandbox detection code
     // ========================================================================
 
-    bool EnvironmentEvasionDetector::AnalyzeProcessPEForEvasion(
+    bool EnvironmentEvasionDetector::AnalyzeProcessPeForEvasion(
         uint32_t processId,
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
@@ -4810,13 +4810,20 @@ namespace ShadowStrike::AntiEvasion {
 
             // Parse the PE file
             PEParser::PEParser parser;
-            PEParser::ParseError parseErr;
-            if (!parser.Parse(exePath, &parseErr)) {
+            PEParser::PEError parseErr;
+            PEParser::PEInfo pe_info;
+            if (!parser.ParseFile(exePath,pe_info ,&parseErr)) {
+				SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeProcessPeForEvasion: Failed to parse PE file");
                 return false;
             }
 
-            const auto& peInfo = parser.GetPEInfo();
-            if (!peInfo) return false;
+            if (!pe_info.valid) return false;
+
+            std::vector<PEParser::ImportInfo> imports;
+			if (!parser.ParseImports(imports, &parseErr)) {
+				SS_LOG_ERROR(L"EnvironmentEvasionDetector", L"AnalyzeProcessPeForEvasion: Failed to parse imports");
+                return false;
+            }
 
             // ================================================================
             // 1. CHECK IMPORTS FOR EVASION-RELATED APIS
@@ -4848,7 +4855,7 @@ namespace ShadowStrike::AntiEvasion {
                 {L"SetUnhandledExceptionFilter", L"Exception handling manipulation"},
             };
 
-            for (const auto& import : peInfo->imports) {
+            for (const auto& import : imports) {
                 for (const auto& func : import.functions) {
                     std::wstring funcName = Utils::StringUtils::ToWide(func.name);
 
@@ -4891,7 +4898,7 @@ namespace ShadowStrike::AntiEvasion {
                 {L".nsp", L"NSPack packer"},
             };
 
-            for (const auto& section : peInfo->sections) {
+            for (const auto& section : pe_info.sections) {
                 std::wstring sectionName = Utils::StringUtils::ToWide(section.name);
                 std::transform(sectionName.begin(), sectionName.end(), sectionName.begin(), ::towlower);
 
@@ -4913,7 +4920,7 @@ namespace ShadowStrike::AntiEvasion {
             // ================================================================
             // 3. CHECK ENTROPY FOR PACKED/ENCRYPTED SECTIONS
             // ================================================================
-            for (const auto& section : peInfo->sections) {
+            for (const auto& section : pe_info.sections) {
                 // High entropy (> 7.0) suggests encryption/packing
                 if (section.entropy > 7.0 && section.virtualSize > 1024) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::ADVANCED_EncryptedCheck);

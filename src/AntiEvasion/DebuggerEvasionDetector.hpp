@@ -96,7 +96,9 @@
 #  include <Windows.h>
 #  include <winternl.h>
 #  include <TlHelp32.h>
+#  include <Psapi.h>
 #  pragma comment(lib, "ntdll.lib")
+#  pragma comment(lib, "psapi.lib")
 #endif
 
 // Undefine conflicting macros if previously defined
@@ -116,6 +118,10 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/MemoryUtils.hpp"
+
+// Forward declaration for Zydis decoder
+struct ZydisDecoder_;
+typedef struct ZydisDecoder_ ZydisDecoder;
 
 // Forward declarations to avoid circular dependencies
 namespace ShadowStrike::SignatureStore {
@@ -1954,6 +1960,65 @@ namespace ShadowStrike {
             void AnalyzeTimingPatterns(
                 HANDLE hProcess,
                 uint32_t processId,
+                DebuggerEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Scan code buffer for timing-related CPU instructions
+             */
+            void ScanCodeForTimingInstructions(
+                const ZydisDecoder* decoder,
+                const uint8_t* code,
+                size_t size,
+                uintptr_t baseAddress,
+                DebuggerEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Scan executable section for timing patterns with context analysis
+             */
+            void ScanCodeForTimingPatterns(
+                const ZydisDecoder* decoder,
+                const uint8_t* code,
+                size_t size,
+                uintptr_t baseAddress,
+                const BYTE sectionName[8],
+                DebuggerEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Parse IAT and detect imports of timing-related APIs
+             */
+            void AnalyzeIATForTimingAPIs(
+                HANDLE hProcess,
+                LPVOID moduleBase,
+                DWORD importDirRva,
+                DWORD importDirSize,
+                bool is64Bit,
+                DebuggerEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Process imports from a single DLL for timing API detection
+             */
+            void ProcessDLLImportsForTiming(
+                HANDLE hProcess,
+                LPVOID moduleBase,
+                const IMAGE_IMPORT_DESCRIPTOR* importDesc,
+                const char* dllName,
+                bool is64Bit,
+                const std::unordered_map<std::string, const struct TimingAPIInfo*>& timingApiMap,
+                std::vector<const struct TimingAPIInfo*>& importedTimingAPIs,
+                DebuggerEvasionResult& result
+            ) noexcept;
+
+            /**
+             * @brief Detect direct access to KUSER_SHARED_DATA for timing (bypasses API hooks)
+             */
+            void AnalyzeKUserSharedDataAccess(
+                HANDLE hProcess,
+                const MODULEINFO& modInfo,
+                bool is64Bit,
                 DebuggerEvasionResult& result
             ) noexcept;
 

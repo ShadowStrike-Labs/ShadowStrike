@@ -89,7 +89,7 @@
 
 #include "pch.h"
 #include "DebuggerEvasionDetector.hpp"
-#include "Zydis/Zydis.h"
+#include <Zydis/Zydis.h>
 #include <format>
 #include <algorithm>
 #include <execution>
@@ -279,6 +279,80 @@ typedef struct _KUSER_SHARED_DATA_PARTIAL {
 } KUSER_SHARED_DATA_PARTIAL;
 
 namespace ShadowStrike::AntiEvasion {
+
+    // ========================================================================
+    // RAII HANDLE WRAPPER (avoids resource leaks in exception paths)
+    // ========================================================================
+
+    /// @brief RAII wrapper for Windows HANDLE to ensure proper cleanup
+    /// @note This is local to avoid depending on ProcessUtils internal detail
+    class ProcessHandleGuard {
+    public:
+        explicit ProcessHandleGuard(HANDLE h = nullptr) noexcept : m_handle(h) {}
+        ~ProcessHandleGuard() noexcept { Close(); }
+
+        // Non-copyable
+        ProcessHandleGuard(const ProcessHandleGuard&) = delete;
+        ProcessHandleGuard& operator=(const ProcessHandleGuard&) = delete;
+
+        // Movable
+        ProcessHandleGuard(ProcessHandleGuard&& other) noexcept : m_handle(other.m_handle) {
+            other.m_handle = nullptr;
+        }
+        ProcessHandleGuard& operator=(ProcessHandleGuard&& other) noexcept {
+            if (this != &other) {
+                Close();
+                m_handle = other.m_handle;
+                other.m_handle = nullptr;
+            }
+            return *this;
+        }
+
+        [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_handle && m_handle != INVALID_HANDLE_VALUE; }
+        [[nodiscard]] explicit operator bool() const noexcept { return IsValid(); }
+
+        HANDLE Release() noexcept {
+            HANDLE h = m_handle;
+            m_handle = nullptr;
+            return h;
+        }
+
+        void Reset(HANDLE h = nullptr) noexcept {
+            Close();
+            m_handle = h;
+        }
+
+    private:
+        void Close() noexcept {
+            if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+                ::CloseHandle(m_handle);
+                m_handle = nullptr;
+            }
+        }
+        HANDLE m_handle;
+    };
+
+    /// @brief RAII wrapper for CreateToolhelp32Snapshot handles
+    class SnapshotHandleGuard {
+    public:
+        explicit SnapshotHandleGuard(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+        ~SnapshotHandleGuard() noexcept { 
+            if (m_handle != INVALID_HANDLE_VALUE) {
+                ::CloseHandle(m_handle);
+            }
+        }
+
+        // Non-copyable, non-movable (simple RAII)
+        SnapshotHandleGuard(const SnapshotHandleGuard&) = delete;
+        SnapshotHandleGuard& operator=(const SnapshotHandleGuard&) = delete;
+
+        [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+        [[nodiscard]] bool IsValid() const noexcept { return m_handle != INVALID_HANDLE_VALUE; }
+
+    private:
+        HANDLE m_handle;
+    };
 
     // ========================================================================
     // LOGGING CATEGORY
@@ -573,20 +647,235 @@ namespace ShadowStrike::AntiEvasion {
             }
         }
 
+        /// @brief Dynamically extract syscall numbers from ntdll.dll
+        /// 
+        /// Syscall numbers change between Windows builds (10 vs 11, different versions).
+        /// This function reads them directly from the in-memory ntdll.dll by parsing
+        /// the instruction bytes of each Nt* function stub.
+        /// 
+        /// x64 syscall stub pattern (Windows 10/11):
+        ///   4C 8B D1          mov r10, rcx
+        ///   B8 XX XX 00 00    mov eax, <syscall_number>
+        ///   [optional test/jne for syscall dispatcher check]
+        ///   0F 05             syscall
+        ///   C3                ret
+        /// 
+        /// On some Windows 10 builds with certain patches:
+        ///   4C 8B D1          mov r10, rcx
+        ///   B8 XX XX 00 00    mov eax, <syscall_number>
+        ///   F6 04 25 08 03 FE 7F 01  test byte ptr [0x7FFE0308], 1
+        ///   75 03             jne +3 (to int 2e path)
+        ///   0F 05             syscall
+        ///   C3                ret
+        ///   CD 2E             int 2eh (fallback)
+        ///   C3                ret
         void InitializeSyscallNumbers() noexcept {
-            // Common Windows 10/11 syscall numbers (may vary by build)
-            // These are used for syscall stub validation
-            m_syscallNumbers = {
-                {"NtQueryInformationProcess", 0x19},
-                {"NtSetInformationThread", 0x0D},
-                {"NtClose", 0x0F},
-                {"NtReadVirtualMemory", 0x3F},
-                {"NtWriteVirtualMemory", 0x3A},
-                {"NtQueryVirtualMemory", 0x23},
-                {"NtProtectVirtualMemory", 0x50},
-                {"NtAllocateVirtualMemory", 0x18},
-                {"NtFreeVirtualMemory", 0x1E}
-            };
+            if (!m_hNtDll) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"InitializeSyscallNumbers: ntdll.dll not loaded");
+                return;
+            }
+
+            // Critical Nt* functions we need syscall numbers for (security-relevant)
+            static constexpr std::array<const char*, 32> CRITICAL_NT_FUNCTIONS = {{
+                "NtQueryInformationProcess",
+                "NtSetInformationThread",
+                "NtQueryInformationThread",
+                "NtClose",
+                "NtReadVirtualMemory",
+                "NtWriteVirtualMemory",
+                "NtQueryVirtualMemory",
+                "NtProtectVirtualMemory",
+                "NtAllocateVirtualMemory",
+                "NtFreeVirtualMemory",
+                "NtOpenProcess",
+                "NtOpenThread",
+                "NtSuspendProcess",
+                "NtResumeProcess",
+                "NtSuspendThread",
+                "NtResumeThread",
+                "NtTerminateProcess",
+                "NtTerminateThread",
+                "NtCreateThreadEx",
+                "NtQuerySystemInformation",
+                "NtSetContextThread",
+                "NtGetContextThread",
+                "NtContinue",
+                "NtRaiseException",
+                "NtDebugActiveProcess",
+                "NtRemoveProcessDebug",
+                "NtSetInformationProcess",
+                "NtCreateFile",
+                "NtDeviceIoControlFile",
+                "NtMapViewOfSection",
+                "NtUnmapViewOfSection",
+                "NtQueryObject"
+            }};
+
+            m_syscallNumbers.clear();
+            m_syscallNumbers.reserve(CRITICAL_NT_FUNCTIONS.size());
+
+            size_t successCount = 0;
+            size_t failCount = 0;
+
+            for (const char* funcName : CRITICAL_NT_FUNCTIONS) {
+                if (!funcName) continue;
+
+                // Get function address from ntdll exports
+                FARPROC pFunc = GetProcAddress(m_hNtDll, funcName);
+                if (!pFunc) {
+                    // Function may not exist on this Windows version - not an error
+                    continue;
+                }
+
+                // Read the first 32 bytes of the stub to extract syscall number
+                // This is safe because ntdll is always mapped in our process
+                const uint8_t* stubBytes = reinterpret_cast<const uint8_t*>(pFunc);
+
+                std::optional<uint32_t> syscallNum = ExtractSyscallNumberFromStub(stubBytes, 32);
+                if (syscallNum.has_value()) {
+                    m_syscallNumbers[funcName] = syscallNum.value();
+                    successCount++;
+                }
+                else {
+                    // Log but don't fail - stub may be hooked or unusual format
+                    SS_LOG_DEBUG(LOG_CATEGORY, L"Failed to extract syscall number for %hs (may be hooked)", funcName);
+                    failCount++;
+                }
+            }
+
+            SS_LOG_INFO(LOG_CATEGORY, L"InitializeSyscallNumbers: Extracted %zu syscall numbers (%zu failed)",
+                successCount, failCount);
+
+            // Sanity check - we should get most of them
+            if (successCount < 10) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Low syscall extraction success rate - ntdll may be heavily hooked");
+            }
+        }
+
+        /// @brief Extract syscall number from a Nt* function stub
+        /// @param stubBytes Pointer to the function's first bytes
+        /// @param maxSize Maximum bytes to examine (should be >= 16)
+        /// @return Syscall number if successfully extracted, std::nullopt otherwise
+        [[nodiscard]] std::optional<uint32_t> ExtractSyscallNumberFromStub(
+            const uint8_t* stubBytes,
+            size_t maxSize
+        ) const noexcept {
+            if (!stubBytes || maxSize < 8) {
+                return std::nullopt;
+            }
+
+            // Wrap memory access in SEH for safety
+            __try {
+                // Pattern 1: Standard x64 syscall stub
+                // 4C 8B D1       mov r10, rcx
+                // B8 XX XX 00 00 mov eax, syscall_num
+                if (maxSize >= 8 &&
+                    stubBytes[0] == 0x4C &&
+                    stubBytes[1] == 0x8B &&
+                    stubBytes[2] == 0xD1 &&
+                    stubBytes[3] == 0xB8) {
+                    // Extract 32-bit syscall number (little-endian)
+                    uint32_t syscallNum =
+                        static_cast<uint32_t>(stubBytes[4]) |
+                        (static_cast<uint32_t>(stubBytes[5]) << 8) |
+                        (static_cast<uint32_t>(stubBytes[6]) << 16) |
+                        (static_cast<uint32_t>(stubBytes[7]) << 24);
+
+                    // Sanity check: syscall numbers are typically < 0x1000 on Windows
+                    if (syscallNum < 0x2000) {
+                        return syscallNum;
+                    }
+                }
+
+                // Pattern 2: Hooked stub with jmp at start - try to follow
+                // E9 XX XX XX XX  jmp rel32 (5 bytes)
+                // or
+                // 48 B8 XX XX XX XX XX XX XX XX  mov rax, imm64 (10 bytes)
+                // FF E0                          jmp rax (2 bytes)
+                if (stubBytes[0] == 0xE9 && maxSize >= 5) {
+                    // Calculate jump target
+                    int32_t offset = *reinterpret_cast<const int32_t*>(stubBytes + 1);
+                    const uint8_t* target = stubBytes + 5 + offset;
+
+                    // Try to extract from jump target (recursive with limited depth)
+                    // Don't follow if target looks invalid
+                    uintptr_t targetAddr = reinterpret_cast<uintptr_t>(target);
+                    uintptr_t ntdllBase = reinterpret_cast<uintptr_t>(m_hNtDll);
+
+                    // Only follow if target is within ntdll's reasonable bounds
+                    if (targetAddr > ntdllBase && targetAddr < ntdllBase + 0x1000000) {
+                        // Check if target has the standard pattern
+                        __try {
+                            if (target[0] == 0x4C && target[1] == 0x8B && target[2] == 0xD1 && target[3] == 0xB8) {
+                                uint32_t syscallNum =
+                                    static_cast<uint32_t>(target[4]) |
+                                    (static_cast<uint32_t>(target[5]) << 8) |
+                                    (static_cast<uint32_t>(target[6]) << 16) |
+                                    (static_cast<uint32_t>(target[7]) << 24);
+                                if (syscallNum < 0x2000) {
+                                    return syscallNum;
+                                }
+                            }
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER) {
+                            // Target memory not readable
+                        }
+                    }
+                }
+
+                // Pattern 3: Windows 10 with Meltdown/Spectre mitigations
+                // Some builds have different prologues
+                // Check for mov eax at different offsets
+                for (size_t offset = 0; offset < std::min<size_t>(maxSize - 5, 16); ++offset) {
+                    if (stubBytes[offset] == 0xB8) {
+                        // mov eax, imm32
+                        uint32_t syscallNum =
+                            static_cast<uint32_t>(stubBytes[offset + 1]) |
+                            (static_cast<uint32_t>(stubBytes[offset + 2]) << 8) |
+                            (static_cast<uint32_t>(stubBytes[offset + 3]) << 16) |
+                            (static_cast<uint32_t>(stubBytes[offset + 4]) << 24);
+
+                        // Validate this looks like a syscall number
+                        if (syscallNum < 0x2000) {
+                            // Additional validation: look for syscall or int 2e nearby
+                            for (size_t i = offset + 5; i < std::min<size_t>(maxSize - 1, offset + 20); ++i) {
+                                // 0F 05 = syscall
+                                if (stubBytes[i] == 0x0F && stubBytes[i + 1] == 0x05) {
+                                    return syscallNum;
+                                }
+                                // CD 2E = int 2eh (legacy syscall)
+                                if (stubBytes[i] == 0xCD && stubBytes[i + 1] == 0x2E) {
+                                    return syscallNum;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Pattern 4: WoW64 thunk (32-bit process on 64-bit Windows)
+                // These have different patterns we can't easily parse here
+                // Return nullopt and let caller handle gracefully
+
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Memory access violation - stub is unmapped or protected
+                SS_LOG_DEBUG(LOG_CATEGORY, L"ExtractSyscallNumberFromStub: Memory access violation");
+            }
+
+            return std::nullopt;
+        }
+
+        /// @brief Get the expected syscall number for a function name
+        /// @param functionName Name of the Nt* function (e.g., "NtQueryInformationProcess")
+        /// @return Syscall number if known, std::nullopt otherwise
+        [[nodiscard]] std::optional<uint32_t> GetExpectedSyscallNumber(
+            const std::string& functionName
+        ) const noexcept {
+            auto it = m_syscallNumbers.find(functionName);
+            if (it != m_syscallNumbers.end()) {
+                return it->second;
+            }
+            return std::nullopt;
         }
 
         /// @brief Get appropriate Zydis decoder based on bitness
@@ -719,59 +1008,394 @@ namespace ShadowStrike::AntiEvasion {
             return false;
         }
 
-        /// @brief Validate syscall stub integrity
+        /// @brief Enterprise-grade syscall stub integrity validation
+        /// 
+        /// This function performs comprehensive validation of Windows NT syscall stubs
+        /// to detect inline hooks, trampolines, and other modifications.
+        /// 
+        /// Valid x64 syscall stub patterns:
+        /// 
+        /// Pattern A (Windows 10 standard):
+        ///   4C 8B D1          mov r10, rcx
+        ///   B8 XX XX 00 00    mov eax, <syscall_num>
+        ///   0F 05             syscall
+        ///   C3                ret
+        /// 
+        /// Pattern B (Windows 10 with syscall check):
+        ///   4C 8B D1                      mov r10, rcx
+        ///   B8 XX XX 00 00                mov eax, <syscall_num>
+        ///   F6 04 25 08 03 FE 7F 01       test byte ptr [0x7FFE0308], 1
+        ///   75 03                         jne +3
+        ///   0F 05                         syscall
+        ///   C3                            ret
+        ///   CD 2E                         int 2eh (fallback)
+        ///   C3                            ret
+        /// 
+        /// Pattern C (Windows 11 22H2+):
+        ///   4C 8B D1          mov r10, rcx
+        ///   B8 XX XX 00 00    mov eax, <syscall_num>
+        ///   F6 04 25 08 03 FE 7F 01  test byte ptr [SharedUserData!SystemCall], 1
+        ///   75 03             jne to int 2e
+        ///   0F 05             syscall
+        ///   C3                ret
+        ///   CD 2E             int 2eh
+        ///   C3                ret
+        /// 
+        /// @param stubBytes Pointer to syscall stub bytes
+        /// @param size Size of buffer (should be >= 32 for reliable detection)
+        /// @param is64Bit True for 64-bit process
+        /// @param outDetails Output string with detailed findings
+        /// @param expectedFunctionName Optional function name for syscall number validation
+        /// @return true if stub appears valid, false if hooked/modified
         [[nodiscard]] bool ValidateSyscallStub(
             const uint8_t* stubBytes,
             size_t size,
             bool is64Bit,
-            std::wstring& outDetails
+            std::wstring& outDetails,
+            const std::string& expectedFunctionName = ""
         ) const noexcept {
             if (!stubBytes || size < 8) {
-                return true; // Can't validate, assume OK
+                outDetails = L"Insufficient bytes for validation";
+                return true; // Can't validate, don't flag as hooked
             }
 
-            if (is64Bit) {
-                // Expected pattern: 4C 8B D1 B8 xx xx 00 00 ... 0F 05 ... C3
-                // mov r10, rcx; mov eax, syscall_num; ... syscall; ... ret
+            if (!is64Bit) {
+                // x86/WoW64 syscall stubs use different patterns (sysenter/int 2eh)
+                // Validate WoW64 stubs separately
+                return ValidateWoW64SyscallStub(stubBytes, size, outDetails);
+            }
 
-                // Check for expected prologue
-                if (size >= 4 &&
-                    stubBytes[0] == 0x4C &&
-                    stubBytes[1] == 0x8B &&
-                    stubBytes[2] == 0xD1 &&
-                    stubBytes[3] == 0xB8) {
-                    // Looks like valid syscall stub
-                    return true;
+            // ================================================================
+            // PHASE 1: Quick byte-pattern check for common hook patterns
+            // ================================================================
+
+            // Immediate hook detection (first-byte checks)
+            switch (stubBytes[0]) {
+            case 0xE9: // JMP rel32 (5-byte hook)
+                outDetails = std::format(L"Inline hook: JMP rel32 at stub start (target: +0x{:X})",
+                    *reinterpret_cast<const int32_t*>(stubBytes + 1));
+                return false;
+
+            case 0xE8: // CALL rel32 (unusual but possible)
+                outDetails = L"Suspicious: CALL rel32 at stub start";
+                return false;
+
+            case 0xCC: // INT3 (software breakpoint)
+                outDetails = L"Software breakpoint (INT3) at stub start";
+                return false;
+
+            case 0xCD: // INT xx
+                outDetails = std::format(L"Interrupt instruction at stub start: INT 0x{:02X}", stubBytes[1]);
+                return false;
+
+            case 0xFF: // FF 25 = JMP [mem], FF 15 = CALL [mem]
+                if (size >= 2) {
+                    if (stubBytes[1] == 0x25) {
+                        outDetails = L"Inline hook: JMP [RIP+disp32] at stub start";
+                        return false;
+                    }
+                    if (stubBytes[1] == 0x15) {
+                        outDetails = L"Suspicious: CALL [RIP+disp32] at stub start";
+                        return false;
+                    }
+                }
+                break;
+
+            case 0x48: // REX.W prefix - check for MOV RAX, imm64 pattern
+                if (size >= 12 && stubBytes[1] == 0xB8) {
+                    // 48 B8 XX XX XX XX XX XX XX XX = movabs rax, imm64
+                    // Often followed by FF E0 (jmp rax) for 12-byte hook
+                    outDetails = L"Possible 12-byte hook: MOV RAX, imm64 at stub start";
+                    // Check for JMP RAX after
+                    if (size >= 14 && stubBytes[10] == 0xFF && stubBytes[11] == 0xE0) {
+                        outDetails = L"Inline hook: MOV RAX, imm64; JMP RAX";
+                        return false;
+                    }
+                }
+                break;
+
+            case 0x68: // PUSH imm32 (possible push+ret hook)
+                if (size >= 6) {
+                    // Check for RET (C3) or RET imm16 (C2) after push
+                    if (stubBytes[5] == 0xC3 || stubBytes[5] == 0xC2) {
+                        outDetails = L"Inline hook: PUSH imm32; RET pattern";
+                        return false;
+                    }
+                }
+                break;
+
+            default:
+                break;
+            }
+
+            // ================================================================
+            // PHASE 2: Full disassembly validation using Zydis
+            // ================================================================
+
+            const auto* decoder = GetDecoder(true);
+            if (!decoder) {
+                // No decoder available - fall back to byte pattern check
+                return ValidateSyscallStubBytePattern(stubBytes, size, outDetails);
+            }
+
+            // State machine for expected instruction sequence
+            enum class StubState {
+                ExpectMovR10Rcx,      // First instruction
+                ExpectMovEaxImm,      // mov eax, syscall_num
+                ExpectTestOrSyscall,  // test byte ptr [...] or syscall
+                ExpectJneOrSyscall,   // jne (to int 2e) or syscall
+                ExpectSyscall,        // syscall instruction
+                ExpectRet,            // ret instruction
+                FoundSyscall,         // Valid syscall found
+                Invalid               // Invalid sequence
+            };
+
+            StubState state = StubState::ExpectMovR10Rcx;
+            size_t offset = 0;
+            uint32_t extractedSyscallNum = 0;
+            bool hasSyscallCheck = false;
+            size_t instructionCount = 0;
+            constexpr size_t MAX_INSTRUCTIONS = 16; // Limit to prevent infinite loops
+
+            std::wstring instructionTrace;
+
+            while (offset < size && state != StubState::FoundSyscall &&
+                state != StubState::Invalid && instructionCount < MAX_INSTRUCTIONS) {
+
+                ZydisDecodedInstruction instr;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, stubBytes + offset, size - offset, &instr, ops))) {
+                    // Decoding failed - could be invalid code or data
+                    break;
                 }
 
-                // Check for hook patterns
-                if (stubBytes[0] == 0xE9 ||                          // JMP rel32
-                    stubBytes[0] == 0xCC ||                          // INT3
-                    (stubBytes[0] == 0xFF && stubBytes[1] == 0x25)) { // JMP [mem]
-                    outDetails = L"Syscall stub appears hooked";
+                // Build instruction trace for diagnostics
+                if (m_formatterInitialized) {
+                    char asmBuf[64] = {};
+                    ZydisFormatterFormatInstruction(&m_formatter, &instr, ops, instr.operand_count,
+                        asmBuf, sizeof(asmBuf), offset, nullptr);
+                    instructionTrace += std::format(L"  +0x{:02X}: {}\n", offset, Utils::StringUtils::ToWide(asmBuf));
+                }
+
+                switch (state) {
+                case StubState::ExpectMovR10Rcx:
+                    // Expected: mov r10, rcx (4C 8B D1)
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                        instr.operand_count >= 2 &&
+                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        ops[0].reg.value == ZYDIS_REGISTER_R10 &&
+                        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        ops[1].reg.value == ZYDIS_REGISTER_RCX) {
+                        state = StubState::ExpectMovEaxImm;
+                    }
+                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
+                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                        outDetails = std::format(L"Hook detected: {} instead of 'mov r10, rcx'\n{}",
+                            instr.mnemonic == ZYDIS_MNEMONIC_JMP ? L"JMP" : L"CALL",
+                            instructionTrace);
+                        return false;
+                    }
+                    else {
+                        outDetails = std::format(L"Unexpected first instruction (expected 'mov r10, rcx'):\n{}",
+                            instructionTrace);
+                        return false;
+                    }
+                    break;
+
+                case StubState::ExpectMovEaxImm:
+                    // Expected: mov eax, imm32 (B8 XX XX XX XX)
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                        instr.operand_count >= 2 &&
+                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        ops[0].reg.value == ZYDIS_REGISTER_EAX &&
+                        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        extractedSyscallNum = static_cast<uint32_t>(ops[1].imm.value.u);
+                        state = StubState::ExpectTestOrSyscall;
+                    }
+                    else {
+                        outDetails = std::format(L"Unexpected instruction (expected 'mov eax, <syscall_num>'):\n{}",
+                            instructionTrace);
+                        return false;
+                    }
+                    break;
+
+                case StubState::ExpectTestOrSyscall:
+                    // Can be: test byte ptr [...], 1  OR  syscall
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
+                        state = StubState::FoundSyscall;
+                    }
+                    else if (instr.mnemonic == ZYDIS_MNEMONIC_TEST) {
+                        // Windows syscall check: test byte ptr [0x7FFE0308], 1
+                        hasSyscallCheck = true;
+                        state = StubState::ExpectJneOrSyscall;
+                    }
+                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
+                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                        outDetails = std::format(L"Hook detected after syscall number:\n{}", instructionTrace);
+                        return false;
+                    }
+                    else {
+                        // Allow some flexibility for unusual but valid patterns
+                        // (e.g., NOP padding, compiler variations)
+                        if (instr.mnemonic != ZYDIS_MNEMONIC_NOP) {
+                            // Continue but stay in same state (limited tolerance)
+                        }
+                    }
+                    break;
+                    
+                case StubState::ExpectJneOrSyscall:
+                    // After test, expect: jne (to int 2e path) OR syscall
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
+                        state = StubState::FoundSyscall;
+                    }
+                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JNE ||
+                        instr.mnemonic == ZYDIS_MNEMONIC_JNZ) {
+                        // Valid - conditional jump to int 2e fallback
+                        state = StubState::ExpectSyscall;
+                    }
+                    else {
+                        outDetails = std::format(L"Unexpected instruction after TEST:\n{}", instructionTrace);
+                        return false;
+                    }
+                    break;
+
+                case StubState::ExpectSyscall:
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
+                        state = StubState::FoundSyscall;
+                    }
+                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
+                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                        outDetails = std::format(L"Hook detected instead of SYSCALL:\n{}", instructionTrace);
+                        return false;
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+
+                offset += instr.length;
+                instructionCount++;
+            }
+
+            // ================================================================
+            // PHASE 3: Validate extracted syscall number against expected
+            // ================================================================
+
+            if (state == StubState::FoundSyscall && !expectedFunctionName.empty()) {
+                auto expected = GetExpectedSyscallNumber(expectedFunctionName);
+                if (expected.has_value() && expected.value() != extractedSyscallNum) {
+                    outDetails = std::format(
+                        L"Syscall number mismatch for {}: expected 0x{:X}, found 0x{:X}\n{}",
+                        Utils::StringUtils::ToWide(expectedFunctionName),
+                        expected.value(), extractedSyscallNum, instructionTrace);
                     return false;
                 }
+            }
 
-                // Check if first instruction is JMP (any form)
-                const auto* decoder = GetDecoder(true);
-                if (decoder) {
-                    ZydisDecodedInstruction instr;
-                    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-                    if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, stubBytes, size, &instr, ops))) {
-                        if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
-                            instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
-                            outDetails = std::format(L"Unexpected {} at syscall stub start",
-                                instr.mnemonic == ZYDIS_MNEMONIC_JMP ? L"JMP" : L"CALL");
-                            return false;
-                        }
+            // Validate we reached a valid end state
+            if (state == StubState::FoundSyscall) {
+                outDetails = std::format(L"Valid syscall stub (syscall number: 0x{:X}, has_check: {})",
+                    extractedSyscallNum, hasSyscallCheck ? L"yes" : L"no");
+                return true;
+            }
+
+            // Didn't find expected syscall - suspicious
+            outDetails = std::format(L"Incomplete/invalid syscall stub (state: {}):\n{}",
+                static_cast<int>(state), instructionTrace);
+            return false;
+        }
+
+        /// @brief Validate WoW64 (32-bit on 64-bit Windows) syscall stubs
+        [[nodiscard]] bool ValidateWoW64SyscallStub(
+            const uint8_t* stubBytes,
+            size_t size,
+            std::wstring& outDetails
+        ) const noexcept {
+            // WoW64 syscall stubs have different patterns:
+            // Pattern A (via wow64cpu.dll thunk):
+            //   B8 XX XX XX XX    mov eax, <syscall_num>
+            //   BA XX XX XX XX    mov edx, <wow64_syscall_addr>
+            //   FF D2             call edx
+            //   C2 XX XX          ret imm16
+            // 
+            // Pattern B (direct syscall on newer Windows):
+            //   B8 XX XX XX XX    mov eax, <syscall_num>
+            //   CD 2E             int 2eh
+            //   C3                ret
+
+            if (!stubBytes || size < 7) {
+                return true; // Can't validate
+            }
+
+            // Check for common hook patterns first
+            if (stubBytes[0] == 0xE9 || stubBytes[0] == 0xCC ||
+                (stubBytes[0] == 0xFF && stubBytes[1] == 0x25)) {
+                outDetails = L"WoW64 syscall stub appears hooked";
+                return false;
+            }
+
+            // Check for expected mov eax, imm32 prologue
+            if (stubBytes[0] == 0xB8) {
+                // Looks like valid WoW64 stub start
+                // Check what follows
+                if (size >= 7) {
+                    // Check for call edx pattern
+                    if (stubBytes[5] == 0xBA) {
+                        // mov edx, imm32 - WoW64 thunk pattern
+                        return true;
+                    }
+                    // Check for int 2eh pattern
+                    if (stubBytes[5] == 0xCD && stubBytes[6] == 0x2E) {
+                        return true;
+                    }
+                }
+                // Has correct start, assume OK
+                return true;
+            }
+
+            // Use Zydis for detailed analysis if available
+            const auto* decoder = GetDecoder(false); // 32-bit decoder
+            if (decoder) {
+                ZydisDecodedInstruction instr;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, stubBytes, size, &instr, ops))) {
+                    if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
+                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                        outDetails = L"WoW64 stub: Unexpected JMP/CALL at start";
+                        return false;
                     }
                 }
             }
-            else {
-                // x86 syscall stubs are more varied, skip detailed validation
-            }
 
             return true;
+        }
+
+        /// @brief Fallback byte-pattern validation when Zydis unavailable
+        [[nodiscard]] bool ValidateSyscallStubBytePattern(
+            const uint8_t* stubBytes,
+            size_t size,
+            std::wstring& outDetails
+        ) const noexcept {
+            // Standard x64 pattern check
+            if (size >= 8 &&
+                stubBytes[0] == 0x4C &&  // mov r10, rcx
+                stubBytes[1] == 0x8B &&
+                stubBytes[2] == 0xD1 &&
+                stubBytes[3] == 0xB8) {  // mov eax, imm32
+                // Scan for syscall (0F 05) within reasonable distance
+                for (size_t i = 8; i < std::min<size_t>(size - 1, 32); ++i) {
+                    if (stubBytes[i] == 0x0F && stubBytes[i + 1] == 0x05) {
+                        return true; // Found syscall
+                    }
+                }
+                outDetails = L"Valid prologue but no SYSCALL instruction found";
+                return false;
+            }
+
+            outDetails = L"Non-standard syscall stub prologue";
+            return false;
         }
 
         /// @brief Scan code for anti-debug instructions
@@ -1201,27 +1825,58 @@ namespace ShadowStrike::AntiEvasion {
         uint32_t processId,
         DebuggerEvasionResult& result
     ) noexcept {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) return;
+        SnapshotHandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+        if (!hSnapshot.IsValid()) return;
 
         THREADENTRY32 te32 = {};
         te32.dwSize = sizeof(te32);
 
         size_t threadsScanned = 0;
 
-        if (Thread32First(hSnapshot, &te32)) {
+        if (Thread32First(hSnapshot.Get(), &te32)) {
             do {
                 if (te32.th32OwnerProcessID == processId) {
                     if (threadsScanned >= result.config.maxThreads) break;
 
-                    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
+                    // SECURITY: TOCTOU mitigation - thread may have terminated between snapshot and OpenThread
+                    // OpenThread will fail if the thread no longer exists, which is acceptable
+                    ProcessHandleGuard hThread(OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID));
                     if (hThread) {
+                        // SECURITY: Verify the thread still belongs to our target process
+                        // This mitigates the TOCTOU race where a thread ID could be reused by another process
+                        DWORD threadProcessId = 0;
+                        if (m_impl->m_NtQueryInformationThread) {
+                            // Use NtQueryInformationThread to get the owning process
+                            struct THREAD_BASIC_INFORMATION {
+                                NTSTATUS ExitStatus;
+                                PVOID TebBaseAddress;
+                                CLIENT_ID ClientId;
+                                ULONG_PTR AffinityMask;
+                                LONG Priority;
+                                LONG BasePriority;
+                            } tbi = {};
+                            ULONG len = 0;
+                            
+                            if (m_impl->m_NtQueryInformationThread(hThread.Get(), 0, &tbi, sizeof(tbi), &len) >= 0) {
+                                threadProcessId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(tbi.ClientId.UniqueProcess));
+                            }
+                        }
+                        
+                        // If we got the process ID and it doesn't match, skip this thread (TOCTOU detected)
+                        if (threadProcessId != 0 && threadProcessId != processId) {
+                            SS_LOG_DEBUG(LOG_CATEGORY, L"Thread {} no longer belongs to process {} (now belongs to {})", 
+                                te32.th32ThreadID, processId, threadProcessId);
+                            threadsScanned++;
+                            continue;
+                        }
+                        
                         // Suspend to get consistent context
-                        if (SuspendThread(hThread) != (DWORD)-1) {
+                        DWORD suspendCount = SuspendThread(hThread.Get());
+                        if (suspendCount != (DWORD)-1) {
                             CONTEXT ctx = {};
                             ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
-                            if (GetThreadContext(hThread, &ctx)) {
+                            if (GetThreadContext(hThread.Get(), &ctx)) {
                                 if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
                                     HardwareBreakpointInfo info;
                                     info.threadId = te32.th32ThreadID;
@@ -1265,15 +1920,13 @@ namespace ShadowStrike::AntiEvasion {
                                         .Build());
                                 }
                             }
-                            ResumeThread(hThread);
+                            ResumeThread(hThread.Get());
                         }
-                        CloseHandle(hThread);
                     }
                     threadsScanned++;
                 }
-            } while (Thread32Next(hSnapshot, &te32));
+            } while (Thread32Next(hSnapshot.Get(), &te32));
         }
-        CloseHandle(hSnapshot);
         result.threadsScanned = static_cast<uint32_t>(threadsScanned);
     }
 
@@ -1286,32 +1939,31 @@ namespace ShadowStrike::AntiEvasion {
         DebuggerEvasionResult& result
     ) noexcept {
         // Get parent PID
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) return;
+        SnapshotHandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot.IsValid()) return;
 
         PROCESSENTRY32W pe32 = {};
         pe32.dwSize = sizeof(pe32);
         uint32_t parentPid = 0;
 
-        if (Process32FirstW(hSnapshot, &pe32)) {
+        if (Process32FirstW(hSnapshot.Get(), &pe32)) {
             do {
                 if (pe32.th32ProcessID == processId) {
                     parentPid = pe32.th32ParentProcessID;
                     break;
                 }
-            } while (Process32NextW(hSnapshot, &pe32));
+            } while (Process32NextW(hSnapshot.Get(), &pe32));
         }
-        CloseHandle(hSnapshot);
 
         if (parentPid != 0) {
             result.parentInfo.parentPid = parentPid;
 
             // Get Parent Name
-            HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+            ProcessHandleGuard hParent(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid));
             if (hParent) {
                 wchar_t path[MAX_PATH] = {};
                 DWORD size = MAX_PATH;
-                if (QueryFullProcessImageNameW(hParent, 0, path, &size)) {
+                if (QueryFullProcessImageNameW(hParent.Get(), 0, path, &size)) {
                     result.parentInfo.parentPath = path;
                     std::wstring parentName = result.parentInfo.parentPath.substr(result.parentInfo.parentPath.find_last_of(L"\\/") + 1);
                     result.parentInfo.parentName = parentName;
@@ -1346,7 +1998,6 @@ namespace ShadowStrike::AntiEvasion {
                         result.parentInfo.isServiceHost = true;
                     }
                 }
-                CloseHandle(hParent);
             }
             result.parentInfo.valid = true;
         }
@@ -1638,7 +2289,7 @@ namespace ShadowStrike::AntiEvasion {
                 if (funcName[0] == 'N' && funcName[1] == 't') {
                     std::wstring stubDetails;
 #ifdef _WIN64
-                    if (!m_impl->ValidateSyscallStub(remoteBytes, bytesRead, true, stubDetails)) {
+                    if (!m_impl->ValidateSyscallStub(remoteBytes, bytesRead, true, stubDetails, funcName)) {
                         detected = true;
                         DetectedTechnique tech(EvasionTechnique::CODE_InlineHooks);
                         tech.description = std::format(L"Syscall stub tampered: {}", Utils::StringUtils::ToWide(funcName));
@@ -1768,29 +2419,49 @@ namespace ShadowStrike::AntiEvasion {
                         callbackCount++;
                     }
 
+                    // TLS callbacks are COMMON in legitimate software:
+                    // - C++ static initializers in DLLs
+                    // - Microsoft Visual C++ CRT initialization
+                    // - .NET mixed-mode assemblies
+                    // - Thread-local storage cleanup
+                    // 
+                    // Only flag if we actually find anti-debug code INSIDE the callback
+                    // The mere presence of TLS callbacks should NOT be flagged
+                    
                     if (callbackCount > 0) {
-                        detected = true;
-                        DetectedTechnique tech(EvasionTechnique::THREAD_TLSCallback);
-                        tech.description = std::format(L"TLS Callbacks detected ({})", callbackCount);
-                        tech.severity = EvasionSeverity::Medium;
-                        tech.confidence = 0.6;
+                        bool hasAntiDebugCode = false;
+                        std::wstring antiDebugDetails;
 
-                        // Analyze first callback for anti-debug code
-                        if (callbacks[0] != 0) {
-                            uint8_t callbackCode[256] = {};
-                            if (ReadProcessMemory(hProcess, (void*)callbacks[0], callbackCode, sizeof(callbackCode), &bytesRead)) {
-                                auto antiDebugInstrs = m_impl->ScanForAntiDebugInstructions(
-                                    callbackCode, bytesRead, is64Bit, callbacks[0]);
+                        // Analyze callbacks for anti-debug code
+                        for (size_t i = 0; i < callbackCount && i < 4; ++i) {
+                            if (callbacks[i] != 0) {
+                                uint8_t callbackCode[512] = {};
+                                SIZE_T cbRead = 0;
+                                if (ReadProcessMemory(hProcess, (void*)callbacks[i], callbackCode, sizeof(callbackCode), &cbRead) && cbRead > 0) {
+                                    auto antiDebugInstrs = m_impl->ScanForAntiDebugInstructions(
+                                        callbackCode, cbRead, is64Bit, callbacks[i]);
 
-                                if (!antiDebugInstrs.empty()) {
-                                    tech.description = L"TLS Callback contains anti-debug code";
-                                    tech.severity = EvasionSeverity::High;
-                                    tech.confidence = 0.9;
+                                    if (!antiDebugInstrs.empty()) {
+                                        hasAntiDebugCode = true;
+                                        antiDebugDetails = std::format(L"TLS callback #{} at 0x{:X} contains {} anti-debug instructions",
+                                            i, callbacks[i], antiDebugInstrs.size());
+                                        break;
+                                    }
                                 }
                             }
                         }
 
-                        outDetections.push_back(tech);
+                        // ONLY report if anti-debug code is actually found
+                        if (hasAntiDebugCode) {
+                            detected = true;
+                            DetectedTechnique tech(EvasionTechnique::THREAD_TLSCallback);
+                            tech.description = L"TLS Callback contains anti-debug code";
+                            tech.technicalDetails = antiDebugDetails;
+                            tech.severity = EvasionSeverity::High;
+                            tech.confidence = 0.85; // High confidence when we actually find anti-debug code
+                            outDetections.push_back(tech);
+                        }
+                        // If no anti-debug code found, DO NOT flag - TLS callbacks are normal
                     }
                 }
             }
@@ -2017,8 +2688,55 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
-    // TIMING PATTERN ANALYSIS
+    // TIMING PATTERN ANALYSIS (Enterprise-Grade with Full IAT Parsing)
     // ========================================================================
+
+    /// @brief Timing API function information for IAT analysis
+    struct TimingAPIInfo {
+        const char* functionName;
+        const char* dllName;
+        EvasionTechnique technique;
+        EvasionSeverity baseSeverity;
+        double baseConfidence;
+        const wchar_t* description;
+    };
+
+    /// @brief Known timing APIs used for anti-debug checks
+    /// 
+    /// IMPORTANT: Confidence scores are intentionally LOW because these APIs are used
+    /// by virtually ALL legitimate Windows applications. Only flag when combined with
+    /// other suspicious patterns (e.g., timing brackets around debug checks, process
+    /// termination after timing deltas).
+    /// 
+    /// FALSE POSITIVE RISK: High - Games, benchmarks, video players, profilers,
+    /// scientific apps, databases all use timing APIs legitimately.
+    static constexpr TimingAPIInfo KNOWN_TIMING_APIS[] = {
+        // Kernel32 timing APIs - COMMON IN LEGITIMATE SOFTWARE
+        // Base confidence is LOW because nearly all applications use these
+        {"GetTickCount", "kernel32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.10, L"GetTickCount() - Low resolution timer (extremely common, alone not suspicious)"},
+        {"GetTickCount64", "kernel32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.10, L"GetTickCount64() - 64-bit tick counter (common in all modern apps)"},
+        {"QueryPerformanceCounter", "kernel32.dll", EvasionTechnique::TIMING_QueryPerformanceCounter, EvasionSeverity::Low, 0.15, L"QueryPerformanceCounter() - High-resolution timer (common in games/media)"},
+        {"QueryPerformanceFrequency", "kernel32.dll", EvasionTechnique::TIMING_QueryPerformanceCounter, EvasionSeverity::Low, 0.05, L"QueryPerformanceFrequency() - Timer frequency query (required companion to QPC)"},
+        {"GetSystemTimeAsFileTime", "kernel32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.08, L"GetSystemTimeAsFileTime() - System time (common for timestamps)"},
+        {"GetSystemTimePreciseAsFileTime", "kernel32.dll", EvasionTechnique::TIMING_QueryPerformanceCounter, EvasionSeverity::Low, 0.12, L"GetSystemTimePreciseAsFileTime() - High-precision system time"},
+        {"GetLocalTime", "kernel32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.05, L"GetLocalTime() - Local time (extremely common, not suspicious)"},
+        {"GetSystemTime", "kernel32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.05, L"GetSystemTime() - System time (extremely common, not suspicious)"},
+        {"Sleep", "kernel32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.03, L"Sleep() - Delay function (universal, not suspicious alone)"},
+
+        // NTDLL timing APIs - Used by lower-level apps, slightly more suspicious
+        {"NtQueryPerformanceCounter", "ntdll.dll", EvasionTechnique::TIMING_QueryPerformanceCounter, EvasionSeverity::Low, 0.20, L"NtQueryPerformanceCounter() - Native API (less common but still legitimate)"},
+        {"NtDelayExecution", "ntdll.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.10, L"NtDelayExecution() - Native sleep (uncommon but valid)"},
+        {"NtQuerySystemTime", "ntdll.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.10, L"NtQuerySystemTime() - Native system time"},
+        {"RtlQueryPerformanceCounter", "ntdll.dll", EvasionTechnique::TIMING_QueryPerformanceCounter, EvasionSeverity::Low, 0.15, L"RtlQueryPerformanceCounter() - RTL performance counter"},
+
+        // Winmm timing APIs - Multimedia, common in games/media players
+        {"timeGetTime", "winmm.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.12, L"timeGetTime() - Multimedia timer (common in games/audio)"},
+        {"timeBeginPeriod", "winmm.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.08, L"timeBeginPeriod() - Timer resolution adjustment (games do this)"},
+        {"timeEndPeriod", "winmm.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.05, L"timeEndPeriod() - Timer resolution reset"},
+
+        // User32 timing-related
+        {"GetMessageTime", "user32.dll", EvasionTechnique::TIMING_GetTickCount, EvasionSeverity::Low, 0.08, L"GetMessageTime() - Message timestamp (common in GUI apps)"},
+    };
 
     void DebuggerEvasionDetector::AnalyzeTimingPatterns(
         HANDLE hProcess,
@@ -2044,8 +2762,6 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             const size_t moduleCount = std::min<size_t>(cbNeeded / sizeof(HMODULE), 256);
-
-            // Focus on main executable (first module) for timing pattern analysis
             if (moduleCount == 0) return;
 
             MODULEINFO modInfo = {};
@@ -2053,114 +2769,676 @@ namespace ShadowStrike::AntiEvasion {
                 return;
             }
 
-            // Read PE headers to locate code sections
-            uint8_t headerBuffer[4096] = {};
+            // Read PE headers to locate code sections and IAT
+            constexpr size_t HEADER_BUFFER_SIZE = 8192; // Larger buffer for full headers + section table
+            std::vector<uint8_t> headerBuffer(HEADER_BUFFER_SIZE);
             SIZE_T bytesRead = 0;
 
-            if (!ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, headerBuffer, sizeof(headerBuffer), &bytesRead)) {
+            if (!ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, headerBuffer.data(), HEADER_BUFFER_SIZE, &bytesRead)) {
                 return;
             }
 
             // Parse DOS header
-            auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(headerBuffer);
+            auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(headerBuffer.data());
             if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
                 return;
             }
 
-            if (dosHeader->e_lfanew < 0 || static_cast<size_t>(dosHeader->e_lfanew) >= sizeof(headerBuffer) - sizeof(IMAGE_NT_HEADERS64)) {
+            if (dosHeader->e_lfanew < 0 ||
+                static_cast<size_t>(dosHeader->e_lfanew) >= HEADER_BUFFER_SIZE - sizeof(IMAGE_NT_HEADERS64)) {
                 return;
             }
 
-            // Parse NT headers
-            auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(headerBuffer + dosHeader->e_lfanew);
+            // Determine bitness and parse NT headers
+            auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(headerBuffer.data() + dosHeader->e_lfanew);
             if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
                 return;
             }
 
-            // Get entry point RVA
-            DWORD entryPointRva = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-            if (entryPointRva == 0) {
+            const bool is64Bit = (ntHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+
+            // ================================================================
+            // PHASE 1: Scan entry point region for timing instructions
+            // ================================================================
+
+            DWORD entryPointRva = is64Bit ?
+                ntHeaders->OptionalHeader.AddressOfEntryPoint :
+                reinterpret_cast<IMAGE_NT_HEADERS32*>(headerBuffer.data() + dosHeader->e_lfanew)->OptionalHeader.AddressOfEntryPoint;
+
+            if (entryPointRva != 0) {
+                void* pEntryPoint = static_cast<uint8_t*>(modInfo.lpBaseOfDll) + entryPointRva;
+                constexpr size_t SCAN_SIZE = 8192; // Scan 8KB for better coverage
+                std::vector<uint8_t> codeBuffer(SCAN_SIZE);
+
+                if (ReadProcessMemory(hProcess, pEntryPoint, codeBuffer.data(), SCAN_SIZE, &bytesRead) && bytesRead > 0) {
+                    ScanCodeForTimingInstructions(decoder, codeBuffer.data(), bytesRead,
+                        reinterpret_cast<uintptr_t>(pEntryPoint), result);
+                }
+            }
+
+            // ================================================================
+            // PHASE 2: Full IAT Analysis for Timing API Imports
+            // ================================================================
+
+            // Get Import Directory RVA
+            DWORD importDirRva = 0;
+            DWORD importDirSize = 0;
+
+            if (is64Bit) {
+                if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+                    importDirRva = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                    importDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                }
+            }
+            else {
+                auto* ntHeaders32 = reinterpret_cast<IMAGE_NT_HEADERS32*>(headerBuffer.data() + dosHeader->e_lfanew);
+                if (ntHeaders32->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+                    importDirRva = ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                    importDirSize = ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                }
+            }
+
+            if (importDirRva != 0 && importDirSize > 0) {
+                AnalyzeIATForTimingAPIs(hProcess, modInfo.lpBaseOfDll, importDirRva, importDirSize, is64Bit, result);
+            }
+
+            // ================================================================
+            // PHASE 3: Scan .text section for timing instruction patterns
+            // ================================================================
+
+            // Parse section headers to find .text section
+            // SECURITY: Validate section count to prevent integer overflow
+            // Windows PE spec: max 96 sections, but be paranoid
+            const WORD numberOfSections = ntHeaders->FileHeader.NumberOfSections;
+            if (numberOfSections > 96) {
+                SS_LOG_WARNING(LOG_CATEGORY, L"Suspicious number of sections: {}", numberOfSections);
+                return;
+            }
+            
+            const size_t optionalHeaderSize = is64Bit ?
+                sizeof(IMAGE_OPTIONAL_HEADER64) : sizeof(IMAGE_OPTIONAL_HEADER32);
+            const size_t sectionHeadersOffset = dosHeader->e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) + optionalHeaderSize;
+
+            // SECURITY: Check for overflow before multiplication
+            // numberOfSections is now guaranteed <= 96, so this can't overflow
+            const size_t totalSectionHeadersSize = static_cast<size_t>(numberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+            
+            if (sectionHeadersOffset <= HEADER_BUFFER_SIZE && 
+                totalSectionHeadersSize <= HEADER_BUFFER_SIZE - sectionHeadersOffset) {
+                auto* sectionHeaders = reinterpret_cast<IMAGE_SECTION_HEADER*>(headerBuffer.data() + sectionHeadersOffset);
+
+                for (WORD i = 0; i < numberOfSections; ++i) {
+                    // Check for executable section (typically .text)
+                    if (sectionHeaders[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                        // Scan first 64KB of executable sections
+                        constexpr size_t MAX_SECTION_SCAN = 65536;
+                        const size_t scanSize = std::min<size_t>(sectionHeaders[i].Misc.VirtualSize, MAX_SECTION_SCAN);
+
+                        if (scanSize > 0) {
+                            std::vector<uint8_t> sectionBuffer(scanSize);
+                            void* sectionAddr = static_cast<uint8_t*>(modInfo.lpBaseOfDll) + sectionHeaders[i].VirtualAddress;
+
+                            if (ReadProcessMemory(hProcess, sectionAddr, sectionBuffer.data(), scanSize, &bytesRead) && bytesRead > 0) {
+                                // Scan for timing instruction patterns, but be more selective
+                                // Only report if we find suspicious patterns (paired RDTSC, etc.)
+                                ScanCodeForTimingPatterns(decoder, sectionBuffer.data(), bytesRead,
+                                    reinterpret_cast<uintptr_t>(sectionAddr),
+                                    sectionHeaders[i].Name, result);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ================================================================
+            // PHASE 4: Check for KUSER_SHARED_DATA access (timing without API)
+            // ================================================================
+
+            // KUSER_SHARED_DATA is at 0x7FFE0000 on all Windows versions
+            // Malware can read timing directly from there to avoid API hooks
+            // Look for references to this address in code
+
+            AnalyzeKUserSharedDataAccess(hProcess, modInfo, is64Bit, result);
+
+            result.techniquesChecked += 8; // RDTSC, RDTSCP, QPC, GetTickCount variants, KUSER_SHARED_DATA
+
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeTimingPatterns: Exception during analysis");
+        }
+    }
+
+    /// @brief Scan code buffer for timing-related CPU instructions
+    /// @brief Scan code buffer for timing-related CPU instructions
+    /// 
+    /// IMPORTANT FALSE POSITIVE MITIGATION:
+    /// RDTSC/RDTSCP are used extensively by legitimate software:
+    /// - Game engines for frame timing (Unreal, Unity, Source)
+    /// - Benchmarking tools (CPU-Z, CineBench, PassMark)
+    /// - Scientific computing and simulations
+    /// - Video encoding (FFmpeg, x264, x265)
+    /// - Database engines for performance profiling
+    /// - .NET/JVM JIT compilers for optimization
+    /// 
+    /// We use LOW base confidence and only elevate when:
+    /// 1. Paired RDTSC in tight proximity (classic timing attack pattern)
+    /// 2. Combined with conditional jumps that could terminate process
+    /// 3. Found in combination with debug API calls
+    void DebuggerEvasionDetector::ScanCodeForTimingInstructions(
+        const ZydisDecoder* decoder,
+        const uint8_t* code,
+        size_t size,
+        uintptr_t baseAddress,
+        DebuggerEvasionResult& result
+    ) noexcept {
+        if (!decoder || !code || size == 0) return;
+
+        std::unordered_set<uintptr_t> detectedAddresses;
+        std::vector<uintptr_t> rdtscLocations;
+        std::vector<uintptr_t> rdtscpLocations;
+        uint32_t cpuidCount = 0;
+
+        // First pass: Collect all timing instruction locations
+        size_t offset = 0;
+        while (offset + 15 <= size) {
+            ZydisDecodedInstruction instruction;
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+
+            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset, size - offset, &instruction, operands))) {
+                uintptr_t instrAddress = baseAddress + offset;
+
+                switch (instruction.mnemonic) {
+                case ZYDIS_MNEMONIC_RDTSC:
+                    rdtscLocations.push_back(instrAddress);
+                    detectedAddresses.insert(instrAddress);
+                    break;
+
+                case ZYDIS_MNEMONIC_RDTSCP:
+                    rdtscpLocations.push_back(instrAddress);
+                    detectedAddresses.insert(instrAddress);
+                    break;
+
+                case ZYDIS_MNEMONIC_CPUID:
+                    // CPUID is extremely common for feature detection - very low confidence
+                    if (detectedAddresses.insert(instrAddress).second) {
+                        cpuidCount++;
+                        // Only flag if in first 256 bytes AND multiple found (suspicious pattern)
+                        if (offset < 256 && cpuidCount >= 2) {
+                            AddDetection(result, DetectionPatternBuilder()
+                                .Technique(EvasionTechnique::TIMING_RDTSC)
+                                .Description(L"Multiple CPUID in entry region (potential timing serialization)")
+                                .Address(instrAddress)
+                                .TechnicalDetails(std::format(L"CPUID #{} at offset +0x{:X}", cpuidCount, offset))
+                                .Confidence(0.25) // Low - CPUID is normal for feature detection
+                                .Severity(EvasionSeverity::Low)
+                                .Build());
+                        }
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+
+                offset += instruction.length;
+            }
+            else {
+                offset++;
+            }
+        }
+
+        // Second pass: Analyze patterns for suspicious timing attacks
+        // Single RDTSC/RDTSCP alone is NOT suspicious - games, benchmarks use them constantly
+        
+        // Look for paired RDTSC pattern: Two RDTSC within 256 bytes is classic anti-debug
+        bool foundTimingPair = false;
+        for (size_t i = 0; i + 1 < rdtscLocations.size(); ++i) {
+            uintptr_t distance = rdtscLocations[i + 1] - rdtscLocations[i];
+            if (distance <= 256) {
+                foundTimingPair = true;
+                // This IS suspicious - paired timing check pattern
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_RDTSC)
+                    .Description(L"Paired RDTSC pattern detected (timing delta check)")
+                    .Address(rdtscLocations[i])
+                    .TechnicalDetails(std::format(L"RDTSC pair at 0x{:016X} and 0x{:016X} (distance: {} bytes) - classic anti-debug pattern",
+                        rdtscLocations[i], rdtscLocations[i + 1], distance))
+                    .Confidence(0.70) // Moderate-high - this is a known anti-debug pattern
+                    .Severity(EvasionSeverity::Medium)
+                    .Build());
+            }
+        }
+
+        // Same for RDTSCP pairs
+        for (size_t i = 0; i + 1 < rdtscpLocations.size(); ++i) {
+            uintptr_t distance = rdtscpLocations[i + 1] - rdtscpLocations[i];
+            if (distance <= 256) {
+                foundTimingPair = true;
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_RDTSCP)
+                    .Description(L"Paired RDTSCP pattern detected (serializing timing delta check)")
+                    .Address(rdtscpLocations[i])
+                    .TechnicalDetails(std::format(L"RDTSCP pair at 0x{:016X} and 0x{:016X} (distance: {} bytes)",
+                        rdtscpLocations[i], rdtscpLocations[i + 1], distance))
+                    .Confidence(0.75) // RDTSCP pairing is more suspicious than RDTSC
+                    .Severity(EvasionSeverity::Medium)
+                    .Build());
+            }
+        }
+
+        // Only report individual RDTSC if we have MANY (>= 5) which is unusual for legit code
+        // AND we haven't already found paired patterns
+        if (!foundTimingPair) {
+            if (rdtscLocations.size() >= 5) {
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_RDTSC)
+                    .Description(L"High RDTSC density (unusual for legitimate code)")
+                    .TechnicalDetails(std::format(L"Found {} RDTSC instructions in entry point region", rdtscLocations.size()))
+                    .Confidence(0.40) // Moderate - could still be legit profiling code
+                    .Severity(EvasionSeverity::Low)
+                    .Build());
+            }
+            if (rdtscpLocations.size() >= 5) {
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_RDTSCP)
+                    .Description(L"High RDTSCP density (unusual for legitimate code)")
+                    .TechnicalDetails(std::format(L"Found {} RDTSCP instructions", rdtscpLocations.size()))
+                    .Confidence(0.45)
+                    .Severity(EvasionSeverity::Low)
+                    .Build());
+            }
+        }
+
+        // DO NOT report single RDTSC/RDTSCP occurrences - way too many false positives
+        // Games, benchmarks, media players all use these legitimately
+    }
+
+    /// @brief Scan executable section for timing patterns with context analysis
+    void DebuggerEvasionDetector::ScanCodeForTimingPatterns(
+        const ZydisDecoder* decoder,
+        const uint8_t* code,
+        size_t size,
+        uintptr_t baseAddress,
+        const BYTE sectionName[8],
+        DebuggerEvasionResult& result
+    ) noexcept {
+        if (!decoder || !code || size == 0) return;
+
+        // Track RDTSC locations to detect paired timing checks
+        std::vector<uintptr_t> rdtscLocations;
+        std::vector<uintptr_t> rdtscpLocations;
+
+        size_t offset = 0;
+        while (offset + 15 <= size) {
+            ZydisDecodedInstruction instruction;
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+
+            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset, size - offset, &instruction, operands))) {
+                if (instruction.mnemonic == ZYDIS_MNEMONIC_RDTSC) {
+                    rdtscLocations.push_back(baseAddress + offset);
+                }
+                else if (instruction.mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+                    rdtscpLocations.push_back(baseAddress + offset);
+                }
+                offset += instruction.length;
+            }
+            else {
+                offset++;
+            }
+        }
+
+        // Analyze patterns: Look for paired RDTSC with small distance (timing check pattern)
+        for (size_t i = 0; i + 1 < rdtscLocations.size(); ++i) {
+            uintptr_t distance = rdtscLocations[i + 1] - rdtscLocations[i];
+            // Classic pattern: two RDTSC within 256 bytes (timing check bracket)
+            if (distance <= 256) {
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_RDTSC)
+                    .Description(L"Paired RDTSC pattern (timing delta check - classic anti-debug)")
+                    .Address(rdtscLocations[i])
+                    .TechnicalDetails(std::format(L"RDTSC pair at 0x{:016X} and 0x{:016X} (distance: {} bytes)",
+                        rdtscLocations[i], rdtscLocations[i + 1], distance))
+                    .Confidence(0.98)
+                    .Severity(EvasionSeverity::Critical)
+                    .Build());
+            }
+        }
+
+        // Same for RDTSCP pairs
+        for (size_t i = 0; i + 1 < rdtscpLocations.size(); ++i) {
+            uintptr_t distance = rdtscpLocations[i + 1] - rdtscpLocations[i];
+            if (distance <= 256) {
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_RDTSCP)
+                    .Description(L"Paired RDTSCP pattern (serializing timing delta check)")
+                    .Address(rdtscpLocations[i])
+                    .TechnicalDetails(std::format(L"RDTSCP pair at 0x{:016X} and 0x{:016X} (distance: {} bytes)",
+                        rdtscpLocations[i], rdtscpLocations[i + 1], distance))
+                    .Confidence(0.98)
+                    .Severity(EvasionSeverity::Critical)
+                    .Build());
+            }
+        }
+    }
+
+    /// @brief Parse IAT and detect imports of timing-related APIs
+    void DebuggerEvasionDetector::AnalyzeIATForTimingAPIs(
+        HANDLE hProcess,
+        LPVOID moduleBase,
+        DWORD importDirRva,
+        DWORD importDirSize,
+        bool is64Bit,
+        DebuggerEvasionResult& result
+    ) noexcept {
+        if (!hProcess || !moduleBase || importDirRva == 0) return;
+
+        // Build lookup map for fast API matching
+        std::unordered_map<std::string, const TimingAPIInfo*> timingApiMap;
+        for (const auto& api : KNOWN_TIMING_APIS) {
+            timingApiMap[api.functionName] = &api;
+        }
+
+        // Track which timing APIs are imported for pattern analysis
+        std::vector<const TimingAPIInfo*> importedTimingAPIs;
+        size_t totalTimingImports = 0;
+
+        try {
+            // Read Import Directory
+            constexpr size_t MAX_IMPORT_DIR_SIZE = 65536;
+            const size_t readSize = std::min<size_t>(importDirSize + 4096, MAX_IMPORT_DIR_SIZE);
+            std::vector<uint8_t> importBuffer(readSize);
+
+            SIZE_T bytesRead = 0;
+            void* importDirAddr = static_cast<uint8_t*>(moduleBase) + importDirRva;
+
+            if (!ReadProcessMemory(hProcess, importDirAddr, importBuffer.data(), readSize, &bytesRead) || bytesRead == 0) {
                 return;
             }
 
-            // Scan entry point region for timing instructions
-            void* pEntryPoint = static_cast<uint8_t*>(modInfo.lpBaseOfDll) + entryPointRva;
-            constexpr size_t SCAN_SIZE = 4096;
+            // Walk Import Descriptors
+            auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(importBuffer.data());
+            constexpr size_t MAX_DLLS = 256;
+            size_t dllCount = 0;
+
+            while (importDesc->Name != 0 && dllCount < MAX_DLLS) {
+                // Validate RVA bounds
+                if (importDesc->Name < importDirRva || importDesc->Name > importDirRva + readSize) {
+                    // Name RVA is outside our buffer, need to read it separately
+                    char dllNameBuf[256] = {};
+                    void* dllNameAddr = static_cast<uint8_t*>(moduleBase) + importDesc->Name;
+
+                    if (!ReadProcessMemory(hProcess, dllNameAddr, dllNameBuf, sizeof(dllNameBuf) - 1, &bytesRead)) {
+                        importDesc++;
+                        dllCount++;
+                        continue;
+                    }
+                    dllNameBuf[sizeof(dllNameBuf) - 1] = '\0';
+
+                    // Process this DLL's imports
+                    ProcessDLLImportsForTiming(hProcess, moduleBase, importDesc, dllNameBuf, is64Bit,
+                        timingApiMap, importedTimingAPIs, result);
+                }
+                else {
+                    // Name is within our buffer
+                    size_t nameOffset = importDesc->Name - importDirRva;
+                    if (nameOffset < readSize) {
+                        const char* dllName = reinterpret_cast<const char*>(importBuffer.data() + nameOffset);
+                        ProcessDLLImportsForTiming(hProcess, moduleBase, importDesc, dllName, is64Bit,
+                            timingApiMap, importedTimingAPIs, result);
+                    }
+                }
+
+                importDesc++;
+                dllCount++;
+            }
+
+            // Pattern analysis: Multiple timing API imports
+            // NOTE: Having multiple timing APIs is EXTREMELY COMMON in legitimate software
+            // Games, media players, benchmarks all import many timing functions
+            // We only flag with LOW confidence as a data point, not as evidence of malware
+            
+            // Only report if we have an unusually high number (6+) of timing APIs
+            // AND they include suspicious combinations
+            if (importedTimingAPIs.size() >= 6) {
+                std::wstring apiList;
+                for (const auto* api : importedTimingAPIs) {
+                    if (!apiList.empty()) apiList += L", ";
+                    apiList += Utils::StringUtils::ToWide(api->functionName);
+                }
+
+                AddDetection(result, DetectionPatternBuilder()
+                    .Technique(EvasionTechnique::TIMING_QueryPerformanceCounter)
+                    .Description(L"High number of timing APIs imported (informational)")
+                    .TechnicalDetails(std::format(L"Imported {} timing APIs: {} - common in games/benchmarks", 
+                        importedTimingAPIs.size(), apiList))
+                    .Confidence(0.20) // LOW - this is very common in legit software
+                    .Severity(EvasionSeverity::Low) // Informational only
+                    .Build());
+            }
+
+            // QPC + GetTickCount combination analysis
+            // IMPORTANT: This combination is EXTREMELY COMMON in legitimate software:
+            // - Games use QPC for frame timing and GetTickCount for session time
+            // - Media players use both for A/V sync
+            // - Many apps use GetTickCount for coarse timing and QPC for precise timing
+            // 
+            // We should NOT flag this as suspicious without additional context
+            // (e.g., both being called in tight succession with delta comparison)
+            bool hasQPC = false;
+            bool hasGetTickCount = false;
+            for (const auto* api : importedTimingAPIs) {
+                if (strcmp(api->functionName, "QueryPerformanceCounter") == 0 ||
+                    strcmp(api->functionName, "NtQueryPerformanceCounter") == 0) {
+                    hasQPC = true;
+                }
+                if (strcmp(api->functionName, "GetTickCount") == 0 ||
+                    strcmp(api->functionName, "GetTickCount64") == 0) {
+                    hasGetTickCount = true;
+                }
+            }
+
+            // Having both QPC and GetTickCount is NOT suspicious on its own
+            // Only flag if combined with other suspicious indicators (handled elsewhere)
+            // DO NOT ADD DETECTION HERE - too many false positives
+            (void)hasQPC;
+            (void)hasGetTickCount;
+        }
+        catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeIATForTimingAPIs: Exception during IAT parsing");
+        }
+    }
+
+    /// @brief Process imports from a single DLL for timing API detection
+    void DebuggerEvasionDetector::ProcessDLLImportsForTiming(
+        HANDLE hProcess,
+        LPVOID moduleBase,
+        const IMAGE_IMPORT_DESCRIPTOR* importDesc,
+        const char* dllName,
+        bool is64Bit,
+        const std::unordered_map<std::string, const TimingAPIInfo*>& timingApiMap,
+        std::vector<const TimingAPIInfo*>& importedTimingAPIs,
+        DebuggerEvasionResult& result
+    ) noexcept {
+        if (!importDesc || !dllName) return;
+
+        // Use OriginalFirstThunk (Import Name Table) if available, else FirstThunk (IAT)
+        DWORD thunkRva = importDesc->OriginalFirstThunk ? importDesc->OriginalFirstThunk : importDesc->FirstThunk;
+        if (thunkRva == 0) return;
+
+        // Convert DLL name to lowercase for comparison
+        std::string dllNameLower(dllName);
+        std::transform(dllNameLower.begin(), dllNameLower.end(), dllNameLower.begin(), ::tolower);
+
+        try {
+            // Read thunk array (limited to reasonable size)
+            constexpr size_t MAX_THUNKS = 4096;
+            const size_t thunkSize = is64Bit ? sizeof(IMAGE_THUNK_DATA64) : sizeof(IMAGE_THUNK_DATA32);
+            std::vector<uint8_t> thunkBuffer(MAX_THUNKS * thunkSize);
+
+            SIZE_T bytesRead = 0;
+            void* thunkAddr = static_cast<uint8_t*>(moduleBase) + thunkRva;
+
+            if (!ReadProcessMemory(hProcess, thunkAddr, thunkBuffer.data(), thunkBuffer.size(), &bytesRead) || bytesRead == 0) {
+                return;
+            }
+
+            size_t thunkCount = 0;
+            const size_t maxValidOffset = bytesRead >= thunkSize ? bytesRead - thunkSize : 0;
+            
+            while (thunkCount < MAX_THUNKS) {
+                // SECURITY: Bounds check - ensure we don't read beyond bytesRead
+                const size_t currentOffset = thunkCount * thunkSize;
+                if (currentOffset > maxValidOffset) {
+                    break; // Would read past the data we actually got
+                }
+                
+                uint64_t thunkValue = 0;
+
+                if (is64Bit) {
+                    auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(thunkBuffer.data() + thunkCount * thunkSize);
+                    if (thunk->u1.AddressOfData == 0) break;
+                    thunkValue = thunk->u1.AddressOfData;
+                }
+                else {
+                    auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(thunkBuffer.data() + thunkCount * thunkSize);
+                    if (thunk->u1.AddressOfData == 0) break;
+                    thunkValue = thunk->u1.AddressOfData;
+                }
+
+                // Check if import by ordinal
+                const uint64_t ordinalFlag = is64Bit ? IMAGE_ORDINAL_FLAG64 : IMAGE_ORDINAL_FLAG32;
+                if (!(thunkValue & ordinalFlag)) {
+                    // Import by name - read IMAGE_IMPORT_BY_NAME
+                    DWORD nameRva = static_cast<DWORD>(thunkValue);
+                    char funcNameBuf[256] = {};
+                    void* funcNameAddr = static_cast<uint8_t*>(moduleBase) + nameRva + 2; // Skip Hint
+
+                    if (ReadProcessMemory(hProcess, funcNameAddr, funcNameBuf, sizeof(funcNameBuf) - 1, &bytesRead)) {
+                        funcNameBuf[sizeof(funcNameBuf) - 1] = '\0';
+
+                        // Check if this is a timing API
+                        auto it = timingApiMap.find(funcNameBuf);
+                        if (it != timingApiMap.end()) {
+                            const TimingAPIInfo* apiInfo = it->second;
+
+                            // Verify DLL name matches (case-insensitive)
+                            std::string expectedDll(apiInfo->dllName);
+                            std::transform(expectedDll.begin(), expectedDll.end(), expectedDll.begin(), ::tolower);
+
+                            if (dllNameLower.find(expectedDll) != std::string::npos ||
+                                expectedDll.find(dllNameLower) != std::string::npos) {
+
+                                importedTimingAPIs.push_back(apiInfo);
+
+                                // Report detection for high-severity timing APIs
+                                if (apiInfo->baseSeverity >= EvasionSeverity::Medium) {
+                                    AddDetection(result, DetectionPatternBuilder()
+                                        .Technique(apiInfo->technique)
+                                        .Description(apiInfo->description)
+                                        .TechnicalDetails(std::format(L"Import: {} from {}",
+                                            Utils::StringUtils::ToWide(apiInfo->functionName),
+                                            Utils::StringUtils::ToWide(dllName)))
+                                        .Confidence(apiInfo->baseConfidence)
+                                        .Severity(apiInfo->baseSeverity)
+                                        .Build());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                thunkCount++;
+            }
+        }
+        catch (...) {
+            // Continue processing other DLLs
+        }
+    }
+
+    /// @brief Detect direct access to KUSER_SHARED_DATA for timing (bypasses API hooks)
+    void DebuggerEvasionDetector::AnalyzeKUserSharedDataAccess(
+        HANDLE hProcess,
+        const MODULEINFO& modInfo,
+        bool is64Bit,
+        DebuggerEvasionResult& result
+    ) noexcept {
+        // KUSER_SHARED_DATA is at fixed address 0x7FFE0000 on all Windows versions
+        // Malware can read timing directly:
+        //   - SystemTime at offset 0x14
+        //   - InterruptTime at offset 0x8
+        //   - TickCount at offset 0x320
+
+        const auto* decoder = m_impl->GetDecoder(is64Bit);
+        if (!decoder) return;
+
+        try {
+            // Read first 64KB of main module to scan for KUSER_SHARED_DATA references
+            constexpr size_t SCAN_SIZE = 65536;
             std::vector<uint8_t> codeBuffer(SCAN_SIZE);
+            SIZE_T bytesRead = 0;
 
-            if (!ReadProcessMemory(hProcess, pEntryPoint, codeBuffer.data(), SCAN_SIZE, &bytesRead) || bytesRead == 0) {
+            if (!ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, codeBuffer.data(), SCAN_SIZE, &bytesRead) || bytesRead == 0) {
                 return;
             }
 
-            // Track unique timing detections to avoid duplicates
-            std::unordered_set<uintptr_t> detectedAddresses;
+            // Look for references to 0x7FFE0000 range
+            // Common patterns:
+            //   mov rax, 0x7FFE0000
+            //   mov eax, [0x7FFE0320]  ; TickCount
+            //   mov rax, [rip+xxxx] where target is 0x7FFE...
 
-            // Scan for timing-related instructions using Zydis
+            constexpr uint32_t KUSER_SHARED_DATA_BASE = 0x7FFE0000;
+            constexpr uint32_t KUSER_SHARED_DATA_END = 0x7FFE1000;
+
             size_t offset = 0;
-            uint32_t rdtscCount = 0;
-            uint32_t rdtscpCount = 0;
-            uint32_t cpuidCount = 0;
+            uint32_t kuserdataRefCount = 0;
 
             while (offset + 15 <= bytesRead) {
                 ZydisDecodedInstruction instruction;
                 ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
 
                 if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, codeBuffer.data() + offset, bytesRead - offset, &instruction, operands))) {
-                    uintptr_t instrAddress = reinterpret_cast<uintptr_t>(pEntryPoint) + offset;
 
-                    switch (instruction.mnemonic) {
-                    case ZYDIS_MNEMONIC_RDTSC:
-                        if (detectedAddresses.insert(instrAddress).second) {
-                            rdtscCount++;
-                            if (rdtscCount <= 3) { // Report first 3 occurrences
-                                AddDetection(result, DetectionPatternBuilder()
-                                    .Technique(EvasionTechnique::TIMING_RDTSC)
-                                    .Description(L"RDTSC instruction detected (high-resolution timing)")
-                                    .Address(instrAddress)
-                                    .TechnicalDetails(std::format(L"RDTSC at EP+0x{:X}", offset))
-                                    .Confidence(0.85)
-                                    .Severity(EvasionSeverity::High)
-                                    .Build());
+                    // Check for immediate values or memory operands referencing KUSER_SHARED_DATA
+                    for (uint8_t i = 0; i < instruction.operand_count && i < ZYDIS_MAX_OPERAND_COUNT; ++i) {
+                        const auto& op = operands[i];
+
+                        if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                            uint64_t imm = op.imm.value.u;
+                            if (imm >= KUSER_SHARED_DATA_BASE && imm < KUSER_SHARED_DATA_END) {
+                                kuserdataRefCount++;
+                                if (kuserdataRefCount <= 3) {
+                                    AddDetection(result, DetectionPatternBuilder()
+                                        .Technique(EvasionTechnique::TIMING_KUSER_SHARED_DATA)
+                                        .Description(L"Direct KUSER_SHARED_DATA access (timing without API)")
+                                        .Address(reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll) + offset)
+                                        .TechnicalDetails(std::format(L"Reference to 0x{:08X} at offset 0x{:X}", static_cast<uint32_t>(imm), offset))
+                                        .Confidence(0.95)
+                                        .Severity(EvasionSeverity::Critical)
+                                        .Build());
+                                }
                             }
                         }
-                        break;
-
-                    case ZYDIS_MNEMONIC_RDTSCP:
-                        if (detectedAddresses.insert(instrAddress).second) {
-                            rdtscpCount++;
-                            if (rdtscpCount <= 3) {
-                                AddDetection(result, DetectionPatternBuilder()
-                                    .Technique(EvasionTechnique::TIMING_RDTSCP)
-                                    .Description(L"RDTSCP instruction detected (serializing timing)")
-                                    .Address(instrAddress)
-                                    .TechnicalDetails(std::format(L"RDTSCP at EP+0x{:X}", offset))
-                                    .Confidence(0.90)
-                                    .Severity(EvasionSeverity::High)
-                                    .Build());
+                        else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                            // Check displacement for KUSER_SHARED_DATA addresses
+                            if (op.mem.disp.has_displacement) {
+                                int64_t disp = op.mem.disp.value;
+                                // For absolute addressing or large displacements that might be KUSD
+                                if (disp >= KUSER_SHARED_DATA_BASE && disp < KUSER_SHARED_DATA_END) {
+                                    kuserdataRefCount++;
+                                    if (kuserdataRefCount <= 3) {
+                                        AddDetection(result, DetectionPatternBuilder()
+                                            .Technique(EvasionTechnique::TIMING_KUSER_SHARED_DATA)
+                                            .Description(L"Memory read from KUSER_SHARED_DATA (timing evasion)")
+                                            .Address(reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll) + offset)
+                                            .TechnicalDetails(std::format(L"Memory access at 0x{:08X}, offset 0x{:X}", static_cast<uint32_t>(disp), offset))
+                                            .Confidence(0.98)
+                                            .Severity(EvasionSeverity::Critical)
+                                            .Build());
+                                    }
+                                }
                             }
                         }
-                        break;
-
-                    case ZYDIS_MNEMONIC_CPUID:
-                        // CPUID can be used for timing (serialization) and VM detection
-                        if (detectedAddresses.insert(instrAddress).second) {
-                            cpuidCount++;
-                            // Only flag if near entry point (first 512 bytes) - more suspicious
-                            if (offset < 512 && cpuidCount <= 2) {
-                                AddDetection(result, DetectionPatternBuilder()
-                                    .Technique(EvasionTechnique::TIMING_RDTSC) // Reuse timing category
-                                    .Description(L"CPUID near entry point (potential timing/VM check)")
-                                    .Address(instrAddress)
-                                    .TechnicalDetails(std::format(L"CPUID at EP+0x{:X}", offset))
-                                    .Confidence(0.60)
-                                    .Severity(EvasionSeverity::Medium)
-                                    .Build());
-                            }
-                        }
-                        break;
-
-                    default:
-                        break;
                     }
 
                     offset += instruction.length;
@@ -2170,50 +3448,18 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
-            // Check for paired RDTSC instructions (classic timing check pattern)
-            if (rdtscCount >= 2 || rdtscpCount >= 2) {
+            if (kuserdataRefCount > 3) {
                 AddDetection(result, DetectionPatternBuilder()
-                    .Technique(EvasionTechnique::TIMING_RDTSC)
-                    .Description(L"Multiple timing instructions detected (timing attack pattern)")
-                    .TechnicalDetails(std::format(L"RDTSC: {}, RDTSCP: {}", rdtscCount, rdtscpCount))
-                    .Confidence(0.95)
-                    .Severity(EvasionSeverity::High)
+                    .Technique(EvasionTechnique::TIMING_KUSER_SHARED_DATA)
+                    .Description(L"Multiple KUSER_SHARED_DATA references (advanced timing evasion)")
+                    .TechnicalDetails(std::format(L"Found {} references to KUSER_SHARED_DATA (0x7FFE0000)", kuserdataRefCount))
+                    .Confidence(0.99)
+                    .Severity(EvasionSeverity::Critical)
                     .Build());
             }
-
-            // Check for API-based timing by scanning IAT for timing functions
-            // GetTickCount, GetTickCount64, QueryPerformanceCounter, timeGetTime
-            const char* timingApis[] = {
-                "GetTickCount", "GetTickCount64", "QueryPerformanceCounter",
-                "QueryPerformanceFrequency", "timeGetTime", "GetSystemTimeAsFileTime"
-            };
-
-            // Get IAT from PE
-            DWORD iatRva = 0;
-            DWORD iatSize = 0;
-
-            if (result.is64Bit) {
-                if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
-                    iatRva = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-                    iatSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
-                }
-            }
-            else {
-                auto* ntHeaders32 = reinterpret_cast<IMAGE_NT_HEADERS32*>(headerBuffer + dosHeader->e_lfanew);
-                if (ntHeaders32->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
-                    iatRva = ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-                    iatSize = ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
-                }
-            }
-
-            // Note: Full IAT parsing for timing API imports would require significant
-            // additional implementation. The instruction-level analysis above provides
-            // the primary detection capability for anti-debug timing techniques.
-
-            result.techniquesChecked += 6; // RDTSC, RDTSCP, QPC, GetTickCount variants
         }
         catch (...) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeTimingPatterns: Exception during analysis");
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeKUserSharedDataAccess: Exception");
         }
     }
 
@@ -2772,7 +4018,7 @@ namespace ShadowStrike::AntiEvasion {
                 // Validate syscall stub for Nt* functions
                 if (funcName[0] == 'N' && funcName[1] == 't' && result.is64Bit) {
                     std::wstring stubDetails;
-                    if (!m_impl->ValidateSyscallStub(remoteBytes, bytesRead, true, stubDetails)) {
+                    if (!m_impl->ValidateSyscallStub(remoteBytes, bytesRead, true, stubDetails, funcName)) {
                         AddDetection(result, DetectionPatternBuilder()
                             .Technique(EvasionTechnique::CODE_InlineHooks)
                             .Description(std::format(L"Syscall stub tampered: {}", Utils::StringUtils::ToWide(funcName)))
@@ -3177,11 +4423,9 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckTimingTechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
-        bool result = CheckTimingTechniquesInternal(hProcess, processId, outDetections, err);
-        CloseHandle(hProcess);
-        return result;
+        return CheckTimingTechniquesInternal(hProcess.Get(), processId, outDetections, err);
     }
 
     bool DebuggerEvasionDetector::CheckAPITechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
@@ -3198,11 +4442,9 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckExceptionTechniques(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
-        bool result = CheckExceptionTechniquesInternal(hProcess, processId, outDetections, err);
-        CloseHandle(hProcess);
-        return result;
+        return CheckExceptionTechniquesInternal(hProcess.Get(), processId, outDetections, err);
     }
 
     bool DebuggerEvasionDetector::CheckParentProcess(uint32_t processId, ParentProcessInfo& outParentInfo, Error* err) noexcept {
@@ -3218,7 +4460,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckDebugObjectHandles(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
         bool detected = false;
 
@@ -3226,7 +4468,7 @@ namespace ShadowStrike::AntiEvasion {
             HANDLE hDebugObj = NULL;
             ULONG len = 0;
             NTSTATUS status = m_impl->m_NtQueryInformationProcess(
-                hProcess, ProcessDebugObjectHandle, &hDebugObj, sizeof(hDebugObj), &len
+                hProcess.Get(), ProcessDebugObjectHandle, &hDebugObj, sizeof(hDebugObj), &len
             );
             if (status >= 0 && hDebugObj != NULL) {
                 detected = true;
@@ -3237,21 +4479,20 @@ namespace ShadowStrike::AntiEvasion {
                 outDetections.push_back(tech);
             }
         }
-        CloseHandle(hProcess);
         return detected;
     }
 
     bool DebuggerEvasionDetector::CheckSelfDebugging(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
         bool detected = false;
 
         if (m_impl->m_NtQueryInformationProcess) {
             PROCESS_BASIC_INFORMATION pbi = {};
-            if (m_impl->m_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL) >= 0 && pbi.PebBaseAddress) {
+            if (m_impl->m_NtQueryInformationProcess(hProcess.Get(), 0, &pbi, sizeof(pbi), NULL) >= 0 && pbi.PebBaseAddress) {
                 uint8_t beingDebugged = 0;
                 SIZE_T read = 0;
-                if (ReadProcessMemory(hProcess, (PBYTE)pbi.PebBaseAddress + 2, &beingDebugged, 1, &read) && beingDebugged) {
+                if (ReadProcessMemory(hProcess.Get(), (PBYTE)pbi.PebBaseAddress + 2, &beingDebugged, 1, &read) && beingDebugged) {
                     detected = true;
                     DetectedTechnique tech(EvasionTechnique::PEB_BeingDebugged);
                     tech.severity = EvasionSeverity::Medium;
@@ -3261,24 +4502,19 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
         }
-        CloseHandle(hProcess);
         return detected;
     }
 
     bool DebuggerEvasionDetector::CheckTLSCallbacks(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
-        bool result = CheckTLSCallbacksInternal(hProcess, processId, outDetections, err);
-        CloseHandle(hProcess);
-        return result;
+        return CheckTLSCallbacksInternal(hProcess.Get(), processId, outDetections, err);
     }
 
     bool DebuggerEvasionDetector::CheckHiddenThreads(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
-        bool result = CheckHiddenThreadsInternal(hProcess, processId, outDetections, err);
-        CloseHandle(hProcess);
-        return result;
+        return CheckHiddenThreadsInternal(hProcess.Get(), processId, outDetections, err);
     }
 
     bool DebuggerEvasionDetector::CheckKernelDebugInfo(std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
@@ -3304,15 +4540,13 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool DebuggerEvasionDetector::CheckAPIHookDetection(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
-        bool result = CheckAPIHookDetectionInternal(hProcess, processId, outDetections, err);
-        CloseHandle(hProcess);
-        return result;
+        return CheckAPIHookDetectionInternal(hProcess.Get(), processId, outDetections, err);
     }
 
     bool DebuggerEvasionDetector::CheckCodeIntegrity(uint32_t processId, std::vector<DetectedTechnique>& outDetections, Error* err) noexcept {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        ProcessHandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
         if (!hProcess) return false;
 
         bool detected = false;
@@ -3321,7 +4555,7 @@ namespace ShadowStrike::AntiEvasion {
             PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION callbackInfo = {};
             ULONG len = 0;
             NTSTATUS status = m_impl->m_NtQueryInformationProcess(
-                hProcess, 40, &callbackInfo, sizeof(callbackInfo), &len
+                hProcess.Get(), 40, &callbackInfo, sizeof(callbackInfo), &len
             );
 
             if (status >= 0 && callbackInfo.Callback != 0) {
@@ -3334,7 +4568,6 @@ namespace ShadowStrike::AntiEvasion {
                 outDetections.push_back(tech);
             }
         }
-        CloseHandle(hProcess);
         return detected;
     }
 
