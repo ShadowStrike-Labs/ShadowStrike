@@ -1286,26 +1286,32 @@ namespace ShadowStrike {
             /// @brief Hash type (SSDEEP, TLSH)
             std::wstring hashType;
 
-            /// @brief Computed hash
-            std::string computedHash;
+            /// @brief Computed hash value
+            std::wstring computedHash;
 
-            /// @brief Matched hash
-            std::string matchedHash;
+            /// @brief Matched hash from database (empty if no match)
+            std::wstring matchedHash;
 
-            /// @brief Similarity score (SSDEEP: 0-100, TLSH: distance)
+            /// @brief Similarity score (SSDEEP: 0-100, TLSH: distance where lower=better)
             int similarityScore = 0;
 
-            /// @brief Matched family name
+            /// @brief Matched malware family name (from HashStore/SignatureStore)
+            std::wstring malwareFamily;
+
+            /// @brief Matched family name (alias for backward compatibility)
             std::wstring familyName;
 
             /// @brief Matched variant name
             std::wstring variantName;
 
-            /// @brief Match confidence
+            /// @brief Match confidence (0.0-1.0)
             double confidence = 0.0;
 
-            /// @brief Is significant match
+            /// @brief Is significant match (threat level >= Medium)
             bool isSignificant = false;
+
+            /// @brief Threat level from signature database
+            SignatureStore::ThreatLevel threatLevel = SignatureStore::ThreatLevel::Info;
         };
 
         /**

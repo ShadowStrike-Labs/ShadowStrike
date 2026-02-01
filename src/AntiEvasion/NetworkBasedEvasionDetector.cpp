@@ -1849,9 +1849,243 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     bool NetworkBasedEvasionDetector::Impl::DetectPromiscuousMode() const noexcept {
-        // This would require raw socket access or driver-level detection
-        // For now, return false as this requires elevated privileges
-        return false;
+        // ============================================================================
+        // Enterprise-grade promiscuous mode detection for network interface cards
+        // Malware analysis tools and network sniffers often put NICs in promiscuous mode
+        // This function detects such behavior which may indicate sandbox/analysis environment
+        // ============================================================================
+        
+        try {
+            // Allocate buffer for adapter information
+            ULONG bufferSize = 0;
+            DWORD result = ::GetAdaptersAddresses(
+                AF_UNSPEC,
+                GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                nullptr,
+                nullptr,
+                &bufferSize
+            );
+            
+            if (result != ERROR_BUFFER_OVERFLOW || bufferSize == 0) {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"GetAdaptersAddresses initial call failed with code: %lu", result);
+                return false;
+            }
+            
+            // Cap allocation to prevent memory exhaustion attacks
+            constexpr ULONG MAX_ADAPTER_BUFFER = 64 * 1024; // 64 KB max
+            if (bufferSize > MAX_ADAPTER_BUFFER) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Adapter buffer size exceeds limit: %lu > %lu", 
+                    bufferSize, MAX_ADAPTER_BUFFER);
+                return false;
+            }
+            
+            // RAII buffer allocation
+            auto adapterBuffer = std::make_unique<uint8_t[]>(bufferSize);
+            auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(adapterBuffer.get());
+            
+            result = ::GetAdaptersAddresses(
+                AF_UNSPEC,
+                GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                nullptr,
+                adapters,
+                &bufferSize
+            );
+            
+            if (result != ERROR_SUCCESS) {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"GetAdaptersAddresses failed with code: %lu", result);
+                return false;
+            }
+            
+            // Track promiscuous interfaces found
+            bool promiscuousFound = false;
+            std::vector<std::wstring> promiscuousAdapters;
+            
+            // NDIS packet filter constants (defined locally to avoid header dependencies)
+            constexpr ULONG LOCAL_NDIS_PACKET_TYPE_PROMISCUOUS = 0x00000020;
+            constexpr ULONG LOCAL_NDIS_PACKET_TYPE_ALL_LOCAL = 0x00000080;
+            // IOCTL for querying NDIS global statistics (hardcoded to avoid CTL_CODE macro issues)
+            constexpr DWORD LOCAL_IOCTL_NDIS_QUERY_GLOBAL_STATS = 0x00170002;
+            // OID for packet filter query
+            constexpr ULONG LOCAL_OID_GEN_CURRENT_PACKET_FILTER = 0x0001010E;
+            
+            // Iterate through all adapters
+            for (PIP_ADAPTER_ADDRESSES adapter = adapters; 
+                 adapter != nullptr; 
+                 adapter = adapter->Next) {
+                
+                // Skip loopback and tunnel adapters - not relevant for sniffing
+                if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+                    adapter->IfType == IF_TYPE_TUNNEL) {
+                    continue;
+                }
+                
+                // Skip adapters that are not operational
+                if (adapter->OperStatus != IfOperStatusUp) {
+                    continue;
+                }
+                
+                // Method 1: Query MIB_IF_ROW2 for packet statistics analysis
+                MIB_IF_ROW2 ifRow = {};
+                ifRow.InterfaceLuid = adapter->Luid;
+                
+                DWORD mibResult = ::GetIfEntry2(&ifRow);
+                if (mibResult == NO_ERROR) {
+                    // Check if incoming packets >> outgoing (typical of passive sniffing)
+                    if (ifRow.InUcastPkts > 0 && ifRow.OutUcastPkts > 0) {
+                        double inOutRatio = static_cast<double>(ifRow.InUcastPkts) / 
+                                           static_cast<double>(ifRow.OutUcastPkts);
+                        
+                        // Extremely high ratio might indicate passive capture
+                        // Normal ratio is typically < 10:1, sniffers can be 100:1+
+                        if (inOutRatio > 50.0 && ifRow.InUcastPkts > 100000) {
+                            SS_LOG_INFO(LOG_CATEGORY,
+                                L"High in/out packet ratio on %ls: %.2f:1 (%llu in, %llu out)",
+                                adapter->FriendlyName ? adapter->FriendlyName : L"Unknown",
+                                inOutRatio, ifRow.InUcastPkts, ifRow.OutUcastPkts);
+                        }
+                    }
+                }
+                
+                // Method 2: Check via NDIS OID query using DeviceIoControl
+                // This requires admin privileges but we're an EDR so we have them
+                
+                // Build the device path for the adapter
+                if (adapter->AdapterName == nullptr) {
+                    continue; // Can't query without adapter name
+                }
+                
+                // AdapterName is GUID format like {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
+                std::string guidStr(adapter->AdapterName);
+                std::wstring guidWide(guidStr.begin(), guidStr.end());
+                std::wstring devicePath = L"\\\\.\\NDIS_" + guidWide;
+                
+                // Open handle to the NDIS device
+                HANDLE hDevice = ::CreateFileW(
+                    devicePath.c_str(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    0,
+                    nullptr
+                );
+                
+                if (hDevice != INVALID_HANDLE_VALUE) {
+                    // Query OID_GEN_CURRENT_PACKET_FILTER
+                    ULONG oidQuery = LOCAL_OID_GEN_CURRENT_PACKET_FILTER;
+                    ULONG packetFilter = 0;
+                    DWORD bytesReturned = 0;
+                    
+                    if (::DeviceIoControl(
+                            hDevice,
+                            LOCAL_IOCTL_NDIS_QUERY_GLOBAL_STATS,
+                            &oidQuery,
+                            sizeof(oidQuery),
+                            &packetFilter,
+                            sizeof(packetFilter),
+                            &bytesReturned,
+                            nullptr)) {
+                        
+                        if (bytesReturned >= sizeof(ULONG)) {
+                            // Check for promiscuous mode flags
+                            if (packetFilter & LOCAL_NDIS_PACKET_TYPE_PROMISCUOUS) {
+                                promiscuousFound = true;
+                                promiscuousAdapters.push_back(
+                                    adapter->FriendlyName ? adapter->FriendlyName : L"Unknown"
+                                );
+                                
+                                SS_LOG_WARN(LOG_CATEGORY,
+                                    L"Promiscuous mode detected on adapter: %ls (filter: 0x%08X)",
+                                    adapter->FriendlyName ? adapter->FriendlyName : L"Unknown",
+                                    packetFilter);
+                            }
+                            else if (packetFilter & LOCAL_NDIS_PACKET_TYPE_ALL_LOCAL) {
+                                // ALL_LOCAL is less suspicious but still worth noting
+                                SS_LOG_DEBUG(LOG_CATEGORY,
+                                    L"ALL_LOCAL packet filter on adapter: %ls (filter: 0x%08X)",
+                                    adapter->FriendlyName ? adapter->FriendlyName : L"Unknown",
+                                    packetFilter);
+                            }
+                        }
+                    }
+                    
+                    ::CloseHandle(hDevice);
+                }
+                
+            } // End adapter loop
+            
+            // Method 3: Check for packet capture driver presence (system-wide check, do once)
+            static bool driversChecked = false;
+            static bool captureDriversFound = false;
+            
+            if (!driversChecked) {
+                driversChecked = true;
+                
+                // Check for WinPcap/Npcap service
+                SC_HANDLE hSCManager = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+                if (hSCManager != nullptr) {
+                    const wchar_t* captureServices[] = {
+                        L"npf",      // WinPcap/Npcap driver
+                        L"npcap",    // Npcap service
+                        L"NPF",      // Legacy WinPcap
+                    };
+                    
+                    for (const auto* serviceName : captureServices) {
+                        SC_HANDLE hService = ::OpenServiceW(hSCManager, serviceName, SERVICE_QUERY_STATUS);
+                        if (hService != nullptr) {
+                            SERVICE_STATUS status = {};
+                            if (::QueryServiceStatus(hService, &status)) {
+                                if (status.dwCurrentState == SERVICE_RUNNING) {
+                                    captureDriversFound = true;
+                                    SS_LOG_INFO(LOG_CATEGORY,
+                                        L"Packet capture driver running: %ls", serviceName);
+                                }
+                            }
+                            ::CloseServiceHandle(hService);
+                        }
+                    }
+                    ::CloseServiceHandle(hSCManager);
+                }
+                
+                // Check for NPF device directly
+                HANDLE hNpf = ::CreateFileW(
+                    L"\\\\.\\NPF",
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    0,
+                    nullptr
+                );
+                if (hNpf != INVALID_HANDLE_VALUE) {
+                    captureDriversFound = true;
+                    ::CloseHandle(hNpf);
+                    SS_LOG_INFO(LOG_CATEGORY,
+                        L"NPF device accessible - packet capture infrastructure present");
+                }
+            }
+            
+            // Combine results: promiscuous mode OR capture drivers indicate potential monitoring
+            if (promiscuousFound) {
+                m_stats.totalDetections.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Network monitoring detected: %zu adapter(s) in promiscuous mode",
+                    promiscuousAdapters.size());
+                return true;
+            }
+            
+            // Capture drivers alone are not definitive (many legitimate uses)
+            // but combined with other evasion signals could be significant
+            
+            return false;
+            
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Exception in DetectPromiscuousMode: %hs", e.what());
+            return false;
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Unknown exception in DetectPromiscuousMode");
+            return false;
+        }
     }
 
     // ========================================================================
@@ -1925,83 +2159,363 @@ namespace ShadowStrike::AntiEvasion {
         bool& outMismatch,
         std::wstring& outDetails
     ) const noexcept {
+        // ============================================================================
+        // Enterprise-grade SSL/TLS certificate validation
+        // Detects suspicious certificates commonly used by:
+        //   - C2 infrastructure (self-signed, expired, mismatched)
+        //   - MITM attacks (interception proxies)
+        //   - Malware callbacks (cheap/free certs, DV-only)
+        //   - Analysis environments (lab-generated certs)
+        // ============================================================================
+        
         outSelfSigned = false;
         outExpired = false;
         outMismatch = false;
         outDetails.clear();
 
         try {
+            // Input validation
+            if (domain.empty() || domain.length() > 253) {
+                outDetails = L"Invalid domain name";
+                return false;
+            }
+            
             Utils::NetworkUtils::SslCertificateInfo certInfo;
             // GetSslCertificate requires hostname, port, and certInfo
             if (!Utils::NetworkUtils::GetSslCertificate(domain, 443, certInfo)) {
-                outDetails = L"Failed to retrieve SSL certificate";
+                outDetails = L"Failed to retrieve SSL certificate - connection failed or no TLS";
                 return false;
             }
 
-            // Check if self-signed (also available as certInfo.isSelfSigned)
+            // Track all suspicious indicators for comprehensive reporting
+            std::vector<std::wstring> issues;
+            int suspicionScore = 0; // Cumulative score for severity assessment
+            
+            // ====================================================================
+            // CHECK 1: Self-signed certificate detection
+            // ====================================================================
             if (certInfo.isSelfSigned || certInfo.issuer == certInfo.subject) {
                 outSelfSigned = true;
-                outDetails += L"Self-signed certificate. ";
+                issues.push_back(L"Self-signed certificate");
+                suspicionScore += 40; // High suspicion
             }
 
-            // Check expiration
+            // ====================================================================
+            // CHECK 2: Certificate temporal validity
+            // ====================================================================
             auto now = std::chrono::system_clock::now();
+            
             if (now > certInfo.validTo) {
                 outExpired = true;
-                outDetails += L"Certificate expired. ";
+                
+                // Calculate how long expired
+                auto expiredDuration = std::chrono::duration_cast<std::chrono::hours>(now - certInfo.validTo);
+                int daysExpired = static_cast<int>(expiredDuration.count() / 24);
+                
+                issues.push_back(std::format(L"Certificate expired ({} days ago)", daysExpired));
+                
+                // Score based on severity - recently expired might be negligence, long expired is suspicious
+                if (daysExpired > 365) {
+                    suspicionScore += 50; // Very suspicious - over a year expired
+                } else if (daysExpired > 90) {
+                    suspicionScore += 35;
+                } else if (daysExpired > 30) {
+                    suspicionScore += 25;
+                } else {
+                    suspicionScore += 15; // Recently expired - might be admin oversight
+                }
             }
             else if (now < certInfo.validFrom) {
-                outDetails += L"Certificate not yet valid. ";
+                // Certificate not yet valid - even more suspicious than expired
+                auto notYetDuration = std::chrono::duration_cast<std::chrono::hours>(certInfo.validFrom - now);
+                int daysUntilValid = static_cast<int>(notYetDuration.count() / 24);
+                
+                issues.push_back(std::format(L"Certificate not yet valid (valid in {} days)", daysUntilValid));
+                suspicionScore += 45; // Very suspicious - indicates intentional manipulation
+            }
+            
+            // ====================================================================
+            // CHECK 3: Certificate validity period analysis
+            // ====================================================================
+            auto validityPeriod = std::chrono::duration_cast<std::chrono::hours>(certInfo.validTo - certInfo.validFrom);
+            int validityDays = static_cast<int>(validityPeriod.count() / 24);
+            
+            // Extremely short validity (< 30 days) is suspicious - might be temporary C2 infra
+            if (validityDays < 30 && validityDays > 0) {
+                issues.push_back(std::format(L"Very short validity period ({} days)", validityDays));
+                suspicionScore += 25;
+            }
+            // Extremely long validity (> 825 days / ~27 months) violates CA/Browser Forum rules
+            // Legitimate CAs since 2020 max out at 398 days (13 months)
+            else if (validityDays > 825) {
+                issues.push_back(std::format(L"Excessive validity period ({} days) - likely self-generated", validityDays));
+                suspicionScore += 20;
+            }
+            // > 398 days (current max for public CAs since Sept 2020)
+            else if (validityDays > 398 && !outSelfSigned) {
+                issues.push_back(std::format(L"Validity period ({} days) exceeds CA/Browser Forum maximum", validityDays));
+                suspicionScore += 10; // Moderate - might be older cert or internal CA
             }
 
-            // Check subject name mismatch
-            std::wstring subjectLower = certInfo.subject;
+            // ====================================================================
+            // CHECK 4: Subject name matching (RFC 6125 compliant)
+            // ====================================================================
             std::wstring domainLower(domain);
-            std::transform(subjectLower.begin(), subjectLower.end(),
-                subjectLower.begin(), ::towlower);
-            std::transform(domainLower.begin(), domainLower.end(),
-                domainLower.begin(), ::towlower);
-
+            std::transform(domainLower.begin(), domainLower.end(), domainLower.begin(), ::towlower);
+            
             bool nameMatches = false;
-            // Check CN in subject
-            if (subjectLower.find(domainLower) != std::wstring::npos) {
-                nameMatches = true;
+            
+            // Check Subject Common Name (CN) - deprecated but still used
+            std::wstring subjectLower = certInfo.subject;
+            std::transform(subjectLower.begin(), subjectLower.end(), subjectLower.begin(), ::towlower);
+            
+            // Extract CN from subject string (format: "CN=..., O=..., C=...")
+            size_t cnPos = subjectLower.find(L"cn=");
+            if (cnPos != std::wstring::npos) {
+                size_t cnEnd = subjectLower.find(L',', cnPos);
+                std::wstring cn = (cnEnd != std::wstring::npos) 
+                    ? subjectLower.substr(cnPos + 3, cnEnd - cnPos - 3)
+                    : subjectLower.substr(cnPos + 3);
+                
+                // Trim whitespace
+                while (!cn.empty() && std::iswspace(cn.front())) cn.erase(0, 1);
+                while (!cn.empty() && std::iswspace(cn.back())) cn.pop_back();
+                
+                // Check exact match or wildcard
+                if (cn == domainLower) {
+                    nameMatches = true;
+                }
+                else if (cn.length() > 2 && cn.substr(0, 2) == L"*.") {
+                    std::wstring wildcardBase = cn.substr(2);
+                    size_t dotPos = domainLower.find(L'.');
+                    if (dotPos != std::wstring::npos && domainLower.substr(dotPos + 1) == wildcardBase) {
+                        nameMatches = true;
+                    }
+                }
             }
-            // Check SANs
+            
+            // Check Subject Alternative Names (preferred method per RFC 6125)
             for (const auto& san : certInfo.subjectAltNames) {
+                if (nameMatches) break;
+                
                 std::wstring sanLower = san;
-                std::transform(sanLower.begin(), sanLower.end(),
-                    sanLower.begin(), ::towlower);
+                std::transform(sanLower.begin(), sanLower.end(), sanLower.begin(), ::towlower);
 
-                // Handle wildcard certs
-                if (sanLower.substr(0, 2) == L"*.") {
-                    std::wstring wildcard = sanLower.substr(2);
+                // Exact match
+                if (sanLower == domainLower) {
+                    nameMatches = true;
+                    break;
+                }
+                
+                // Wildcard match (RFC 6125 Section 6.4.3)
+                if (sanLower.length() > 2 && sanLower.substr(0, 2) == L"*.") {
+                    std::wstring wildcardBase = sanLower.substr(2);
                     size_t dotPos = domainLower.find(L'.');
                     if (dotPos != std::wstring::npos) {
-                        if (domainLower.substr(dotPos + 1) == wildcard) {
-                            nameMatches = true;
-                            break;
+                        // Wildcard only matches single label
+                        // *.example.com matches www.example.com but NOT www.sub.example.com
+                        std::wstring afterFirstDot = domainLower.substr(dotPos + 1);
+                        if (afterFirstDot == wildcardBase) {
+                            // Ensure the wildcard is not matching a multi-level subdomain
+                            size_t wildcardDots = std::count(domainLower.begin(), domainLower.begin() + dotPos, L'.');
+                            if (wildcardDots == 0) {
+                                nameMatches = true;
+                                break;
+                            }
                         }
                     }
                 }
-                else if (sanLower == domainLower) {
-                    nameMatches = true;
-                    break;
+                
+                // IP address SAN match (for IP-based domains)
+                // Format: "IP:x.x.x.x" or just IP address
+                if (sanLower.find(L"ip:") == 0) {
+                    std::wstring sanIp = sanLower.substr(3);
+                    if (sanIp == domainLower) {
+                        nameMatches = true;
+                        break;
+                    }
                 }
             }
 
             if (!nameMatches) {
                 outMismatch = true;
-                outDetails += L"Certificate name mismatch. ";
+                issues.push_back(L"Certificate name mismatch (CN/SAN doesn't match domain)");
+                suspicionScore += 30;
             }
 
-            // Note: keyBits not available in SslCertificateInfo struct
-            // Future enhancement: Add key strength validation when field is added
+            // ====================================================================
+            // CHECK 5: Issuer analysis for suspicious CAs
+            // ====================================================================
+            std::wstring issuerLower = certInfo.issuer;
+            std::transform(issuerLower.begin(), issuerLower.end(), issuerLower.begin(), ::towlower);
+            
+            // Known suspicious/revoked/low-trust CAs
+            static const std::vector<std::wstring> SUSPICIOUS_ISSUERS = {
+                L"symantec",           // Distrusted since 2018
+                L"thawte",             // Subsidiary of distrusted Symantec
+                L"verisign class 3",   // Older Symantec subsidiary
+                L"geotrust",           // Symantec subsidiary
+                L"rapidssl",           // Symantec subsidiary
+                L"startcom",           // Distrusted since 2016
+                L"wosign",             // Distrusted since 2016
+                L"certum",             // History of misissued certs
+                L"camerfirma",         // Compliance issues
+                // Known test/dev CAs that shouldn't be in production
+                L"localhost",
+                L"test",
+                L"development",
+                L"debug",
+                L"untrusted",
+                L"invalid",
+                L"example",
+                L"fiddler",            // HTTP debugger
+                L"charles",            // Charles Proxy
+                L"burp",               // Burp Suite
+                L"mitmproxy",          // MITM proxy
+                L"zscaler",            // SSL inspection (legitimate but indicates interception)
+            };
+            
+            for (const auto& suspicious : SUSPICIOUS_ISSUERS) {
+                if (issuerLower.find(suspicious) != std::wstring::npos) {
+                    issues.push_back(std::format(L"Suspicious issuer detected: {}", suspicious));
+                    
+                    // Score differently for distrusted vs interception
+                    if (suspicious == L"fiddler" || suspicious == L"charles" || 
+                        suspicious == L"burp" || suspicious == L"mitmproxy") {
+                        suspicionScore += 50; // Very suspicious - active interception
+                    } else if (suspicious == L"zscaler") {
+                        suspicionScore += 5; // Low - might be legitimate enterprise
+                    } else {
+                        suspicionScore += 25;
+                    }
+                    break;
+                }
+            }
+
+            // ====================================================================
+            // CHECK 6: Free/DV certificate detection (higher C2 correlation)
+            // ====================================================================
+            // These issuers offer free certificates commonly abused by malware
+            static const std::vector<std::wstring> FREE_DV_ISSUERS = {
+                L"let's encrypt",
+                L"letsencrypt",
+                L"zerossl",
+                L"buypass",
+                L"ssl.com",
+            };
+            
+            bool isFreeCert = false;
+            for (const auto& freeIssuer : FREE_DV_ISSUERS) {
+                if (issuerLower.find(freeIssuer) != std::wstring::npos) {
+                    isFreeCert = true;
+                    break;
+                }
+            }
+            
+            // Free certs alone aren't suspicious, but combined with other indicators...
+            if (isFreeCert && (outSelfSigned || outExpired || outMismatch)) {
+                issues.push_back(L"Free/DV certificate with other issues - higher C2 likelihood");
+                suspicionScore += 15;
+            }
+
+            // ====================================================================
+            // CHECK 7: Serial number analysis
+            // ====================================================================
+            if (!certInfo.serialNumber.empty()) {
+                // Check for common test serial numbers
+                if (certInfo.serialNumber == L"00" || 
+                    certInfo.serialNumber == L"01" ||
+                    certInfo.serialNumber == L"1" ||
+                    certInfo.serialNumber.length() < 4) {
+                    issues.push_back(L"Suspicious serial number (too short/simple)");
+                    suspicionScore += 20;
+                }
+                
+                // Check for sequential or all-same digit serials
+                bool allSame = true;
+                for (size_t i = 1; i < certInfo.serialNumber.length() && allSame; ++i) {
+                    if (certInfo.serialNumber[i] != certInfo.serialNumber[0]) {
+                        allSame = false;
+                    }
+                }
+                if (allSame && certInfo.serialNumber.length() > 3) {
+                    issues.push_back(L"Suspicious serial number (all same digits)");
+                    suspicionScore += 15;
+                }
+            }
+
+            // ====================================================================
+            // CHECK 8: Subject organization analysis
+            // ====================================================================
+            // Missing organization in certificate - DV certs don't require it but OV/EV do
+            bool hasOrganization = (subjectLower.find(L"o=") != std::wstring::npos);
+            
+            // High-value domains without organization cert are suspicious
+            static const std::vector<std::wstring> HIGH_VALUE_TLDS = {
+                L".bank", L".gov", L".mil", L".edu"
+            };
+            
+            for (const auto& tld : HIGH_VALUE_TLDS) {
+                if (domainLower.length() > tld.length() &&
+                    domainLower.substr(domainLower.length() - tld.length()) == tld) {
+                    if (!hasOrganization && !outSelfSigned) {
+                        issues.push_back(std::format(L"High-value domain ({}) without OV/EV certificate", tld));
+                        suspicionScore += 25;
+                    }
+                    break;
+                }
+            }
+
+            // ====================================================================
+            // CHECK 9: Recently issued certificate analysis
+            // ====================================================================
+            auto certAge = std::chrono::duration_cast<std::chrono::hours>(now - certInfo.validFrom);
+            int certAgeDays = static_cast<int>(certAge.count() / 24);
+            
+            // Certificate issued very recently AND combined with other issues
+            if (certAgeDays < 7 && suspicionScore > 0) {
+                issues.push_back(std::format(L"Very recently issued certificate ({} days old) with other issues", certAgeDays));
+                suspicionScore += 10;
+            }
+
+            // ====================================================================
+            // BUILD OUTPUT DETAILS
+            // ====================================================================
+            if (!issues.empty()) {
+                outDetails = L"SSL Issues: ";
+                for (size_t i = 0; i < issues.size(); ++i) {
+                    if (i > 0) outDetails += L"; ";
+                    outDetails += issues[i];
+                }
+                outDetails += std::format(L" [Suspicion Score: {}]", suspicionScore);
+                
+                // Log if highly suspicious
+                if (suspicionScore >= 50) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Highly suspicious SSL certificate for %.*ls: %ls", 
+                        static_cast<int>(domain.length()), domain.data(), outDetails.c_str());
+                }
+            }
+            
+            // Store suspicion metrics for analysis
+            if (suspicionScore > 0) {
+                m_stats.totalDetections.fetch_add(1, std::memory_order_relaxed);
+            }
 
             return true;
-        }
-        catch (...) {
-            outDetails = L"Certificate check failed";
+            
+        } catch (const std::exception& e) {
+            outDetails = std::format(L"Certificate check failed: {}",
+                Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Exception in CheckSSLCertificate for %.*ls: %ls", 
+                static_cast<int>(domain.length()), domain.data(), outDetails.c_str());
+            return false;
+        } catch (...) {
+            outDetails = L"Certificate check failed: unknown exception";
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Unknown exception in CheckSSLCertificate for %.*ls", 
+                static_cast<int>(domain.length()), domain.data());
             return false;
         }
     }
