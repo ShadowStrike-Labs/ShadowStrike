@@ -17,6 +17,7 @@
  * with ShadowStrike's PEParser for safe PE file handling.
  */
 
+#include "pch.h"
 #include "MetamorphicDetector.hpp"
 #include "../PEParser/PEParser.hpp"
 #include "../PEParser/PEConstants.hpp"
@@ -24,6 +25,12 @@
 #include "../Utils/MemoryUtils.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+
+// Fuzzy hashing libraries
+extern "C" {
+#include "ssdeep/fuzzy.h"
+}
+#include "tlsh/tlsh.h"
 
 #include <Zydis/Zydis.h>
 #include <Psapi.h>
@@ -1980,7 +1987,62 @@ bool MetamorphicDetector::PerformFuzzyMatching(
     MetamorphicError* err) noexcept
 {
     outMatches.clear();
-    return true;
+
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        if (err) {
+            err->win32Code = ERROR_NOT_READY;
+            err->message = L"MetamorphicDetector not initialized";
+        }
+        return false;
+    }
+
+    try {
+        // Compute SSDEEP hash for the file
+        auto ssdeepHash = ComputeSSDeep(filePath, err);
+        if (ssdeepHash.has_value() && !ssdeepHash->empty()) {
+            FuzzyHashMatch ssdeepMatch;
+            ssdeepMatch.hashType = L"SSDEEP";
+            ssdeepMatch.computedHash = *ssdeepHash;
+            ssdeepMatch.similarityScore = 0;
+            ssdeepMatch.confidence = 0.0;
+            ssdeepMatch.isSignificant = false;
+
+            // Compare against known malware SSDEEP hashes from our database
+            // This would integrate with SignatureStore/HashStore in production
+            // For now, we store the computed hash for potential matching
+            outMatches.push_back(std::move(ssdeepMatch));
+        }
+
+        // Compute TLSH hash for the file
+        auto tlshHash = ComputeTLSH(filePath, err);
+        if (tlshHash.has_value() && !tlshHash->empty()) {
+            FuzzyHashMatch tlshMatch;
+            tlshMatch.hashType = L"TLSH";
+            tlshMatch.computedHash = *tlshHash;
+            tlshMatch.similarityScore = INT_MAX; // TLSH uses distance (lower = better)
+            tlshMatch.confidence = 0.0;
+            tlshMatch.isSignificant = false;
+
+            outMatches.push_back(std::move(tlshMatch));
+        }
+
+        SS_LOG_DEBUG(L"MetamorphicDetector", 
+            L"Fuzzy matching computed {} hashes for: {}",
+            outMatches.size(), filePath);
+
+        return true;
+
+    } catch (const std::exception& e) {
+        if (err) {
+            err->win32Code = ERROR_INTERNAL_ERROR;
+            err->message = L"Exception in PerformFuzzyMatching: " + 
+                Utils::StringUtils::Utf8ToWide(e.what());
+        }
+        SS_LOG_ERROR(L"MetamorphicDetector", 
+            L"Exception in PerformFuzzyMatching: {}", 
+            Utils::StringUtils::Utf8ToWide(e.what()));
+        return false;
+    }
 }
 
 bool MetamorphicDetector::MatchKnownFamilies(
@@ -1990,29 +2052,402 @@ bool MetamorphicDetector::MatchKnownFamilies(
     MetamorphicError* err) noexcept
 {
     outMatches.clear();
-    return true;
+
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        if (err) {
+            err->win32Code = ERROR_NOT_READY;
+            err->message = L"MetamorphicDetector not initialized";
+        }
+        return false;
+    }
+
+    if (!buffer || size == 0) {
+        if (err) {
+            err->win32Code = ERROR_INVALID_PARAMETER;
+            err->message = L"Invalid buffer for family matching";
+        }
+        return false;
+    }
+
+    // Cap buffer size to prevent excessive processing
+    constexpr size_t MAX_MATCH_SIZE = 64 * 1024 * 1024; // 64MB
+    if (size > MAX_MATCH_SIZE) {
+        size = MAX_MATCH_SIZE;
+    }
+
+    try {
+        // Known metamorphic engine byte patterns (simplified - real implementation
+        // would use SignatureStore's Aho-Corasick multi-pattern matching)
+        struct KnownPattern {
+            const char* familyName;
+            const char* variant;
+            const uint8_t* pattern;
+            size_t patternLen;
+            const char* description;
+        };
+
+        // Simile virus marker pattern (code permutation engine indicator)
+        static constexpr uint8_t SIMILE_MARKER[] = { 0x8B, 0xC4, 0x8B, 0xEC, 0x83, 0xC4 };
+        
+        // MetaPHOR engine pattern (metamorphic shrink/expand)
+        static constexpr uint8_t METAPHOR_MARKER[] = { 0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5D };
+
+        // Zmist entry point obfuscation pattern
+        static constexpr uint8_t ZMIST_MARKER[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, 0xBA };
+
+        // Virut polymorphic decryptor pattern
+        static constexpr uint8_t VIRUT_MARKER[] = { 0x68, 0x00, 0x00, 0x00, 0x00, 0xE8 };
+
+        // Sality encryption stub
+        static constexpr uint8_t SALITY_MARKER[] = { 0x55, 0x8B, 0xEC, 0x83, 0xC4, 0xF0 };
+
+        static const KnownPattern PATTERNS[] = {
+            { "W32.Simile", "Generic", SIMILE_MARKER, sizeof(SIMILE_MARKER), "Metamorphic permutation engine" },
+            { "MetaPHOR", "Generic", METAPHOR_MARKER, sizeof(METAPHOR_MARKER), "Full metamorphic mutation" },
+            { "Zmist", "Mistfall", ZMIST_MARKER, sizeof(ZMIST_MARKER), "Entry point obscuration" },
+            { "W32.Virut", "Generic", VIRUT_MARKER, sizeof(VIRUT_MARKER), "Polymorphic file infector" },
+            { "W32.Sality", "Generic", SALITY_MARKER, sizeof(SALITY_MARKER), "Polymorphic virus" },
+        };
+
+        // Search for patterns in buffer
+        for (const auto& pat : PATTERNS) {
+            // Simple pattern search (production would use Aho-Corasick from PatternStore)
+            const uint8_t* haystack = buffer;
+            const uint8_t* haystackEnd = buffer + size - pat.patternLen;
+
+            while (haystack <= haystackEnd) {
+                if (std::memcmp(haystack, pat.pattern, pat.patternLen) == 0) {
+                    FamilyMatchInfo match;
+                    match.familyName = Utils::StringUtils::Utf8ToWide(pat.familyName);
+                    match.variant = Utils::StringUtils::Utf8ToWide(pat.variant);
+                    match.confidence = 0.65; // Pattern match alone is medium confidence
+                    match.matchMethod = L"BytePattern";
+                    match.matchedPattern = Utils::StringUtils::Utf8ToWide(pat.description);
+                    match.knownBehaviors.push_back(L"Code mutation");
+                    match.knownBehaviors.push_back(L"Signature evasion");
+
+                    outMatches.push_back(std::move(match));
+                    break; // One match per family is enough
+                }
+                ++haystack;
+            }
+        }
+
+        // Additional heuristic: check for GetPC (get program counter) techniques
+        // Common in polymorphic/metamorphic code
+        static constexpr uint8_t GETPC_CALL[] = { 0xE8, 0x00, 0x00, 0x00, 0x00 }; // call $+5
+        
+        const uint8_t* p = buffer;
+        const uint8_t* pEnd = buffer + size - 6;
+        int getPcCount = 0;
+
+        while (p < pEnd) {
+            if (std::memcmp(p, GETPC_CALL, sizeof(GETPC_CALL)) == 0) {
+                // Check if followed by POP
+                uint8_t nextByte = p[5];
+                if (nextByte >= 0x58 && nextByte <= 0x5F) { // pop eax-edi
+                    ++getPcCount;
+                }
+            }
+            ++p;
+        }
+
+        if (getPcCount >= 2) {
+            FamilyMatchInfo match;
+            match.familyName = L"Generic.Polymorphic";
+            match.variant = L"GetPC";
+            match.confidence = 0.5 + (std::min(getPcCount, 5) * 0.08);
+            match.matchMethod = L"GetPC_Heuristic";
+            match.matchedPattern = L"Multiple CALL $+5; POP reg sequences";
+            match.knownBehaviors.push_back(L"Position-independent code");
+            match.knownBehaviors.push_back(L"Self-decryption");
+
+            outMatches.push_back(std::move(match));
+        }
+
+        SS_LOG_DEBUG(L"MetamorphicDetector", 
+            L"Family matching found {} potential matches", outMatches.size());
+
+        return true;
+
+    } catch (const std::exception& e) {
+        if (err) {
+            err->win32Code = ERROR_INTERNAL_ERROR;
+            err->message = L"Exception in MatchKnownFamilies: " + 
+                Utils::StringUtils::Utf8ToWide(e.what());
+        }
+        SS_LOG_ERROR(L"MetamorphicDetector", 
+            L"Exception in MatchKnownFamilies: {}", 
+            Utils::StringUtils::Utf8ToWide(e.what()));
+        return false;
+    }
 }
 
 std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
     const std::wstring& filePath,
     MetamorphicError* err) noexcept
 {
-    return std::nullopt;
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        if (err) {
+            err->win32Code = ERROR_NOT_READY;
+            err->message = L"MetamorphicDetector not initialized";
+        }
+        return std::nullopt;
+    }
+
+    try {
+        // Memory-map the file for efficient access
+        Utils::MemoryUtils::MappedView mappedFile;
+        if (!mappedFile.mapReadOnly(filePath)) {
+            if (err) {
+                err->win32Code = GetLastError();
+                err->message = L"Failed to map file for SSDEEP: " + filePath;
+            }
+            return std::nullopt;
+        }
+
+        // SSDEEP needs minimum ~4KB for meaningful hash
+        constexpr size_t SSDEEP_MIN_SIZE = 4096;
+        if (mappedFile.size() < SSDEEP_MIN_SIZE) {
+            if (err) {
+                err->win32Code = ERROR_FILE_TOO_SMALL;
+                err->message = L"File too small for SSDEEP (< 4KB)";
+            }
+            SS_LOG_DEBUG(L"MetamorphicDetector", 
+                L"File too small for SSDEEP: {} ({} bytes)", 
+                filePath, mappedFile.size());
+            return std::nullopt;
+        }
+
+        // Cap at 256MB to prevent excessive memory/time usage
+        constexpr size_t SSDEEP_MAX_SIZE = 256 * 1024 * 1024;
+        size_t hashSize = std::min(mappedFile.size(), SSDEEP_MAX_SIZE);
+
+        // Allocate result buffer (FUZZY_MAX_RESULT = 148 bytes)
+        char hashBuffer[FUZZY_MAX_RESULT + 1] = { 0 };
+
+        // Compute SSDEEP using the library's buffer-based API
+        int result = fuzzy_hash_buf(
+            static_cast<const unsigned char*>(mappedFile.data()),
+            static_cast<uint32_t>(hashSize),
+            hashBuffer
+        );
+
+        if (result != 0) {
+            if (err) {
+                err->win32Code = ERROR_INVALID_DATA;
+                err->message = L"SSDEEP computation failed with code: " + 
+                    std::to_wstring(result);
+            }
+            SS_LOG_WARNING(L"MetamorphicDetector", 
+                L"SSDEEP computation failed (ret={}) for: {}", result, filePath);
+            return std::nullopt;
+        }
+
+        if (hashBuffer[0] == '\0') {
+            if (err) {
+                err->win32Code = ERROR_INVALID_DATA;
+                err->message = L"SSDEEP returned empty hash";
+            }
+            return std::nullopt;
+        }
+
+        std::string hash(hashBuffer);
+        SS_LOG_DEBUG(L"MetamorphicDetector", 
+            L"SSDEEP computed: {} for: {}", 
+            Utils::StringUtils::Utf8ToWide(hash), filePath);
+
+        return hash;
+
+    } catch (const std::exception& e) {
+        if (err) {
+            err->win32Code = ERROR_INTERNAL_ERROR;
+            err->message = L"Exception in ComputeSSDeep: " + 
+                Utils::StringUtils::Utf8ToWide(e.what());
+        }
+        SS_LOG_ERROR(L"MetamorphicDetector", 
+            L"Exception in ComputeSSDeep: {}", 
+            Utils::StringUtils::Utf8ToWide(e.what()));
+        return std::nullopt;
+    }
 }
 
 std::optional<std::string> MetamorphicDetector::ComputeTLSH(
     const std::wstring& filePath,
     MetamorphicError* err) noexcept
 {
-    return std::nullopt;
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        if (err) {
+            err->win32Code = ERROR_NOT_READY;
+            err->message = L"MetamorphicDetector not initialized";
+        }
+        return std::nullopt;
+    }
+
+    try {
+        // Memory-map the file for efficient access
+        Utils::MemoryUtils::MappedView mappedFile;
+        if (!mappedFile.mapReadOnly(filePath)) {
+            if (err) {
+                err->win32Code = GetLastError();
+                err->message = L"Failed to map file for TLSH: " + filePath;
+            }
+            return std::nullopt;
+        }
+
+        // TLSH requires minimum 256 bytes (MIN_CONSERVATIVE_DATA_LENGTH)
+        constexpr size_t TLSH_MIN_SIZE = 256;
+        if (mappedFile.size() < TLSH_MIN_SIZE) {
+            if (err) {
+                err->win32Code = ERROR_FILE_TOO_SMALL;
+                err->message = L"File too small for TLSH (< 256 bytes)";
+            }
+            SS_LOG_DEBUG(L"MetamorphicDetector", 
+                L"File too small for TLSH: {} ({} bytes)", 
+                filePath, mappedFile.size());
+            return std::nullopt;
+        }
+
+        // Create TLSH instance
+        Tlsh tlshObj;
+
+        // Feed data in chunks for better cache utilization on large files
+        constexpr size_t CHUNK_SIZE = 64 * 1024; // 64KB chunks
+        const unsigned char* data = static_cast<const unsigned char*>(mappedFile.data());
+        size_t remaining = mappedFile.size();
+        size_t offset = 0;
+
+        while (remaining > 0) {
+            size_t chunkSize = std::min(remaining, CHUNK_SIZE);
+            tlshObj.update(data + offset, static_cast<unsigned int>(chunkSize));
+            offset += chunkSize;
+            remaining -= chunkSize;
+        }
+
+        // Finalize the hash computation
+        tlshObj.final();
+
+        // Check if the TLSH object is valid
+        if (!tlshObj.isValid()) {
+            if (err) {
+                err->win32Code = ERROR_INVALID_DATA;
+                err->message = L"TLSH computation resulted in invalid hash";
+            }
+            SS_LOG_WARNING(L"MetamorphicDetector", 
+                L"TLSH invalid after final() for: {}", filePath);
+            return std::nullopt;
+        }
+
+        // Get the hash string with version prefix (T1)
+        char hashBuffer[TLSH_STRING_BUFFER_LEN] = { 0 };
+        const char* hashStr = tlshObj.getHash(hashBuffer, TLSH_STRING_BUFFER_LEN, 1);
+
+        if (!hashStr || hashStr[0] == '\0') {
+            if (err) {
+                err->win32Code = ERROR_INVALID_DATA;
+                err->message = L"TLSH getHash returned empty";
+            }
+            return std::nullopt;
+        }
+
+        std::string hash(hashStr);
+        SS_LOG_DEBUG(L"MetamorphicDetector", 
+            L"TLSH computed: {} for: {}", 
+            Utils::StringUtils::Utf8ToWide(hash), filePath);
+
+        return hash;
+
+    } catch (const std::exception& e) {
+        if (err) {
+            err->win32Code = ERROR_INTERNAL_ERROR;
+            err->message = L"Exception in ComputeTLSH: " + 
+                Utils::StringUtils::Utf8ToWide(e.what());
+        }
+        SS_LOG_ERROR(L"MetamorphicDetector", 
+            L"Exception in ComputeTLSH: {}", 
+            Utils::StringUtils::Utf8ToWide(e.what()));
+        return std::nullopt;
+    }
 }
 
 int MetamorphicDetector::CompareSSDeep(const std::string& hash1, const std::string& hash2) noexcept {
-    return 0;
+    // Validate inputs
+    if (hash1.empty() || hash2.empty()) {
+        return 0; // No similarity if either hash is empty
+    }
+
+    // SSDEEP hash format: blocksize:hash1:hash2
+    // Validate basic format
+    if (hash1.find(':') == std::string::npos || hash2.find(':') == std::string::npos) {
+        SS_LOG_WARNING(L"MetamorphicDetector", 
+            L"Invalid SSDEEP hash format in CompareSSDeep");
+        return 0;
+    }
+
+    // Use ssdeep library's fuzzy_compare function
+    // Returns: 0-100 similarity score, or -1 on error
+    int score = fuzzy_compare(hash1.c_str(), hash2.c_str());
+
+    if (score < 0) {
+        SS_LOG_WARNING(L"MetamorphicDetector", 
+            L"fuzzy_compare returned error: {}", score);
+        return 0;
+    }
+
+    return score;
 }
 
 int MetamorphicDetector::CompareTLSH(const std::string& hash1, const std::string& hash2) noexcept {
-    return INT_MAX;
+    // Validate inputs
+    if (hash1.empty() || hash2.empty()) {
+        return INT_MAX; // Maximum distance if either hash is empty
+    }
+
+    // TLSH hash format: T1 followed by hex string (72 chars for 128 buckets)
+    // Minimum valid length check
+    constexpr size_t MIN_TLSH_LEN = 70; // T1 + 68 hex chars minimum
+    if (hash1.length() < MIN_TLSH_LEN || hash2.length() < MIN_TLSH_LEN) {
+        SS_LOG_WARNING(L"MetamorphicDetector", 
+            L"TLSH hash too short in CompareTLSH");
+        return INT_MAX;
+    }
+
+    try {
+        // Create TLSH objects from hash strings
+        Tlsh tlsh1;
+        Tlsh tlsh2;
+
+        // Parse hash strings into TLSH objects
+        if (tlsh1.fromTlshStr(hash1.c_str()) != 0) {
+            SS_LOG_WARNING(L"MetamorphicDetector", 
+                L"Failed to parse first TLSH hash");
+            return INT_MAX;
+        }
+
+        if (tlsh2.fromTlshStr(hash2.c_str()) != 0) {
+            SS_LOG_WARNING(L"MetamorphicDetector", 
+                L"Failed to parse second TLSH hash");
+            return INT_MAX;
+        }
+
+        // Compute distance (lower = more similar)
+        // len_diff=true includes length difference in calculation
+        int distance = tlsh1.totalDiff(&tlsh2, true);
+
+        // TLSH distance typically ranges from 0 (identical) to ~300+ (very different)
+        // Common thresholds:
+        // < 30: Very similar (likely same family/variant)
+        // < 100: Similar (potentially related)
+        // > 200: Likely unrelated
+
+        return distance;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"MetamorphicDetector", 
+            L"Exception in CompareTLSH: {}", 
+            Utils::StringUtils::Utf8ToWide(e.what()));
+        return INT_MAX;
+    }
 }
 
 // ============================================================================

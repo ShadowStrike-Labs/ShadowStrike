@@ -76,6 +76,7 @@
 #include <execution>
 #include <numeric>
 #include <queue>
+#include <cwctype>
 #include <regex>
 #include <sstream>
 #include <format>

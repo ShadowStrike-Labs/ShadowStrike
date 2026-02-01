@@ -36,9 +36,9 @@
  */
 
 #pragma once
-#include<yara.h>
-#include "SignatureFormat.hpp"
+#include <yara.h>
 
+#include "SignatureFormat.hpp"
 #include <memory>
 #include <vector>
 #include <string>

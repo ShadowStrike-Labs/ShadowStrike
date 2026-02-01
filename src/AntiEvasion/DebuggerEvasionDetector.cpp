@@ -354,6 +354,308 @@ namespace ShadowStrike::AntiEvasion {
         HANDLE m_handle;
     };
 
+} // End namespace ShadowStrike::AntiEvasion
+
+// ============================================================================
+// ASSEMBLY FUNCTION DECLARATIONS (DebuggerEvasionDetector_x64.asm)
+// These provide low-level CPU timing and instruction execution for advanced
+// debugger detection that cannot be reliably done in pure C++.
+// ============================================================================
+
+extern "C" {
+    // Timing-based detection functions
+    uint64_t DetectSingleStepTiming() noexcept;
+    uint64_t DetectTrapFlagManipulation() noexcept;
+    uint64_t DetectInt2DBehavior() noexcept;
+    uint64_t DetectInt3Timing() noexcept;
+    uint64_t DetectHardwareBreakpointsTiming() noexcept;
+    uint64_t MeasureDebugInstructionTiming() noexcept;
+    uint64_t DetectICEBPBehavior() noexcept;
+    
+    // Descriptor table detection
+    uint64_t DetectIDTRelocation(uint64_t* outBase, uint16_t* outLimit) noexcept;
+    uint64_t DetectGDTRelocation(uint64_t* outBase, uint16_t* outLimit) noexcept;
+    uint64_t DetectLDTPresence() noexcept;
+    
+    // Debug register detection
+    uint64_t CheckDebugRegistersIndirect() noexcept;
+    
+    // Timing utilities
+    uint64_t MeasureCPUIDRDTSCPair() noexcept;
+    uint64_t DetectPrefetchTiming(void* address) noexcept;
+    uint64_t DetectExceptionHandlerTiming() noexcept;
+    
+    // Memory scanning
+    uint64_t ScanForBreakpointOpcodes(const void* start, size_t size) noexcept;
+    uint64_t MeasureCodeIntegrity(const void* start, size_t size) noexcept;
+    
+    // Serialization utilities
+    uint64_t GetRDTSCPrecise() noexcept;
+    uint64_t SerializeCPU() noexcept;
+}
+
+// ============================================================================
+// C++ FALLBACK IMPLEMENTATIONS FOR ASSEMBLY FUNCTIONS
+// Used when assembly is not linked (e.g., x86 builds or testing)
+// ============================================================================
+
+namespace AsmFallback {
+
+    // Fallback: DetectSingleStepTiming
+    extern "C" uint64_t Fallback_DetectSingleStepTiming() noexcept {
+        // Use MSVC intrinsics for timing
+        uint64_t start = __rdtsc();
+        
+        // Execute NOPs that would be slow under single-stepping
+        for (volatile int i = 0; i < 64; ++i) {
+            __nop();
+        }
+        
+        uint64_t end = __rdtsc();
+        uint64_t delta = end - start;
+        
+        // Average per iteration, check threshold
+        return (delta / 64 > 500) ? 1 : 0;
+    }
+
+    // Fallback: DetectTrapFlagManipulation
+    extern "C" uint64_t Fallback_DetectTrapFlagManipulation() noexcept {
+        // Cannot reliably test POPF timing from C++
+        // Return 0 (not detected)
+        return 0;
+    }
+
+    // Fallback: DetectInt2DBehavior
+    extern "C" uint64_t Fallback_DetectInt2DBehavior() noexcept {
+        // Use PEB access timing as proxy
+        uint64_t start = __rdtsc();
+        
+        // Access PEB (often monitored by debuggers)
+        volatile PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+        volatile uint8_t beingDebugged = peb->BeingDebugged;
+        (void)beingDebugged;
+        
+        uint64_t end = __rdtsc();
+        
+        return (end - start > 300) ? 1 : 0;
+    }
+
+    // Fallback: DetectInt3Timing
+    extern "C" uint64_t Fallback_DetectInt3Timing() noexcept {
+        uint64_t start = __rdtsc();
+        
+        for (volatile int i = 0; i < 32; ++i) {
+            __nop();
+        }
+        
+        uint64_t end = __rdtsc();
+        return (end - start > 200 * 32) ? 1 : 0;
+    }
+
+    // Fallback: DetectHardwareBreakpointsTiming
+    extern "C" uint64_t Fallback_DetectHardwareBreakpointsTiming() noexcept {
+        uint64_t start = __rdtsc();
+        
+        // Memory operations that could trigger DR watchpoints
+        volatile uint64_t dummy = 0;
+        for (int i = 0; i < 100; ++i) {
+            dummy = dummy + 1;
+        }
+        
+        uint64_t end = __rdtsc();
+        return (end - start / 100 > 500) ? 1 : 0;
+    }
+
+    // Fallback: MeasureDebugInstructionTiming
+    extern "C" uint64_t Fallback_MeasureDebugInstructionTiming() noexcept {
+        uint64_t total = 0;
+        
+        for (int i = 0; i < 100; ++i) {
+            uint64_t start = __rdtsc();
+            
+            int cpuInfo[4];
+            __cpuid(cpuInfo, 0);
+            
+            uint64_t end = __rdtsc();
+            total += (end - start);
+        }
+        
+        return total / 100;
+    }
+
+    // Fallback: DetectICEBPBehavior
+    extern "C" uint64_t Fallback_DetectICEBPBehavior() noexcept {
+        // Similar to single-step detection
+        return Fallback_DetectSingleStepTiming();
+    }
+
+    // Fallback: DetectIDTRelocation
+    extern "C" uint64_t Fallback_DetectIDTRelocation(uint64_t* outBase, uint16_t* outLimit) noexcept {
+        // Cannot execute SIDT from C++ - would need inline assembly
+        // Return 0 (not detected) and null values
+        if (outBase) *outBase = 0;
+        if (outLimit) *outLimit = 0;
+        return 0;
+    }
+
+    // Fallback: DetectGDTRelocation
+    extern "C" uint64_t Fallback_DetectGDTRelocation(uint64_t* outBase, uint16_t* outLimit) noexcept {
+        if (outBase) *outBase = 0;
+        if (outLimit) *outLimit = 0;
+        return 0;
+    }
+
+    // Fallback: DetectLDTPresence
+    extern "C" uint64_t Fallback_DetectLDTPresence() noexcept {
+        // Cannot execute SLDT from C++
+        return 0;
+    }
+
+    // Fallback: CheckDebugRegistersIndirect
+    extern "C" uint64_t Fallback_CheckDebugRegistersIndirect() noexcept {
+        // Use GetThreadContext API as fallback
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        
+        if (GetThreadContext(GetCurrentThread(), &ctx)) {
+            // Check if any DR0-DR3 are set
+            if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
+                return 1000;  // High indicator value
+            }
+            // Check if DR7 has any breakpoints enabled
+            if (ctx.Dr7 & 0xFF) {
+                return 500;
+            }
+        }
+        return 0;
+    }
+
+    // Fallback: MeasureCPUIDRDTSCPair
+    extern "C" uint64_t Fallback_MeasureCPUIDRDTSCPair() noexcept {
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0);  // Serialize
+        
+        uint64_t start = __rdtsc();
+        
+        __cpuid(cpuInfo, 0);
+        
+        uint64_t end = __rdtsc();
+        return end - start;
+    }
+
+    // Fallback: DetectPrefetchTiming
+    extern "C" uint64_t Fallback_DetectPrefetchTiming(void* address) noexcept {
+        if (!address) return 0;
+        
+        uint64_t total = 0;
+        for (int i = 0; i < 100; ++i) {
+            uint64_t start = __rdtsc();
+            
+            _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+            
+            uint64_t end = __rdtsc();
+            total += (end - start);
+        }
+        
+        return (total / 100 > 100) ? 1 : 0;
+    }
+
+    // Fallback: DetectExceptionHandlerTiming
+    extern "C" uint64_t Fallback_DetectExceptionHandlerTiming() noexcept {
+        return Fallback_MeasureDebugInstructionTiming();
+    }
+
+    // Fallback: ScanForBreakpointOpcodes
+    extern "C" uint64_t Fallback_ScanForBreakpointOpcodes(const void* start, size_t size) noexcept {
+        if (!start || size == 0) return 0;
+        
+        const uint8_t* ptr = static_cast<const uint8_t*>(start);
+        uint64_t count = 0;
+        
+        __try {
+            for (size_t i = 0; i < size; ++i) {
+                if (ptr[i] == 0xCC) {
+                    ++count;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Memory access failed
+            return count;
+        }
+        
+        return count;
+    }
+
+    // Fallback: MeasureCodeIntegrity
+    extern "C" uint64_t Fallback_MeasureCodeIntegrity(const void* start, size_t size) noexcept {
+        if (!start || size == 0) return 0;
+        
+        uint64_t total = 0;
+        const uint8_t* ptr = static_cast<const uint8_t*>(start);
+        
+        __try {
+            for (int iter = 0; iter < 10; ++iter) {
+                uint64_t startTime = __rdtsc();
+                
+                volatile uint64_t checksum = 0;
+                for (size_t i = 0; i < size; i += 8) {
+                    checksum ^= *reinterpret_cast<const uint64_t*>(ptr + i);
+                }
+                
+                uint64_t endTime = __rdtsc();
+                total += (endTime - startTime);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+        
+        return total / 10;
+    }
+
+    // Fallback: GetRDTSCPrecise
+    extern "C" uint64_t Fallback_GetRDTSCPrecise() noexcept {
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0);  // Serialize
+        return __rdtsc();
+    }
+
+    // Fallback: SerializeCPU
+    extern "C" uint64_t Fallback_SerializeCPU() noexcept {
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0);
+        return cpuInfo[1];  // Return EBX (vendor string part)
+    }
+
+} // namespace AsmFallback
+
+// ============================================================================
+// LINKER ALTERNATE NAMES
+// If assembly functions are not found, use the C++ fallbacks
+// ============================================================================
+
+#pragma comment(linker, "/alternatename:DetectSingleStepTiming=Fallback_DetectSingleStepTiming")
+#pragma comment(linker, "/alternatename:DetectTrapFlagManipulation=Fallback_DetectTrapFlagManipulation")
+#pragma comment(linker, "/alternatename:DetectInt2DBehavior=Fallback_DetectInt2DBehavior")
+#pragma comment(linker, "/alternatename:DetectInt3Timing=Fallback_DetectInt3Timing")
+#pragma comment(linker, "/alternatename:DetectHardwareBreakpointsTiming=Fallback_DetectHardwareBreakpointsTiming")
+#pragma comment(linker, "/alternatename:MeasureDebugInstructionTiming=Fallback_MeasureDebugInstructionTiming")
+#pragma comment(linker, "/alternatename:DetectICEBPBehavior=Fallback_DetectICEBPBehavior")
+#pragma comment(linker, "/alternatename:DetectIDTRelocation=Fallback_DetectIDTRelocation")
+#pragma comment(linker, "/alternatename:DetectGDTRelocation=Fallback_DetectGDTRelocation")
+#pragma comment(linker, "/alternatename:DetectLDTPresence=Fallback_DetectLDTPresence")
+#pragma comment(linker, "/alternatename:CheckDebugRegistersIndirect=Fallback_CheckDebugRegistersIndirect")
+#pragma comment(linker, "/alternatename:MeasureCPUIDRDTSCPair=Fallback_MeasureCPUIDRDTSCPair")
+#pragma comment(linker, "/alternatename:DetectPrefetchTiming=Fallback_DetectPrefetchTiming")
+#pragma comment(linker, "/alternatename:DetectExceptionHandlerTiming=Fallback_DetectExceptionHandlerTiming")
+#pragma comment(linker, "/alternatename:ScanForBreakpointOpcodes=Fallback_ScanForBreakpointOpcodes")
+#pragma comment(linker, "/alternatename:MeasureCodeIntegrity=Fallback_MeasureCodeIntegrity")
+#pragma comment(linker, "/alternatename:GetRDTSCPrecise=Fallback_GetRDTSCPrecise")
+#pragma comment(linker, "/alternatename:SerializeCPU=Fallback_SerializeCPU")
+
+namespace ShadowStrike::AntiEvasion {
+
     // ========================================================================
     // LOGGING CATEGORY
     // ========================================================================
