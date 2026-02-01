@@ -149,6 +149,7 @@
     <ClCompile Include="src\AntiEvasion\DebuggerEvasionDetector.cpp" />
     <ClCompile Include="src\AntiEvasion\EnvironmentEvasionDetector.cpp" />
     <ClCompile Include="src\AntiEvasion\MetamorphicDetector.cpp" />
+    <ClCompile Include="src\AntiEvasion\metamorphic_polymorphicdetector.cpp" />
     <ClCompile Include="src\AntiEvasion\NetworkBasedEvasionDetector.cpp" />
     <ClCompile Include="src\AntiEvasion\PackerDetector.cpp" />
     <ClCompile Include="src\AntiEvasion\ProcessEvasionDetector.cpp" />
@@ -676,6 +677,7 @@
     <ClInclude Include="src\AntiEvasion\DebuggerEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\EnvironmentEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\MetamorphicDetector.hpp" />
+    <ClInclude Include="src\AntiEvasion\metamorphic_polymorphicdetector.hpp" />
     <ClInclude Include="src\AntiEvasion\NetworkBasedEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\nt_undocumented.h" />
     <ClInclude Include="src\AntiEvasion\PackerDetector.hpp" />

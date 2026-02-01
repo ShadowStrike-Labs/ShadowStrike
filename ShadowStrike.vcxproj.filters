@@ -1095,6 +1095,9 @@
     <ClCompile Include="src\AntiEvasion\ProcessEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\AntiEvasion\metamorphic_polymorphicdetector.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
@@ -1668,6 +1671,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\AntiEvasion\nt_undocumented.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\AntiEvasion\metamorphic_polymorphicdetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

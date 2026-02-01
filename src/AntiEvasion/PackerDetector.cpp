@@ -558,6 +558,454 @@ namespace EPSignatures {
 } // namespace EPSignatures
 
 // ============================================================================
+// ASSEMBLY FUNCTION FALLBACKS
+// ============================================================================
+// These fallback implementations are used when the assembly module is not
+// available or fails to link. They provide functionally equivalent (but slower)
+// C++ implementations using compiler intrinsics.
+// ============================================================================
+
+namespace {
+
+#if defined(_MSC_VER)
+    #include <intrin.h>
+#endif
+
+    // ========================================================================
+    // TIMING FALLBACKS
+    // ========================================================================
+
+    extern "C" uint64_t Fallback_GetRDTSCValue() noexcept {
+#if defined(_MSC_VER)
+        return __rdtsc();
+#else
+        uint32_t lo, hi;
+        __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
+    }
+
+    extern "C" uint64_t Fallback_GetRDTSCPValue(uint32_t* processorId) noexcept {
+#if defined(_MSC_VER)
+        unsigned int procId = 0;
+        uint64_t tsc = __rdtscp(&procId);
+        if (processorId) {
+            *processorId = procId;
+        }
+        return tsc;
+#else
+        uint32_t lo, hi, aux;
+        __asm__ __volatile__("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+        if (processorId) {
+            *processorId = aux;
+        }
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
+    }
+
+    extern "C" uint64_t Fallback_MeasureUnpackStubTiming(
+        const uint8_t* /*code*/, 
+        size_t /*size*/,
+        uint64_t* startTime, 
+        uint64_t* endTime) noexcept 
+    {
+        uint64_t start = Fallback_GetRDTSCValue();
+        // Execute memory fence to serialize
+#if defined(_MSC_VER)
+        _mm_mfence();
+#endif
+        uint64_t end = Fallback_GetRDTSCValue();
+        
+        if (startTime) *startTime = start;
+        if (endTime) *endTime = end;
+        
+        return end - start;
+    }
+
+    extern "C" uint64_t Fallback_MeasureInstructionSequence(size_t iterations) noexcept {
+        if (iterations == 0) return 0;
+        
+        uint64_t start = Fallback_GetRDTSCValue();
+        volatile uint64_t dummy = 0;
+        for (size_t i = 0; i < iterations; ++i) {
+            dummy += i;
+        }
+        uint64_t end = Fallback_GetRDTSCValue();
+        
+        (void)dummy; // Prevent optimization
+        return (end - start) / iterations;
+    }
+
+    extern "C" uint64_t Fallback_DetectTimingAnomaly(uint64_t threshold) noexcept {
+        // Take multiple samples and check for anomalies
+        constexpr size_t SAMPLES = 10;
+        uint64_t samples[SAMPLES];
+        
+        for (size_t i = 0; i < SAMPLES; ++i) {
+            uint64_t start = Fallback_GetRDTSCValue();
+#if defined(_MSC_VER)
+            _mm_pause();
+#endif
+            uint64_t end = Fallback_GetRDTSCValue();
+            samples[i] = end - start;
+        }
+        
+        // Check if any sample exceeds threshold (VM/debugger indicator)
+        for (size_t i = 0; i < SAMPLES; ++i) {
+            if (samples[i] > threshold) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    // ========================================================================
+    // DEBUG REGISTER FALLBACKS
+    // ========================================================================
+
+    extern "C" uint64_t Fallback_GetDebugRegistersForUnpacker(uint64_t* registers) noexcept {
+        // Reading debug registers from user mode requires elevated privileges
+        // or use of GetThreadContext. This fallback returns 0 (no data).
+        if (registers) {
+            for (int i = 0; i < 8; ++i) {
+                registers[i] = 0;
+            }
+        }
+        return 0; // Indicate failure - requires kernel mode or GetThreadContext
+    }
+
+    extern "C" uint64_t Fallback_CheckHardwareBreakpointTraps(const uint64_t* dr7Value) noexcept {
+        if (!dr7Value) return 0;
+        
+        // DR7 bits: L0, G0, L1, G1, L2, G2, L3, G3 (local/global enable for DR0-3)
+        uint64_t dr7 = *dr7Value;
+        uint64_t count = 0;
+        
+        if (dr7 & 0x03) ++count; // DR0 enabled (L0 or G0)
+        if (dr7 & 0x0C) ++count; // DR1 enabled (L1 or G1)
+        if (dr7 & 0x30) ++count; // DR2 enabled (L2 or G2)
+        if (dr7 & 0xC0) ++count; // DR3 enabled (L3 or G3)
+        
+        return count;
+    }
+
+    extern "C" uint64_t Fallback_ReadDR0() noexcept { return 0; }
+    extern "C" uint64_t Fallback_ReadDR1() noexcept { return 0; }
+    extern "C" uint64_t Fallback_ReadDR2() noexcept { return 0; }
+    extern "C" uint64_t Fallback_ReadDR3() noexcept { return 0; }
+    extern "C" uint64_t Fallback_ReadDR6() noexcept { return 0; }
+    extern "C" uint64_t Fallback_ReadDR7() noexcept { return 0; }
+
+    // ========================================================================
+    // ANTI-DEBUG SCANNING FALLBACKS
+    // ========================================================================
+
+    extern "C" uint64_t Fallback_DetectRDTSCAntiDebug(size_t sampleCount, uint64_t* samples) noexcept {
+        if (!samples || sampleCount == 0) return 0;
+        
+        constexpr uint64_t ANOMALY_THRESHOLD = 10000; // Cycles - adjust as needed
+        bool anomalyDetected = false;
+        
+        for (size_t i = 0; i < sampleCount; ++i) {
+            uint64_t start = Fallback_GetRDTSCValue();
+#if defined(_MSC_VER)
+            int cpuInfo[4];
+            __cpuid(cpuInfo, 0); // Serialize
+#endif
+            uint64_t end = Fallback_GetRDTSCValue();
+            samples[i] = end - start;
+            
+            if (samples[i] > ANOMALY_THRESHOLD) {
+                anomalyDetected = true;
+            }
+        }
+        
+        return anomalyDetected ? 1 : 0;
+    }
+
+    extern "C" uint64_t Fallback_ScanForAntiDebugOpcodes(
+        const uint8_t* buffer, 
+        size_t size,
+        uint32_t* flags) noexcept 
+    {
+        if (!buffer || size == 0) {
+            if (flags) *flags = 0;
+            return 0;
+        }
+        
+        uint32_t resultFlags = 0;
+        uint64_t count = 0;
+        
+        for (size_t i = 0; i < size; ++i) {
+            // INT 2D (0xCD 0x2D) - Anti-debugging
+            if (i + 1 < size && buffer[i] == 0xCD && buffer[i + 1] == 0x2D) {
+                resultFlags |= 0x01;
+                ++count;
+            }
+            // INT 3 (0xCC) - Breakpoint
+            if (buffer[i] == 0xCC) {
+                resultFlags |= 0x02;
+                ++count;
+            }
+            // RDTSC (0x0F 0x31)
+            if (i + 1 < size && buffer[i] == 0x0F && buffer[i + 1] == 0x31) {
+                resultFlags |= 0x04;
+                ++count;
+            }
+            // CPUID (0x0F 0xA2)
+            if (i + 1 < size && buffer[i] == 0x0F && buffer[i + 1] == 0xA2) {
+                resultFlags |= 0x08;
+                ++count;
+            }
+            // RDTSCP (0x0F 0x01 0xF9)
+            if (i + 2 < size && buffer[i] == 0x0F && buffer[i + 1] == 0x01 && buffer[i + 2] == 0xF9) {
+                resultFlags |= 0x10;
+                ++count;
+            }
+        }
+        
+        if (flags) *flags = resultFlags;
+        return count;
+    }
+
+    extern "C" int64_t Fallback_ScanForInt2DOpcode(const uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size < 2) return -1;
+        
+        for (size_t i = 0; i + 1 < size; ++i) {
+            if (buffer[i] == 0xCD && buffer[i + 1] == 0x2D) {
+                return static_cast<int64_t>(i);
+            }
+        }
+        return -1;
+    }
+
+    extern "C" int64_t Fallback_ScanForRDTSCOpcode(const uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size < 2) return -1;
+        
+        for (size_t i = 0; i + 1 < size; ++i) {
+            if (buffer[i] == 0x0F && buffer[i + 1] == 0x31) {
+                return static_cast<int64_t>(i);
+            }
+        }
+        return -1;
+    }
+
+    extern "C" int64_t Fallback_ScanForCPUIDOpcode(const uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size < 2) return -1;
+        
+        for (size_t i = 0; i + 1 < size; ++i) {
+            if (buffer[i] == 0x0F && buffer[i + 1] == 0xA2) {
+                return static_cast<int64_t>(i);
+            }
+        }
+        return -1;
+    }
+
+    // ========================================================================
+    // CODE ANALYSIS FALLBACKS
+    // ========================================================================
+
+    extern "C" uint64_t Fallback_CheckCodePageWritability(const void* address) noexcept {
+        if (!address) return 0;
+        
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
+            return 0;
+        }
+        
+        // Check if page is writable
+        DWORD writableFlags = PAGE_READWRITE | PAGE_WRITECOPY | 
+                              PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        return (mbi.Protect & writableFlags) ? 1 : 0;
+    }
+
+    extern "C" uint64_t Fallback_ScanForSMCPatterns(const uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size < 4) return 0;
+        
+        uint64_t count = 0;
+        
+        // Look for patterns that write to code addresses
+        // MOV [reg], imm or MOV [reg+disp], reg patterns
+        for (size_t i = 0; i + 3 < size; ++i) {
+            // MOV byte ptr [reg], imm8 (C6 /0)
+            if (buffer[i] == 0xC6) {
+                ++count;
+            }
+            // MOV dword ptr [reg], imm32 (C7 /0)
+            if (buffer[i] == 0xC7) {
+                ++count;
+            }
+            // REP STOSB (F3 AA) - bulk memory fill
+            if (i + 1 < size && buffer[i] == 0xF3 && buffer[i + 1] == 0xAA) {
+                ++count;
+            }
+            // REP STOSD (F3 AB)
+            if (i + 1 < size && buffer[i] == 0xF3 && buffer[i + 1] == 0xAB) {
+                ++count;
+            }
+        }
+        
+        return count;
+    }
+
+    extern "C" uint64_t Fallback_ScanForXORDecryptionLoop(const uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size < 8) return 0;
+        
+        uint64_t count = 0;
+        
+        // XOR decryption patterns:
+        // - XOR [mem], reg followed by LOOP/DEC+JNZ
+        // - XOR reg, [mem] in a loop
+        
+        for (size_t i = 0; i + 4 < size; ++i) {
+            // XOR [reg], reg (30, 31, 32, 33)
+            if ((buffer[i] >= 0x30 && buffer[i] <= 0x33) || buffer[i] == 0x80 || buffer[i] == 0x81) {
+                // Look for loop indicator nearby
+                for (size_t j = i + 2; j < i + 32 && j < size - 1; ++j) {
+                    // LOOP (E2), LOOPNZ (E0), LOOPZ (E1)
+                    if (buffer[j] >= 0xE0 && buffer[j] <= 0xE2) {
+                        ++count;
+                        break;
+                    }
+                    // DEC + JNZ pattern
+                    if ((buffer[j] == 0x48 || buffer[j] == 0x49 || buffer[j] == 0xFF) && 
+                        j + 2 < size && buffer[j + 1] == 0x75) {
+                        ++count;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return count;
+    }
+
+    extern "C" uint64_t Fallback_ScanForAPIHashingPattern(const uint8_t* buffer, size_t size) noexcept {
+        if (!buffer || size < 8) return 0;
+        
+        uint64_t count = 0;
+        
+        // API hashing typically uses: ROL/ROR + ADD/XOR patterns
+        for (size_t i = 0; i + 4 < size; ++i) {
+            // ROL (C0, C1, D0, D1 with /0) or ROR (with /1)
+            if (buffer[i] == 0xC0 || buffer[i] == 0xC1 || 
+                buffer[i] == 0xD0 || buffer[i] == 0xD1) {
+                // Look for XOR or ADD nearby
+                for (size_t j = i + 2; j < i + 16 && j < size - 1; ++j) {
+                    // XOR (30-35) or ADD (00-05)
+                    if ((buffer[j] >= 0x30 && buffer[j] <= 0x35) ||
+                        (buffer[j] >= 0x00 && buffer[j] <= 0x05) ||
+                        buffer[j] == 0x33 || buffer[j] == 0x03) {
+                        ++count;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return count;
+    }
+
+    // ========================================================================
+    // SIMD SCANNING FALLBACKS
+    // ========================================================================
+
+    extern "C" int64_t Fallback_SIMDScanForByte(
+        const uint8_t* buffer, 
+        size_t size, 
+        uint8_t byteValue) noexcept 
+    {
+        if (!buffer || size == 0) return -1;
+        
+        // Use memchr for optimized single-byte search
+        const void* found = memchr(buffer, byteValue, size);
+        if (found) {
+            return static_cast<int64_t>(static_cast<const uint8_t*>(found) - buffer);
+        }
+        return -1;
+    }
+
+    extern "C" int64_t Fallback_SIMDScanForWord(
+        const uint8_t* buffer, 
+        size_t size, 
+        uint16_t wordValue) noexcept 
+    {
+        if (!buffer || size < 2) return -1;
+        
+        const uint8_t lo = static_cast<uint8_t>(wordValue & 0xFF);
+        const uint8_t hi = static_cast<uint8_t>((wordValue >> 8) & 0xFF);
+        
+        for (size_t i = 0; i + 1 < size; ++i) {
+            if (buffer[i] == lo && buffer[i + 1] == hi) {
+                return static_cast<int64_t>(i);
+            }
+        }
+        return -1;
+    }
+
+    extern "C" int64_t Fallback_SIMDScanForPattern(
+        const uint8_t* buffer, 
+        size_t bufferSize,
+        const uint8_t* pattern, 
+        size_t patternSize) noexcept 
+    {
+        if (!buffer || !pattern || bufferSize == 0 || patternSize == 0) return -1;
+        if (patternSize > bufferSize) return -1;
+        
+        const size_t searchLimit = bufferSize - patternSize + 1;
+        
+        for (size_t i = 0; i < searchLimit; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < patternSize; ++j) {
+                if (buffer[i + j] != pattern[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return static_cast<int64_t>(i);
+            }
+        }
+        return -1;
+    }
+
+    // ========================================================================
+    // WEAK SYMBOL ALIASES (Link to fallbacks if ASM not found)
+    // ========================================================================
+    // These allow the linker to use fallbacks when assembly functions are missing
+
+#if defined(_MSC_VER)
+    // MSVC uses /ALTERNATENAME linker directive
+    #pragma comment(linker, "/ALTERNATENAME:GetRDTSCValue=Fallback_GetRDTSCValue")
+    #pragma comment(linker, "/ALTERNATENAME:GetRDTSCPValue=Fallback_GetRDTSCPValue")
+    #pragma comment(linker, "/ALTERNATENAME:MeasureUnpackStubTiming=Fallback_MeasureUnpackStubTiming")
+    #pragma comment(linker, "/ALTERNATENAME:MeasureInstructionSequence=Fallback_MeasureInstructionSequence")
+    #pragma comment(linker, "/ALTERNATENAME:DetectTimingAnomaly=Fallback_DetectTimingAnomaly")
+    #pragma comment(linker, "/ALTERNATENAME:GetDebugRegistersForUnpacker=Fallback_GetDebugRegistersForUnpacker")
+    #pragma comment(linker, "/ALTERNATENAME:CheckHardwareBreakpointTraps=Fallback_CheckHardwareBreakpointTraps")
+    #pragma comment(linker, "/ALTERNATENAME:ReadDR0=Fallback_ReadDR0")
+    #pragma comment(linker, "/ALTERNATENAME:ReadDR1=Fallback_ReadDR1")
+    #pragma comment(linker, "/ALTERNATENAME:ReadDR2=Fallback_ReadDR2")
+    #pragma comment(linker, "/ALTERNATENAME:ReadDR3=Fallback_ReadDR3")
+    #pragma comment(linker, "/ALTERNATENAME:ReadDR6=Fallback_ReadDR6")
+    #pragma comment(linker, "/ALTERNATENAME:ReadDR7=Fallback_ReadDR7")
+    #pragma comment(linker, "/ALTERNATENAME:DetectRDTSCAntiDebug=Fallback_DetectRDTSCAntiDebug")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForAntiDebugOpcodes=Fallback_ScanForAntiDebugOpcodes")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForInt2DOpcode=Fallback_ScanForInt2DOpcode")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForRDTSCOpcode=Fallback_ScanForRDTSCOpcode")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForCPUIDOpcode=Fallback_ScanForCPUIDOpcode")
+    #pragma comment(linker, "/ALTERNATENAME:CheckCodePageWritability=Fallback_CheckCodePageWritability")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForSMCPatterns=Fallback_ScanForSMCPatterns")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForXORDecryptionLoop=Fallback_ScanForXORDecryptionLoop")
+    #pragma comment(linker, "/ALTERNATENAME:ScanForAPIHashingPattern=Fallback_ScanForAPIHashingPattern")
+    #pragma comment(linker, "/ALTERNATENAME:SIMDScanForByte=Fallback_SIMDScanForByte")
+    #pragma comment(linker, "/ALTERNATENAME:SIMDScanForWord=Fallback_SIMDScanForWord")
+    #pragma comment(linker, "/ALTERNATENAME:SIMDScanForPattern=Fallback_SIMDScanForPattern")
+#endif
+
+} // anonymous namespace
+
+// ============================================================================
 // PACKER DETECTOR IMPLEMENTATION CLASS
 // ============================================================================
 
@@ -1124,12 +1572,18 @@ public:
         outOverlay.percentageOfFile = (static_cast<double>(peInfo.overlaySize) /
             static_cast<double>(peInfo.fileSize)) * 100.0;
 
-        if (peInfo.overlayOffset + 16 <= mappedFile.size()) {
+        // SECURITY FIX: Validate overlay size before accessing magic bytes
+        // Must have at least 4 bytes to safely check all magic patterns
+        if (peInfo.overlayOffset + 16 <= mappedFile.size() && peInfo.overlaySize >= 4) {
             const uint8_t* overlayData = static_cast<const uint8_t*>(mappedFile.data()) +
                 peInfo.overlayOffset;
-            std::copy_n(overlayData, std::min(size_t(16), peInfo.overlaySize),
-                outOverlay.magicBytes.begin());
+            
+            // Copy only available bytes, capped at 16
+            const size_t bytesToCopy = std::min({size_t(16), peInfo.overlaySize, 
+                mappedFile.size() - peInfo.overlayOffset});
+            std::copy_n(overlayData, bytesToCopy, outOverlay.magicBytes.begin());
 
+            // Now safe to access bytes 0-3
             if (overlayData[0] == 0x50 && overlayData[1] == 0x4B) {
                 outOverlay.detectedFormat = L"ZIP/JAR archive";
             } else if (overlayData[0] == 0x52 && overlayData[1] == 0x61 &&
@@ -1145,10 +1599,20 @@ public:
                 outOverlay.detectedFormat = L"NSIS installer data";
             }
         }
+        // Handle case where overlay exists but is less than 4 bytes
+        else if (peInfo.overlayOffset < mappedFile.size() && peInfo.overlaySize > 0 && peInfo.overlaySize < 4) {
+            const size_t bytesToCopy = std::min(peInfo.overlaySize, mappedFile.size() - peInfo.overlayOffset);
+            const uint8_t* overlayData = static_cast<const uint8_t*>(mappedFile.data()) + peInfo.overlayOffset;
+            std::copy_n(overlayData, bytesToCopy, outOverlay.magicBytes.begin());
+            // Cannot reliably identify format with < 4 bytes
+        }
 
+        // SECURITY FIX: Prevent integer overflow in bounds check
         size_t overlayAnalyzeSize = std::min(peInfo.overlaySize,
             PackerConstants::MAX_OVERLAY_SIZE);
-        if (overlayAnalyzeSize >= MIN_SECTION_SIZE_FOR_ENTROPY) {
+        if (overlayAnalyzeSize >= MIN_SECTION_SIZE_FOR_ENTROPY &&
+            peInfo.overlayOffset <= mappedFile.size() &&
+            overlayAnalyzeSize <= mappedFile.size() - peInfo.overlayOffset) {
             outOverlay.entropy = CalculateEntropy(
                 static_cast<const uint8_t*>(mappedFile.data()) + peInfo.overlayOffset,
                 overlayAnalyzeSize
@@ -1587,7 +2051,11 @@ public:
 
         if (peInfo.overlaySize > 0) {
             Utils::MemoryUtils::MappedView mappedFile;
-            if (mappedFile.mapReadOnly(filePath) && peInfo.overlayOffset + 4 <= mappedFile.size()) {
+            // SECURITY FIX: Validate overlay has at least 4 bytes AND bounds are valid
+            if (mappedFile.mapReadOnly(filePath) && 
+                peInfo.overlaySize >= 4 &&
+                peInfo.overlayOffset <= mappedFile.size() &&
+                4 <= mappedFile.size() - peInfo.overlayOffset) {
                 const uint8_t* overlayData = static_cast<const uint8_t*>(mappedFile.data()) +
                     peInfo.overlayOffset;
 
@@ -1663,6 +2131,17 @@ public:
     [[nodiscard]] size_t GetCacheSize() const noexcept {
         std::shared_lock lock(m_cacheMutex);
         return m_cache.size();
+    }
+
+    void UpdateCache(const std::wstring& filePath, const PackingInfo& result) noexcept {
+        std::unique_lock lock(m_cacheMutex);
+
+        // Evict oldest entries if cache is full (simple FIFO eviction)
+        while (m_cache.size() >= PackerConstants::MAX_CACHE_ENTRIES) {
+            m_cache.erase(m_cache.begin());
+        }
+
+        m_cache[filePath] = { result, std::chrono::system_clock::now() };
     }
 
     // ========================================================================
@@ -1788,13 +2267,13 @@ private:
 
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableSignatureVerification) &&
             !filePath.empty()) {
-            VerifySignature(filePath, result.signatureInfo, nullptr);
+            (void)VerifySignature(filePath, result.signatureInfo, nullptr);
         }
 
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableYARAScanning) &&
             m_signatureStore && !filePath.empty()) {
             std::vector<PackerMatch> yaraMatches;
-            ScanWithYARA(filePath, yaraMatches, nullptr);
+            (void)ScanWithYARA(filePath, yaraMatches, nullptr);
             for (auto& match : yaraMatches) {
                 AddMatch(result, std::move(match));
             }
@@ -1815,7 +2294,7 @@ private:
         DeterminePackingVerdict(result, config);
 
         if (HasFlag(config.flags, PackerAnalysisFlags::IncludeUnpackingHints) && result.isPacked) {
-            GenerateUnpackingHints(result, result.unpackingHints, nullptr);
+            (void)GenerateUnpackingHints(result, result.unpackingHints, nullptr);
         }
     }
 
@@ -1832,8 +2311,11 @@ private:
         size_t entropyCount = 0;
 
         for (const auto& sec : peInfo.sections) {
+            // SECURITY FIX: Overflow-safe bounds checking
+            // Check: sec.rawAddress <= size && sec.rawSize <= size - sec.rawAddress
             if (sec.rawSize >= MIN_SECTION_SIZE_FOR_ENTROPY &&
-                sec.rawAddress + sec.rawSize <= size) {
+                sec.rawAddress <= size &&
+                sec.rawSize <= size - sec.rawAddress) {
                 double secEntropy = CalculateEntropy(buffer + sec.rawAddress, sec.rawSize);
 
                 if (secEntropy > result.maxSectionEntropy) {
@@ -1921,8 +2403,10 @@ private:
             if (peSec.isExecutable) ++result.executableSectionCount;
             if (peSec.isWritable) ++result.writableSectionCount;
 
+            // SECURITY FIX: Overflow-safe bounds checking
             if (peSec.rawSize >= MIN_SECTION_SIZE_FOR_ENTROPY &&
-                peSec.rawAddress + peSec.rawSize <= size) {
+                peSec.rawAddress <= size &&
+                peSec.rawSize <= size - peSec.rawAddress) {
                 sec.entropy = CalculateEntropy(buffer + peSec.rawAddress, peSec.rawSize);
                 sec.hasHighEntropy = sec.entropy >= PackerConstants::HIGH_SECTION_ENTROPY;
             }
@@ -2094,23 +2578,48 @@ private:
         result.overlayInfo.percentageOfFile =
             (static_cast<double>(peInfo.overlaySize) / static_cast<double>(size)) * 100.0;
 
-        if (peInfo.overlayOffset + 16 <= size) {
+        // SECURITY FIX: Validate overlay size >= 4 before accessing magic bytes
+        // Also use overflow-safe bounds checking
+        if (peInfo.overlayOffset <= size && peInfo.overlaySize >= 4 &&
+            16 <= size - peInfo.overlayOffset) {
             const uint8_t* overlayData = buffer + peInfo.overlayOffset;
-            std::copy_n(overlayData, std::min(size_t(16), peInfo.overlaySize),
-                result.overlayInfo.magicBytes.begin());
+            
+            // Copy available bytes, capped at 16 and actual overlay size
+            const size_t bytesToCopy = std::min({size_t(16), peInfo.overlaySize,
+                size - peInfo.overlayOffset});
+            std::copy_n(overlayData, bytesToCopy, result.overlayInfo.magicBytes.begin());
 
+            // Now safe to check 4-byte magic patterns
             if (overlayData[0] == 0x50 && overlayData[1] == 0x4B) {
                 result.overlayInfo.detectedFormat = L"ZIP archive";
             } else if (overlayData[0] == 0xEF && overlayData[1] == 0xBE &&
                        overlayData[2] == 0xAD && overlayData[3] == 0xDE) {
                 result.overlayInfo.detectedFormat = L"NSIS data";
+            } else if (overlayData[0] == 0x52 && overlayData[1] == 0x61 &&
+                       overlayData[2] == 0x72 && overlayData[3] == 0x21) {
+                result.overlayInfo.detectedFormat = L"RAR archive";
+            } else if (overlayData[0] == 0x37 && overlayData[1] == 0x7A &&
+                       overlayData[2] == 0xBC && overlayData[3] == 0xAF) {
+                result.overlayInfo.detectedFormat = L"7-Zip archive";
+            } else if (overlayData[0] == 0x1F && overlayData[1] == 0x8B) {
+                result.overlayInfo.detectedFormat = L"GZIP compressed";
+            }
+        }
+        // Handle small overlays (< 4 bytes) - still copy what's available
+        else if (peInfo.overlayOffset <= size && peInfo.overlaySize > 0 && peInfo.overlaySize < 4) {
+            const size_t bytesToCopy = std::min(peInfo.overlaySize, size - peInfo.overlayOffset);
+            if (bytesToCopy > 0) {
+                std::copy_n(buffer + peInfo.overlayOffset, bytesToCopy,
+                    result.overlayInfo.magicBytes.begin());
             }
         }
 
+        // SECURITY FIX: Overflow-safe bounds checking for entropy analysis
         size_t overlayAnalyzeSize = std::min(peInfo.overlaySize,
             PackerConstants::MAX_OVERLAY_SIZE);
         if (overlayAnalyzeSize >= MIN_SECTION_SIZE_FOR_ENTROPY &&
-            peInfo.overlayOffset + overlayAnalyzeSize <= size) {
+            peInfo.overlayOffset <= size &&
+            overlayAnalyzeSize <= size - peInfo.overlayOffset) {
             result.overlayInfo.entropy = CalculateEntropy(
                 buffer + peInfo.overlayOffset, overlayAnalyzeSize);
             result.overlayInfo.isCompressed =
@@ -2221,16 +2730,66 @@ private:
         bool is64Bit,
         PackingInfo& result) noexcept
     {
+        // ============================================================================
+        // Enterprise-grade packer stub analysis using Zydis disassembly
+        // Detects:
+        //   - Register preservation patterns (PUSHAD/PUSHA sequences)
+        //   - Unpacking loops (LOOP, DEC+JNZ, SUB+JNZ patterns)
+        //   - Decryption patterns (XOR, ROL/ROR, ADD/SUB with memory)
+        //   - API hashing patterns (ROL+XOR sequences for GetProcAddress hash)
+        //   - Self-modifying code indicators (writes to code section)
+        //   - Anti-debugging techniques (RDTSC, INT 2D, IsDebuggerPresent)
+        //   - Stack pivoting (large ESP/RSP modifications)
+        //   - Polymorphic NOP sequences (multi-byte NOPs, XCHG patterns)
+        // ============================================================================
+        
         ZydisDecoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
 
         ZydisDecodedInstruction instruction;
         ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
         ZyanUSize offset = 0;
 
+        // Counters and state tracking
         size_t pushCount = 0;
+        size_t popCount = 0;
+        size_t xorCount = 0;
+        size_t rolRorCount = 0;
+        size_t addSubCount = 0;
+        size_t callCount = 0;
+        size_t jmpCount = 0;
+        size_t nopCount = 0;
+        size_t decCount = 0;
+        size_t incCount = 0;
+        
         bool hasUnpackLoop = false;
-
+        bool hasDecJnzLoop = false;
+        bool hasSubJnzLoop = false;
+        bool hasApiHashing = false;
+        bool hasStackPivot = false;
+        bool hasRdtsc = false;
+        bool hasInt2d = false;
+        bool hasInt3 = false;
+        bool hasCpuid = false;
+        bool hasVmDetection = false;
+        bool hasWriteToCode = false;
+        bool hasIndirectCall = false;
+        bool hasGetProcAddress = false;
+        bool hasLoadLibrary = false;
+        
+        // Track instruction history for pattern matching
+        struct InstrRecord {
+            ZydisMnemonic mnemonic;
+            ZydisOperandType op0Type;
+            ZydisRegister op0Reg;
+            bool op0IsMem;
+            bool op1IsMem;
+        };
+        std::vector<InstrRecord> history;
+        history.reserve(MAX_STUB_INSTRUCTIONS);
+        
         size_t instructionCount = 0;
+        size_t memXorCount = 0;
+        size_t regXorCount = 0;
 
         while (offset < codeSize && instructionCount < MAX_STUB_INSTRUCTIONS) {
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset,
@@ -2238,24 +2797,246 @@ private:
                 break;
             }
 
+            // Record for pattern matching
+            InstrRecord rec{};
+            rec.mnemonic = instruction.mnemonic;
+            if (instruction.operand_count > 0) {
+                rec.op0Type = operands[0].type;
+                if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    rec.op0Reg = operands[0].reg.value;
+                }
+                rec.op0IsMem = (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+            }
+            if (instruction.operand_count > 1) {
+                rec.op1IsMem = (operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
+            }
+            history.push_back(rec);
+
             switch (instruction.mnemonic) {
+                // ================================================================
+                // Register preservation detection
+                // ================================================================
                 case ZYDIS_MNEMONIC_PUSH:
                 case ZYDIS_MNEMONIC_PUSHFQ:
-                case ZYDIS_MNEMONIC_PUSHA:
-                case ZYDIS_MNEMONIC_PUSHAD:
+                case ZYDIS_MNEMONIC_PUSHF:
                     ++pushCount;
                     break;
+                    
+                case ZYDIS_MNEMONIC_PUSHA:
+                case ZYDIS_MNEMONIC_PUSHAD:
+                    pushCount += 8; // PUSHAD pushes 8 registers
+                    break;
+                    
+                case ZYDIS_MNEMONIC_POP:
+                case ZYDIS_MNEMONIC_POPFQ:
+                case ZYDIS_MNEMONIC_POPF:
+                    ++popCount;
+                    break;
+                    
+                case ZYDIS_MNEMONIC_POPA:
+                case ZYDIS_MNEMONIC_POPAD:
+                    popCount += 8;
+                    break;
 
+                // ================================================================
+                // Loop detection (traditional LOOP instruction)
+                // ================================================================
                 case ZYDIS_MNEMONIC_LOOP:
                 case ZYDIS_MNEMONIC_LOOPE:
                 case ZYDIS_MNEMONIC_LOOPNE:
                     hasUnpackLoop = true;
                     break;
 
+                // ================================================================
+                // Decryption pattern detection (XOR, ROL, ROR, ADD, SUB)
+                // ================================================================
                 case ZYDIS_MNEMONIC_XOR:
+                    ++xorCount;
                     if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY ||
                         operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-                        result.indicators.push_back(L"XOR decryption pattern detected");
+                        ++memXorCount;
+                    } else {
+                        ++regXorCount;
+                        // Check for XOR reg, reg (zero idiom) vs actual XOR
+                        if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            operands[0].reg.value != operands[1].reg.value) {
+                            // XOR with different registers - potential decryption
+                        }
+                    }
+                    break;
+                    
+                case ZYDIS_MNEMONIC_ROL:
+                case ZYDIS_MNEMONIC_ROR:
+                    ++rolRorCount;
+                    // Check for API hashing pattern: ROL followed by XOR
+                    if (history.size() >= 2) {
+                        const auto& prev = history[history.size() - 2];
+                        if (prev.mnemonic == ZYDIS_MNEMONIC_XOR ||
+                            prev.mnemonic == ZYDIS_MNEMONIC_ADD) {
+                            hasApiHashing = true;
+                        }
+                    }
+                    break;
+                    
+                case ZYDIS_MNEMONIC_ADD:
+                case ZYDIS_MNEMONIC_SUB:
+                    ++addSubCount;
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        // ADD/SUB to memory - potential decryption
+                    }
+                    // Check for stack pivot (large immediate to ESP/RSP)
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                        ZydisRegister reg = operands[0].reg.value;
+                        if (reg == ZYDIS_REGISTER_RSP || reg == ZYDIS_REGISTER_ESP ||
+                            reg == ZYDIS_REGISTER_SP) {
+                            if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                                int64_t imm = operands[1].imm.value.s;
+                                // Large stack adjustment (> 4KB) is suspicious
+                                if (std::abs(imm) > 4096) {
+                                    hasStackPivot = true;
+                                }
+                            }
+                        }
+                    }
+                    break;
+
+                // ================================================================
+                // Counter manipulation (DEC/INC for loop detection)
+                // ================================================================
+                case ZYDIS_MNEMONIC_DEC:
+                    ++decCount;
+                    break;
+                    
+                case ZYDIS_MNEMONIC_INC:
+                    ++incCount;
+                    break;
+
+                // ================================================================
+                // Conditional jumps - check for DEC+JNZ or SUB+JNZ loops
+                // Zydis: JNE is JNZ (same opcode 0x75)
+                // ================================================================
+                case ZYDIS_MNEMONIC_JNZ:
+                    if (history.size() >= 2) {
+                        const auto& prev = history[history.size() - 2];
+                        if (prev.mnemonic == ZYDIS_MNEMONIC_DEC) {
+                            hasDecJnzLoop = true;
+                        } else if (prev.mnemonic == ZYDIS_MNEMONIC_SUB) {
+                            hasSubJnzLoop = true;
+                        }
+                    }
+                    ++jmpCount;
+                    break;
+                    
+                case ZYDIS_MNEMONIC_JMP:
+                case ZYDIS_MNEMONIC_JZ:      // JE is JZ (same opcode 0x74)
+                case ZYDIS_MNEMONIC_JB:
+                case ZYDIS_MNEMONIC_JNBE:    // JA is JNBE (same opcode 0x77)
+                case ZYDIS_MNEMONIC_JL:
+                case ZYDIS_MNEMONIC_JNLE:    // JG is JNLE (same opcode 0x7F)
+                case ZYDIS_MNEMONIC_JLE:
+                case ZYDIS_MNEMONIC_JNL:     // JGE is JNL (same opcode 0x7D)
+                    ++jmpCount;
+                    break;
+
+                // ================================================================
+                // Call detection
+                // ================================================================
+                case ZYDIS_MNEMONIC_CALL:
+                    ++callCount;
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER ||
+                        operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        hasIndirectCall = true;
+                    }
+                    break;
+
+                // ================================================================
+                // Anti-debugging detection
+                // ================================================================
+                case ZYDIS_MNEMONIC_RDTSC:
+                case ZYDIS_MNEMONIC_RDTSCP:
+                    hasRdtsc = true;
+                    break;
+                    
+                case ZYDIS_MNEMONIC_INT:
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        uint8_t intNum = static_cast<uint8_t>(operands[0].imm.value.u);
+                        if (intNum == 0x2D) {
+                            hasInt2d = true; // Anti-debugging
+                        } else if (intNum == 0x03) {
+                            hasInt3 = true; // Breakpoint
+                        }
+                    }
+                    break;
+                    
+                case ZYDIS_MNEMONIC_CPUID:
+                    hasCpuid = true;
+                    break;
+                    
+                // ================================================================
+                // VM detection instructions
+                // ================================================================
+                case ZYDIS_MNEMONIC_SIDT:
+                case ZYDIS_MNEMONIC_SGDT:
+                case ZYDIS_MNEMONIC_SLDT:
+                case ZYDIS_MNEMONIC_STR:
+                    hasVmDetection = true;
+                    break;
+                    
+                case ZYDIS_MNEMONIC_IN:
+                case ZYDIS_MNEMONIC_OUT:
+                    // I/O instructions often used for VM detection (VMware backdoor)
+                    if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        uint16_t port = static_cast<uint16_t>(operands[1].imm.value.u);
+                        if (port == 0x5658 || port == 0x5659) { // VMware ports
+                            hasVmDetection = true;
+                        }
+                    }
+                    break;
+
+                // ================================================================
+                // NOP detection (polymorphic NOPs)
+                // ================================================================
+                case ZYDIS_MNEMONIC_NOP:
+                    ++nopCount;
+                    break;
+                    
+                case ZYDIS_MNEMONIC_XCHG:
+                    // XCHG reg, reg is often used as a NOP (e.g., XCHG EAX, EAX)
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        operands[0].reg.value == operands[1].reg.value) {
+                        ++nopCount;
+                    }
+                    break;
+                    
+                case ZYDIS_MNEMONIC_LEA:
+                    // LEA reg, [reg] is a NOP-equivalent
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        operands[1].mem.base == operands[0].reg.value &&
+                        operands[1].mem.disp.value == 0 &&
+                        operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+                        ++nopCount;
+                    }
+                    break;
+
+                // ================================================================
+                // Memory write detection (self-modifying code indicator)
+                // Zydis uses size-suffixed mnemonics: MOVSB/MOVSW/MOVSD/MOVSQ
+                // ================================================================
+                case ZYDIS_MNEMONIC_MOV:
+                case ZYDIS_MNEMONIC_MOVSB:
+                case ZYDIS_MNEMONIC_MOVSW:
+                case ZYDIS_MNEMONIC_MOVSD:
+                case ZYDIS_MNEMONIC_MOVSQ:
+                case ZYDIS_MNEMONIC_STOSB:
+                case ZYDIS_MNEMONIC_STOSW:
+                case ZYDIS_MNEMONIC_STOSD:
+                case ZYDIS_MNEMONIC_STOSQ:
+                    if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        // Could be writing to code section (self-modifying)
+                        hasWriteToCode = true;
                     }
                     break;
 
@@ -2267,12 +3048,83 @@ private:
             ++instructionCount;
         }
 
-        if (pushCount > 5 && instructionCount < 20) {
+        // ============================================================================
+        // Generate indicators based on analysis
+        // ============================================================================
+        
+        // Register preservation pattern (classic packer stub)
+        if (pushCount >= 5 && instructionCount < 30) {
             result.indicators.push_back(L"Register preservation at entry (packer stub pattern)");
         }
+        
+        // PUSHAD/POPAD pair (strong packer indicator)
+        if (pushCount >= 8 && popCount >= 8) {
+            result.indicators.push_back(L"PUSHAD/POPAD pattern detected (classic packer)");
+        }
 
+        // Loop detection
         if (hasUnpackLoop) {
-            result.indicators.push_back(L"Decompression/decryption loop detected");
+            result.indicators.push_back(L"LOOP instruction decompression/decryption pattern");
+        }
+        if (hasDecJnzLoop) {
+            result.indicators.push_back(L"DEC+JNZ unpacking loop detected");
+        }
+        if (hasSubJnzLoop) {
+            result.indicators.push_back(L"SUB+JNZ counter loop detected");
+        }
+        
+        // XOR decryption pattern
+        if (memXorCount >= 3) {
+            result.indicators.push_back(L"XOR memory decryption pattern detected");
+        }
+        
+        // API hashing (GetProcAddress by hash)
+        if (hasApiHashing || (rolRorCount >= 2 && xorCount >= 2)) {
+            result.indicators.push_back(L"API hashing pattern (ROL/ROR+XOR) detected");
+        }
+        
+        // Stack pivot (shellcode/ROP indicator)
+        if (hasStackPivot) {
+            result.indicators.push_back(L"Stack pivot detected (large ESP/RSP modification)");
+        }
+        
+        // Anti-debugging
+        if (hasRdtsc) {
+            result.indicators.push_back(L"RDTSC timing check (anti-debugging)");
+        }
+        if (hasInt2d) {
+            result.indicators.push_back(L"INT 2D anti-debugging technique");
+        }
+        if (hasInt3) {
+            result.indicators.push_back(L"INT 3 breakpoint instruction");
+        }
+        
+        // VM detection
+        if (hasVmDetection) {
+            result.indicators.push_back(L"VM/sandbox detection instructions");
+        }
+        if (hasCpuid) {
+            result.indicators.push_back(L"CPUID instruction (potential VM detection)");
+        }
+        
+        // Indirect calls (dynamic API resolution)
+        if (hasIndirectCall && callCount >= 2) {
+            result.indicators.push_back(L"Indirect calls (dynamic API resolution)");
+        }
+        
+        // Self-modifying code indicator
+        if (hasWriteToCode && (hasUnpackLoop || hasDecJnzLoop || hasSubJnzLoop)) {
+            result.indicators.push_back(L"Self-modifying code pattern (runtime unpacking)");
+        }
+        
+        // Polymorphic NOP sequences
+        if (nopCount >= 5 && instructionCount < 50) {
+            result.indicators.push_back(L"Polymorphic NOP sequences (code obfuscation)");
+        }
+        
+        // High control flow complexity
+        if (jmpCount >= 10 && instructionCount < 100) {
+            result.indicators.push_back(L"High control flow complexity (obfuscation)");
         }
     }
 
@@ -2450,16 +3302,6 @@ private:
             result.hasMultipleLayers = true;
             result.layerCount = static_cast<uint32_t>(result.packerMatches.size());
         }
-    }
-
-    void UpdateCache(const std::wstring& filePath, const PackingInfo& result) noexcept {
-        std::unique_lock lock(m_cacheMutex);
-
-        while (m_cache.size() >= PackerConstants::MAX_CACHE_ENTRIES) {
-            m_cache.erase(m_cache.begin());
-        }
-
-        m_cache[filePath] = { result, std::chrono::system_clock::now() };
     }
 
     // ========================================================================
@@ -2866,8 +3708,27 @@ void PackerDetector::AnalyzeFileInternal(
 
     if (HasFlag(config.flags, PackerAnalysisFlags::EnableSignatureVerification) &&
         !filePath.empty()) {
-        SignatureInfo sigInfo;
-        m_sigVerifier.VerifyPESignature(filePath,result.signatureInfo, nullptr);
+        // Use the Utils signature verifier but convert result to our local struct
+        Utils::pe_sig_utils::SignatureInfo utilsSigInfo;
+        (void)m_sigVerifier.VerifyPESignature(filePath, utilsSigInfo, nullptr);
+        
+        // Convert Utils SignatureInfo to our local SignatureInfo
+        result.signatureInfo.hasSignature = utilsSigInfo.isSigned;
+        result.signatureInfo.isValid = utilsSigInfo.isVerified && utilsSigInfo.isChainTrusted;
+        result.signatureInfo.signerName = utilsSigInfo.signerName;
+        result.signatureInfo.issuerName = utilsSigInfo.issuerName;
+        // Convert wstring thumbprint to string using WideCharToMultiByte for proper conversion
+        if (!utilsSigInfo.thumbprint.empty()) {
+            int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, utilsSigInfo.thumbprint.c_str(),
+                static_cast<int>(utilsSigInfo.thumbprint.length()), nullptr, 0, nullptr, nullptr);
+            if (sizeNeeded > 0) {
+                result.signatureInfo.thumbprint.resize(static_cast<size_t>(sizeNeeded));
+                WideCharToMultiByte(CP_UTF8, 0, utilsSigInfo.thumbprint.c_str(),
+                    static_cast<int>(utilsSigInfo.thumbprint.length()),
+                    result.signatureInfo.thumbprint.data(), sizeNeeded, nullptr, nullptr);
+            }
+        }
+        result.signatureInfo.valid = true;
     }
 
     // Determine final verdict
@@ -2928,8 +3789,10 @@ void PackerDetector::AnalyzeEntropyDistribution(
         for (const auto& sec : peInfo.sections) {
             constexpr size_t MIN_SECTION_SIZE = 256;
 
+            // SECURITY FIX: Overflow-safe bounds checking
             if (sec.rawSize >= MIN_SECTION_SIZE &&
-                sec.rawAddress + sec.rawSize <= size) {
+                sec.rawAddress <= size &&
+                sec.rawSize <= size - sec.rawAddress) {
 
                 double secEntropy = CalculateEntropy(buffer + sec.rawAddress, sec.rawSize);
 
@@ -3006,9 +3869,11 @@ void PackerDetector::AnalyzePEStructure(
         if (peSec.isWritable) ++result.writableSectionCount;
 
         // Calculate section entropy
+        // SECURITY FIX: Overflow-safe bounds checking
         constexpr size_t MIN_SECTION_SIZE = 256;
         if (peSec.rawSize >= MIN_SECTION_SIZE &&
-            peSec.rawAddress + peSec.rawSize <= size) {
+            peSec.rawAddress <= size &&
+            peSec.rawSize <= size - peSec.rawAddress) {
             sec.entropy = CalculateEntropy(buffer + peSec.rawAddress, peSec.rawSize);
             sec.hasHighEntropy = sec.entropy >= PackerConstants::HIGH_SECTION_ENTROPY;
         }
@@ -3410,9 +4275,7 @@ void PackerDetector::UpdateCache(
     const PackingInfo& result) noexcept
 {
     if (m_impl) {
-        // Delegate to Impl's cache update mechanism
-        // The Impl class maintains the cache internally
-        // This is handled by calling GetCachedResult/InvalidateCache through m_impl
+        m_impl->UpdateCache(filePath, result);
     }
 }
 

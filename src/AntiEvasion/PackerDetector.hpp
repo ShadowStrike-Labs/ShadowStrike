@@ -207,6 +207,147 @@
 #include "../PatternStore/PatternStore.hpp"
 #include "../HashStore/HashStore.hpp"
 
+// ============================================================================
+// ASSEMBLY FUNCTION DECLARATIONS (PackerDetector_x64.asm)
+// ============================================================================
+// These functions provide low-level detection capabilities that cannot be
+// reliably implemented in C++ due to compiler optimizations.
+// ============================================================================
+
+extern "C" {
+    // ========================================================================
+    // TIMING-BASED DETECTION
+    // ========================================================================
+    
+    /// @brief Get current RDTSC timestamp value
+    /// @return 64-bit timestamp (EDX:EAX combined)
+    uint64_t GetRDTSCValue() noexcept;
+    
+    /// @brief Get serializing RDTSCP timestamp value with processor ID
+    /// @param processorId Optional pointer to store processor ID (can be NULL)
+    /// @return 64-bit timestamp
+    uint64_t GetRDTSCPValue(uint32_t* processorId) noexcept;
+    
+    /// @brief Measure RDTSC delta for unpacker stub timing analysis
+    /// @param code Pointer to code to measure
+    /// @param size Size of code region
+    /// @param startTime Pointer to store start timestamp
+    /// @param endTime Pointer to store end timestamp
+    /// @return Delta (end - start)
+    uint64_t MeasureUnpackStubTiming(const uint8_t* code, size_t size,
+        uint64_t* startTime, uint64_t* endTime) noexcept;
+    
+    /// @brief Measure timing of instruction sequence
+    /// @param iterations Number of iterations
+    /// @return Average cycles per iteration
+    uint64_t MeasureInstructionSequence(size_t iterations) noexcept;
+    
+    /// @brief Detect timing anomalies indicating VM/debugging
+    /// @param threshold Threshold for anomaly detection (cycles)
+    /// @return 1 if anomaly detected, 0 otherwise
+    uint64_t DetectTimingAnomaly(uint64_t threshold) noexcept;
+    
+    // ========================================================================
+    // DEBUG REGISTER MONITORING
+    // ========================================================================
+    
+    /// @brief Read all debug registers
+    /// @param registers Pointer to 8-element uint64_t array
+    /// @return 1 if successful, 0 if failed
+    uint64_t GetDebugRegistersForUnpacker(uint64_t* registers) noexcept;
+    
+    /// @brief Check for active hardware breakpoints
+    /// @param dr7Value Pointer to DR7 value
+    /// @return Number of active breakpoints (0-4)
+    uint64_t CheckHardwareBreakpointTraps(const uint64_t* dr7Value) noexcept;
+    
+    /// @brief Read individual debug registers (SEH-safe)
+    uint64_t ReadDR0() noexcept;
+    uint64_t ReadDR1() noexcept;
+    uint64_t ReadDR2() noexcept;
+    uint64_t ReadDR3() noexcept;
+    uint64_t ReadDR6() noexcept;
+    uint64_t ReadDR7() noexcept;
+    
+    // ========================================================================
+    // ANTI-UNPACKING DETECTION
+    // ========================================================================
+    
+    /// @brief Detect RDTSC-based anti-debugging in unpacker
+    /// @param sampleCount Number of samples to take
+    /// @param samples Pointer to array for samples
+    /// @return 1 if anti-debug detected, 0 otherwise
+    uint64_t DetectRDTSCAntiDebug(size_t sampleCount, uint64_t* samples) noexcept;
+    
+    /// @brief SIMD-accelerated scan for anti-debugging opcodes
+    /// @param buffer Code buffer
+    /// @param size Buffer size
+    /// @param flags Pointer to result flags (bit 0=INT2D, bit 1=INT3, etc.)
+    /// @return Total count of anti-debug opcodes found
+    uint64_t ScanForAntiDebugOpcodes(const uint8_t* buffer, size_t size,
+        uint32_t* flags) noexcept;
+    
+    /// @brief Individual opcode scanners
+    /// @return Offset if found, -1 if not found
+    int64_t ScanForInt2DOpcode(const uint8_t* buffer, size_t size) noexcept;
+    int64_t ScanForRDTSCOpcode(const uint8_t* buffer, size_t size) noexcept;
+    int64_t ScanForCPUIDOpcode(const uint8_t* buffer, size_t size) noexcept;
+    
+    // ========================================================================
+    // CODE ANALYSIS
+    // ========================================================================
+    
+    /// @brief Check if code page is writable (SMC indicator)
+    /// @param address Address to check
+    /// @return 1 if writable, 0 if not
+    uint64_t CheckCodePageWritability(const void* address) noexcept;
+    
+    /// @brief Scan for self-modifying code patterns
+    /// @param buffer Code buffer
+    /// @param size Buffer size
+    /// @return Count of SMC patterns found
+    uint64_t ScanForSMCPatterns(const uint8_t* buffer, size_t size) noexcept;
+    
+    /// @brief Scan for XOR decryption loop patterns
+    /// @param buffer Code buffer
+    /// @param size Buffer size
+    /// @return Count of XOR decryption patterns found
+    uint64_t ScanForXORDecryptionLoop(const uint8_t* buffer, size_t size) noexcept;
+    
+    /// @brief Scan for API hashing patterns (ROL/ROR + XOR)
+    /// @param buffer Code buffer
+    /// @param size Buffer size
+    /// @return Count of API hashing patterns found
+    uint64_t ScanForAPIHashingPattern(const uint8_t* buffer, size_t size) noexcept;
+    
+    // ========================================================================
+    // SIMD-ACCELERATED SCANNING
+    // ========================================================================
+    
+    /// @brief Fast SIMD scan for a specific byte value
+    /// @param buffer Buffer to search
+    /// @param size Buffer size
+    /// @param byteValue Byte to find
+    /// @return Offset of first occurrence, -1 if not found
+    int64_t SIMDScanForByte(const uint8_t* buffer, size_t size, uint8_t byteValue) noexcept;
+    
+    /// @brief Fast SIMD scan for a 2-byte word value
+    /// @param buffer Buffer to search
+    /// @param size Buffer size
+    /// @param wordValue Word to find
+    /// @return Offset of first occurrence, -1 if not found
+    int64_t SIMDScanForWord(const uint8_t* buffer, size_t size, uint16_t wordValue) noexcept;
+    
+    /// @brief Fast scan for a multi-byte pattern
+    /// @param buffer Buffer to search
+    /// @param bufferSize Buffer size
+    /// @param pattern Pattern to find
+    /// @param patternSize Pattern size
+    /// @return Offset of first occurrence, -1 if not found
+    int64_t SIMDScanForPattern(const uint8_t* buffer, size_t bufferSize,
+        const uint8_t* pattern, size_t patternSize) noexcept;
+}
+
 // Forward declarations
 namespace ShadowStrike::ThreatIntel {
     class ThreatIntelStore;
