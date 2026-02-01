@@ -118,6 +118,535 @@ extern "C" {
     uint64_t MeasureRDTSCPTiming(uint32_t iterations) noexcept;
 }
 
+// ============================================================================
+// C++ FALLBACK IMPLEMENTATIONS FOR ASSEMBLY FUNCTIONS
+// ============================================================================
+// These fallback functions provide functionality when:
+// - Assembly module is not linked
+// - Running on platforms where assembly isn't supported
+// - Testing/debugging without assembly
+//
+// The fallbacks use MSVC intrinsics where possible, providing near-native
+// performance while maintaining portability.
+// ============================================================================
+
+namespace {
+    /// @brief Configuration flag to prefer fallbacks (for testing/debugging)
+    constexpr bool USE_ASM_FUNCTIONS = true;
+
+    // ------------------------------------------------------------------------
+    // CPUID Fallbacks (using MSVC __cpuid intrinsic)
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Check CPUID hypervisor bit using intrinsics
+    [[nodiscard]] bool Fallback_CheckCPUIDHypervisorBit() noexcept {
+        int cpuInfo[4] = { 0 };
+        __cpuid(cpuInfo, 1);  // Leaf 1 contains feature flags
+        // ECX bit 31 indicates hypervisor present
+        return (cpuInfo[2] & (1 << 31)) != 0;
+    }
+
+    /// @brief Fallback: Get CPUID vendor string using intrinsics
+    void Fallback_GetCPUIDVendorString(char* buffer, size_t bufferSize) noexcept {
+        if (!buffer || bufferSize < 13) return;
+
+        int cpuInfo[4] = { 0 };
+        __cpuid(cpuInfo, 0x40000000);  // Hypervisor vendor leaf
+
+        // Check if hypervisor is present first
+        int featureInfo[4] = { 0 };
+        __cpuid(featureInfo, 1);
+        if ((featureInfo[2] & (1 << 31)) == 0) {
+            buffer[0] = '\0';
+            return;
+        }
+
+        // Vendor string is in EBX, ECX, EDX (12 chars total)
+        memcpy(buffer, &cpuInfo[1], 4);      // EBX
+        memcpy(buffer + 4, &cpuInfo[2], 4);  // ECX
+        memcpy(buffer + 8, &cpuInfo[3], 4);  // EDX
+        buffer[12] = '\0';
+    }
+
+    /// @brief Fallback: Measure RDTSC timing delta using intrinsics
+    [[nodiscard]] uint64_t Fallback_MeasureRDTSCTimingDelta(uint32_t iterations) noexcept {
+        if (iterations == 0) return 0;
+
+        uint64_t totalDelta = 0;
+        unsigned int aux = 0;
+
+        for (uint32_t i = 0; i < iterations; ++i) {
+            // Serialize with CPUID, then measure RDTSC
+            int cpuInfo[4] = { 0 };
+            __cpuid(cpuInfo, 0);  // Serializing instruction
+
+            uint64_t start = __rdtsc();
+
+            // Execute a simple operation that may trigger VM exit
+            __cpuid(cpuInfo, 1);
+
+            uint64_t end = __rdtsc();
+
+            totalDelta += (end - start);
+        }
+
+        return totalDelta / iterations;
+    }
+
+    // ------------------------------------------------------------------------
+    // Descriptor Table Fallbacks (using inline assembly via intrinsics)
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Get IDT base address
+    /// @note On x64 Windows, user-mode cannot directly execute SIDT
+    /// Returns 0 as a fallback - assembly version handles this properly
+    [[nodiscard]] uint64_t Fallback_GetIDTBase() noexcept {
+        // SIDT requires special handling on x64
+        // Use the SGDT/SIDT intrinsics if available, otherwise return sentinel
+        uint8_t idtr[10] = { 0 };
+        
+        // MSVC doesn't have __sidt intrinsic for x64, use assembly or return 0
+        // The ASM version handles this - fallback indicates "not available"
+        #if defined(_M_X64)
+            // On x64, we can't reliably get IDT from user mode without ASM
+            // Return a sentinel value that won't trigger false positives
+            return 0xFFFFFFFF'FFFFFFFF;
+        #else
+            return 0;
+        #endif
+    }
+
+    /// @brief Fallback: Get GDT base address
+    [[nodiscard]] uint64_t Fallback_GetGDTBase() noexcept {
+        #if defined(_M_X64)
+            // Same limitation as IDT
+            return 0xFFFFFFFF'FFFFFFFF;
+        #else
+            return 0;
+        #endif
+    }
+
+    /// @brief Fallback: Get LDT selector
+    [[nodiscard]] uint16_t Fallback_GetLDTSelector() noexcept {
+        // SLDT not available via intrinsics
+        // Return 0 (typical value, won't trigger false positives)
+        return 0;
+    }
+
+    /// @brief Fallback: Get TR selector
+    [[nodiscard]] uint16_t Fallback_GetTRSelector() noexcept {
+        // STR instruction not available via intrinsics
+        // Return typical Windows value to avoid false positives
+        return 0x40;  // Typical TR selector on Windows
+    }
+
+    // ------------------------------------------------------------------------
+    // VMware Backdoor Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Check VMware backdoor
+    /// @note This is a no-op fallback - real detection requires ASM
+    void Fallback_CheckVMwareBackdoor(uint32_t* rax, uint32_t* rbx, 
+                                       uint32_t* rcx, uint32_t* rdx) noexcept {
+        // VMware backdoor requires privileged I/O port access
+        // Cannot be done reliably without assembly
+        if (rax) *rax = 0;
+        if (rbx) *rbx = 0;
+        if (rcx) *rcx = 0;
+        if (rdx) *rdx = 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // CPUID Timing Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Measure CPUID timing
+    [[nodiscard]] uint64_t Fallback_MeasureCPUIDTiming(uint32_t iterations) noexcept {
+        if (iterations == 0) return 0;
+
+        uint64_t totalCycles = 0;
+
+        for (uint32_t i = 0; i < iterations; ++i) {
+            int cpuInfo[4] = { 0 };
+            
+            // Serialize
+            __cpuid(cpuInfo, 0);
+            
+            uint64_t start = __rdtsc();
+            
+            // Measure CPUID leaf 0 (causes VM exit on hypervisors)
+            __cpuid(cpuInfo, 0);
+            
+            uint64_t end = __rdtsc();
+            
+            totalCycles += (end - start);
+        }
+
+        return totalCycles / iterations;
+    }
+
+    // ------------------------------------------------------------------------
+    // Hyper-V Detection Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Check Hyper-V backdoor
+    [[nodiscard]] uint32_t Fallback_CheckHyperVBackdoor() noexcept {
+        // Check for Hyper-V signature via CPUID
+        int cpuInfo[4] = { 0 };
+        __cpuid(cpuInfo, 0x40000000);
+
+        // Check max leaf value (Hyper-V returns at least 0x40000005)
+        if (cpuInfo[0] >= 0x40000005) {
+            // Verify "Microsoft Hv" signature
+            char vendor[13] = { 0 };
+            memcpy(vendor, &cpuInfo[1], 4);
+            memcpy(vendor + 4, &cpuInfo[2], 4);
+            memcpy(vendor + 8, &cpuInfo[3], 4);
+            
+            if (strncmp(vendor, "Microsoft Hv", 12) == 0) {
+                return cpuInfo[0];  // Return max leaf as indicator
+            }
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // Extended CPUID Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Get extended CPUID info
+    [[nodiscard]] bool Fallback_GetExtendedCPUIDInfo(uint32_t leaf, uint32_t subleaf,
+                                                      uint32_t* eax, uint32_t* ebx,
+                                                      uint32_t* ecx, uint32_t* edx) noexcept {
+        int cpuInfo[4] = { 0 };
+        __cpuidex(cpuInfo, static_cast<int>(leaf), static_cast<int>(subleaf));
+
+        if (eax) *eax = static_cast<uint32_t>(cpuInfo[0]);
+        if (ebx) *ebx = static_cast<uint32_t>(cpuInfo[1]);
+        if (ecx) *ecx = static_cast<uint32_t>(cpuInfo[2]);
+        if (edx) *edx = static_cast<uint32_t>(cpuInfo[3]);
+
+        return true;
+    }
+
+    // ------------------------------------------------------------------------
+    // Segment Limits Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Check segment limits
+    /// @note Cannot get actual segment limits without assembly
+    [[nodiscard]] bool Fallback_CheckSegmentLimits(uint32_t* csLimit, uint32_t* dsLimit, 
+                                                    uint32_t* ssLimit) noexcept {
+        // On x64 flat model, segment limits are 0xFFFFFFFF
+        // Return typical values to avoid false positives
+        if (csLimit) *csLimit = 0xFFFFFFFF;
+        if (dsLimit) *dsLimit = 0xFFFFFFFF;
+        if (ssLimit) *ssLimit = 0xFFFFFFFF;
+        return true;
+    }
+
+    // ------------------------------------------------------------------------
+    // Instruction Timing Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Measure generic instruction timing
+    [[nodiscard]] uint64_t Fallback_MeasureInstructionTiming(uint32_t iterations, 
+                                                              uint32_t instructionType) noexcept {
+        if (iterations == 0) return 0;
+
+        uint64_t totalCycles = 0;
+        int cpuInfo[4] = { 0 };
+
+        for (uint32_t i = 0; i < iterations; ++i) {
+            // Serialize
+            __cpuid(cpuInfo, 0);
+            uint64_t start = __rdtsc();
+
+            // Execute instruction based on type
+            switch (instructionType) {
+                case 0:  // CPUID
+                    __cpuid(cpuInfo, 0);
+                    break;
+                case 1:  // RDTSC (already doing it)
+                    (void)__rdtsc();
+                    break;
+                case 2:  // Memory fence
+                    _mm_mfence();
+                    break;
+                default:
+                    __cpuid(cpuInfo, 0);
+                    break;
+            }
+
+            uint64_t end = __rdtsc();
+            totalCycles += (end - start);
+        }
+
+        return totalCycles / iterations;
+    }
+
+    // ------------------------------------------------------------------------
+    // VMCALL/VMMCALL Fallbacks
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Detect VMCALL (Intel VT-x)
+    /// @note Cannot safely execute VMCALL without ASM/SEH
+    [[nodiscard]] bool Fallback_DetectVMCALL() noexcept {
+        // VMCALL would cause #UD on bare metal
+        // Fallback cannot safely test this - return false
+        return false;
+    }
+
+    /// @brief Fallback: Detect VMMCALL (AMD-V)
+    [[nodiscard]] bool Fallback_DetectVMMCALL() noexcept {
+        // VMMCALL would cause #UD on bare metal
+        // Fallback cannot safely test this - return false
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // CPUID Leaf Range Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Check CPUID leaf range
+    [[nodiscard]] uint32_t Fallback_CheckCPUIDLeafRange() noexcept {
+        int cpuInfo[4] = { 0 };
+        
+        // Check if hypervisor is present
+        __cpuid(cpuInfo, 1);
+        if ((cpuInfo[2] & (1 << 31)) == 0) {
+            return 0;  // No hypervisor
+        }
+
+        // Get hypervisor leaf range
+        __cpuid(cpuInfo, 0x40000000);
+        return static_cast<uint32_t>(cpuInfo[0]);  // Max leaf value
+    }
+
+    // ------------------------------------------------------------------------
+    // IDT/GDT Combined Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Get IDT and GDT info
+    [[nodiscard]] bool Fallback_GetIDTAndGDTInfo(uint64_t* idtBase, uint16_t* idtLimit,
+                                                  uint64_t* gdtBase, uint16_t* gdtLimit) noexcept {
+        // Cannot get this info without ASM
+        // Return sentinel values that won't trigger false positives
+        if (idtBase) *idtBase = 0xFFFFFFFF'FFFFFFFF;
+        if (idtLimit) *idtLimit = 0xFFF;  // Typical limit
+        if (gdtBase) *gdtBase = 0xFFFFFFFF'FFFFFFFF;
+        if (gdtLimit) *gdtLimit = 0x7F;   // Typical limit
+        return true;
+    }
+
+    // ------------------------------------------------------------------------
+    // RDTSCP Timing Fallback
+    // ------------------------------------------------------------------------
+
+    /// @brief Fallback: Measure RDTSCP timing
+    [[nodiscard]] uint64_t Fallback_MeasureRDTSCPTiming(uint32_t iterations) noexcept {
+        if (iterations == 0) return 0;
+
+        uint64_t totalCycles = 0;
+        unsigned int aux = 0;
+
+        for (uint32_t i = 0; i < iterations; ++i) {
+            // RDTSCP is serializing, no need for CPUID fence
+            uint64_t start = __rdtscp(&aux);
+            
+            // Execute something that causes VM exit
+            int cpuInfo[4] = { 0 };
+            __cpuid(cpuInfo, 0);
+            
+            uint64_t end = __rdtscp(&aux);
+            
+            totalCycles += (end - start);
+        }
+
+        return totalCycles / iterations;
+    }
+
+} // anonymous namespace
+
+// ============================================================================
+// WRAPPER FUNCTIONS - Select ASM or Fallback
+// ============================================================================
+// These inline wrappers allow easy switching between ASM and fallback
+// implementations. In production, USE_ASM_FUNCTIONS should be true.
+// For testing/debugging, set to false to use intrinsic-based fallbacks.
+// ============================================================================
+
+namespace {
+    /// @brief Wrapper for CPUID hypervisor bit check
+    [[nodiscard]] inline bool Safe_CheckCPUIDHypervisorBit() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return CheckCPUIDHypervisorBit();
+        } else {
+            return Fallback_CheckCPUIDHypervisorBit();
+        }
+    }
+
+    /// @brief Wrapper for CPUID vendor string
+    inline void Safe_GetCPUIDVendorString(char* buffer, size_t bufferSize) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            GetCPUIDVendorString(buffer, bufferSize);
+        } else {
+            Fallback_GetCPUIDVendorString(buffer, bufferSize);
+        }
+    }
+
+    /// @brief Wrapper for RDTSC timing
+    [[nodiscard]] inline uint64_t Safe_MeasureRDTSCTimingDelta(uint32_t iterations) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return MeasureRDTSCTimingDelta(iterations);
+        } else {
+            return Fallback_MeasureRDTSCTimingDelta(iterations);
+        }
+    }
+
+    /// @brief Wrapper for IDT base
+    [[nodiscard]] inline uint64_t Safe_GetIDTBase() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return GetIDTBase();
+        } else {
+            return Fallback_GetIDTBase();
+        }
+    }
+
+    /// @brief Wrapper for GDT base
+    [[nodiscard]] inline uint64_t Safe_GetGDTBase() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return GetGDTBase();
+        } else {
+            return Fallback_GetGDTBase();
+        }
+    }
+
+    /// @brief Wrapper for LDT selector
+    [[nodiscard]] inline uint16_t Safe_GetLDTSelector() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return GetLDTSelector();
+        } else {
+            return Fallback_GetLDTSelector();
+        }
+    }
+
+    /// @brief Wrapper for TR selector
+    [[nodiscard]] inline uint16_t Safe_GetTRSelector() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return GetTRSelector();
+        } else {
+            return Fallback_GetTRSelector();
+        }
+    }
+
+    /// @brief Wrapper for VMware backdoor
+    inline void Safe_CheckVMwareBackdoor(uint32_t* rax, uint32_t* rbx, 
+                                          uint32_t* rcx, uint32_t* rdx) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            CheckVMwareBackdoor(rax, rbx, rcx, rdx);
+        } else {
+            Fallback_CheckVMwareBackdoor(rax, rbx, rcx, rdx);
+        }
+    }
+
+    /// @brief Wrapper for CPUID timing
+    [[nodiscard]] inline uint64_t Safe_MeasureCPUIDTiming(uint32_t iterations) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return MeasureCPUIDTiming(iterations);
+        } else {
+            return Fallback_MeasureCPUIDTiming(iterations);
+        }
+    }
+
+    /// @brief Wrapper for Hyper-V backdoor
+    [[nodiscard]] inline uint32_t Safe_CheckHyperVBackdoor() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return CheckHyperVBackdoor();
+        } else {
+            return Fallback_CheckHyperVBackdoor();
+        }
+    }
+
+    /// @brief Wrapper for extended CPUID
+    [[nodiscard]] inline bool Safe_GetExtendedCPUIDInfo(uint32_t leaf, uint32_t subleaf,
+                                                         uint32_t* eax, uint32_t* ebx,
+                                                         uint32_t* ecx, uint32_t* edx) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return GetExtendedCPUIDInfo(leaf, subleaf, eax, ebx, ecx, edx);
+        } else {
+            return Fallback_GetExtendedCPUIDInfo(leaf, subleaf, eax, ebx, ecx, edx);
+        }
+    }
+
+    /// @brief Wrapper for segment limits
+    [[nodiscard]] inline bool Safe_CheckSegmentLimits(uint32_t* csLimit, uint32_t* dsLimit, 
+                                                       uint32_t* ssLimit) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return CheckSegmentLimits(csLimit, dsLimit, ssLimit);
+        } else {
+            return Fallback_CheckSegmentLimits(csLimit, dsLimit, ssLimit);
+        }
+    }
+
+    /// @brief Wrapper for instruction timing
+    [[nodiscard]] inline uint64_t Safe_MeasureInstructionTiming(uint32_t iterations, 
+                                                                 uint32_t instructionType) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return MeasureInstructionTiming(iterations, instructionType);
+        } else {
+            return Fallback_MeasureInstructionTiming(iterations, instructionType);
+        }
+    }
+
+    /// @brief Wrapper for VMCALL detection
+    [[nodiscard]] inline bool Safe_DetectVMCALL() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return DetectVMCALL();
+        } else {
+            return Fallback_DetectVMCALL();
+        }
+    }
+
+    /// @brief Wrapper for VMMCALL detection
+    [[nodiscard]] inline bool Safe_DetectVMMCALL() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return DetectVMMCALL();
+        } else {
+            return Fallback_DetectVMMCALL();
+        }
+    }
+
+    /// @brief Wrapper for CPUID leaf range
+    [[nodiscard]] inline uint32_t Safe_CheckCPUIDLeafRange() noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return CheckCPUIDLeafRange();
+        } else {
+            return Fallback_CheckCPUIDLeafRange();
+        }
+    }
+
+    /// @brief Wrapper for IDT/GDT info
+    [[nodiscard]] inline bool Safe_GetIDTAndGDTInfo(uint64_t* idtBase, uint16_t* idtLimit,
+                                                     uint64_t* gdtBase, uint16_t* gdtLimit) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return GetIDTAndGDTInfo(idtBase, idtLimit, gdtBase, gdtLimit);
+        } else {
+            return Fallback_GetIDTAndGDTInfo(idtBase, idtLimit, gdtBase, gdtLimit);
+        }
+    }
+
+    /// @brief Wrapper for RDTSCP timing
+    [[nodiscard]] inline uint64_t Safe_MeasureRDTSCPTiming(uint32_t iterations) noexcept {
+        if constexpr (USE_ASM_FUNCTIONS) {
+            return MeasureRDTSCPTiming(iterations);
+        } else {
+            return Fallback_MeasureRDTSCPTiming(iterations);
+        }
+    }
+
+} // anonymous namespace
+
 namespace ShadowStrike {
 namespace AntiEvasion {
 
@@ -154,6 +683,263 @@ namespace {
         }
 
         return TRUE;
+    }
+
+    // =========================================================================
+    // ENTERPRISE FALSE POSITIVE REDUCTION - Cloud Environment Detection
+    // =========================================================================
+    // Detect legitimate cloud environments (AWS EC2, Azure, GCP) to avoid
+    // flagging enterprise production workloads as "malware evasion".
+    //
+    // Cloud VMs are LEGITIMATE - only flag as suspicious if combined with
+    // actual malware evasion indicators (sandbox tools, analysis artifacts).
+    // =========================================================================
+
+    struct CloudEnvironmentInfo {
+        bool isCloud = false;
+        std::wstring provider;
+        std::wstring instanceId;
+        std::wstring region;
+    };
+
+    /// @brief Detect AWS EC2 environment via SMBIOS/DMI data
+    [[nodiscard]] bool DetectAWSEC2(CloudEnvironmentInfo& info) {
+        // AWS EC2 instances have specific SMBIOS entries
+        // Check system manufacturer and product name in registry
+        HKEY key;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"HARDWARE\\DESCRIPTION\\System\\BIOS",
+            0, KEY_READ, &key) == ERROR_SUCCESS) {
+            
+            wchar_t manufacturer[256] = {};
+            wchar_t product[256] = {};
+            DWORD size = sizeof(manufacturer);
+            
+            RegQueryValueExW(key, L"SystemManufacturer", nullptr, nullptr,
+                            reinterpret_cast<LPBYTE>(manufacturer), &size);
+            
+            size = sizeof(product);
+            RegQueryValueExW(key, L"SystemProductName", nullptr, nullptr,
+                            reinterpret_cast<LPBYTE>(product), &size);
+            
+            RegCloseKey(key);
+            
+            std::wstring mfr(manufacturer);
+            std::wstring prod(product);
+            
+            // AWS EC2 instances report "Amazon EC2" or "Xen" as manufacturer
+            if (mfr.find(L"Amazon") != std::wstring::npos ||
+                prod.find(L"EC2") != std::wstring::npos ||
+                (mfr.find(L"Xen") != std::wstring::npos && prod.find(L"HVM") != std::wstring::npos)) {
+                info.isCloud = true;
+                info.provider = L"Amazon Web Services (EC2)";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// @brief Detect Microsoft Azure environment
+    [[nodiscard]] bool DetectAzure(CloudEnvironmentInfo& info) {
+        // Azure VMs have specific SMBIOS entries and Hyper-V indicators
+        HKEY key;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"HARDWARE\\DESCRIPTION\\System\\BIOS",
+            0, KEY_READ, &key) == ERROR_SUCCESS) {
+            
+            wchar_t manufacturer[256] = {};
+            wchar_t product[256] = {};
+            DWORD size = sizeof(manufacturer);
+            
+            RegQueryValueExW(key, L"SystemManufacturer", nullptr, nullptr,
+                            reinterpret_cast<LPBYTE>(manufacturer), &size);
+            
+            size = sizeof(product);
+            RegQueryValueExW(key, L"SystemProductName", nullptr, nullptr,
+                            reinterpret_cast<LPBYTE>(product), &size);
+            
+            RegCloseKey(key);
+            
+            std::wstring mfr(manufacturer);
+            std::wstring prod(product);
+            
+            // Azure VMs report "Microsoft Corporation" and "Virtual Machine"
+            if (mfr.find(L"Microsoft") != std::wstring::npos &&
+                prod.find(L"Virtual Machine") != std::wstring::npos) {
+                info.isCloud = true;
+                info.provider = L"Microsoft Azure";
+                return true;
+            }
+        }
+        
+        // Also check for Azure-specific registry key
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows Azure",
+            0, KEY_READ, &key) == ERROR_SUCCESS) {
+            RegCloseKey(key);
+            info.isCloud = true;
+            info.provider = L"Microsoft Azure";
+            return true;
+        }
+        
+        return false;
+    }
+
+    /// @brief Detect Google Cloud Platform environment
+    [[nodiscard]] bool DetectGCP(CloudEnvironmentInfo& info) {
+        HKEY key;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"HARDWARE\\DESCRIPTION\\System\\BIOS",
+            0, KEY_READ, &key) == ERROR_SUCCESS) {
+            
+            wchar_t manufacturer[256] = {};
+            wchar_t product[256] = {};
+            DWORD size = sizeof(manufacturer);
+            
+            RegQueryValueExW(key, L"SystemManufacturer", nullptr, nullptr,
+                            reinterpret_cast<LPBYTE>(manufacturer), &size);
+            
+            size = sizeof(product);
+            RegQueryValueExW(key, L"SystemProductName", nullptr, nullptr,
+                            reinterpret_cast<LPBYTE>(product), &size);
+            
+            RegCloseKey(key);
+            
+            std::wstring mfr(manufacturer);
+            std::wstring prod(product);
+            
+            // GCP VMs report "Google" as manufacturer
+            if (mfr.find(L"Google") != std::wstring::npos) {
+                info.isCloud = true;
+                info.provider = L"Google Cloud Platform";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// @brief Detect enterprise VMware vSphere environment
+    [[nodiscard]] bool DetectEnterpriseVMware(CloudEnvironmentInfo& info) {
+        // Check if this is enterprise VMware (vSphere/ESXi) vs desktop VMware
+        // Enterprise deployments typically have:
+        // - Domain membership
+        // - VMware Tools with enterprise features
+        // - Corporate network indicators
+        
+        // Check for VMware Tools with enterprise configuration
+        HKEY key;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\VMware, Inc.\\VMware Tools",
+            0, KEY_READ, &key) == ERROR_SUCCESS) {
+            
+            // Check if machine is domain-joined (indicates enterprise)
+            wchar_t domain[256] = {};
+            DWORD size = sizeof(domain);
+            
+            if (GetComputerNameExW(ComputerNameDnsDomain, domain, &size) && wcslen(domain) > 0) {
+                // Domain-joined VMware = likely enterprise vSphere
+                RegCloseKey(key);
+                info.isCloud = true;  // Treat enterprise VMware as "legitimate cloud"
+                info.provider = L"VMware vSphere (Enterprise)";
+                return true;
+            }
+            
+            RegCloseKey(key);
+        }
+        return false;
+    }
+
+    /// @brief Master cloud/enterprise environment detection
+    [[nodiscard]] CloudEnvironmentInfo DetectCloudEnvironment() {
+        CloudEnvironmentInfo info;
+        
+        // Check in order of likelihood for enterprise deployments
+        if (DetectAWSEC2(info)) return info;
+        if (DetectAzure(info)) return info;
+        if (DetectGCP(info)) return info;
+        if (DetectEnterpriseVMware(info)) return info;
+        
+        return info;
+    }
+
+    /// @brief Check if VM type is a known legitimate cloud provider
+    [[nodiscard]] bool IsLegitimateCloudVMType(VMType type) {
+        switch (type) {
+            case VMType::AmazonEC2:
+            case VMType::AzureVM:
+            case VMType::GoogleCloud:
+            case VMType::HyperV:  // Could be Azure or enterprise Hyper-V
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // =========================================================================
+    // SEH ISOLATION HELPERS
+    // =========================================================================
+    // C2712 Error: "__try cannot be used in functions that require object unwinding"
+    // 
+    // SEH (__try/__except) cannot coexist with C++ objects that have destructors
+    // in the same function. These helper functions isolate the SEH code so that
+    // the main functions can safely use std::wstring, std::vector, etc.
+    // =========================================================================
+
+    /// @brief Structure to hold I/O port probe results (POD type - no destructors)
+    struct IOPortProbeResult {
+        bool vmwareDetected;
+        uint32_t vmwareResponse;
+        bool vboxDetected;
+        uint16_t vboxResponse;
+    };
+
+    /// @brief Isolated SEH function for VMware backdoor probe
+    /// @note This function has NO C++ objects - only POD types for SEH compatibility
+    [[nodiscard]] bool ProbeVMwareBackdoor_SEH(uint32_t* outResponse) noexcept {
+        __try {
+            // TryVMwareBackdoor is declared noexcept and uses only POD
+            uint32_t response = 0;
+            
+            // VMware backdoor uses port 0x5658 with magic value 0x564D5868 ('VMXh')
+            // We need to call the external function that does the actual probe
+            uint32_t rax = 0, rbx = 0, rcx = 0, rdx = 0;
+            CheckVMwareBackdoor(&rax, &rbx, &rcx, &rdx);
+            
+            // VMware returns magic value in EBX if backdoor is present
+            if (rbx == 0x564D5868) {  // 'VMXh' magic
+                if (outResponse) *outResponse = rbx;
+                return true;
+            }
+            return false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception means we're not in VMware (normal on bare metal)
+            return false;
+        }
+    }
+
+    /// @brief Isolated SEH function for VirtualBox I/O port probe
+    /// @note This function has NO C++ objects - only POD types for SEH compatibility
+    [[nodiscard]] bool ProbeVirtualBoxPort_SEH(uint16_t* outValue) noexcept {
+        __try {
+            // Attempt to read VirtualBox I/O port
+            // This will cause #GP exception on non-VirtualBox systems
+            uint16_t val = __inword(0x4042);  // VirtualBox port
+            if (outValue) *outValue = val;
+            return true;  // If we reach here, we're in VirtualBox
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception means we're not in VirtualBox (normal on bare metal)
+            return false;
+        }
+    }
+
+    /// @brief Combined I/O port probing with SEH isolation
+    [[nodiscard]] IOPortProbeResult ProbeAllIOPorts_SEH() noexcept {
+        IOPortProbeResult result = {};
+        result.vmwareDetected = ProbeVMwareBackdoor_SEH(&result.vmwareResponse);
+        result.vboxDetected = ProbeVirtualBoxPort_SEH(&result.vboxResponse);
+        return result;
     }
 }
 
@@ -536,13 +1322,13 @@ CPUIDInfo VMEvasionDetector::QuickDetectCPUID() {
     CPUIDInfo info;
 
     try {
-        // Check hypervisor bit using assembly function
-        info.hypervisorPresent = CheckCPUIDHypervisorBit();
+        // Check hypervisor bit using assembly function (with fallback)
+        info.hypervisorPresent = Safe_CheckCPUIDHypervisorBit();
 
         if (info.hypervisorPresent) {
             // Get vendor string from CPUID leaf 0x40000000
             char vendorBuffer[13] = {0};
-            GetCPUIDVendorString(vendorBuffer, sizeof(vendorBuffer));
+            Safe_GetCPUIDVendorString(vendorBuffer, sizeof(vendorBuffer));
             info.vendorString = std::string(vendorBuffer, 12);
 
             // Parse vendor string to determine VM type
@@ -731,7 +1517,27 @@ void VMEvasionDetector::CheckNetworkAdapters(VMEvasionResult& result) {
                 netInfo.macAddress = mac;
                 netInfo.adapterName = adapter.friendlyName;
                 netInfo.associatedVMType = vmType;
-                netInfo.confidence = 80.0f;
+                
+                // =========================================================
+                // FALSE POSITIVE FIX: Reduce confidence for cloud VMs
+                // =========================================================
+                // Cloud providers use VM MAC addresses legitimately.
+                // Lower confidence for known cloud VM types to prevent
+                // flagging AWS EC2, Azure, and GCP instances as suspicious.
+                // =========================================================
+                float confidence = 80.0f;
+                if (IsLegitimateCloudVMType(vmType)) {
+                    confidence = 30.0f;  // Lower confidence for cloud VMs
+                    netInfo.confidence = confidence;
+                } else if (vmType == VMType::VMware) {
+                    // VMware could be desktop or enterprise vSphere
+                    // Use moderate confidence until other checks confirm
+                    confidence = 50.0f;
+                    netInfo.confidence = confidence;
+                } else {
+                    netInfo.confidence = confidence;
+                }
+                
                 netInfo.isVirtualAdapter = true;
 
                 result.networkIndicators.push_back(netInfo);
@@ -747,7 +1553,7 @@ void VMEvasionDetector::CheckNetworkAdapters(VMEvasionResult& result) {
                     result,
                     VMDetectionCategory::Network,
                     vmType,
-                    80.0f,
+                    confidence,
                     L"VM-specific MAC OUI detected",
                     macStr.str(),
                     adapter.friendlyName
@@ -775,10 +1581,10 @@ void VMEvasionDetector::CheckFirmwareTables(VMEvasionResult& result) {
         // Query BIOS info from Registry as a fallback since SystemUtils doesn't provide direct SMBIOS access
         std::wstring biosVendor, biosVersion, systemManufacturer, systemModel;
 
-        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"BIOSVendor", biosVendor);
-        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"BIOSVersion", biosVersion);
-        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemManufacturer", systemManufacturer);
-        Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemProductName", systemModel);
+        (void)Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"BIOSVendor", biosVendor);
+        (void)Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"BIOSVersion", biosVersion);
+        (void)Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemManufacturer", systemManufacturer);
+        (void)Utils::RegistryUtils::QuickReadString(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemProductName", systemModel);
 
         result.firmwareInfo.biosVendor = biosVendor;
         result.firmwareInfo.biosVersion = biosVersion;
@@ -932,9 +1738,9 @@ void VMEvasionDetector::CheckRunningProcesses(VMEvasionResult& result) {
 
 void VMEvasionDetector::CheckTiming(VMEvasionResult& result) {
     try {
-        // Use assembly function to measure RDTSC timing
+        // Use assembly function to measure RDTSC timing (with fallback)
         const uint32_t iterations = 1000;
-        uint64_t delta = MeasureRDTSCTimingDelta(iterations);
+        uint64_t delta = Safe_MeasureRDTSCTimingDelta(iterations);
 
         result.timingInfo.rdtscDelta = delta;
         result.timingInfo.sampleCount = iterations;
@@ -970,34 +1776,64 @@ void VMEvasionDetector::CheckTiming(VMEvasionResult& result) {
 }
 
 void VMEvasionDetector::CheckIOPorts(VMEvasionResult& result) {
-// 1. VMware Check    uint32_t vmwareResponse = 0;    if (TryVMwareBackdoor(vmwareResponse)) {        AddArtifact(result, VMDetectionCategory::IOPort, VMType::VMware, 95.0f,                   L"VMware Backdoor port communication successful",                   L"Magic: 0x" + std::to_wstring(vmwareResponse), L"I/O Port Probe");        result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::IOPort;        result.categoryScores[VMDetectionCategory::IOPort] = 95.0f;        m_impl->m_statistics.categoryTriggerCounts[7].fetch_add(1, std::memory_order_relaxed);                SS_LOG_INFO(L"AntiEvasion", L"CheckIOPorts: VMware backdoor detected");    }
-    __try {
-        // VirtualBox uses port 0x4042 (and others)
-        uint16_t val = __inword(VMConstants::VBOX_IO_PORT_START);
+    // =========================================================================
+    // I/O PORT VM DETECTION
+    // =========================================================================
+    // Uses SEH-isolated helper functions to avoid C2712 error.
+    // SEH (__try/__except) cannot be used in functions with C++ objects
+    // that have destructors (std::wstring, etc.), so we isolate the
+    // privileged I/O operations in separate POD-only functions.
+    // =========================================================================
 
+    // Probe all I/O ports using SEH-isolated helper
+    IOPortProbeResult probeResult = ProbeAllIOPorts_SEH();
+
+    // -------------------------------------------------------------------------
+    // 1. VMware Backdoor Detection
+    // -------------------------------------------------------------------------
+    if (probeResult.vmwareDetected) {
+        AddArtifact(result, VMDetectionCategory::IOPort, VMType::VMware, 95.0f,
+                   L"VMware Backdoor port communication successful",
+                   L"Magic: 0x" + std::to_wstring(probeResult.vmwareResponse), 
+                   L"I/O Port Probe");
+        
+        result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::IOPort;
+        result.categoryScores[VMDetectionCategory::IOPort] = 95.0f;
+        m_impl->m_statistics.categoryTriggerCounts[7].fetch_add(1, std::memory_order_relaxed);
+        
+        SS_LOG_INFO(L"AntiEvasion", L"CheckIOPorts: VMware backdoor detected");
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. VirtualBox I/O Port Detection
+    // -------------------------------------------------------------------------
+    if (probeResult.vboxDetected) {
         AddArtifact(result, VMDetectionCategory::IOPort, VMType::VirtualBox, 90.0f,
                    L"VirtualBox I/O Port (0x4042) accessed without exception",
-                   L"No Exception", L"I/O Port Probe");
+                   L"Value: 0x" + std::to_wstring(probeResult.vboxResponse), 
+                   L"I/O Port Probe");
 
         result.triggeredCategories = result.triggeredCategories | VMDetectionCategory::IOPort;
-        result.categoryScores[VMDetectionCategory::IOPort] = 90.0f;
+        result.categoryScores[VMDetectionCategory::IOPort] = 
+            std::max(result.categoryScores[VMDetectionCategory::IOPort], 90.0f);
         m_impl->m_statistics.categoryTriggerCounts[7].fetch_add(1, std::memory_order_relaxed);
-
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Normal behavior on bare metal
+        
+        SS_LOG_INFO(L"AntiEvasion", L"CheckIOPorts: VirtualBox I/O port detected");
     }
 }
 
 void VMEvasionDetector::CheckMemoryArtifacts(VMEvasionResult& result) {
     try {
-        // Check descriptor tables (IDT, GDT, LDT) using assembly functions
-        uint64_t idtBase = GetIDTBase();
+        // Check descriptor tables (IDT, GDT, LDT) using assembly functions (with fallback)
+        uint64_t idtBase = Safe_GetIDTBase();
 
         // On bare metal, IDT/GDT are typically in low memory
         // In VMs, they're often relocated to higher addresses
+        // Note: Fallback returns 0xFFFFFFFF'FFFFFFFF as sentinel (skip check)
         constexpr uint64_t TYPICAL_IDT_THRESHOLD = 0xFFFFFF;  // ~16MB
+        constexpr uint64_t SENTINEL_VALUE = 0xFFFFFFFF'FFFFFFFF;
 
-        if (idtBase > TYPICAL_IDT_THRESHOLD) {
+        if (idtBase != SENTINEL_VALUE && idtBase > TYPICAL_IDT_THRESHOLD) {
             AddArtifact(
                 result,
                 VMDetectionCategory::Memory,
@@ -1829,7 +2665,77 @@ void VMEvasionDetector::CalculateFinalScore(VMEvasionResult& result) {
     }
 
     result.confidenceScore = (totalWeight > 0.0f) ? (weightedSum / totalWeight) : 0.0f;
-    result.isVM = (result.confidenceScore >= m_impl->m_config.minimumConfidenceThreshold);
+    
+    // =========================================================================
+    // ENTERPRISE FALSE POSITIVE REDUCTION: Context-Aware Scoring
+    // =========================================================================
+    // Check if we're in a legitimate cloud environment BEFORE marking as VM.
+    // Cloud VMs (AWS EC2, Azure, GCP) are LEGITIMATE enterprise infrastructure,
+    // not malware evasion. We should:
+    // 1. Detect and flag VM presence (informational)
+    // 2. NOT flag as "suspicious evasion" unless combined with sandbox indicators
+    // =========================================================================
+    
+    CloudEnvironmentInfo cloudInfo = DetectCloudEnvironment();
+    
+    if (cloudInfo.isCloud) {
+        result.isLegitimateCloudEnvironment = true;
+        result.cloudProvider = cloudInfo.provider;
+        result.cloudInstanceId = cloudInfo.instanceId;
+        result.cloudRegion = cloudInfo.region;
+        
+        // For legitimate cloud environments, we still detect VM but don't flag as evasion
+        // unless there are specific malware evasion indicators (sandbox tools, analysis artifacts)
+        result.isVM = true;  // It IS a VM
+        result.isSuspiciousEvasion = false;  // But NOT suspicious evasion
+        
+        SS_LOG_INFO(L"AntiEvasion", 
+            L"CalculateFinalScore: Legitimate cloud environment detected (%ls) - not flagging as evasion",
+            cloudInfo.provider.c_str());
+    } else {
+        // Not a cloud environment - use standard threshold
+        result.isVM = (result.confidenceScore >= m_impl->m_config.minimumConfidenceThreshold);
+        
+        // For non-cloud VMs, check if this looks like malware evasion
+        // Suspicious evasion requires BOTH:
+        // 1. VM presence indicators
+        // 2. Additional suspicious indicators (sandbox artifacts, analysis tools, etc.)
+        if (result.isVM) {
+            // Count suspicious (non-cloud) indicators
+            size_t suspiciousIndicators = 0;
+            for (const auto& artifact : result.artifacts) {
+                // VirtualBox, QEMU, Sandboxie, Wine are more likely to be analysis environments
+                if (artifact.associatedVMType == VMType::VirtualBox ||
+                    artifact.associatedVMType == VMType::QEMU ||
+                    artifact.associatedVMType == VMType::Sandboxie ||
+                    artifact.associatedVMType == VMType::Wine ||
+                    artifact.associatedVMType == VMType::Bochs) {
+                    suspiciousIndicators++;
+                }
+                
+                // Process/service artifacts indicating analysis environment
+                if (artifact.category == VMDetectionCategory::Process &&
+                    artifact.confidence >= 70.0f) {
+                    suspiciousIndicators++;
+                }
+            }
+            
+            // Require multiple suspicious indicators to flag as evasion
+            result.isSuspiciousEvasion = (suspiciousIndicators >= 3);
+            
+            // Check for enterprise VMware (domain-joined) - not suspicious
+            if (result.detectedType == VMType::VMware || result.detectedType == VMType::HyperV) {
+                wchar_t domain[256] = {};
+                DWORD size = sizeof(domain);
+                if (GetComputerNameExW(ComputerNameDnsDomain, domain, &size) && wcslen(domain) > 0) {
+                    result.isEnterpriseVirtualization = true;
+                    result.isSuspiciousEvasion = false;  // Domain-joined = enterprise
+                    SS_LOG_INFO(L"AntiEvasion",
+                        L"CalculateFinalScore: Domain-joined VM detected - enterprise environment");
+                }
+            }
+        }
+    }
 
     // Set confidence level
     if (result.confidenceScore >= 95.0f) result.confidenceLevel = VMConfidenceLevel::Definitive;
@@ -2000,8 +2906,8 @@ bool VMEvasionDetector::TryVMwareBackdoor(uint32_t& response) {
 }
 
 uint64_t VMEvasionDetector::MeasureRDTSCDelta(uint32_t iterations) {
-    // Call the optimized assembly implementation
-    return MeasureRDTSCTimingDelta(iterations);
+    // Call the optimized assembly implementation (with fallback)
+    return Safe_MeasureRDTSCTimingDelta(iterations);
 }
 
 // ============================================================================

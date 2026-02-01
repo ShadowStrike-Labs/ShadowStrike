@@ -1191,6 +1191,28 @@ namespace ShadowStrike {
             std::chrono::system_clock::time_point detectionTime;        ///< When detection was performed
             std::chrono::nanoseconds detectionDuration{ 0 };              ///< How long detection took
 
+            // -------------------------------------------------------------------------
+            // ENTERPRISE FALSE POSITIVE REDUCTION
+            // -------------------------------------------------------------------------
+            // These fields help differentiate LEGITIMATE enterprise virtualization
+            // (AWS EC2, Azure, GCP, VMware vSphere) from SUSPICIOUS sandbox evasion.
+            
+            /// True if running in a known legitimate cloud environment (AWS/Azure/GCP)
+            bool isLegitimateCloudEnvironment = false;
+            
+            /// True if running in enterprise virtualization (domain-joined VMware/Hyper-V)
+            bool isEnterpriseVirtualization = false;
+            
+            /// True if VM detection indicates potential malware evasion (not just VM presence)
+            bool isSuspiciousEvasion = false;
+            
+            /// Detected cloud provider (if any)
+            std::wstring cloudProvider;
+            
+            /// Cloud instance metadata (if available)
+            std::wstring cloudInstanceId;
+            std::wstring cloudRegion;
+
             // Error/status information
             bool completed = false;                            ///< True if detection completed normally
             bool timedOut = false;                             ///< True if detection timed out

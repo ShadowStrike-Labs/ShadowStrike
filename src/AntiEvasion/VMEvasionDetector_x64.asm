@@ -540,14 +540,29 @@ skip_store_eax:
 skip_store_ebx:
 
     ; Get stack parameters for pEcx and pEdx
-    ; Stack layout: ret addr, saved rbx, rdi, rsi = 32 bytes, then shadow space 32 bytes
-    mov r10, qword ptr [rsp + 56]   ; pEcx (5th param)
+    ; =========================================================================
+    ; STACK OFFSET FIX: Correct Microsoft x64 calling convention
+    ; =========================================================================
+    ; When this function is entered, the stack contains:
+    ;   [RSP+0]   = Return address (8 bytes)
+    ;   [RSP+8]   = Shadow space for RCX (8 bytes) - caller allocated
+    ;   [RSP+16]  = Shadow space for RDX (8 bytes) - caller allocated  
+    ;   [RSP+24]  = Shadow space for R8 (8 bytes) - caller allocated
+    ;   [RSP+32]  = Shadow space for R9 (8 bytes) - caller allocated
+    ;   [RSP+40]  = 5th parameter (pEcx)
+    ;   [RSP+48]  = 6th parameter (pEdx)
+    ;
+    ; After our 3 pushes (RBX, RDI, RSI = 24 bytes), stack offsets become:
+    ;   5th param at [RSP + 24 + 40] = [RSP + 64]
+    ;   6th param at [RSP + 24 + 48] = [RSP + 72]
+    ; =========================================================================
+    mov r10, qword ptr [rsp + 64]   ; pEcx (5th param) - FIXED offset
     test r10, r10
     jz skip_store_ecx
     mov dword ptr [r10], ecx
 skip_store_ecx:
 
-    mov r10, qword ptr [rsp + 64]   ; pEdx (6th param)
+    mov r10, qword ptr [rsp + 72]   ; pEdx (6th param) - FIXED offset
     test r10, r10
     jz skip_store_edx
     mov dword ptr [r10], edx
