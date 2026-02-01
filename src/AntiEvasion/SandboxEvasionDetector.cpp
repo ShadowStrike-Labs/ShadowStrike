@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <bitset>
 #include <future>
 #include <mutex>
 #include <numeric>
@@ -46,6 +47,7 @@
 
 #ifdef _WIN32
 #  include <intrin.h>
+#  include <emmintrin.h>  // SSE2 intrinsics for fallback functions
 #  include <TlHelp32.h>
 #  include <Psapi.h>
 #  include <ShlObj.h>
@@ -58,6 +60,412 @@
 #  pragma comment(lib, "Setupapi.lib")
 #  pragma comment(lib, "iphlpapi.lib")
 #endif
+
+// =============================================================================
+// ASSEMBLY FUNCTION FALLBACKS
+// =============================================================================
+// These fallback implementations are used when the assembly module is not
+// linked (e.g., on non-Windows platforms or during testing). They provide
+// equivalent functionality using C++ and compiler intrinsics where possible.
+//
+// MSVC linker directive /ALTERNATENAME automatically falls back to these
+// if the primary assembly symbols are not found.
+// =============================================================================
+
+#ifdef _MSC_VER
+#pragma comment(linker, "/ALTERNATENAME:GetPreciseRDTSC=Fallback_GetPreciseRDTSC")
+#pragma comment(linker, "/ALTERNATENAME:GetPreciseRDTSCP=Fallback_GetPreciseRDTSCP")
+#pragma comment(linker, "/ALTERNATENAME:MeasureRDTSCOverhead=Fallback_MeasureRDTSCOverhead")
+#pragma comment(linker, "/ALTERNATENAME:MeasureCPUIDOverhead=Fallback_MeasureCPUIDOverhead")
+#pragma comment(linker, "/ALTERNATENAME:MeasureSleepAcceleration=Fallback_MeasureSleepAcceleration")
+#pragma comment(linker, "/ALTERNATENAME:CheckCuckooBackdoor=Fallback_CheckCuckooBackdoor")
+#pragma comment(linker, "/ALTERNATENAME:MeasureTimingPrecision=Fallback_MeasureTimingPrecision")
+#pragma comment(linker, "/ALTERNATENAME:DetectSingleStepTiming=Fallback_DetectSingleStepTiming")
+#pragma comment(linker, "/ALTERNATENAME:MeasureVMExitOverhead=Fallback_MeasureVMExitOverhead")
+#pragma comment(linker, "/ALTERNATENAME:CalibrateTimingBaseline=Fallback_CalibrateTimingBaseline")
+#pragma comment(linker, "/ALTERNATENAME:DetectTimingHook=Fallback_DetectTimingHook")
+#pragma comment(linker, "/ALTERNATENAME:MeasureMemoryLatency=Fallback_MeasureMemoryLatency")
+#pragma comment(linker, "/ALTERNATENAME:CheckHypervisorBit=Fallback_CheckHypervisorBit")
+#pragma comment(linker, "/ALTERNATENAME:MeasureIntOverhead=Fallback_MeasureIntOverhead")
+#pragma comment(linker, "/ALTERNATENAME:SandboxRDTSCDifference=Fallback_SandboxRDTSCDifference")
+#pragma comment(linker, "/ALTERNATENAME:GetRDTSCFrequency=Fallback_GetRDTSCFrequency")
+#pragma comment(linker, "/ALTERNATENAME:DetectRDTSCEmulation=Fallback_DetectRDTSCEmulation")
+#endif
+
+extern "C" {
+
+/// Fallback: GetPreciseRDTSC using intrinsics
+uint64_t Fallback_GetPreciseRDTSC(void) {
+#ifdef _WIN32
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0);  // Serialize
+    return __rdtsc();
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: GetPreciseRDTSCP using intrinsics
+uint64_t Fallback_GetPreciseRDTSCP(uint32_t* processorId) {
+#ifdef _WIN32
+    unsigned int aux = 0;
+    uint64_t tsc = __rdtscp(&aux);
+    if (processorId) {
+        *processorId = aux;
+    }
+    return tsc;
+#else
+    if (processorId) *processorId = 0;
+    return 0;
+#endif
+}
+
+/// Fallback: MeasureRDTSCOverhead
+uint64_t Fallback_MeasureRDTSCOverhead(void) {
+#ifdef _WIN32
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0);
+    uint64_t start = __rdtsc();
+    
+    // Execute 100 RDTSC calls
+    for (int i = 0; i < 100; ++i) {
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+        (void)__rdtsc();
+    }
+    
+    __cpuid(cpuInfo, 0);
+    uint64_t end = __rdtsc();
+    return (end - start) / 1000;  // Average per call
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: MeasureCPUIDOverhead
+uint64_t Fallback_MeasureCPUIDOverhead(void) {
+#ifdef _WIN32
+    int cpuInfo[4];
+    uint64_t start = __rdtsc();
+    
+    // Execute 100 CPUID calls
+    for (int i = 0; i < 100; ++i) {
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+        __cpuid(cpuInfo, 0);
+    }
+    
+    uint64_t end = __rdtsc();
+    return (end - start) / 1000;  // Average per call
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: MeasureSleepAcceleration
+uint64_t Fallback_MeasureSleepAcceleration(uint32_t sleepMs) {
+#ifdef _WIN32
+    if (sleepMs < 100) return 0;
+    
+    ULONGLONG startTicks = GetTickCount64();
+    Sleep(sleepMs);
+    ULONGLONG endTicks = GetTickCount64();
+    
+    ULONGLONG actualMs = endTicks - startTicks;
+    
+    // Calculate deviation percentage
+    if (actualMs >= sleepMs) {
+        return 0;  // No acceleration
+    }
+    
+    return ((sleepMs - actualMs) * 100) / sleepMs;
+#else
+    (void)sleepMs;
+    return 0;
+#endif
+}
+
+/// Fallback: CheckCuckooBackdoor
+/// Note: Actual Cuckoo detection requires network socket operations
+uint32_t Fallback_CheckCuckooBackdoor(void) {
+    // This is a stub - real Cuckoo detection is done in C++ code
+    return 0;
+}
+
+/// Fallback: MeasureTimingPrecision
+uint64_t Fallback_MeasureTimingPrecision(void) {
+#ifdef _WIN32
+    uint64_t minDelta = UINT64_MAX;
+    
+    for (int i = 0; i < 100; ++i) {
+        uint64_t t1 = __rdtsc();
+        uint64_t t2 = __rdtsc();
+        uint64_t delta = t2 - t1;
+        if (delta < minDelta) {
+            minDelta = delta;
+        }
+    }
+    
+    return minDelta;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: DetectSingleStepTiming
+uint32_t Fallback_DetectSingleStepTiming(void) {
+#ifdef _WIN32
+    uint64_t start = __rdtsc();
+    
+    // Execute known number of simple operations
+    volatile int x = 0;
+    for (int i = 0; i < 20; ++i) {
+        x++;
+    }
+    
+    uint64_t end = __rdtsc();
+    
+    // If > 1000 cycles for 20 simple increments, likely single-stepping
+    return (end - start > 1000) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: MeasureVMExitOverhead
+uint64_t Fallback_MeasureVMExitOverhead(void) {
+#ifdef _WIN32
+    uint64_t total = 0;
+    int cpuInfo[4];
+    
+    // Test 1: CPUID overhead (causes VM exit)
+    uint64_t start = __rdtsc();
+    __cpuid(cpuInfo, 1);  // Leaf 1
+    uint64_t end = __rdtsc();
+    total += (end - start);
+    
+    // Test 2: Another CPUID
+    start = __rdtsc();
+    __cpuid(cpuInfo, 0);
+    end = __rdtsc();
+    total += (end - start);
+    
+    // Test 3: Memory fence instructions
+    start = __rdtsc();
+    _mm_sfence();
+    _mm_lfence();
+    _mm_mfence();
+    end = __rdtsc();
+    total += (end - start);
+    
+    return total;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: CalibrateTimingBaseline
+static uint64_t g_baselineRDTSC_fallback = 0;
+static uint64_t g_baselineCPUID_fallback = 0;
+static bool g_calibrationDone_fallback = false;
+
+void Fallback_CalibrateTimingBaseline(void) {
+#ifdef _WIN32
+    if (g_calibrationDone_fallback) return;
+    
+    // Measure RDTSC baseline
+    uint64_t sum = 0;
+    for (int i = 0; i < 10; ++i) {
+        uint64_t start = __rdtsc();
+        uint64_t end = __rdtsc();
+        sum += (end - start);
+    }
+    g_baselineRDTSC_fallback = sum / 10;
+    
+    // Measure CPUID baseline
+    int cpuInfo[4];
+    sum = 0;
+    for (int i = 0; i < 10; ++i) {
+        uint64_t start = __rdtsc();
+        __cpuid(cpuInfo, 0);
+        uint64_t end = __rdtsc();
+        sum += (end - start);
+    }
+    g_baselineCPUID_fallback = sum / 10;
+    
+    g_calibrationDone_fallback = true;
+#endif
+}
+
+/// Fallback: DetectTimingHook
+uint32_t Fallback_DetectTimingHook(void) {
+#ifdef _WIN32
+    uint64_t rdtsc1 = __rdtsc();
+    
+    unsigned int aux;
+    uint64_t rdtscp = __rdtscp(&aux);
+    
+    // If difference is very large, timing may be hooked
+    int64_t diff = static_cast<int64_t>(rdtscp) - static_cast<int64_t>(rdtsc1);
+    if (diff < 0) diff = -diff;
+    
+    return (diff > 10000) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: MeasureMemoryLatency
+uint64_t Fallback_MeasureMemoryLatency(void) {
+#ifdef _WIN32
+    // Allocate and flush memory - use alignas for proper alignment
+    alignas(64) static volatile char buffer[4096];
+    
+    // Flush cache line
+    _mm_clflush(const_cast<char*>(&buffer[0]));
+    _mm_mfence();
+    
+    // Measure uncached access
+    uint64_t start = __rdtsc();
+    volatile char x = buffer[0];
+    (void)x;
+    _mm_lfence();
+    uint64_t end = __rdtsc();
+    
+    return end - start;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: CheckHypervisorBit
+uint32_t Fallback_CheckHypervisorBit(void) {
+#ifdef _WIN32
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 1);
+    
+    // Check hypervisor bit (ECX bit 31)
+    return (cpuInfo[2] & (1 << 31)) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: MeasureIntOverhead
+uint64_t Fallback_MeasureIntOverhead(void) {
+#ifdef _WIN32
+    int cpuInfo[4];
+    
+    // Measure hypervisor CPUID leaf (may cause VM exit)
+    __cpuid(cpuInfo, 0);
+    uint64_t start = __rdtsc();
+    __cpuid(cpuInfo, 0x40000000);  // Hypervisor leaf
+    uint64_t end = __rdtsc();
+    
+    return end - start;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: SandboxRDTSCDifference
+uint64_t Fallback_SandboxRDTSCDifference(uint32_t iterations) {
+#ifdef _WIN32
+    if (iterations == 0) return 0;
+    
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0);
+    uint64_t start = __rdtsc();
+    
+    // Busy loop
+    for (uint32_t i = 0; i < iterations; ++i) {
+        _mm_pause();
+    }
+    
+    uint64_t end = __rdtsc();
+    return end - start;
+#else
+    (void)iterations;
+    return 0;
+#endif
+}
+
+/// Fallback: GetRDTSCFrequency
+uint64_t Fallback_GetRDTSCFrequency(void) {
+#ifdef _WIN32
+    int cpuInfo[4];
+    
+    // Try CPUID leaf 0x15 (TSC/Core Crystal Clock info)
+    __cpuid(cpuInfo, 0x15);
+    
+    uint32_t denominator = cpuInfo[0];  // EAX
+    uint32_t numerator = cpuInfo[1];    // EBX
+    uint32_t frequency = cpuInfo[2];    // ECX
+    
+    if (numerator == 0 || denominator == 0) {
+        return 0;  // Info not available
+    }
+    
+    // TSC frequency = (ECX * EBX) / EAX
+    if (frequency != 0) {
+        return (static_cast<uint64_t>(frequency) * numerator) / denominator;
+    }
+    
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+/// Fallback: DetectRDTSCEmulation
+uint32_t Fallback_DetectRDTSCEmulation(void) {
+#ifdef _WIN32
+    // Take 3 consecutive RDTSC readings
+    uint64_t t1 = __rdtsc();
+    uint64_t t2 = __rdtsc();
+    uint64_t t3 = __rdtsc();
+    
+    // Check for constant values (clear emulation sign)
+    if (t1 == t2 || t2 == t3) {
+        return 1;  // Emulation detected
+    }
+    
+    // Check for suspicious constant increment
+    uint64_t delta1 = t2 - t1;
+    uint64_t delta2 = t3 - t2;
+    
+    // If deltas are exactly equal, suspicious (but not definitive)
+    // Real CPUs have some jitter
+    if (delta1 == delta2 && delta1 > 0) {
+        // Additional check - very suspicious if this pattern repeats
+        uint64_t t4 = __rdtsc();
+        uint64_t delta3 = t4 - t3;
+        if (delta3 == delta2) {
+            return 1;  // Emulation very likely
+        }
+    }
+    
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+} // extern "C"
 
 namespace ShadowStrike {
     namespace AntiEvasion {
@@ -74,9 +482,34 @@ namespace ShadowStrike {
 
         namespace {
             // Known VM/Sandbox BIOS strings
+            // CRITICAL FIX (Issue #2): Removed cloud providers to prevent false positives
+            // AWS EC2, Azure, GCP are LEGITIMATE enterprise environments, not sandboxes
+            // Only include strings that definitively indicate analysis sandbox environments
             constexpr std::wstring_view VM_BIOS_STRINGS[] = {
-                L"VBOX", L"VMWARE", L"QEMU", L"VIRTUAL", L"BOCHS", L"PARALLELS",
-                L"XEN", L"INNOTEK", L"ORACLE", L"AMAZON EC2", L"MICROSOFT CORPORATION"
+                L"VBOX",        // VirtualBox (often used for sandboxing)
+                L"QEMU",        // QEMU (common in Cuckoo/CAPE)
+                L"BOCHS",       // Bochs emulator (analysis tool)
+                L"INNOTEK"      // Old VirtualBox identifier
+                // REMOVED: L"VMWARE" - Used legitimately in enterprise (vSphere, Workstation)
+                // REMOVED: L"VIRTUAL" - Too generic, matches legitimate VMs
+                // REMOVED: L"PARALLELS" - Legitimate macOS virtualization
+                // REMOVED: L"XEN" - Used by AWS, legitimate hypervisor
+                // REMOVED: L"ORACLE" - OCI cloud is legitimate
+                // REMOVED: L"AMAZON EC2" - AWS is legitimate enterprise cloud
+                // REMOVED: L"MICROSOFT CORPORATION" - Azure is legitimate enterprise cloud
+            };
+
+            // Known DEFINITIVE sandbox/analysis environment strings
+            // These indicate actual malware analysis sandboxes, not legitimate VMs
+            constexpr std::wstring_view DEFINITIVE_SANDBOX_STRINGS[] = {
+                L"CUCKOO",      // Cuckoo Sandbox
+                L"CAPE",        // CAPE Sandbox
+                L"JOEBOX",      // Joe Sandbox
+                L"ANYRUN",      // ANY.RUN
+                L"VMRAY",       // VMRay
+                L"TRIA.GE",     // Triage sandbox
+                L"HYBRID",      // Hybrid Analysis
+                L"SANDBOX"      // Generic sandbox identifier
             };
 
             // Known VM/Sandbox MAC OUI prefixes (first 3 bytes)
@@ -768,18 +1201,35 @@ namespace ShadowStrike {
             }
 
             // Check BIOS strings for VM indicators
+            // FIX (Issue #2): Reduced suspicion score for generic VMs, high score only for definitive sandboxes
             std::wstring biosCombo = profile.biosVendor + L" " + profile.systemManufacturer + L" " + profile.systemModel;
             std::transform(biosCombo.begin(), biosCombo.end(), biosCombo.begin(), ::towupper);
-            for (const auto& vmStr : VM_BIOS_STRINGS) {
-                if (biosCombo.find(vmStr) != std::wstring::npos) {
-                    suspicionScore += 20.0f;
-                    profile.issues.push_back(L"VM BIOS string detected: " + std::wstring(vmStr));
+            
+            // First check for DEFINITIVE sandbox strings (high confidence)
+            bool definiteSandboxFound = false;
+            for (const auto& sandboxStr : DEFINITIVE_SANDBOX_STRINGS) {
+                if (biosCombo.find(sandboxStr) != std::wstring::npos) {
+                    suspicionScore += 40.0f;  // High confidence - definitive sandbox
+                    profile.issues.push_back(L"Known sandbox environment detected: " + std::wstring(sandboxStr));
+                    definiteSandboxFound = true;
                     break;
                 }
             }
 
+            // Only check generic VM strings if no definitive sandbox found
+            if (!definiteSandboxFound) {
+                for (const auto& vmStr : VM_BIOS_STRINGS) {
+                    if (biosCombo.find(vmStr) != std::wstring::npos) {
+                        // Lower score for generic VM detection - VMs are common in enterprise
+                        suspicionScore += 10.0f;  // Reduced from 20.0f
+                        profile.issues.push_back(L"VM BIOS string detected: " + std::wstring(vmStr));
+                        break;
+                    }
+                }
+            }
+
             profile.suspicionScore = std::min(100.0f, suspicionScore);
-            profile.isSandboxLike = (suspicionScore >= 40.0f);
+            profile.isSandboxLike = (suspicionScore >= 50.0f);  // Raised threshold from 40.0f
 #endif
 
             // Cache the hardware profile
@@ -1057,22 +1507,32 @@ namespace ShadowStrike {
                 L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
                 0, KEY_READ, &ntKey) == ERROR_SUCCESS) {
 
-                wchar_t productName[256];
+                // RAII guard for registry key
+                auto regGuard = [](HKEY k) { if (k) RegCloseKey(k); };
+                std::unique_ptr<std::remove_pointer_t<HKEY>, decltype(regGuard)> keyGuard(ntKey, regGuard);
+
+                wchar_t productName[256] = {};
                 DWORD bufferSize = sizeof(productName);
                 if (RegQueryValueExW(ntKey, L"ProductName", nullptr, nullptr,
                     reinterpret_cast<LPBYTE>(productName), &bufferSize) == ERROR_SUCCESS) {
+                    // Ensure null-termination for safety
+                    productName[255] = L'\0';
                     analysis.windowsVersion = productName;
                 }
 
-                DWORD buildNumber = 0;
-                bufferSize = sizeof(buildNumber);
-                wchar_t buildStr[32];
+                // CRITICAL FIX (Issue #1): Buffer overflow vulnerability
+                // Previous code: bufferSize = sizeof(buildNumber) (4 bytes) but wrote to buildStr[32]
+                // Fixed: Use correct buffer size for the string buffer
+                wchar_t buildStr[32] = {};
+                bufferSize = sizeof(buildStr);  // Correct: 64 bytes (32 * sizeof(wchar_t))
                 if (RegQueryValueExW(ntKey, L"CurrentBuildNumber", nullptr, nullptr,
                     reinterpret_cast<LPBYTE>(buildStr), &bufferSize) == ERROR_SUCCESS) {
+                    // Ensure null-termination for safety
+                    buildStr[31] = L'\0';
                     analysis.windowsBuild = static_cast<uint32_t>(_wtoi(buildStr));
                 }
 
-                RegCloseKey(ntKey);
+                // Key automatically closed by RAII guard
             }
 
             // -------------------------------------------------------------------------
@@ -1403,22 +1863,46 @@ namespace ShadowStrike {
 
                 lastPos = currentPos;
 
-                // Check for clicks
-                if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
+                // Check for clicks - use state change detection to avoid counting held buttons
+                // GetAsyncKeyState bit 0x0001 indicates key was pressed since last call
+                static bool lastLeftButton = false;
+                static bool lastRightButton = false;
+                
+                bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                bool rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+                
+                if (leftDown && !lastLeftButton) {
                     ++analysis.leftClickCount;
                     ++analysis.mouseClickCount;
                 }
-                if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) {
+                if (rightDown && !lastRightButton) {
                     ++analysis.rightClickCount;
                     ++analysis.mouseClickCount;
                 }
+                
+                lastLeftButton = leftDown;
+                lastRightButton = rightDown;
 
-                // Check for keyboard activity
+                // CRITICAL FIX (Issue #5): Keyboard input counting bug
+                // Previous code counted EVERY held key each sample (Shift+A = 2 counts)
+                // Fixed: Track state changes to count only NEW key presses
+                static std::bitset<256> previousKeyStates;
+                std::bitset<256> currentKeyStates;
+                
                 for (int key = 0x08; key <= 0xFE; ++key) {
                     if (GetAsyncKeyState(key) & 0x8000) {
+                        currentKeyStates.set(key);
+                    }
+                }
+                
+                // Count only keys that transitioned from UP to DOWN
+                for (int key = 0x08; key <= 0xFE; ++key) {
+                    if (currentKeyStates[key] && !previousKeyStates[key]) {
                         ++analysis.keyPressCount;
                     }
                 }
+                
+                previousKeyStates = currentKeyStates;
             }
 
             analysis.endTime = std::chrono::steady_clock::now();

@@ -384,6 +384,10 @@ namespace ShadowStrike::AntiEvasion {
         };
 
         /// Expected parent processes (for parent spoofing detection)
+        /// CRITICAL FIX (Issue #8): Added legitimate edge cases to reduce false positives
+        /// - sihost.exe: Shell Infrastructure Host on Windows 10/11
+        /// - taskmgr.exe: When user clicks "Restart Explorer" in Task Manager
+        /// - explorer.exe: When Explorer restarts itself
         std::unordered_map<std::wstring, std::vector<std::wstring>> m_expectedParents = {
             {L"services.exe", {L"wininit.exe"}},
             {L"svchost.exe", {L"services.exe"}},
@@ -392,10 +396,22 @@ namespace ShadowStrike::AntiEvasion {
             {L"winlogon.exe", {L"smss.exe"}},
             {L"wininit.exe", {L"smss.exe"}},
             {L"smss.exe", {L"System"}},
-            {L"explorer.exe", {L"userinit.exe", L"winlogon.exe"}},
+            // Explorer can be started by multiple legitimate parents:
+            // - userinit.exe: Normal logon
+            // - winlogon.exe: Session 0 scenarios
+            // - sihost.exe: Shell Infrastructure Host (Windows 10/11 fast user switching)
+            // - taskmgr.exe: "Restart Explorer" from Task Manager
+            // - explorer.exe: Self-restart
+            // - dllhost.exe: COM activation scenarios
+            {L"explorer.exe", {L"userinit.exe", L"winlogon.exe", L"sihost.exe", 
+                              L"taskmgr.exe", L"explorer.exe", L"dllhost.exe"}},
             {L"taskhost.exe", {L"svchost.exe"}},
             {L"taskhostw.exe", {L"svchost.exe"}},
             {L"RuntimeBroker.exe", {L"svchost.exe"}},
+            // Windows Defender can spawn from multiple service hosts
+            {L"msmpeng.exe", {L"services.exe", L"svchost.exe"}},
+            // Windows Update
+            {L"trustedinstaller.exe", {L"services.exe", L"svchost.exe"}},
         };
 
         // ====================================================================
@@ -487,7 +503,7 @@ namespace ShadowStrike::AntiEvasion {
             // Enterprise: Attempt to load signature database if present
             std::wstring sigPath = L"signatures.db";
             if (ShadowStrike::Utils::FileUtils::Exists(sigPath)) {
-                m_patternStore->Initialize(sigPath);
+                (void)m_patternStore->Initialize(sigPath);
                 SS_LOG_INFO(LOG_CATEGORY, L"Loaded shellcode signatures from %ls", sigPath.c_str());
             }
             else {
@@ -692,8 +708,37 @@ namespace ShadowStrike::AntiEvasion {
             // Buffer for memory content scanning
             std::vector<uint8_t> buffer(MEMORY_SCAN_BUFFER_SIZE);
 
+            // Enterprise-grade limits to prevent DoS and resource exhaustion
+            constexpr size_t MAX_SCAN_ITERATIONS = 500000;    // Cap iterations (128TB / 256KB average)
+            constexpr uint64_t MAX_TOTAL_SCAN_SIZE = 16ULL * 1024 * 1024 * 1024; // 16 GB cap
+            constexpr size_t MAX_SUSPICIOUS_REGIONS = 10000;  // Cap suspicious region count
+            
+            size_t iterations = 0;
+            uint64_t totalScannedSize = 0;
+
             while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+                // Check iteration limit to prevent infinite loops
+                if (++iterations > MAX_SCAN_ITERATIONS) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Memory scan iteration limit reached (%zu)", MAX_SCAN_ITERATIONS);
+                    break;
+                }
+
+                // Check total scanned size limit
+                if (totalScannedSize > MAX_TOTAL_SCAN_SIZE) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Memory scan size limit reached (%.2f GB)", 
+                        static_cast<double>(totalScannedSize) / (1024.0 * 1024.0 * 1024.0));
+                    break;
+                }
+
+                // Check suspicious regions limit
+                if (regions.size() >= MAX_SUSPICIOUS_REGIONS) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Suspicious region limit reached (%zu)", MAX_SUSPICIOUS_REGIONS);
+                    break;
+                }
+
                 if (mbi.State == MEM_COMMIT) {
+                    totalScannedSize += mbi.RegionSize;
+
                     MemoryRegionInfo region;
                     region.baseAddress = reinterpret_cast<uint64_t>(mbi.BaseAddress);
                     region.size = mbi.RegionSize;
@@ -770,7 +815,21 @@ namespace ShadowStrike::AntiEvasion {
                     regions.push_back(region);
                 }
 
+                // CRITICAL FIX: Check for pointer arithmetic overflow before advancing
+                // This prevents infinite loops when BaseAddress + RegionSize wraps around
+                uintptr_t baseAddr = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                if (mbi.RegionSize > UINTPTR_MAX - baseAddr) {
+                    // Would overflow - we've reached the end of address space
+                    SS_LOG_DEBUG(LOG_CATEGORY, L"Address space boundary reached at 0x%p", mbi.BaseAddress);
+                    break;
+                }
                 address = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+                
+                // Additional safety: if address wrapped to zero or went backwards, stop
+                if (address <= static_cast<uint8_t*>(mbi.BaseAddress)) {
+                    SS_LOG_DEBUG(LOG_CATEGORY, L"Address wraparound detected, stopping scan");
+                    break;
+                }
             }
 
             return true;
@@ -955,14 +1014,57 @@ namespace ShadowStrike::AntiEvasion {
                         suspiciousDLLs.push_back(modulePathStr + L" [Loaded from temp directory]");
                     }
 
-                    // DLLs with unusual paths
-                    if (lowerPath.find(L"\\windows\\") == std::wstring::npos &&
+                    // CRITICAL FIX (Issue #7): Whitelist legitimate user directory paths
+                    // Many legitimate applications install plugins/extensions to user directories
+                    // This reduces false positives for: Python, Node.js, Electron apps, Java, etc.
+                    static const std::vector<std::wstring> LEGITIMATE_USER_PATHS = {
+                        L"\\appdata\\local\\programs\\",       // Electron apps (VS Code, Discord, Slack)
+                        L"\\appdata\\roaming\\npm\\",          // Node.js native modules
+                        L"\\appdata\\local\\npm\\",            // Node.js (alternate location)
+                        L"\\appdata\\local\\python",           // Python packages (.pyd files)
+                        L"\\appdata\\roaming\\python",         // Python packages (alternate)
+                        L"\\.m2\\repository\\",                // Maven Java dependencies
+                        L"\\.gradle\\",                        // Gradle Java dependencies
+                        L"\\.nuget\\",                         // NuGet .NET packages
+                        L"\\appdata\\local\\jetbrains\\",      // JetBrains IDE plugins
+                        L"\\appdata\\roaming\\code\\",         // VS Code extensions
+                        L"\\programdata\\",                    // Shared application data
+                        L"\\appdata\\local\\microsoft\\",      // Microsoft apps
+                        L"\\appdata\\roaming\\microsoft\\",    // Microsoft apps
+                        L"\\appdata\\local\\google\\",         // Chrome, etc.
+                        L"\\appdata\\local\\mozilla\\",        // Firefox
+                        L"\\.vscode\\",                        // VS Code extensions
+                        L"\\.docker\\",                        // Docker components
+                        L"\\appdata\\local\\docker\\",         // Docker Desktop
+                    };
+
+                    // Check if path is in a known legitimate location
+                    bool isWhitelistedPath = false;
+                    for (const auto& legitPath : LEGITIMATE_USER_PATHS) {
+                        if (lowerPath.find(legitPath) != std::wstring::npos) {
+                            isWhitelistedPath = true;
+                            break;
+                        }
+                    }
+
+                    // DLLs with unusual paths - only flag if NOT in whitelisted directories
+                    if (!isWhitelistedPath &&
+                        lowerPath.find(L"\\windows\\") == std::wstring::npos &&
                         lowerPath.find(L"\\program files") == std::wstring::npos &&
                         lowerPath.find(L"\\winsxs\\") == std::wstring::npos) {
                         // Check if it's an unsigned DLL from user directory
                         if (lowerPath.find(L"\\users\\") != std::wstring::npos) {
                             if (!IsSignatureValid(modulePathStr)) {
-                                suspiciousDLLs.push_back(modulePathStr + L" [Unsigned DLL from user directory]");
+                                // Additional check: only flag if extension is .dll, not common plugin formats
+                                bool isPluginExtension = 
+                                    lowerPath.ends_with(L".pyd") ||    // Python
+                                    lowerPath.ends_with(L".node") ||   // Node.js native addon
+                                    lowerPath.ends_with(L".vsix") ||   // VS Code extension
+                                    lowerPath.ends_with(L".jar");      // Java (shouldn't load as DLL but safety)
+                                
+                                if (!isPluginExtension) {
+                                    suspiciousDLLs.push_back(modulePathStr + L" [Unsigned DLL from user directory]");
+                                }
                             }
                         }
                     }
@@ -987,7 +1089,8 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Read the PE header from memory
-            uint8_t headerBuffer[4096] = {};
+            constexpr size_t HEADER_BUFFER_SIZE = 4096;
+            uint8_t headerBuffer[HEADER_BUFFER_SIZE] = {};
             SIZE_T bytesRead = 0;
 
             if (!ReadProcessMemory(hProcess, hModules[0], headerBuffer, sizeof(headerBuffer), &bytesRead)) {
@@ -1005,46 +1108,129 @@ namespace ShadowStrike::AntiEvasion {
                 return true;
             }
 
-            // Get expected path and compare
+            // CRITICAL FIX (Issue #4): Validate e_lfanew is within our buffer bounds
+            // e_lfanew is attacker-controlled from process memory - must validate
+            constexpr size_t MIN_PE_HEADER_SPACE = sizeof(uint32_t) + sizeof(PEParser::FileHeader) + 256;
+            if (dosHeader->e_lfanew < sizeof(PEParser::DosHeader) ||
+                dosHeader->e_lfanew >= HEADER_BUFFER_SIZE - MIN_PE_HEADER_SPACE) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Invalid e_lfanew value: 0x%lX (buffer size: %zu)",
+                    static_cast<unsigned long>(dosHeader->e_lfanew), HEADER_BUFFER_SIZE);
+                // Invalid e_lfanew could indicate corruption or hollowing
+                return true;
+            }
+
+            // Additional bounds check: ensure we read enough bytes
+            if (bytesRead <= static_cast<size_t>(dosHeader->e_lfanew) + MIN_PE_HEADER_SPACE) {
+                return false; // Not enough data read
+            }
+
+            // CRITICAL FIX (Issue #2): TOCTOU mitigation for disk file comparison
+            // Open file handle FIRST, then read from it - prevents file replacement attacks
             std::wstring processPath = GetProcessPath(processId);
             if (processPath.empty()) {
                 return false;
             }
 
-            // Parse the file on disk
-            PEParser::PEParser diskParser;
-            PEParser::PEInfo diskInfo;
-            if (!diskParser.ParseFile(processPath, diskInfo, nullptr)) {
+            // Open file with exclusive read to prevent modification during analysis
+            HANDLE hFile = CreateFileW(
+                processPath.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ,  // Allow other readers but no writers
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                nullptr
+            );
+
+            if (hFile == INVALID_HANDLE_VALUE) {
+                // Cannot open file - might be locked or deleted
+                SS_LOG_DEBUG(LOG_CATEGORY, L"Cannot open process file for hollowing check: %ls", processPath.c_str());
                 return false;
             }
 
-            // Compare entry points
-            if (bytesRead > static_cast<size_t>(dosHeader->e_lfanew) + sizeof(uint32_t) + sizeof(PEParser::FileHeader) + 16) {
-                const auto* peSignature = reinterpret_cast<const uint32_t*>(headerBuffer + dosHeader->e_lfanew);
-                if (*peSignature != 0x00004550) { // "PE\0\0"
-                    // Invalid PE signature - hollowed
-                    return true;
-                }
+            // RAII guard for file handle
+            auto fileGuard = [](HANDLE h) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); };
+            std::unique_ptr<void, decltype(fileGuard)> fileHandleGuard(hFile, fileGuard);
 
-                const auto* fileHeader = reinterpret_cast<const PEParser::FileHeader*>(headerBuffer + dosHeader->e_lfanew + 4);
-                const auto* optHeader = reinterpret_cast<const uint16_t*>(headerBuffer + dosHeader->e_lfanew + 4 + sizeof(PEParser::FileHeader));
+            // Read disk file PE headers directly from handle (not path - prevents TOCTOU)
+            uint8_t diskHeaderBuffer[HEADER_BUFFER_SIZE] = {};
+            DWORD diskBytesRead = 0;
 
-                uint32_t memoryEntryPoint = 0;
-                if (*optHeader == 0x20B) { // PE32+
-                    const auto* opt64 = reinterpret_cast<const PEParser::OptionalHeader64*>(optHeader);
-                    memoryEntryPoint = opt64->AddressOfEntryPoint;
-                }
-                else if (*optHeader == 0x10B) { // PE32
-                    const auto* opt32 = reinterpret_cast<const PEParser::OptionalHeader32*>(optHeader);
-                    memoryEntryPoint = opt32->AddressOfEntryPoint;
-                }
+            if (!ReadFile(hFile, diskHeaderBuffer, sizeof(diskHeaderBuffer), &diskBytesRead, nullptr) ||
+                diskBytesRead < sizeof(PEParser::DosHeader)) {
+                return false;
+            }
 
-                // Compare with disk entry point
-                if (memoryEntryPoint != 0 && memoryEntryPoint != diskInfo.entryPointRva) {
-                    SS_LOG_WARN(LOG_CATEGORY, L"Process hollowing detected: Entry point mismatch (memory: 0x%X, disk: 0x%X)",
-                        memoryEntryPoint, diskInfo.entryPointRva);
-                    return true;
-                }
+            const auto* diskDosHeader = reinterpret_cast<const PEParser::DosHeader*>(diskHeaderBuffer);
+            if (diskDosHeader->e_magic != 0x5A4D) {
+                return false; // Disk file is not a valid PE
+            }
+
+            // Validate disk e_lfanew
+            if (diskDosHeader->e_lfanew < sizeof(PEParser::DosHeader) ||
+                diskDosHeader->e_lfanew >= diskBytesRead - MIN_PE_HEADER_SPACE) {
+                return false;
+            }
+
+            // Compare PE signatures
+            const auto* memPeSignature = reinterpret_cast<const uint32_t*>(headerBuffer + dosHeader->e_lfanew);
+            const auto* diskPeSignature = reinterpret_cast<const uint32_t*>(diskHeaderBuffer + diskDosHeader->e_lfanew);
+
+            if (*memPeSignature != 0x00004550) { // "PE\0\0"
+                // Invalid PE signature in memory - hollowed
+                return true;
+            }
+
+            if (*diskPeSignature != 0x00004550) {
+                return false; // Disk file invalid
+            }
+
+            // Parse optional headers to get entry points
+            const auto* memFileHeader = reinterpret_cast<const PEParser::FileHeader*>(
+                headerBuffer + dosHeader->e_lfanew + 4);
+            const auto* diskFileHeader = reinterpret_cast<const PEParser::FileHeader*>(
+                diskHeaderBuffer + diskDosHeader->e_lfanew + 4);
+
+            const auto* memOptMagic = reinterpret_cast<const uint16_t*>(
+                headerBuffer + dosHeader->e_lfanew + 4 + sizeof(PEParser::FileHeader));
+            const auto* diskOptMagic = reinterpret_cast<const uint16_t*>(
+                diskHeaderBuffer + diskDosHeader->e_lfanew + 4 + sizeof(PEParser::FileHeader));
+
+            uint32_t memoryEntryPoint = 0;
+            uint32_t diskEntryPoint = 0;
+
+            // Extract memory entry point
+            if (*memOptMagic == 0x20B) { // PE32+
+                const auto* opt64 = reinterpret_cast<const PEParser::OptionalHeader64*>(memOptMagic);
+                memoryEntryPoint = opt64->AddressOfEntryPoint;
+            }
+            else if (*memOptMagic == 0x10B) { // PE32
+                const auto* opt32 = reinterpret_cast<const PEParser::OptionalHeader32*>(memOptMagic);
+                memoryEntryPoint = opt32->AddressOfEntryPoint;
+            }
+
+            // Extract disk entry point
+            if (*diskOptMagic == 0x20B) { // PE32+
+                const auto* opt64 = reinterpret_cast<const PEParser::OptionalHeader64*>(diskOptMagic);
+                diskEntryPoint = opt64->AddressOfEntryPoint;
+            }
+            else if (*diskOptMagic == 0x10B) { // PE32
+                const auto* opt32 = reinterpret_cast<const PEParser::OptionalHeader32*>(diskOptMagic);
+                diskEntryPoint = opt32->AddressOfEntryPoint;
+            }
+
+            // Compare entry points - mismatch indicates hollowing
+            if (memoryEntryPoint != 0 && diskEntryPoint != 0 && memoryEntryPoint != diskEntryPoint) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Process hollowing detected: Entry point mismatch (memory: 0x%X, disk: 0x%X)",
+                    memoryEntryPoint, diskEntryPoint);
+                return true;
+            }
+
+            // Compare section counts - significant difference indicates hollowing
+            if (memFileHeader->NumberOfSections != diskFileHeader->NumberOfSections) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Process hollowing detected: Section count mismatch (memory: %u, disk: %u)",
+                    memFileHeader->NumberOfSections, diskFileHeader->NumberOfSections);
+                return true;
             }
 
             return false;
@@ -1430,16 +1616,31 @@ namespace ShadowStrike::AntiEvasion {
                     ++instructionCount;
                 }
 
-                // Report findings
-                if (rdtscCount > 5) {
-                    techniques.push_back(std::format(L"RDTSC/RDTSCP instructions detected: {} occurrences (timing-based anti-debug)",
-                        rdtscCount));
+                // Report findings - CRITICAL FIX (Issue #6): Raised thresholds to reduce false positives
+                // RDTSC is commonly used by: browsers (performance.now), games, profilers, databases
+                // Only flag when count is extremely high AND combined with other indicators
+                constexpr uint32_t RDTSC_WARNING_THRESHOLD = 50;   // Informational
+                constexpr uint32_t RDTSC_SUSPICIOUS_THRESHOLD = 200; // Suspicious when combined
+                
+                if (rdtscCount > RDTSC_SUSPICIOUS_THRESHOLD && (int2dCount > 0 || int3Count > 5)) {
+                    // High RDTSC WITH other anti-debug indicators = suspicious
+                    techniques.push_back(std::format(L"RDTSC/RDTSCP with anti-debug: {} occurrences + {} INT2D + {} INT3",
+                        rdtscCount, int2dCount, int3Count));
                 }
+                else if (rdtscCount > RDTSC_WARNING_THRESHOLD && rdtscCount <= RDTSC_SUSPICIOUS_THRESHOLD) {
+                    // Moderate RDTSC count - only log, don't flag as technique
+                    SS_LOG_DEBUG(LOG_CATEGORY, L"Process has %u RDTSC instructions (below suspicious threshold)", rdtscCount);
+                }
+                
+                // INT 2D is always suspicious - used almost exclusively for anti-debugging
                 if (int2dCount > 0) {
                     techniques.push_back(std::format(L"INT 2D instructions detected: {} occurrences (debugger detection)",
                         int2dCount));
                 }
-                if (int3Count > 10) {
+                
+                // INT3 threshold raised - debuggers and instrumentation use many breakpoints
+                constexpr uint32_t INT3_THRESHOLD = 50;
+                if (int3Count > INT3_THRESHOLD) {
                     techniques.push_back(std::format(L"Excessive INT3 instructions: {} occurrences (possible anti-debug or obfuscation)",
                         int3Count));
                 }
@@ -1786,34 +1987,57 @@ namespace ShadowStrike::AntiEvasion {
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) return false;
 
+            // RAII guard for snapshot handle - ensures cleanup on all exit paths
+            auto snapshotGuard = [](HANDLE h) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); };
+            std::unique_ptr<void, decltype(snapshotGuard)> snapshotCleanup(hSnapshot, snapshotGuard);
+
             THREADENTRY32 te32 = {};
             te32.dwSize = sizeof(te32);
 
             bool detected = false;
+            size_t threadsChecked = 0;
+            constexpr size_t MAX_THREADS_TO_CHECK = 1000; // Prevent excessive thread enumeration
 
             if (Thread32First(hSnapshot, &te32)) {
                 do {
                     if (te32.th32OwnerProcessID == processId) {
+                        // Limit threads checked to prevent DoS
+                        if (++threadsChecked > MAX_THREADS_TO_CHECK) {
+                            SS_LOG_WARN(LOG_CATEGORY, L"Thread enumeration limit reached for PID %lu", processId);
+                            break;
+                        }
+
                         HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
-                        if (hThread) {
-                            if (SuspendThread(hThread) != (DWORD)-1) {
+                        if (hThread != nullptr) {
+                            // RAII guard for thread handle - CRITICAL FIX (Issue #3)
+                            // Ensures handle is closed regardless of SuspendThread success
+                            auto threadGuard = [](HANDLE h) { if (h) CloseHandle(h); };
+                            std::unique_ptr<void, decltype(threadGuard)> threadCleanup(hThread, threadGuard);
+
+                            DWORD suspendResult = SuspendThread(hThread);
+                            if (suspendResult != static_cast<DWORD>(-1)) {
                                 CONTEXT ctx = {};
                                 ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
                                 if (GetThreadContext(hThread, &ctx)) {
+                                    // Check if any debug registers are set
                                     if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+                                        detected = true;
+                                    }
+                                    // Also check DR7 for enabled breakpoints
+                                    if ((ctx.Dr7 & 0xFF) != 0) {
                                         detected = true;
                                     }
                                 }
                                 ResumeThread(hThread);
                             }
-                            CloseHandle(hThread);
+                            // Thread handle automatically closed by RAII guard
                         }
                     }
                 } while (!detected && Thread32Next(hSnapshot, &te32));
             }
 
-            CloseHandle(hSnapshot);
+            // Snapshot handle automatically closed by RAII guard
             return detected;
         }
         catch (...) {
@@ -2586,7 +2810,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Memory scanning
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMemory)) {
-                ScanMemory(processId, result.suspiciousMemoryRegions, nullptr);
+                (void)ScanMemory(processId, result.suspiciousMemoryRegions, nullptr);
             }
 
             // Deep analysis - additional checks

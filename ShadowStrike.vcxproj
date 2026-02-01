@@ -758,6 +758,7 @@
     <MASM Include="src\AntiEvasion\EnvironmentEvasionDetector_x64.asm">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </MASM>
+    <MASM Include="src\AntiEvasion\PackerDetector_x64.asm" />
     <MASM Include="src\AntiEvasion\VMEvasionDetector_x64.asm">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </MASM>

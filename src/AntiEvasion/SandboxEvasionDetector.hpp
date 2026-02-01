@@ -179,6 +179,95 @@
 #  include <Windows.h>
 #endif
 
+// =============================================================================
+// ASSEMBLY FUNCTION DECLARATIONS (SandboxEvasionDetector_x64.asm)
+// =============================================================================
+// These functions provide low-level timing and environment detection that
+// cannot be reliably implemented in C++ due to:
+// - Precise instruction sequencing requirements
+// - Need to avoid compiler optimizations
+// - Direct access to CPU features (RDTSC, CPUID, RDPMC)
+// - Detection of VM/hypervisor timing anomalies
+// =============================================================================
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// @brief Gets RDTSC value with full serialization for accurate measurement.
+/// @return 64-bit TSC value
+uint64_t GetPreciseRDTSC(void);
+
+/// @brief Gets RDTSCP value which is self-serializing.
+/// @param processorId Optional pointer to receive processor ID (can be NULL)
+/// @return 64-bit TSC value
+uint64_t GetPreciseRDTSCP(uint32_t* processorId);
+
+/// @brief Measures the overhead of RDTSC instructions.
+/// @return Measured overhead in cycles (high = likely VM)
+uint64_t MeasureRDTSCOverhead(void);
+
+/// @brief Measures CPUID instruction overhead.
+/// @return Measured overhead in cycles (high = likely VM)
+uint64_t MeasureCPUIDOverhead(void);
+
+/// @brief Detects sandbox sleep acceleration/patching.
+/// @param sleepMs Sleep duration in milliseconds
+/// @return Deviation percentage (0 = exact, >50 = likely patched)
+uint64_t MeasureSleepAcceleration(uint32_t sleepMs);
+
+/// @brief Detects Cuckoo sandbox backdoor communication.
+/// @return 1 if Cuckoo indicators found, 0 otherwise
+uint32_t CheckCuckooBackdoor(void);
+
+/// @brief Measures the precision of RDTSC timing.
+/// @return Minimum timing delta (high values = emulation)
+uint64_t MeasureTimingPrecision(void);
+
+/// @brief Detects timing-based debuggers via instruction timing analysis.
+/// @return 1 if single-stepping detected, 0 otherwise
+uint32_t DetectSingleStepTiming(void);
+
+/// @brief Comprehensive VM detection via multiple timing measurements.
+/// @return Combined overhead score (higher = more likely VM)
+uint64_t MeasureVMExitOverhead(void);
+
+/// @brief Establishes baseline timing values for detection.
+void CalibrateTimingBaseline(void);
+
+/// @brief Detects if timing functions are hooked.
+/// @return 1 if timing hook detected, 0 otherwise
+uint32_t DetectTimingHook(void);
+
+/// @brief Measures memory access latency.
+/// @return Memory access latency in cycles
+uint64_t MeasureMemoryLatency(void);
+
+/// @brief Checks CPUID hypervisor present bit.
+/// @return 1 if hypervisor bit set, 0 otherwise
+uint32_t CheckHypervisorBit(void);
+
+/// @brief Measures interrupt handling overhead.
+/// @return Interrupt overhead measurement
+uint64_t MeasureIntOverhead(void);
+
+/// @brief Computes RDTSC difference over a known delay.
+/// @param iterations Number of loop iterations
+/// @return Total RDTSC difference
+uint64_t SandboxRDTSCDifference(uint32_t iterations);
+
+/// @brief Estimates RDTSC frequency using CPUID.
+/// @return Estimated frequency in Hz (0 if unavailable)
+uint64_t GetRDTSCFrequency(void);
+
+/// @brief Detects RDTSC emulation by checking for unrealistic values.
+/// @return 1 if emulation detected, 0 otherwise
+uint32_t DetectRDTSCEmulation(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 // Forward declarations to avoid header pollution
 namespace ShadowStrike::Utils {
     class ThreadPool;
@@ -211,24 +300,37 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             // Hardware Thresholds
             // -------------------------------------------------------------------------
+            // CRITICAL FIX (Issue #3): Reduced thresholds to prevent false positives
+            // Modern cloud instances and containers legitimately have low resources:
+            // - AWS t3.micro: 1GB RAM, 2 vCPU (FREE TIER)
+            // - Azure B1s: 1GB RAM, 1 vCPU
+            // - Kubernetes pods: Often have 512MB-2GB memory limits
+            // - Docker containers: Resource-constrained by design
+            // - IoT/Edge devices: 1-2GB RAM common
 
             /// @brief Minimum RAM size for non-sandbox system (bytes)
-            constexpr uint64_t MIN_RAM_BYTES = 4ULL * 1024 * 1024 * 1024;  // 4GB
+            /// Reduced from 4GB to 1GB to accommodate cloud instances
+            constexpr uint64_t MIN_RAM_BYTES = 1ULL * 1024 * 1024 * 1024;  // 1GB (was 4GB)
 
             /// @brief Suspicious RAM threshold (likely sandbox)
-            constexpr uint64_t SUSPICIOUS_RAM_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2GB
+            /// Reduced from 2GB to 512MB - only truly tiny VMs are suspicious
+            constexpr uint64_t SUSPICIOUS_RAM_BYTES = 512ULL * 1024 * 1024;  // 512MB (was 2GB)
 
             /// @brief Minimum CPU cores for non-sandbox system
-            constexpr uint32_t MIN_CPU_CORES = 2;
+            /// Reduced to 1 - single-core VMs are legitimate (containers, edge)
+            constexpr uint32_t MIN_CPU_CORES = 1;  // was 2
 
             /// @brief Suspicious CPU core count
-            constexpr uint32_t SUSPICIOUS_CPU_CORES = 1;
+            /// 0 cores is impossible, so this effectively disables CPU-based detection alone
+            constexpr uint32_t SUSPICIOUS_CPU_CORES = 0;  // was 1
 
             /// @brief Minimum disk size for non-sandbox system (bytes)
-            constexpr uint64_t MIN_DISK_BYTES = 80ULL * 1024 * 1024 * 1024;  // 80GB
+            /// Reduced from 80GB to 20GB - containers use small disks
+            constexpr uint64_t MIN_DISK_BYTES = 20ULL * 1024 * 1024 * 1024;  // 20GB (was 80GB)
 
             /// @brief Suspicious disk size
-            constexpr uint64_t SUSPICIOUS_DISK_BYTES = 40ULL * 1024 * 1024 * 1024;  // 40GB
+            /// Reduced from 40GB to 8GB - only very small disks are suspicious
+            constexpr uint64_t SUSPICIOUS_DISK_BYTES = 8ULL * 1024 * 1024 * 1024;  // 8GB (was 40GB)
 
             // -------------------------------------------------------------------------
             // Timing Thresholds
