@@ -1690,5 +1690,8 @@
     <MASM Include="src\AntiEvasion\PackerDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
+    <MASM Include="src\AntiEvasion\SandboxEvasionDetector_x64.asm">
+      <Filter>Source Files</Filter>
+    </MASM>
   </ItemGroup>
 </Project>

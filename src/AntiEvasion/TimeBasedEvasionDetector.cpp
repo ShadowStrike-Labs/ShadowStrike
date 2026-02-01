@@ -71,6 +71,7 @@
 
 #include <TlHelp32.h>
 #include <intrin.h>
+#include <emmintrin.h>  // SSE2 intrinsics for fallback functions
 
 // ============================================================================
 // SHADOWSTRIKE INTERNAL INCLUDES
@@ -84,6 +85,365 @@
 #include "../PEParser/PEParser.hpp"
 
 #include <Zydis/Zydis.h>
+
+// =============================================================================
+// ASSEMBLY FUNCTION FALLBACKS
+// =============================================================================
+// These fallback implementations are used when the assembly module is not
+// linked (e.g., on non-Windows platforms or during testing). They provide
+// equivalent functionality using C++ and compiler intrinsics where possible.
+//
+// MSVC linker directive /ALTERNATENAME automatically falls back to these
+// if the primary assembly symbols are not found.
+// =============================================================================
+
+#ifdef _MSC_VER
+#pragma comment(linker, "/ALTERNATENAME:TimingGetPreciseRDTSC=Fallback_TimingGetPreciseRDTSC")
+#pragma comment(linker, "/ALTERNATENAME:TimingGetPreciseRDTSCP=Fallback_TimingGetPreciseRDTSCP")
+#pragma comment(linker, "/ALTERNATENAME:TimingRDTSCDelta=Fallback_TimingRDTSCDelta")
+#pragma comment(linker, "/ALTERNATENAME:TimingSerializedRDTSC=Fallback_TimingSerializedRDTSC")
+#pragma comment(linker, "/ALTERNATENAME:TimingCompareRDTSCvRDTSCP=Fallback_TimingCompareRDTSCvRDTSCP")
+#pragma comment(linker, "/ALTERNATENAME:TimingCPUIDLatency=Fallback_TimingCPUIDLatency")
+#pragma comment(linker, "/ALTERNATENAME:TimingCheckHypervisorLeaf=Fallback_TimingCheckHypervisorLeaf")
+#pragma comment(linker, "/ALTERNATENAME:TimingCPUIDVariance=Fallback_TimingCPUIDVariance")
+#pragma comment(linker, "/ALTERNATENAME:TimingMeasureSleep=Fallback_TimingMeasureSleep")
+#pragma comment(linker, "/ALTERNATENAME:TimingDetectSleepAcceleration=Fallback_TimingDetectSleepAcceleration")
+#pragma comment(linker, "/ALTERNATENAME:TimingCalibrateTimebase=Fallback_TimingCalibrateTimebase")
+#pragma comment(linker, "/ALTERNATENAME:TimingMeasureInstructions=Fallback_TimingMeasureInstructions")
+#pragma comment(linker, "/ALTERNATENAME:TimingMeasureMemory=Fallback_TimingMeasureMemory")
+#pragma comment(linker, "/ALTERNATENAME:TimingDetectSingleStep=Fallback_TimingDetectSingleStep")
+#pragma comment(linker, "/ALTERNATENAME:TimingGetTSCFrequency=Fallback_TimingGetTSCFrequency")
+#pragma comment(linker, "/ALTERNATENAME:TimingDetectVMExit=Fallback_TimingDetectVMExit")
+#pragma comment(linker, "/ALTERNATENAME:TimingMeasureHypervisor=Fallback_TimingMeasureHypervisor")
+#endif
+
+extern "C" {
+
+/// Fallback: TimingGetPreciseRDTSC
+uint64_t Fallback_TimingGetPreciseRDTSC(void) {
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0);  // Serialize
+    return __rdtsc();
+}
+
+/// Fallback: TimingGetPreciseRDTSCP
+uint64_t Fallback_TimingGetPreciseRDTSCP(uint32_t* processorId) {
+    unsigned int aux = 0;
+    uint64_t tsc = __rdtscp(&aux);
+    if (processorId) {
+        *processorId = aux;
+    }
+    return tsc;
+}
+
+/// Fallback: TimingRDTSCDelta
+uint64_t Fallback_TimingRDTSCDelta(void) {
+    uint64_t sum = 0;
+    constexpr int iterations = 100;
+    
+    for (int i = 0; i < iterations; ++i) {
+        uint64_t start = __rdtsc();
+        uint64_t end = __rdtsc();
+        sum += (end - start);
+    }
+    
+    return sum / iterations;
+}
+
+/// Fallback: TimingSerializedRDTSC
+uint64_t Fallback_TimingSerializedRDTSC(void) {
+    uint64_t sum = 0;
+    int cpuInfo[4];
+    constexpr int iterations = 100;
+    
+    for (int i = 0; i < iterations; ++i) {
+        __cpuid(cpuInfo, 0);
+        uint64_t start = __rdtsc();
+        __cpuid(cpuInfo, 0);
+        uint64_t end = __rdtsc();
+        sum += (end - start);
+    }
+    
+    return sum / iterations;
+}
+
+/// Fallback: TimingCompareRDTSCvRDTSCP
+int64_t Fallback_TimingCompareRDTSCvRDTSCP(void) {
+    int cpuInfo[4];
+    unsigned int aux;
+    
+    // Measure RDTSC
+    __cpuid(cpuInfo, 0);
+    uint64_t rdtscStart = __rdtsc();
+    __cpuid(cpuInfo, 0);
+    uint64_t rdtscEnd = __rdtsc();
+    uint64_t rdtscDelta = rdtscEnd - rdtscStart;
+    
+    // Measure RDTSCP
+    uint64_t rdtscpStart = __rdtscp(&aux);
+    uint64_t rdtscpEnd = __rdtscp(&aux);
+    uint64_t rdtscpDelta = rdtscpEnd - rdtscpStart;
+    
+    return static_cast<int64_t>(rdtscpDelta) - static_cast<int64_t>(rdtscDelta);
+}
+
+/// Fallback: TimingCPUIDLatency
+uint64_t Fallback_TimingCPUIDLatency(void) {
+    uint64_t sum = 0;
+    int cpuInfo[4];
+    constexpr int iterations = 100;
+    
+    for (int i = 0; i < iterations; ++i) {
+        uint64_t start = __rdtsc();
+        __cpuid(cpuInfo, 0);
+        uint64_t end = __rdtsc();
+        sum += (end - start);
+    }
+    
+    return sum / iterations;
+}
+
+/// Fallback: TimingCheckHypervisorLeaf
+uint32_t Fallback_TimingCheckHypervisorLeaf(char* vendorOut) {
+    int cpuInfo[4];
+    
+    // Check hypervisor bit (CPUID.1:ECX.31)
+    __cpuid(cpuInfo, 1);
+    if (!(cpuInfo[2] & (1 << 31))) {
+        return 0;  // No hypervisor
+    }
+    
+    // Query hypervisor leaf
+    __cpuid(cpuInfo, 0x40000000);
+    
+    if (vendorOut) {
+        *reinterpret_cast<int*>(vendorOut) = cpuInfo[1];
+        *reinterpret_cast<int*>(vendorOut + 4) = cpuInfo[2];
+        *reinterpret_cast<int*>(vendorOut + 8) = cpuInfo[3];
+        vendorOut[12] = '\0';
+    }
+    
+    return 1;
+}
+
+/// Fallback: TimingCPUIDVariance
+uint64_t Fallback_TimingCPUIDVariance(void) {
+    constexpr int iterations = 50;
+    uint64_t measurements[50];
+    int cpuInfo[4];
+    uint64_t sum = 0;
+    
+    // Collect measurements
+    for (int i = 0; i < iterations; ++i) {
+        uint64_t start = __rdtsc();
+        __cpuid(cpuInfo, 0);
+        uint64_t end = __rdtsc();
+        measurements[i] = end - start;
+        sum += measurements[i];
+    }
+    
+    // Calculate mean
+    uint64_t mean = sum / iterations;
+    
+    // Calculate variance
+    uint64_t variance = 0;
+    for (int i = 0; i < iterations; ++i) {
+        int64_t diff = static_cast<int64_t>(measurements[i]) - static_cast<int64_t>(mean);
+        variance += static_cast<uint64_t>(diff * diff);
+    }
+    
+    return variance / iterations;
+}
+
+/// Fallback: TimingMeasureSleep
+uint64_t Fallback_TimingMeasureSleep(uint32_t sleepMs) {
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0);
+    uint64_t start = __rdtsc();
+    
+    Sleep(sleepMs);
+    
+    __cpuid(cpuInfo, 0);
+    uint64_t end = __rdtsc();
+    
+    return end - start;
+}
+
+/// Fallback: TimingDetectSleepAcceleration
+uint32_t Fallback_TimingDetectSleepAcceleration(uint32_t sleepMs) {
+    if (sleepMs < 100) return 0;
+    
+    ULONGLONG startTicks = GetTickCount64();
+    Sleep(sleepMs);
+    ULONGLONG endTicks = GetTickCount64();
+    
+    ULONGLONG actualMs = endTicks - startTicks;
+    
+    if (actualMs >= sleepMs) {
+        return 0;  // No acceleration
+    }
+    
+    // Calculate acceleration percentage
+    return static_cast<uint32_t>(((sleepMs - actualMs) * 100) / sleepMs);
+}
+
+/// Fallback: TimingCalibrateTimebase - stored frequency
+static uint64_t g_tscFrequency_fallback = 0;
+static bool g_calibrated_fallback = false;
+
+uint64_t Fallback_TimingCalibrateTimebase(void) {
+    if (g_calibrated_fallback) {
+        return g_tscFrequency_fallback;
+    }
+    
+    LARGE_INTEGER freq, startQpc, endQpc;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&startQpc);
+    
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0);
+    uint64_t startTsc = __rdtsc();
+    
+    // Busy wait ~50ms
+    Sleep(50);
+    
+    uint64_t endTsc = __rdtsc();
+    QueryPerformanceCounter(&endQpc);
+    
+    // Calculate frequency
+    uint64_t tscDelta = endTsc - startTsc;
+    uint64_t qpcDelta = endQpc.QuadPart - startQpc.QuadPart;
+    
+    if (qpcDelta > 0) {
+        g_tscFrequency_fallback = (tscDelta * freq.QuadPart) / qpcDelta;
+        g_calibrated_fallback = true;
+    }
+    
+    return g_tscFrequency_fallback;
+}
+
+/// Fallback: TimingMeasureInstructions
+uint64_t Fallback_TimingMeasureInstructions(void) {
+    uint64_t start = __rdtsc();
+    
+    // 100 simple operations
+    volatile int x = 0;
+    for (int i = 0; i < 100; ++i) {
+        x++;
+    }
+    (void)x;
+    
+    uint64_t end = __rdtsc();
+    return end - start;
+}
+
+/// Fallback: TimingMeasureMemory
+uint64_t Fallback_TimingMeasureMemory(void) {
+    alignas(64) static volatile char buffer[4096];
+    
+    // Flush cache
+    _mm_clflush(const_cast<char*>(&buffer[0]));
+    _mm_mfence();
+    
+    // Measure uncached access
+    uint64_t start = __rdtsc();
+    volatile char x = buffer[0];
+    (void)x;
+    _mm_lfence();
+    uint64_t end = __rdtsc();
+    
+    return end - start;
+}
+
+/// Fallback: TimingDetectSingleStep
+uint32_t Fallback_TimingDetectSingleStep(void) {
+    uint64_t start = __rdtsc();
+    
+    // 20 NOPs - should take ~20 cycles normally
+    for (int i = 0; i < 20; ++i) {
+        __nop();
+    }
+    
+    uint64_t end = __rdtsc();
+    
+    // > 500 cycles indicates single-stepping
+    return (end - start > 500) ? 1 : 0;
+}
+
+/// Fallback: TimingGetTSCFrequency
+uint64_t Fallback_TimingGetTSCFrequency(void) {
+    if (g_calibrated_fallback) {
+        return g_tscFrequency_fallback;
+    }
+    
+    // Try CPUID leaf 0x15
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0x15);
+    
+    uint32_t denominator = cpuInfo[0];
+    uint32_t numerator = cpuInfo[1];
+    uint32_t frequency = cpuInfo[2];
+    
+    if (numerator != 0 && denominator != 0 && frequency != 0) {
+        return (static_cast<uint64_t>(frequency) * numerator) / denominator;
+    }
+    
+    return 0;
+}
+
+/// Fallback: TimingDetectVMExit
+uint32_t Fallback_TimingDetectVMExit(uint64_t* details) {
+    uint32_t score = 0;
+    
+    // Test 1: RDTSC overhead
+    uint64_t rdtscOverhead = Fallback_TimingSerializedRDTSC();
+    if (rdtscOverhead > 500) {
+        score += 35;
+    }
+    
+    // Test 2: CPUID latency
+    uint64_t cpuidLatency = Fallback_TimingCPUIDLatency();
+    if (cpuidLatency > 1500) {
+        score += 40;
+    }
+    
+    // Test 3: Hypervisor bit
+    uint32_t hvPresent = Fallback_TimingCheckHypervisorLeaf(nullptr);
+    if (hvPresent) {
+        score += 25;
+    }
+    
+    // Store details if requested
+    if (details) {
+        details[0] = rdtscOverhead;
+        details[1] = cpuidLatency;
+        details[2] = hvPresent;
+    }
+    
+    return (score > 100) ? 100 : score;
+}
+
+/// Fallback: TimingMeasureHypervisor
+uint64_t Fallback_TimingMeasureHypervisor(void) {
+    int cpuInfo[4];
+    
+    // Check for hypervisor first
+    __cpuid(cpuInfo, 1);
+    if (!(cpuInfo[2] & (1 << 31))) {
+        return 0;  // No hypervisor
+    }
+    
+    // Measure hypervisor CPUID leaf timing
+    uint64_t start = __rdtsc();
+    __cpuid(cpuInfo, 0x40000000);
+    uint64_t end = __rdtsc();
+    
+    return end - start;
+}
+
+} // extern "C"
+
+#include "../Utils/ThreadPool.hpp"
 
 namespace ShadowStrike {
 namespace AntiEvasion {
@@ -104,7 +464,8 @@ namespace {
     constexpr size_t MAX_INSTRUCTIONS_PER_SCAN = 10000;
 
     /// @brief Minimum RDTSC call count to consider suspicious
-    constexpr uint64_t MIN_RDTSC_FOR_SUSPICION = 5;
+    /// FIX (Issue #8): Raised from 5 to 20 - game engines, profilers, multimedia use RDTSC legitimately
+    constexpr uint64_t MIN_RDTSC_FOR_SUSPICION = 20;
 
     /// @brief Default callback ID counter start
     constexpr uint64_t CALLBACK_ID_START = 1000;
@@ -507,14 +868,35 @@ struct TimeBasedEvasionDetector::Impl {
             return true;
         }
 
-        // Queue async task
-        // Note: In production, this would use the thread pool
-        std::thread([this, processId, callback = std::move(callback)]() {
-            auto result = AnalyzeProcess(processId);
-            callback(std::move(result));
-        }).detach();
-
-        return true;
+        // FIX (Issue #3): Use thread pool instead of detached thread
+        // Detached threads capture 'this' and cause use-after-free on shutdown
+        // ThreadPool properly manages thread lifetime and allows graceful shutdown
+        try {
+            // Use Submit with TaskContext parameter as required by ThreadPool API
+            (void)m_threadPool->Submit([this, processId, callback = std::move(callback)](const Utils::TaskContext& /*ctx*/) {
+                // Check if detector is still active before proceeding
+                if (!m_initialized.load(std::memory_order_acquire)) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Async analysis cancelled - detector shutdown");
+                    return;
+                }
+                
+                try {
+                    auto result = AnalyzeProcess(processId);
+                    callback(std::move(result));
+                } catch (const std::exception& e) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Async analysis failed: %hs", e.what());
+                    // Create error result to notify caller
+                    TimingEvasionResult errorResult;
+                    errorResult.processId = processId;
+                    errorResult.isEvasive = false;
+                    callback(std::move(errorResult));
+                }
+            });
+            return true;
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to queue async analysis: %hs", e.what());
+            return false;
+        }
     }
 
     [[nodiscard]] bool QuickScanProcess(uint32_t processId) {
@@ -560,8 +942,9 @@ struct TimeBasedEvasionDetector::Impl {
             }
         }
 
-        // More than 4 timing APIs is suspicious
-        return timingImportCount > 4;
+        // FIX (Issue #8): Raised from >4 to >8 with context - multimedia apps use many timing APIs
+        // More than 8 timing APIs is suspicious, but only if not known-good software
+        return timingImportCount > 8;
     }
 
     // ========================================================================
@@ -590,8 +973,9 @@ struct TimeBasedEvasionDetector::Impl {
         const auto& mainModule = modules[0];
         bool is64Bit = false;
 
-        // Check if 64-bit process
-        Utils::ProcessUtils::IsProcess64Bit(processId);
+        // FIX (Issue #1): Capture the return value - previous code ignored it!
+        // This caused all 64-bit malware to be analyzed with wrong Zydis decoder
+        is64Bit = Utils::ProcessUtils::IsProcess64Bit(processId);
 
         // Read code section and scan for RDTSC patterns
         if (mainModule.baseAddress && mainModule.size > 0) {
@@ -986,34 +1370,39 @@ struct TimeBasedEvasionDetector::Impl {
     void CheckTimerAnomalies(uint32_t processId, TimingEvasionResult& result) {
         auto apiAnalysis = AnalyzeAPITiming(processId);
 
-        // High GetTickCount usage
-        if (apiAnalysis.getTickCountCalls > 5) {
+        // FIX (Issue #8): Raised thresholds to reduce false positives
+        // Network monitoring tools, audio/video software legitimately use these APIs frequently
+        
+        // High GetTickCount usage - raised from 5 to 15
+        // Legitimate use: Network tools (Wireshark), performance monitors, game engines
+        if (apiAnalysis.getTickCountCalls > 15) {
             TimingEvasionFinding finding;
             finding.type = TimingEvasionType::GetTickCountDelta;
-            finding.severity = TimingEvasionSeverity::Medium;
-            finding.confidence = 50.0f;
+            finding.severity = TimingEvasionSeverity::Low;  // Reduced from Medium
+            finding.confidence = 35.0f;  // Reduced from 50.0f - many false positives
             finding.detectionTime = std::chrono::system_clock::now();
             finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
-            finding.description = L"Excessive GetTickCount usage detected";
+            finding.description = L"High GetTickCount usage detected";
             finding.technicalDetails = Utils::StringUtils::Format(
-                L"GetTickCount import count: %u", apiAnalysis.getTickCountCalls);
+                L"GetTickCount import count: %u (threshold: 15)", apiAnalysis.getTickCountCalls);
             finding.mitreId = "T1497.003";
 
             result.findings.push_back(finding);
             result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::GetTickCountDelta));
         }
 
-        // High QPC usage
-        if (apiAnalysis.qpcCalls > 3) {
+        // High QPC usage - raised from 3 to 10
+        // Legitimate use: Audio/video software, game engines, profilers, high-precision timing
+        if (apiAnalysis.qpcCalls > 10) {
             TimingEvasionFinding finding;
             finding.type = TimingEvasionType::QPCAnomaly;
-            finding.severity = TimingEvasionSeverity::Medium;
-            finding.confidence = 45.0f;
+            finding.severity = TimingEvasionSeverity::Low;  // Reduced from Medium
+            finding.confidence = 30.0f;  // Reduced from 45.0f - QPC is very commonly used
             finding.detectionTime = std::chrono::system_clock::now();
             finding.detectionMethod = TimingDetectionMethod::StaticAnalysis;
-            finding.description = L"QueryPerformanceCounter usage pattern detected";
+            finding.description = L"High QueryPerformanceCounter usage pattern detected";
             finding.technicalDetails = Utils::StringUtils::Format(
-                L"QPC import count: %u", apiAnalysis.qpcCalls);
+                L"QPC import count: %u (threshold: 10)", apiAnalysis.qpcCalls);
             finding.mitreId = "T1497.003";
 
             result.findings.push_back(finding);
@@ -1305,8 +1694,12 @@ struct TimeBasedEvasionDetector::Impl {
 
         m_stats.currentlyMonitoring.fetch_add(1, std::memory_order_relaxed);
 
-        // Start monitoring thread if not running
-        if (!m_monitoringActive.exchange(true)) {
+        // FIX (Issue #4): Use compare_exchange_strong to prevent race condition
+        // Multiple threads could previously pass the exchange(true) check simultaneously
+        // compare_exchange_strong ensures only ONE thread starts the monitoring thread
+        bool expected = false;
+        if (m_monitoringActive.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
             StartMonitoringThread();
         }
 
@@ -1476,16 +1869,33 @@ struct TimeBasedEvasionDetector::Impl {
     void UpdateCache(uint32_t processId, const TimingEvasionResult& result) {
         std::unique_lock lock(m_cacheMutex);
 
-        // Limit cache size
-        while (m_resultCache.size() >= 1000) {
-            // Remove oldest entry
-            auto oldest = m_resultCache.begin();
-            for (auto it = m_resultCache.begin(); it != m_resultCache.end(); ++it) {
-                if (it->second.timestamp < oldest->second.timestamp) {
-                    oldest = it;
-                }
+        // FIX (Issue #5): O(n²) cache eviction replaced with O(n) single-pass
+        // Previous code: O(n) loop inside O(n) eviction = O(n²) under exclusive lock
+        // This blocked all cache operations when cache was full
+        constexpr size_t CACHE_MAX_SIZE = 1000;
+        constexpr size_t CACHE_EVICT_COUNT = 50;  // Evict 50 at once to amortize cost
+        
+        if (m_resultCache.size() >= CACHE_MAX_SIZE) {
+            // Find and remove oldest entries in single pass
+            // Use partial_sort for O(n log k) instead of O(n²)
+            std::vector<std::pair<uint32_t, std::chrono::steady_clock::time_point>> entries;
+            entries.reserve(m_resultCache.size());
+            
+            for (const auto& [pid, cached] : m_resultCache) {
+                entries.emplace_back(pid, cached.timestamp);
             }
-            m_resultCache.erase(oldest);
+            
+            // Partial sort to find oldest CACHE_EVICT_COUNT entries - O(n log k)
+            size_t evictCount = std::min(CACHE_EVICT_COUNT, entries.size());
+            std::partial_sort(entries.begin(), entries.begin() + evictCount, entries.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second < b.second;  // Oldest first
+                });
+            
+            // Remove the oldest entries
+            for (size_t i = 0; i < evictCount; ++i) {
+                m_resultCache.erase(entries[i].first);
+            }
         }
 
         m_resultCache[processId] = { result, std::chrono::steady_clock::now() };
@@ -1503,15 +1913,36 @@ struct TimeBasedEvasionDetector::Impl {
         }
 
         const auto& ctx = *it->second;
+        
+        // FIX (Issue #7): Check for empty events vector to prevent division by zero
+        if (ctx.events.empty() || ctx.eventCount == 0) {
+            return {};
+        }
+        
         size_t count = (maxEvents == 0) ? ctx.eventCount : std::min(maxEvents, ctx.eventCount);
-
+        
+        // FIX (Issue #2): Correct ring buffer index calculation
+        // Previous code had integer underflow when count > eventWriteIndex
         std::vector<TimingEventRecord> result;
         result.reserve(count);
 
-        // Get events in order
-        for (size_t i = 0; i < count; ++i) {
-            size_t idx = (ctx.events.size() + ctx.eventWriteIndex - count + i) % ctx.events.size();
-            if (idx < ctx.events.size()) {
+        const size_t bufferSize = ctx.events.size();
+        
+        // Check if ring buffer has wrapped around
+        if (ctx.eventCount < bufferSize) {
+            // Buffer hasn't wrapped - events are at indices [0, eventCount)
+            size_t startIdx = (ctx.eventCount > count) ? (ctx.eventCount - count) : 0;
+            size_t actualCount = std::min(count, ctx.eventCount);
+            for (size_t i = 0; i < actualCount; ++i) {
+                result.push_back(ctx.events[startIdx + i]);
+            }
+        } else {
+            // Buffer has wrapped - use proper ring buffer arithmetic
+            // eventWriteIndex points to next write position (oldest entry when full)
+            // We want the last 'count' entries before the write position
+            for (size_t i = 0; i < count; ++i) {
+                // Safe calculation: add bufferSize first to prevent underflow
+                size_t idx = (bufferSize + ctx.eventWriteIndex - count + i) % bufferSize;
                 result.push_back(ctx.events[idx]);
             }
         }
@@ -1521,7 +1952,7 @@ struct TimeBasedEvasionDetector::Impl {
 
 private:
     // ========================================================================
-    // INTERNAL HELPERS
+    // INTERNAL HELPERS (truly private - not accessed via public wrappers)
     // ========================================================================
 
     void StartMonitoringThread() {
@@ -1551,31 +1982,42 @@ private:
         }
 
         for (uint32_t pid : activeProcesses) {
-            MonitoringTick(pid);
+            MonitoringTickInternal(pid);
         }
     }
-
-    void MonitoringTick(uint32_t processId) {
-        // Check if process is still running
+    
+    /// @brief Internal tick - called from MonitoringLoop (private)
+    void MonitoringTickInternal(uint32_t processId) {
+        // FIX (Issue #6): TOCTOU race condition
+        // Wrap analysis in try-catch to handle process termination gracefully
+        
         if (!Utils::ProcessUtils::IsProcessRunning(processId)) {
-            std::unique_lock lock(m_monitorMutex);
-            auto it = m_monitoredProcesses.find(processId);
-            if (it != m_monitoredProcesses.end()) {
-                it->second->state = MonitoringState::Completed;
-                m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
-            }
+            MarkProcessCompleted(processId);
             return;
         }
 
-        // Perform quick analysis
-        auto result = AnalyzeProcess(processId);
+        TimingEvasionResult result;
+        bool analysisSucceeded = false;
+        
+        try {
+            result = AnalyzeProcess(processId);
+            analysisSucceeded = true;
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"Process %u analysis failed (likely terminated): %hs", 
+                processId, e.what());
+            MarkProcessCompleted(processId);
+            return;
+        }
+        
+        if (!analysisSucceeded || !Utils::ProcessUtils::IsProcessRunning(processId)) {
+            MarkProcessCompleted(processId);
+            return;
+        }
 
         if (result.isEvasive) {
-            // Invoke callbacks
             InvokeCallbacks(result);
         }
 
-        // Update context
         {
             std::unique_lock lock(m_monitorMutex);
             auto it = m_monitoredProcesses.find(processId);
@@ -1584,6 +2026,26 @@ private:
                 it->second->rdtscCount = result.rdtscCallCount;
             }
         }
+    }
+    
+    /// @brief Helper to mark a process as completed
+    void MarkProcessCompleted(uint32_t processId) {
+        std::unique_lock lock(m_monitorMutex);
+        auto it = m_monitoredProcesses.find(processId);
+        if (it != m_monitoredProcesses.end() && 
+            it->second->state != MonitoringState::Completed) {
+            it->second->state = MonitoringState::Completed;
+            m_stats.currentlyMonitoring.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+public:
+    // ========================================================================
+    // PUBLIC HELPER METHODS (called via public wrapper methods in main class)
+    // ========================================================================
+
+    void MonitoringTick(uint32_t processId) {
+        MonitoringTickInternal(processId);
     }
 
     void RecordTimingEvent(const TimingEventRecord& event) {
@@ -1826,7 +2288,7 @@ bool TimeBasedEvasionDetector::UnregisterEventCallback(uint64_t callbackId) {
     return m_impl->UnregisterEventCallback(callbackId);
 }
 
-TimingDetectorStats TimeBasedEvasionDetector::GetStats() const {
+const TimingDetectorStats& TimeBasedEvasionDetector::GetStats() const {
     return m_impl->GetStats();
 }
 

@@ -2356,7 +2356,7 @@ namespace ShadowStrike {
             /**
              * @brief Get detection statistics.
              */
-            [[nodiscard]] SandboxDetectorStats GetStats() const;
+            [[nodiscard]] const SandboxDetectorStats& GetStats() const;
 
             /**
              * @brief Reset statistics.

@@ -120,6 +120,98 @@
 #  include <Windows.h>
 #endif
 
+// =============================================================================
+// ASSEMBLY FUNCTION DECLARATIONS (TimeBasedEvasionDetector_x64.asm)
+// =============================================================================
+// These functions provide low-level CPU timing measurements that CANNOT be
+// reliably implemented in C++ due to:
+// - Compiler optimizations that reorder or eliminate timing instructions
+// - Instruction scheduling that adds variable overhead
+// - Need for precise CPUID serialization before RDTSC
+// - Detection of sub-microsecond VM exit latency
+// =============================================================================
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// @brief Gets RDTSC value with CPUID serialization
+/// @return 64-bit TSC value
+uint64_t TimingGetPreciseRDTSC(void);
+
+/// @brief Gets RDTSCP value with optional processor ID
+/// @param processorId Optional pointer for processor ID (can be NULL)
+/// @return 64-bit TSC value
+uint64_t TimingGetPreciseRDTSCP(uint32_t* processorId);
+
+/// @brief Measures raw RDTSC instruction overhead
+/// @return Average RDTSC overhead in cycles
+uint64_t TimingRDTSCDelta(void);
+
+/// @brief Measures RDTSC with CPUID serialization (gold-standard for VM detection)
+/// @return Average serialized RDTSC overhead in cycles
+uint64_t TimingSerializedRDTSC(void);
+
+/// @brief Compares RDTSC and RDTSCP timing
+/// @return Difference (RDTSCP - RDTSC) in cycles
+int64_t TimingCompareRDTSCvRDTSCP(void);
+
+/// @brief Measures CPUID instruction latency (always causes VM exit)
+/// @return Average CPUID overhead in cycles
+uint64_t TimingCPUIDLatency(void);
+
+/// @brief Checks for hypervisor via CPUID leaf 0x40000000
+/// @param vendorOut Buffer for vendor string (13 bytes min) or NULL
+/// @return 1 if hypervisor present, 0 otherwise
+uint32_t TimingCheckHypervisorLeaf(char* vendorOut);
+
+/// @brief Measures variance in CPUID timing (VMs have higher variance)
+/// @return Variance metric (higher = likely VM)
+uint64_t TimingCPUIDVariance(void);
+
+/// @brief Measures actual sleep duration using TSC
+/// @param sleepMs Requested sleep duration in milliseconds
+/// @return Actual sleep duration in TSC cycles
+uint64_t TimingMeasureSleep(uint32_t sleepMs);
+
+/// @brief Detects sandbox sleep acceleration
+/// @param sleepMs Sleep duration to test (recommended: 500-1000ms)
+/// @return Acceleration percentage (0 = none, >30 = likely sandbox)
+uint32_t TimingDetectSleepAcceleration(uint32_t sleepMs);
+
+/// @brief Calibrates TSC frequency using QueryPerformanceCounter
+/// @return TSC frequency in Hz
+uint64_t TimingCalibrateTimebase(void);
+
+/// @brief Measures timing of known instruction sequence (single-step detection)
+/// @return Cycles for 100 simple instructions
+uint64_t TimingMeasureInstructions(void);
+
+/// @brief Measures memory access latency (VM memory virtualization detection)
+/// @return Memory access latency in cycles
+uint64_t TimingMeasureMemory(void);
+
+/// @brief Detects single-step debugging via timing
+/// @return 1 if single-stepping detected, 0 otherwise
+uint32_t TimingDetectSingleStep(void);
+
+/// @brief Returns cached or estimated TSC frequency
+/// @return TSC frequency in Hz (0 if not calibrated)
+uint64_t TimingGetTSCFrequency(void);
+
+/// @brief Comprehensive VM detection using multiple timing sources
+/// @param details Optional pointer to receive detailed measurements (3 uint64_t)
+/// @return Confidence score 0-100 (>50 = likely VM)
+uint32_t TimingDetectVMExit(uint64_t* details);
+
+/// @brief Measures timing characteristics specific to hypervisors
+/// @return Hypervisor overhead measurement (0 if no hypervisor)
+uint64_t TimingMeasureHypervisor(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 // Forward declarations to avoid header pollution
 namespace ShadowStrike::Utils {
     class ThreadPool;
@@ -1490,7 +1582,7 @@ namespace ShadowStrike {
             /**
              * @brief Get current detection statistics.
              */
-            [[nodiscard]] TimingDetectorStats GetStats() const;
+            [[nodiscard]] const TimingDetectorStats& GetStats() const;
 
             /**
              * @brief Reset all statistics.

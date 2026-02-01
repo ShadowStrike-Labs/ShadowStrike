@@ -55,10 +55,17 @@
 #  include <comdef.h>
 #  include <SetupAPI.h>
 #  include <devguid.h>
-#  include<iphlpapi.h>
+#  include <iphlpapi.h>
+#  include <mmsystem.h>   // For waveOutGetNumDevs
 #  pragma comment(lib, "wbemuuid.lib")
 #  pragma comment(lib, "Setupapi.lib")
 #  pragma comment(lib, "iphlpapi.lib")
+#  pragma comment(lib, "winmm.lib")  // For multimedia functions
+#endif
+
+// Define M_PI if not defined (not guaranteed in C++20)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 // =============================================================================
@@ -563,6 +570,54 @@ namespace ShadowStrike {
 
             // Callback ID counter
             static std::atomic<uint64_t> s_callbackIdCounter{ 1 };
+
+            // -------------------------------------------------------------------------
+            // Helper: Count files in a directory (non-recursive)
+            // Used for system wear and tear analysis
+            // -------------------------------------------------------------------------
+            [[nodiscard]] size_t CountFilesInDirectory(std::wstring_view dirPath) noexcept {
+                size_t count = 0;
+#ifdef _WIN32
+                if (dirPath.empty()) return 0;
+                
+                std::wstring searchPath(dirPath);
+                if (searchPath.back() != L'\\' && searchPath.back() != L'/') {
+                    searchPath += L'\\';
+                }
+                searchPath += L'*';
+                
+                WIN32_FIND_DATAW findData{};
+                HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                if (hFind == INVALID_HANDLE_VALUE) {
+                    return 0;
+                }
+                
+                // Limit iteration to prevent denial of service on huge directories
+                constexpr size_t MAX_FILE_COUNT = 100000;
+                
+                do {
+                    // Skip . and ..
+                    if (findData.cFileName[0] == L'.' && 
+                        (findData.cFileName[1] == L'\0' || 
+                         (findData.cFileName[1] == L'.' && findData.cFileName[2] == L'\0'))) {
+                        continue;
+                    }
+                    
+                    // Only count files, not directories
+                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        ++count;
+                    }
+                    
+                    if (count >= MAX_FILE_COUNT) break;
+                    
+                } while (FindNextFileW(hFind, &findData));
+                
+                FindClose(hFind);
+#else
+                (void)dirPath;
+#endif
+                return count;
+            }
         }
 
         // ============================================================================
@@ -921,13 +976,18 @@ namespace ShadowStrike {
                 return false;
             }
 
-            // Capture callback and queue async scan
-            m_impl->threadPool->Enqueue([this, cb = std::move(callback)]() {
-                auto result = ScanSystem();
-                if (cb) {
-                    cb(std::move(result));
-                }
-            });
+            // Capture callback and queue async scan using proper ThreadPool::Submit API
+            // Discard return value - we don't need to wait for completion
+            (void)m_impl->threadPool->Submit(
+                [this, cb = std::move(callback)](const Utils::TaskContext&) {
+                    auto result = ScanSystem();
+                    if (cb) {
+                        cb(std::move(result));
+                    }
+                },
+                Utils::TaskPriority::Normal,
+                "SandboxEvasionDetector::ScanSystemAsync"
+            );
 
             SS_LOG_DEBUG(LOG_CATEGORY, L"Async sandbox scan queued");
             return true;
@@ -1251,7 +1311,7 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             wchar_t recentPath[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_RECENT, nullptr, 0, recentPath))) {
-                analysis.recentDocumentsCount = Utils::FileUtils::CountFilesInDirectory(recentPath);
+                analysis.recentDocumentsCount = CountFilesInDirectory(recentPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1259,7 +1319,7 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             wchar_t desktopPath[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOP, nullptr, 0, desktopPath))) {
-                analysis.desktopFileCount = Utils::FileUtils::CountFilesInDirectory(desktopPath);
+                analysis.desktopFileCount = CountFilesInDirectory(desktopPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1268,7 +1328,7 @@ namespace ShadowStrike {
             wchar_t profilePath[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROFILE, nullptr, 0, profilePath))) {
                 std::wstring downloadsPath = std::wstring(profilePath) + L"\\Downloads";
-                analysis.downloadsFileCount = Utils::FileUtils::CountFilesInDirectory(downloadsPath);
+                analysis.downloadsFileCount = CountFilesInDirectory(downloadsPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1276,7 +1336,7 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             wchar_t documentsPath[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, documentsPath))) {
-                analysis.documentsFileCount = Utils::FileUtils::CountFilesInDirectory(documentsPath);
+                analysis.documentsFileCount = CountFilesInDirectory(documentsPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1284,7 +1344,7 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             wchar_t picturesPath[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYPICTURES, nullptr, 0, picturesPath))) {
-                analysis.picturesFileCount = Utils::FileUtils::CountFilesInDirectory(picturesPath);
+                analysis.picturesFileCount = CountFilesInDirectory(picturesPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1318,7 +1378,7 @@ namespace ShadowStrike {
             wchar_t windowsPath[MAX_PATH];
             if (GetWindowsDirectoryW(windowsPath, MAX_PATH)) {
                 std::wstring prefetchPath = std::wstring(windowsPath) + L"\\Prefetch";
-                analysis.prefetchFileCount = Utils::FileUtils::CountFilesInDirectory(prefetchPath);
+                analysis.prefetchFileCount = CountFilesInDirectory(prefetchPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1326,7 +1386,7 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
             wchar_t tempPath[MAX_PATH];
             if (GetTempPathW(MAX_PATH, tempPath)) {
-                analysis.tempFileCount = Utils::FileUtils::CountFilesInDirectory(tempPath);
+                analysis.tempFileCount = CountFilesInDirectory(tempPath);
             }
 
             // -------------------------------------------------------------------------
@@ -1350,7 +1410,7 @@ namespace ShadowStrike {
             wchar_t fontsPath[MAX_PATH];
             if (GetWindowsDirectoryW(fontsPath, MAX_PATH)) {
                 wcscat_s(fontsPath, L"\\Fonts");
-                analysis.fontCount = Utils::FileUtils::CountFilesInDirectory(fontsPath);
+                analysis.fontCount = CountFilesInDirectory(fontsPath);
             }
 
             // -------------------------------------------------------------------------
@@ -2094,7 +2154,7 @@ namespace ShadowStrike {
         // STATISTICS & CACHE
         // ============================================================================
 
-        SandboxDetectorStats SandboxEvasionDetector::GetStats() const {
+        const SandboxDetectorStats& SandboxEvasionDetector::GetStats() const {
             return m_impl->stats;
         }
 
