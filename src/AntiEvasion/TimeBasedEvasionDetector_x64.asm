@@ -96,8 +96,9 @@ g_baselineRDTSC         DQ 0            ; Baseline RDTSC overhead
 g_baselineCPUID         DQ 0            ; Baseline CPUID overhead  
 g_calibrated            DD 0            ; Calibration complete flag
 
-;; Memory test buffer (cache-line aligned)
-ALIGN 64
+;; Memory test buffer (use ALIGN 16 which is supported in .DATA)
+;; Note: ALIGN 64 not supported in .DATA segment, using 16 instead
+ALIGN 16
 g_testBuffer            DB 4096 DUP(0)
 
 .CODE
@@ -113,22 +114,20 @@ g_testBuffer            DB 4096 DUP(0)
 ;; =============================================================================
 TimingGetPreciseRDTSC PROC
     push    rbx
-    push    rcx
-    push    rdx
+    ;; Note: RCX, RDX are caller-saved in x64, no need to preserve
+    ;; CPUID clobbers RAX, RBX, RCX, RDX - we save RBX as it's callee-saved
     
     ;; Serialize with CPUID (leaf 0)
     xor     eax, eax
     cpuid
     
-    ;; Read TSC
+    ;; Read TSC - clobbers EDX:EAX
     rdtsc
     
     ;; Combine EDX:EAX into RAX
     shl     rdx, 32
     or      rax, rdx
     
-    pop     rdx
-    pop     rcx
     pop     rbx
     ret
 TimingGetPreciseRDTSC ENDP
@@ -481,15 +480,43 @@ TimingCPUIDVariance PROC
     mov     rdi, rax        ; rdi = mean
     
     ;; Calculate variance (sum of squared differences)
+    ;; SECURITY FIX: Use proper signed arithmetic and cap squared values
+    ;; to prevent overflow when variance is extreme (common in VMs)
     xor     r14, r14        ; Variance accumulator
     xor     r13d, r13d
     
 @VarianceCalc:
     mov     rax, QWORD PTR [r12 + r13*8]
-    sub     rax, rdi        ; Difference from mean
-    imul    rax, rax        ; Square it
-    add     r14, rax
+    ;; Calculate signed difference
+    sub     rax, rdi        ; Difference from mean (signed)
     
+    ;; OVERFLOW FIX: Cap difference to prevent overflow when squaring
+    ;; Max safe value for squaring in 64-bit: 2^31 - 1 = ~2 billion
+    ;; If |diff| > 2^31, cap it (extreme outlier anyway)
+    mov     rcx, rax
+    sar     rcx, 63         ; Sign extend to get mask (-1 for negative, 0 for positive)
+    xor     rax, rcx        ; Conditional negate (abs value computation, step 1)
+    sub     rax, rcx        ; Complete abs value computation
+    
+    ;; Cap at 2^31 - 1 to prevent overflow
+    mov     rcx, 7FFFFFFFh
+    cmp     rax, rcx
+    cmova   rax, rcx        ; Cap if too large
+    
+    ;; Now safe to square (result fits in 64-bit)
+    imul    rax, rax        ; Square it (result guaranteed < 2^62)
+    
+    ;; Check for accumulator overflow before adding
+    mov     rcx, r14
+    add     rcx, rax
+    jc      @CapVariance    ; If carry, variance overflowed
+    mov     r14, rcx
+    jmp     @VarianceNext
+    
+@CapVariance:
+    mov     r14, 0FFFFFFFFFFFFFFFFh  ; Saturate at max
+    
+@VarianceNext:
     inc     r13d
     cmp     r13d, VARIANCE_ITERATIONS
     jb      @VarianceCalc
@@ -581,6 +608,12 @@ TimingDetectSleepAcceleration PROC
     
     mov     r12d, ecx       ; Save requested sleep
     
+    ;; SECURITY FIX: Validate input - reject zero or excessively large sleep
+    test    r12d, r12d
+    jz      @NoAccel        ; Zero sleep = return 0
+    cmp     r12d, 60000     ; Cap at 60 seconds (60000ms)
+    ja      @NoAccel        ; Too large = don't bother measuring
+    
     ;; Get start tick count
     call    QWORD PTR [__imp_GetTickCount64]
     mov     r13, rax
@@ -600,11 +633,23 @@ TimingDetectSleepAcceleration PROC
     jae     @NoAccel        ; actual >= requested = no acceleration
     
     ;; actual < requested - calculate acceleration percentage
+    ;; OVERFLOW FIX: Check if deviation * 100 would overflow
+    ;; Since r12d is capped at 60000, max deviation is 60000
+    ;; 60000 * 100 = 6,000,000 - fits easily in 64-bit
     mov     rax, r12
     sub     rax, rdi        ; deviation = requested - actual
-    imul    rax, 100
+    imul    rax, 100        ; Safe due to cap above
     xor     edx, edx
+    
+    ;; SECURITY FIX: Check divisor before division
+    test    r12, r12
+    jz      @NoAccel        ; Should never happen due to earlier check, but defense-in-depth
     div     r12             ; deviation percentage
+    
+    ;; Cap result at 100%
+    cmp     eax, 100
+    jbe     @AccelReturn
+    mov     eax, 100
     jmp     @AccelReturn
     
 @NoAccel:
@@ -626,6 +671,12 @@ TimingDetectSleepAcceleration ENDP
 ;; Calibrates TSC frequency using QueryPerformanceCounter.
 ;; Must be called before using frequency-dependent functions.
 ;;
+;; SECURITY FIXES:
+;; - Uses LOCK CMPXCHG for thread-safe calibration flag
+;; - Uses Sleep() API instead of unreliable busy loop
+;; - Uses 128-bit multiplication to prevent overflow
+;; - Checks for division by zero before dividing
+;;
 ;; Prototype: uint64_t TimingCalibrateTimebase(void);
 ;; Returns: TSC frequency in Hz
 ;; =============================================================================
@@ -635,23 +686,38 @@ TimingCalibrateTimebase PROC
     push    rdi
     push    r12
     push    r13
-    sub     rsp, 56
+    push    r14
+    push    r15
+    sub     rsp, 72         ; Extra space for 128-bit intermediate
     
-    ;; Check if already calibrated
-    cmp     DWORD PTR [g_calibrated], 1
+    ;; THREAD-SAFETY FIX: Use atomic compare-exchange for calibration check
+    ;; Try to acquire calibration lock (0 -> 2 means "calibrating")
+    xor     eax, eax        ; Expected: 0 (not calibrated)
+    mov     ecx, 2          ; New value: 2 (calibrating in progress)
+    lock cmpxchg DWORD PTR [g_calibrated], ecx
+    
+    ;; Check result
+    cmp     eax, 1          ; Was it already calibrated (1)?
     je      @ReturnCached
+    cmp     eax, 2          ; Is another thread calibrating (2)?
+    je      @WaitForCalibration
+    ;; We won the race (was 0, now 2) - proceed with calibration
     
     ;; Get QPC frequency
-    lea     rcx, [rsp+32]
+    lea     rcx, [rsp+48]
     call    QWORD PTR [__imp_QueryPerformanceFrequency]
-    mov     r12, QWORD PTR [rsp+32]  ; QPC frequency
+    mov     r12, QWORD PTR [rsp+48]  ; QPC frequency
+    
+    ;; VALIDATION: QPC frequency must be > 0
+    test    r12, r12
+    jz      @CalibrationFailed
     
     ;; Get start QPC
-    lea     rcx, [rsp+32]
+    lea     rcx, [rsp+48]
     call    QWORD PTR [__imp_QueryPerformanceCounter]
-    mov     rsi, QWORD PTR [rsp+32]  ; Start QPC
+    mov     rsi, QWORD PTR [rsp+48]  ; Start QPC
     
-    ;; Get start TSC
+    ;; Get start TSC (serialized)
     xor     eax, eax
     cpuid
     rdtsc
@@ -659,47 +725,86 @@ TimingCalibrateTimebase PROC
     or      rax, rdx
     mov     r13, rax                 ; Start TSC
     
-    ;; Wait ~100ms using busy loop
-    mov     ecx, 10000000
-@BusyWait:
-    pause
-    dec     ecx
-    jnz     @BusyWait
+    ;; RELIABILITY FIX: Use Sleep() API instead of busy loop
+    ;; Busy loop timing varies with CPU frequency and is unreliable
+    mov     ecx, 100        ; Sleep for 100ms (reliable timing)
+    call    QWORD PTR [__imp_Sleep]
     
-    ;; Get end TSC
+    ;; Get end TSC (serialized)
+    xor     eax, eax
+    cpuid
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    mov     rdi, rax                 ; End TSC
+    mov     r14, rax                 ; End TSC
     
     ;; Get end QPC
-    lea     rcx, [rsp+32]
+    lea     rcx, [rsp+48]
     call    QWORD PTR [__imp_QueryPerformanceCounter]
-    mov     rax, QWORD PTR [rsp+32]  ; End QPC
-    sub     rax, rsi                 ; QPC delta
+    mov     r15, QWORD PTR [rsp+48]  ; End QPC
     
-    ;; Calculate TSC frequency
-    ;; TSC_freq = TSC_delta * QPC_freq / QPC_delta
-    sub     rdi, r13                 ; TSC delta
-    mov     rax, rdi
-    imul    rax, r12                 ; TSC_delta * QPC_freq
-    mov     rcx, rax
-    sub     rcx, rsi
-    xor     edx, edx
-    mov     rbx, QWORD PTR [rsp+32]
-    sub     rbx, rsi
-    div     rbx                      ; / QPC_delta
+    ;; Calculate deltas
+    sub     r14, r13                 ; TSC delta
+    sub     r15, rsi                 ; QPC delta
     
-    ;; Store result
+    ;; SECURITY FIX: Check for zero QPC delta (division by zero)
+    test    r15, r15
+    jz      @CalibrationFailed
+    
+    ;; Calculate TSC frequency using 128-bit multiplication to prevent overflow
+    ;; TSC_freq = (TSC_delta * QPC_freq) / QPC_delta
+    ;;
+    ;; OVERFLOW FIX: Use MUL for 128-bit result (RDX:RAX = RAX * r12)
+    ;; Then divide 128-bit by 64-bit
+    mov     rax, r14                 ; TSC delta
+    mul     r12                      ; RDX:RAX = TSC_delta * QPC_freq (128-bit)
+    
+    ;; Now divide RDX:RAX by r15 (QPC delta)
+    ;; DIV r64: RDX:RAX / r64 -> RAX=quotient, RDX=remainder
+    div     r15                      ; RAX = TSC frequency
+    
+    ;; Sanity check: frequency should be between 100MHz and 10GHz
+    mov     rcx, 100000000           ; 100 MHz minimum
+    cmp     rax, rcx
+    jb      @CalibrationFailed
+    mov     rcx, 10000000000         ; 10 GHz maximum  
+    cmp     rax, rcx
+    ja      @CalibrationFailed
+    
+    ;; Store result atomically
     mov     QWORD PTR [g_tscFrequency], rax
+    mov     r13, rax                 ; Save for return
+    
+    ;; THREAD-SAFETY: Mark calibration complete (2 -> 1)
     mov     DWORD PTR [g_calibrated], 1
+    
+    mov     rax, r13
     jmp     @CalibReturn
+    
+@WaitForCalibration:
+    ;; Another thread is calibrating - spin until done
+    mov     ecx, 10         ; Short sleep to avoid busy spin
+    call    QWORD PTR [__imp_Sleep]
+    
+    ;; Check if calibration completed
+    cmp     DWORD PTR [g_calibrated], 1
+    jne     @WaitForCalibration
+    ;; Fall through to return cached value
     
 @ReturnCached:
     mov     rax, QWORD PTR [g_tscFrequency]
+    jmp     @CalibReturn
+    
+@CalibrationFailed:
+    ;; Calibration failed - reset flag and return default
+    mov     DWORD PTR [g_calibrated], 0
+    mov     rax, 3000000000          ; Default: 3 GHz (reasonable fallback)
+    mov     QWORD PTR [g_tscFrequency], rax
     
 @CalibReturn:
-    add     rsp, 56
+    add     rsp, 72
+    pop     r15
+    pop     r14
     pop     r13
     pop     r12
     pop     rdi

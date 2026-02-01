@@ -186,7 +186,9 @@ uint64_t Fallback_MeasureCPUIDOverhead(void) {
 /// Fallback: MeasureSleepAcceleration
 uint64_t Fallback_MeasureSleepAcceleration(uint32_t sleepMs) {
 #ifdef _WIN32
-    if (sleepMs < 100) return 0;
+    // SECURITY FIX: Explicit division-by-zero guard at point of use
+    // Even though sleepMs < 100 is rejected, we add defense-in-depth
+    if (sleepMs < 100 || sleepMs == 0) return 0;
     
     ULONGLONG startTicks = GetTickCount64();
     Sleep(sleepMs);
@@ -199,6 +201,7 @@ uint64_t Fallback_MeasureSleepAcceleration(uint32_t sleepMs) {
         return 0;  // No acceleration
     }
     
+    // Division is safe: sleepMs guaranteed > 0 by guard above
     return ((sleepMs - actualMs) * 100) / sleepMs;
 #else
     (void)sleepMs;
@@ -679,6 +682,7 @@ namespace ShadowStrike {
             // COM Initialization State
             // -------------------------------------------------------------------------
             bool comInitialized{ false };
+            mutable std::mutex comMutex;  // Protects COM init/uninit operations;
 
             // -------------------------------------------------------------------------
             // Utility Methods
@@ -717,10 +721,16 @@ namespace ShadowStrike {
 
             void InitializeCOM() {
 #ifdef _WIN32
+                // THREAD-SAFETY FIX: Protect COM initialization with mutex
+                // COM apartment model requires careful thread management
+                std::lock_guard<std::mutex> lock(comMutex);
                 if (!comInitialized) {
                     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
                     if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
                         comInitialized = true;
+                        SS_LOG_DEBUG(LOG_CATEGORY, L"COM initialized for sandbox detection");
+                    } else {
+                        SS_LOG_WARN(LOG_CATEGORY, L"COM initialization failed: 0x%08X", hr);
                     }
                 }
 #endif
@@ -728,9 +738,12 @@ namespace ShadowStrike {
 
             void UninitializeCOM() {
 #ifdef _WIN32
+                // THREAD-SAFETY FIX: Protect COM uninitialization with mutex
+                std::lock_guard<std::mutex> lock(comMutex);
                 if (comInitialized) {
                     CoUninitialize();
                     comInitialized = false;
+                    SS_LOG_DEBUG(LOG_CATEGORY, L"COM uninitialized");
                 }
 #endif
             }
@@ -1924,9 +1937,11 @@ namespace ShadowStrike {
                 lastPos = currentPos;
 
                 // Check for clicks - use state change detection to avoid counting held buttons
-                // GetAsyncKeyState bit 0x0001 indicates key was pressed since last call
-                static bool lastLeftButton = false;
-                static bool lastRightButton = false;
+                // THREAD-SAFETY FIX: Use thread_local instead of static to avoid race conditions
+                // when multiple threads call AnalyzeHumanInteraction() simultaneously
+                // (e.g., via ScanSystemAsync concurrent calls)
+                thread_local bool lastLeftButton = false;
+                thread_local bool lastRightButton = false;
                 
                 bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
                 bool rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
@@ -1946,7 +1961,8 @@ namespace ShadowStrike {
                 // CRITICAL FIX (Issue #5): Keyboard input counting bug
                 // Previous code counted EVERY held key each sample (Shift+A = 2 counts)
                 // Fixed: Track state changes to count only NEW key presses
-                static std::bitset<256> previousKeyStates;
+                // THREAD-SAFETY FIX: Use thread_local to avoid race conditions
+                thread_local std::bitset<256> previousKeyStates;
                 std::bitset<256> currentKeyStates;
                 
                 for (int key = 0x08; key <= 0xFE; ++key) {

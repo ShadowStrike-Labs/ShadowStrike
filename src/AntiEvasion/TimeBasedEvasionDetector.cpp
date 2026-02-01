@@ -288,38 +288,90 @@ uint32_t Fallback_TimingDetectSleepAcceleration(uint32_t sleepMs) {
 }
 
 /// Fallback: TimingCalibrateTimebase - stored frequency
-static uint64_t g_tscFrequency_fallback = 0;
-static bool g_calibrated_fallback = false;
+/// THREAD-SAFETY FIX: Use atomic variables and call_once for thread-safe calibration
+static std::atomic<uint64_t> g_tscFrequency_fallback{0};
+static std::atomic<int> g_calibration_state{0};  // 0=not done, 1=in progress, 2=complete
+static constexpr uint64_t DEFAULT_TSC_FREQ = 3000000000ULL;  // 3 GHz fallback
 
 uint64_t Fallback_TimingCalibrateTimebase(void) {
-    if (g_calibrated_fallback) {
-        return g_tscFrequency_fallback;
+    // Fast path: already calibrated
+    if (g_calibration_state.load(std::memory_order_acquire) == 2) {
+        return g_tscFrequency_fallback.load(std::memory_order_relaxed);
     }
     
+    // Try to acquire calibration lock (0 -> 1)
+    int expected = 0;
+    if (!g_calibration_state.compare_exchange_strong(expected, 1, 
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        // Another thread is calibrating or already done
+        if (expected == 2) {
+            return g_tscFrequency_fallback.load(std::memory_order_relaxed);
+        }
+        // Spin-wait for calibration to complete
+        while (g_calibration_state.load(std::memory_order_acquire) == 1) {
+            Sleep(1);
+        }
+        return g_tscFrequency_fallback.load(std::memory_order_relaxed);
+    }
+    
+    // We won the race - perform calibration
     LARGE_INTEGER freq, startQpc, endQpc;
-    QueryPerformanceFrequency(&freq);
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
+        g_tscFrequency_fallback.store(DEFAULT_TSC_FREQ, std::memory_order_relaxed);
+        g_calibration_state.store(2, std::memory_order_release);
+        return DEFAULT_TSC_FREQ;
+    }
+    
     QueryPerformanceCounter(&startQpc);
     
     int cpuInfo[4];
-    __cpuid(cpuInfo, 0);
+    __cpuid(cpuInfo, 0);  // Serialize
     uint64_t startTsc = __rdtsc();
     
-    // Busy wait ~50ms
-    Sleep(50);
+    // Sleep for reliable timing (not busy wait)
+    Sleep(100);
     
+    __cpuid(cpuInfo, 0);  // Serialize
     uint64_t endTsc = __rdtsc();
     QueryPerformanceCounter(&endQpc);
     
-    // Calculate frequency
+    // Calculate frequency with overflow protection
     uint64_t tscDelta = endTsc - startTsc;
-    uint64_t qpcDelta = endQpc.QuadPart - startQpc.QuadPart;
+    uint64_t qpcDelta = static_cast<uint64_t>(endQpc.QuadPart - startQpc.QuadPart);
     
+    uint64_t frequency = DEFAULT_TSC_FREQ;
     if (qpcDelta > 0) {
-        g_tscFrequency_fallback = (tscDelta * freq.QuadPart) / qpcDelta;
-        g_calibrated_fallback = true;
+        // Use 128-bit multiplication via compiler intrinsic to prevent overflow
+        // TSC_freq = (TSC_delta * QPC_freq) / QPC_delta
+        uint64_t high;
+        uint64_t low = _umul128(tscDelta, static_cast<uint64_t>(freq.QuadPart), &high);
+        
+        // Perform 128-bit / 64-bit division
+        if (high == 0) {
+            // No overflow case - simple division
+            frequency = low / qpcDelta;
+        } else {
+            // Overflow case - approximate by shifting
+            // Shift right until high is 0, divide, shift result back
+            int shift = 0;
+            while (high > 0 && shift < 64) {
+                high >>= 1;
+                low = (low >> 1) | ((high & 1) << 63);
+                high >>= 1;
+                shift++;
+            }
+            frequency = (low / qpcDelta) << shift;
+        }
+        
+        // Sanity check: frequency should be between 100MHz and 10GHz
+        if (frequency < 100000000ULL) frequency = DEFAULT_TSC_FREQ;
+        if (frequency > 10000000000ULL) frequency = DEFAULT_TSC_FREQ;
     }
     
-    return g_tscFrequency_fallback;
+    g_tscFrequency_fallback.store(frequency, std::memory_order_relaxed);
+    g_calibration_state.store(2, std::memory_order_release);
+    
+    return frequency;
 }
 
 /// Fallback: TimingMeasureInstructions
@@ -372,11 +424,12 @@ uint32_t Fallback_TimingDetectSingleStep(void) {
 
 /// Fallback: TimingGetTSCFrequency
 uint64_t Fallback_TimingGetTSCFrequency(void) {
-    if (g_calibrated_fallback) {
-        return g_tscFrequency_fallback;
+    // Check if calibration is complete
+    if (g_calibration_state.load(std::memory_order_acquire) == 2) {
+        return g_tscFrequency_fallback.load(std::memory_order_relaxed);
     }
     
-    // Try CPUID leaf 0x15
+    // Try CPUID leaf 0x15 first (doesn't require calibration)
     int cpuInfo[4];
     __cpuid(cpuInfo, 0x15);
     
@@ -388,7 +441,8 @@ uint64_t Fallback_TimingGetTSCFrequency(void) {
         return (static_cast<uint64_t>(frequency) * numerator) / denominator;
     }
     
-    return 0;
+    // Fall back to calibrated value (may trigger calibration)
+    return Fallback_TimingCalibrateTimebase();
 }
 
 /// Fallback: TimingDetectVMExit
@@ -464,8 +518,19 @@ namespace {
     constexpr size_t MAX_INSTRUCTIONS_PER_SCAN = 10000;
 
     /// @brief Minimum RDTSC call count to consider suspicious
-    /// FIX (Issue #8): Raised from 5 to 20 - game engines, profilers, multimedia use RDTSC legitimately
-    constexpr uint64_t MIN_RDTSC_FOR_SUSPICION = 20;
+    /// FALSE POSITIVE FIX: Raised significantly to reduce false positives
+    /// 
+    /// Legitimate software that uses RDTSC heavily:
+    /// - Game engines (Unreal, Unity): Frame timing, performance profiling
+    /// - Profilers (VTune, perf tools): Instruction-level timing
+    /// - Crypto libraries: RNG seeding, timing attack mitigations
+    /// - Scientific software: High-precision benchmarking
+    /// - Multimedia codecs: A/V synchronization
+    /// - Database engines: Query timing, lock contention measurement
+    ///
+    /// Previous value (20) was flagging too many legitimate applications.
+    /// New threshold requires significant RDTSC usage pattern to trigger.
+    constexpr uint64_t MIN_RDTSC_FOR_SUSPICION = 100;
 
     /// @brief Default callback ID counter start
     constexpr uint64_t CALLBACK_ID_START = 1000;
@@ -1017,8 +1082,11 @@ struct TimeBasedEvasionDetector::Impl {
 
         if (analysis.rdtscCount >= MIN_RDTSC_FOR_SUSPICION) {
             analysis.highFrequencyDetected = true;
-            analysis.confidence = std::min(100.0f,
-                static_cast<float>(analysis.rdtscCount) / 10.0f * 100.0f);
+            // PRECISION FIX: Calculate confidence with proper clamping before float conversion
+            // Scale: 100 RDTSC = 10% confidence base, up to 1000 = 100% confidence
+            // Using integer math first to avoid float precision issues
+            uint64_t scaledCount = std::min(analysis.rdtscCount, 1000ULL);
+            analysis.confidence = static_cast<float>(scaledCount) / 10.0f;
         }
 
         if (analysis.rdtscCpuidComboCount >= 2) {
