@@ -203,10 +203,15 @@ namespace ShadowStrike {
             // ========================================================================
 
             /// @brief Minimum DGA score for detection (0-100)
-            inline constexpr double MIN_DGA_SCORE = 70.0;
+            /// FP FIX #7: Raised from 70 to 85 - 70 caused false positives on
+            /// legitimate domains with non-English names, technical terms, or
+            /// creative branding (e.g., kubernetes.io, githubusercontent.com)
+            inline constexpr double MIN_DGA_SCORE = 85.0;
 
             /// @brief Maximum legitimate DNS queries per minute
-            inline constexpr size_t MAX_NORMAL_DNS_QUERIES = 50;
+            /// FP FIX #6: Raised from 50 to 200 - modern web apps, browsers with
+            /// many tabs, and SPAs using CDNs easily exceed 50/min normally
+            inline constexpr size_t MAX_NORMAL_DNS_QUERIES = 200;
 
             /// @brief Minimum beaconing regularity score (0-1)
             inline constexpr double MIN_BEACONING_REGULARITY = 0.8;
@@ -1447,23 +1452,40 @@ namespace ShadowStrike {
                 std::atomic<uint64_t> totalAnalysisTimeUs{ 0 };
                 std::array<std::atomic<uint64_t>, 16> categoryDetections{};
 
+                // ==============================================================
+                // BUG FIX #8: Atomic Reset with Memory Ordering
+                // Original code used non-atomic assignment (=) which is UB when
+                // racing with atomic increments from analysis threads.
+                // Use store() with memory_order_relaxed for each counter.
+                // 
+                // NOTE: This provides individual atomicity per counter. For
+                // point-in-time snapshot consistency, call ResetStatistics()
+                // which acquires the mutex first.
+                // ==============================================================
                 void Reset() noexcept {
-                    totalAnalyses = 0;
-                    evasiveProcesses = 0;
-                    totalDNSQueries = 0;
-                    totalHTTPRequests = 0;
-                    dgaDetections = 0;
-                    beaconingDetections = 0;
-                    c2Detections = 0;
-                    cacheHits = 0;
-                    cacheMisses = 0;
-                    analysisErrors = 0;
-                    totalAnalysisTimeUs = 0;
-                    for (auto& cat : categoryDetections) cat = 0;
+                    totalAnalyses.store(0, std::memory_order_relaxed);
+                    totalDetections.store(0, std::memory_order_relaxed);
+                    evasiveProcesses.store(0, std::memory_order_relaxed);
+                    totalDNSQueries.store(0, std::memory_order_relaxed);
+                    totalHTTPRequests.store(0, std::memory_order_relaxed);
+                    dgaDetections.store(0, std::memory_order_relaxed);
+                    beaconingDetections.store(0, std::memory_order_relaxed);
+                    c2Detections.store(0, std::memory_order_relaxed);
+                    cacheHits.store(0, std::memory_order_relaxed);
+                    cacheMisses.store(0, std::memory_order_relaxed);
+                    analysisErrors.store(0, std::memory_order_relaxed);
+                    totalAnalysisTimeUs.store(0, std::memory_order_relaxed);
+                    for (auto& cat : categoryDetections) {
+                        cat.store(0, std::memory_order_relaxed);
+                    }
+                    // Memory fence to ensure all stores are visible
+                    std::atomic_thread_fence(std::memory_order_release);
                 }
             };
 
             [[nodiscard]] const Statistics& GetStatistics() const noexcept;
+            
+            /// @brief Reset statistics (thread-safe - acquires mutex)
             void ResetStatistics() noexcept;
 
         private:

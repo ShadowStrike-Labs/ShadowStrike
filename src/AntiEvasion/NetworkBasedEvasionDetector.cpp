@@ -168,7 +168,28 @@ namespace ShadowStrike::AntiEvasion {
             L"buzz", L"monster", L"rest", L"surf"
         };
 
-        /// @brief Cloud provider domains (for cloud abuse detection)
+        // ====================================================================
+        // FP FIX #3: Cloud Provider Detection - Tiered Approach
+        // The original list included mainstream services (Discord, Telegram)
+        // used by hundreds of millions of legitimate users.
+        // 
+        // NEW APPROACH:
+        // - Tier 1 (SUSPICIOUS): Services frequently abused by malware for C2
+        // - Tier 2 (INFORMATIONAL): Mainstream cloud - only flag with other indicators
+        // Discord and Telegram REMOVED - they are legitimate communication tools
+        // ====================================================================
+
+        /// @brief Highly suspicious cloud services (known C2 abuse vectors)
+        /// These warrant higher confidence flagging
+        const std::vector<std::wstring> SUSPICIOUS_CLOUD_SERVICES = {
+            L"ngrok.io", L"serveo.net",           // Tunneling services (common C2)
+            L"pastebin.com", L"paste.ee", L"ghostbin.com", // Paste sites (payload hosting)
+            L"transfer.sh", L"file.io",            // Anonymous file sharing
+            L"requestbin.com", L"webhook.site"     // Data exfil endpoints
+        };
+
+        /// @brief Mainstream cloud providers - informational only
+        /// Flagging these with high confidence would cause massive false positives
         const std::vector<std::wstring> CLOUD_PROVIDERS = {
             L"amazonaws.com", L"cloudfront.net", L"s3.amazonaws.com",
             L"azure.com", L"azurewebsites.net", L"blob.core.windows.net",
@@ -177,11 +198,9 @@ namespace ShadowStrike::AntiEvasion {
             L"cloudflare.com", L"workers.dev",
             L"digitaloceanspaces.com", L"do.co",
             L"herokuapp.com", L"heroku.com",
-            L"netlify.app", L"vercel.app",
-            L"ngrok.io", L"serveo.net",
-            L"pastebin.com", L"paste.ee", L"ghostbin.com",
-            L"discord.com", L"discordapp.com", L"cdn.discordapp.com",
-            L"telegram.org", L"t.me"
+            L"netlify.app", L"vercel.app"
+            // NOTE: Discord and Telegram REMOVED - legitimate communication platforms
+            // used by millions of enterprises for team collaboration
         };
 
         /// @brief Known Tor exit node ports
@@ -408,8 +427,8 @@ namespace ShadowStrike::AntiEvasion {
         /// @brief Detection callback
         NetworkDetectionCallback m_detectionCallback;
 
-        /// @brief Statistics
-        NetworkBasedEvasionDetector::Statistics m_stats;
+        /// @brief Statistics (mutable for const functions to update atomics)
+        mutable NetworkBasedEvasionDetector::Statistics m_stats;
 
         /// @brief Result cache
         struct CacheEntry {
@@ -1818,7 +1837,8 @@ namespace ShadowStrike::AntiEvasion {
             CloseHandle(hSnapshot);
 
             if (!detectedTools.empty()) {
-                m_stats.totalDetections++;
+                // Use atomic operation - can't use ++ on const atomic
+                m_stats.totalDetections.fetch_add(1, std::memory_order_relaxed);
             }
 
             return !detectedTools.empty();
@@ -1912,13 +1932,14 @@ namespace ShadowStrike::AntiEvasion {
 
         try {
             Utils::NetworkUtils::SslCertificateInfo certInfo;
-            if (!Utils::NetworkUtils::GetSslCertificate(domain, certInfo)) {
+            // GetSslCertificate requires hostname, port, and certInfo
+            if (!Utils::NetworkUtils::GetSslCertificate(domain, 443, certInfo)) {
                 outDetails = L"Failed to retrieve SSL certificate";
                 return false;
             }
 
-            // Check if self-signed
-            if (certInfo.issuer == certInfo.subject) {
+            // Check if self-signed (also available as certInfo.isSelfSigned)
+            if (certInfo.isSelfSigned || certInfo.issuer == certInfo.subject) {
                 outSelfSigned = true;
                 outDetails += L"Self-signed certificate. ";
             }
@@ -1974,10 +1995,8 @@ namespace ShadowStrike::AntiEvasion {
                 outDetails += L"Certificate name mismatch. ";
             }
 
-            // Additional checks
-            if (certInfo.keyBits < 2048) {
-                outDetails += std::format(L"Weak key size: {} bits. ", certInfo.keyBits);
-            }
+            // Note: keyBits not available in SslCertificateInfo struct
+            // Future enhancement: Add key strength validation when field is added
 
             return true;
         }
@@ -2418,12 +2437,25 @@ namespace ShadowStrike::AntiEvasion {
                 return false;
             }
 
-            // Check if connectivity check domain
+            // ====================================================================
+            // FP FIX #4: Connectivity Check Domains - INFORMATIONAL ONLY
+            // Checking google.com/microsoft.com for connectivity is STANDARD
+            // behavior for legitimate software including:
+            // - Windows itself (msftconnecttest.com)
+            // - Chrome, Edge, Firefox (captive portal detection)
+            // - Office 365, Teams, OneDrive
+            // - Virtually every modern application
+            //
+            // Original: 0.8 confidence (flagged as "likely malicious")
+            // Fixed: 0.15 confidence (informational only, needs corroboration)
+            // ====================================================================
             if (m_impl->IsConnectivityCheckDomain(domain)) {
                 NetworkDetectedTechnique detection(NetworkEvasionTechnique::CONN_DNSResolutionCheck);
-                detection.confidence = 0.8;
+                detection.confidence = 0.15; // Informational only - NOT suspicious alone
+                detection.severity = NetworkEvasionSeverity::Low;
                 detection.target = std::wstring(domain);
-                detection.description = L"Known connectivity check domain";
+                detection.description = L"Connectivity check domain (normal behavior)";
+                detection.technicalDetails = L"Standard internet connectivity verification";
                 outDetections.push_back(std::move(detection));
             }
 
@@ -2710,17 +2742,30 @@ namespace ShadowStrike::AntiEvasion {
             DWORD proxyInfoSize = sizeof(proxyInfo);
 
             if (InternetQueryOptionA(nullptr, INTERNET_OPTION_PROXY, &proxyInfo, &proxyInfoSize)) {
-                bool found = false;
+                // ================================================================
+                // SECURITY FIX #5: RAII cleanup for proxy strings
+                // Original code leaked memory if ToWide() threw an exception.
+                // Use scope guards to ensure cleanup happens regardless of
+                // exception paths.
+                // ================================================================
+                
+                // RAII guards for automatic cleanup
+                struct ProxyCleanup {
+                    LPCSTR proxy = nullptr;
+                    LPCSTR bypass = nullptr;
+                    ~ProxyCleanup() {
+                        if (proxy) GlobalFree((HGLOBAL)proxy);
+                        if (bypass) GlobalFree((HGLOBAL)bypass);
+                    }
+                } cleanup;
+                cleanup.proxy = proxyInfo.lpszProxy;
+                cleanup.bypass = proxyInfo.lpszProxyBypass;
+
                 if (proxyInfo.lpszProxy && proxyInfo.lpszProxy[0] != '\0') {
                     outProxyAddress = Utils::StringUtils::ToWide(proxyInfo.lpszProxy);
-                    found = true;
+                    return true;
                 }
-
-                // Clean up allocated strings
-                if (proxyInfo.lpszProxy) GlobalFree((HGLOBAL)proxyInfo.lpszProxy);
-                if (proxyInfo.lpszProxyBypass) GlobalFree((HGLOBAL)proxyInfo.lpszProxyBypass);
-
-                if (found) return true;
+                // cleanup destructor runs here, freeing both strings
             }
 
             return false;
@@ -2831,10 +2876,21 @@ namespace ShadowStrike::AntiEvasion {
                         std::transform(lowerName.begin(), lowerName.end(),
                             lowerName.begin(), ::towlower);
 
+                        // ================================================================
+                        // FP FIX #2: Removed firefox.exe from Tor detection
+                        // The original code flagged ALL Firefox instances as Tor-related.
+                        // Firefox is used by 200M+ users - this caused massive FPs.
+                        // Tor Browser does use Firefox, but we detect it via:
+                        //   1. tor.exe process (always runs with Tor Browser)
+                        //   2. Tor ports (9050, 9150, 9051) - checked separately
+                        //   3. tor-browser.exe (the launcher)
+                        // Regular Firefox without tor.exe running is LEGITIMATE.
+                        // ================================================================
                         if (lowerName == L"tor.exe" ||
                             lowerName == L"tor-browser.exe" ||
-                            lowerName == L"firefox.exe" || // Tor Browser uses Firefox
-                            lowerName == L"vidalia.exe") {
+                            lowerName == L"vidalia.exe" ||
+                            lowerName == L"obfs4proxy.exe" ||    // Tor bridge proxy
+                            lowerName == L"snowflake-client.exe") { // Tor censorship circumvention
 
                             CloseHandle(hSnapshot);
                             SS_LOG_WARN(LOG_CATEGORY, L"Tor-related process detected: %ls", processName.c_str());
@@ -3207,30 +3263,61 @@ namespace ShadowStrike::AntiEvasion {
                 CheckConnectivity(result);
             }
 
+            // ====================================================================
+            // SECURITY FIX #1: TOCTOU Race Condition Prevention
+            // Copy tracking data while holding the lock to avoid data races.
+            // The original code released the lock before passing references to
+            // Check* functions, allowing concurrent modification during analysis.
+            // ====================================================================
+
             // Analyze DNS activity
             if (HasFlag(config.flags, NetworkAnalysisFlags::ScanDNS)) {
-                std::shared_lock lock(m_impl->m_mutex);
-                auto it = m_impl->m_dnsTracking.find(processId);
-                if (it != m_impl->m_dnsTracking.end()) {
-                    CheckDNSEvasion(it->second.timestamps, it->second.domainToIPs, result);
+                // Copy data while holding lock to prevent TOCTOU
+                std::vector<std::chrono::system_clock::time_point> dnsTimestamps;
+                std::unordered_map<std::wstring, std::vector<std::wstring>> dnsDomainToIPs;
+                {
+                    std::shared_lock lock(m_impl->m_mutex);
+                    auto it = m_impl->m_dnsTracking.find(processId);
+                    if (it != m_impl->m_dnsTracking.end()) {
+                        dnsTimestamps = it->second.timestamps;
+                        dnsDomainToIPs = it->second.domainToIPs;
+                    }
+                }
+                // Now analyze with our local copy (lock released)
+                if (!dnsTimestamps.empty() || !dnsDomainToIPs.empty()) {
+                    CheckDNSEvasion(dnsTimestamps, dnsDomainToIPs, result);
                 }
             }
 
             // Analyze traffic patterns
             if (HasFlag(config.flags, NetworkAnalysisFlags::ScanTrafficPatterns)) {
-                std::shared_lock lock(m_impl->m_mutex);
-                auto it = m_impl->m_connectionTracking.find(processId);
-                if (it != m_impl->m_connectionTracking.end()) {
-                    CheckTrafficPatterns(it->second.targetTimestamps, result);
+                // Copy data while holding lock to prevent TOCTOU
+                std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>> targetTimestamps;
+                {
+                    std::shared_lock lock(m_impl->m_mutex);
+                    auto it = m_impl->m_connectionTracking.find(processId);
+                    if (it != m_impl->m_connectionTracking.end()) {
+                        targetTimestamps = it->second.targetTimestamps;
+                    }
+                }
+                if (!targetTimestamps.empty()) {
+                    CheckTrafficPatterns(targetTimestamps, result);
                 }
             }
 
             // Analyze beaconing
             if (HasFlag(config.flags, NetworkAnalysisFlags::ScanBeaconing)) {
-                std::shared_lock lock(m_impl->m_mutex);
-                auto it = m_impl->m_connectionTracking.find(processId);
-                if (it != m_impl->m_connectionTracking.end()) {
-                    CheckBeaconing(it->second.targetTimestamps, result);
+                // Copy data while holding lock to prevent TOCTOU
+                std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>> targetTimestamps;
+                {
+                    std::shared_lock lock(m_impl->m_mutex);
+                    auto it = m_impl->m_connectionTracking.find(processId);
+                    if (it != m_impl->m_connectionTracking.end()) {
+                        targetTimestamps = it->second.targetTimestamps;
+                    }
+                }
+                if (!targetTimestamps.empty()) {
+                    CheckBeaconing(targetTimestamps, result);
                 }
             }
 
@@ -3313,11 +3400,33 @@ namespace ShadowStrike::AntiEvasion {
                     }
                 }
 
+                // ================================================================
+                // FP FIX #6: DNS Query Threshold - Increased and Scaled Confidence
+                // Original: 50 queries/min at 0.8 confidence - WAY too aggressive
+                // Modern web apps, browsers with many tabs, SPAs with CDNs can
+                // easily exceed 50 queries/minute during normal operation.
+                //
+                // NEW: Threshold raised to 200/min (constant updated in hpp)
+                // Confidence scaled by how much the threshold is exceeded.
+                // ================================================================
                 if (recentQueries > NetworkEvasionConstants::MAX_NORMAL_DNS_QUERIES) {
+                    // Scale confidence based on severity
+                    // 200-300: 0.25, 300-500: 0.40, 500-1000: 0.55, 1000+: 0.70
+                    double confidence = 0.25;
+                    if (recentQueries > 1000) {
+                        confidence = 0.70;
+                    } else if (recentQueries > 500) {
+                        confidence = 0.55;
+                    } else if (recentQueries > 300) {
+                        confidence = 0.40;
+                    }
+
                     NetworkDetectedTechnique detection(NetworkEvasionTechnique::DNS_ExcessiveLookups);
-                    detection.confidence = 0.8;
-                    detection.description = L"Excessive DNS queries";
-                    detection.technicalDetails = std::format(L"Queries per minute: {}", recentQueries);
+                    detection.confidence = confidence;
+                    detection.severity = (recentQueries > 500) ? NetworkEvasionSeverity::Medium : NetworkEvasionSeverity::Low;
+                    detection.description = L"Elevated DNS query rate";
+                    detection.technicalDetails = std::format(L"Queries per minute: {} (threshold: {})", 
+                                                             recentQueries, NetworkEvasionConstants::MAX_NORMAL_DNS_QUERIES);
                     AddDetection(result, std::move(detection));
                 }
             }
