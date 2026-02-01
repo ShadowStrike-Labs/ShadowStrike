@@ -231,7 +231,9 @@ namespace ShadowStrike {
             inline constexpr double MAX_STRUCTURED_ENTROPY = 7.9;
 
             /// @brief Minimum NOP percentage indicating junk code insertion
-            inline constexpr double MIN_SUSPICIOUS_NOP_PERCENTAGE = 15.0;
+            /// FP FIX: Raised from 15% to 25% - legitimate code alignment can have 20%
+            /// Visual C++ Release builds with /O2 can have 18-22% NOP for alignment
+            inline constexpr double MIN_SUSPICIOUS_NOP_PERCENTAGE = 25.0;
 
             /// @brief Minimum dead code percentage for metamorphic detection
             inline constexpr double MIN_SUSPICIOUS_DEAD_CODE_PERCENTAGE = 20.0;
@@ -1322,6 +1324,9 @@ namespace ShadowStrike {
             /// @brief Raw size
             uint32_t rawSize = 0;
 
+            /// @brief Raw address (file offset / PointerToRawData)
+            uint32_t rawAddress = 0;
+
             /// @brief Characteristics
             uint32_t characteristics = 0;
 
@@ -1333,6 +1338,9 @@ namespace ShadowStrike {
 
             /// @brief Is writable
             bool isWritable = false;
+
+            /// @brief Has code (based on characteristics)
+            bool hasCode = false;
 
             /// @brief Has high entropy
             bool hasHighEntropy = false;
@@ -1593,6 +1601,22 @@ namespace ShadowStrike {
 
             /// @brief From cache
             bool fromCache = false;
+
+            // ========================================================================
+            // FUZZY HASHING RESULTS
+            // ========================================================================
+
+            /// @brief SSDEEP fuzzy hash
+            std::string ssdeepHash;
+
+            /// @brief TLSH fuzzy hash
+            std::string tlshHash;
+
+            /// @brief N-gram profile (top N-grams by frequency)
+            std::vector<uint64_t> ngramProfile;
+
+            /// @brief Similarity analysis completed
+            bool similarityAnalysisComplete = false;
 
             // ========================================================================
             // METHODS

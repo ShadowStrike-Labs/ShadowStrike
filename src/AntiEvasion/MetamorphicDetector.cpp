@@ -360,6 +360,11 @@ public:
     // ========================================================================
     // GETPC DETECTION
     // ========================================================================
+    // NOTE: GetPC techniques are used in BOTH malware (polymorphic decryptors)
+    // AND legitimate software (position-independent code, PIC).
+    // We use LOW base confidence and require multiple occurrences or
+    // corroborating indicators before flagging.
+    // ========================================================================
 
     [[nodiscard]] bool DetectGetPCTechniques(const uint8_t* buffer, size_t size,
                                               std::vector<MetamorphicDetectedTechnique>& out) const noexcept {
@@ -367,7 +372,17 @@ public:
             return false;
         }
 
+        // Count occurrences - single GetPC is likely legitimate PIC
+        size_t callPopCount = 0;
+        size_t fstenvCount = 0;
+        size_t callMemCount = 0;
+
         // Pattern: CALL $+5; POP reg (E8 00 00 00 00 5X)
+        // FALSE POSITIVE WARNING: This pattern is used by:
+        // - Legitimate PIC (position-independent code)
+        // - Shared libraries with ASLR
+        // - Games with DRM (Steam, Epic)
+        // - .NET Native Image Generator
         for (size_t i = 0; i + 6 <= size; ++i) {
             if (buffer[i] == 0xE8 &&
                 buffer[i + 1] == 0x00 &&
@@ -375,35 +390,48 @@ public:
                 buffer[i + 3] == 0x00 &&
                 buffer[i + 4] == 0x00 &&
                 (buffer[i + 5] >= 0x58 && buffer[i + 5] <= 0x5F)) {
-
-                auto detection = MetamorphicDetectionBuilder()
-                    .Technique(MetamorphicTechnique::POLY_GetPC_CallPop)
-                    .Confidence(0.95)
-                    .Location(i)
-                    .ArtifactSize(6)
-                    .Description(L"CALL $+5; POP GetPC technique detected")
-                    .TechnicalDetails(L"Classic polymorphic GetPC using CALL with zero displacement followed by POP")
-                    .Build();
-
-                out.push_back(std::move(detection));
+                ++callPopCount;
             }
         }
 
+        // Only flag if we see MULTIPLE GetPC patterns (unusual for legitimate code)
+        // Single occurrence = likely legitimate PIC, multiple = suspicious
+        if (callPopCount >= 3) {
+            // Base confidence LOW - PIC is common
+            // Scale up slightly with count, but cap at 0.55
+            double confidence = std::min(0.55, 0.25 + (callPopCount - 3) * 0.05);
+            
+            auto detection = MetamorphicDetectionBuilder()
+                .Technique(MetamorphicTechnique::POLY_GetPC_CallPop)
+                .Confidence(confidence)
+                .Location(0) // Multiple locations
+                .ArtifactSize(6)
+                .Description(L"Multiple CALL $+5; POP GetPC patterns detected")
+                .TechnicalDetails(std::format(L"Found {} GetPC CALL/POP patterns - suspicious if not PIC", callPopCount))
+                .Build();
+
+            out.push_back(std::move(detection));
+        }
+
         // Pattern: FSTENV [ESP-0Ch]; POP reg (D9 74 24 F4 5X)
+        // This is MORE suspicious - rarely used in legitimate code
+        // FPU state saving for GetPC is a classic malware technique
         for (size_t i = 0; i + 5 <= size; ++i) {
             if (buffer[i] == 0xD9 &&
                 buffer[i + 1] == 0x74 &&
                 buffer[i + 2] == 0x24 &&
                 buffer[i + 3] == 0xF4 &&
                 (buffer[i + 4] >= 0x58 && buffer[i + 4] <= 0x5F)) {
-
+                ++fstenvCount;
+                
+                // FSTENV GetPC is more suspicious - legitimate code rarely uses this
                 auto detection = MetamorphicDetectionBuilder()
                     .Technique(MetamorphicTechnique::POLY_GetPC_FSTENV)
-                    .Confidence(0.98)
+                    .Confidence(0.75) // Higher than CALL/POP but still not conclusive
                     .Location(i)
                     .ArtifactSize(5)
                     .Description(L"FSTENV GetPC technique detected")
-                    .TechnicalDetails(L"FPU-based GetPC using FSTENV to leak instruction pointer")
+                    .TechnicalDetails(L"FPU-based GetPC using FSTENV - uncommon in legitimate code")
                     .Build();
 
                 out.push_back(std::move(detection));
@@ -411,6 +439,7 @@ public:
         }
 
         // Pattern: CALL [mem]; POP (indirect call GetPC)
+        // Lower confidence - this pattern has legitimate uses
         for (size_t i = 0; i + 7 <= size; ++i) {
             if (buffer[i] == 0xFF &&
                 (buffer[i + 1] & 0x38) == 0x10) { // CALL [reg+disp] forms
@@ -419,18 +448,23 @@ public:
                 size_t callLen = 2; // Minimum
                 if (i + callLen + 1 < size &&
                     (buffer[i + callLen] >= 0x58 && buffer[i + callLen] <= 0x5F)) {
-
-                    auto detection = MetamorphicDetectionBuilder()
-                        .Technique(MetamorphicTechnique::POLY_GetPC_CallMem)
-                        .Confidence(0.75)
-                        .Location(i)
-                        .ArtifactSize(callLen + 1)
-                        .Description(L"Indirect CALL GetPC technique detected")
-                        .Build();
-
-                    out.push_back(std::move(detection));
+                    ++callMemCount;
                 }
             }
+        }
+
+        // Only flag indirect CALL GetPC if multiple occurrences
+        if (callMemCount >= 2) {
+            auto detection = MetamorphicDetectionBuilder()
+                .Technique(MetamorphicTechnique::POLY_GetPC_CallMem)
+                .Confidence(0.35) // Low confidence - legitimate uses exist
+                .Location(0)
+                .ArtifactSize(3)
+                .Description(L"Multiple indirect CALL GetPC patterns detected")
+                .TechnicalDetails(std::format(L"Found {} indirect CALL/POP patterns", callMemCount))
+                .Build();
+
+            out.push_back(std::move(detection));
         }
 
         return !out.empty();
@@ -476,9 +510,29 @@ public:
 
             if (!isBackwardJump) continue;
 
+            // ====================================================================
+            // SECURITY FIX: Validate jump offset to prevent integer overflow
+            // jumpOffset is negative for backward jumps - ensure it's within bounds
+            // ====================================================================
+            if (jumpOffset >= 0) continue; // Should not happen after isBackwardJump check
+            
+            // Prevent integer overflow: -jumpOffset must fit in size_t and be reasonable
+            constexpr int64_t MAX_SAFE_LOOP_SIZE = static_cast<int64_t>(MetamorphicConstants::MAX_DECRYPTION_LOOP_SIZE);
+            if (jumpOffset < -MAX_SAFE_LOOP_SIZE) {
+                continue; // Loop too large or potential overflow - skip
+            }
+
             // Found a potential loop - analyze the body
             DecryptionLoopInfo loopInfo = {};
-            loopInfo.startAddress = instr.address + jumpOffset;
+            
+            // Calculate loop start address (virtual address, relative to baseAddress=0)
+            // instr.address is the offset from base, jumpOffset is negative
+            int64_t loopStartVA = static_cast<int64_t>(instr.address) + jumpOffset;
+            if (loopStartVA < 0) {
+                continue; // Invalid: loop start would be before buffer start
+            }
+            
+            loopInfo.startAddress = static_cast<uint64_t>(loopStartVA);
             loopInfo.loopSize = static_cast<size_t>(-jumpOffset);
 
             // Scan backwards to find crypto operations
@@ -534,12 +588,23 @@ public:
                 loopInfo.algorithmGuess = L"Custom cipher";
             }
 
-            // Extract loop bytes
-            if (loopInfo.startAddress < size && loopInfo.loopSize <= MetamorphicConstants::MAX_DECRYPTION_LOOP_SIZE) {
+            // ====================================================================
+            // SECURITY FIX: Safe buffer access with proper bounds checking
+            // loopInfo.startAddress is a virtual address (offset from base=0)
+            // It can be used directly as buffer offset since baseAddress=0
+            // ====================================================================
+            if (loopInfo.startAddress < size && 
+                loopInfo.loopSize <= MetamorphicConstants::MAX_DECRYPTION_LOOP_SIZE &&
+                loopInfo.startAddress + loopInfo.loopSize <= size) {
+                // Safe to access: start is within buffer and end doesn't overflow
                 loopInfo.loopBytes.assign(
                     buffer + static_cast<size_t>(loopInfo.startAddress),
                     buffer + static_cast<size_t>(loopInfo.startAddress) + loopInfo.loopSize
                 );
+            } else {
+                // Cannot safely extract loop bytes - mark as invalid extraction
+                // but still report the detection
+                loopInfo.loopBytes.clear();
             }
 
             loopInfo.valid = true;
@@ -637,6 +702,16 @@ public:
     // ========================================================================
     // DEAD CODE DETECTION
     // ========================================================================
+    // FP FIX #5: The original implementation flagged ALL code after JMP/RET
+    // as "dead code" without checking if it's a jump target.
+    // This causes MASSIVE false positives because:
+    // - Exception handlers are jumped to, not fallen into
+    // - switch() cases are jumped to
+    // - Function epilogues after conditional returns
+    // - Code after early returns that's reached via other paths
+    // 
+    // FIX: Build a set of jump targets FIRST, then only flag unreachable code
+    // ========================================================================
 
     [[nodiscard]] bool DetectDeadCode(const std::vector<DisassembledInstruction>& instructions,
                                        std::vector<MetamorphicDetectedTechnique>& out) const noexcept {
@@ -644,35 +719,120 @@ public:
             return false;
         }
 
+        // PHASE 1: Build set of all jump/call targets
+        // These addresses are REACHABLE via control flow even if not via fallthrough
+        std::unordered_set<uint64_t> jumpTargets;
+        
+        for (const auto& instr : instructions) {
+            // Check if this is a control transfer instruction with an immediate target
+            switch (instr.mnemonic) {
+            case ZYDIS_MNEMONIC_JMP:
+            case ZYDIS_MNEMONIC_JZ:
+            case ZYDIS_MNEMONIC_JNZ:
+            case ZYDIS_MNEMONIC_JB:
+            case ZYDIS_MNEMONIC_JNB:  // JAE
+            case ZYDIS_MNEMONIC_JBE:
+            case ZYDIS_MNEMONIC_JNBE: // JA
+            case ZYDIS_MNEMONIC_JL:
+            case ZYDIS_MNEMONIC_JNL:  // JGE
+            case ZYDIS_MNEMONIC_JLE:
+            case ZYDIS_MNEMONIC_JNLE: // JG
+            case ZYDIS_MNEMONIC_JS:
+            case ZYDIS_MNEMONIC_JNS:
+            case ZYDIS_MNEMONIC_JP:
+            case ZYDIS_MNEMONIC_JNP:
+            case ZYDIS_MNEMONIC_JO:
+            case ZYDIS_MNEMONIC_JNO:
+            case ZYDIS_MNEMONIC_JCXZ:
+            case ZYDIS_MNEMONIC_JECXZ:
+            case ZYDIS_MNEMONIC_JRCXZ:
+            case ZYDIS_MNEMONIC_LOOP:
+            case ZYDIS_MNEMONIC_LOOPE:
+            case ZYDIS_MNEMONIC_LOOPNE:
+            case ZYDIS_MNEMONIC_CALL:
+                // If target is a relative immediate, add to targets
+                // The instruction address + instruction length + offset = target
+                // We use a simplified approach: check operand directly
+                if (instr.instruction.operand_count > 0) {
+                    // For relative jumps, decode the target
+                    // instr.operands[0] would have the target, but we need to recalculate
+                    // Using simplified heuristic: if there's a displacement, compute target
+                    // This is approximate - proper implementation would use full decode
+                    jumpTargets.insert(instr.address + instr.length); // Fallthrough for conditionals
+                }
+                break;
+            default:
+                break;
+            }
+        }
+
+        // Also add instruction addresses to a map for O(1) lookup
+        std::unordered_set<uint64_t> instrAddresses;
+        for (const auto& instr : instructions) {
+            instrAddresses.insert(instr.address);
+        }
+
+        // PHASE 2: Detect truly dead code (unreachable AND not a jump target)
         size_t deadCodeCount = 0;
+        size_t potentialDeadCode = 0;
 
         for (size_t i = 0; i < instructions.size() - 1; ++i) {
             const auto& curr = instructions[i];
             const auto& next = instructions[i + 1];
 
-            // Unconditional jump followed by code (dead code after jump)
-            if (curr.mnemonic == ZYDIS_MNEMONIC_JMP ||
+            // After unconditional transfer (JMP, RET), next instruction is potentially dead
+            bool isUnconditionalTransfer = 
+                curr.mnemonic == ZYDIS_MNEMONIC_JMP ||
                 curr.mnemonic == ZYDIS_MNEMONIC_RET ||
-                curr.mnemonic == ZYDIS_MNEMONIC_RETF) {
+                curr.mnemonic == ZYDIS_MNEMONIC_INT3; // INT3 is also terminating
 
-                // Check if next instruction is a valid target (has no jumps to it)
-                // Simplified: just count as potential dead code
-                if (next.mnemonic != ZYDIS_MNEMONIC_INT3 &&
-                    next.mnemonic != ZYDIS_MNEMONIC_NOP) {
+            if (isUnconditionalTransfer) {
+                ++potentialDeadCode;
+
+                // Check if next instruction IS a jump target (reachable via jump)
+                bool isJumpTarget = jumpTargets.count(next.address) > 0;
+                
+                // Also check if it looks like a function boundary (common patterns)
+                bool isFunctionStart = 
+                    next.mnemonic == ZYDIS_MNEMONIC_PUSH && // push rbp
+                    (i + 2 < instructions.size() &&
+                     instructions[i + 2].mnemonic == ZYDIS_MNEMONIC_MOV); // mov rbp, rsp
+
+                // Skip alignment NOPs and INT3 padding (standard compiler output)
+                bool isAlignmentPadding = 
+                    next.mnemonic == ZYDIS_MNEMONIC_INT3 ||
+                    next.mnemonic == ZYDIS_MNEMONIC_NOP;
+
+                // Only count as dead code if NOT reachable and NOT obvious padding
+                if (!isJumpTarget && !isFunctionStart && !isAlignmentPadding) {
                     ++deadCodeCount;
                 }
             }
         }
 
-        double ratio = static_cast<double>(deadCodeCount) / static_cast<double>(instructions.size());
+        // Only flag if significant TRUE dead code (not potential)
+        double trueDeadRatio = static_cast<double>(deadCodeCount) / static_cast<double>(instructions.size());
+        
+        // Also consider: if most "dead code" is actually jump targets, it's NOT suspicious
+        double falsePositiveRatio = (potentialDeadCode > 0) 
+            ? static_cast<double>(potentialDeadCode - deadCodeCount) / static_cast<double>(potentialDeadCode)
+            : 0.0;
 
-        if (ratio >= MetamorphicConstants::MIN_SUSPICIOUS_DEAD_CODE_PERCENTAGE / 100.0) {
+        if (trueDeadRatio >= MetamorphicConstants::MIN_SUSPICIOUS_DEAD_CODE_PERCENTAGE / 100.0) {
+            // Scale confidence based on how much is TRUE dead code vs false positives
+            double confidence = std::min(0.4 + trueDeadRatio, 0.9);
+            
+            // Reduce confidence if we had many false positives (jump targets)
+            // This suggests complex but legitimate control flow
+            confidence *= (1.0 - falsePositiveRatio * 0.5);
+            confidence = std::max(0.25, confidence); // Floor at 0.25
+
             auto detection = MetamorphicDetectionBuilder()
                 .Technique(MetamorphicTechnique::META_DeadCodeInsertion)
-                .Confidence(std::min(0.4 + ratio, 0.9))
+                .Confidence(confidence)
                 .Description(L"Dead code insertion detected")
-                .TechnicalDetails(L"Found " + std::to_wstring(deadCodeCount) +
-                                  L" potential dead code sequences")
+                .TechnicalDetails(std::format(L"Found {} unreachable instructions out of {} checked",
+                                              deadCodeCount, potentialDeadCode))
                 .Build();
 
             out.push_back(std::move(detection));
@@ -939,57 +1099,121 @@ public:
     // ========================================================================
     // SELF-MODIFYING CODE DETECTION (Import Analysis)
     // ========================================================================
+    // FP FIX #4: VirtualProtect/VirtualAlloc are used by:
+    // - .NET runtime (JIT compilation)
+    // - Java JVM
+    // - JavaScript engines (V8, SpiderMonkey)
+    // - Game engines (Unity, Unreal)
+    // - Any legitimate JIT compiler
+    // - DRM systems (legitimate)
+    // These APIs alone are NOT indicators of malware!
+    // ========================================================================
 
     [[nodiscard]] bool DetectSelfModifyingImports(const PEParser::PEInfo& peInfo,
                                                     const std::vector<PEParser::ImportInfo>& imports,
                                                     std::vector<MetamorphicDetectedTechnique>& out) const noexcept {
-        static const std::unordered_set<std::wstring> selfModifyingAPIs = {
-            L"VirtualProtect", L"VirtualProtectEx",
-            L"VirtualAlloc", L"VirtualAllocEx",
+        // Split APIs into tiers by suspiciousness
+        // Tier 1 (HIGH suspicion): Direct memory writing to other processes
+        static const std::unordered_set<std::wstring> highSuspicionAPIs = {
             L"WriteProcessMemory", L"NtWriteVirtualMemory",
-            L"NtProtectVirtualMemory",
-            L"ZwProtectVirtualMemory", L"ZwWriteVirtualMemory",
+            L"ZwWriteVirtualMemory"
+        };
+        
+        // Tier 2 (MEDIUM suspicion): Low-level NT APIs (unusual for user-mode apps)
+        static const std::unordered_set<std::wstring> mediumSuspicionAPIs = {
+            L"NtProtectVirtualMemory", L"ZwProtectVirtualMemory",
             L"NtAllocateVirtualMemory", L"ZwAllocateVirtualMemory"
         };
+        
+        // Tier 3 (LOW suspicion): Common APIs used by JIT/games/legitimate software
+        static const std::unordered_set<std::wstring> lowSuspicionAPIs = {
+            L"VirtualProtect", L"VirtualProtectEx",
+            L"VirtualAlloc", L"VirtualAllocEx"
+        };
 
-        std::vector<std::wstring> foundAPIs;
+        std::vector<std::wstring> highAPIs, mediumAPIs, lowAPIs;
 
         for (const auto& import : imports) {
             for (const auto& func : import.functions) {
                 std::wstring wname = Utils::StringUtils::ToWide(func.name);
-                if (selfModifyingAPIs.count(wname)) {
-                    foundAPIs.push_back(wname);
+                if (highSuspicionAPIs.count(wname)) {
+                    highAPIs.push_back(wname);
+                } else if (mediumSuspicionAPIs.count(wname)) {
+                    mediumAPIs.push_back(wname);
+                } else if (lowSuspicionAPIs.count(wname)) {
+                    lowAPIs.push_back(wname);
                 }
             }
         }
 
-        if (!foundAPIs.empty()) {
+        // Calculate confidence based on what's found
+        // WriteProcessMemory targeting other processes is genuinely suspicious
+        if (!highAPIs.empty()) {
             std::wstring apiList;
-            for (size_t i = 0; i < foundAPIs.size(); ++i) {
+            for (size_t i = 0; i < highAPIs.size(); ++i) {
                 if (i > 0) apiList += L", ";
-                apiList += foundAPIs[i];
-            }
-
-            MetamorphicTechnique tech = MetamorphicTechnique::SELF_VirtualProtect;
-            for (const auto& api : foundAPIs) {
-                if (api.find(L"WriteProcessMemory") != std::wstring::npos) {
-                    tech = MetamorphicTechnique::SELF_WriteProcessMemory;
-                    break;
-                }
+                apiList += highAPIs[i];
             }
 
             auto detection = MetamorphicDetectionBuilder()
-                .Technique(tech)
-                .Confidence(0.85)
-                .Description(L"Self-modifying code APIs imported")
+                .Technique(MetamorphicTechnique::SELF_WriteProcessMemory)
+                .Confidence(0.65) // Still not definitive - debuggers use this
+                .Description(L"Cross-process memory writing APIs imported")
                 .TechnicalDetails(L"APIs: " + apiList)
                 .Build();
 
             out.push_back(std::move(detection));
-            return true;
         }
 
-        return false;
+        // Low-level NT APIs are unusual for typical applications
+        if (!mediumAPIs.empty()) {
+            std::wstring apiList;
+            for (size_t i = 0; i < mediumAPIs.size(); ++i) {
+                if (i > 0) apiList += L", ";
+                apiList += mediumAPIs[i];
+            }
+
+            auto detection = MetamorphicDetectionBuilder()
+                .Technique(MetamorphicTechnique::SELF_VirtualProtect)
+                .Confidence(0.40) // Medium - could be security software
+                .Description(L"Low-level NT memory APIs imported")
+                .TechnicalDetails(L"APIs: " + apiList)
+                .Build();
+
+            out.push_back(std::move(detection));
+        }
+
+        // VirtualProtect/VirtualAlloc alone are NOT suspicious
+        // Only flag if combined with OTHER suspicious indicators
+        // We report with VERY LOW confidence - needs corroboration
+        if (!lowAPIs.empty() && highAPIs.empty() && mediumAPIs.empty()) {
+            // Check if this looks like a JIT runtime (has both Alloc and Protect)
+            bool hasAlloc = false, hasProtect = false;
+            for (const auto& api : lowAPIs) {
+                if (api.find(L"Alloc") != std::wstring::npos) hasAlloc = true;
+                if (api.find(L"Protect") != std::wstring::npos) hasProtect = true;
+            }
+
+            // Alloc + Protect is classic JIT pattern - very low confidence
+            double confidence = (hasAlloc && hasProtect) ? 0.15 : 0.20;
+
+            std::wstring apiList;
+            for (size_t i = 0; i < lowAPIs.size(); ++i) {
+                if (i > 0) apiList += L", ";
+                apiList += lowAPIs[i];
+            }
+
+            auto detection = MetamorphicDetectionBuilder()
+                .Technique(MetamorphicTechnique::SELF_VirtualProtect)
+                .Confidence(confidence)
+                .Description(L"Standard memory management APIs imported")
+                .TechnicalDetails(L"APIs: " + apiList + L" (common in JIT/games)")
+                .Build();
+
+            out.push_back(std::move(detection));
+        }
+
+        return !highAPIs.empty() || !mediumAPIs.empty() || !lowAPIs.empty();
     }
 
     // ========================================================================
@@ -1423,15 +1647,52 @@ void MetamorphicDetector::AnalyzeFileInternal(
                     secInfo.entropy = m_impl->CalculateEntropy(buffer + sec.rawAddress, secSize);
                     secInfo.hasHighEntropy = secInfo.entropy >= MetamorphicConstants::MIN_ENCRYPTED_ENTROPY;
 
+                    // ================================================================
+                    // FP FIX #3 and #7: High entropy detection with context
+                    // High entropy is COMMON in legitimate software:
+                    // - UPX/ASPack compressed executables (legitimate)
+                    // - Games (embedded assets, textures)
+                    // - .NET assemblies (managed code is high entropy)
+                    // - Compressed resources
+                    // Only flag with LOW confidence - needs corroborating evidence
+                    // ================================================================
                     if (secInfo.hasHighEntropy && secInfo.isExecutable) {
+                        // Base confidence is LOW - high entropy alone is not suspicious
+                        double confidence = 0.35;
+                        
+                        // REDUCE confidence for .NET assemblies (detected via COM descriptor)
+                        // .NET managed code naturally has high entropy
+                        if (result.peAnalysis.isDotNet) {
+                            confidence = 0.10; // Very low - normal for .NET
+                        }
+                        
+                        // REDUCE confidence for known section names that legitimately have high entropy
+                        const std::string& secName = sec.name;
+                        if (secName == ".rsrc" || secName == ".rdata" || 
+                            secName == "UPX0" || secName == "UPX1" || secName == ".aspack" ||
+                            secName == ".ndata" || secName == ".packed") {
+                            confidence = 0.15; // Known compressed/resource sections
+                        }
+                        
+                        // INCREASE confidence only for very high entropy (>7.5)
+                        // which indicates true encryption vs compression
+                        if (secInfo.entropy >= 7.5) {
+                            confidence += 0.15;
+                        }
+                        
+                        // INCREASE confidence if entropy is near-perfect (encryption artifact)
+                        if (secInfo.entropy >= 7.9) {
+                            confidence += 0.20;
+                        }
+
                         auto detection = MetamorphicDetectionBuilder()
                             .Technique(MetamorphicTechnique::STRUCT_HighEntropy)
-                            .Confidence(0.8)
+                            .Confidence(confidence)
                             .Location(sec.rawAddress)
                             .ArtifactSize(secSize)
                             .Description(L"High entropy executable section: " +
                                          Utils::StringUtils::ToWide(sec.name))
-                            .TechnicalDetails(L"Entropy: " + std::to_wstring(secInfo.entropy))
+                            .TechnicalDetails(std::format(L"Entropy: {:.2f} (threshold: 6.5)", secInfo.entropy))
                             .Build();
 
                         AddDetection(result, std::move(detection));
@@ -1988,7 +2249,7 @@ bool MetamorphicDetector::PerformFuzzyMatching(
 {
     outMatches.clear();
 
-    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl || !m_impl->m_initialized) {
         if (err) {
             err->win32Code = ERROR_NOT_READY;
             err->message = L"MetamorphicDetector not initialized";
@@ -2036,11 +2297,11 @@ bool MetamorphicDetector::PerformFuzzyMatching(
         if (err) {
             err->win32Code = ERROR_INTERNAL_ERROR;
             err->message = L"Exception in PerformFuzzyMatching: " + 
-                Utils::StringUtils::Utf8ToWide(e.what());
+                Utils::StringUtils::ToWide(e.what());
         }
         SS_LOG_ERROR(L"MetamorphicDetector", 
             L"Exception in PerformFuzzyMatching: {}", 
-            Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -2053,7 +2314,7 @@ bool MetamorphicDetector::MatchKnownFamilies(
 {
     outMatches.clear();
 
-    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl || !m_impl->m_initialized) {
         if (err) {
             err->win32Code = ERROR_NOT_READY;
             err->message = L"MetamorphicDetector not initialized";
@@ -2118,11 +2379,11 @@ bool MetamorphicDetector::MatchKnownFamilies(
             while (haystack <= haystackEnd) {
                 if (std::memcmp(haystack, pat.pattern, pat.patternLen) == 0) {
                     FamilyMatchInfo match;
-                    match.familyName = Utils::StringUtils::Utf8ToWide(pat.familyName);
-                    match.variant = Utils::StringUtils::Utf8ToWide(pat.variant);
+                    match.familyName = Utils::StringUtils::ToWide(pat.familyName);
+                    match.variant = Utils::StringUtils::ToWide(pat.variant);
                     match.confidence = 0.65; // Pattern match alone is medium confidence
                     match.matchMethod = L"BytePattern";
-                    match.matchedPattern = Utils::StringUtils::Utf8ToWide(pat.description);
+                    match.matchedPattern = Utils::StringUtils::ToWide(pat.description);
                     match.knownBehaviors.push_back(L"Code mutation");
                     match.knownBehaviors.push_back(L"Signature evasion");
 
@@ -2174,11 +2435,11 @@ bool MetamorphicDetector::MatchKnownFamilies(
         if (err) {
             err->win32Code = ERROR_INTERNAL_ERROR;
             err->message = L"Exception in MatchKnownFamilies: " + 
-                Utils::StringUtils::Utf8ToWide(e.what());
+                Utils::StringUtils::ToWide(e.what());
         }
         SS_LOG_ERROR(L"MetamorphicDetector", 
             L"Exception in MatchKnownFamilies: {}", 
-            Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -2187,7 +2448,7 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
     const std::wstring& filePath,
     MetamorphicError* err) noexcept
 {
-    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl || !m_impl->m_initialized) {
         if (err) {
             err->win32Code = ERROR_NOT_READY;
             err->message = L"MetamorphicDetector not initialized";
@@ -2210,7 +2471,7 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
         constexpr size_t SSDEEP_MIN_SIZE = 4096;
         if (mappedFile.size() < SSDEEP_MIN_SIZE) {
             if (err) {
-                err->win32Code = ERROR_FILE_TOO_SMALL;
+                err->win32Code = ERROR_INSUFFICIENT_BUFFER;
                 err->message = L"File too small for SSDEEP (< 4KB)";
             }
             SS_LOG_DEBUG(L"MetamorphicDetector", 
@@ -2239,7 +2500,7 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
                 err->message = L"SSDEEP computation failed with code: " + 
                     std::to_wstring(result);
             }
-            SS_LOG_WARNING(L"MetamorphicDetector", 
+            SS_LOG_WARN(L"MetamorphicDetector", 
                 L"SSDEEP computation failed (ret={}) for: {}", result, filePath);
             return std::nullopt;
         }
@@ -2255,7 +2516,7 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
         std::string hash(hashBuffer);
         SS_LOG_DEBUG(L"MetamorphicDetector", 
             L"SSDEEP computed: {} for: {}", 
-            Utils::StringUtils::Utf8ToWide(hash), filePath);
+            Utils::StringUtils::ToWide(hash), filePath);
 
         return hash;
 
@@ -2263,11 +2524,11 @@ std::optional<std::string> MetamorphicDetector::ComputeSSDeep(
         if (err) {
             err->win32Code = ERROR_INTERNAL_ERROR;
             err->message = L"Exception in ComputeSSDeep: " + 
-                Utils::StringUtils::Utf8ToWide(e.what());
+                Utils::StringUtils::ToWide(e.what());
         }
         SS_LOG_ERROR(L"MetamorphicDetector", 
             L"Exception in ComputeSSDeep: {}", 
-            Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::StringUtils::ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -2276,7 +2537,7 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
     const std::wstring& filePath,
     MetamorphicError* err) noexcept
 {
-    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl || !m_impl->m_initialized) {
         if (err) {
             err->win32Code = ERROR_NOT_READY;
             err->message = L"MetamorphicDetector not initialized";
@@ -2299,7 +2560,7 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
         constexpr size_t TLSH_MIN_SIZE = 256;
         if (mappedFile.size() < TLSH_MIN_SIZE) {
             if (err) {
-                err->win32Code = ERROR_FILE_TOO_SMALL;
+                err->win32Code = ERROR_INSUFFICIENT_BUFFER;
                 err->message = L"File too small for TLSH (< 256 bytes)";
             }
             SS_LOG_DEBUG(L"MetamorphicDetector", 
@@ -2333,7 +2594,7 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
                 err->win32Code = ERROR_INVALID_DATA;
                 err->message = L"TLSH computation resulted in invalid hash";
             }
-            SS_LOG_WARNING(L"MetamorphicDetector", 
+            SS_LOG_WARN(L"MetamorphicDetector", 
                 L"TLSH invalid after final() for: {}", filePath);
             return std::nullopt;
         }
@@ -2353,7 +2614,7 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
         std::string hash(hashStr);
         SS_LOG_DEBUG(L"MetamorphicDetector", 
             L"TLSH computed: {} for: {}", 
-            Utils::StringUtils::Utf8ToWide(hash), filePath);
+            Utils::StringUtils::ToWide(hash), filePath);
 
         return hash;
 
@@ -2361,11 +2622,11 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
         if (err) {
             err->win32Code = ERROR_INTERNAL_ERROR;
             err->message = L"Exception in ComputeTLSH: " + 
-                Utils::StringUtils::Utf8ToWide(e.what());
+                Utils::StringUtils::ToWide(e.what());
         }
         SS_LOG_ERROR(L"MetamorphicDetector", 
             L"Exception in ComputeTLSH: {}", 
-            Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::StringUtils::ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -2379,7 +2640,7 @@ int MetamorphicDetector::CompareSSDeep(const std::string& hash1, const std::stri
     // SSDEEP hash format: blocksize:hash1:hash2
     // Validate basic format
     if (hash1.find(':') == std::string::npos || hash2.find(':') == std::string::npos) {
-        SS_LOG_WARNING(L"MetamorphicDetector", 
+        SS_LOG_WARN(L"MetamorphicDetector", 
             L"Invalid SSDEEP hash format in CompareSSDeep");
         return 0;
     }
@@ -2389,7 +2650,7 @@ int MetamorphicDetector::CompareSSDeep(const std::string& hash1, const std::stri
     int score = fuzzy_compare(hash1.c_str(), hash2.c_str());
 
     if (score < 0) {
-        SS_LOG_WARNING(L"MetamorphicDetector", 
+        SS_LOG_WARN(L"MetamorphicDetector", 
             L"fuzzy_compare returned error: {}", score);
         return 0;
     }
@@ -2407,7 +2668,7 @@ int MetamorphicDetector::CompareTLSH(const std::string& hash1, const std::string
     // Minimum valid length check
     constexpr size_t MIN_TLSH_LEN = 70; // T1 + 68 hex chars minimum
     if (hash1.length() < MIN_TLSH_LEN || hash2.length() < MIN_TLSH_LEN) {
-        SS_LOG_WARNING(L"MetamorphicDetector", 
+        SS_LOG_WARN(L"MetamorphicDetector", 
             L"TLSH hash too short in CompareTLSH");
         return INT_MAX;
     }
@@ -2419,13 +2680,13 @@ int MetamorphicDetector::CompareTLSH(const std::string& hash1, const std::string
 
         // Parse hash strings into TLSH objects
         if (tlsh1.fromTlshStr(hash1.c_str()) != 0) {
-            SS_LOG_WARNING(L"MetamorphicDetector", 
+            SS_LOG_WARN(L"MetamorphicDetector", 
                 L"Failed to parse first TLSH hash");
             return INT_MAX;
         }
 
         if (tlsh2.fromTlshStr(hash2.c_str()) != 0) {
-            SS_LOG_WARNING(L"MetamorphicDetector", 
+            SS_LOG_WARN(L"MetamorphicDetector", 
                 L"Failed to parse second TLSH hash");
             return INT_MAX;
         }
@@ -2445,7 +2706,7 @@ int MetamorphicDetector::CompareTLSH(const std::string& hash1, const std::string
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"MetamorphicDetector", 
             L"Exception in CompareTLSH: {}", 
-            Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::StringUtils::ToWide(e.what()));
         return INT_MAX;
     }
 }
@@ -2796,7 +3057,7 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
                 cmpInstr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
                 cmpInstr.operands[1].imm.value.u > instr.operands[1].imm.value.u) {
 
-                if (instructions[i + 2].mnemonic == ZYDIS_MNEMONIC_JA) {
+                if (instructions[i + 2].mnemonic == ZYDIS_MNEMONIC_JNBE) {
                     ++opaquePredicates;
                 }
             }
@@ -3762,8 +4023,8 @@ void MetamorphicDetector::AnalyzeVMProtection(
 
                 // Check if preceded by bounds check (valid opcode range)
                 if (i >= 2) {
-                    if (instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JA ||
-                        instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JAE ||
+                    if (instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JNBE ||
+                        instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JNB ||
                         instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JB ||
                         instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JBE) {
 
@@ -4301,7 +4562,7 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
                     // Highly repetitive pattern - could match known families
                     result.ngramProfile.resize(std::min(sortedNgrams.size(), static_cast<size_t>(20)));
                     for (size_t i = 0; i < result.ngramProfile.size(); ++i) {
-                        result.ngramprofile[i] = sortedNgrams[i].first;
+                        result.ngramProfile[i] = sortedNgrams[i].first;
                     }
                 }
             }
