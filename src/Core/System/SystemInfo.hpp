@@ -74,10 +74,7 @@ namespace ShadowStrike {
 namespace Core {
 namespace System {
 
-// ============================================================================
-// FORWARD DECLARATIONS
-// ============================================================================
-class SystemInfoImpl;
+// Forward declaration is inside the class definition for PIMPL pattern
 
 // ============================================================================
 // ENUMERATIONS
@@ -99,6 +96,21 @@ enum class VirtualizationType : uint8_t {
     AmazonEC2 = 8,
     AzureVM = 9,
     GoogleCloud = 10,
+    Unknown = 255
+};
+
+/**
+ * @enum CloudVMType
+ * @brief Cloud provider VM type (legitimate cloud, not suspicious).
+ */
+enum class CloudVMType : uint8_t {
+    None = 0,
+    AWS = 1,
+    Azure = 2,
+    GCP = 3,
+    DigitalOcean = 4,
+    Linode = 5,
+    Oracle = 6,
     Unknown = 255
 };
 
@@ -249,7 +261,9 @@ struct alignas(64) NetworkInterfaceInfo {
  */
 struct alignas(64) VirtualizationInfo {
     bool isVirtualized{ false };
+    bool isCloudVM{ false };           // True if running on AWS/Azure/GCP (legitimate)
     VirtualizationType type{ VirtualizationType::None };
+    CloudVMType cloudType{ CloudVMType::None };
     double confidence{ 0.0 };
     std::wstring hypervisorName;
     std::wstring vmToolsVersion;
@@ -355,6 +369,9 @@ struct alignas(64) SystemInfoStatistics {
  * and environment detection capabilities.
  */
 class SystemInfo {
+    // Forward declaration of PIMPL implementation struct
+    struct SystemInfoImpl;
+
 public:
     /**
      * @brief Gets singleton instance.

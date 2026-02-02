@@ -57,10 +57,100 @@
 #include <deque>
 #include <format>
 #include <cmath>
+#include <unordered_set>
+#include <filesystem>
 
 namespace ShadowStrike {
 namespace Core {
 namespace System {
+
+// ============================================================================
+// LOG CATEGORY
+// ============================================================================
+static constexpr const wchar_t* LOG_CATEGORY = L"PerformanceMonitor";
+
+// ============================================================================
+// RAII HANDLE WRAPPER
+// ============================================================================
+
+/**
+ * @brief RAII wrapper for Windows HANDLE to prevent leaks.
+ * 
+ * Guarantees cleanup on all code paths including exceptions.
+ * Non-copyable, move-only semantics.
+ */
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE handle = nullptr) noexcept : m_handle(handle) {}
+    
+    ~UniqueHandle() noexcept {
+        Reset();
+    }
+    
+    // Non-copyable
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+    
+    // Move-only
+    UniqueHandle(UniqueHandle&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = nullptr;
+    }
+    
+    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            m_handle = other.m_handle;
+            other.m_handle = nullptr;
+        }
+        return *this;
+    }
+    
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+    [[nodiscard]] explicit operator bool() const noexcept { 
+        return m_handle != nullptr && m_handle != INVALID_HANDLE_VALUE; 
+    }
+    
+    void Reset(HANDLE handle = nullptr) noexcept {
+        if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_handle);
+        }
+        m_handle = handle;
+    }
+    
+    HANDLE Release() noexcept {
+        HANDLE h = m_handle;
+        m_handle = nullptr;
+        return h;
+    }
+
+private:
+    HANDLE m_handle;
+};
+
+// ============================================================================
+// THROTTLE LEVEL CONSTANTS
+// ============================================================================
+
+namespace ThrottleConstants {
+    // Resource utilization thresholds for throttle level calculation
+    // These values are tuned based on empirical testing to balance
+    // AV responsiveness with system performance impact.
+    
+    /** Below this utilization, no throttling is needed */
+    constexpr double kNoThrottleThreshold = 0.6;
+    
+    /** Light throttling zone: 60-80% utilization */
+    constexpr double kLightThrottleThreshold = 0.8;
+    
+    /** Moderate throttling zone: 80-90% utilization */
+    constexpr double kModerateThrottleThreshold = 0.9;
+    
+    // Throttle levels (0.0 = full speed, 1.0 = maximum throttle)
+    constexpr double kNoThrottleLevel = 0.0;
+    constexpr double kLightThrottleLevel = 0.3;
+    constexpr double kModerateThrottleLevel = 0.6;
+    constexpr double kHeavyThrottleLevel = 0.9;
+}
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -70,14 +160,33 @@ namespace {
 
 /**
  * @brief Calculate CPU usage percentage from process times.
+ * 
+ * Handles counter wraparound/reset on PID reuse by returning 0 if
+ * current values are less than previous (indicates process restart).
  */
 double CalculateCPUUsage(uint64_t prevKernelTime, uint64_t prevUserTime,
                          uint64_t currKernelTime, uint64_t currUserTime,
                          uint64_t elapsedMs, uint32_t processorCount) {
     if (elapsedMs == 0) return 0.0;
+    
+    // SECURITY FIX: Validate processorCount to prevent division by zero
+    // std::thread::hardware_concurrency() can return 0 per C++ spec
+    if (processorCount == 0) {
+        processorCount = 1;
+    }
 
     const uint64_t prevTotal = prevKernelTime + prevUserTime;
     const uint64_t currTotal = currKernelTime + currUserTime;
+    
+    // SECURITY FIX: Handle counter reset/wraparound on PID reuse
+    // When a PID is reused, the new process has near-zero times but
+    // our tracking has the old process's large values. Detect and handle.
+    if (currTotal < prevTotal) {
+        // Counter went backwards - likely PID reuse. Return 0 and let
+        // the next sample establish a valid baseline.
+        return 0.0;
+    }
+    
     const uint64_t deltaTime = currTotal - prevTotal;
 
     // Convert to milliseconds (times are in 100-nanosecond units)
@@ -133,14 +242,34 @@ ResourcePressure CalculatePressure(double usagePercent) {
 
 /**
  * @brief Get idle time in milliseconds.
+ * 
+ * Uses GetTickCount64() to avoid wraparound issues after 49.7 days uptime.
+ * GetTickCount() is 32-bit and wraps at ~49.7 days, causing incorrect
+ * idle time calculations on long-running systems.
  */
 uint64_t GetSystemIdleTime() {
     LASTINPUTINFO lii = {};
     lii.cbSize = sizeof(LASTINPUTINFO);
 
     if (GetLastInputInfo(&lii)) {
-        const DWORD currentTick = GetTickCount();
-        return currentTick - lii.dwTime;
+        // SECURITY FIX: Use GetTickCount64() to prevent 49.7-day wraparound
+        // GetTickCount() returns DWORD (32-bit) which wraps after ~49.7 days
+        // GetTickCount64() returns ULONGLONG (64-bit) - won't wrap for 584M years
+        const uint64_t currentTick = GetTickCount64();
+        
+        // lii.dwTime is still 32-bit, but we handle the comparison correctly
+        // by checking if current is less (would indicate wrap if using 32-bit)
+        const uint64_t lastInputTick = static_cast<uint64_t>(lii.dwTime);
+        
+        // Handle potential wraparound of lii.dwTime (it's still 32-bit)
+        // If lastInputTick appears to be in the future, it wrapped
+        if (currentTick >= lastInputTick) {
+            return currentTick - lastInputTick;
+        } else {
+            // lii.dwTime wrapped - calculate correctly
+            // This handles the edge case where dwTime wrapped but GetTickCount64 didn't
+            return currentTick + (0xFFFFFFFFULL - lastInputTick + 1);
+        }
     }
 
     return 0;
@@ -237,35 +366,73 @@ public:
         return m_throttleCallbacks.erase(id) > 0;
     }
 
+    /**
+     * @brief Invokes resource usage callbacks with minimal lock hold time.
+     * 
+     * PERFORMANCE FIX: Copies callbacks under lock, then invokes outside lock.
+     * This prevents slow callbacks from blocking registration/unregistration.
+     */
     void InvokeResourceUsage(const SystemResourceUsage& usage) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_resourceCallbacks) {
+        // Copy callbacks under lock to minimize lock hold time
+        std::vector<ResourceUsageCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_resourceCallbacks.size());
+            for (const auto& [id, callback] : m_resourceCallbacks) {
+                callbacksCopy.push_back(callback);
+            }
+        }
+        
+        // Invoke outside lock - slow callbacks won't block registration
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(usage);
             } catch (const std::exception& e) {
-                Logger::Error("ResourceUsageCallback exception: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ResourceUsageCallback exception: %hs", e.what());
             }
         }
     }
 
+    /**
+     * @brief Invokes anomaly callbacks with minimal lock hold time.
+     */
     void InvokeAnomaly(const PerformanceAnomaly& anomaly) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_anomalyCallbacks) {
+        std::vector<AnomalyCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_anomalyCallbacks.size());
+            for (const auto& [id, callback] : m_anomalyCallbacks) {
+                callbacksCopy.push_back(callback);
+            }
+        }
+        
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(anomaly);
             } catch (const std::exception& e) {
-                Logger::Error("AnomalyCallback exception: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"AnomalyCallback exception: %hs", e.what());
             }
         }
     }
 
+    /**
+     * @brief Invokes throttle callbacks with minimal lock hold time.
+     */
     void InvokeThrottle(bool shouldThrottle, double currentLoad) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_throttleCallbacks) {
+        std::vector<ThrottleCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_throttleCallbacks.size());
+            for (const auto& [id, callback] : m_throttleCallbacks) {
+                callbacksCopy.push_back(callback);
+            }
+        }
+        
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(shouldThrottle, currentLoad);
             } catch (const std::exception& e) {
-                Logger::Error("ThrottleCallback exception: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ThrottleCallback exception: %hs", e.what());
             }
         }
     }
@@ -397,6 +564,38 @@ public:
         CheckCryptomining(pid, usage, tracker);
     }
 
+    /**
+     * @brief Gets anomalies that have NOT yet been reported to callbacks.
+     * 
+     * CALLBACK STORM FIX: Only returns anomalies that haven't been sent to
+     * callbacks yet. Marks them as reported after retrieval. This prevents
+     * the same anomaly from triggering callbacks on every monitoring iteration.
+     * 
+     * @return Vector of newly detected anomalies not yet reported
+     */
+    std::vector<PerformanceAnomaly> GetNewAnomalies() {
+        std::unique_lock lock(m_mutex);
+
+        std::vector<PerformanceAnomaly> result;
+        for (auto& [pid, anomalies] : m_activeAnomalies) {
+            for (auto& anomaly : anomalies) {
+                // Create unique key for this anomaly
+                AnomalyKey key{ pid, anomaly.type };
+                
+                // Only return if not already reported
+                if (m_reportedAnomalies.find(key) == m_reportedAnomalies.end()) {
+                    result.push_back(anomaly);
+                    m_reportedAnomalies.insert(key);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * @brief Gets all active anomalies (for query purposes, not callbacks).
+     */
     std::vector<PerformanceAnomaly> GetActiveAnomalies() const {
         std::shared_lock lock(m_mutex);
 
@@ -446,6 +645,16 @@ public:
         // Remove stale process trackers
         for (auto it = m_processTrackers.begin(); it != m_processTrackers.end();) {
             if (now - it->second.lastUpdate > staleThreshold) {
+                // Clear reported anomalies for this PID so they can be re-reported
+                // if the process restarts and exhibits the same behavior
+                const uint32_t pid = it->first;
+                for (auto rit = m_reportedAnomalies.begin(); rit != m_reportedAnomalies.end();) {
+                    if (rit->pid == pid) {
+                        rit = m_reportedAnomalies.erase(rit);
+                    } else {
+                        ++rit;
+                    }
+                }
                 m_activeAnomalies.erase(it->first);
                 it = m_processTrackers.erase(it);
             } else {
@@ -461,6 +670,25 @@ private:
         std::chrono::steady_clock::time_point highCpuStart;
         uint64_t baselineMemory{ 0 };
         uint32_t baselineHandles{ 0 };
+    };
+
+    /**
+     * @brief Key for tracking which anomalies have been reported to callbacks.
+     */
+    struct AnomalyKey {
+        uint32_t pid;
+        PerformanceAnomalyType type;
+        
+        bool operator==(const AnomalyKey& other) const {
+            return pid == other.pid && type == other.type;
+        }
+    };
+    
+    struct AnomalyKeyHash {
+        size_t operator()(const AnomalyKey& key) const {
+            return std::hash<uint32_t>{}(key.pid) ^ 
+                   (std::hash<uint8_t>{}(static_cast<uint8_t>(key.type)) << 8);
+        }
     };
 
     void CheckHighCPU(uint32_t pid, const ProcessResourceUsage& usage, ProcessTracker& tracker) {
@@ -553,11 +781,11 @@ private:
 
     void AddAnomaly(uint32_t pid, PerformanceAnomalyType type, const std::wstring& processName,
                    const std::wstring& description, double value, double threshold, uint8_t severity) {
-        // Check if already reported
+        // Check if already in active anomalies list
         auto& anomalies = m_activeAnomalies[pid];
         for (const auto& existing : anomalies) {
             if (existing.type == type) {
-                return;  // Already reported
+                return;  // Already in list
             }
         }
 
@@ -573,14 +801,17 @@ private:
 
         anomalies.push_back(anomaly);
 
-        Logger::Warn("Performance anomaly detected - PID {}: {}",
-                    pid, Utils::StringUtils::WideToUtf8(description));
+        SS_LOG_WARN(LOG_CATEGORY, L"Performance anomaly detected - PID %u: %ls",
+                    pid, description.c_str());
     }
 
     mutable std::shared_mutex m_mutex;
     ResourceThresholds m_thresholds;
     std::unordered_map<uint32_t, ProcessTracker> m_processTrackers;
     std::unordered_map<uint32_t, std::vector<PerformanceAnomaly>> m_activeAnomalies;
+    
+    // Track which anomalies have been reported to callbacks to prevent storm
+    std::unordered_set<AnomalyKey, AnomalyKeyHash> m_reportedAnomalies;
 };
 
 // ============================================================================
@@ -589,12 +820,35 @@ private:
 
 class ProcessTracker {
 public:
+    /**
+     * @brief Constructor with processor count validation.
+     * 
+     * SECURITY FIX: std::thread::hardware_concurrency() can return 0
+     * per C++ spec if the value is "not computable or well defined".
+     * We default to 1 to prevent division by zero in CPU calculations.
+     */
+    ProcessTracker() {
+        m_processorCount = std::thread::hardware_concurrency();
+        if (m_processorCount == 0) {
+            SS_LOG_WARN(LOG_CATEGORY, L"ProcessTracker: hardware_concurrency returned 0, defaulting to 1");
+            m_processorCount = 1;
+        }
+    }
+    
+    /**
+     * @brief Gets resource usage for a specific process.
+     * 
+     * SECURITY FIX: Uses RAII UniqueHandle to prevent handle leaks on
+     * exception paths. All exceptions are caught and the handle is
+     * guaranteed to be closed.
+     */
     ProcessResourceUsage GetUsage(uint32_t pid) {
         ProcessResourceUsage usage;
         usage.processId = pid;
         usage.sampleTime = std::chrono::steady_clock::now();
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        // SECURITY FIX: Use RAII wrapper to prevent handle leak on exception
+        UniqueHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) {
             return usage;
         }
@@ -603,7 +857,7 @@ public:
             // Get process name
             wchar_t imagePath[MAX_PATH];
             DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, imagePath, &size)) {
+            if (QueryFullProcessImageNameW(hProcess.Get(), 0, imagePath, &size)) {
                 std::filesystem::path path(imagePath);
                 usage.processName = path.filename().wstring();
                 usage.imagePath = imagePath;
@@ -611,7 +865,7 @@ public:
 
             // Get CPU times
             FILETIME createTime, exitTime, kernelTime, userTime;
-            if (GetProcessTimes(hProcess, &createTime, &exitTime, &kernelTime, &userTime)) {
+            if (GetProcessTimes(hProcess.Get(), &createTime, &exitTime, &kernelTime, &userTime)) {
                 usage.kernelTimeMs = FileTimeToMs(kernelTime);
                 usage.userTimeMs = FileTimeToMs(userTime);
 
@@ -639,7 +893,7 @@ public:
             // Get memory info
             PROCESS_MEMORY_COUNTERS_EX pmc = {};
             pmc.cb = sizeof(pmc);
-            if (GetProcessMemoryInfo(hProcess, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+            if (GetProcessMemoryInfo(hProcess.Get(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
                 usage.workingSetBytes = pmc.WorkingSetSize;
                 usage.privateBytes = pmc.PrivateUsage;
                 usage.peakWorkingSetBytes = pmc.PeakWorkingSetSize;
@@ -648,14 +902,14 @@ public:
 
             // Get I/O counters
             IO_COUNTERS ioCounters = {};
-            if (GetProcessIoCounters(hProcess, &ioCounters)) {
+            if (GetProcessIoCounters(hProcess.Get(), &ioCounters)) {
                 usage.ioReadBytes = ioCounters.ReadTransferCount;
                 usage.ioWriteBytes = ioCounters.WriteTransferCount;
                 usage.ioOtherBytes = ioCounters.OtherTransferCount;
                 usage.ioReadOps = ioCounters.ReadOperationCount;
                 usage.ioWriteOps = ioCounters.WriteOperationCount;
 
-                // Calculate I/O rates
+                // Calculate I/O rates with underflow protection
                 auto it = m_previousTimes.find(pid);
                 if (it != m_previousTimes.end()) {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -664,15 +918,33 @@ public:
 
                     if (elapsed.count() > 0) {
                         const double elapsedSec = static_cast<double>(elapsed.count()) / 1000.0;
-                        usage.ioReadBytesPerSec = static_cast<double>(usage.ioReadBytes - it->second.ioReadBytes) / elapsedSec;
-                        usage.ioWriteBytesPerSec = static_cast<double>(usage.ioWriteBytes - it->second.ioWriteBytes) / elapsedSec;
+                        
+                        // SECURITY FIX: Protect against I/O counter underflow on PID reuse
+                        // When a PID is reused, the new process has lower counters than
+                        // our tracking. Subtracting would cause uint64_t underflow to a
+                        // huge positive value, triggering false "high I/O" anomalies.
+                        if (usage.ioReadBytes >= it->second.ioReadBytes) {
+                            usage.ioReadBytesPerSec = static_cast<double>(
+                                usage.ioReadBytes - it->second.ioReadBytes) / elapsedSec;
+                        } else {
+                            // Counter went backwards - likely PID reuse, clamp to 0
+                            usage.ioReadBytesPerSec = 0.0;
+                        }
+                        
+                        if (usage.ioWriteBytes >= it->second.ioWriteBytes) {
+                            usage.ioWriteBytesPerSec = static_cast<double>(
+                                usage.ioWriteBytes - it->second.ioWriteBytes) / elapsedSec;
+                        } else {
+                            // Counter went backwards - likely PID reuse, clamp to 0
+                            usage.ioWriteBytesPerSec = 0.0;
+                        }
                     }
                 }
             }
 
             // Get handle count
             DWORD handleCount = 0;
-            if (GetProcessHandleCount(hProcess, &handleCount)) {
+            if (GetProcessHandleCount(hProcess.Get(), &handleCount)) {
                 usage.handleCount = handleCount;
             }
 
@@ -680,29 +952,31 @@ public:
             usage.threadCount = GetProcessThreadCount(pid);
 
             // Get GDI/USER object counts
-            usage.gdiObjectCount = GetGuiResources(hProcess, GR_GDIOBJECTS);
-            usage.userObjectCount = GetGuiResources(hProcess, GR_USEROBJECTS);
+            usage.gdiObjectCount = GetGuiResources(hProcess.Get(), GR_GDIOBJECTS);
+            usage.userObjectCount = GetGuiResources(hProcess.Get(), GR_USEROBJECTS);
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessTracker::GetUsage exception for PID {}: {}", pid, e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ProcessTracker::GetUsage exception for PID %u: %hs", pid, e.what());
+            // UniqueHandle destructor will close handle automatically
         }
 
-        CloseHandle(hProcess);
+        // UniqueHandle destructor closes handle - no manual CloseHandle needed
         return usage;
     }
 
     std::vector<ProcessResourceUsage> GetAllProcessUsage() {
         std::vector<ProcessResourceUsage> result;
 
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        // Use RAII for snapshot handle as well
+        UniqueHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot) {
             return result;
         }
 
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (Process32FirstW(hSnapshot, &pe32)) {
+        if (Process32FirstW(hSnapshot.Get(), &pe32)) {
             do {
                 if (pe32.th32ProcessID > 4) {  // Skip System/Idle
                     auto usage = GetUsage(pe32.th32ProcessID);
@@ -710,10 +984,10 @@ public:
                         result.push_back(usage);
                     }
                 }
-            } while (Process32NextW(hSnapshot, &pe32));
+            } while (Process32NextW(hSnapshot.Get(), &pe32));
         }
 
-        CloseHandle(hSnapshot);
+        // UniqueHandle destructor closes snapshot - no manual CloseHandle needed
         return result;
     }
 
@@ -728,28 +1002,29 @@ private:
     uint32_t GetProcessThreadCount(uint32_t pid) const {
         uint32_t count = 0;
 
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        // Use RAII for snapshot handle
+        UniqueHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+        if (!hSnapshot) {
             return count;
         }
 
         THREADENTRY32 te32;
         te32.dwSize = sizeof(THREADENTRY32);
 
-        if (Thread32First(hSnapshot, &te32)) {
+        if (Thread32First(hSnapshot.Get(), &te32)) {
             do {
                 if (te32.th32OwnerProcessID == pid) {
                     count++;
                 }
-            } while (Thread32Next(hSnapshot, &te32));
+            } while (Thread32Next(hSnapshot.Get(), &te32));
         }
 
-        CloseHandle(hSnapshot);
+        // UniqueHandle destructor closes snapshot - no manual CloseHandle needed
         return count;
     }
 
     std::unordered_map<uint32_t, ProcessResourceUsage> m_previousTimes;
-    uint32_t m_processorCount{ std::thread::hardware_concurrency() };
+    uint32_t m_processorCount{ 1 };  // Set in constructor with validation
 };
 
 // ============================================================================
@@ -913,7 +1188,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("PerformanceMonitor: Initializing...");
+            SS_LOG_INFO(L"PerformanceMonitor:",L"Initializing...");
 
             m_config = config;
 
@@ -927,11 +1202,11 @@ public:
             m_historyManager->SetMaxHistorySeconds(config.historyDepthSeconds);
 
             m_initialized = true;
-            Logger::Info("PerformanceMonitor: Initialized successfully");
+            SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformanceMonitor: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -942,7 +1217,7 @@ public:
         std::unique_lock lock(m_mutex);
         m_initialized = false;
 
-        Logger::Info("PerformanceMonitor: Shutdown complete");
+        SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
     }
 
     // ========================================================================
@@ -953,34 +1228,34 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("PerformanceMonitor: Not initialized");
+            SS_LOG_ERROR(LOG_CATEGORY, L"Not initialized");
             return;
         }
 
-        if (m_monitoring) {
-            Logger::Warn("PerformanceMonitor: Already monitoring");
+        if (m_monitoring.load(std::memory_order_acquire)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Already monitoring");
             return;
         }
 
-        m_monitoring = true;
+        m_monitoring.store(true, std::memory_order_release);
         m_monitorThread = std::thread(&PerformanceMonitorImpl::MonitorThreadFunc, this);
 
-        Logger::Info("PerformanceMonitor: Monitoring started (interval: {}ms)",
+        SS_LOG_INFO(LOG_CATEGORY, L"Monitoring started (interval: %ums)",
                     m_config.samplingIntervalMs);
     }
 
     void StopMonitoring() {
         {
             std::unique_lock lock(m_mutex);
-            if (!m_monitoring) return;
-            m_monitoring = false;
+            if (!m_monitoring.load(std::memory_order_acquire)) return;
+            m_monitoring.store(false, std::memory_order_release);
         }
 
         if (m_monitorThread.joinable()) {
             m_monitorThread.join();
         }
 
-        Logger::Info("PerformanceMonitor: Monitoring stopped");
+        SS_LOG_INFO(LOG_CATEGORY, L"Monitoring stopped");
     }
 
     // ========================================================================
@@ -1127,10 +1402,12 @@ public:
 
         const double maxFactor = std::max(cpuFactor, memFactor);
 
-        if (maxFactor < 0.6) return 0.0;  // No throttling
-        if (maxFactor < 0.8) return 0.3;  // Light throttling
-        if (maxFactor < 0.9) return 0.6;  // Moderate throttling
-        return 0.9;  // Heavy throttling
+        // Use named constants for throttle thresholds
+        using namespace ThrottleConstants;
+        if (maxFactor < kNoThrottleThreshold) return kNoThrottleLevel;
+        if (maxFactor < kLightThrottleThreshold) return kLightThrottleLevel;
+        if (maxFactor < kModerateThrottleThreshold) return kModerateThrottleLevel;
+        return kHeavyThrottleLevel;
     }
 
     bool IsGoodTimeForIntensiveScan() const {
@@ -1218,11 +1495,11 @@ private:
     // ========================================================================
 
     void MonitorThreadFunc() {
-        Logger::Info("PerformanceMonitor: Monitor thread started");
+        SS_LOG_INFO(L"PerformanceMonitor:", L"Monitor thread started.");
 
         const auto samplingInterval = std::chrono::milliseconds(m_config.samplingIntervalMs);
 
-        while (m_monitoring) {
+        while (m_monitoring.load(std::memory_order_acquire)) {
             try {
                 const auto startTime = std::chrono::steady_clock::now();
 
@@ -1238,11 +1515,12 @@ private:
                     m_historyManager->AddSystemSample(systemUsage);
                     m_callbackManager->InvokeResourceUsage(systemUsage);
 
-                    // Check throttling
+                    // Check throttling with atomic operations
                     if (m_config.autoThrottle) {
                         const bool shouldThrottle = ShouldThrottle();
-                        if (shouldThrottle != m_lastThrottleState) {
-                            m_lastThrottleState = shouldThrottle;
+                        const bool lastState = m_lastThrottleState.load(std::memory_order_acquire);
+                        if (shouldThrottle != lastState) {
+                            m_lastThrottleState.store(shouldThrottle, std::memory_order_release);
                             m_stats.throttleEngagements.fetch_add(1, std::memory_order_relaxed);
                             m_callbackManager->InvokeThrottle(shouldThrottle, systemUsage.totalCpuPercent);
                         }
@@ -1265,15 +1543,24 @@ private:
                     }
                 }
 
-                // Check for new anomalies
+                // Check for new anomalies - ONLY invoke callbacks for NEW anomalies
+                // CALLBACK STORM FIX: Previously, we called GetActiveAnomalies() which
+                // returns ALL active anomalies, causing callbacks to fire repeatedly
+                // for the same anomalies. Now we use GetNewAnomalies() which only
+                // returns anomalies that haven't been reported to callbacks yet.
                 if (m_config.detectAnomalies) {
-                    auto anomalies = m_anomalyDetector->GetActiveAnomalies();
+                    // Get only NEW anomalies that haven't been reported yet
+                    auto newAnomalies = m_anomalyDetector->GetNewAnomalies();
+                    
+                    // Update total active count for status reporting
+                    auto allAnomalies = m_anomalyDetector->GetActiveAnomalies();
+                    m_stats.anomaliesDetected.store(allAnomalies.size(), std::memory_order_relaxed);
 
-                    m_stats.anomaliesDetected.store(anomalies.size(), std::memory_order_relaxed);
-
-                    // Invoke callbacks for new anomalies
-                    for (const auto& anomaly : anomalies) {
-                        // Update type-specific stats
+                    // STATS FIX: Only increment counters for NEW anomalies
+                    // Previously we incremented on every iteration for every active anomaly,
+                    // causing counter overflow and misleading statistics.
+                    for (const auto& anomaly : newAnomalies) {
+                        // Update type-specific stats ONCE per anomaly
                         switch (anomaly.type) {
                             case PerformanceAnomalyType::HighCPU:
                                 m_stats.highCpuDetections.fetch_add(1, std::memory_order_relaxed);
@@ -1288,6 +1575,7 @@ private:
                                 break;
                         }
 
+                        // Invoke callbacks ONLY for new anomalies
                         m_callbackManager->InvokeAnomaly(anomaly);
                     }
 
@@ -1306,11 +1594,11 @@ private:
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("PerformanceMonitor: Monitor thread exception: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"Monitor thread exception: %hs", e.what());
             }
         }
 
-        Logger::Info("PerformanceMonitor: Monitor thread stopped");
+        SS_LOG_INFO(LOG_CATEGORY, L"Monitor thread stopped");
     }
 
     // ========================================================================
@@ -1319,12 +1607,16 @@ private:
 
     mutable std::shared_mutex m_mutex;
     bool m_initialized{ false };
-    bool m_monitoring{ false };
+    std::atomic<bool> m_monitoring{ false };  // Atomic for thread-safe shutdown check
     PerformanceMonitorConfig m_config;
 
     // Current state
     SystemResourceUsage m_currentSystemUsage;
-    bool m_lastThrottleState{ false };
+    
+    // THREAD SAFETY NOTE: m_lastThrottleState is only accessed from the
+    // monitoring thread (MonitorThreadFunc), making it thread-confined.
+    // Using std::atomic for defensive programming and future-proofing.
+    std::atomic<bool> m_lastThrottleState{ false };
 
     // Managers
     std::unique_ptr<CallbackManager> m_callbackManager;

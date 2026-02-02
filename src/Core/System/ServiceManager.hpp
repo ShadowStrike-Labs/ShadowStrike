@@ -253,7 +253,8 @@ struct alignas(64) ServiceConfig {
 struct alignas(64) MinifilterInfo {
     std::wstring filterName;
     uint32_t numberOfInstances{ 0 };
-    uint32_t altitude{ 0 };
+    uint32_t altitude{ 0 };              // Parsed numeric altitude value
+    uint32_t frameID{ 0 };               // Filter manager frame ID
     bool isLoaded{ false };
     std::vector<std::wstring> volumes;
 };
@@ -485,9 +486,13 @@ public:
     
     /**
      * @brief Loads a minifilter driver.
+     * @param filterName Name of the minifilter to load.
+     * @param driverPath Full path to the minifilter driver file (.sys).
+     * @param altitude Minifilter altitude (determines load order).
      */
     [[nodiscard]] bool LoadMinifilter(
         const std::wstring& filterName,
+        const std::wstring& driverPath,
         uint32_t altitude = ServiceManagerConstants::ALTITUDE_AV_FILTER);
     
     /**

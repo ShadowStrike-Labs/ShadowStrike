@@ -146,6 +146,75 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Drivers\ShadowSensorELAM\BootDriverVerify.c" />
+    <ClCompile Include="Drivers\ShadowSensorELAM\BootThreatDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensorELAM\ELAMCallbacks.c" />
+    <ClCompile Include="Drivers\ShadowSensorELAM\ELAMDriver.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\AnomalyDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\AttackChainTracker.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\BehaviorEngine.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\IOCMatcher.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\MITREMapper.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\PatternMatcher.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\RuleEngine.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Behavioral\ThreatScoring.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\FileSystem\FileSystemCallbacks.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\CommandLineParser.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\EnvironmentMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\HandleTracker.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\ParentChainTracker.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\PrivilegeMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\ProcessAnalyzer.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\ProcessRelationship.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Callbacks\Process\TokenAnalyzer.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Communication\Compression.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Communication\Encryption.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Communication\MessageQueue.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Communication\TelemetryBuffer.c" />
+    <ClCompile Include="Drivers\ShadowSensor\ETW\ETWConsumer.c" />
+    <ClCompile Include="Drivers\ShadowSensor\ETW\ETWProvider.c" />
+    <ClCompile Include="Drivers\ShadowSensor\ETW\EventSchema.c" />
+    <ClCompile Include="Drivers\ShadowSensor\ETW\ManifestGenerator.c" />
+    <ClCompile Include="Drivers\ShadowSensor\ETW\TelemetryEvents.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\HeapSpray.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\HollowingDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\InjectionDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\MemoryMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\ROPDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\SectionTracker.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\ShellcodeDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Memory\VadTracker.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\C2Detection.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\ConnectionTracker.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\DataExfiltration.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\DnsMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\NetworkFilter.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\NetworkReputation.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\PortScanner.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Network\SSLInspection.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Performance\BatchProcessing.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Performance\CacheOptimization.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Performance\LookasideLists.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Performance\PerformanceMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Performance\ResourceThrottling.c" />
+    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\AntiDebug.c" />
+    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\AntiUnload.c" />
+    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\CallbackProtection.c" />
+    <ClCompile Include="Drivers\ShadowSensor\SelfProtection\IntegrityMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Sync\AsyncWorkQueue.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Sync\DeferredProcedure.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Sync\SpinLock.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Sync\ThreadPool.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Sync\TimerManager.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\CallstackAnalyzer.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\DirectSyscallDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\HeavensGateDetector.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\NtdllIntegrity.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\SyscallHooks.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\SyscallMonitor.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Syscall\SyscallTable.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Tracing\Trace.c" />
+    <ClCompile Include="Drivers\ShadowSensor\Tracing\WppConfig.c" />
     <ClCompile Include="src\AntiEvasion\DebuggerEvasionDetector.cpp" />
     <ClCompile Include="src\AntiEvasion\EnvironmentEvasionDetector.cpp" />
     <ClCompile Include="src\AntiEvasion\MetamorphicDetector.cpp" />
@@ -685,6 +754,18 @@
     <ClInclude Include="src\AntiEvasion\SandboxEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\TimeBasedEvasionDetector.hpp" />
     <ClInclude Include="src\AntiEvasion\VMEvasionDetector.hpp" />
+    <ClInclude Include="src\Backup\BackupManager.hpp" />
+    <ClInclude Include="src\Backup\BackupScheduler.hpp" />
+    <ClInclude Include="src\Backup\IncrementalBackup.hpp" />
+    <ClInclude Include="src\Backup\RestoreManager.hpp" />
+    <ClInclude Include="src\Core\System\BootTimeAnalyzer.hpp" />
+    <ClInclude Include="src\Core\System\CrashHandler.hpp" />
+    <ClInclude Include="src\Core\System\DriverAnalyzer.hpp" />
+    <ClInclude Include="src\Core\System\EventLogger.hpp" />
+    <ClInclude Include="src\Core\System\HardwareMonitor.hpp" />
+    <ClInclude Include="src\Core\System\PerformanceMonitor.hpp" />
+    <ClInclude Include="src\Core\System\ServiceManager.hpp" />
+    <ClInclude Include="src\Core\System\SystemInfo.hpp" />
     <ClInclude Include="src\database\ConfigurationDB.hpp" />
     <ClInclude Include="src\database\DatabaseManager.hpp" />
     <ClInclude Include="src\database\LogDB.hpp" />
@@ -767,6 +848,9 @@
     <MASM Include="src\AntiEvasion\DebuggerEvasionDetector_x64.asm">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Drivers\ShadowSensor\Network\ProtocolParser.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

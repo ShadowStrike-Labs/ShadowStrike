@@ -76,10 +76,7 @@ namespace ShadowStrike {
 namespace Core {
 namespace System {
 
-// ============================================================================
-// FORWARD DECLARATIONS
-// ============================================================================
-class BootTimeAnalyzerImpl;
+// Forward declaration is inside the class definition for PIMPL pattern
 
 // ============================================================================
 // ENUMERATIONS
@@ -355,6 +352,9 @@ struct alignas(64) BootTimeAnalyzerStatistics {
  * with security assessment and optimization recommendations.
  */
 class BootTimeAnalyzer {
+    // Forward declaration of PIMPL implementation struct
+    struct BootTimeAnalyzerImpl;
+    
 public:
     /**
      * @brief Gets singleton instance.

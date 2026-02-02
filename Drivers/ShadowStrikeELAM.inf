@@ -1,0 +1,61 @@
+;
+; ShadowStrikeELAM.inf - ELAM Driver Installation
+;
+; Copyright (c) ShadowStrike Team. All rights reserved.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "Early Launch Anti-Malware"
+ClassGUID   = {533C5B84-EC70-11D2-8172-00A0C95978FD}
+Provider    = %ManufacturerName%
+CatalogFile = ShadowStrikeELAM.cat
+DriverVer   = 01/01/2025,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 13
+ShadowStrikeELAM.CopyFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+ShadowStrikeELAM.sys = 1,,
+
+[DefaultInstall.NTAMD64]
+CopyFiles = ShadowStrikeELAM.CopyFiles
+
+[DefaultInstall.NTAMD64.Services]
+AddService = ShadowStrikeELAM,,ShadowStrikeELAM.Service,ShadowStrikeELAM.EventLog
+
+[ShadowStrikeELAM.CopyFiles]
+ShadowStrikeELAM.sys
+
+[ShadowStrikeELAM.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 0                  ; SERVICE_BOOT_START
+ErrorControl   = 3                  ; SERVICE_ERROR_CRITICAL
+ServiceBinary  = %13%\ShadowStrikeELAM.sys
+LoadOrderGroup = "Early-Launch"
+
+[ShadowStrikeELAM.EventLog]
+AddReg = ShadowStrikeELAM.EventLog.AddReg
+
+[ShadowStrikeELAM.EventLog.AddReg]
+HKR,,EventMessageFile,0x00020000,"%%SystemRoot%%\System32\drivers\ShadowStrikeELAM.sys"
+HKR,,TypesSupported,0x00010001,7
+
+[DefaultUninstall.NTAMD64]
+DelFiles = ShadowStrikeELAM.CopyFiles
+
+[DefaultUninstall.NTAMD64.Services]
+DelService = ShadowStrikeELAM,0x200
+
+[Strings]
+ManufacturerName    = "ShadowStrike Security"
+ServiceName         = "ShadowStrike ELAM Driver"
+ServiceDescription  = "ShadowStrike Early Launch Anti-Malware driver for boot-time protection"
+DiskName            = "ShadowStrike ELAM Installation Disk"

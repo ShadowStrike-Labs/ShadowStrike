@@ -30,6 +30,7 @@
 #include <format>
 #include <thread>
 #include <sstream>
+#include <unordered_set>
 
 // ============================================================================
 // WINDOWS INCLUDES
@@ -53,10 +54,210 @@ using namespace std::chrono;
 using namespace Utils;
 
 // ============================================================================
+// LOG CATEGORY
+// ============================================================================
+static constexpr const wchar_t* LOG_CATEGORY = L"ServiceManager";
+
+// ============================================================================
+// RAII WRAPPERS
+// ============================================================================
+
+/**
+ * @brief RAII wrapper for SC_HANDLE (Service Control Manager handles).
+ */
+class SCHandleGuard {
+public:
+    explicit SCHandleGuard(SC_HANDLE handle = nullptr) noexcept : m_handle(handle) {}
+    
+    ~SCHandleGuard() noexcept {
+        if (m_handle) {
+            CloseServiceHandle(m_handle);
+        }
+    }
+    
+    SCHandleGuard(const SCHandleGuard&) = delete;
+    SCHandleGuard& operator=(const SCHandleGuard&) = delete;
+    
+    SCHandleGuard(SCHandleGuard&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = nullptr;
+    }
+    
+    SCHandleGuard& operator=(SCHandleGuard&& other) noexcept {
+        if (this != &other) {
+            if (m_handle) CloseServiceHandle(m_handle);
+            m_handle = other.m_handle;
+            other.m_handle = nullptr;
+        }
+        return *this;
+    }
+    
+    [[nodiscard]] SC_HANDLE get() const noexcept { return m_handle; }
+    [[nodiscard]] bool valid() const noexcept { return m_handle != nullptr; }
+    [[nodiscard]] explicit operator bool() const noexcept { return valid(); }
+    
+    SC_HANDLE release() noexcept {
+        SC_HANDLE h = m_handle;
+        m_handle = nullptr;
+        return h;
+    }
+    
+    void reset(SC_HANDLE handle = nullptr) noexcept {
+        if (m_handle) CloseServiceHandle(m_handle);
+        m_handle = handle;
+    }
+
+private:
+    SC_HANDLE m_handle;
+};
+
+/**
+ * @brief RAII wrapper for filter enumeration handles.
+ */
+class FilterEnumGuard {
+public:
+    explicit FilterEnumGuard(HANDLE handle = INVALID_HANDLE_VALUE) noexcept : m_handle(handle) {}
+    
+    ~FilterEnumGuard() noexcept {
+        if (m_handle != INVALID_HANDLE_VALUE) {
+            FilterFindClose(m_handle);
+        }
+    }
+    
+    FilterEnumGuard(const FilterEnumGuard&) = delete;
+    FilterEnumGuard& operator=(const FilterEnumGuard&) = delete;
+    
+    [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
+    [[nodiscard]] bool valid() const noexcept { return m_handle != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] HANDLE* addressof() noexcept { return &m_handle; }
+
+private:
+    HANDLE m_handle;
+};
+
+// ============================================================================
+// SERVICE NAME VALIDATION
+// ============================================================================
+
+/**
+ * @brief Validates a service name for safe use with Windows APIs.
+ * @param serviceName The service name to validate.
+ * @return true if valid, false otherwise.
+ */
+[[nodiscard]] static bool ValidateServiceName(const std::wstring& serviceName) noexcept {
+    // Empty check
+    if (serviceName.empty()) {
+        return false;
+    }
+    
+    // Length check (Windows limit is 256 characters)
+    if (serviceName.length() > 256) {
+        return false;
+    }
+    
+    // Check for embedded null characters
+    if (serviceName.find(L'\0') != std::wstring::npos) {
+        return false;
+    }
+    
+    // Check for invalid characters (backslash, forward slash)
+    if (serviceName.find(L'\\') != std::wstring::npos ||
+        serviceName.find(L'/') != std::wstring::npos) {
+        return false;
+    }
+    
+    return true;
+}
+
+// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
 namespace {
+
+// Known legitimate apps that install services in ProgramData
+// (to reduce false positives)
+static const std::unordered_set<std::wstring> KNOWN_PROGRAMDATA_SERVICES = {
+    L"microsoft",
+    L"windows",
+    L"defender",
+    L"chocolatey",
+    L"docker",
+    L"jenkins",
+    L"grafana",
+    L"prometheus",
+    L"elasticsearch",
+    L"mongodb",
+    L"postgresql",
+    L"mysql",
+    L"redis",
+    L"nginx",
+    L"apache",
+    L"git",
+    L"nodejs",
+    L"python",
+    L"java",
+    L"dotnet",
+    L"oracle"
+};
+
+/**
+ * @brief Compute SHA256 hash of a file.
+ * @param filePath Path to the file.
+ * @return Hex string of hash, or empty string on error.
+ */
+[[nodiscard]] std::string ComputeFileSHA256(const std::wstring& filePath) noexcept {
+    try {
+        // Open file
+        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            return "";
+        }
+
+        HashUtils::Hasher hasher(HashUtils::Algorithm::SHA256);
+        if (!hasher.Init()) {
+            CloseHandle(hFile);
+            return "";
+        }
+
+        constexpr size_t BUFFER_SIZE = 64 * 1024;  // 64KB chunks
+        std::vector<uint8_t> buffer(BUFFER_SIZE);
+        DWORD bytesRead = 0;
+
+        while (ReadFile(hFile, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr) && bytesRead > 0) {
+            if (!hasher.Update(buffer.data(), bytesRead)) {
+                CloseHandle(hFile);
+                return "";
+            }
+        }
+
+        CloseHandle(hFile);
+
+        std::string hexHash;
+        if (!hasher.FinalHex(hexHash, false)) {
+            return "";
+        }
+
+        return hexHash;
+
+    } catch (...) {
+        return "";
+    }
+}
+
+/**
+ * @brief Check if a path is in ProgramData but for a known legitimate vendor.
+ */
+[[nodiscard]] bool IsKnownProgramDataService(const std::wstring& binaryPath) noexcept {
+    std::wstring lowerPath = StringUtils::ToLowerCopy(binaryPath);
+    
+    for (const auto& vendor : KNOWN_PROGRAMDATA_SERVICES) {
+        if (lowerPath.find(vendor) != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * @brief Convert Windows service state to our enum.
@@ -183,7 +384,7 @@ namespace {
         // by inspecting the certificate chain (CryptQueryObject, CertFindCertificateInStore).
         // For now, we trust a valid signature + path heuristics.
 
-        std::wstring lowerPath = StringUtils::ToLowerCase(binaryPath);
+        std::wstring lowerPath = StringUtils::ToLowerCopy(binaryPath);
         if (lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos) return true;
         if (lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) return true;
         if (lowerPath.find(L"\\program files\\windows defender\\") != std::wstring::npos) return true;
@@ -238,7 +439,7 @@ void ServiceManagerStatistics::Reset() noexcept {
 /**
  * @brief Private implementation class for ServiceManager.
  */
-class ServiceManager::ServiceManagerImpl {
+class ServiceManagerImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -258,8 +459,8 @@ public:
     // Configuration
     ServiceManagerConfig m_config{};
 
-    // Statistics
-    ServiceManagerStatistics m_stats{};
+    // Statistics (mutable for const method updates)
+    mutable ServiceManagerStatistics m_stats{};
 
     // Callbacks
     std::atomic<uint64_t> m_nextCallbackId{1};
@@ -293,12 +494,12 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("ServiceManager::Impl already initialized");
+            SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager::Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("ServiceManager::Impl: Initializing");
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager::Impl: Initializing");
 
             // Store configuration
             m_config = config;
@@ -310,12 +511,12 @@ public:
             EstablishServiceBaselines();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("ServiceManager::Impl: Initialization complete");
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager::Impl: Initialization complete");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager::Impl: Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -327,7 +528,7 @@ public:
             return;
         }
 
-        Logger::Info("ServiceManager::Impl: Shutting down");
+        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager::Impl: Shutting down");
 
         // Stop watchdog
         StopWatchdogImpl();
@@ -340,7 +541,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("ServiceManager::Impl: Shutdown complete");
+        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager::Impl: Shutdown complete");
     }
 
     void EstablishServiceBaselines() {
@@ -353,12 +554,16 @@ public:
                 baseline.serviceAccount = info->serviceAccount;
 
                 if (FileUtils::Exists(info->binaryPath)) {
-                    baseline.binaryHash = HashUtils::CalculateSHA256File(info->binaryPath);
+                    baseline.binaryHash = ComputeFileSHA256(info->binaryPath);
+                    if (baseline.binaryHash.empty()) {
+                        SS_LOG_WARN(LOG_CATEGORY, L"Failed to hash main service binary: %ls",
+                            info->binaryPath.c_str());
+                    }
                 }
 
                 m_serviceBaselines[m_config.mainServiceName] = baseline;
-                Logger::Info("ServiceManager: Established baseline for {}",
-                    StringUtils::WideToUtf8(m_config.mainServiceName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Established baseline for %ls",
+                    m_config.mainServiceName.c_str());
             }
 
             // Baseline our driver service
@@ -369,16 +574,20 @@ public:
                 baseline.serviceAccount = info->serviceAccount;
 
                 if (FileUtils::Exists(info->binaryPath)) {
-                    baseline.binaryHash = HashUtils::CalculateSHA256File(info->binaryPath);
+                    baseline.binaryHash = ComputeFileSHA256(info->binaryPath);
+                    if (baseline.binaryHash.empty()) {
+                        SS_LOG_WARN(LOG_CATEGORY, L"Failed to hash driver service binary: %ls",
+                            info->binaryPath.c_str());
+                    }
                 }
 
                 m_serviceBaselines[m_config.driverServiceName] = baseline;
-                Logger::Info("ServiceManager: Established baseline for {}",
-                    StringUtils::WideToUtf8(m_config.driverServiceName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Established baseline for %ls",
+                    m_config.driverServiceName.c_str());
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: Baseline establishment exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Baseline establishment exception: %hs", e.what());
         }
     }
 
@@ -390,9 +599,9 @@ public:
         std::vector<ServiceInfo> services;
 
         try {
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE));
             if (!scm) {
-                Logger::Error("ServiceManager: Failed to open SCM: {}", GetLastError());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Failed to open SCM: %lu", GetLastError());
                 return services;
             }
 
@@ -402,7 +611,7 @@ public:
 
             // First call to get size
             EnumServicesStatusExW(
-                scm,
+                scm.get(),
                 SC_ENUM_PROCESS_INFO,
                 SERVICE_WIN32 | SERVICE_DRIVER,
                 SERVICE_STATE_ALL,
@@ -415,7 +624,6 @@ public:
             );
 
             if (bytesNeeded == 0) {
-                CloseServiceHandle(scm);
                 return services;
             }
 
@@ -424,7 +632,7 @@ public:
 
             // Actual enumeration
             if (EnumServicesStatusExW(
-                    scm,
+                    scm.get(),
                     SC_ENUM_PROCESS_INFO,
                     SERVICE_WIN32 | SERVICE_DRIVER,
                     SERVICE_STATE_ALL,
@@ -458,10 +666,8 @@ public:
                 m_stats.servicesEnumerated.fetch_add(servicesReturned, std::memory_order_relaxed);
             }
 
-            CloseServiceHandle(scm);
-
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: Enumeration exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Enumeration exception: %hs", e.what());
         }
 
         return services;
@@ -481,16 +687,21 @@ public:
     }
 
     [[nodiscard]] std::optional<ServiceInfo> GetServiceInfoImpl(const std::wstring& serviceName) const {
+        // Validate service name
+        if (!ValidateServiceName(serviceName)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Invalid service name provided");
+            return std::nullopt;
+        }
+        
         try {
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
             if (!scm) {
                 return std::nullopt;
             }
 
-            SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(),
-                SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS);
+            SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(),
+                SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS));
             if (!service) {
-                CloseServiceHandle(scm);
                 return std::nullopt;
             }
 
@@ -499,13 +710,13 @@ public:
 
             // Get config
             DWORD bytesNeeded = 0;
-            QueryServiceConfigW(service, nullptr, 0, &bytesNeeded);
+            QueryServiceConfigW(service.get(), nullptr, 0, &bytesNeeded);
 
             if (bytesNeeded > 0) {
                 std::vector<uint8_t> buffer(bytesNeeded);
                 auto* pConfig = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
 
-                if (QueryServiceConfigW(service, pConfig, bytesNeeded, &bytesNeeded)) {
+                if (QueryServiceConfigW(service.get(), pConfig, bytesNeeded, &bytesNeeded)) {
                     info.displayName = pConfig->lpDisplayName ? pConfig->lpDisplayName : L"";
                     info.binaryPath = pConfig->lpBinaryPathName ? pConfig->lpBinaryPathName : L"";
                     info.serviceType = WinTypeToServiceType(pConfig->dwServiceType);
@@ -519,7 +730,7 @@ public:
 
             // Get status
             SERVICE_STATUS_PROCESS status{};
-            if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+            if (QueryServiceStatusEx(service.get(), SC_STATUS_PROCESS_INFO,
                     reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded)) {
                 info.state = WinStateToServiceState(status.dwCurrentState);
                 info.processId = status.dwProcessId;
@@ -530,13 +741,13 @@ public:
 
             // Get description
             bytesNeeded = 0;
-            QueryServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, nullptr, 0, &bytesNeeded);
+            QueryServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION, nullptr, 0, &bytesNeeded);
 
             if (bytesNeeded > 0) {
                 std::vector<uint8_t> descBuffer(bytesNeeded);
                 auto* pDesc = reinterpret_cast<SERVICE_DESCRIPTIONW*>(descBuffer.data());
 
-                if (QueryServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION,
+                if (QueryServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION,
                         reinterpret_cast<LPBYTE>(pDesc), bytesNeeded, &bytesNeeded)) {
                     if (pDesc->lpDescription) {
                         info.description = pDesc->lpDescription;
@@ -544,13 +755,10 @@ public:
                 }
             }
 
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-
             return info;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: GetServiceInfo exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: GetServiceInfo exception: %hs", e.what());
             return std::nullopt;
         }
     }
@@ -571,21 +779,27 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool InstallServiceImpl(const ServiceConfig& config) {
+        // Validate service name
+        if (!ValidateServiceName(config.serviceName)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid service name for installation");
+            return false;
+        }
+        
         try {
-            Logger::Info("ServiceManager: Installing service: {}",
-                StringUtils::WideToUtf8(config.serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Installing service: %ls",
+                config.serviceName.c_str());
 
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE));
             if (!scm) {
-                Logger::Error("ServiceManager: Failed to open SCM: {}", GetLastError());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Failed to open SCM: %lu", GetLastError());
                 return false;
             }
 
             DWORD serviceType = ServiceTypeToWinType(config.serviceType);
             DWORD startType = StartTypeToWinStartType(config.startType);
 
-            SC_HANDLE service = CreateServiceW(
-                scm,
+            SCHandleGuard service(CreateServiceW(
+                scm.get(),
                 config.serviceName.c_str(),
                 config.displayName.c_str(),
                 SERVICE_ALL_ACCESS,
@@ -598,12 +812,11 @@ public:
                 nullptr,  // Dependencies would be formatted
                 config.serviceAccount.empty() ? nullptr : config.serviceAccount.c_str(),
                 config.password.empty() ? nullptr : config.password.c_str()
-            );
+            ));
 
             if (!service) {
                 DWORD error = GetLastError();
-                Logger::Error("ServiceManager: CreateService failed: {}", error);
-                CloseServiceHandle(scm);
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: CreateService failed: %lu", error);
                 return false;
             }
 
@@ -612,12 +825,12 @@ public:
                 SERVICE_DESCRIPTIONW desc;
                 desc.lpDescription = const_cast<LPWSTR>(config.description.c_str());
 
-                ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &desc);
+                ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION, &desc);
             }
 
             // Configure failure recovery
             if (config.configureRecovery) {
-                ConfigureRecoveryImpl(service,
+                ConfigureRecoveryImpl(service.get(),
                     config.firstFailure,
                     config.secondFailure,
                     config.subsequentFailures,
@@ -625,64 +838,63 @@ public:
                     config.restartDelayMs);
             }
 
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-
-            Logger::Info("ServiceManager: Service installed successfully: {}",
-                StringUtils::WideToUtf8(config.serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Service installed successfully: %ls",
+                config.serviceName.c_str());
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: InstallService exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: InstallService exception: %hs", e.what());
             return false;
         }
     }
 
     [[nodiscard]] bool UninstallServiceImpl(const std::wstring& serviceName, bool force) {
+        // Validate service name
+        if (!ValidateServiceName(serviceName)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid service name for uninstallation");
+            return false;
+        }
+        
         try {
-            Logger::Info("ServiceManager: Uninstalling service: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Uninstalling service: %ls",
+                serviceName.c_str());
 
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
             if (!scm) {
-                Logger::Error("ServiceManager: Failed to open SCM: {}", GetLastError());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Failed to open SCM: %lu", GetLastError());
                 return false;
             }
 
-            SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(), DELETE | SERVICE_STOP);
+            SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(), DELETE | SERVICE_STOP));
             if (!service) {
                 DWORD error = GetLastError();
-                Logger::Error("ServiceManager: OpenService failed: {}", error);
-                CloseServiceHandle(scm);
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: OpenService failed: %lu", error);
                 return false;
             }
 
             // Stop if running and force is specified
             if (force) {
                 SERVICE_STATUS status;
-                ControlService(service, SERVICE_CONTROL_STOP, &status);
+                ControlService(service.get(), SERVICE_CONTROL_STOP, &status);
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
 
             // Delete
-            BOOL success = DeleteService(service);
+            BOOL success = DeleteService(service.get());
             if (!success) {
-                Logger::Error("ServiceManager: DeleteService failed: {}", GetLastError());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: DeleteService failed: %lu", GetLastError());
             }
 
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-
             if (success) {
-                Logger::Info("ServiceManager: Service uninstalled: {}",
-                    StringUtils::WideToUtf8(serviceName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Service uninstalled: %ls",
+                    serviceName.c_str());
             }
 
             return success != FALSE;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: UninstallService exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: UninstallService exception: %hs", e.what());
             return false;
         }
     }
@@ -692,18 +904,23 @@ public:
         const std::vector<std::wstring>& args,
         uint32_t timeoutMs) {
 
+        // Validate service name
+        if (!ValidateServiceName(serviceName)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid service name for start operation");
+            return false;
+        }
+        
         try {
-            Logger::Info("ServiceManager: Starting service: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Starting service: %ls",
+                serviceName.c_str());
 
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
             if (!scm) {
                 return false;
             }
 
-            SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(), SERVICE_START | SERVICE_QUERY_STATUS);
+            SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(), SERVICE_START | SERVICE_QUERY_STATUS));
             if (!service) {
-                CloseServiceHandle(scm);
                 return false;
             }
 
@@ -713,8 +930,8 @@ public:
                 argPtrs.push_back(arg.c_str());
             }
 
-            BOOL success = StartServiceW(
-                service,
+            BOOL success = ::StartServiceW(
+                service.get(),
                 static_cast<DWORD>(argPtrs.size()),
                 argPtrs.empty() ? nullptr : argPtrs.data()
             );
@@ -722,9 +939,7 @@ public:
             if (!success) {
                 DWORD error = GetLastError();
                 if (error != ERROR_SERVICE_ALREADY_RUNNING) {
-                    Logger::Error("ServiceManager: StartService failed: {}", error);
-                    CloseServiceHandle(service);
-                    CloseServiceHandle(scm);
+                    SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: StartService failed: %lu", error);
                     return false;
                 }
             }
@@ -735,17 +950,14 @@ public:
                 SERVICE_STATUS_PROCESS status;
                 DWORD bytesNeeded;
 
-                if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                if (QueryServiceStatusEx(service.get(), SC_STATUS_PROCESS_INFO,
                         reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded)) {
 
                     if (status.dwCurrentState == SERVICE_RUNNING) {
-                        CloseServiceHandle(service);
-                        CloseServiceHandle(scm);
-
                         m_stats.servicesStarted.fetch_add(1, std::memory_order_relaxed);
 
-                        Logger::Info("ServiceManager: Service started: {}",
-                            StringUtils::WideToUtf8(serviceName));
+                        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Service started: %ls",
+                            serviceName.c_str());
 
                         return true;
                     }
@@ -758,16 +970,13 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-
-            Logger::Warn("ServiceManager: Service start timeout: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: Service start timeout: %ls",
+                serviceName.c_str());
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: StartService exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: StartService exception: %hs", e.what());
             return false;
         }
     }
@@ -777,19 +986,24 @@ public:
         bool stopDependents,
         uint32_t timeoutMs) {
 
+        // Validate service name
+        if (!ValidateServiceName(serviceName)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid service name for stop operation");
+            return false;
+        }
+        
         try {
-            Logger::Info("ServiceManager: Stopping service: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Stopping service: %ls",
+                serviceName.c_str());
 
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
             if (!scm) {
                 return false;
             }
 
-            SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(),
-                SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_ENUMERATE_DEPENDENTS);
+            SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(),
+                SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_ENUMERATE_DEPENDENTS));
             if (!service) {
-                CloseServiceHandle(scm);
                 return false;
             }
 
@@ -799,12 +1013,10 @@ public:
             }
 
             SERVICE_STATUS status;
-            if (!ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+            if (!ControlService(service.get(), SERVICE_CONTROL_STOP, &status)) {
                 DWORD error = GetLastError();
                 if (error != ERROR_SERVICE_NOT_ACTIVE) {
-                    Logger::Error("ServiceManager: ControlService(STOP) failed: {}", error);
-                    CloseServiceHandle(service);
-                    CloseServiceHandle(scm);
+                    SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: ControlService(STOP) failed: %lu", error);
                     return false;
                 }
             }
@@ -815,17 +1027,14 @@ public:
                 SERVICE_STATUS_PROCESS statusEx;
                 DWORD bytesNeeded;
 
-                if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                if (QueryServiceStatusEx(service.get(), SC_STATUS_PROCESS_INFO,
                         reinterpret_cast<LPBYTE>(&statusEx), sizeof(statusEx), &bytesNeeded)) {
 
                     if (statusEx.dwCurrentState == SERVICE_STOPPED) {
-                        CloseServiceHandle(service);
-                        CloseServiceHandle(scm);
-
                         m_stats.servicesStopped.fetch_add(1, std::memory_order_relaxed);
 
-                        Logger::Info("ServiceManager: Service stopped: {}",
-                            StringUtils::WideToUtf8(serviceName));
+                        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Service stopped: %ls",
+                            serviceName.c_str());
 
                         return true;
                     }
@@ -834,16 +1043,13 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-
-            Logger::Warn("ServiceManager: Service stop timeout: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: Service stop timeout: %ls",
+                serviceName.c_str());
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: StopService exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: StopService exception: %hs", e.what());
             return false;
         }
     }
@@ -859,40 +1065,42 @@ public:
     }
 
     [[nodiscard]] bool SetStartTypeImpl(const std::wstring& serviceName, StartType startType) {
+        // Validate service name
+        if (!ValidateServiceName(serviceName)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Invalid service name for SetStartType");
+            return false;
+        }
+        
         try {
-            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
             if (!scm) {
                 return false;
             }
 
-            SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(), SERVICE_CHANGE_CONFIG);
+            SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(), SERVICE_CHANGE_CONFIG));
             if (!service) {
-                CloseServiceHandle(scm);
                 return false;
             }
 
             DWORD winStartType = StartTypeToWinStartType(startType);
 
             BOOL success = ChangeServiceConfigW(
-                service,
+                service.get(),
                 SERVICE_NO_CHANGE,
                 winStartType,
                 SERVICE_NO_CHANGE,
                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
             );
 
-            CloseServiceHandle(service);
-            CloseServiceHandle(scm);
-
             if (success) {
-                Logger::Info("ServiceManager: Changed start type for {}",
-                    StringUtils::WideToUtf8(serviceName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Changed start type for %ls",
+                    serviceName.c_str());
             }
 
             return success != FALSE;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: SetStartType exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: SetStartType exception: %hs", e.what());
             return false;
         }
     }
@@ -932,7 +1140,7 @@ public:
             return success != FALSE;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: ConfigureRecovery exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: ConfigureRecovery exception: %hs", e.what());
             return false;
         }
     }
@@ -942,9 +1150,20 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool LoadDriverImpl(const DriverLoadRequest& request) {
+        // Validate driver path
+        if (request.driverPath.empty()) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Driver path is required for LoadDriver");
+            return false;
+        }
+        
+        if (!FileUtils::Exists(request.driverPath)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Driver file does not exist: %ls", request.driverPath.c_str());
+            return false;
+        }
+        
         try {
-            Logger::Info("ServiceManager: Loading driver: {}",
-                StringUtils::WideToUtf8(request.driverName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Loading driver: %ls",
+                request.driverName.c_str());
 
             // Install as service first
             ServiceConfig config;
@@ -957,7 +1176,7 @@ public:
 
             if (!InstallServiceImpl(config)) {
                 // May already exist
-                Logger::Warn("ServiceManager: Driver service may already exist");
+                SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: Driver service may already exist");
             }
 
             // Start the driver
@@ -967,22 +1186,22 @@ public:
             if (started) {
                 m_stats.driversLoaded.fetch_add(1, std::memory_order_relaxed);
 
-                Logger::Info("ServiceManager: Driver loaded: {}",
-                    StringUtils::WideToUtf8(request.driverName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Driver loaded: %ls",
+                    request.driverName.c_str());
             }
 
             return started;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: LoadDriver exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: LoadDriver exception: %hs", e.what());
             return false;
         }
     }
 
     [[nodiscard]] bool UnloadDriverImpl(const std::wstring& driverName, bool force) {
         try {
-            Logger::Info("ServiceManager: Unloading driver: {}",
-                StringUtils::WideToUtf8(driverName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Unloading driver: %ls",
+                driverName.c_str());
 
             bool stopped = StopServiceImpl(driverName, false,
                 ServiceManagerConstants::DRIVER_LOAD_TIMEOUT_MS);
@@ -990,8 +1209,8 @@ public:
             if (stopped || force) {
                 m_stats.driversUnloaded.fetch_add(1, std::memory_order_relaxed);
 
-                Logger::Info("ServiceManager: Driver unloaded: {}",
-                    StringUtils::WideToUtf8(driverName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Driver unloaded: %ls",
+                    driverName.c_str());
 
                 return true;
             }
@@ -999,7 +1218,7 @@ public:
             return stopped;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: UnloadDriver exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: UnloadDriver exception: %hs", e.what());
             return false;
         }
     }
@@ -1008,16 +1227,17 @@ public:
         std::vector<MinifilterInfo> filters;
 
         try {
-            HANDLE hEnum = INVALID_HANDLE_VALUE;
+            FilterEnumGuard hEnum;
             DWORD bytesReturned = 0;
-            // Buffer for FILTER_FULL_INFORMATION
+            // Buffer for FILTER_AGGREGATE_BASIC_INFORMATION (has altitude info)
             std::vector<uint8_t> buffer(4096);
 
-            HRESULT hr = FilterFindFirst(FilterFullInformation,
+            // Use FilterAggregateBasicInformation to get altitude data
+            HRESULT hr = FilterFindFirst(FilterAggregateBasicInformation,
                                        buffer.data(),
                                        static_cast<DWORD>(buffer.size()),
                                        &bytesReturned,
-                                       &hEnum);
+                                       hEnum.addressof());
 
             if (hr == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)) {
                 return filters;
@@ -1025,38 +1245,56 @@ public:
 
             if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
                 buffer.resize(bytesReturned);
-                hr = FilterFindFirst(FilterFullInformation,
+                hr = FilterFindFirst(FilterAggregateBasicInformation,
                                    buffer.data(),
                                    static_cast<DWORD>(buffer.size()),
                                    &bytesReturned,
-                                   &hEnum);
+                                   hEnum.addressof());
             }
 
             if (FAILED(hr)) {
-                Logger::Error("ServiceManager: FilterFindFirst failed: {:#x}", static_cast<uint32_t>(hr));
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: FilterFindFirst failed: 0x%08X", static_cast<uint32_t>(hr));
                 return filters;
             }
 
             auto ProcessFilterInfo = [&](const uint8_t* pBuf) {
-                auto* pInfo = reinterpret_cast<const FILTER_FULL_INFORMATION*>(pBuf);
+                auto* pInfo = reinterpret_cast<const FILTER_AGGREGATE_BASIC_INFORMATION*>(pBuf);
+
+                // Only process minifilters (not legacy filters)
+                if (!(pInfo->Flags & FLTFL_AGGREGATE_INFO_IS_MINIFILTER)) {
+                    return; // Skip legacy filters
+                }
 
                 MinifilterInfo info;
-                // Parse name (offset and length in bytes)
-                if (pInfo->FilterNameLength > 0) {
-                    std::wstring name((wchar_t*)((uint8_t*)pInfo + pInfo->FilterNameBufferOffset),
-                                      pInfo->FilterNameLength / sizeof(wchar_t));
-                    info.filterName = name;
+
+                // Parse name from MiniFilter union member
+                if (pInfo->Type.MiniFilter.FilterNameLength > 0) {
+                    // FilterNameBuffer follows the structure in memory
+                    const wchar_t* nameStart = reinterpret_cast<const wchar_t*>(
+                        reinterpret_cast<const uint8_t*>(pInfo) + 
+                        pInfo->Type.MiniFilter.FilterNameBufferOffset);
+                    info.filterName = std::wstring(nameStart, 
+                        pInfo->Type.MiniFilter.FilterNameLength / sizeof(wchar_t));
                 }
 
-                // Parse altitude
-                if (pInfo->FilterAltitudeLength > 0) {
-                    std::wstring alt((wchar_t*)((uint8_t*)pInfo + pInfo->FilterAltitudeBufferOffset),
-                                     pInfo->FilterAltitudeLength / sizeof(wchar_t));
-                    info.altitude = alt;
+                // Parse altitude - convert string to uint32_t
+                if (pInfo->Type.MiniFilter.FilterAltitudeLength > 0) {
+                    const wchar_t* altStart = reinterpret_cast<const wchar_t*>(
+                        reinterpret_cast<const uint8_t*>(pInfo) + 
+                        pInfo->Type.MiniFilter.FilterAltitudeBufferOffset);
+                    std::wstring altStr(altStart, 
+                        pInfo->Type.MiniFilter.FilterAltitudeLength / sizeof(wchar_t));
+                    try {
+                        // Altitude is a numeric string like "385201"
+                        info.altitude = std::stoul(altStr);
+                    } catch (...) {
+                        info.altitude = 0;
+                    }
                 }
 
-                info.frameID = pInfo->FrameID;
-                info.numberOfInstances = pInfo->NumberOfInstances;
+                info.frameID = pInfo->Type.MiniFilter.FrameID;
+                info.numberOfInstances = pInfo->Type.MiniFilter.NumberOfInstances;
+                info.isLoaded = true;
                 filters.push_back(info);
             };
 
@@ -1065,8 +1303,8 @@ public:
 
             // Process remaining results
             while (true) {
-                hr = FilterFindNext(hEnum,
-                                  FilterFullInformation,
+                hr = FilterFindNext(hEnum.get(),
+                                  FilterAggregateBasicInformation,
                                   buffer.data(),
                                   static_cast<DWORD>(buffer.size()),
                                   &bytesReturned);
@@ -1075,8 +1313,8 @@ public:
 
                 if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
                     buffer.resize(bytesReturned);
-                    hr = FilterFindNext(hEnum,
-                                      FilterFullInformation,
+                    hr = FilterFindNext(hEnum.get(),
+                                      FilterAggregateBasicInformation,
                                       buffer.data(),
                                       static_cast<DWORD>(buffer.size()),
                                       &bytesReturned);
@@ -1087,11 +1325,11 @@ public:
                 ProcessFilterInfo(buffer.data());
             }
 
-            FilterFindClose(hEnum);
-            Logger::Info("ServiceManager: Enumerated {} minifilters", filters.size());
+            // RAII handles cleanup via FilterEnumGuard
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Enumerated %zu minifilters", filters.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: GetLoadedMinifilters exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: GetLoadedMinifilters exception: %hs", e.what());
         }
 
         return filters;
@@ -1111,7 +1349,7 @@ public:
             auto currentInfo = GetServiceInfoImpl(serviceName);
             if (!currentInfo) {
                 result.isTampered = true;
-                result.details = "Service not found";
+                result.details = L"Service not found";
                 return result;
             }
 
@@ -1127,20 +1365,24 @@ public:
             result.actualBinaryPath = currentInfo->binaryPath;
 
             // Check binary path
-            if (StringUtils::ToLowerCase(currentInfo->binaryPath) !=
-                StringUtils::ToLowerCase(baseline.binaryPath)) {
+            if (StringUtils::ToLowerCopy(currentInfo->binaryPath) !=
+                StringUtils::ToLowerCopy(baseline.binaryPath)) {
                 result.isTampered = true;
                 result.binaryModified = true;
-                result.details += "Binary path changed; ";
+                result.details += L"Binary path changed; ";
             }
 
-            // Check binary hash
+            // Check binary hash with error handling
             if (FileUtils::Exists(currentInfo->binaryPath)) {
-                std::string currentHash = HashUtils::CalculateSHA256File(currentInfo->binaryPath);
-                if (currentHash != baseline.binaryHash) {
+                std::string currentHash = ComputeFileSHA256(currentInfo->binaryPath);
+                if (!currentHash.empty() && currentHash != baseline.binaryHash) {
                     result.isTampered = true;
                     result.binaryModified = true;
-                    result.details += "Binary hash mismatch; ";
+                    result.details += L"Binary hash mismatch; ";
+                } else if (currentHash.empty()) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to hash binary for integrity check: %ls",
+                        currentInfo->binaryPath.c_str());
+                    // Don't flag as tampered if we can't access the file
                 }
             }
 
@@ -1148,28 +1390,28 @@ public:
             if (currentInfo->startType != baseline.startType) {
                 result.isTampered = true;
                 result.startTypeChanged = true;
-                result.details += "Start type changed; ";
+                result.details += L"Start type changed; ";
             }
 
             // Check service account
-            if (StringUtils::ToLowerCase(currentInfo->serviceAccount) !=
-                StringUtils::ToLowerCase(baseline.serviceAccount)) {
+            if (StringUtils::ToLowerCopy(currentInfo->serviceAccount) !=
+                StringUtils::ToLowerCopy(baseline.serviceAccount)) {
                 result.isTampered = true;
                 result.accountChanged = true;
-                result.details += "Service account changed; ";
+                result.details += L"Service account changed; ";
             }
 
             if (result.isTampered) {
-                Logger::Critical("ServiceManager: TAMPER DETECTED for {}: {}",
-                    StringUtils::WideToUtf8(serviceName), result.details);
+                SS_LOG_FATAL(LOG_CATEGORY, L"ServiceManager: TAMPER DETECTED for %ls: %ls",
+                    serviceName.c_str(), result.details.c_str());
 
                 m_stats.tamperAttempts.fetch_add(1, std::memory_order_relaxed);
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: VerifyServiceIntegrity exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: VerifyServiceIntegrity exception: %hs", e.what());
             result.isTampered = true;
-            result.details = "Exception during verification";
+            result.details = L"Exception during verification";
         }
 
         return result;
@@ -1179,7 +1421,7 @@ public:
         std::unique_lock lock(m_watchdogMutex);
 
         if (m_watchdogRunning.load(std::memory_order_acquire)) {
-            Logger::Warn("ServiceManager: Watchdog already running");
+            SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: Watchdog already running");
             return;
         }
 
@@ -1191,7 +1433,7 @@ public:
 
         m_watchdogRunning.store(true, std::memory_order_release);
 
-        Logger::Info("ServiceManager: Watchdog started (interval: {} ms)",
+        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Watchdog started (interval: %u ms)",
             m_config.watchdogIntervalMs);
     }
 
@@ -1204,18 +1446,21 @@ public:
 
         m_stopWatchdog.store(true, std::memory_order_release);
 
+        // Note: std::jthread destructor automatically calls request_stop() and join()
+        // The reset() below will invoke the destructor which handles the thread properly
         if (m_watchdogThread) {
             m_watchdogThread->request_stop();
-            m_watchdogThread.reset();
+            // jthread destructor will join - this is safe
         }
+        m_watchdogThread.reset();
 
         m_watchdogRunning.store(false, std::memory_order_release);
 
-        Logger::Info("ServiceManager: Watchdog stopped");
+        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Watchdog stopped");
     }
 
     void WatchdogThread(std::stop_token stoken) {
-        Logger::Debug("ServiceManager: Watchdog thread started");
+        SS_LOG_DEBUG(LOG_CATEGORY, L"ServiceManager: Watchdog thread started");
 
         while (!stoken.stop_requested() && !m_stopWatchdog.load(std::memory_order_acquire)) {
             try {
@@ -1229,11 +1474,11 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(m_config.watchdogIntervalMs));
 
             } catch (const std::exception& e) {
-                Logger::Error("ServiceManager: Watchdog exception: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Watchdog exception: %hs", e.what());
             }
         }
 
-        Logger::Debug("ServiceManager: Watchdog thread stopped");
+        SS_LOG_DEBUG(LOG_CATEGORY, L"ServiceManager: Watchdog thread stopped");
     }
 
     void CheckAndRecoverService(const std::wstring& serviceName) {
@@ -1247,8 +1492,8 @@ public:
 
                 // Attempt recovery
                 if (m_config.autoRestartOnFailure) {
-                    Logger::Warn("ServiceManager: Attempting recovery for {}",
-                        StringUtils::WideToUtf8(serviceName));
+                    SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: Attempting recovery for %ls",
+                        serviceName.c_str());
 
                     // Simplified recovery - would do more in production
                     RestartServiceImpl(serviceName, ServiceManagerConstants::DEFAULT_TIMEOUT_MS);
@@ -1260,8 +1505,8 @@ public:
             // Check if service is running
             auto state = GetServiceStateImpl(serviceName);
             if (state == ServiceState::Stopped && m_config.autoRestartOnFailure) {
-                Logger::Warn("ServiceManager: Service {} is stopped, restarting",
-                    StringUtils::WideToUtf8(serviceName));
+                SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: Service %ls is stopped, restarting",
+                    serviceName.c_str());
 
                 StartServiceImpl(serviceName, {}, ServiceManagerConstants::DEFAULT_TIMEOUT_MS);
 
@@ -1269,7 +1514,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: CheckAndRecoverService exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: CheckAndRecoverService exception: %hs", e.what());
         }
     }
 
@@ -1282,8 +1527,8 @@ public:
         bool quarantineBinary) {
 
         try {
-            Logger::Info("ServiceManager: Disabling malicious service: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Disabling malicious service: %ls",
+                serviceName.c_str());
 
             // Get binary path before disabling
             std::wstring binaryPath;
@@ -1302,19 +1547,19 @@ public:
             // Quarantine binary
             if (quarantineBinary && !binaryPath.empty()) {
                 // Would call QuarantineManager here
-                Logger::Info("ServiceManager: Would quarantine: {}",
-                    StringUtils::WideToUtf8(binaryPath));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Would quarantine: %ls",
+                    binaryPath.c_str());
             }
 
             m_stats.remediationActions.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Info("ServiceManager: Malicious service disabled: {}",
-                StringUtils::WideToUtf8(serviceName));
+            SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Malicious service disabled: %ls",
+                serviceName.c_str());
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: DisableMaliciousService exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: DisableMaliciousService exception: %hs", e.what());
             return false;
         }
     }
@@ -1334,11 +1579,18 @@ public:
                 }
 
                 // Check if binary path is suspicious
-                std::wstring lowerPath = StringUtils::ToLowerCase(service.binaryPath);
+                // Note: ProgramData is legitimate for many apps, only flag temp/appdata
+                std::wstring lowerPath = StringUtils::ToLowerCopy(service.binaryPath);
                 if (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
-                    lowerPath.find(L"\\appdata\\") != std::wstring::npos ||
-                    lowerPath.find(L"\\programdata\\") != std::wstring::npos) {
+                    lowerPath.find(L"\\appdata\\local\\temp\\") != std::wstring::npos) {
                     isSuspicious = true;
+                }
+                
+                // ProgramData is flagged only if not from a known vendor
+                if (lowerPath.find(L"\\programdata\\") != std::wstring::npos) {
+                    if (!IsKnownProgramDataService(service.binaryPath)) {
+                        isSuspicious = true;
+                    }
                 }
 
                 // Check if LocalSystem with suspicious name
@@ -1352,7 +1604,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ServiceManager: GetSuspiciousServices exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: GetSuspiciousServices exception: %hs", e.what());
         }
 
         return suspicious;
@@ -1369,7 +1621,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("ServiceManager: Tamper callback exception: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Tamper callback exception: %hs", e.what());
             }
         }
     }
@@ -1391,14 +1643,14 @@ ServiceManager& ServiceManager::Instance() {
 ServiceManager::ServiceManager()
     : m_impl(std::make_unique<ServiceManagerImpl>())
 {
-    Logger::Info("ServiceManager: Constructor called");
+    SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Constructor called");
 }
 
 ServiceManager::~ServiceManager() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("ServiceManager: Destructor called");
+    SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Destructor called");
 }
 
 // ============================================================================
@@ -1407,7 +1659,7 @@ ServiceManager::~ServiceManager() {
 
 bool ServiceManager::Initialize(const ServiceManagerConfig& config) {
     if (!m_impl) {
-        Logger::Critical("ServiceManager: Implementation is null");
+        SS_LOG_FATAL(LOG_CATEGORY, L"ServiceManager: Implementation is null");
         return false;
     }
 
@@ -1426,7 +1678,7 @@ void ServiceManager::Shutdown() noexcept {
 
 [[nodiscard]] std::vector<ServiceInfo> ServiceManager::EnumerateServices() const {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return {};
     }
 
@@ -1435,7 +1687,7 @@ void ServiceManager::Shutdown() noexcept {
 
 [[nodiscard]] std::vector<ServiceInfo> ServiceManager::EnumerateDrivers() const {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return {};
     }
 
@@ -1446,7 +1698,7 @@ void ServiceManager::Shutdown() noexcept {
     const std::wstring& serviceName) const {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return std::nullopt;
     }
 
@@ -1477,7 +1729,7 @@ void ServiceManager::Shutdown() noexcept {
 
 [[nodiscard]] bool ServiceManager::InstallService(const ServiceConfig& config) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1489,7 +1741,7 @@ void ServiceManager::Shutdown() noexcept {
     bool force) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1502,7 +1754,7 @@ void ServiceManager::Shutdown() noexcept {
     uint32_t timeoutMs) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1515,7 +1767,7 @@ void ServiceManager::Shutdown() noexcept {
     uint32_t timeoutMs) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1527,7 +1779,7 @@ void ServiceManager::Shutdown() noexcept {
     uint32_t timeoutMs) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1540,25 +1792,21 @@ void ServiceManager::Shutdown() noexcept {
     }
 
     try {
-        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
         if (!scm) return false;
 
-        SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(), SERVICE_PAUSE_CONTINUE);
+        SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(), SERVICE_PAUSE_CONTINUE));
         if (!service) {
-            CloseServiceHandle(scm);
             return false;
         }
 
         SERVICE_STATUS status;
-        BOOL success = ControlService(service, SERVICE_CONTROL_PAUSE, &status);
-
-        CloseServiceHandle(service);
-        CloseServiceHandle(scm);
+        BOOL success = ControlService(service.get(), SERVICE_CONTROL_PAUSE, &status);
 
         return success != FALSE;
 
     } catch (const std::exception& e) {
-        Logger::Error("ServiceManager: PauseService exception: {}", e.what());
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: PauseService exception: %hs", e.what());
         return false;
     }
 }
@@ -1569,25 +1817,21 @@ void ServiceManager::Shutdown() noexcept {
     }
 
     try {
-        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
         if (!scm) return false;
 
-        SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(), SERVICE_PAUSE_CONTINUE);
+        SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(), SERVICE_PAUSE_CONTINUE));
         if (!service) {
-            CloseServiceHandle(scm);
             return false;
         }
 
         SERVICE_STATUS status;
-        BOOL success = ControlService(service, SERVICE_CONTROL_CONTINUE, &status);
-
-        CloseServiceHandle(service);
-        CloseServiceHandle(scm);
+        BOOL success = ControlService(service.get(), SERVICE_CONTROL_CONTINUE, &status);
 
         return success != FALSE;
 
     } catch (const std::exception& e) {
-        Logger::Error("ServiceManager: ContinueService exception: {}", e.what());
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: ContinueService exception: %hs", e.what());
         return false;
     }
 }
@@ -1597,7 +1841,7 @@ void ServiceManager::Shutdown() noexcept {
     StartType startType) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1613,30 +1857,26 @@ void ServiceManager::Shutdown() noexcept {
     uint32_t restartDelayMs) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
     try {
-        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        SCHandleGuard scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
         if (!scm) return false;
 
-        SC_HANDLE service = OpenServiceW(scm, serviceName.c_str(), SERVICE_CHANGE_CONFIG);
+        SCHandleGuard service(OpenServiceW(scm.get(), serviceName.c_str(), SERVICE_CHANGE_CONFIG));
         if (!service) {
-            CloseServiceHandle(scm);
             return false;
         }
 
-        bool result = m_impl->ConfigureRecoveryImpl(service, firstFailure, secondFailure,
+        bool result = m_impl->ConfigureRecoveryImpl(service.get(), firstFailure, secondFailure,
             subsequentFailures, resetPeriodSeconds, restartDelayMs);
-
-        CloseServiceHandle(service);
-        CloseServiceHandle(scm);
 
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("ServiceManager: ConfigureRecovery exception: {}", e.what());
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: ConfigureRecovery exception: %hs", e.what());
         return false;
     }
 }
@@ -1647,7 +1887,7 @@ void ServiceManager::Shutdown() noexcept {
 
 [[nodiscard]] bool ServiceManager::LoadDriver(const DriverLoadRequest& request) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1659,7 +1899,7 @@ void ServiceManager::Shutdown() noexcept {
     bool force) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1668,15 +1908,17 @@ void ServiceManager::Shutdown() noexcept {
 
 [[nodiscard]] bool ServiceManager::LoadMinifilter(
     const std::wstring& filterName,
+    const std::wstring& driverPath,
     uint32_t altitude) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
     DriverLoadRequest request;
     request.driverName = filterName;
+    request.driverPath = driverPath;  // Now properly set
     request.displayName = filterName;
     request.isMinifilter = true;
     request.altitude = altitude;
@@ -1702,8 +1944,8 @@ void ServiceManager::Shutdown() noexcept {
 
     return std::any_of(filters.begin(), filters.end(),
         [&filterName](const MinifilterInfo& info) {
-            return StringUtils::ToLowerCase(info.filterName) ==
-                   StringUtils::ToLowerCase(filterName);
+            return StringUtils::ToLowerCopy(info.filterName) ==
+                   StringUtils::ToLowerCopy(filterName);
         });
 }
 
@@ -1717,7 +1959,7 @@ void ServiceManager::Shutdown() noexcept {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
         TamperDetectionResult result;
         result.isTampered = true;
-        result.details = "Not initialized";
+        result.details = L"Not initialized";
         return result;
     }
 
@@ -1726,6 +1968,7 @@ void ServiceManager::Shutdown() noexcept {
 
 [[nodiscard]] bool ServiceManager::ProtectService(const std::wstring& serviceName) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized for ProtectService");
         return false;
     }
 
@@ -1733,10 +1976,13 @@ void ServiceManager::Shutdown() noexcept {
     // In a production environment, this would involve a kernel callback
     // to strip handle access rights (PROCESS_TERMINATE, WRITE_DAC, etc.)
     // for the protected service process.
-    Logger::Info("ServiceManager: Protected service: {}",
-        StringUtils::WideToUtf8(serviceName));
+    // 
+    // NOTE: This is a placeholder - real protection requires kernel driver integration.
+    // Return false to indicate protection was NOT applied until kernel integration.
+    SS_LOG_WARN(LOG_CATEGORY, L"ServiceManager: ProtectService not yet implemented - %ls",
+        serviceName.c_str());
 
-    return true;
+    return false;  // Return false until kernel integration is complete
 }
 
 void ServiceManager::StartWatchdog() {
@@ -1764,7 +2010,7 @@ void ServiceManager::StopWatchdog() {
     bool quarantineBinary) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1776,7 +2022,7 @@ void ServiceManager::StopWatchdog() {
     bool rebootRequired) {
 
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("ServiceManager: Not initialized");
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: Not initialized");
         return false;
     }
 
@@ -1804,8 +2050,8 @@ void ServiceManager::StopWatchdog() {
         for (const auto& service : allServices) {
             // Check if binary exists
             if (!service.binaryPath.empty() && !FileUtils::Exists(service.binaryPath)) {
-                Logger::Info("ServiceManager: Cleaning orphaned service: {}",
-                    StringUtils::WideToUtf8(service.serviceName));
+                SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Cleaning orphaned service: %ls",
+                    service.serviceName.c_str());
 
                 if (m_impl->UninstallServiceImpl(service.serviceName, true)) {
                     cleaned++;
@@ -1818,7 +2064,7 @@ void ServiceManager::StopWatchdog() {
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("ServiceManager: CleanOrphanedServices exception: {}", e.what());
+        SS_LOG_ERROR(LOG_CATEGORY, L"ServiceManager: CleanOrphanedServices exception: %hs", e.what());
     }
 
     return cleaned;
@@ -1844,7 +2090,7 @@ uint64_t ServiceManager::RegisterServiceChangeCallback(ServiceChangeCallback cal
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_serviceChangeCallbacks[id] = std::move(callback);
 
-    Logger::Debug("ServiceManager: Registered service change callback {}", id);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"ServiceManager: Registered service change callback %llu", id);
     return id;
 }
 
@@ -1854,7 +2100,7 @@ void ServiceManager::UnregisterServiceChangeCallback(uint64_t callbackId) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_serviceChangeCallbacks.erase(callbackId);
 
-    Logger::Debug("ServiceManager: Unregistered service change callback {}", callbackId);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"ServiceManager: Unregistered service change callback %llu", callbackId);
 }
 
 uint64_t ServiceManager::RegisterTamperAlertCallback(TamperAlertCallback callback) {
@@ -1865,7 +2111,7 @@ uint64_t ServiceManager::RegisterTamperAlertCallback(TamperAlertCallback callbac
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_tamperAlertCallbacks[id] = std::move(callback);
 
-    Logger::Debug("ServiceManager: Registered tamper alert callback {}", id);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"ServiceManager: Registered tamper alert callback %llu", id);
     return id;
 }
 
@@ -1875,7 +2121,7 @@ void ServiceManager::UnregisterTamperAlertCallback(uint64_t callbackId) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_tamperAlertCallbacks.erase(callbackId);
 
-    Logger::Debug("ServiceManager: Unregistered tamper alert callback {}", callbackId);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"ServiceManager: Unregistered tamper alert callback %llu", callbackId);
 }
 
 // ============================================================================
@@ -1890,7 +2136,7 @@ void ServiceManager::UnregisterTamperAlertCallback(uint64_t callbackId) {
 void ServiceManager::ResetStatistics() noexcept {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("ServiceManager: Statistics reset");
+        SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager: Statistics reset");
     }
 }
 

@@ -173,18 +173,31 @@ struct alignas(64) EventContext {
 };
 
 /**
- * @struct SecurityEvent
- * @brief Complete security event record.
+ * @enum EventPriority
+ * @brief Priority level for queue management (high priority events never dropped).
  */
-struct alignas(256) SecurityEvent {
+enum class EventPriority : uint8_t {
+    Low = 0,        // Debug, Info
+    Normal = 1,     // Warning
+    High = 2,       // Error, Scan results
+    Critical = 3    // Critical, ThreatDetection, Audit - NEVER dropped
+};
+
+/**
+ * @struct SecurityEvent
+ * @brief Complete security event record with integrity protection.
+ */
+struct alignas(64) SecurityEvent {
     // Identity
     uint64_t eventId{ 0 };
+    uint64_t sequenceNumber{ 0 };     // Monotonic sequence for ordering
     uint32_t windowsEventId{ 0 };     // For Windows Event Log
     std::wstring eventGuid;
     
     // Classification
     EventSeverity severity{ EventSeverity::Info };
     EventCategory category{ EventCategory::System };
+    EventPriority priority{ EventPriority::Normal };
     std::wstring subcategory;
     
     // Content
@@ -202,9 +215,11 @@ struct alignas(256) SecurityEvent {
     // Context
     EventContext context;
     
-    // Timing
+    // Timing (high resolution)
     std::chrono::system_clock::time_point timestamp;
     std::chrono::steady_clock::time_point monotonicTime;
+    uint64_t highResolutionTicks{ 0 };   // QueryPerformanceCounter ticks
+    uint64_t highResolutionFrequency{ 0 }; // QPC frequency for conversion
     
     // Additional data
     std::unordered_map<std::wstring, std::wstring> properties;
@@ -213,6 +228,10 @@ struct alignas(256) SecurityEvent {
     // Correlation
     std::wstring correlationId;       // For related events
     std::wstring parentEventId;
+    
+    // Integrity (tamper protection)
+    std::string hmacSignature;        // HMAC-SHA256 of event content
+    std::string previousEventHash;    // Hash chain to previous event
 };
 
 /**
@@ -297,6 +316,7 @@ struct alignas(128) EventLoggerConfig {
     uint64_t maxLogFileSizeMB{ 100 };
     uint32_t maxLogFiles{ 10 };
     bool compressOldLogs{ true };
+    std::wstring allowedLogDirectory{ L"C:\\ProgramData\\ShadowStrike\\Logs" };
     
     // Syslog
     SyslogConfig syslog;
@@ -307,10 +327,32 @@ struct alignas(128) EventLoggerConfig {
     // Forensic
     bool enableForensicCapture{ true };
     uint32_t forensicBufferSize{ 10000 };
+    uint64_t forensicBufferMaxMemoryMB{ 256 };  // Memory cap in addition to count
     
     // Performance
     uint32_t asyncQueueSize{ 100000 };
     uint32_t workerThreads{ 2 };
+    uint32_t criticalQueueReserve{ 10000 };     // Reserved slots for critical events
+    
+    // Security - Integrity
+    bool enableTamperProtection{ true };
+    std::vector<uint8_t> hmacKey;               // 32-byte key for HMAC-SHA256
+    bool enableHashChain{ true };               // Chain events cryptographically
+    
+    // Security - Access Control
+    bool restrictLogFileAccess{ true };         // Set ACL to SYSTEM+Admins only
+    
+    // Security - Field Limits (prevent memory exhaustion)
+    uint32_t maxFieldLengthBytes{ 4096 };       // Max length per string field
+    uint32_t maxPropertiesCount{ 100 };         // Max properties per event
+    
+    // Compliance
+    bool enableCrashSafeLogging{ true };        // FlushFileBuffers after critical events
+    bool secureDeleteRotatedLogs{ false };      // Overwrite before delete
+    
+    // Callback safety
+    uint32_t callbackTimeoutMs{ 1000 };         // Max time for callback execution
+    uint32_t maxCallbackFailures{ 5 };          // Failures before auto-unregister
     
     static EventLoggerConfig CreateDefault() noexcept;
     static EventLoggerConfig CreateEnterprise() noexcept;
@@ -319,17 +361,26 @@ struct alignas(128) EventLoggerConfig {
 
 /**
  * @struct EventLoggerStatistics
- * @brief Runtime statistics.
+ * @brief Runtime statistics with integrity metrics.
  */
 struct alignas(128) EventLoggerStatistics {
     std::atomic<uint64_t> eventsLogged{ 0 };
     std::atomic<uint64_t> eventsDropped{ 0 };
+    std::atomic<uint64_t> criticalEventsDropped{ 0 };   // Should always be 0
     std::atomic<uint64_t> windowsEventsWritten{ 0 };
     std::atomic<uint64_t> syslogEventsForwarded{ 0 };
     std::atomic<uint64_t> siemEventsForwarded{ 0 };
     std::atomic<uint64_t> dbEventsWritten{ 0 };
     std::atomic<uint64_t> auditEventsLogged{ 0 };
     std::atomic<uint64_t> forensicEventsCaptures{ 0 };
+    std::atomic<uint64_t> logRotations{ 0 };
+    std::atomic<uint64_t> integritySignaturesGenerated{ 0 };
+    std::atomic<uint64_t> crashSafeFlushes{ 0 };
+    std::atomic<uint64_t> callbackTimeouts{ 0 };
+    std::atomic<uint64_t> sanitizationApplied{ 0 };     // Injection attempts blocked
+    std::atomic<uint64_t> pathTraversalBlocked{ 0 };
+    std::atomic<uint64_t> queueHighWaterMark{ 0 };      // Peak queue size
+    std::atomic<uint64_t> forensicBufferMemoryBytes{ 0 };
     
     void Reset() noexcept;
 };
