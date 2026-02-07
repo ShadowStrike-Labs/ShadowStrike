@@ -24,6 +24,7 @@ extern "C" {
 
 #include <fltKernel.h>
 #include "../Shared/SharedDefs.h"
+#include "StreamContext.h"
 
 // ============================================================================
 // FILTER REGISTRATION STRUCTURE
@@ -274,87 +275,6 @@ ShadowStrikePreAcquireForSectionSync(
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext
-    );
-
-// ============================================================================
-// CONTEXT DEFINITIONS
-// ============================================================================
-
-/**
- * @brief Stream context for per-file state tracking.
- */
-typedef struct _SHADOWSTRIKE_STREAM_CONTEXT {
-
-    /// @brief File has been scanned
-    BOOLEAN Scanned;
-
-    /// @brief Last scan verdict
-    UINT8 LastVerdict;
-
-    /// @brief File has been modified since last scan
-    BOOLEAN Modified;
-
-    /// @brief Reserved padding
-    BOOLEAN Reserved;
-
-    /// @brief Last scan time (KeQuerySystemTime)
-    LARGE_INTEGER LastScanTime;
-
-    /// @brief Cached hash (if computed)
-    UCHAR FileHash[32];
-
-    /// @brief Hash is valid
-    BOOLEAN HashValid;
-
-    /// @brief Reserved
-    UCHAR Reserved2[7];
-
-} SHADOWSTRIKE_STREAM_CONTEXT, *PSHADOWSTRIKE_STREAM_CONTEXT;
-
-#define SHADOWSTRIKE_STREAM_CONTEXT_SIZE sizeof(SHADOWSTRIKE_STREAM_CONTEXT)
-
-/**
- * @brief Context cleanup callback.
- *
- * Called when a context is being freed.
- *
- * @param Context      Pointer to the context.
- * @param ContextType  Type of context being cleaned up.
- */
-VOID
-ShadowStrikeContextCleanup(
-    _In_ PFLT_CONTEXT Context,
-    _In_ FLT_CONTEXT_TYPE ContextType
-    );
-
-// ============================================================================
-// CONTEXT OPERATIONS
-// ============================================================================
-
-/**
- * @brief Get or create stream context for a file.
- *
- * @param Instance     Filter instance.
- * @param FileObject   File object.
- * @param Context      Receives the context pointer.
- * @return STATUS_SUCCESS on success.
- */
-NTSTATUS
-ShadowStrikeGetStreamContext(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Outptr_ PSHADOWSTRIKE_STREAM_CONTEXT* Context
-    );
-
-/**
- * @brief Create new stream context.
- *
- * @param Context  Receives the new context pointer.
- * @return STATUS_SUCCESS on success.
- */
-NTSTATUS
-ShadowStrikeCreateStreamContext(
-    _Outptr_ PSHADOWSTRIKE_STREAM_CONTEXT* Context
     );
 
 #ifdef __cplusplus

@@ -101,7 +101,7 @@
       <PrecompiledHeaderOutputFile>$(IntDir)$pch.pch</PrecompiledHeaderOutputFile>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;C:\Program Files (x86)\Windows Kits\10\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
@@ -133,7 +133,7 @@
       <PrecompiledHeaderOutputFile>$(IntDir)$pch.pch</PrecompiledHeaderOutputFile>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;C:\Program Files (x86)\Windows Kits\10\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
@@ -171,6 +171,7 @@
     <ClCompile Include="Drivers\ShadowSensor\Communication\Encryption.c" />
     <ClCompile Include="Drivers\ShadowSensor\Communication\MessageQueue.c" />
     <ClCompile Include="Drivers\ShadowSensor\Communication\TelemetryBuffer.c" />
+    <ClCompile Include="drivers\ShadowSensor\Context\InstanceContext.c" />
     <ClCompile Include="Drivers\ShadowSensor\ETW\ETWConsumer.c" />
     <ClCompile Include="Drivers\ShadowSensor\ETW\ETWProvider.c" />
     <ClCompile Include="Drivers\ShadowSensor\ETW\EventSchema.c" />
@@ -629,6 +630,7 @@
     <ClCompile Include="tests\unit\utils\XMLUtils_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="drivers\ShadowSensor\Context\InstanceContext.h" />
     <ClInclude Include="include\gmock\gmock-actions.h" />
     <ClInclude Include="include\gmock\gmock-cardinalities.h" />
     <ClInclude Include="include\gmock\gmock-function-mocker.h" />

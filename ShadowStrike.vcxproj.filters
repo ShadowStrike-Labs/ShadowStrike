@@ -1305,6 +1305,9 @@
     <ClCompile Include="Drivers\ShadowSensorELAM\ELAMDriver.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="drivers\ShadowSensor\Context\InstanceContext.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
@@ -1917,6 +1920,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\Core\System\SystemInfo.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="drivers\ShadowSensor\Context\InstanceContext.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

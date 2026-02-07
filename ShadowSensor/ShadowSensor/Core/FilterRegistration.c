@@ -18,6 +18,7 @@
 #include "FilterRegistration.h"
 #include "Globals.h"
 #include "DriverEntry.h"
+#include "StreamContext.h"
 #include "../Communication/CommPort.h"
 #include "../SelfProtection/SelfProtect.h"
 #include "../Shared/SharedDefs.h"
@@ -43,9 +44,9 @@ CONST FLT_CONTEXT_REGISTRATION g_ContextRegistration[] = {
     {
         FLT_STREAM_CONTEXT,                         // ContextType
         0,                                          // Flags
-        ShadowStrikeContextCleanup,                 // ContextCleanupCallback
-        SHADOWSTRIKE_STREAM_CONTEXT_SIZE,           // Size
-        SHADOWSTRIKE_POOL_TAG,                      // PoolTag
+        ShadowCleanupStreamContext,                 // ContextCleanupCallback
+        sizeof(SHADOW_STREAM_CONTEXT),              // Size
+        SHADOW_CONTEXT_TAG,                         // PoolTag
         NULL,                                       // ContextAllocateCallback
         NULL,                                       // ContextFreeCallback
         NULL                                        // Reserved
