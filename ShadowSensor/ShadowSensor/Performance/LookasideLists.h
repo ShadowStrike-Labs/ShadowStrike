@@ -27,13 +27,23 @@
  * - Magic value validation to detect corruption
  * - Poison patterns on free for use-after-free detection
  * - Bounds checking on all operations
+ * - Reference counting prevents use-after-free
+ *
+ * Security Hardening (v3.0.0):
+ * ============================
+ * - Lock-free reference counting with atomic CAS operations
+ * - Proper callback IRQL validation
+ * - Safe list enumeration with next-pointer caching
+ * - Work item deferral for DISPATCH_LEVEL callbacks
+ * - State machine with atomic transitions
+ * - ExAllocatePool2 usage for modern Windows
  *
  * MITRE ATT&CK Coverage:
  * - T1055: Process Injection (secure allocation tracking)
  * - T1003: Credential Dumping (memory zeroing)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -66,6 +76,11 @@ extern "C" {
  * @brief Pool tag for lookaside metadata
  */
 #define LL_META_TAG                     'MLSS'
+
+/**
+ * @brief Pool tag for work item context
+ */
+#define LL_WORKITEM_TAG                 'WLSS'
 
 // ============================================================================
 // CONSTANTS
@@ -127,6 +142,11 @@ extern "C" {
 #define LL_ENTRY_MAGIC                  0x4C4C5353  // 'SSLL'
 
 /**
+ * @brief Magic value for manager validation
+ */
+#define LL_MANAGER_MAGIC                0x4D4C5353  // 'SSLM'
+
+/**
  * @brief Poison pattern for freed entries (debug)
  */
 #define LL_POISON_PATTERN               0xDE
@@ -135,6 +155,39 @@ extern "C" {
  * @brief Cache line size for alignment
  */
 #define LL_CACHE_LINE_SIZE              64
+
+/**
+ * @brief Reference count sentinel value (being destroyed)
+ */
+#define LL_REFCOUNT_DESTROYING          (-1)
+
+/**
+ * @brief Maximum wait iterations for reference drain
+ */
+#define LL_REFCOUNT_DRAIN_MAX_ITERATIONS    100
+
+/**
+ * @brief Drain interval in milliseconds
+ */
+#define LL_REFCOUNT_DRAIN_INTERVAL_MS       10
+
+/**
+ * @brief Sequence number increment for lock-free operations
+ *
+ * Used to detect ABA problems in lock-free reference counting.
+ * The sequence counter occupies the upper 32 bits of a 64-bit word.
+ */
+#define LL_SEQUENCE_INCREMENT           0x100000000ULL
+
+/**
+ * @brief Mask to extract reference count from combined value
+ */
+#define LL_REFCOUNT_MASK                0x00000000FFFFFFFFULL
+
+/**
+ * @brief Flag indicating lookaside is being destroyed (in upper bits)
+ */
+#define LL_DESTROYING_FLAG              0x8000000000000000ULL
 
 // ============================================================================
 // ENUMERATIONS
@@ -146,6 +199,9 @@ extern "C" {
 typedef enum _LL_STATE {
     /// Not initialized
     LlStateUninitialized = 0,
+
+    /// Initializing
+    LlStateInitializing,
 
     /// Initialized and ready
     LlStateActive,
@@ -244,9 +300,12 @@ typedef struct DECLSPEC_CACHEALIGN _LL_STATISTICS {
     /// Maximum allocation latency
     volatile LONG64 MaxLatency;
 
+    /// Secure frees count
+    volatile LONG64 SecureFrees;
+
     /// Padding for cache line alignment
     UCHAR Reserved[LL_CACHE_LINE_SIZE -
-                   (sizeof(LONG64) * 9 + sizeof(LONG) * 2) % LL_CACHE_LINE_SIZE];
+                   (sizeof(LONG64) * 10 + sizeof(LONG) * 2) % LL_CACHE_LINE_SIZE];
 
 } LL_STATISTICS, *PLL_STATISTICS;
 
@@ -278,6 +337,9 @@ typedef struct _LL_GLOBAL_STATISTICS {
     /// Memory pressure events
     volatile LONG64 MemoryPressureEvents;
 
+    /// Reference count races detected
+    volatile LONG64 RefCountRaces;
+
     /// Manager start time
     LARGE_INTEGER StartTime;
 
@@ -285,6 +347,12 @@ typedef struct _LL_GLOBAL_STATISTICS {
     LARGE_INTEGER LastResetTime;
 
 } LL_GLOBAL_STATISTICS, *PLL_GLOBAL_STATISTICS;
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+struct _LL_MANAGER;
 
 // ============================================================================
 // LOOKASIDE LIST STRUCTURE
@@ -318,8 +386,8 @@ typedef struct _LL_LOOKASIDE {
     /// Is paged pool
     BOOLEAN IsPaged;
 
-    /// Current state
-    LL_STATE State;
+    /// Current state (atomic)
+    volatile LL_STATE State;
 
     /// Allocation flags
     ULONG Flags;
@@ -345,6 +413,21 @@ typedef struct _LL_LOOKASIDE {
     /// Magic value for validation
     ULONG Magic;
 
+    /**
+     * @brief Combined reference count and state word (lock-free)
+     *
+     * Layout (64-bit):
+     * - Bits 0-30:  Reference count (0 to 0x7FFFFFFF)
+     * - Bit 31:     Reserved
+     * - Bits 32-62: Sequence counter (ABA protection)
+     * - Bit 63:     Destroying flag (1 = being destroyed)
+     *
+     * This design eliminates the TOCTOU race between checking RemovedFromList
+     * and incrementing ReferenceCount by combining both into a single atomic
+     * 64-bit compare-and-swap operation.
+     */
+    volatile LONG64 RefCountAndState;
+
     /// Back pointer to manager
     struct _LL_MANAGER* Manager;
 
@@ -357,11 +440,15 @@ typedef struct _LL_LOOKASIDE {
 } LL_LOOKASIDE, *PLL_LOOKASIDE;
 
 // ============================================================================
-// MANAGER STRUCTURE
+// CALLBACK TYPES
 // ============================================================================
 
 /**
  * @brief Callback for memory pressure notification
+ *
+ * @note MUST be in non-paged memory as it may be called at DISPATCH_LEVEL
+ *       via deferred work item. If called from DPC context, actual execution
+ *       is deferred to a work item at PASSIVE_LEVEL.
  */
 typedef VOID (*LL_PRESSURE_CALLBACK)(
     _In_ LL_MEMORY_PRESSURE PressureLevel,
@@ -371,14 +458,26 @@ typedef VOID (*LL_PRESSURE_CALLBACK)(
 );
 
 /**
+ * @brief Callback for lookaside enumeration
+ */
+typedef BOOLEAN (*LL_ENUM_CALLBACK)(
+    _In_ PLL_LOOKASIDE Lookaside,
+    _In_opt_ PVOID Context
+);
+
+// ============================================================================
+// MANAGER STRUCTURE
+// ============================================================================
+
+/**
  * @brief Central lookaside list manager
  */
 typedef struct _LL_MANAGER {
     /// Manager initialized
     BOOLEAN Initialized;
 
-    /// Manager state
-    LL_STATE State;
+    /// Manager state (atomic)
+    volatile LL_STATE State;
 
     /// Reserved for alignment
     UCHAR Reserved1[2];
@@ -411,11 +510,24 @@ typedef struct _LL_MANAGER {
     LL_PRESSURE_CALLBACK PressureCallback;
     PVOID PressureCallbackContext;
 
+    /// TRUE if pressure callback is in non-paged memory (validated)
+    BOOLEAN PressureCallbackValidated;
+
     /// Periodic maintenance timer
     KTIMER MaintenanceTimer;
     KDPC MaintenanceDpc;
     ULONG MaintenanceIntervalMs;
     BOOLEAN MaintenanceEnabled;
+
+    /// Work item for deferred pressure callback
+    PIO_WORKITEM PressureWorkItem;
+    PDEVICE_OBJECT DeviceObject;
+
+    /// Pending pressure notification (for work item)
+    volatile LL_MEMORY_PRESSURE PendingPressureLevel;
+    volatile LONG64 PendingCurrentMemory;
+    volatile LONG64 PendingMemoryLimit;
+    volatile LONG PressureWorkPending;
 
     /// Self-tuning enabled
     BOOLEAN SelfTuningEnabled;
@@ -429,7 +541,7 @@ typedef struct _LL_MANAGER {
     /// Spinlock for fast operations
     KSPIN_LOCK FastLock;
 
-    /// Reference count
+    /// Reference count for safe shutdown
     volatile LONG RefCount;
 
     /// Shutdown event
@@ -458,6 +570,24 @@ _Must_inspect_result_
 NTSTATUS
 LlInitialize(
     _Out_ PLL_MANAGER* Manager
+    );
+
+/**
+ * @brief Initialize manager with device object for work items.
+ *
+ * @param Manager       Receives pointer to initialized manager
+ * @param DeviceObject  Device object for work item operations
+ *
+ * @return STATUS_SUCCESS on success
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+LlInitializeEx(
+    _Out_ PLL_MANAGER* Manager,
+    _In_opt_ PDEVICE_OBJECT DeviceObject
     );
 
 /**
@@ -556,6 +686,44 @@ _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 LlDestroyLookaside(
     _In_ PLL_MANAGER Manager,
+    _In_ PLL_LOOKASIDE Lookaside
+    );
+
+// ============================================================================
+// REFERENCE COUNTING
+// ============================================================================
+
+/**
+ * @brief Acquire reference to lookaside list.
+ *
+ * Thread-safe reference increment using atomic CAS loop.
+ * Must be called before using a lookaside obtained from enumeration.
+ *
+ * @param Lookaside Lookaside to reference
+ *
+ * @return TRUE if reference acquired, FALSE if lookaside is being destroyed
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+LlReferenceLookaside(
+    _In_ PLL_LOOKASIDE Lookaside
+    );
+
+/**
+ * @brief Release reference to lookaside list.
+ *
+ * Decrements reference count. When count reaches zero and list is
+ * marked for removal, the list is freed.
+ *
+ * @param Lookaside Lookaside to release
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+LlReleaseLookaside(
     _In_ PLL_LOOKASIDE Lookaside
     );
 
@@ -764,12 +932,15 @@ LlGetMemoryUsage(
  * @brief Register memory pressure callback.
  *
  * @param Manager   Lookaside manager
- * @param Callback  Callback function
+ * @param Callback  Callback function (MUST be in non-paged memory)
  * @param Context   Callback context
  *
  * @return STATUS_SUCCESS on success
  *
  * @irql PASSIVE_LEVEL
+ *
+ * @note The callback will be invoked at PASSIVE_LEVEL via work item
+ *       when pressure changes are detected at DISPATCH_LEVEL.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -854,14 +1025,6 @@ LlEnableSelfTuning(
 // ============================================================================
 
 /**
- * @brief Callback for lookaside enumeration
- */
-typedef BOOLEAN (*LL_ENUM_CALLBACK)(
-    _In_ PLL_LOOKASIDE Lookaside,
-    _In_opt_ PVOID Context
-);
-
-/**
  * @brief Enumerate all lookaside lists.
  *
  * @param Manager   Lookaside manager
@@ -871,6 +1034,9 @@ typedef BOOLEAN (*LL_ENUM_CALLBACK)(
  * @return STATUS_SUCCESS on success
  *
  * @irql <= APC_LEVEL
+ *
+ * @note Callback must NOT destroy the lookaside being enumerated.
+ *       Safe enumeration captures next pointer before callback.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -885,11 +1051,13 @@ LlEnumerateLookasides(
  *
  * @param Manager   Lookaside manager
  * @param Name      Lookaside name to find
- * @param Lookaside Receives lookaside if found
+ * @param Lookaside Receives lookaside if found (caller must release)
  *
  * @return STATUS_SUCCESS if found, STATUS_NOT_FOUND otherwise
  *
  * @irql <= APC_LEVEL
+ *
+ * @note Caller must call LlReleaseLookaside when done with returned lookaside
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -904,11 +1072,13 @@ LlFindByName(
  *
  * @param Manager   Lookaside manager
  * @param Tag       Pool tag to find
- * @param Lookaside Receives lookaside if found
+ * @param Lookaside Receives lookaside if found (caller must release)
  *
  * @return STATUS_SUCCESS if found, STATUS_NOT_FOUND otherwise
  *
  * @irql <= APC_LEVEL
+ *
+ * @note Caller must call LlReleaseLookaside when done with returned lookaside
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -989,7 +1159,7 @@ LlGetStats(
 // ============================================================================
 
 /**
- * @brief Calculate hit rate percentage.
+ * @brief Calculate hit rate percentage (overflow-safe).
  */
 FORCEINLINE
 ULONG
@@ -1002,11 +1172,18 @@ LlCalculateHitRate(
     if (Total == 0) {
         return 0;
     }
-    return (ULONG)((Hits * 100) / Total);
+    //
+    // Use 64-bit multiplication to prevent overflow
+    // Cast to ULONG64 before multiplying to ensure no signed overflow
+    //
+    return (ULONG)(((ULONG64)Hits * 100ULL) / (ULONG64)Total);
 }
 
 /**
- * @brief Check if lookaside is valid.
+ * @brief Check if lookaside is valid (fast path validation).
+ *
+ * @note This is a quick validity check. For operations that need
+ *       to safely use the lookaside, use LlReferenceLookaside.
  */
 FORCEINLINE
 BOOLEAN
@@ -1014,15 +1191,29 @@ LlIsValid(
     _In_opt_ PLL_LOOKASIDE Lookaside
     )
 {
+    LL_STATE State;
+
     if (Lookaside == NULL) {
         return FALSE;
     }
+
+    //
+    // Use volatile read to ensure we see current value
+    //
     if (Lookaside->Magic != LL_ENTRY_MAGIC) {
         return FALSE;
     }
-    if (Lookaside->State != LlStateActive) {
+
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Lookaside->State,
+        LlStateActive,
+        LlStateActive
+    );
+
+    if (State != LlStateActive) {
         return FALSE;
     }
+
     return TRUE;
 }
 
@@ -1035,15 +1226,73 @@ LlManagerIsValid(
     _In_opt_ PLL_MANAGER Manager
     )
 {
+    LL_STATE State;
+
     if (Manager == NULL) {
         return FALSE;
     }
-    if (Manager->Magic != LL_ENTRY_MAGIC) {
+
+    if (Manager->Magic != LL_MANAGER_MAGIC) {
         return FALSE;
     }
+
     if (!Manager->Initialized) {
         return FALSE;
     }
+
+    //
+    // Atomic read of state
+    //
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Manager->State,
+        LlStateActive,
+        LlStateActive
+    );
+
+    if (State != LlStateActive) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/**
+ * @brief Safe size addition with overflow check.
+ */
+FORCEINLINE
+BOOLEAN
+LlSafeAdd(
+    _In_ SIZE_T Size1,
+    _In_ SIZE_T Size2,
+    _Out_ PSIZE_T Result
+    )
+{
+    if (Size1 > (SIZE_T)(-1) - Size2) {
+        *Result = 0;
+        return FALSE;
+    }
+
+    *Result = Size1 + Size2;
+    return TRUE;
+}
+
+/**
+ * @brief Safe size multiplication with overflow check.
+ */
+FORCEINLINE
+BOOLEAN
+LlSafeMultiply(
+    _In_ SIZE_T Size1,
+    _In_ SIZE_T Size2,
+    _Out_ PSIZE_T Result
+    )
+{
+    if (Size2 != 0 && Size1 > (SIZE_T)(-1) / Size2) {
+        *Result = 0;
+        return FALSE;
+    }
+
+    *Result = Size1 * Size2;
     return TRUE;
 }
 

@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * ShadowStrike NGAV - ALPC & PROCESS PROTECTION MONITOR IMPLEMENTATION
+ * ShadowStrike NGAV - PROCESS PROTECTION MONITOR IMPLEMENTATION
  * ============================================================================
  *
  * @file AlpcMonitor.c
@@ -9,24 +9,32 @@
  * Implements CrowdStrike Falcon-level protection against credential dumping,
  * process injection, and privilege escalation attacks.
  *
- * Key Capabilities:
- * - LSASS protection (Mimikatz, credential dumping detection)
- * - Process injection detection (CREATE_THREAD, VM_WRITE)
- * - Token manipulation detection (DUP_HANDLE)
- * - Cross-session access monitoring
- * - Behavioral threat scoring with rate limiting
- * - LRU cache for performance
- * - Real-time alerting to user-mode
+ * CRITICAL FIXES IN THIS VERSION (v3.0.0):
+ * =========================================
+ * 1. IRQL SAFETY: All callbacks now use NonPagedPool and cached process names
+ *    - No more PagedPool allocations at APC/DISPATCH level
+ *    - Process names cached at PASSIVE_LEVEL during process creation
  *
- * BSOD Safety Guarantees:
- * - Atomic initialization (no race conditions)
- * - Proper lock hierarchy (no deadlocks)
- * - Exception handling in callbacks
- * - Reference counting (no use-after-free)
- * - Process exit cleanup (no stale PIDs)
+ * 2. REFERENCE COUNTING: Proper reference counting without forced resets
+ *    - Entries marked as "removed from list" before decrement
+ *    - No more InterlockedExchange to force refcount to 1
+ *    - Safe concurrent access from multiple callbacks
+ *
+ * 3. LOCK HIERARCHY: Explicit, documented, enforced
+ *    - Lock (EX_PUSH_LOCK) -> NameCacheLock (KSPIN_LOCK) -> AlertLock (KSPIN_LOCK)
+ *    - Never acquire outer lock while holding inner spinlock
+ *
+ * 4. EXACT NAME MATCHING: No more substring bypass vulnerabilities
+ *    - Extract and compare base names exactly
+ *    - Case-insensitive but exact match
+ *
+ * 5. PROCESS NAME CACHE: IRQL-safe lookup infrastructure
+ *    - Populated at process creation (PASSIVE_LEVEL)
+ *    - Queried from callbacks at any IRQL
+ *    - Invalidated on process exit
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition - Falcon-Grade)
+ * @version 3.0.0 (Enterprise Edition - Production Ready)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -38,17 +46,14 @@
 // ============================================================================
 
 /**
- * @brief Global ALPC monitor state.
+ * @brief Global process monitor state.
  */
 SHADOW_ALPC_MONITOR_STATE g_AlpcMonitorState = { 0 };
 
 // ============================================================================
-// CONSTANTS
+// PROTECTED PROCESS NAMES (Exact base name match, lowercase)
 // ============================================================================
 
-/**
- * @brief Protected process names (case-insensitive)
- */
 static const WCHAR* g_ProtectedProcessNames[] = {
     L"lsass.exe",
     L"csrss.exe",
@@ -57,14 +62,18 @@ static const WCHAR* g_ProtectedProcessNames[] = {
     L"smss.exe",
     L"wininit.exe",
     L"svchost.exe",
+    L"lsaiso.exe",        // Credential Guard
+    L"spoolsv.exe",
+    L"dwm.exe",
     NULL
 };
 
 /**
- * @brief Suspicious parent process names (common malware launchers)
+ * @brief Suspicious parent process names (common attack launchers)
  */
 static const WCHAR* g_SuspiciousParentNames[] = {
     L"powershell.exe",
+    L"pwsh.exe",
     L"cmd.exe",
     L"wscript.exe",
     L"cscript.exe",
@@ -73,6 +82,8 @@ static const WCHAR* g_SuspiciousParentNames[] = {
     L"regsvr32.exe",
     L"certutil.exe",
     L"bitsadmin.exe",
+    L"msiexec.exe",
+    L"wmic.exe",
     NULL
 };
 
@@ -80,39 +91,458 @@ static const WCHAR* g_SuspiciousParentNames[] = {
 // FORWARD DECLARATIONS
 // ============================================================================
 
-NTSTATUS
-ShadowGetProcessImageName(
+static BOOLEAN
+ShadowIsNameProtected(
+    _In_z_ PCWSTR BaseName
+    );
+
+static BOOLEAN
+ShadowIsNameSuspiciousParent(
+    _In_z_ PCWSTR BaseName
+    );
+
+static VOID
+ShadowExtractBaseName(
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_writes_(SHADOW_MAX_BASE_NAME) PWCHAR BaseName
+    );
+
+static VOID
+ShadowToLowerCase(
+    _Inout_z_ PWCHAR String
+    );
+
+static ULONG
+ShadowHashProcessId(
+    _In_ HANDLE ProcessId
+    );
+
+// ============================================================================
+// FORWARD DECLARATIONS FOR DYNAMIC LOOKUP (FALLBACK)
+// ============================================================================
+
+static NTSTATUS
+ShadowpQueryProcessImageName(
     _In_ HANDLE ProcessId,
-    _Out_ PUNICODE_STRING ImageName
+    _Out_writes_(SHADOW_MAX_BASE_NAME) PWCHAR BaseName,
+    _Out_ PBOOLEAN IsProtected
     );
 
+static NTSTATUS
+ShadowpPopulateExistingProcesses(
+    VOID
+    );
+
+// ============================================================================
+// PROCESS NAME CACHE IMPLEMENTATION
+// ============================================================================
+
+/**
+ * @brief Initialize process name cache.
+ *
+ * ENTERPRISE FIX: After cache initialization, we pre-populate the cache
+ * with all existing processes to ensure protected processes like LSASS
+ * that started before the driver are properly detected.
+ */
+_Use_decl_annotations_
 NTSTATUS
-ShadowGetParentProcessId(
+ShadowInitializeProcessNameCache(
+    VOID
+    )
+{
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
+    SIZE_T cacheSize;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    state->ProcessNameCacheSize = SHADOW_PROCESS_NAME_CACHE_SIZE;
+    cacheSize = state->ProcessNameCacheSize * sizeof(SHADOW_PROCESS_NAME_CACHE_ENTRY);
+
+    //
+    // Allocate from NonPagedPool for IRQL-safe access
+    //
+    state->ProcessNameCache = (PSHADOW_PROCESS_NAME_CACHE_ENTRY)ExAllocatePoolWithTag(
+        NonPagedPool,
+        cacheSize,
+        SHADOW_ALPC_CACHE_TAG
+    );
+
+    if (state->ProcessNameCache == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to allocate process name cache\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(state->ProcessNameCache, cacheSize);
+    KeInitializeSpinLock(&state->NameCacheLock);
+
+    //
+    // CRITICAL ENTERPRISE FIX: Pre-populate cache with existing processes
+    // This ensures LSASS, csrss.exe, services.exe etc. that started before
+    // our driver are properly protected from credential theft attacks.
+    //
+    status = ShadowpPopulateExistingProcesses();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Warning: Could not pre-populate process cache: 0x%X\n", status);
+        //
+        // Non-fatal - we have dynamic fallback for cache misses
+        //
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Process name cache initialized (%lu entries)\n",
+               state->ProcessNameCacheSize);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Cleanup process name cache.
+ */
+_Use_decl_annotations_
+VOID
+ShadowCleanupProcessNameCache(
+    VOID
+    )
+{
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
+
+    PAGED_CODE();
+
+    if (state->ProcessNameCache != NULL) {
+        ExFreePoolWithTag(state->ProcessNameCache, SHADOW_ALPC_CACHE_TAG);
+        state->ProcessNameCache = NULL;
+    }
+
+    state->ProcessNameCacheSize = 0;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Process name cache cleaned up\n");
+}
+
+/**
+ * @brief Hash function for process ID to cache index.
+ */
+static ULONG
+ShadowHashProcessId(
+    _In_ HANDLE ProcessId
+    )
+{
+    ULONG_PTR pid = (ULONG_PTR)ProcessId;
+
+    //
+    // Simple hash with good distribution for PIDs
+    //
+    pid = ((pid >> 16) ^ pid) * 0x45d9f3b;
+    pid = ((pid >> 16) ^ pid) * 0x45d9f3b;
+    pid = (pid >> 16) ^ pid;
+
+    return (ULONG)(pid % SHADOW_PROCESS_NAME_CACHE_SIZE);
+}
+
+/**
+ * @brief Add process to name cache.
+ *
+ * Called from process notify routine at PASSIVE_LEVEL.
+ */
+_Use_decl_annotations_
+VOID
+ShadowCacheProcessName(
     _In_ HANDLE ProcessId,
-    _Out_ PHANDLE ParentProcessId
-    );
-
-BOOLEAN
-ShadowIsProcessInSameSession(
-    _In_ HANDLE Pid1,
-    _In_ HANDLE Pid2
-    );
-
-BOOLEAN
-ShadowIsSuspiciousParent(
+    _In_opt_ PUNICODE_STRING ImageFileName,
     _In_ HANDLE ParentProcessId
-    );
+    )
+{
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
+    PSHADOW_PROCESS_NAME_CACHE_ENTRY entry;
+    KIRQL oldIrql;
+    ULONG index;
+    PEPROCESS process = NULL;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (state->ProcessNameCache == NULL) {
+        return;
+    }
+
+    index = ShadowHashProcessId(ProcessId);
+    entry = &state->ProcessNameCache[index];
+
+    //
+    // Get session ID at PASSIVE_LEVEL
+    //
+    ULONG sessionId = 0;
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (NT_SUCCESS(status)) {
+        sessionId = PsGetProcessSessionId(process);
+        ObDereferenceObject(process);
+    }
+
+    KeAcquireSpinLock(&state->NameCacheLock, &oldIrql);
+
+    //
+    // Populate cache entry
+    //
+    entry->ProcessId = ProcessId;
+    entry->ParentProcessId = ParentProcessId;
+    entry->SessionId = sessionId;
+    entry->Valid = TRUE;
+    KeQuerySystemTime(&entry->Timestamp);
+
+    //
+    // Extract and store base name
+    //
+    if (ImageFileName != NULL && ImageFileName->Buffer != NULL) {
+        ShadowExtractBaseName(ImageFileName, entry->BaseName);
+        ShadowToLowerCase(entry->BaseName);
+
+        //
+        // Store full path (truncated if necessary)
+        //
+        USHORT copyLen = min(ImageFileName->Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
+        RtlCopyMemory(entry->FullPath, ImageFileName->Buffer, copyLen * sizeof(WCHAR));
+        entry->FullPath[copyLen] = L'\0';
+        ShadowToLowerCase(entry->FullPath);
+    } else {
+        entry->BaseName[0] = L'\0';
+        entry->FullPath[0] = L'\0';
+    }
+
+    //
+    // Determine if protected (exact match)
+    //
+    entry->IsProtected = ShadowIsNameProtected(entry->BaseName);
+
+    KeReleaseSpinLock(&state->NameCacheLock, oldIrql);
+
+    InterlockedIncrement64(&state->Stats.NameCacheMisses);  // Initial add counts as miss
+}
+
+/**
+ * @brief Remove process from name cache.
+ */
+_Use_decl_annotations_
+VOID
+ShadowRemoveProcessFromCache(
+    _In_ HANDLE ProcessId
+    )
+{
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
+    PSHADOW_PROCESS_NAME_CACHE_ENTRY entry;
+    KIRQL oldIrql;
+    ULONG index;
+
+    if (state->ProcessNameCache == NULL) {
+        return;
+    }
+
+    index = ShadowHashProcessId(ProcessId);
+    entry = &state->ProcessNameCache[index];
+
+    KeAcquireSpinLock(&state->NameCacheLock, &oldIrql);
+
+    //
+    // Only invalidate if this is the correct entry (hash collision handling)
+    //
+    if (entry->Valid && entry->ProcessId == ProcessId) {
+        entry->Valid = FALSE;
+        entry->ProcessId = NULL;
+    }
+
+    KeReleaseSpinLock(&state->NameCacheLock, oldIrql);
+}
+
+/**
+ * @brief Lookup process in name cache.
+ */
+_Use_decl_annotations_
+BOOLEAN
+ShadowLookupProcessInCache(
+    _In_ HANDLE ProcessId,
+    _Out_writes_opt_(SHADOW_MAX_BASE_NAME) PWCHAR BaseName,
+    _Out_opt_ PBOOLEAN IsProtected,
+    _Out_opt_ PULONG SessionId,
+    _Out_opt_ PHANDLE ParentPid
+    )
+{
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
+    PSHADOW_PROCESS_NAME_CACHE_ENTRY entry;
+    KIRQL oldIrql;
+    ULONG index;
+    BOOLEAN found = FALSE;
+
+    if (state->ProcessNameCache == NULL) {
+        if (BaseName != NULL) BaseName[0] = L'\0';
+        if (IsProtected != NULL) *IsProtected = FALSE;
+        if (SessionId != NULL) *SessionId = 0;
+        if (ParentPid != NULL) *ParentPid = NULL;
+        return FALSE;
+    }
+
+    index = ShadowHashProcessId(ProcessId);
+    entry = &state->ProcessNameCache[index];
+
+    KeAcquireSpinLock(&state->NameCacheLock, &oldIrql);
+
+    if (entry->Valid && entry->ProcessId == ProcessId) {
+        found = TRUE;
+
+        if (BaseName != NULL) {
+            RtlCopyMemory(BaseName, entry->BaseName, SHADOW_MAX_BASE_NAME * sizeof(WCHAR));
+        }
+        if (IsProtected != NULL) {
+            *IsProtected = entry->IsProtected;
+        }
+        if (SessionId != NULL) {
+            *SessionId = entry->SessionId;
+        }
+        if (ParentPid != NULL) {
+            *ParentPid = entry->ParentProcessId;
+        }
+
+        InterlockedIncrement64(&state->Stats.NameCacheHits);
+    } else {
+        if (BaseName != NULL) BaseName[0] = L'\0';
+        if (IsProtected != NULL) *IsProtected = FALSE;
+        if (SessionId != NULL) *SessionId = 0;
+        if (ParentPid != NULL) *ParentPid = NULL;
+
+        InterlockedIncrement64(&state->Stats.NameCacheMisses);
+    }
+
+    KeReleaseSpinLock(&state->NameCacheLock, oldIrql);
+
+    return found;
+}
+
+// ============================================================================
+// STRING HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Extract base name from full path.
+ */
+static VOID
+ShadowExtractBaseName(
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_writes_(SHADOW_MAX_BASE_NAME) PWCHAR BaseName
+    )
+{
+    USHORT i;
+    USHORT lastSlash = 0;
+    USHORT length;
+    USHORT copyLen;
+
+    BaseName[0] = L'\0';
+
+    if (FullPath == NULL || FullPath->Buffer == NULL || FullPath->Length == 0) {
+        return;
+    }
+
+    length = FullPath->Length / sizeof(WCHAR);
+
+    //
+    // Find last backslash
+    //
+    for (i = 0; i < length; i++) {
+        if (FullPath->Buffer[i] == L'\\' || FullPath->Buffer[i] == L'/') {
+            lastSlash = i + 1;
+        }
+    }
+
+    //
+    // Copy base name
+    //
+    copyLen = min(length - lastSlash, SHADOW_MAX_BASE_NAME - 1);
+    if (copyLen > 0) {
+        RtlCopyMemory(BaseName, &FullPath->Buffer[lastSlash], copyLen * sizeof(WCHAR));
+    }
+    BaseName[copyLen] = L'\0';
+}
+
+/**
+ * @brief Convert wide string to lowercase in place.
+ */
+static VOID
+ShadowToLowerCase(
+    _Inout_z_ PWCHAR String
+    )
+{
+    if (String == NULL) {
+        return;
+    }
+
+    while (*String != L'\0') {
+        if (*String >= L'A' && *String <= L'Z') {
+            *String = *String - L'A' + L'a';
+        }
+        String++;
+    }
+}
+
+/**
+ * @brief Check if base name matches a protected process (exact match).
+ */
+static BOOLEAN
+ShadowIsNameProtected(
+    _In_z_ PCWSTR BaseName
+    )
+{
+    ULONG i;
+
+    if (BaseName == NULL || BaseName[0] == L'\0') {
+        return FALSE;
+    }
+
+    for (i = 0; g_ProtectedProcessNames[i] != NULL; i++) {
+        //
+        // Exact case-insensitive match (names already lowercase)
+        //
+        if (_wcsicmp(BaseName, g_ProtectedProcessNames[i]) == 0) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
+ * @brief Check if base name matches a suspicious parent (exact match).
+ */
+static BOOLEAN
+ShadowIsNameSuspiciousParent(
+    _In_z_ PCWSTR BaseName
+    )
+{
+    ULONG i;
+
+    if (BaseName == NULL || BaseName[0] == L'\0') {
+        return FALSE;
+    }
+
+    for (i = 0; g_SuspiciousParentNames[i] != NULL; i++) {
+        if (_wcsicmp(BaseName, g_SuspiciousParentNames[i]) == 0) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
 
 // ============================================================================
 // PUBLIC FUNCTIONS
 // ============================================================================
 
 /**
- * @brief Initialize ALPC/process monitoring subsystem.
+ * @brief Initialize process monitoring subsystem.
  */
+_Use_decl_annotations_
 NTSTATUS
 ShadowInitializeAlpcMonitor(
-    _In_ PFLT_FILTER FilterHandle
+    _In_opt_ PFLT_FILTER FilterHandle
     )
 {
     NTSTATUS status;
@@ -123,8 +553,7 @@ ShadowInitializeAlpcMonitor(
     PAGED_CODE();
 
     //
-    // CRITICAL FIX: Atomic initialization to prevent race conditions
-    // This is the CrowdStrike Falcon approach
+    // Atomic initialization to prevent race conditions
     //
     previousState = InterlockedCompareExchange(
         &state->InitializationState,
@@ -134,13 +563,13 @@ ShadowInitializeAlpcMonitor(
 
     if (previousState == ALPC_STATE_INITIALIZED) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] ALPC monitor already initialized\n");
+                   "[ShadowStrike] Process monitor already initialized\n");
         return STATUS_ALREADY_INITIALIZED;
     }
 
     if (previousState == ALPC_STATE_INITIALIZING) {
         //
-        // Another thread is currently initializing - wait for it
+        // Another thread is initializing - wait with timeout
         //
         sleepInterval.QuadPart = -((LONGLONG)50 * 10000LL); // 50ms
 
@@ -150,18 +579,24 @@ ShadowInitializeAlpcMonitor(
             if (state->InitializationState == ALPC_STATE_INITIALIZED) {
                 return STATUS_SUCCESS;
             }
+            if (state->InitializationState == ALPC_STATE_UNINITIALIZED) {
+                //
+                // Other thread failed - we should not retry
+                //
+                return STATUS_UNSUCCESSFUL;
+            }
         }
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] ALPC monitor initialization timeout\n");
+                   "[ShadowStrike] Process monitor initialization timeout\n");
         return STATUS_TIMEOUT;
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Initializing ALPC/Process monitor (Enterprise Edition)\n");
+               "[ShadowStrike] Initializing Process Protection Monitor v3.0.0 (Enterprise)\n");
 
     //
-    // Initialize synchronization
+    // Initialize synchronization primitives
     //
     FsRtlInitializePushLock(&state->Lock);
     state->LockInitialized = TRUE;
@@ -183,24 +618,41 @@ ShadowInitializeAlpcMonitor(
     state->MaxAlerts = SHADOW_MAX_ALERT_QUEUE;
 
     //
-    // Initialize configuration (default: monitoring enabled, blocking disabled)
+    // Initialize process name cache (CRITICAL for IRQL safety)
+    //
+    status = ShadowInitializeProcessNameCache();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to initialize process name cache: 0x%X\n", status);
+        goto cleanup;
+    }
+
+    //
+    // Initialize configuration
     //
     state->MonitoringEnabled = TRUE;
-    state->BlockingEnabled = FALSE;
+    state->BlockingEnabled = FALSE;  // Start in monitor-only mode
     state->ProtectLsass = TRUE;
     state->RateLimitingEnabled = TRUE;
     state->ThreatThreshold = SHADOW_ALPC_THREAT_THRESHOLD;
     state->MaxAccessesPerSecond = SHADOW_MAX_OPENS_PER_SECOND;
-
-    //
-    // Convert rate limit window to 100ns units
-    //
     state->RateLimitWindow.QuadPart = SHADOW_RATE_LIMIT_WINDOW_MS * 10000LL;
 
     //
     // Zero statistics
     //
     RtlZeroMemory(&state->Stats, sizeof(SHADOW_ALPC_STATISTICS));
+
+    //
+    // Register process notify routine FIRST
+    // This populates the process name cache before callbacks need it
+    //
+    status = ShadowRegisterProcessNotify();
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to register process notify: 0x%X\n", status);
+        goto cleanup;
+    }
 
     //
     // Register process object callbacks
@@ -213,19 +665,7 @@ ShadowInitializeAlpcMonitor(
     }
 
     //
-    // Register process notify routine
-    //
-    status = ShadowRegisterProcessNotify();
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to register process notify: 0x%X\n", status);
-        goto cleanup;
-    }
-
-    //
-    // TODO: Create filter communication port for user-mode alerts
-    // This would be implemented with FltCreateCommunicationPort
-    // For now, we'll queue alerts internally
+    // Store filter handle for future communication port
     //
     UNREFERENCED_PARAMETER(FilterHandle);
     state->ServerPort = NULL;
@@ -237,27 +677,25 @@ ShadowInitializeAlpcMonitor(
     //
     KeQuerySystemTime(&state->InitTime);
     state->Initialized = TRUE;
-    state->ShuttingDown = FALSE;
+    InterlockedExchange(&state->ShuttingDown, FALSE);
 
     InterlockedExchange(&state->InitializationState, ALPC_STATE_INITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] ALPC/Process monitor initialized successfully\n");
+               "[ShadowStrike] Process Protection Monitor initialized successfully\n");
 
     return STATUS_SUCCESS;
 
 cleanup:
-    //
-    // Cleanup on failure
-    //
     InterlockedExchange(&state->InitializationState, ALPC_STATE_UNINITIALIZED);
     ShadowCleanupAlpcMonitor();
     return status;
 }
 
 /**
- * @brief Cleanup ALPC monitoring subsystem.
+ * @brief Cleanup process monitoring subsystem.
  */
+_Use_decl_annotations_
 VOID
 ShadowCleanupAlpcMonitor(
     VOID
@@ -268,20 +706,18 @@ ShadowCleanupAlpcMonitor(
     PAGED_CODE();
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Cleaning up ALPC/Process monitor\n");
+               "[ShadowStrike] Cleaning up Process Protection Monitor\n");
 
     //
-    // Mark as shutting down
+    // Mark as shutting down FIRST
     //
-    if (state->LockInitialized) {
-        FsRtlAcquirePushLockExclusive(&state->Lock);
-        state->ShuttingDown = TRUE;
-        InterlockedExchange(&state->InitializationState, ALPC_STATE_UNINITIALIZED);
-        FsRtlReleasePushLockExclusive(&state->Lock);
-    } else {
-        state->ShuttingDown = TRUE;
-        InterlockedExchange(&state->InitializationState, ALPC_STATE_UNINITIALIZED);
-    }
+    InterlockedExchange(&state->ShuttingDown, TRUE);
+    InterlockedExchange(&state->InitializationState, ALPC_STATE_UNINITIALIZED);
+
+    //
+    // Unregister callbacks (prevents new operations)
+    //
+    ShadowUnregisterProcessCallbacks();
 
     //
     // Unregister process notify routine
@@ -289,31 +725,26 @@ ShadowCleanupAlpcMonitor(
     ShadowUnregisterProcessNotify();
 
     //
-    // Unregister callbacks
+    // Wait briefly for any in-flight operations
     //
-    ShadowUnregisterProcessCallbacks();
+    LARGE_INTEGER delay;
+    delay.QuadPart = -((LONGLONG)100 * 10000LL); // 100ms
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
 
     //
-    // Cleanup all tracking entries
+    // Cleanup tracking entries (requires Lock)
     //
     ShadowCleanupTrackingEntries();
 
     //
-    // Cleanup alert queue
+    // Cleanup alert queue (requires AlertLock)
     //
     ShadowCleanupAlertQueue();
 
     //
-    // Close communication port
+    // Cleanup process name cache
     //
-    if (state->ServerPort != NULL) {
-        FltCloseCommunicationPort(state->ServerPort);
-        state->ServerPort = NULL;
-    }
-    if (state->ClientPort != NULL) {
-        FltCloseClientPort(g_Globals.FilterHandle, &state->ClientPort);
-        state->ClientPort = NULL;
-    }
+    ShadowCleanupProcessNameCache();
 
     //
     // Delete push lock
@@ -329,12 +760,13 @@ ShadowCleanupAlpcMonitor(
     state->Initialized = FALSE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] ALPC/Process monitor cleaned up\n");
+               "[ShadowStrike] Process Protection Monitor cleaned up\n");
 }
 
 /**
  * @brief Register process object callbacks.
  */
+_Use_decl_annotations_
 NTSTATUS
 ShadowRegisterProcessCallbacks(
     VOID
@@ -354,7 +786,6 @@ ShadowRegisterProcessCallbacks(
 
     //
     // Setup operation registration for PROCESS objects
-    // CRITICAL FIX: Use PsProcessType (documented), NOT AlpcPortObjectType (doesn't exist)
     //
     RtlZeroMemory(&operationRegistration, sizeof(operationRegistration));
     operationRegistration.ObjectType = PsProcessType;
@@ -365,7 +796,7 @@ ShadowRegisterProcessCallbacks(
     //
     // Setup callback registration
     //
-    RtlInitUnicodeString(&altitude, L"385200");  // Altitude for antivirus
+    RtlInitUnicodeString(&altitude, L"385200");
 
     RtlZeroMemory(&callbackRegistration, sizeof(callbackRegistration));
     callbackRegistration.Version = OB_FLT_REGISTRATION_VERSION;
@@ -391,7 +822,7 @@ ShadowRegisterProcessCallbacks(
     state->CallbacksRegistered = TRUE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Process callbacks registered successfully\n");
+               "[ShadowStrike] Process callbacks registered\n");
 
     return STATUS_SUCCESS;
 }
@@ -399,6 +830,7 @@ ShadowRegisterProcessCallbacks(
 /**
  * @brief Unregister process object callbacks.
  */
+_Use_decl_annotations_
 VOID
 ShadowUnregisterProcessCallbacks(
     VOID
@@ -421,6 +853,7 @@ ShadowUnregisterProcessCallbacks(
 /**
  * @brief Register process creation notification.
  */
+_Use_decl_annotations_
 NTSTATUS
 ShadowRegisterProcessNotify(
     VOID
@@ -435,9 +868,6 @@ ShadowRegisterProcessNotify(
         return STATUS_ALREADY_REGISTERED;
     }
 
-    //
-    // Register process notify routine for lifetime tracking
-    //
     status = PsSetCreateProcessNotifyRoutineEx(
         ShadowProcessNotifyRoutine,
         FALSE
@@ -451,7 +881,7 @@ ShadowRegisterProcessNotify(
 
     state->ProcessNotifyRegistered = TRUE;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Process notify routine registered\n");
 
     return STATUS_SUCCESS;
@@ -460,6 +890,7 @@ ShadowRegisterProcessNotify(
 /**
  * @brief Unregister process creation notification.
  */
+_Use_decl_annotations_
 VOID
 ShadowUnregisterProcessNotify(
     VOID
@@ -476,14 +907,17 @@ ShadowUnregisterProcessNotify(
         );
         state->ProcessNotifyRegistered = FALSE;
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "[ShadowStrike] Process notify routine unregistered\n");
     }
 }
 
 /**
- * @brief Track process access operation.
+ * @brief Track process access operation (IRQL-safe).
+ *
+ * Uses cached process names - NO paged allocations.
  */
+_Use_decl_annotations_
 NTSTATUS
 ShadowTrackProcessAccess(
     _In_ HANDLE SourcePid,
@@ -492,13 +926,11 @@ ShadowTrackProcessAccess(
     _Outptr_ PSHADOW_PROCESS_TRACKING* Tracking
     )
 {
-    NTSTATUS status;
     PSHADOW_PROCESS_TRACKING tracking = NULL;
     PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
-    ULONG threatScore = 0;
-    UNICODE_STRING sourceImageName = { 0 };
-    UNICODE_STRING targetImageName = { 0 };
-    HANDLE parentPid = NULL;
+    ULONG sourceSessionId = 0;
+    ULONG targetSessionId = 0;
+    BOOLEAN sourceInCache, targetInCache;
 
     *Tracking = NULL;
 
@@ -507,7 +939,7 @@ ShadowTrackProcessAccess(
     }
 
     //
-    // Allocate tracking structure
+    // Allocate tracking structure from NonPagedPool (IRQL-safe)
     //
     tracking = (PSHADOW_PROCESS_TRACKING)ExAllocatePoolWithTag(
         NonPagedPool,
@@ -528,57 +960,36 @@ ShadowTrackProcessAccess(
     tracking->TargetProcessId = TargetPid;
     tracking->RequestedAccess = RequestedAccess;
     tracking->ReferenceCount = 1;
+    tracking->RemovedFromList = FALSE;
 
     KeQuerySystemTime(&tracking->FirstAccessTime);
     tracking->LastAccessTime = tracking->FirstAccessTime;
 
     //
-    // Get source process name
+    // Lookup process names from cache (IRQL-safe)
     //
-    status = ShadowGetProcessImageName(SourcePid, &sourceImageName);
-    if (NT_SUCCESS(status) && sourceImageName.Buffer != NULL) {
-        USHORT copyLength = min(sourceImageName.Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
-        RtlCopyMemory(
-            tracking->SourceProcessName,
-            sourceImageName.Buffer,
-            copyLength * sizeof(WCHAR)
-        );
-        tracking->SourceProcessName[copyLength] = L'\0';
-        ExFreePoolWithTag(sourceImageName.Buffer, SHADOW_ALPC_STRING_TAG);
+    sourceInCache = ShadowLookupProcessInCache(
+        SourcePid,
+        tracking->SourceProcessName,
+        NULL,
+        &sourceSessionId,
+        &tracking->ParentProcessId
+    );
+
+    targetInCache = ShadowLookupProcessInCache(
+        TargetPid,
+        tracking->TargetProcessName,
+        &tracking->IsProtectedTarget,
+        &targetSessionId,
+        NULL
+    );
+
+    //
+    // Determine cross-session access
+    //
+    if (sourceInCache && targetInCache) {
+        tracking->IsCrossSession = (sourceSessionId != targetSessionId);
     }
-
-    //
-    // Get target process name
-    //
-    status = ShadowGetProcessImageName(TargetPid, &targetImageName);
-    if (NT_SUCCESS(status) && targetImageName.Buffer != NULL) {
-        USHORT copyLength = min(targetImageName.Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
-        RtlCopyMemory(
-            tracking->TargetProcessName,
-            targetImageName.Buffer,
-            copyLength * sizeof(WCHAR)
-        );
-        tracking->TargetProcessName[copyLength] = L'\0';
-        ExFreePoolWithTag(targetImageName.Buffer, SHADOW_ALPC_STRING_TAG);
-    }
-
-    //
-    // Get parent process ID
-    //
-    status = ShadowGetParentProcessId(SourcePid, &parentPid);
-    if (NT_SUCCESS(status)) {
-        tracking->ParentProcessId = parentPid;
-    }
-
-    //
-    // Determine if target is protected process
-    //
-    tracking->IsProtectedTarget = ShadowIsProtectedProcess(TargetPid);
-
-    //
-    // Check if cross-session
-    //
-    tracking->IsCrossSession = !ShadowIsProcessInSameSession(SourcePid, TargetPid);
 
     //
     // Analyze access rights
@@ -592,25 +1003,18 @@ ShadowTrackProcessAccess(
     //
     // Calculate initial threat score
     //
-    status = ShadowCalculateThreatScore(
-        SourcePid,
-        TargetPid,
-        RequestedAccess,
-        ProcessOperationOpen,
-        &threatScore
-    );
-
-    if (NT_SUCCESS(status)) {
-        InterlockedExchange(&tracking->ThreatScore, (LONG)threatScore);
-    }
+    ULONG threatScore = 0;
+    ShadowCalculateThreatScoreFromTracking(tracking, &threatScore);
+    InterlockedExchange(&tracking->ThreatScore, (LONG)threatScore);
 
     //
-    // Add to tracking list
+    // Add to tracking list (requires Lock at PASSIVE/APC)
+    // Note: In callback context, we may be at APC_LEVEL which is OK for push lock
     //
     FsRtlAcquirePushLockExclusive(&state->Lock);
 
     //
-    // Check if cache is full - evict LRU if needed
+    // Evict LRU if cache is full
     //
     if (state->TrackingCount >= (LONG)state->MaxTrackingEntries) {
         ShadowEvictLruTracking();
@@ -636,6 +1040,7 @@ ShadowTrackProcessAccess(
 /**
  * @brief Find existing process tracking entry.
  */
+_Use_decl_annotations_
 NTSTATUS
 ShadowFindProcessTracking(
     _In_ HANDLE SourcePid,
@@ -654,15 +1059,8 @@ ShadowFindProcessTracking(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    //
-    // CRITICAL FIX: Use EXCLUSIVE lock when modifying list (moving to front)
-    // Shared lock only allows reads, not writes
-    //
     FsRtlAcquirePushLockExclusive(&state->Lock);
 
-    //
-    // Search tracking list
-    //
     for (entry = state->TrackingList.Flink;
          entry != &state->TrackingList;
          entry = entry->Flink) {
@@ -670,7 +1068,8 @@ ShadowFindProcessTracking(
         tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
 
         if (tracking->SourceProcessId == SourcePid &&
-            tracking->TargetProcessId == TargetPid) {
+            tracking->TargetProcessId == TargetPid &&
+            !tracking->RemovedFromList) {
 
             //
             // Found - increment reference count
@@ -687,12 +1086,12 @@ ShadowFindProcessTracking(
             InterlockedExchange64(&tracking->LastAccessTime.QuadPart, currentTime.QuadPart);
 
             //
-            // Increment access count (for rate limiting)
+            // Increment access count
             //
             InterlockedIncrement(&tracking->AccessCount);
 
             //
-            // Move to front (LRU) - safe because we have EXCLUSIVE lock
+            // Move to front (LRU)
             //
             RemoveEntryList(&tracking->ListEntry);
             InsertHeadList(&state->TrackingList, &tracking->ListEntry);
@@ -714,10 +1113,13 @@ ShadowFindProcessTracking(
 
 /**
  * @brief Release process tracking reference.
+ *
+ * CRITICAL FIX: Proper reference counting without forced resets.
  */
+_Use_decl_annotations_
 VOID
 ShadowReleaseProcessTracking(
-    _In_ PSHADOW_PROCESS_TRACKING Tracking
+    _In_opt_ PSHADOW_PROCESS_TRACKING Tracking
     )
 {
     LONG newRefCount;
@@ -730,25 +1132,28 @@ ShadowReleaseProcessTracking(
 
     if (newRefCount == 0) {
         //
-        // Last reference - free the tracking entry
+        // Last reference - safe to free
+        // Entry should already be removed from list (RemovedFromList == TRUE)
         //
         ExFreePoolWithTag(Tracking, SHADOW_ALPC_PROCESS_TAG);
     }
     else if (newRefCount < 0) {
         //
-        // Reference count underflow - FATAL in production
+        // Reference count underflow - CRITICAL BUG
         //
-#if DBG
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] FATAL: Process tracking reference underflow!\n");
+                   "[ShadowStrike] CRITICAL: Reference count underflow! Tracking=%p, RefCount=%ld\n",
+                   Tracking, newRefCount);
+
+#if DBG
+        DbgBreakPoint();
 #else
         //
-        // In production builds, bugcheck immediately
-        // This prevents use-after-free exploits
+        // In production, bugcheck to prevent exploitation
         //
         KeBugCheckEx(
             DRIVER_VERIFIER_DETECTED_VIOLATION,
-            0x2000, // Custom code: Reference underflow
+            0x2000,
             (ULONG_PTR)Tracking,
             (ULONG_PTR)newRefCount,
             0
@@ -758,89 +1163,72 @@ ShadowReleaseProcessTracking(
 }
 
 /**
- * @brief Calculate threat score for process access.
+ * @brief Calculate threat score from tracking entry.
+ *
+ * IRQL-safe - uses only cached data from tracking entry.
  */
+_Use_decl_annotations_
 NTSTATUS
-ShadowCalculateThreatScore(
-    _In_ HANDLE SourcePid,
-    _In_ HANDLE TargetPid,
-    _In_ ACCESS_MASK RequestedAccess,
-    _In_ SHADOW_PROCESS_OPERATION Operation,
+ShadowCalculateThreatScoreFromTracking(
+    _In_ PSHADOW_PROCESS_TRACKING Tracking,
     _Out_ PULONG ThreatScore
     )
 {
     ULONG score = 0;
-    BOOLEAN isProtectedTarget;
-    BOOLEAN isCrossSession;
-    BOOLEAN hasCredentialAccess;
-    BOOLEAN hasInjectionAccess;
-    BOOLEAN hasSuspiciousParent;
-    HANDLE parentPid = NULL;
-    UNICODE_STRING targetImageName = { 0 };
-    NTSTATUS status;
-
-    UNREFERENCED_PARAMETER(Operation);
+    PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
+    WCHAR parentBaseName[SHADOW_MAX_BASE_NAME];
 
     *ThreatScore = 0;
 
     //
     // THREAT FACTOR 1: Protected process target (40 points)
     //
-    isProtectedTarget = ShadowIsProtectedProcess(TargetPid);
-    if (isProtectedTarget) {
+    if (Tracking->IsProtectedTarget) {
         score += 40;
 
         //
-        // Special case: LSASS access is CRITICAL
+        // Special case: LSASS access is CRITICAL (exact match)
         //
-        status = ShadowGetProcessImageName(TargetPid, &targetImageName);
-        if (NT_SUCCESS(status) && targetImageName.Buffer != NULL) {
-            _wcslwr(targetImageName.Buffer);
-            if (wcsstr(targetImageName.Buffer, L"lsass.exe") != NULL) {
-                score += 30;  // Total: 70 (LSASS access)
-                InterlockedIncrement64(&g_AlpcMonitorState.Stats.LsassAccessAttempts);
-            }
-            ExFreePoolWithTag(targetImageName.Buffer, SHADOW_ALPC_STRING_TAG);
+        if (_wcsicmp(Tracking->TargetProcessName, L"lsass.exe") == 0) {
+            score += 30;  // Total: 70 for LSASS access
+            InterlockedIncrement64(&state->Stats.LsassAccessAttempts);
         }
     }
 
     //
     // THREAT FACTOR 2: Suspicious access rights
     //
-    ShadowIsSuspiciousAccess(RequestedAccess, &hasCredentialAccess, &hasInjectionAccess);
-
-    if (hasCredentialAccess) {
-        score += 20;  // VM_READ on protected process
-        InterlockedIncrement64(&g_AlpcMonitorState.Stats.SuspiciousVmRead);
+    if (Tracking->HasCredentialAccess) {
+        score += 20;
+        InterlockedIncrement64(&state->Stats.SuspiciousVmRead);
     }
 
-    if (hasInjectionAccess) {
-        score += 25;  // CREATE_THREAD, VM_WRITE
-        InterlockedIncrement64(&g_AlpcMonitorState.Stats.InjectionAttempts);
+    if (Tracking->HasInjectionAccess) {
+        score += 25;
+        InterlockedIncrement64(&state->Stats.InjectionAttempts);
     }
 
-    if (RequestedAccess & SUSPICIOUS_HANDLE_ACCESS) {
-        score += 15;  // Handle duplication
-        InterlockedIncrement64(&g_AlpcMonitorState.Stats.HandleDuplicationAttempts);
+    if (Tracking->RequestedAccess & SUSPICIOUS_HANDLE_ACCESS) {
+        score += 15;
+        InterlockedIncrement64(&state->Stats.HandleDuplicationAttempts);
     }
 
     //
-    // THREAT FACTOR 3: Cross-session communication
+    // THREAT FACTOR 3: Cross-session access
     //
-    isCrossSession = !ShadowIsProcessInSameSession(SourcePid, TargetPid);
-    if (isCrossSession) {
-        score += 15;  // Unusual cross-session access
-        InterlockedIncrement64(&g_AlpcMonitorState.Stats.CrossSessionAccess);
+    if (Tracking->IsCrossSession) {
+        score += 15;
+        InterlockedIncrement64(&state->Stats.CrossSessionAccess);
     }
 
     //
     // THREAT FACTOR 4: Suspicious parent process
     //
-    status = ShadowGetParentProcessId(SourcePid, &parentPid);
-    if (NT_SUCCESS(status)) {
-        hasSuspiciousParent = ShadowIsSuspiciousParent(parentPid);
-        if (hasSuspiciousParent) {
-            score += 10;  // PowerShell, cmd.exe, etc.
+    if (Tracking->ParentProcessId != NULL) {
+        if (ShadowLookupProcessInCache(Tracking->ParentProcessId, parentBaseName, NULL, NULL, NULL)) {
+            if (ShadowIsNameSuspiciousParent(parentBaseName)) {
+                score += 10;
+            }
         }
     }
 
@@ -856,74 +1244,53 @@ ShadowCalculateThreatScore(
     //
     // Generate alert if high threat
     //
-    if (score >= g_AlpcMonitorState.ThreatThreshold) {
-        InterlockedIncrement64(&g_AlpcMonitorState.Stats.ThreatAlerts);
+    if (score >= state->ThreatThreshold) {
+        InterlockedIncrement64(&state->Stats.ThreatAlerts);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] THREAT DETECTED! Score=%lu, Source=%p, Target=%p, Access=0x%X\n",
-                   score, SourcePid, TargetPid, RequestedAccess);
+                   "[ShadowStrike] THREAT: Score=%lu, %ws -> %ws, Access=0x%X\n",
+                   score,
+                   Tracking->SourceProcessName[0] ? Tracking->SourceProcessName : L"<unknown>",
+                   Tracking->TargetProcessName[0] ? Tracking->TargetProcessName : L"<unknown>",
+                   Tracking->RequestedAccess);
     }
 
     return STATUS_SUCCESS;
 }
 
 /**
- * @brief Check if process is protected.
+ * @brief Check if process is protected (IRQL-safe).
  */
+_Use_decl_annotations_
 BOOLEAN
-ShadowIsProtectedProcess(
+ShadowIsProtectedProcessCached(
     _In_ HANDLE ProcessId
     )
 {
-    NTSTATUS status;
-    UNICODE_STRING imageName = { 0 };
     BOOLEAN isProtected = FALSE;
-    ULONG i;
 
     //
     // System process (PID 4) is always protected
     //
-    if (ProcessId == (HANDLE)4) {
+    if (ProcessId == (HANDLE)(ULONG_PTR)4) {
         return TRUE;
     }
 
     //
     // Idle process (PID 0) is not accessible
     //
-    if (ProcessId == (HANDLE)0) {
+    if (ProcessId == NULL) {
         return FALSE;
     }
 
-    //
-    // Get process image name
-    //
-    status = ShadowGetProcessImageName(ProcessId, &imageName);
-    if (!NT_SUCCESS(status) || imageName.Buffer == NULL) {
-        return FALSE;
-    }
-
-    //
-    // Convert to lowercase for comparison
-    //
-    _wcslwr(imageName.Buffer);
-
-    //
-    // Check against protected process list
-    //
-    for (i = 0; g_ProtectedProcessNames[i] != NULL; i++) {
-        if (wcsstr(imageName.Buffer, g_ProtectedProcessNames[i]) != NULL) {
-            isProtected = TRUE;
-            break;
-        }
-    }
-
-    ExFreePoolWithTag(imageName.Buffer, SHADOW_ALPC_STRING_TAG);
+    ShadowLookupProcessInCache(ProcessId, NULL, &isProtected, NULL, NULL);
     return isProtected;
 }
 
 /**
  * @brief Check if access rights are suspicious.
  */
+_Use_decl_annotations_
 BOOLEAN
 ShadowIsSuspiciousAccess(
     _In_ ACCESS_MASK RequestedAccess,
@@ -936,25 +1303,16 @@ ShadowIsSuspiciousAccess(
     *IsCredentialAccess = FALSE;
     *IsInjectionAccess = FALSE;
 
-    //
-    // Check for credential theft patterns
-    //
     if ((RequestedAccess & SUSPICIOUS_CREDENTIAL_ACCESS) != 0) {
         *IsCredentialAccess = TRUE;
         suspicious = TRUE;
     }
 
-    //
-    // Check for injection patterns
-    //
     if ((RequestedAccess & SUSPICIOUS_INJECTION_ACCESS) != 0) {
         *IsInjectionAccess = TRUE;
         suspicious = TRUE;
     }
 
-    //
-    // Check for handle duplication
-    //
     if ((RequestedAccess & SUSPICIOUS_HANDLE_ACCESS) != 0) {
         suspicious = TRUE;
     }
@@ -965,6 +1323,7 @@ ShadowIsSuspiciousAccess(
 /**
  * @brief Check if rate limit is violated.
  */
+_Use_decl_annotations_
 BOOLEAN
 ShadowCheckRateLimit(
     _In_ PSHADOW_PROCESS_TRACKING Tracking
@@ -979,9 +1338,6 @@ ShadowCheckRateLimit(
         return FALSE;
     }
 
-    //
-    // Get current time and calculate delta
-    //
     KeQuerySystemTime(&currentTime);
     timeDelta = currentTime.QuadPart - Tracking->FirstAccessTime.QuadPart;
 
@@ -1007,8 +1363,9 @@ ShadowCheckRateLimit(
 }
 
 /**
- * @brief Get ALPC monitoring statistics.
+ * @brief Get monitoring statistics.
  */
+_Use_decl_annotations_
 VOID
 ShadowGetAlpcStatistics(
     _Out_ PSHADOW_ALPC_STATISTICS Stats
@@ -1021,35 +1378,30 @@ ShadowGetAlpcStatistics(
     }
 
     //
-    // Copy statistics atomically
-    // Note: Individual LONG64 reads are atomic, but full structure copy is not
-    // This is acceptable for statistics gathering
+    // Copy statistics
+    // Note: Individual reads are atomic, full copy is not
+    // Acceptable for statistics gathering
     //
     RtlCopyMemory(Stats, &state->Stats, sizeof(SHADOW_ALPC_STATISTICS));
 }
 
 /**
- * @brief Queue threat alert for user-mode notification.
+ * @brief Queue threat alert (IRQL-safe).
  */
+_Use_decl_annotations_
 NTSTATUS
-ShadowQueueThreatAlert(
+ShadowQueueThreatAlertFromTracking(
     _In_ SHADOW_ALERT_TYPE AlertType,
-    _In_ HANDLE SourcePid,
-    _In_ HANDLE TargetPid,
-    _In_ ACCESS_MASK RequestedAccess,
-    _In_ ULONG ThreatScore,
+    _In_ PSHADOW_PROCESS_TRACKING Tracking,
     _In_ BOOLEAN WasBlocked
     )
 {
     PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
     PSHADOW_THREAT_ALERT alert = NULL;
     KIRQL oldIrql;
-    UNICODE_STRING sourceImageName = { 0 };
-    UNICODE_STRING targetImageName = { 0 };
-    NTSTATUS status;
 
     //
-    // Allocate alert structure
+    // Allocate alert from NonPagedPool (IRQL-safe)
     //
     alert = (PSHADOW_THREAT_ALERT)ExAllocatePoolWithTag(
         NonPagedPool,
@@ -1064,45 +1416,34 @@ ShadowQueueThreatAlert(
     RtlZeroMemory(alert, sizeof(SHADOW_THREAT_ALERT));
 
     //
-    // Initialize alert
+    // Initialize alert from tracking entry (no allocations needed)
     //
     alert->AlertType = AlertType;
-    alert->ThreatScore = ThreatScore;
-    alert->SourceProcessId = SourcePid;
-    alert->TargetProcessId = TargetPid;
-    alert->RequestedAccess = RequestedAccess;
+    alert->ThreatScore = (ULONG)Tracking->ThreatScore;
+    alert->SourceProcessId = Tracking->SourceProcessId;
+    alert->TargetProcessId = Tracking->TargetProcessId;
+    alert->RequestedAccess = Tracking->RequestedAccess;
     alert->WasBlocked = WasBlocked;
 
     KeQuerySystemTime(&alert->AlertTime);
 
     //
-    // Get process names
+    // Copy process names from tracking entry
     //
-    status = ShadowGetProcessImageName(SourcePid, &sourceImageName);
-    if (NT_SUCCESS(status) && sourceImageName.Buffer != NULL) {
-        USHORT copyLength = min(sourceImageName.Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
-        RtlCopyMemory(alert->SourceProcessName, sourceImageName.Buffer, copyLength * sizeof(WCHAR));
-        alert->SourceProcessName[copyLength] = L'\0';
-        ExFreePoolWithTag(sourceImageName.Buffer, SHADOW_ALPC_STRING_TAG);
-    }
-
-    status = ShadowGetProcessImageName(TargetPid, &targetImageName);
-    if (NT_SUCCESS(status) && targetImageName.Buffer != NULL) {
-        USHORT copyLength = min(targetImageName.Length / sizeof(WCHAR), SHADOW_MAX_PROCESS_NAME - 1);
-        RtlCopyMemory(alert->TargetProcessName, targetImageName.Buffer, copyLength * sizeof(WCHAR));
-        alert->TargetProcessName[copyLength] = L'\0';
-        ExFreePoolWithTag(targetImageName.Buffer, SHADOW_ALPC_STRING_TAG);
-    }
+    RtlCopyMemory(alert->SourceProcessName, Tracking->SourceProcessName,
+                  SHADOW_MAX_BASE_NAME * sizeof(WCHAR));
+    RtlCopyMemory(alert->TargetProcessName, Tracking->TargetProcessName,
+                  SHADOW_MAX_BASE_NAME * sizeof(WCHAR));
 
     //
     // Add to alert queue
     //
     KeAcquireSpinLock(&state->AlertLock, &oldIrql);
 
-    //
-    // Check if queue is full - drop oldest if needed
-    //
     if (state->AlertCount >= (LONG)state->MaxAlerts) {
+        //
+        // Queue full - drop oldest
+        //
         PLIST_ENTRY oldEntry = RemoveTailList(&state->AlertQueue);
         PSHADOW_THREAT_ALERT oldAlert = CONTAINING_RECORD(oldEntry, SHADOW_THREAT_ALERT, ListEntry);
         ExFreePoolWithTag(oldAlert, SHADOW_ALPC_ALERT_TAG);
@@ -1123,6 +1464,9 @@ ShadowQueueThreatAlert(
 
 /**
  * @brief Pre-operation callback for process access.
+ *
+ * CRITICAL: This runs at <= APC_LEVEL per documentation.
+ * All operations must be IRQL-safe (NonPagedPool, cached lookups).
  */
 OB_PREOP_CALLBACK_STATUS
 ShadowProcessPreOperationCallback(
@@ -1139,15 +1483,16 @@ ShadowProcessPreOperationCallback(
     PSHADOW_PROCESS_TRACKING tracking = NULL;
     BOOLEAN rateLimitViolated = FALSE;
     SHADOW_ALERT_TYPE alertType = AlertCredentialTheft;
+    BOOLEAN isCredential, isInjection;
 
     //
-    // CRITICAL FIX: NULL check to prevent BSOD
+    // Safety checks
     //
     if (OperationInformation == NULL || OperationInformation->Object == NULL) {
         return OB_PREOP_SUCCESS;
     }
 
-    if (!state->Initialized || state->ShuttingDown || !state->MonitoringEnabled) {
+    if (state == NULL || !state->Initialized || state->ShuttingDown || !state->MonitoringEnabled) {
         return OB_PREOP_SUCCESS;
     }
 
@@ -1177,9 +1522,8 @@ ShadowProcessPreOperationCallback(
         }
 
         //
-        // Skip if no suspicious access rights requested
+        // Quick check for suspicious access
         //
-        BOOLEAN isCredential, isInjection;
         if (!ShadowIsSuspiciousAccess(requestedAccess, &isCredential, &isInjection)) {
             return OB_PREOP_SUCCESS;
         }
@@ -1189,9 +1533,6 @@ ShadowProcessPreOperationCallback(
         //
         status = ShadowFindProcessTracking(sourcePid, targetPid, &tracking);
         if (!NT_SUCCESS(status)) {
-            //
-            // Not found - create new tracking entry
-            //
             status = ShadowTrackProcessAccess(sourcePid, targetPid, requestedAccess, &tracking);
             if (!NT_SUCCESS(status)) {
                 return OB_PREOP_SUCCESS;
@@ -1206,14 +1547,7 @@ ShadowProcessPreOperationCallback(
         //
         // Calculate threat score
         //
-        status = ShadowCalculateThreatScore(
-            sourcePid,
-            targetPid,
-            requestedAccess,
-            ProcessOperationOpen,
-            &threatScore
-        );
-
+        status = ShadowCalculateThreatScoreFromTracking(tracking, &threatScore);
         if (NT_SUCCESS(status)) {
             InterlockedExchange(&tracking->ThreatScore, (LONG)threatScore);
         }
@@ -1221,62 +1555,57 @@ ShadowProcessPreOperationCallback(
         //
         // Determine alert type
         //
-        if (isCredential) {
+        if (isCredential && tracking->IsProtectedTarget) {
             alertType = AlertCredentialTheft;
         } else if (isInjection) {
             alertType = AlertProcessInjection;
         } else if (requestedAccess & SUSPICIOUS_HANDLE_ACCESS) {
             alertType = AlertHandleDuplication;
+        } else if (tracking->IsCrossSession) {
+            alertType = AlertCrossSessionAccess;
         }
 
         //
-        // Block if threat score exceeds threshold or rate limit violated
+        // Block if threat score exceeds threshold
         //
         if (state->BlockingEnabled && (threatScore >= state->ThreatThreshold || rateLimitViolated)) {
             //
             // Strip dangerous access rights
             //
             if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-                OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~SUSPICIOUS_CREDENTIAL_ACCESS;
-                OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~SUSPICIOUS_INJECTION_ACCESS;
-                OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~SUSPICIOUS_HANDLE_ACCESS;
-            } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
-                OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &= ~SUSPICIOUS_CREDENTIAL_ACCESS;
-                OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &= ~SUSPICIOUS_INJECTION_ACCESS;
-                OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &= ~SUSPICIOUS_HANDLE_ACCESS;
+                OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &=
+                    ~(SUSPICIOUS_CREDENTIAL_ACCESS | SUSPICIOUS_INJECTION_ACCESS | SUSPICIOUS_HANDLE_ACCESS);
+            } else {
+                OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &=
+                    ~(SUSPICIOUS_CREDENTIAL_ACCESS | SUSPICIOUS_INJECTION_ACCESS | SUSPICIOUS_HANDLE_ACCESS);
             }
 
             tracking->IsBlocked = TRUE;
             InterlockedIncrement64(&state->Stats.BlockedOperations);
 
-            //
-            // Queue alert
-            //
-            ShadowQueueThreatAlert(alertType, sourcePid, targetPid, requestedAccess, threatScore, TRUE);
+            ShadowQueueThreatAlertFromTracking(alertType, tracking, TRUE);
 
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] BLOCKED process access: Source=%p, Target=%p, Score=%lu\n",
-                       sourcePid, targetPid, threatScore);
+                       "[ShadowStrike] BLOCKED: %ws -> %ws (Score=%lu)\n",
+                       tracking->SourceProcessName[0] ? tracking->SourceProcessName : L"<?>",
+                       tracking->TargetProcessName[0] ? tracking->TargetProcessName : L"<?>",
+                       threatScore);
         } else if (threatScore >= state->ThreatThreshold) {
             //
-            // Queue alert (not blocking, just monitoring)
+            // Alert only (not blocking)
             //
-            ShadowQueueThreatAlert(alertType, sourcePid, targetPid, requestedAccess, threatScore, FALSE);
+            ShadowQueueThreatAlertFromTracking(alertType, tracking, FALSE);
         }
 
         //
         // Release tracking reference
         //
-        if (tracking != NULL) {
-            ShadowReleaseProcessTracking(tracking);
-        }
+        ShadowReleaseProcessTracking(tracking);
+        tracking = NULL;
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        //
-        // Exception handler to prevent BSOD
-        //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Exception in process callback: 0x%X\n",
+                   "[ShadowStrike] Exception in callback: 0x%X\n",
                    GetExceptionCode());
 
         if (tracking != NULL) {
@@ -1296,18 +1625,27 @@ ShadowProcessPostOperationCallback(
     _In_ POB_POST_OPERATION_INFORMATION OperationInformation
     )
 {
-    UNREFERENCED_PARAMETER(RegistrationContext);
+    PSHADOW_ALPC_MONITOR_STATE state = (PSHADOW_ALPC_MONITOR_STATE)RegistrationContext;
+
     UNREFERENCED_PARAMETER(OperationInformation);
 
+    if (state == NULL || !state->Initialized) {
+        return;
+    }
+
     //
-    // Post-operation telemetry could be added here
-    // For now, we primarily use pre-operation callback
+    // Post-operation telemetry could log final granted access
+    // For now, pre-operation handles all detection logic
     //
 }
 
 /**
  * @brief Process creation/exit notification callback.
+ *
+ * CRITICAL: This runs at PASSIVE_LEVEL - safe for paged operations.
+ * Used to populate/invalidate the process name cache.
  */
+_Use_decl_annotations_
 VOID
 ShadowProcessNotifyRoutine(
     _Inout_ PEPROCESS Process,
@@ -1318,6 +1656,7 @@ ShadowProcessNotifyRoutine(
     PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
     PLIST_ENTRY entry, nextEntry;
     PSHADOW_PROCESS_TRACKING tracking;
+    LIST_ENTRY entriesToFree;
 
     UNREFERENCED_PARAMETER(Process);
 
@@ -1327,20 +1666,42 @@ ShadowProcessNotifyRoutine(
 
     if (CreateInfo != NULL) {
         //
-        // Process creation
+        // Process creation - cache the process name at PASSIVE_LEVEL
         //
         InterlockedIncrement64(&state->Stats.ProcessCreations);
+
+        ShadowCacheProcessName(
+            ProcessId,
+            CreateInfo->ImageFileName,
+            CreateInfo->ParentProcessId
+        );
+
     } else {
         //
-        // Process exit - cleanup tracking entries
+        // Process exit - cleanup
         //
         InterlockedIncrement64(&state->Stats.ProcessExits);
 
-        FsRtlAcquirePushLockExclusive(&state->Lock);
+        //
+        // Remove from process name cache
+        //
+        ShadowRemoveProcessFromCache(ProcessId);
 
         //
-        // Remove all tracking entries involving this process
+        // CRITICAL FIX: Proper cleanup without forced reference count manipulation
         //
+        // Strategy:
+        // 1. Remove entries from list under lock
+        // 2. Mark them as removed (RemovedFromList = TRUE)
+        // 3. Decrement reference count
+        // 4. If refcount hits 0, entry is freed; otherwise it stays alive
+        //    until the callback holding a reference releases it
+        //
+
+        InitializeListHead(&entriesToFree);
+
+        FsRtlAcquirePushLockExclusive(&state->Lock);
+
         for (entry = state->TrackingList.Flink;
              entry != &state->TrackingList;
              entry = nextEntry) {
@@ -1348,199 +1709,49 @@ ShadowProcessNotifyRoutine(
             nextEntry = entry->Flink;
             tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
 
-            if (tracking->SourceProcessId == ProcessId || tracking->TargetProcessId == ProcessId) {
+            if (tracking->SourceProcessId == ProcessId ||
+                tracking->TargetProcessId == ProcessId) {
+
+                //
+                // Remove from main list
+                //
                 RemoveEntryList(&tracking->ListEntry);
                 InterlockedDecrement(&state->TrackingCount);
 
                 //
-                // Force reference count to 1, then release (will free)
+                // Mark as removed (prevents FindProcessTracking from returning it)
                 //
-                InterlockedExchange(&tracking->ReferenceCount, 1);
-                ShadowReleaseProcessTracking(tracking);
+                InterlockedExchange(&tracking->RemovedFromList, TRUE);
+
+                //
+                // Add to temporary list for later release
+                //
+                InsertTailList(&entriesToFree, &tracking->ListEntry);
             }
         }
 
         FsRtlReleasePushLockExclusive(&state->Lock);
-    }
-}
 
-// ============================================================================
-// PRIVATE HELPER FUNCTIONS
-// ============================================================================
-
-/**
- * @brief Get process image name.
- */
-NTSTATUS
-ShadowGetProcessImageName(
-    _In_ HANDLE ProcessId,
-    _Out_ PUNICODE_STRING ImageName
-    )
-{
-    NTSTATUS status;
-    PEPROCESS process = NULL;
-    PUNICODE_STRING processImageName = NULL;
-
-    ImageName->Buffer = NULL;
-    ImageName->Length = 0;
-    ImageName->MaximumLength = 0;
-
-    //
-    // Reference the process
-    //
-    status = PsLookupProcessByProcessId(ProcessId, &process);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    //
-    // Get image name
-    //
-    status = SeLocateProcessImageName(process, &processImageName);
-    if (NT_SUCCESS(status) && processImageName != NULL && processImageName->Buffer != NULL) {
         //
-        // Allocate buffer and copy
+        // Now release references outside the lock
         //
-        ImageName->MaximumLength = processImageName->Length + sizeof(WCHAR);
-        ImageName->Buffer = (PWCH)ExAllocatePoolWithTag(
-            PagedPool,
-            ImageName->MaximumLength,
-            SHADOW_ALPC_STRING_TAG
-        );
+        while (!IsListEmpty(&entriesToFree)) {
+            entry = RemoveHeadList(&entriesToFree);
+            tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
 
-        if (ImageName->Buffer != NULL) {
-            RtlCopyUnicodeString(ImageName, processImageName);
-        } else {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        ExFreePool(processImageName);
-    }
-
-    ObDereferenceObject(process);
-    return status;
-}
-
-/**
- * @brief Get parent process ID.
- */
-NTSTATUS
-ShadowGetParentProcessId(
-    _In_ HANDLE ProcessId,
-    _Out_ PHANDLE ParentProcessId
-    )
-{
-    NTSTATUS status;
-    PEPROCESS process = NULL;
-    HANDLE parentPid = NULL;
-
-    *ParentProcessId = NULL;
-
-    status = PsLookupProcessByProcessId(ProcessId, &process);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    //
-    // Get parent process ID using undocumented offset
-    // Note: This is fragile across OS versions
-    // A production implementation would use PsGetProcessInheritedFromUniqueProcessId (Win8+)
-    //
-#if (NTDDI_VERSION >= NTDDI_WIN8)
-    parentPid = PsGetProcessInheritedFromUniqueProcessId(process);
-#else
-    //
-    // Fallback for older OS versions
-    //
-    parentPid = NULL;
-#endif
-
-    *ParentProcessId = parentPid;
-
-    ObDereferenceObject(process);
-    return STATUS_SUCCESS;
-}
-
-/**
- * @brief Check if two processes are in the same session.
- */
-BOOLEAN
-ShadowIsProcessInSameSession(
-    _In_ HANDLE Pid1,
-    _In_ HANDLE Pid2
-    )
-{
-    NTSTATUS status;
-    PEPROCESS process1 = NULL;
-    PEPROCESS process2 = NULL;
-    ULONG session1, session2;
-    BOOLEAN sameSession = FALSE;
-
-    //
-    // Reference processes
-    //
-    status = PsLookupProcessByProcessId(Pid1, &process1);
-    if (!NT_SUCCESS(status)) {
-        return FALSE;
-    }
-
-    status = PsLookupProcessByProcessId(Pid2, &process2);
-    if (!NT_SUCCESS(status)) {
-        ObDereferenceObject(process1);
-        return FALSE;
-    }
-
-    //
-    // Get session IDs
-    //
-    session1 = PsGetProcessSessionId(process1);
-    session2 = PsGetProcessSessionId(process2);
-
-    sameSession = (session1 == session2);
-
-    ObDereferenceObject(process1);
-    ObDereferenceObject(process2);
-
-    return sameSession;
-}
-
-/**
- * @brief Check if parent process is suspicious.
- */
-BOOLEAN
-ShadowIsSuspiciousParent(
-    _In_ HANDLE ParentProcessId
-    )
-{
-    NTSTATUS status;
-    UNICODE_STRING imageName = { 0 };
-    BOOLEAN isSuspicious = FALSE;
-    ULONG i;
-
-    if (ParentProcessId == NULL) {
-        return FALSE;
-    }
-
-    status = ShadowGetProcessImageName(ParentProcessId, &imageName);
-    if (!NT_SUCCESS(status) || imageName.Buffer == NULL) {
-        return FALSE;
-    }
-
-    _wcslwr(imageName.Buffer);
-
-    for (i = 0; g_SuspiciousParentNames[i] != NULL; i++) {
-        if (wcsstr(imageName.Buffer, g_SuspiciousParentNames[i]) != NULL) {
-            isSuspicious = TRUE;
-            break;
+            //
+            // Release OUR reference (the list's reference)
+            // If someone else holds a reference, entry stays alive
+            //
+            ShadowReleaseProcessTracking(tracking);
         }
     }
-
-    ExFreePoolWithTag(imageName.Buffer, SHADOW_ALPC_STRING_TAG);
-    return isSuspicious;
 }
 
 /**
- * @brief Evict least recently used tracking entry from cache.
+ * @brief Evict least recently used tracking entry.
+ *
+ * Caller must hold state->Lock exclusively.
  */
 VOID
 ShadowEvictLruTracking(
@@ -1551,29 +1762,29 @@ ShadowEvictLruTracking(
     PLIST_ENTRY entry;
     PSHADOW_PROCESS_TRACKING tracking;
 
-    //
-    // Lock must be held by caller (EXCLUSIVE)
-    //
+    if (IsListEmpty(&state->TrackingList)) {
+        return;
+    }
 
     //
     // Remove tail (least recently used)
     //
-    if (!IsListEmpty(&state->TrackingList)) {
-        entry = RemoveTailList(&state->TrackingList);
-        tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
+    entry = RemoveTailList(&state->TrackingList);
+    tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
 
-        InterlockedDecrement(&state->TrackingCount);
+    InterlockedDecrement(&state->TrackingCount);
+    InterlockedExchange(&tracking->RemovedFromList, TRUE);
 
-        //
-        // Release reference (may free if no other references)
-        //
-        ShadowReleaseProcessTracking(tracking);
-    }
+    //
+    // Release reference (may or may not free immediately)
+    //
+    ShadowReleaseProcessTracking(tracking);
 }
 
 /**
  * @brief Cleanup all tracking entries.
  */
+_Use_decl_annotations_
 VOID
 ShadowCleanupTrackingEntries(
     VOID
@@ -1582,38 +1793,52 @@ ShadowCleanupTrackingEntries(
     PSHADOW_ALPC_MONITOR_STATE state = &g_AlpcMonitorState;
     PLIST_ENTRY entry;
     PSHADOW_PROCESS_TRACKING tracking;
+    LIST_ENTRY entriesToFree;
+
+    PAGED_CODE();
 
     if (!state->LockInitialized) {
         return;
     }
 
+    InitializeListHead(&entriesToFree);
+
     FsRtlAcquirePushLockExclusive(&state->Lock);
 
-    //
-    // Free all tracking entries
-    //
     while (!IsListEmpty(&state->TrackingList)) {
         entry = RemoveHeadList(&state->TrackingList);
         tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
 
         InterlockedDecrement(&state->TrackingCount);
+        InterlockedExchange(&tracking->RemovedFromList, TRUE);
 
-        //
-        // Force reference count to 1, then release (will free)
-        //
-        InterlockedExchange(&tracking->ReferenceCount, 1);
-        ShadowReleaseProcessTracking(tracking);
+        InsertTailList(&entriesToFree, &tracking->ListEntry);
     }
 
     FsRtlReleasePushLockExclusive(&state->Lock);
 
+    //
+    // Free entries outside lock
+    //
+    while (!IsListEmpty(&entriesToFree)) {
+        entry = RemoveHeadList(&entriesToFree);
+        tracking = CONTAINING_RECORD(entry, SHADOW_PROCESS_TRACKING, ListEntry);
+
+        //
+        // Force free during shutdown
+        // At this point, no callbacks should be running
+        //
+        ExFreePoolWithTag(tracking, SHADOW_ALPC_PROCESS_TAG);
+    }
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Cleaned up all process tracking entries\n");
+               "[ShadowStrike] Cleaned up all tracking entries\n");
 }
 
 /**
  * @brief Cleanup alert queue.
  */
+_Use_decl_annotations_
 VOID
 ShadowCleanupAlertQueue(
     VOID
@@ -1626,9 +1851,6 @@ ShadowCleanupAlertQueue(
 
     KeAcquireSpinLock(&state->AlertLock, &oldIrql);
 
-    //
-    // Free all alerts
-    //
     while (!IsListEmpty(&state->AlertQueue)) {
         entry = RemoveHeadList(&state->AlertQueue);
         alert = CONTAINING_RECORD(entry, SHADOW_THREAT_ALERT, ListEntry);

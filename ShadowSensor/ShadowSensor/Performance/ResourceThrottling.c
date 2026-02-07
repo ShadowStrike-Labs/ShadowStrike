@@ -204,7 +204,6 @@ RtInitialize(
     _Outptr_ PRT_THROTTLER* Throttler
 )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PRT_THROTTLER throttler = NULL;
     ULONG i;
 
@@ -245,9 +244,11 @@ RtInitialize(
     throttler->Magic = RT_THROTTLER_MAGIC;
 
     //
-    // Initialize push locks
+    // Initialize spin lock for callback (must be usable at DISPATCH_LEVEL)
+    // Note: We use a spin lock instead of push lock because callbacks
+    // may be invoked from DPC context
     //
-    ExInitializePushLock(&throttler->CallbackLock);
+    KeInitializeSpinLock(&throttler->CallbackSpinLock);
     ExInitializePushLock(&throttler->ProcessQuotas.Lock);
 
     //
@@ -275,6 +276,11 @@ RtInitialize(
     // Initialize shutdown event
     //
     KeInitializeEvent(&throttler->ShutdownEvent, NotificationEvent, FALSE);
+
+    //
+    // Initialize callback notification event for deferred notifications
+    //
+    KeInitializeEvent(&throttler->CallbackNotifyEvent, SynchronizationEvent, FALSE);
 
     //
     // Set default configuration for all resources
@@ -437,17 +443,17 @@ RtSetLimits(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Throttler->States[Resource].StateLock);
 
-    config->SoftLimit = SoftLimit;
-    config->HardLimit = HardLimit;
-    config->CriticalLimit = CriticalLimit;
-    config->Enabled = TRUE;
-
     //
-    // Count configured resources
+    // Count configured resources (before setting Enabled)
     //
     if (!config->Enabled) {
         Throttler->ConfiguredResourceCount++;
     }
+
+    config->SoftLimit = SoftLimit;
+    config->HardLimit = HardLimit;
+    config->CriticalLimit = CriticalLimit;
+    config->Enabled = TRUE;
 
     ExReleasePushLockExclusive(&Throttler->States[Resource].StateLock);
     KeLeaveCriticalRegion();
@@ -583,6 +589,8 @@ RtRegisterCallback(
     _In_opt_ PVOID Context
 )
 {
+    KIRQL oldIrql;
+
     PAGED_CODE();
 
     if (!RtIsValidThrottler(Throttler)) {
@@ -593,14 +601,15 @@ RtRegisterCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Throttler->CallbackLock);
+    //
+    // Use spin lock for thread-safe update (matches RtpNotifyCallback)
+    //
+    KeAcquireSpinLock(&Throttler->CallbackSpinLock, &oldIrql);
 
     Throttler->ThrottleCallback = Callback;
     Throttler->CallbackContext = Context;
 
-    ExReleasePushLockExclusive(&Throttler->CallbackLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->CallbackSpinLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -611,20 +620,23 @@ RtUnregisterCallback(
     _In_ PRT_THROTTLER Throttler
 )
 {
+    KIRQL oldIrql;
+
     PAGED_CODE();
 
     if (!RtIsValidThrottler(Throttler)) {
         return;
     }
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Throttler->CallbackLock);
+    //
+    // Use spin lock for thread-safe update (matches RtpNotifyCallback)
+    //
+    KeAcquireSpinLock(&Throttler->CallbackSpinLock, &oldIrql);
 
     Throttler->ThrottleCallback = NULL;
     Throttler->CallbackContext = NULL;
 
-    ExReleasePushLockExclusive(&Throttler->CallbackLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->CallbackSpinLock, oldIrql);
 }
 
 // ============================================================================
@@ -802,10 +814,20 @@ RtSetUsage(
     InterlockedExchange64(&state->CurrentUsage, (LONG64)Value);
 
     //
-    // Update peak if necessary
+    // Update peak if necessary (lock-free CAS pattern)
     //
-    if ((LONG64)Value > state->PeakUsage) {
-        InterlockedExchange64(&state->PeakUsage, (LONG64)Value);
+    {
+        LONG64 currentPeak;
+        do {
+            currentPeak = state->PeakUsage;
+            if ((LONG64)Value <= currentPeak) {
+                break;
+            }
+        } while (InterlockedCompareExchange64(
+            &state->PeakUsage,
+            (LONG64)Value,
+            currentPeak
+        ) != currentPeak);
     }
 
     return STATUS_SUCCESS;
@@ -1154,7 +1176,7 @@ RtRemoveProcess(
 {
     PRT_PROCESS_QUOTA quota;
     ULONG bucket;
-    KIRQL oldIrql;
+    PLIST_ENTRY entry;
 
     if (!RtIsValidThrottler(Throttler)) {
         return;
@@ -1166,13 +1188,21 @@ RtRemoveProcess(
     ExAcquirePushLockExclusive(&Throttler->ProcessQuotas.Lock);
 
     //
-    // Find and remove the quota entry
+    // Search directly in the hash bucket - do NOT call RtpFindOrCreateProcessQuota
+    // to avoid deadlock (we already hold the lock)
     //
-    quota = RtpFindOrCreateProcessQuota(Throttler, ProcessId, FALSE);
-    if (quota != NULL && quota->InUse) {
-        RemoveEntryList(&quota->HashLink);
-        RtlZeroMemory(quota, sizeof(RT_PROCESS_QUOTA));
-        InterlockedDecrement(&Throttler->ProcessQuotas.ActiveCount);
+    for (entry = Throttler->ProcessQuotas.HashBuckets[bucket].Flink;
+         entry != &Throttler->ProcessQuotas.HashBuckets[bucket];
+         entry = entry->Flink) {
+
+        quota = CONTAINING_RECORD(entry, RT_PROCESS_QUOTA, HashLink);
+
+        if (quota->ProcessId == ProcessId && quota->InUse) {
+            RemoveEntryList(&quota->HashLink);
+            RtlZeroMemory(quota, sizeof(RT_PROCESS_QUOTA));
+            InterlockedDecrement(&Throttler->ProcessQuotas.ActiveCount);
+            break;
+        }
     }
 
     ExReleasePushLockExclusive(&Throttler->ProcessQuotas.Lock);
@@ -2016,18 +2046,17 @@ RtpNotifyCallback(
 {
     PRT_THROTTLE_CALLBACK callback;
     PVOID context;
+    KIRQL oldIrql;
 
     //
-    // Acquire callback lock shared
+    // Acquire spin lock (safe at DISPATCH_LEVEL from DPC)
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Throttler->CallbackLock);
+    KeAcquireSpinLock(&Throttler->CallbackSpinLock, &oldIrql);
 
     callback = Throttler->ThrottleCallback;
     context = Throttler->CallbackContext;
 
-    ExReleasePushLockShared(&Throttler->CallbackLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Throttler->CallbackSpinLock, oldIrql);
 
     if (callback != NULL) {
         callback(Event, context);

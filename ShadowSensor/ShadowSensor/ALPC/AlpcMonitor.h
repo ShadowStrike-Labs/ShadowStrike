@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * ShadowStrike NGAV - ALPC & PROCESS PROTECTION MONITOR
+ * ShadowStrike NGAV - PROCESS PROTECTION MONITOR (Enterprise Edition)
  * ============================================================================
  *
  * @file AlpcMonitor.h
@@ -12,41 +12,48 @@
  * - Token manipulation and privilege escalation
  * - Handle duplication attacks
  * - Cross-session process access
- * - Suspicious ALPC communication patterns
  *
  * Architecture (PRODUCTION-GRADE APPROACH):
  * ==========================================
- * 1. ObRegisterCallbacks for *PsProcessType* (NOT AlpcPortObjectType - that's undocumented)
- *    → Monitor PROCESS_VM_READ on LSASS (credential theft)
- *    → Monitor PROCESS_CREATE_THREAD (injection)
- *    → Monitor PROCESS_DUP_HANDLE (privilege escalation)
+ * 1. ObRegisterCallbacks for *PsProcessType* (documented API)
+ *    -> Monitor PROCESS_VM_READ on LSASS (credential theft)
+ *    -> Monitor PROCESS_CREATE_THREAD (injection)
+ *    -> Monitor PROCESS_DUP_HANDLE (privilege escalation)
  *
  * 2. Process Notify Routine (PsSetCreateProcessNotifyRoutineEx)
- *    → Track process lifetime and parent chains
- *    → Cleanup connections on process exit
- *    → Detect suspicious process creation patterns
+ *    -> Track process lifetime and parent chains
+ *    -> Cleanup connections on process exit
+ *    -> Detect suspicious process creation patterns
  *
  * 3. Thread-safe connection tracking with LRU cache
- *    → Atomic initialization (no race conditions)
- *    → Reference counting (no use-after-free)
- *    → Proper lock hierarchy (no deadlocks)
+ *    -> Atomic initialization (no race conditions)
+ *    -> Reference counting (no use-after-free)
+ *    -> Proper lock hierarchy (no deadlocks)
+ *    -> IRQL-safe operations throughout
  *
  * 4. Rate limiting and behavioral analytics
- *    → Time-windowed access tracking
- *    → Adaptive threat scoring
- *    → Anomaly detection
+ *    -> Time-windowed access tracking
+ *    -> Adaptive threat scoring
+ *    -> Anomaly detection
  *
  * 5. User-mode communication (filter communication port)
- *    → Real-time threat alerts
- *    → Telemetry streaming
- *    → Policy updates
+ *    -> Real-time threat alerts
+ *    -> Telemetry streaming
+ *    -> Policy updates
  *
  * Security Guarantees:
  * ====================
  * - BSOD-safe: Atomic initialization, proper cleanup, exception handling
  * - Thread-safe: All operations protected by appropriate locks
+ * - IRQL-safe: NonPagedPool for callback contexts, proper lock usage
  * - DoS-resistant: Rate limiting, bounded memory usage
  * - Bypass-resistant: Multiple detection layers, behavioral analytics
+ *
+ * Lock Hierarchy (MUST BE FOLLOWED):
+ * ==================================
+ * 1. state->Lock (EX_PUSH_LOCK) - Outer lock, acquired at PASSIVE/APC
+ * 2. state->AlertLock (KSPIN_LOCK) - Inner lock, raises to DISPATCH
+ * NEVER acquire Lock while holding AlertLock!
  *
  * MITRE ATT&CK Coverage:
  * ======================
@@ -60,7 +67,7 @@
  * - T1106: Native API (direct LSASS access)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition - Falcon-Grade)
+ * @version 3.0.0 (Enterprise Edition - Production Ready)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -92,7 +99,7 @@ extern "C" {
 #define SHADOW_ALPC_PROCESS_TAG 'pSSa'
 
 /**
- * @brief Pool tag for ALPC port name strings
+ * @brief Pool tag for ALPC port name strings (NonPaged for callback safety)
  */
 #define SHADOW_ALPC_STRING_TAG 'sSSa'
 
@@ -100,6 +107,11 @@ extern "C" {
  * @brief Pool tag for alert queue entries
  */
 #define SHADOW_ALPC_ALERT_TAG 'lSSa'
+
+/**
+ * @brief Pool tag for cached process names
+ */
+#define SHADOW_ALPC_CACHE_TAG 'cSSa'
 
 // ============================================================================
 // CONSTANTS
@@ -111,9 +123,14 @@ extern "C" {
 #define SHADOW_MAX_PROCESS_TRACKING 2048
 
 /**
- * @brief Maximum process image name length
+ * @brief Maximum process image name length (characters)
  */
-#define SHADOW_MAX_PROCESS_NAME 256
+#define SHADOW_MAX_PROCESS_NAME 260
+
+/**
+ * @brief Maximum base name length for exact matching
+ */
+#define SHADOW_MAX_BASE_NAME 64
 
 /**
  * @brief Rate limit window (milliseconds)
@@ -134,6 +151,16 @@ extern "C" {
  * @brief Alert queue maximum size
  */
 #define SHADOW_MAX_ALERT_QUEUE 512
+
+/**
+ * @brief Process name cache size
+ */
+#define SHADOW_PROCESS_NAME_CACHE_SIZE 256
+
+/**
+ * @brief Process name cache entry TTL (100ns units = 30 seconds)
+ */
+#define SHADOW_PROCESS_NAME_CACHE_TTL (30LL * 10000000LL)
 
 /**
  * @brief Initialization states
@@ -265,7 +292,51 @@ typedef struct _SHADOW_ALPC_STATISTICS {
     /// @brief Process exits tracked
     volatile LONG64 ProcessExits;
 
+    /// @brief Process name cache hits
+    volatile LONG64 NameCacheHits;
+
+    /// @brief Process name cache misses
+    volatile LONG64 NameCacheMisses;
+
 } SHADOW_ALPC_STATISTICS, *PSHADOW_ALPC_STATISTICS;
+
+// ============================================================================
+// PROCESS NAME CACHE ENTRY (IRQL-SAFE)
+// ============================================================================
+
+/**
+ * @brief Cached process name entry for IRQL-safe lookups.
+ *
+ * This cache allows process name lookups from DISPATCH_LEVEL callbacks
+ * without allocating paged memory.
+ */
+typedef struct _SHADOW_PROCESS_NAME_CACHE_ENTRY {
+
+    /// @brief Process ID
+    HANDLE ProcessId;
+
+    /// @brief Base name (null-terminated, lowercase)
+    WCHAR BaseName[SHADOW_MAX_BASE_NAME];
+
+    /// @brief Full path (null-terminated, lowercase)
+    WCHAR FullPath[SHADOW_MAX_PROCESS_NAME];
+
+    /// @brief Cache entry timestamp
+    LARGE_INTEGER Timestamp;
+
+    /// @brief Is this entry valid?
+    BOOLEAN Valid;
+
+    /// @brief Is this a protected process?
+    BOOLEAN IsProtected;
+
+    /// @brief Session ID
+    ULONG SessionId;
+
+    /// @brief Parent process ID (cached at creation time)
+    HANDLE ParentProcessId;
+
+} SHADOW_PROCESS_NAME_CACHE_ENTRY, *PSHADOW_PROCESS_NAME_CACHE_ENTRY;
 
 // ============================================================================
 // PROCESS TRACKING ENTRY
@@ -275,6 +346,7 @@ typedef struct _SHADOW_ALPC_STATISTICS {
  * @brief Process access tracking entry.
  *
  * Tracks per-process access patterns for behavioral analysis.
+ * All fields are safe for access at DISPATCH_LEVEL.
  */
 typedef struct _SHADOW_PROCESS_TRACKING {
 
@@ -287,11 +359,11 @@ typedef struct _SHADOW_PROCESS_TRACKING {
     /// @brief Target process ID (accessed)
     HANDLE TargetProcessId;
 
-    /// @brief Source process name
-    WCHAR SourceProcessName[SHADOW_MAX_PROCESS_NAME];
+    /// @brief Source process base name (from cache, IRQL-safe)
+    WCHAR SourceProcessName[SHADOW_MAX_BASE_NAME];
 
-    /// @brief Target process name
-    WCHAR TargetProcessName[SHADOW_MAX_PROCESS_NAME];
+    /// @brief Target process base name (from cache, IRQL-safe)
+    WCHAR TargetProcessName[SHADOW_MAX_BASE_NAME];
 
     /// @brief Parent process ID of source
     HANDLE ParentProcessId;
@@ -329,8 +401,11 @@ typedef struct _SHADOW_PROCESS_TRACKING {
     /// @brief Reference count for safe cleanup
     volatile LONG ReferenceCount;
 
+    /// @brief Entry has been removed from list (pending free)
+    volatile LONG RemovedFromList;
+
     /// @brief Padding for alignment
-    UCHAR Reserved[2];
+    UCHAR Reserved[4];
 
 } SHADOW_PROCESS_TRACKING, *PSHADOW_PROCESS_TRACKING;
 
@@ -358,11 +433,11 @@ typedef struct _SHADOW_THREAT_ALERT {
     /// @brief Target process ID
     HANDLE TargetProcessId;
 
-    /// @brief Source process name
-    WCHAR SourceProcessName[SHADOW_MAX_PROCESS_NAME];
+    /// @brief Source process name (base name only)
+    WCHAR SourceProcessName[SHADOW_MAX_BASE_NAME];
 
-    /// @brief Target process name
-    WCHAR TargetProcessName[SHADOW_MAX_PROCESS_NAME];
+    /// @brief Target process name (base name only)
+    WCHAR TargetProcessName[SHADOW_MAX_BASE_NAME];
 
     /// @brief Alert timestamp
     LARGE_INTEGER AlertTime;
@@ -373,6 +448,9 @@ typedef struct _SHADOW_THREAT_ALERT {
     /// @brief Was this access blocked?
     BOOLEAN WasBlocked;
 
+    /// @brief Padding
+    UCHAR Reserved[3];
+
 } SHADOW_THREAT_ALERT, *PSHADOW_THREAT_ALERT;
 
 // ============================================================================
@@ -380,7 +458,15 @@ typedef struct _SHADOW_THREAT_ALERT {
 // ============================================================================
 
 /**
- * @brief ALPC monitor global state.
+ * @brief Process monitor global state.
+ *
+ * Lock Hierarchy (MUST follow this order):
+ * 1. Lock (EX_PUSH_LOCK) - for TrackingList, acquired at PASSIVE/APC
+ * 2. NameCacheLock (KSPIN_LOCK) - for ProcessNameCache, raises to DISPATCH
+ * 3. AlertLock (KSPIN_LOCK) - for AlertQueue, raises to DISPATCH
+ *
+ * NEVER acquire a higher-numbered lock while holding a lower-numbered lock
+ * when the lower lock is a spinlock (would cause IRQL issues).
  */
 typedef struct _SHADOW_ALPC_MONITOR_STATE {
 
@@ -388,11 +474,17 @@ typedef struct _SHADOW_ALPC_MONITOR_STATE {
     // Synchronization
     //
 
-    /// @brief Lock protecting this structure
+    /// @brief Lock protecting TrackingList (PASSIVE/APC level only)
     EX_PUSH_LOCK Lock;
 
-    /// @brief TRUE if lock was initialized
+    /// @brief TRUE if Lock was initialized
     BOOLEAN LockInitialized;
+
+    /// @brief Lock protecting ProcessNameCache (can be acquired at DISPATCH)
+    KSPIN_LOCK NameCacheLock;
+
+    /// @brief Lock protecting AlertQueue (can be acquired at DISPATCH)
+    KSPIN_LOCK AlertLock;
 
     /// @brief Atomic initialization state (0/1/2)
     volatile LONG InitializationState;
@@ -415,6 +507,16 @@ typedef struct _SHADOW_ALPC_MONITOR_STATE {
     BOOLEAN ProcessNotifyRegistered;
 
     //
+    // Process Name Cache (IRQL-safe)
+    //
+
+    /// @brief Process name cache (preallocated NonPagedPool)
+    PSHADOW_PROCESS_NAME_CACHE_ENTRY ProcessNameCache;
+
+    /// @brief Process name cache size
+    ULONG ProcessNameCacheSize;
+
+    //
     // Process Tracking
     //
 
@@ -430,9 +532,6 @@ typedef struct _SHADOW_ALPC_MONITOR_STATE {
     //
     // Alert Queue
     //
-
-    /// @brief Lock for alert queue
-    KSPIN_LOCK AlertLock;
 
     /// @brief Alert queue list
     LIST_ENTRY AlertQueue;
@@ -483,7 +582,7 @@ typedef struct _SHADOW_ALPC_MONITOR_STATE {
     BOOLEAN Initialized;
 
     /// @brief TRUE if shutting down
-    BOOLEAN ShuttingDown;
+    volatile LONG ShuttingDown;
 
     /// @brief Initialization timestamp
     LARGE_INTEGER InitTime;
@@ -508,7 +607,7 @@ typedef struct _SHADOW_ALPC_MONITOR_STATE {
 // ============================================================================
 
 /**
- * @brief Global ALPC monitor state.
+ * @brief Global process monitor state.
  *
  * Defined in AlpcMonitor.c.
  */
@@ -519,7 +618,7 @@ extern SHADOW_ALPC_MONITOR_STATE g_AlpcMonitorState;
 // ============================================================================
 
 /**
- * @brief Initialize ALPC/process monitoring subsystem.
+ * @brief Initialize process monitoring subsystem.
  *
  * Registers object callbacks for process access, process notify routine,
  * and initializes tracking infrastructure.
@@ -534,19 +633,22 @@ extern SHADOW_ALPC_MONITOR_STATE g_AlpcMonitorState;
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowInitializeAlpcMonitor(
-    _In_ PFLT_FILTER FilterHandle
+    _In_opt_ PFLT_FILTER FilterHandle
     );
 
 /**
- * @brief Cleanup ALPC monitoring subsystem.
+ * @brief Cleanup process monitoring subsystem.
  *
  * Unregisters callbacks, frees all tracked entries, and cleans up
  * resources. BSOD-safe - handles partial initialization.
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupAlpcMonitor(
     VOID
@@ -563,6 +665,8 @@ ShadowCleanupAlpcMonitor(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowRegisterProcessCallbacks(
     VOID
@@ -575,6 +679,7 @@ ShadowRegisterProcessCallbacks(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowUnregisterProcessCallbacks(
     VOID
@@ -589,6 +694,8 @@ ShadowUnregisterProcessCallbacks(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowRegisterProcessNotify(
     VOID
@@ -599,15 +706,17 @@ ShadowRegisterProcessNotify(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowUnregisterProcessNotify(
     VOID
     );
 
 /**
- * @brief Track process access operation.
+ * @brief Track process access operation (IRQL-safe version).
  *
  * Creates tracking entry for process access with threat scoring.
+ * Uses cached process names for IRQL safety.
  *
  * @param SourcePid         Source process ID
  * @param TargetPid         Target process ID
@@ -617,7 +726,10 @@ ShadowUnregisterProcessNotify(
  * @return STATUS_SUCCESS on success
  *
  * @note Caller must call ShadowReleaseProcessTracking when done
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowTrackProcessAccess(
     _In_ HANDLE SourcePid,
@@ -636,7 +748,11 @@ ShadowTrackProcessAccess(
  * @param Tracking      [out] Receives tracking if found (caller must release)
  *
  * @return STATUS_SUCCESS if found, STATUS_NOT_FOUND otherwise
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowFindProcessTracking(
     _In_ HANDLE SourcePid,
@@ -650,10 +766,13 @@ ShadowFindProcessTracking(
  * Decrements reference count. When count reaches zero, entry is freed.
  *
  * @param Tracking      Tracking entry to release
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowReleaseProcessTracking(
-    _In_ PSHADOW_PROCESS_TRACKING Tracking
+    _In_opt_ PSHADOW_PROCESS_TRACKING Tracking
     );
 
 /**
@@ -667,35 +786,35 @@ ShadowReleaseProcessTracking(
  * - Rate limiting violations
  * - Behavioral patterns
  *
- * @param SourcePid         Source process ID
- * @param TargetPid         Target process ID
- * @param RequestedAccess   Access rights requested
- * @param Operation         Operation type
- * @param ThreatScore       [out] Receives threat score (0-100)
+ * @param Tracking      Process tracking entry with cached data
+ * @param ThreatScore   [out] Receives threat score (0-100)
  *
  * @return STATUS_SUCCESS
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
-ShadowCalculateThreatScore(
-    _In_ HANDLE SourcePid,
-    _In_ HANDLE TargetPid,
-    _In_ ACCESS_MASK RequestedAccess,
-    _In_ SHADOW_PROCESS_OPERATION Operation,
+ShadowCalculateThreatScoreFromTracking(
+    _In_ PSHADOW_PROCESS_TRACKING Tracking,
     _Out_ PULONG ThreatScore
     );
 
 /**
- * @brief Check if process is protected.
+ * @brief Check if process is protected (IRQL-safe).
  *
- * Determines if target process is a protected system process that
- * requires additional monitoring (LSASS, csrss.exe, services.exe, etc.).
+ * Uses cached process names for IRQL safety.
  *
  * @param ProcessId     Process ID to check
  *
  * @return TRUE if protected, FALSE otherwise
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
-ShadowIsProtectedProcess(
+ShadowIsProtectedProcessCached(
     _In_ HANDLE ProcessId
     );
 
@@ -709,7 +828,10 @@ ShadowIsProtectedProcess(
  * @param IsInjectionAccess  [out] TRUE if injection access detected
  *
  * @return TRUE if suspicious, FALSE otherwise
+ *
+ * @irql Any
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowIsSuspiciousAccess(
     _In_ ACCESS_MASK RequestedAccess,
@@ -725,18 +847,23 @@ ShadowIsSuspiciousAccess(
  * @param Tracking      Process tracking entry
  *
  * @return TRUE if rate limit exceeded, FALSE otherwise
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowCheckRateLimit(
     _In_ PSHADOW_PROCESS_TRACKING Tracking
     );
 
 /**
- * @brief Get ALPC monitoring statistics.
+ * @brief Get monitoring statistics.
  *
  * Thread-safe retrieval of current statistics.
  *
  * @param Stats     [out] Receives statistics snapshot
+ *
+ * @irql Any
  */
 VOID
 ShadowGetAlpcStatistics(
@@ -747,24 +874,115 @@ ShadowGetAlpcStatistics(
  * @brief Queue threat alert for user-mode notification.
  *
  * Adds alert to queue for delivery to user-mode service.
+ * Uses cached process names for IRQL safety.
  *
  * @param AlertType         Alert type
- * @param SourcePid         Source process ID
- * @param TargetPid         Target process ID
- * @param RequestedAccess   Access rights
- * @param ThreatScore       Threat score
+ * @param Tracking          Process tracking entry
  * @param WasBlocked        Was operation blocked?
  *
  * @return STATUS_SUCCESS or STATUS_INSUFFICIENT_RESOURCES
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
-ShadowQueueThreatAlert(
+ShadowQueueThreatAlertFromTracking(
     _In_ SHADOW_ALERT_TYPE AlertType,
-    _In_ HANDLE SourcePid,
-    _In_ HANDLE TargetPid,
-    _In_ ACCESS_MASK RequestedAccess,
-    _In_ ULONG ThreatScore,
+    _In_ PSHADOW_PROCESS_TRACKING Tracking,
     _In_ BOOLEAN WasBlocked
+    );
+
+// ============================================================================
+// PROCESS NAME CACHE FUNCTIONS (IRQL-SAFE)
+// ============================================================================
+
+/**
+ * @brief Initialize process name cache.
+ *
+ * Allocates NonPagedPool cache for IRQL-safe process name lookups.
+ *
+ * @return STATUS_SUCCESS or STATUS_INSUFFICIENT_RESOURCES
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowInitializeProcessNameCache(
+    VOID
+    );
+
+/**
+ * @brief Cleanup process name cache.
+ *
+ * Frees the process name cache.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowCleanupProcessNameCache(
+    VOID
+    );
+
+/**
+ * @brief Add process to name cache.
+ *
+ * Called from process notify routine at PASSIVE_LEVEL when process is created.
+ *
+ * @param ProcessId         Process ID
+ * @param ImageFileName     Process image file name (from CreateInfo)
+ * @param ParentProcessId   Parent process ID
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ShadowCacheProcessName(
+    _In_ HANDLE ProcessId,
+    _In_opt_ PUNICODE_STRING ImageFileName,
+    _In_ HANDLE ParentProcessId
+    );
+
+/**
+ * @brief Remove process from name cache.
+ *
+ * Called from process notify routine when process exits.
+ *
+ * @param ProcessId     Process ID to remove
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowRemoveProcessFromCache(
+    _In_ HANDLE ProcessId
+    );
+
+/**
+ * @brief Lookup process in name cache.
+ *
+ * Fast, IRQL-safe lookup of cached process information.
+ *
+ * @param ProcessId     Process ID to lookup
+ * @param BaseName      [out] Receives base name (optional, SHADOW_MAX_BASE_NAME)
+ * @param IsProtected   [out] Receives protected status (optional)
+ * @param SessionId     [out] Receives session ID (optional)
+ * @param ParentPid     [out] Receives parent PID (optional)
+ *
+ * @return TRUE if found in cache, FALSE otherwise
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowLookupProcessInCache(
+    _In_ HANDLE ProcessId,
+    _Out_writes_opt_(SHADOW_MAX_BASE_NAME) PWCHAR BaseName,
+    _Out_opt_ PBOOLEAN IsProtected,
+    _Out_opt_ PULONG SessionId,
+    _Out_opt_ PHANDLE ParentPid
     );
 
 // ============================================================================
@@ -776,6 +994,8 @@ ShadowQueueThreatAlert(
  *
  * Called before process handle is opened or duplicated.
  * Implements threat detection and access control.
+ *
+ * @irql <= APC_LEVEL (per ObRegisterCallbacks documentation)
  */
 OB_PREOP_CALLBACK_STATUS
 ShadowProcessPreOperationCallback(
@@ -788,6 +1008,8 @@ ShadowProcessPreOperationCallback(
  *
  * Called after process handle operation completes.
  * Used for telemetry and tracking.
+ *
+ * @irql <= APC_LEVEL
  */
 VOID
 ShadowProcessPostOperationCallback(
@@ -799,8 +1021,11 @@ ShadowProcessPostOperationCallback(
  * @brief Process creation/exit notification callback.
  *
  * Called when process is created or destroyed.
- * Tracks process lifetime and cleans up tracking entries.
+ * Populates process name cache and cleans up tracking entries.
+ *
+ * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowProcessNotifyRoutine(
     _Inout_ PEPROCESS Process,
@@ -811,7 +1036,9 @@ ShadowProcessNotifyRoutine(
 /**
  * @brief Evict least recently used tracking entry from cache.
  *
- * Called when tracking cache is full.
+ * Called when tracking cache is full. Lock must be held by caller.
+ *
+ * @irql <= DISPATCH_LEVEL (caller holds lock)
  */
 VOID
 ShadowEvictLruTracking(
@@ -822,7 +1049,10 @@ ShadowEvictLruTracking(
  * @brief Cleanup all tracking entries.
  *
  * Frees all tracked entries. Called during shutdown.
+ *
+ * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupTrackingEntries(
     VOID
@@ -832,7 +1062,10 @@ ShadowCleanupTrackingEntries(
  * @brief Cleanup alert queue.
  *
  * Frees all pending alerts.
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowCleanupAlertQueue(
     VOID

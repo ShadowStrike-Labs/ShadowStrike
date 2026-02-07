@@ -589,7 +589,9 @@ typedef struct _RT_THROTTLER {
     /// Global throttle callback
     PRT_THROTTLE_CALLBACK ThrottleCallback;
     PVOID CallbackContext;
-    EX_PUSH_LOCK CallbackLock;
+    EX_PUSH_LOCK CallbackLock;           // For registration at APC_LEVEL
+    KSPIN_LOCK CallbackSpinLock;         // For invocation at DISPATCH_LEVEL
+    KEVENT CallbackNotifyEvent;          // For deferred callback notifications
 
     /// Per-process quota tracking
     struct {

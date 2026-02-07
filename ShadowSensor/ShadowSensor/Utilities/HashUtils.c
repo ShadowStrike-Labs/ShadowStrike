@@ -14,8 +14,28 @@
  * - HMAC support for message authentication
  * - Multi-algorithm parallel hashing for threat intelligence
  *
+ * CRITICAL FIXES IN THIS VERSION (v2.1.0):
+ * =========================================
+ * 1. PUSH LOCK INITIALIZATION: EX_PUSH_LOCK now properly initialized via
+ *    ExInitializePushLock before any use
+ *
+ * 2. INITIALIZATION STATE MACHINE: Atomic 3-state initialization prevents
+ *    race conditions during concurrent Initialize calls
+ *
+ * 3. CLEANUP TIMEOUT: Bounded wait loop prevents infinite hang if operations
+ *    never complete (10 second timeout)
+ *
+ * 4. PROVIDER VALIDATION: All multi-hash operations verify provider
+ *    initialization before use
+ *
+ * 5. CNG ERROR HANDLING: All BCryptHashData return values checked
+ *
+ * 6. THREAD-SAFE STATISTICS: Reset uses proper atomic operations
+ *
+ * 7. IRQL VALIDATION: Debug assertions verify IRQL requirements
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Production Ready)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -37,6 +57,23 @@
 // ============================================================================
 // INTERNAL STRUCTURES
 // ============================================================================
+
+/**
+ * @brief Initialization state constants
+ */
+#define HASH_STATE_UNINITIALIZED    0
+#define HASH_STATE_INITIALIZING     1
+#define HASH_STATE_INITIALIZED      2
+
+/**
+ * @brief Cleanup timeout (10 seconds in 100ns units)
+ */
+#define HASH_CLEANUP_TIMEOUT_100NS  (10LL * 10000000LL)
+
+/**
+ * @brief Maximum wait iterations for cleanup (100 iterations * 100ms = 10 seconds)
+ */
+#define HASH_CLEANUP_MAX_WAIT_ITERATIONS    100
 
 /**
  * @brief Internal algorithm provider state
@@ -61,6 +98,11 @@ typedef struct _SHADOWSTRIKE_HASH_PROVIDER {
 
 /**
  * @brief Global hash subsystem state
+ *
+ * CRITICAL FIX v2.1.0:
+ * - InitLock is now properly initialized via ExInitializePushLock
+ * - Initialization uses proper atomic state machine
+ * - Cleanup has bounded wait with timeout
  */
 typedef struct _SHADOWSTRIKE_HASH_GLOBALS {
     /// Algorithm providers
@@ -70,18 +112,24 @@ typedef struct _SHADOWSTRIKE_HASH_GLOBALS {
     BCRYPT_ALG_HANDLE HmacSha256Handle;
     ULONG HmacSha256ObjectSize;
 
-    /// Subsystem initialization state
-    volatile LONG InitializationCount;
-    BOOLEAN Initialized;
+    /// Subsystem initialization state machine
+    /// Values: HASH_STATE_UNINITIALIZED (0), HASH_STATE_INITIALIZING (1), HASH_STATE_INITIALIZED (2)
+    volatile LONG InitializationState;
 
-    /// Synchronization
+    /// Reference count for nested Initialize/Cleanup calls
+    volatile LONG ReferenceCount;
+
+    /// Synchronization - MUST be initialized before use
     EX_PUSH_LOCK InitLock;
+
+    /// TRUE if InitLock has been initialized
+    BOOLEAN LockInitialized;
 
     /// Statistics
     SHADOWSTRIKE_HASH_STATISTICS Statistics;
 
-    /// Reserved
-    UCHAR Reserved[4];
+    /// Reserved for alignment
+    UCHAR Reserved[3];
 
 } SHADOWSTRIKE_HASH_GLOBALS, *PSHADOWSTRIKE_HASH_GLOBALS;
 
@@ -389,21 +437,64 @@ ShadowStrikeInitializeHashUtils(
     ULONG ResultLength = 0;
     SHADOWSTRIKE_HASH_ALGORITHM Algorithm;
     PCWSTR CngAlgorithmString;
-    BOOLEAN AnyProviderInitialized = FALSE;
+    LONG PreviousState;
 
     PAGED_CODE();
 
     //
-    // Use push lock for thread-safe initialization
+    // CRITICAL FIX: Atomic state machine for thread-safe initialization
+    // Prevents race conditions when multiple threads call Initialize concurrently
     //
-    ExAcquirePushLockExclusive(&g_HashGlobals.InitLock);
+    PreviousState = InterlockedCompareExchange(
+        &g_HashGlobals.InitializationState,
+        HASH_STATE_INITIALIZING,
+        HASH_STATE_UNINITIALIZED
+    );
+
+    if (PreviousState == HASH_STATE_INITIALIZED) {
+        //
+        // Already initialized - just increment reference count
+        //
+        InterlockedIncrement(&g_HashGlobals.ReferenceCount);
+        return STATUS_SUCCESS;
+    }
+
+    if (PreviousState == HASH_STATE_INITIALIZING) {
+        //
+        // Another thread is initializing - wait for completion with timeout
+        //
+        LARGE_INTEGER WaitInterval;
+        WaitInterval.QuadPart = -((LONGLONG)10 * 10000LL); // 10ms
+
+        for (ULONG i = 0; i < 500; i++) { // 5 second timeout
+            KeDelayExecutionThread(KernelMode, FALSE, &WaitInterval);
+
+            LONG CurrentState = g_HashGlobals.InitializationState;
+            if (CurrentState == HASH_STATE_INITIALIZED) {
+                InterlockedIncrement(&g_HashGlobals.ReferenceCount);
+                return STATUS_SUCCESS;
+            }
+            if (CurrentState == HASH_STATE_UNINITIALIZED) {
+                // Other thread failed - don't retry, return failure
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
+
+        // Timeout waiting for initialization
+        return STATUS_TIMEOUT;
+    }
 
     //
-    // Check if already initialized (reference counting)
+    // We won the race - we're the initializing thread
+    // PreviousState == HASH_STATE_UNINITIALIZED
     //
-    if (InterlockedIncrement(&g_HashGlobals.InitializationCount) > 1) {
-        ExReleasePushLockExclusive(&g_HashGlobals.InitLock);
-        return STATUS_SUCCESS;
+
+    //
+    // CRITICAL FIX: Initialize push lock BEFORE first use
+    //
+    if (!g_HashGlobals.LockInitialized) {
+        ExInitializePushLock(&g_HashGlobals.InitLock);
+        g_HashGlobals.LockInitialized = TRUE;
     }
 
     //
@@ -483,7 +574,6 @@ ShadowStrikeInitializeHashUtils(
         }
 
         g_HashGlobals.Providers[Algorithm].Initialized = TRUE;
-        AnyProviderInitialized = TRUE;
     }
 
     //
@@ -515,8 +605,12 @@ ShadowStrikeInitializeHashUtils(
         goto CleanupOnFailure;
     }
 
-    g_HashGlobals.Initialized = TRUE;
-    ExReleasePushLockExclusive(&g_HashGlobals.InitLock);
+    //
+    // Mark as initialized and set initial reference count
+    //
+    g_HashGlobals.ReferenceCount = 1;
+    InterlockedExchange(&g_HashGlobals.InitializationState, HASH_STATE_INITIALIZED);
+
     return STATUS_SUCCESS;
 
 CleanupOnFailure:
@@ -541,8 +635,11 @@ CleanupOnFailure:
         g_HashGlobals.HmacSha256Handle = NULL;
     }
 
-    InterlockedDecrement(&g_HashGlobals.InitializationCount);
-    ExReleasePushLockExclusive(&g_HashGlobals.InitLock);
+    //
+    // Reset state to uninitialized so another attempt can be made
+    //
+    InterlockedExchange(&g_HashGlobals.InitializationState, HASH_STATE_UNINITIALIZED);
+
     return Status;
 }
 
@@ -553,26 +650,46 @@ ShadowStrikeCleanupHashUtils(
     )
 {
     SHADOWSTRIKE_HASH_ALGORITHM Algorithm;
+    ULONG WaitIterations;
 
     PAGED_CODE();
 
-    ExAcquirePushLockExclusive(&g_HashGlobals.InitLock);
-
     //
-    // Reference counting - only cleanup when last reference released
+    // Verify we're initialized
     //
-    if (InterlockedDecrement(&g_HashGlobals.InitializationCount) > 0) {
-        ExReleasePushLockExclusive(&g_HashGlobals.InitLock);
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         return;
     }
 
     //
-    // Wait for outstanding operations to complete
+    // Reference counting - only cleanup when last reference released
     //
-    while (g_HashGlobals.Statistics.CurrentOperations > 0) {
+    if (InterlockedDecrement(&g_HashGlobals.ReferenceCount) > 0) {
+        return;
+    }
+
+    //
+    // CRITICAL FIX: Bounded wait for outstanding operations with timeout
+    // Prevents infinite hang if operations never complete
+    //
+    WaitIterations = 0;
+    while (g_HashGlobals.Statistics.CurrentOperations > 0 &&
+           WaitIterations < HASH_CLEANUP_MAX_WAIT_ITERATIONS) {
+
         LARGE_INTEGER Delay;
-        Delay.QuadPart = -10000; // 1ms
+        Delay.QuadPart = -((LONGLONG)100 * 10000LL); // 100ms per iteration
         KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        WaitIterations++;
+    }
+
+    if (WaitIterations >= HASH_CLEANUP_MAX_WAIT_ITERATIONS) {
+        //
+        // Timeout reached - log warning but proceed with cleanup
+        // Outstanding operations will fail gracefully
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] HashUtils cleanup timeout: %ld operations still pending\n",
+                   g_HashGlobals.Statistics.CurrentOperations);
     }
 
     //
@@ -599,9 +716,10 @@ ShadowStrikeCleanupHashUtils(
         g_HashGlobals.HmacSha256Handle = NULL;
     }
 
-    g_HashGlobals.Initialized = FALSE;
-
-    ExReleasePushLockExclusive(&g_HashGlobals.InitLock);
+    //
+    // Mark as uninitialized
+    //
+    InterlockedExchange(&g_HashGlobals.InitializationState, HASH_STATE_UNINITIALIZED);
 }
 
 _Use_decl_annotations_
@@ -610,7 +728,7 @@ ShadowStrikeIsHashUtilsInitialized(
     VOID
     )
 {
-    return g_HashGlobals.Initialized;
+    return (g_HashGlobals.InitializationState == HASH_STATE_INITIALIZED);
 }
 
 _Use_decl_annotations_
@@ -632,16 +750,24 @@ ShadowStrikeResetHashStatistics(
     VOID
     )
 {
-    LONG CurrentOps = g_HashGlobals.Statistics.CurrentOperations;
-    LONG PeakOps = g_HashGlobals.Statistics.PeakOperations;
-
-    RtlZeroMemory(&g_HashGlobals.Statistics, sizeof(SHADOWSTRIKE_HASH_STATISTICS));
-
     //
-    // Preserve current/peak as they're still relevant
+    // CRITICAL FIX: Thread-safe statistics reset using atomic operations
+    // Preserve CurrentOperations and PeakOperations as they track live state
     //
-    g_HashGlobals.Statistics.CurrentOperations = CurrentOps;
-    g_HashGlobals.Statistics.PeakOperations = PeakOps;
+    InterlockedExchange64(&g_HashGlobals.Statistics.TotalOperations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.SuccessfulOperations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.FailedOperations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.TotalBytesHashed, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.Sha256Operations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.Sha1Operations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.Md5Operations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.Sha512Operations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.FileHashOperations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.BufferHashOperations, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.SizeLimitExceeded, 0);
+    InterlockedExchange64(&g_HashGlobals.Statistics.CngErrors, 0);
+    // Note: CurrentOperations and PeakOperations are intentionally NOT reset
+    // as they track live operational state
 }
 
 // ============================================================================
@@ -1258,6 +1384,7 @@ ShadowStrikeComputeFileMultiHash(
     )
 {
     NTSTATUS Status;
+    NTSTATUS HashStatus;
     BCRYPT_HASH_HANDLE hHashSha256 = NULL;
     BCRYPT_HASH_HANDLE hHashSha1 = NULL;
     BCRYPT_HASH_HANDLE hHashMd5 = NULL;
@@ -1271,6 +1398,9 @@ ShadowStrikeComputeFileMultiHash(
     ULONG BytesRead;
     FILE_STANDARD_INFORMATION FileInfo;
     ULONG Flags;
+    BOOLEAN Sha256Failed = FALSE;
+    BOOLEAN Sha1Failed = FALSE;
+    BOOLEAN Md5Failed = FALSE;
 
     PAGED_CODE();
 
@@ -1296,9 +1426,23 @@ ShadowStrikeComputeFileMultiHash(
     if (MaxFileSize == 0) MaxFileSize = HASH_MAX_FILE_SIZE_DEFAULT;
     if (cbChunkSize == 0) cbChunkSize = HASH_DEFAULT_CHUNK_SIZE;
 
-    if (!g_HashGlobals.Initialized) {
+    //
+    // CRITICAL FIX: Use proper initialization state check
+    //
+    if (g_HashGlobals.InitializationState != HASH_STATE_INITIALIZED) {
         Result->Status = ShadowHashStatusNotInitialized;
         return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // CRITICAL FIX: Verify all required providers are initialized before use
+    //
+    if (!g_HashGlobals.Providers[ShadowHashAlgorithmSha256].Initialized ||
+        !g_HashGlobals.Providers[ShadowHashAlgorithmSha1].Initialized ||
+        !g_HashGlobals.Providers[ShadowHashAlgorithmMd5].Initialized) {
+        Result->Status = ShadowHashStatusAlgorithmError;
+        Result->NtStatus = STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED;
     }
 
     HashiEnterOperation();

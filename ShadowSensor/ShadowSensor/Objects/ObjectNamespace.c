@@ -14,22 +14,29 @@
  * - Restrictive DACL (SYSTEM + Administrators only)
  * - High Integrity Level mandatory label
  * - Full boundary descriptor implementation
- * - SACL auditing for forensic analysis
+ * - Merged SACL (mandatory label + audit ACEs in single ACL)
+ * - Self-relative security descriptor (proper memory management)
  * - BSOD-safe resource management with reference counting
  * - Protection against object hijacking and tampering
  * - Graceful handling of partial initialization failures
  * - ETW telemetry integration
  *
  * Security Architecture:
- * - Directory object secured with explicit DACL + SACL + Mandatory Label
+ * - Directory object secured with explicit DACL + merged SACL
  * - Boundary descriptor prevents Medium IL access
  * - All handles tracked for proper cleanup
  * - Reference counting prevents use-after-free during shutdown
  * - Lock-protected state transitions
  * - Atomic operations for initialization flag
  *
+ * Memory Management (CRITICAL FIXES):
+ * - Uses SELF-RELATIVE security descriptor format
+ * - All ACLs embedded in single allocation - no separate tracking needed
+ * - Single ExFreePoolWithTag frees everything
+ * - No memory leaks, no double-free vulnerabilities
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Memory Safe)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -89,16 +96,6 @@ ShadowBuildNamespaceSecurityDescriptor(
 NTSTATUS
 ShadowCreateBoundaryDescriptor(
     _Outptr_ POBJECT_BOUNDARY_DESCRIPTOR* BoundaryDescriptor
-    );
-
-NTSTATUS
-ShadowAddMandatoryLabel(
-    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor
-    );
-
-NTSTATUS
-ShadowAddAuditSacl(
-    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor
     );
 
 VOID
@@ -178,7 +175,8 @@ ShadowCreatePrivateNamespace(
     state->DrainTimeoutMs = SHADOW_DEFAULT_DRAIN_TIMEOUT_MS;
 
     //
-    // STEP 3: Build restrictive security descriptor with SACL and Mandatory Label
+    // STEP 3: Build self-relative security descriptor with merged DACL + SACL
+    // This is the CRITICAL FIX - single allocation contains everything
     //
     status = ShadowBuildNamespaceSecurityDescriptor(
         &state->DirectorySecurityDescriptor,
@@ -193,28 +191,12 @@ ShadowCreatePrivateNamespace(
 
     state->SecurityDescriptorAllocated = TRUE;
 
-    //
-    // STEP 4: Add SACL for auditing (enterprise feature)
-    //
-    status = ShadowAddAuditSacl(state->DirectorySecurityDescriptor);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to add audit SACL: 0x%X\n", status);
-        // Non-fatal - continue without auditing
-    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] Security descriptor created (self-relative, size=%lu)\n",
+               state->SecurityDescriptorSize);
 
     //
-    // STEP 5: Add High Integrity Level mandatory label
-    //
-    status = ShadowAddMandatoryLabel(state->DirectorySecurityDescriptor);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to add mandatory label: 0x%X\n", status);
-        // Non-fatal - continue with DACL protection only
-    }
-
-    //
-    // STEP 6: Create boundary descriptor for namespace isolation
+    // STEP 4: Create boundary descriptor for namespace isolation
     //
     status = ShadowCreateBoundaryDescriptor(&state->BoundaryDescriptor);
     if (!NT_SUCCESS(status)) {
@@ -224,7 +206,7 @@ ShadowCreatePrivateNamespace(
     }
 
     //
-    // STEP 7: Create the \ShadowStrike directory object
+    // STEP 5: Create the \ShadowStrike directory object
     //
     RtlInitUnicodeString(&directoryName, SHADOW_NAMESPACE_ROOT);
 
@@ -264,7 +246,7 @@ ShadowCreatePrivateNamespace(
     }
 
     //
-    // STEP 8: Validate handle before referencing
+    // STEP 6: Validate handle before referencing
     //
     if (state->DirectoryHandle == NULL || state->DirectoryHandle == INVALID_HANDLE_VALUE) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -274,7 +256,7 @@ ShadowCreatePrivateNamespace(
     }
 
     //
-    // STEP 9: Reference the directory object to prevent premature deletion
+    // STEP 7: Reference the directory object to prevent premature deletion
     //
     status = ObReferenceObjectByHandle(
         state->DirectoryHandle,
@@ -294,7 +276,7 @@ ShadowCreatePrivateNamespace(
     state->DirectoryObjectReferenced = TRUE;
 
     //
-    // STEP 10: Mark namespace as initialized (atomic)
+    // STEP 8: Mark namespace as initialized (atomic)
     //
     KeQuerySystemTime(&state->CreationTime);
     state->ReferenceCount = 0;
@@ -304,7 +286,7 @@ ShadowCreatePrivateNamespace(
     InterlockedExchange(&state->InitializationState, NAMESPACE_STATE_INITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Private namespace created successfully (Enterprise Edition)\n");
+               "[ShadowStrike] Private namespace created successfully (Enterprise Edition v2.1)\n");
 
     return STATUS_SUCCESS;
 
@@ -870,7 +852,28 @@ ShadowDereferenceNamespace(
 // ============================================================================
 
 /**
- * @brief Build restrictive security descriptor with DACL.
+ * @brief Build SELF-RELATIVE security descriptor with merged DACL and SACL.
+ *
+ * CRITICAL FIX: This function now creates a SELF-RELATIVE security descriptor
+ * which embeds all ACLs in a single contiguous allocation. This eliminates:
+ * - Memory leaks (no separate ACL allocations to track)
+ * - Double-free vulnerabilities (single allocation = single free)
+ * - SACL overwrite issues (both mandatory label and audit ACEs in one SACL)
+ *
+ * Memory Layout of Self-Relative SD:
+ * +---------------------------+
+ * | SECURITY_DESCRIPTOR       |
+ * +---------------------------+
+ * | Owner SID (embedded)      |
+ * +---------------------------+
+ * | Group SID (embedded)      |
+ * +---------------------------+
+ * | DACL (embedded)           |
+ * +---------------------------+
+ * | SACL (embedded)           |
+ * +---------------------------+
+ *
+ * Single ExFreePoolWithTag frees everything.
  */
 NTSTATUS
 ShadowBuildNamespaceSecurityDescriptor(
@@ -879,13 +882,19 @@ ShadowBuildNamespaceSecurityDescriptor(
     )
 {
     NTSTATUS status;
-    PSECURITY_DESCRIPTOR securityDescriptor = NULL;
+    SECURITY_DESCRIPTOR absoluteSD;
+    PSECURITY_DESCRIPTOR selfRelativeSD = NULL;
     PACL dacl = NULL;
+    PACL sacl = NULL;
     ULONG daclSize;
+    ULONG saclSize;
+    ULONG selfRelativeSize = 0;
     SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    SID_IDENTIFIER_AUTHORITY worldAuthority = SECURITY_WORLD_SID_AUTHORITY;
     PSID systemSid = NULL;
     PSID adminSid = NULL;
-    ULONG sdSize;
+    PSID highILSid = NULL;
+    PSID everyoneSid = NULL;
 
     PAGED_CODE();
 
@@ -893,8 +902,10 @@ ShadowBuildNamespaceSecurityDescriptor(
     *DescriptorSize = 0;
 
     //
-    // STEP 1: Create SIDs for SYSTEM and Administrators
+    // STEP 1: Create all required SIDs
     //
+
+    // SYSTEM SID
     status = RtlAllocateAndInitializeSid(
         &ntAuthority,
         1,
@@ -909,6 +920,7 @@ ShadowBuildNamespaceSecurityDescriptor(
         goto cleanup;
     }
 
+    // Administrators SID
     status = RtlAllocateAndInitializeSid(
         &ntAuthority,
         2,
@@ -924,42 +936,95 @@ ShadowBuildNamespaceSecurityDescriptor(
         goto cleanup;
     }
 
+    // High Integrity Level SID (for mandatory label)
+    status = RtlAllocateAndInitializeSid(
+        &ntAuthority,
+        1,
+        SECURITY_MANDATORY_HIGH_RID,
+        0, 0, 0, 0, 0, 0, 0,
+        &highILSid
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to create High IL SID: 0x%X\n", status);
+        goto cleanup;
+    }
+
+    // Everyone SID (for audit ACE)
+    status = RtlAllocateAndInitializeSid(
+        &worldAuthority,
+        1,
+        SECURITY_WORLD_RID,
+        0, 0, 0, 0, 0, 0, 0,
+        &everyoneSid
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to create Everyone SID: 0x%X\n", status);
+        goto cleanup;
+    }
+
     //
-    // STEP 2: Calculate DACL size (with overflow protection)
+    // STEP 2: Calculate DACL size with overflow protection
     //
     daclSize = sizeof(ACL);
 
+    // Two ACCESS_ALLOWED_ACE entries (SYSTEM + Administrators)
     if (daclSize > MAXULONG - (2 * sizeof(ACCESS_ALLOWED_ACE))) {
         status = STATUS_INTEGER_OVERFLOW;
         goto cleanup;
     }
     daclSize += (2 * sizeof(ACCESS_ALLOWED_ACE));
 
-    if (daclSize > MAXULONG - RtlLengthSid(systemSid)) {
+    // Add SID sizes (subtract SidStart which is already in ACE)
+    if (daclSize > MAXULONG - RtlLengthSid(systemSid) + sizeof(ULONG)) {
         status = STATUS_INTEGER_OVERFLOW;
         goto cleanup;
     }
-    daclSize += RtlLengthSid(systemSid);
+    daclSize += RtlLengthSid(systemSid) - sizeof(ULONG);
 
-    if (daclSize > MAXULONG - RtlLengthSid(adminSid)) {
+    if (daclSize > MAXULONG - RtlLengthSid(adminSid) + sizeof(ULONG)) {
         status = STATUS_INTEGER_OVERFLOW;
         goto cleanup;
     }
-    daclSize += RtlLengthSid(adminSid);
+    daclSize += RtlLengthSid(adminSid) - sizeof(ULONG);
 
-    if (daclSize > MAXULONG - (2 * sizeof(ULONG))) {
-        status = STATUS_INTEGER_OVERFLOW;
-        goto cleanup;
-    }
-    daclSize += (2 * sizeof(ULONG)); // Padding
+    // Align to ULONG boundary
+    daclSize = (daclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
 
     //
-    // STEP 3: Allocate DACL
+    // STEP 3: Calculate SACL size (mandatory label + audit ACE)
+    //
+    saclSize = sizeof(ACL);
+
+    // SYSTEM_MANDATORY_LABEL_ACE for High IL
+    if (saclSize > MAXULONG - sizeof(SYSTEM_MANDATORY_LABEL_ACE)) {
+        status = STATUS_INTEGER_OVERFLOW;
+        goto cleanup;
+    }
+    saclSize += sizeof(SYSTEM_MANDATORY_LABEL_ACE);
+    saclSize += RtlLengthSid(highILSid) - sizeof(ULONG);
+
+    // SYSTEM_AUDIT_ACE for Everyone
+    if (saclSize > MAXULONG - sizeof(SYSTEM_AUDIT_ACE)) {
+        status = STATUS_INTEGER_OVERFLOW;
+        goto cleanup;
+    }
+    saclSize += sizeof(SYSTEM_AUDIT_ACE);
+    saclSize += RtlLengthSid(everyoneSid) - sizeof(ULONG);
+
+    // Align to ULONG boundary
+    saclSize = (saclSize + sizeof(ULONG) - 1) & ~(sizeof(ULONG) - 1);
+
+    //
+    // STEP 4: Allocate and initialize DACL
     //
     dacl = (PACL)ExAllocatePoolWithTag(
         PagedPool,
         daclSize,
-        SHADOW_NAMESPACE_SD_TAG
+        SHADOW_NAMESPACE_ACL_TAG
     );
 
     if (dacl == NULL) {
@@ -969,19 +1034,14 @@ ShadowBuildNamespaceSecurityDescriptor(
         goto cleanup;
     }
 
-    //
-    // STEP 4: Initialize DACL
-    //
     status = RtlCreateAcl(dacl, daclSize, ACL_REVISION);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to create ACL: 0x%X\n", status);
+                   "[ShadowStrike] Failed to create DACL: 0x%X\n", status);
         goto cleanup;
     }
 
-    //
-    // STEP 5: Add ACEs for SYSTEM and Administrators
-    //
+    // Add SYSTEM ACE
     status = RtlAddAccessAllowedAce(
         dacl,
         ACL_REVISION,
@@ -995,6 +1055,7 @@ ShadowBuildNamespaceSecurityDescriptor(
         goto cleanup;
     }
 
+    // Add Administrators ACE
     status = RtlAddAccessAllowedAce(
         dacl,
         ACL_REVISION,
@@ -1009,24 +1070,65 @@ ShadowBuildNamespaceSecurityDescriptor(
     }
 
     //
-    // STEP 6: Allocate and create security descriptor
+    // STEP 5: Allocate and initialize SACL (merged mandatory label + audit)
     //
-    sdSize = sizeof(SECURITY_DESCRIPTOR);
-    securityDescriptor = (PSECURITY_DESCRIPTOR)ExAllocatePoolWithTag(
+    sacl = (PACL)ExAllocatePoolWithTag(
         PagedPool,
-        sdSize,
-        SHADOW_NAMESPACE_SD_TAG
+        saclSize,
+        SHADOW_NAMESPACE_ACL_TAG
     );
 
-    if (securityDescriptor == NULL) {
+    if (sacl == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to allocate security descriptor\n");
+                   "[ShadowStrike] Failed to allocate SACL\n");
         goto cleanup;
     }
 
+    status = RtlCreateAcl(sacl, saclSize, ACL_REVISION);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to create SACL: 0x%X\n", status);
+        goto cleanup;
+    }
+
+    // Add mandatory label ACE (High Integrity Level)
+    status = RtlAddMandatoryAce(
+        sacl,
+        ACL_REVISION,
+        0,
+        SYSTEM_MANDATORY_LABEL_NO_WRITE_UP | SYSTEM_MANDATORY_LABEL_NO_READ_UP,
+        0,
+        highILSid
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Failed to add mandatory label ACE: 0x%X (non-fatal)\n", status);
+        // Continue - audit is still valuable
+    }
+
+    // Add audit ACE (Everyone - success and failure)
+    status = RtlAddAuditAccessAce(
+        sacl,
+        ACL_REVISION,
+        GENERIC_ALL,
+        everyoneSid,
+        TRUE,  // Audit success
+        TRUE   // Audit failure
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Failed to add audit ACE: 0x%X (non-fatal)\n", status);
+        // Continue - mandatory label is still valuable
+    }
+
+    //
+    // STEP 6: Create absolute security descriptor
+    //
     status = RtlCreateSecurityDescriptor(
-        securityDescriptor,
+        &absoluteSD,
         SECURITY_DESCRIPTOR_REVISION
     );
 
@@ -1036,13 +1138,9 @@ ShadowBuildNamespaceSecurityDescriptor(
         goto cleanup;
     }
 
-    //
-    // STEP 7: Set DACL in security descriptor
-    // CRITICAL FIX: Use TRUE for 4th parameter to copy DACL into SD
-    // This prevents double-free vulnerability
-    //
+    // Set DACL
     status = RtlSetDaclSecurityDescriptor(
-        securityDescriptor,
+        &absoluteSD,
         TRUE,  // DACL present
         dacl,
         FALSE  // Not defaulted
@@ -1054,47 +1152,106 @@ ShadowBuildNamespaceSecurityDescriptor(
         goto cleanup;
     }
 
+    // Set SACL (contains both mandatory label and audit ACEs)
+    status = RtlSetSaclSecurityDescriptor(
+        &absoluteSD,
+        TRUE,
+        sacl,
+        FALSE
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] Failed to set SACL: 0x%X (non-fatal)\n", status);
+        // Continue - DACL protection is sufficient
+    }
+
     //
-    // Success - return security descriptor
-    // NOTE: Security descriptor now owns the DACL pointer
+    // STEP 7: Convert to self-relative format
+    // This creates a SINGLE allocation containing everything
     //
-    *SecurityDescriptor = securityDescriptor;
-    *DescriptorSize = sdSize;
+
+    // First call to get required size
+    status = RtlAbsoluteToSelfRelativeSD(
+        &absoluteSD,
+        NULL,
+        &selfRelativeSize
+    );
+
+    if (status != STATUS_BUFFER_TOO_SMALL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Unexpected status from size query: 0x%X\n", status);
+        if (NT_SUCCESS(status)) {
+            status = STATUS_INTERNAL_ERROR;
+        }
+        goto cleanup;
+    }
+
+    // Allocate self-relative SD
+    selfRelativeSD = (PSECURITY_DESCRIPTOR)ExAllocatePoolWithTag(
+        PagedPool,
+        selfRelativeSize,
+        SHADOW_NAMESPACE_SD_TAG
+    );
+
+    if (selfRelativeSD == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to allocate self-relative SD\n");
+        goto cleanup;
+    }
+
+    // Convert to self-relative
+    status = RtlAbsoluteToSelfRelativeSD(
+        &absoluteSD,
+        selfRelativeSD,
+        &selfRelativeSize
+    );
+
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Failed to convert to self-relative SD: 0x%X\n", status);
+        goto cleanup;
+    }
+
+    //
+    // SUCCESS: Return self-relative security descriptor
+    // The ACLs are now embedded - free the temporary absolute ACLs
+    //
+    *SecurityDescriptor = selfRelativeSD;
+    *DescriptorSize = selfRelativeSize;
+    selfRelativeSD = NULL; // Prevent cleanup from freeing it
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Security descriptor created successfully\n");
+               "[ShadowStrike] Self-relative security descriptor created successfully "
+               "(size=%lu, DACL+merged SACL)\n", selfRelativeSize);
 
-    //
-    // Cleanup SIDs (security descriptor holds reference to DACL)
-    //
-    if (systemSid != NULL) {
-        RtlFreeSid(systemSid);
-    }
-    if (adminSid != NULL) {
-        RtlFreeSid(adminSid);
-    }
-
-    //
-    // Don't free DACL here - it's now owned by the security descriptor
-    //
-
-    return STATUS_SUCCESS;
+    status = STATUS_SUCCESS;
 
 cleanup:
     //
-    // Cleanup on failure
+    // Free temporary allocations (ACLs were copied into self-relative SD)
     //
     if (dacl != NULL) {
-        ExFreePoolWithTag(dacl, SHADOW_NAMESPACE_SD_TAG);
+        ExFreePoolWithTag(dacl, SHADOW_NAMESPACE_ACL_TAG);
     }
-    if (securityDescriptor != NULL) {
-        ExFreePoolWithTag(securityDescriptor, SHADOW_NAMESPACE_SD_TAG);
+    if (sacl != NULL) {
+        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_ACL_TAG);
+    }
+    if (selfRelativeSD != NULL) {
+        ExFreePoolWithTag(selfRelativeSD, SHADOW_NAMESPACE_SD_TAG);
     }
     if (systemSid != NULL) {
         RtlFreeSid(systemSid);
     }
     if (adminSid != NULL) {
         RtlFreeSid(adminSid);
+    }
+    if (highILSid != NULL) {
+        RtlFreeSid(highILSid);
+    }
+    if (everyoneSid != NULL) {
+        RtlFreeSid(everyoneSid);
     }
 
     return status;
@@ -1182,215 +1339,11 @@ ShadowCreateBoundaryDescriptor(
 }
 
 /**
- * @brief Add mandatory integrity level to security descriptor.
- */
-NTSTATUS
-ShadowAddMandatoryLabel(
-    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor
-    )
-{
-    NTSTATUS status;
-    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-    PSID highILSid = NULL;
-    PACL sacl = NULL;
-    ULONG saclSize;
-    SYSTEM_MANDATORY_LABEL_ACE* ace;
-
-    PAGED_CODE();
-
-    if (SecurityDescriptor == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // ENTERPRISE FIX: Add High Integrity Level mandatory label
-    // This is critical for preventing Medium IL bypass attacks
-    //
-    status = RtlAllocateAndInitializeSid(
-        &ntAuthority,
-        1,
-        SECURITY_MANDATORY_HIGH_RID,
-        0, 0, 0, 0, 0, 0, 0,
-        &highILSid
-    );
-
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    //
-    // Calculate SACL size for mandatory label
-    //
-    saclSize = sizeof(ACL) + sizeof(SYSTEM_MANDATORY_LABEL_ACE) +
-               RtlLengthSid(highILSid);
-
-    sacl = (PACL)ExAllocatePoolWithTag(
-        PagedPool,
-        saclSize,
-        SHADOW_NAMESPACE_SD_TAG
-    );
-
-    if (sacl == NULL) {
-        RtlFreeSid(highILSid);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // Initialize SACL
-    //
-    status = RtlCreateAcl(sacl, saclSize, ACL_REVISION);
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_SD_TAG);
-        RtlFreeSid(highILSid);
-        return status;
-    }
-
-    //
-    // Add mandatory label ACE
-    //
-    status = RtlAddMandatoryAce(
-        sacl,
-        ACL_REVISION,
-        0,
-        SYSTEM_MANDATORY_LABEL_NO_WRITE_UP | SYSTEM_MANDATORY_LABEL_NO_READ_UP,
-        0,
-        highILSid
-    );
-
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_SD_TAG);
-        RtlFreeSid(highILSid);
-        return status;
-    }
-
-    //
-    // Set SACL in security descriptor
-    //
-    status = RtlSetSaclSecurityDescriptor(
-        SecurityDescriptor,
-        TRUE,
-        sacl,
-        FALSE
-    );
-
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_SD_TAG);
-    }
-
-    RtlFreeSid(highILSid);
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Mandatory High IL label added\n");
-
-    return status;
-}
-
-/**
- * @brief Add SACL for auditing to security descriptor.
- */
-NTSTATUS
-ShadowAddAuditSacl(
-    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor
-    )
-{
-    NTSTATUS status;
-    SID_IDENTIFIER_AUTHORITY worldAuthority = SECURITY_WORLD_SID_AUTHORITY;
-    PSID everyoneSid = NULL;
-    PACL sacl = NULL;
-    ULONG saclSize;
-
-    PAGED_CODE();
-
-    if (SecurityDescriptor == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // ENTERPRISE FIX: Add audit SACL for forensic analysis
-    // This logs all access attempts to namespace objects
-    //
-    status = RtlAllocateAndInitializeSid(
-        &worldAuthority,
-        1,
-        SECURITY_WORLD_RID,
-        0, 0, 0, 0, 0, 0, 0,
-        &everyoneSid
-    );
-
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    //
-    // Calculate SACL size
-    //
-    saclSize = sizeof(ACL) + sizeof(SYSTEM_AUDIT_ACE) +
-               RtlLengthSid(everyoneSid);
-
-    sacl = (PACL)ExAllocatePoolWithTag(
-        PagedPool,
-        saclSize,
-        SHADOW_NAMESPACE_SD_TAG
-    );
-
-    if (sacl == NULL) {
-        RtlFreeSid(everyoneSid);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    //
-    // Initialize SACL
-    //
-    status = RtlCreateAcl(sacl, saclSize, ACL_REVISION);
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_SD_TAG);
-        RtlFreeSid(everyoneSid);
-        return status;
-    }
-
-    //
-    // Add audit ACE (success and failure)
-    //
-    status = RtlAddAuditAccessAce(
-        sacl,
-        ACL_REVISION,
-        GENERIC_ALL,
-        everyoneSid,
-        TRUE,  // Audit success
-        TRUE   // Audit failure
-    );
-
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_SD_TAG);
-        RtlFreeSid(everyoneSid);
-        return status;
-    }
-
-    //
-    // Get existing SACL (if any) and merge
-    // For simplicity, we're replacing it here
-    //
-    status = RtlSetSaclSecurityDescriptor(
-        SecurityDescriptor,
-        TRUE,
-        sacl,
-        FALSE
-    );
-
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sacl, SHADOW_NAMESPACE_SD_TAG);
-    }
-
-    RtlFreeSid(everyoneSid);
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Audit SACL added (forensic analysis enabled)\n");
-
-    return status;
-}
-
-/**
  * @brief Cleanup namespace state during shutdown.
+ *
+ * CRITICAL FIX: This function now correctly handles the self-relative
+ * security descriptor. Since the SD is self-relative, all ACLs are
+ * embedded within it - only a single free is needed.
  */
 VOID
 ShadowCleanupNamespaceState(
@@ -1432,14 +1385,16 @@ ShadowCleanupNamespaceState(
     }
 
     //
-    // CRITICAL FIX: Free security descriptor correctly
-    // Security descriptor owns the DACL/SACL, so we only free the SD
-    // This fixes the double-free vulnerability
+    // CRITICAL FIX: Free self-relative security descriptor
+    // This is the ONLY allocation that needs to be freed.
+    // The DACL and SACL are embedded within the self-relative SD,
+    // so freeing the SD frees everything - no memory leaks, no double-free.
     //
     if (State->SecurityDescriptorAllocated && State->DirectorySecurityDescriptor != NULL) {
         ExFreePoolWithTag(State->DirectorySecurityDescriptor, SHADOW_NAMESPACE_SD_TAG);
         State->DirectorySecurityDescriptor = NULL;
         State->SecurityDescriptorAllocated = FALSE;
+        State->SecurityDescriptorSize = 0;
     }
 
     //
@@ -1459,5 +1414,5 @@ ShadowCleanupNamespaceState(
     InterlockedExchange(&State->InitializationState, NAMESPACE_STATE_UNINITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Namespace state cleaned up\n");
+               "[ShadowStrike] Namespace state cleaned up (memory-safe)\n");
 }

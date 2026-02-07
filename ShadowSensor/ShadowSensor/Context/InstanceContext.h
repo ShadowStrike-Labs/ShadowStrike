@@ -16,9 +16,15 @@
  * - Network volume detection and policy enforcement
  * - Removable media tracking and protection
  * - Volume serial number caching for performance
+ * - Filesystem capability detection (FileIDs, streams, etc.)
+ *
+ * Thread Safety Model:
+ * - ERESOURCE protects: VolumeName, VolumeGUIDName, VolumeType, capabilities
+ * - Interlocked operations protect: all statistics counters
+ * - Policy flags are immutable after initialization (no lock needed for reads)
  *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 2.0.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -48,11 +54,25 @@ extern "C" {
 #define SHADOW_INSTANCE_STRING_TAG 'sSSi'
 
 // ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/**
+ * @brief Maximum volume name length we will cache (in bytes)
+ */
+#define SHADOW_MAX_VOLUME_NAME_LENGTH 512
+
+/**
+ * @brief Maximum GUID name length we will cache (in bytes)
+ */
+#define SHADOW_MAX_GUID_NAME_LENGTH 128
+
+// ============================================================================
 // VOLUME TYPE FLAGS
 // ============================================================================
 
 /**
- * @brief Volume type classification flags.
+ * @brief Volume type classification flags (can be combined).
  */
 typedef enum _SHADOW_VOLUME_TYPE {
     VolumeTypeUnknown       = 0x00000000,
@@ -65,6 +85,24 @@ typedef enum _SHADOW_VOLUME_TYPE {
 } SHADOW_VOLUME_TYPE;
 
 // ============================================================================
+// FILESYSTEM CAPABILITIES
+// ============================================================================
+
+/**
+ * @brief Filesystem capability flags queried from volume.
+ */
+typedef struct _SHADOW_FS_CAPABILITIES {
+    BOOLEAN SupportsFileIds;        ///< Supports 64-bit file IDs (NTFS, ReFS)
+    BOOLEAN SupportsStreams;        ///< Supports alternate data streams
+    BOOLEAN SupportsObjectIds;      ///< Supports object IDs
+    BOOLEAN SupportsReparsePoints;  ///< Supports reparse points
+    BOOLEAN SupportsSparseFiles;    ///< Supports sparse files
+    BOOLEAN SupportsEncryption;     ///< Supports EFS encryption
+    BOOLEAN SupportsCompression;    ///< Supports file compression
+    BOOLEAN SupportsHardLinks;      ///< Supports hard links
+} SHADOW_FS_CAPABILITIES, *PSHADOW_FS_CAPABILITIES;
+
+// ============================================================================
 // INSTANCE CONTEXT STRUCTURE
 // ============================================================================
 
@@ -75,8 +113,11 @@ typedef enum _SHADOW_VOLUME_TYPE {
  * each volume instance where the minifilter attaches. It tracks volume-
  * specific state, configuration, and statistics.
  *
- * Thread Safety: Protected by the Resource lock. All field access must
- * be synchronized using ExAcquireResourceSharedLite/ExclusiveLite.
+ * Thread Safety:
+ * - Resource lock protects: VolumeName, VolumeGUIDName, VolumeType,
+ *   FilesystemType, DeviceType, Capabilities, IsReadOnly
+ * - Interlocked operations protect: all LONGLONG statistics fields
+ * - Policy flags (ScanningEnabled, etc.) are set once during init
  *
  * Lifetime: Created during InstanceSetup, destroyed during InstanceTeardown.
  *
@@ -98,6 +139,12 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     /// @brief TRUE if Resource was successfully initialized (CRITICAL for cleanup)
     BOOLEAN ResourceInitialized;
 
+    /// @brief TRUE if context is fully initialized and ready for use
+    BOOLEAN Initialized;
+
+    /// @brief Padding for alignment
+    BOOLEAN Reserved1[2];
+
     //
     // Volume Identity
     //
@@ -114,7 +161,7 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     /// @brief Volume type classification flags
     SHADOW_VOLUME_TYPE VolumeType;
 
-    /// @brief File system type (FLT_FSTYPE_NTFS, etc.)
+    /// @brief File system type (FLT_FSTYPE_NTFS, FLT_FSTYPE_REFS, etc.)
     FLT_FILESYSTEM_TYPE FilesystemType;
 
     /// @brief Device type (FILE_DEVICE_DISK_FILE_SYSTEM, etc.)
@@ -127,17 +174,14 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     /// @brief TRUE if volume is read-only
     BOOLEAN IsReadOnly;
 
-    /// @brief TRUE if volume supports file IDs (NTFS, ReFS)
-    BOOLEAN SupportsFileIds;
+    /// @brief Padding for alignment
+    BOOLEAN Reserved2[3];
 
-    /// @brief TRUE if volume supports alternate data streams
-    BOOLEAN SupportsStreams;
-
-    /// @brief TRUE if volume supports object IDs
-    BOOLEAN SupportsObjectIds;
+    /// @brief Filesystem capabilities (queried once during init)
+    SHADOW_FS_CAPABILITIES Capabilities;
 
     //
-    // Policy Configuration
+    // Policy Configuration (Set once during initialization)
     //
 
     /// @brief TRUE if scanning is enabled for this volume
@@ -150,35 +194,35 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     BOOLEAN WriteProtectionEnabled;
 
     /// @brief Reserved for future policy flags
-    BOOLEAN Reserved[5];
+    BOOLEAN PolicyReserved[5];
 
     //
-    // Statistics (Performance Metrics)
+    // Statistics (All accessed via Interlocked operations)
     //
 
     /// @brief Total file create operations on this volume
-    LONGLONG TotalCreateOperations;
+    volatile LONGLONG TotalCreateOperations;
 
     /// @brief Total files scanned on this volume
-    LONGLONG TotalFilesScanned;
+    volatile LONGLONG TotalFilesScanned;
 
     /// @brief Total files blocked on this volume
-    LONGLONG TotalFilesBlocked;
+    volatile LONGLONG TotalFilesBlocked;
 
     /// @brief Total write operations on this volume
-    LONGLONG TotalWriteOperations;
+    volatile LONGLONG TotalWriteOperations;
 
     /// @brief Total clean verdicts on this volume
-    LONGLONG TotalCleanVerdicts;
+    volatile LONGLONG TotalCleanVerdicts;
 
     /// @brief Total malware verdicts on this volume
-    LONGLONG TotalMalwareVerdicts;
+    volatile LONGLONG TotalMalwareVerdicts;
 
     /// @brief Total scan errors on this volume
-    LONGLONG TotalScanErrors;
+    volatile LONGLONG TotalScanErrors;
 
     /// @brief Total cache hits on this volume
-    LONGLONG TotalCacheHits;
+    volatile LONGLONG TotalCacheHits;
 
     //
     // Timing and Health
@@ -187,11 +231,11 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
     /// @brief Timestamp when this instance was attached
     LARGE_INTEGER AttachTime;
 
-    /// @brief Last activity timestamp (for idle detection)
-    LARGE_INTEGER LastActivityTime;
+    /// @brief Last activity timestamp (for idle detection) - accessed via Interlocked
+    volatile LONGLONG LastActivityTime;
 
-    /// @brief Average scan time in 100ns units
-    LARGE_INTEGER AverageScanTime;
+    /// @brief Cumulative scan time in 100ns units (for average calculation)
+    volatile LONGLONG CumulativeScanTime;
 
 } SHADOW_INSTANCE_CONTEXT, *PSHADOW_INSTANCE_CONTEXT;
 
@@ -212,7 +256,10 @@ typedef struct _SHADOW_INSTANCE_CONTEXT {
  *         STATUS_INSUFFICIENT_RESOURCES if allocation fails
  *
  * @note Caller must set the context via FltSetInstanceContext
+ * @note Caller must call FltReleaseContext when done
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowCreateInstanceContext(
     _In_ PFLT_FILTER FilterHandle,
@@ -233,6 +280,8 @@ ShadowCreateInstanceContext(
  *
  * @note Caller MUST call FltReleaseContext when done
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowGetInstanceContext(
     _In_ PFLT_INSTANCE Instance,
@@ -251,6 +300,7 @@ ShadowGetInstanceContext(
  * @param Context      The context being freed
  * @param ContextType  Type of context (FLT_INSTANCE_CONTEXT)
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowCleanupInstanceContext(
     _In_ PFLT_CONTEXT Context,
@@ -260,20 +310,26 @@ ShadowCleanupInstanceContext(
 /**
  * @brief Initialize volume information in instance context.
  *
- * Queries volume name, GUID, serial number, and characteristics.
+ * Queries volume name, GUID, serial number, filesystem type, and capabilities.
  * Must be called after context is created and attached.
  *
  * Thread-safe - acquires exclusive lock internally.
  *
  * @param Context   The context to initialize
  * @param Instance  Filter instance to query
+ * @param Volume    Volume object (optional, will be queried if NULL)
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_INSUFFICIENT_RESOURCES if memory allocation fails
+ *         Other NTSTATUS codes on query failures
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowInitializeInstanceVolumeInfo(
     _In_ PSHADOW_INSTANCE_CONTEXT Context,
-    _In_ PFLT_INSTANCE Instance
+    _In_ PFLT_INSTANCE Instance,
+    _In_opt_ PFLT_VOLUME Volume
     );
 
 /**
@@ -283,6 +339,7 @@ ShadowInitializeInstanceVolumeInfo(
  *
  * @param Context  The instance context
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowInstanceIncrementCreateCount(
     _In_ PSHADOW_INSTANCE_CONTEXT Context
@@ -295,6 +352,7 @@ ShadowInstanceIncrementCreateCount(
  *
  * @param Context  The instance context
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowInstanceIncrementScanCount(
     _In_ PSHADOW_INSTANCE_CONTEXT Context
@@ -307,26 +365,67 @@ ShadowInstanceIncrementScanCount(
  *
  * @param Context  The instance context
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowInstanceIncrementBlockCount(
     _In_ PSHADOW_INSTANCE_CONTEXT Context
     );
 
 /**
+ * @brief Increment write operation counter.
+ *
+ * Thread-safe atomic increment of TotalWriteOperations.
+ *
+ * @param Context  The instance context
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowInstanceIncrementWriteCount(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
  * @brief Record scan verdict in instance statistics.
  *
- * Updates verdict counters (clean, malware) and average scan time.
+ * Updates verdict counters (clean, malware) and cumulative scan time.
  * Thread-safe - uses atomic operations.
  *
  * @param Context    The instance context
  * @param IsClean    TRUE if clean, FALSE if malware
  * @param ScanTime   Time taken to scan (in 100ns units)
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowInstanceRecordScanVerdict(
     _In_ PSHADOW_INSTANCE_CONTEXT Context,
     _In_ BOOLEAN IsClean,
     _In_ LARGE_INTEGER ScanTime
+    );
+
+/**
+ * @brief Record scan error in instance statistics.
+ *
+ * Thread-safe atomic increment of TotalScanErrors.
+ *
+ * @param Context  The instance context
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowInstanceRecordScanError(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
+ * @brief Record cache hit in instance statistics.
+ *
+ * Thread-safe atomic increment of TotalCacheHits.
+ *
+ * @param Context  The instance context
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ShadowInstanceRecordCacheHit(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
     );
 
 /**
@@ -338,6 +437,7 @@ ShadowInstanceRecordScanVerdict(
  *
  * @return TRUE if network volume, FALSE otherwise
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowInstanceIsNetworkVolume(
     _In_ PSHADOW_INSTANCE_CONTEXT Context
@@ -352,8 +452,54 @@ ShadowInstanceIsNetworkVolume(
  *
  * @return TRUE if removable media, FALSE otherwise
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowInstanceIsRemovableMedia(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
+ * @brief Check if volume supports file IDs.
+ *
+ * Thread-safe - acquires shared lock.
+ *
+ * @param Context  The instance context
+ *
+ * @return TRUE if file IDs are supported, FALSE otherwise
+ */
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowInstanceSupportsFileIds(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
+ * @brief Check if volume supports alternate data streams.
+ *
+ * Thread-safe - acquires shared lock.
+ *
+ * @param Context  The instance context
+ *
+ * @return TRUE if streams are supported, FALSE otherwise
+ */
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ShadowInstanceSupportsStreams(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
+ * @brief Get filesystem type for this volume.
+ *
+ * Thread-safe - acquires shared lock.
+ *
+ * @param Context  The instance context
+ *
+ * @return FLT_FILESYSTEM_TYPE value
+ */
+_IRQL_requires_max_(APC_LEVEL)
+FLT_FILESYSTEM_TYPE
+ShadowInstanceGetFilesystemType(
     _In_ PSHADOW_INSTANCE_CONTEXT Context
     );
 
@@ -364,9 +510,49 @@ ShadowInstanceIsRemovableMedia(
  *
  * @param Context  The instance context
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowInstanceUpdateActivityTime(
     _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
+ * @brief Get average scan time for this volume.
+ *
+ * Thread-safe - uses atomic reads.
+ *
+ * @param Context  The instance context
+ *
+ * @return Average scan time in 100ns units, 0 if no scans performed
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONGLONG
+ShadowInstanceGetAverageScanTime(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context
+    );
+
+/**
+ * @brief Copy volume name to caller buffer.
+ *
+ * Thread-safe - acquires shared lock. Copies the volume name to
+ * caller-provided buffer to avoid holding lock during use.
+ *
+ * @param Context       The instance context
+ * @param Buffer        Caller-provided buffer
+ * @param BufferSize    Size of buffer in bytes
+ * @param RequiredSize  [out] Receives required size if buffer too small
+ *
+ * @return STATUS_SUCCESS on success
+ *         STATUS_BUFFER_TOO_SMALL if buffer is insufficient
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowInstanceCopyVolumeName(
+    _In_ PSHADOW_INSTANCE_CONTEXT Context,
+    _Out_writes_bytes_opt_(BufferSize) PWCHAR Buffer,
+    _In_ ULONG BufferSize,
+    _Out_ PULONG RequiredSize
     );
 
 #ifdef __cplusplus

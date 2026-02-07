@@ -36,6 +36,16 @@
  *    → Telemetry streaming
  *    → Policy-based blocking
  *
+ * Security Hardening (v3.0.0):
+ * ============================
+ * - Lock-free reference counting with atomic CAS operations
+ * - Proper user-mode buffer probing (ProbeForRead/ProbeForWrite)
+ * - IRQL-safe function separation (paged vs non-paged)
+ * - Use-after-free prevention via reference draining
+ * - Pool allocation via ExAllocatePool2 (Windows 10 2004+)
+ * - Lookaside list integration for high-performance allocation
+ * - ETW telemetry integration
+ *
  * MITRE ATT&CK Coverage:
  * ======================
  * - T1486: Data Encrypted for Impact (PRIMARY)
@@ -54,7 +64,7 @@
  * - Hive (transacted VSS deletion)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition - Falcon-Grade)
+ * @version 3.0.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -141,6 +151,23 @@ extern "C" {
 #define KTM_STATE_UNINITIALIZED 0
 #define KTM_STATE_INITIALIZING  1
 #define KTM_STATE_INITIALIZED   2
+#define KTM_STATE_SHUTTING_DOWN 3
+
+/**
+ * @brief Reference count drain timeout (milliseconds)
+ */
+#define SHADOW_REFCOUNT_DRAIN_INTERVAL_MS 100
+#define SHADOW_REFCOUNT_DRAIN_MAX_ITERATIONS 50
+
+/**
+ * @brief Magic value for transaction validation
+ */
+#define SHADOW_KTM_TRANSACTION_MAGIC 0x4B544D58  // 'KTMX'
+
+/**
+ * @brief Reference count sentinel value (transaction being destroyed)
+ */
+#define SHADOW_KTM_REFCOUNT_DESTROYING (-1)
 
 // ============================================================================
 // SUSPICIOUS TRANSACTION PATTERNS
@@ -250,6 +277,12 @@ typedef struct _SHADOW_KTM_STATISTICS {
     /// @brief Files encrypted (estimated)
     volatile LONG64 FilesEncrypted;
 
+    /// @brief Reference count race conditions detected
+    volatile LONG64 RefCountRaces;
+
+    /// @brief Transactions leaked during cleanup
+    volatile LONG64 TransactionsLeaked;
+
 } SHADOW_KTM_STATISTICS, *PSHADOW_KTM_STATISTICS;
 
 // ============================================================================
@@ -260,11 +293,15 @@ typedef struct _SHADOW_KTM_STATISTICS {
  * @brief Transaction tracking entry.
  *
  * Tracks individual transactions for behavioral ransomware detection.
+ * Uses lock-free reference counting for safe concurrent access.
  */
 typedef struct _SHADOW_KTM_TRANSACTION {
 
     /// @brief List entry for LRU cache
     LIST_ENTRY ListEntry;
+
+    /// @brief Magic value for validation
+    ULONG Magic;
 
     /// @brief Transaction GUID
     GUID TransactionGuid;
@@ -272,7 +309,7 @@ typedef struct _SHADOW_KTM_TRANSACTION {
     /// @brief Process ID that created transaction
     HANDLE ProcessId;
 
-    /// @brief Process name
+    /// @brief Process name (captured at creation time for IRQL safety)
     WCHAR ProcessName[SHADOW_MAX_PROCESS_NAME];
 
     /// @brief Transaction creation time
@@ -311,11 +348,14 @@ typedef struct _SHADOW_KTM_TRANSACTION {
     /// @brief Time window for rate calculation (100ns units)
     LARGE_INTEGER RateWindowStart;
 
-    /// @brief Reference count for safe cleanup
+    /// @brief Reference count for safe cleanup (atomic CAS operations only)
     volatile LONG ReferenceCount;
 
-    /// @brief Padding for alignment
-    UCHAR Reserved[3];
+    /// @brief TRUE if removed from list (pending final release)
+    volatile LONG RemovedFromList;
+
+    /// @brief Padding for cache line alignment
+    UCHAR Reserved[4];
 
 } SHADOW_KTM_TRANSACTION, *PSHADOW_KTM_TRANSACTION;
 
@@ -340,7 +380,7 @@ typedef struct _SHADOW_KTM_ALERT {
     /// @brief Process ID
     HANDLE ProcessId;
 
-    /// @brief Process name
+    /// @brief Process name (captured at alert creation for IRQL safety)
     WCHAR ProcessName[SHADOW_MAX_PROCESS_NAME];
 
     /// @brief Transaction GUID
@@ -370,13 +410,13 @@ typedef struct _SHADOW_KTM_MONITOR_STATE {
     // Synchronization
     //
 
-    /// @brief Lock protecting this structure
-    EX_PUSH_LOCK Lock;
+    /// @brief Lock protecting transaction list (ERESOURCE for shared/exclusive)
+    EX_PUSH_LOCK TransactionLock;
 
-    /// @brief TRUE if lock was initialized
-    BOOLEAN LockInitialized;
+    /// @brief TRUE if transaction lock was initialized
+    BOOLEAN TransactionLockInitialized;
 
-    /// @brief Atomic initialization state (0/1/2)
+    /// @brief Atomic initialization state (0/1/2/3)
     volatile LONG InitializationState;
 
     //
@@ -406,7 +446,7 @@ typedef struct _SHADOW_KTM_MONITOR_STATE {
     // Alert Queue
     //
 
-    /// @brief Lock for alert queue
+    /// @brief Lock for alert queue (spinlock for DISPATCH_LEVEL access)
     KSPIN_LOCK AlertLock;
 
     /// @brief Alert queue list
@@ -417,6 +457,22 @@ typedef struct _SHADOW_KTM_MONITOR_STATE {
 
     /// @brief Maximum alerts in queue
     ULONG MaxAlerts;
+
+    //
+    // Lookaside Lists (High-performance allocation)
+    //
+
+    /// @brief Lookaside list for transaction entries
+    NPAGED_LOOKASIDE_LIST TransactionLookaside;
+
+    /// @brief TRUE if transaction lookaside initialized
+    BOOLEAN TransactionLookasideInitialized;
+
+    /// @brief Lookaside list for alert entries
+    NPAGED_LOOKASIDE_LIST AlertLookaside;
+
+    /// @brief TRUE if alert lookaside initialized
+    BOOLEAN AlertLookasideInitialized;
 
     //
     // Configuration
@@ -458,7 +514,7 @@ typedef struct _SHADOW_KTM_MONITOR_STATE {
     BOOLEAN Initialized;
 
     /// @brief TRUE if shutting down
-    BOOLEAN ShuttingDown;
+    volatile LONG ShuttingDown;
 
     /// @brief Initialization timestamp
     LARGE_INTEGER InitTime;
@@ -512,6 +568,7 @@ extern SHADOW_KTM_MONITOR_STATE g_KtmMonitorState;
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowInitializeKtmMonitor(
     _In_ PFLT_FILTER FilterHandle
@@ -525,6 +582,7 @@ ShadowInitializeKtmMonitor(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupKtmMonitor(
     VOID
@@ -542,6 +600,7 @@ ShadowCleanupKtmMonitor(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowRegisterTransactionCallbacks(
     VOID
@@ -554,6 +613,7 @@ ShadowRegisterTransactionCallbacks(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowUnregisterTransactionCallbacks(
     VOID
@@ -571,7 +631,10 @@ ShadowUnregisterTransactionCallbacks(
  * @return STATUS_SUCCESS on success
  *
  * @note Caller must call ShadowReleaseKtmTransaction when done
+ *
+ * @irql <= APC_LEVEL (acquires push lock)
  */
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 ShadowTrackTransaction(
     _In_ GUID TransactionGuid,
@@ -582,13 +645,17 @@ ShadowTrackTransaction(
 /**
  * @brief Find existing transaction.
  *
- * Looks up transaction in LRU cache by GUID.
+ * Looks up transaction in LRU cache by GUID. Uses lock-free reference
+ * counting to prevent use-after-free.
  *
  * @param TransactionGuid   Transaction GUID
  * @param Transaction       [out] Receives transaction if found (caller must release)
  *
  * @return STATUS_SUCCESS if found, STATUS_NOT_FOUND otherwise
+ *
+ * @irql <= APC_LEVEL (acquires push lock)
  */
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 ShadowFindKtmTransaction(
     _In_ GUID TransactionGuid,
@@ -596,12 +663,33 @@ ShadowFindKtmTransaction(
     );
 
 /**
+ * @brief Acquire additional reference to transaction.
+ *
+ * Thread-safe reference increment using atomic CAS loop.
+ *
+ * @param Transaction   Transaction to reference
+ *
+ * @return TRUE if reference acquired, FALSE if transaction is being destroyed
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowReferenceKtmTransaction(
+    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    );
+
+/**
  * @brief Release transaction reference.
  *
  * Decrements reference count. When count reaches zero, transaction is freed.
+ * Uses atomic operations to prevent race conditions.
  *
  * @param Transaction   Transaction to release
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowReleaseKtmTransaction(
     _In_ PSHADOW_KTM_TRANSACTION Transaction
@@ -622,7 +710,10 @@ ShadowReleaseKtmTransaction(
  * @param ThreatScore       [out] Receives threat score (0-100)
  *
  * @return STATUS_SUCCESS
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowCalculateKtmThreatScore(
     _In_ PSHADOW_KTM_TRANSACTION Transaction,
@@ -638,7 +729,10 @@ ShadowCalculateKtmThreatScore(
  * @param FilePath      File path to check
  *
  * @return TRUE if targeted extension, FALSE otherwise
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowIsRansomwareTargetFile(
     _In_ PUNICODE_STRING FilePath
@@ -652,7 +746,10 @@ ShadowIsRansomwareTargetFile(
  * @param Transaction   Transaction to check
  *
  * @return TRUE if ransomware pattern detected, FALSE otherwise
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowDetectRansomwarePattern(
     _In_ PSHADOW_KTM_TRANSACTION Transaction
@@ -667,7 +764,10 @@ ShadowDetectRansomwarePattern(
  * @param FilePath      File path
  *
  * @return STATUS_SUCCESS
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowRecordTransactedFileOperation(
     _In_ PSHADOW_KTM_TRANSACTION Transaction,
@@ -682,7 +782,10 @@ ShadowRecordTransactedFileOperation(
  * @param Transaction   Transaction to mark
  *
  * @return STATUS_SUCCESS
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowMarkTransactionCommitted(
     _In_ PSHADOW_KTM_TRANSACTION Transaction
@@ -694,7 +797,10 @@ ShadowMarkTransactionCommitted(
  * Thread-safe retrieval of current statistics.
  *
  * @param Stats     [out] Receives statistics snapshot
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ShadowGetKtmStatistics(
     _Out_ PSHADOW_KTM_STATISTICS Stats
@@ -704,20 +810,26 @@ ShadowGetKtmStatistics(
  * @brief Queue KTM threat alert for user-mode notification.
  *
  * Adds alert to queue for delivery to user-mode service.
+ * Process name is captured internally to ensure IRQL safety.
  *
  * @param AlertType         Alert type
  * @param ProcessId         Process ID
+ * @param ProcessName       Process name (optional, can be NULL)
  * @param TransactionGuid   Transaction GUID
  * @param FilesAffected     Number of files affected
  * @param ThreatScore       Threat score
  * @param WasBlocked        Was transaction blocked?
  *
  * @return STATUS_SUCCESS or STATUS_INSUFFICIENT_RESOURCES
+ *
+ * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 ShadowQueueKtmAlert(
     _In_ SHADOW_KTM_ALERT_TYPE AlertType,
     _In_ HANDLE ProcessId,
+    _In_opt_ PCWSTR ProcessName,
     _In_ GUID TransactionGuid,
     _In_ ULONG FilesAffected,
     _In_ ULONG ThreatScore,
@@ -774,8 +886,12 @@ ShadowTransactionPostOperationCallback(
 /**
  * @brief Evict least recently used transaction from cache.
  *
- * Called when transaction cache is full.
+ * Called when transaction cache is full. Must be called with
+ * TransactionLock held exclusively.
+ *
+ * @irql <= APC_LEVEL (caller holds lock)
  */
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowEvictLruTransaction(
     VOID
@@ -784,8 +900,12 @@ ShadowEvictLruTransaction(
 /**
  * @brief Cleanup all transaction tracking entries.
  *
- * Frees all tracked transactions. Called during shutdown.
+ * Frees all tracked transactions with proper reference draining.
+ * Called during shutdown.
+ *
+ * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupTransactionEntries(
     VOID
@@ -795,10 +915,47 @@ ShadowCleanupTransactionEntries(
  * @brief Cleanup KTM alert queue.
  *
  * Frees all pending alerts.
+ *
+ * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupKtmAlertQueue(
     VOID
+    );
+
+/**
+ * @brief Validate transaction structure integrity.
+ *
+ * @param Transaction   Transaction to validate
+ *
+ * @return TRUE if valid, FALSE if corrupted
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowValidateKtmTransaction(
+    _In_ PSHADOW_KTM_TRANSACTION Transaction
+    );
+
+/**
+ * @brief Get process image name (IRQL-safe version).
+ *
+ * Must be called at PASSIVE_LEVEL. Allocates buffer from NonPagedPool.
+ *
+ * @param ProcessId     Process ID
+ * @param ImageName     [out] Receives image name (caller must free with SHADOW_KTM_STRING_TAG)
+ *
+ * @return STATUS_SUCCESS on success
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowGetProcessImageNameSafe(
+    _In_ HANDLE ProcessId,
+    _Out_ PUNICODE_STRING ImageName
     );
 
 #ifdef __cplusplus

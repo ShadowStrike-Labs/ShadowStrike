@@ -23,14 +23,20 @@
  * - Boundary descriptor prevents Medium IL access
  * - Directory object secured against deletion/modification
  * - Cleanup is BSOD-safe with proper reference tracking
+ * - Proper ACL memory management (no leaks, no double-free)
  *
  * Thread Safety:
  * - All operations protected by EX_PUSH_LOCK
  * - Handle reference counting prevents use-after-free
  * - Cleanup callback handles race conditions during shutdown
  *
+ * Memory Management:
+ * - Self-relative security descriptors for proper cleanup
+ * - Explicit tracking of all allocated ACLs
+ * - Proper cleanup order to prevent resource leaks
+ *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 2.1.0 (Enterprise Edition - Memory Safe)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -68,6 +74,11 @@ extern "C" {
  * @brief Pool tag for security descriptor allocations
  */
 #define SHADOW_NAMESPACE_SD_TAG 'dSSn'
+
+/**
+ * @brief Pool tag for ACL allocations (DACL/SACL)
+ */
+#define SHADOW_NAMESPACE_ACL_TAG 'aSSn'
 
 // ============================================================================
 // NAMESPACE CONSTANTS
@@ -127,6 +138,11 @@ extern "C" {
  *           ShadowDestroyPrivateNamespace.
  *
  * Thread Safety: All access must be synchronized with EX_PUSH_LOCK.
+ *
+ * Memory Management:
+ * - SecurityDescriptor is self-relative (single allocation)
+ * - DACL and SACL are embedded in self-relative SD
+ * - Only SecurityDescriptor needs to be freed
  */
 typedef struct _SHADOW_NAMESPACE_STATE {
 
@@ -161,12 +177,15 @@ typedef struct _SHADOW_NAMESPACE_STATE {
 
     //
     // Security Descriptors
+    // NOTE: We use a SELF-RELATIVE security descriptor which embeds the ACLs.
+    // This eliminates memory leaks and double-free issues.
     //
 
-    /// @brief Security descriptor for directory object (System + Admin only)
+    /// @brief Self-relative security descriptor for directory object
+    /// Contains embedded DACL and SACL - only this pointer needs to be freed
     PSECURITY_DESCRIPTOR DirectorySecurityDescriptor;
 
-    /// @brief Security descriptor size
+    /// @brief Security descriptor size (self-relative, includes embedded ACLs)
     ULONG SecurityDescriptorSize;
 
     /// @brief TRUE if security descriptor was allocated
@@ -224,10 +243,12 @@ extern SHADOW_NAMESPACE_STATE g_NamespaceState;
  * Algorithm:
  * 1. Initialize namespace state structure
  * 2. Build restrictive security descriptor (SYSTEM + Admin only)
- * 3. Create boundary descriptor for namespace isolation
- * 4. Create \ShadowStrike directory object with security
- * 5. Reference the directory object to prevent premature deletion
- * 6. Mark namespace as initialized
+ * 3. Add mandatory label and audit SACL (merged into single SACL)
+ * 4. Convert to self-relative SD for proper memory management
+ * 5. Create boundary descriptor for namespace isolation
+ * 6. Create \ShadowStrike directory object with security
+ * 7. Reference the directory object to prevent premature deletion
+ * 8. Mark namespace as initialized
  *
  * @return STATUS_SUCCESS on success
  *         STATUS_INSUFFICIENT_RESOURCES if allocation fails
@@ -258,7 +279,7 @@ ShadowCreatePrivateNamespace(
  * 3. Dereference directory object (if referenced)
  * 4. Close directory handle (if opened)
  * 5. Delete boundary descriptor (if created)
- * 6. Free security descriptor (if allocated)
+ * 6. Free self-relative security descriptor (contains embedded ACLs)
  * 7. Delete push lock (if initialized)
  * 8. Zero the namespace state structure
  *
@@ -362,13 +383,19 @@ ShadowDereferenceNamespace(
 // ============================================================================
 
 /**
- * @brief Build restrictive security descriptor.
+ * @brief Build self-relative security descriptor with DACL and merged SACL.
  *
- * Creates DACL allowing only SYSTEM and Administrators with full control.
- * Denies all other principals including Local Service and Network Service.
+ * Creates a SELF-RELATIVE security descriptor containing:
+ * - DACL: SYSTEM and Administrators with full control
+ * - SACL: High Integrity Level mandatory label + Audit ACEs
  *
- * @param SecurityDescriptor [out] Receives allocated security descriptor
- * @param DescriptorSize     [out] Receives size of descriptor
+ * Using self-relative format ensures:
+ * - Single allocation contains all ACLs (no memory leaks)
+ * - Single free cleans up everything (no double-free)
+ * - Thread-safe and copyable
+ *
+ * @param SecurityDescriptor [out] Receives allocated self-relative SD
+ * @param DescriptorSize     [out] Receives total size of SD
  *
  * @return STATUS_SUCCESS or error code
  */
@@ -391,34 +418,6 @@ ShadowBuildNamespaceSecurityDescriptor(
 NTSTATUS
 ShadowCreateBoundaryDescriptor(
     _Outptr_ POBJECT_BOUNDARY_DESCRIPTOR* BoundaryDescriptor
-    );
-
-/**
- * @brief Add mandatory integrity level to security descriptor.
- *
- * Adds High Integrity Level mandatory label to prevent Medium IL access.
- *
- * @param SecurityDescriptor [in/out] Security descriptor to modify
- *
- * @return STATUS_SUCCESS or error code
- */
-NTSTATUS
-ShadowAddMandatoryLabel(
-    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor
-    );
-
-/**
- * @brief Add SACL for auditing to security descriptor.
- *
- * Adds System Audit ACL to log all access attempts.
- *
- * @param SecurityDescriptor [in/out] Security descriptor to modify
- *
- * @return STATUS_SUCCESS or error code
- */
-NTSTATUS
-ShadowAddAuditSacl(
-    _Inout_ PSECURITY_DESCRIPTOR SecurityDescriptor
     );
 
 #ifdef __cplusplus

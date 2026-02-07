@@ -13,8 +13,25 @@
  * - Reliability (comprehensive error handling, leak detection)
  * - Auditability (pool tags, allocation tracking)
  *
+ * CRITICAL FIXES IN VERSION 2.1.0:
+ * --------------------------------
+ * 1. Fixed pool tag mismatch in ShadowStrikeCaptureUserBufferSecure
+ *    - Now passes correct tag to allocation function
+ * 2. Fixed initialization race condition
+ *    - Uses InterlockedCompareExchange for thread-safe init
+ * 3. Added IRQL validation in ShadowStrikeLookasideFree
+ *    - Prevents BSOD from freeing paged memory at DISPATCH_LEVEL
+ * 4. Fixed user address validation
+ *    - Proper range checks including end address overflow
+ * 5. Removed unreliable MmIsAddressValid-based ShadowStrikeIsMemoryValid
+ *    - Replaced with ShadowStrikeIsValidUserAddressRange (range-only check)
+ * 6. Improved secure wipe performance
+ *    - Uses RtlSecureZeroMemory where available
+ *    - Word-aligned writes for better performance
+ * 7. Removed unused spin lock from global state
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -29,8 +46,8 @@
  * @brief Global memory subsystem state
  */
 typedef struct _SHADOWSTRIKE_MEMORY_STATE {
-    /// Subsystem initialized
-    BOOLEAN Initialized;
+    /// Subsystem initialized (use interlocked access only)
+    volatile LONG Initialized;
 
     /// Allocation statistics
     volatile LONG64 TotalAllocations;
@@ -46,9 +63,6 @@ typedef struct _SHADOWSTRIKE_MEMORY_STATE {
     /// Peak values
     volatile LONG64 PeakAllocations;
     volatile LONG64 PeakBytesAllocated;
-
-    /// Lock for statistics update (only for peak calculation)
-    KSPIN_LOCK StatsLock;
 
 } SHADOWSTRIKE_MEMORY_STATE, *PSHADOWSTRIKE_MEMORY_STATE;
 
@@ -66,10 +80,16 @@ static SHADOWSTRIKE_MEMORY_STATE g_MemoryState = { 0 };
         InterlockedIncrement64(&g_MemoryState.TotalAllocations); \
         InterlockedAdd64(&g_MemoryState.TotalBytesAllocated, (LONG64)(Size)); \
         LONG64 current = InterlockedIncrement64(&g_MemoryState.CurrentAllocations); \
+        LONG64 currentBytes = InterlockedAdd64(&g_MemoryState.CurrentBytesAllocated, (LONG64)(Size)); \
         LONG64 peak = g_MemoryState.PeakAllocations; \
         while (current > peak) { \
             InterlockedCompareExchange64(&g_MemoryState.PeakAllocations, current, peak); \
             peak = g_MemoryState.PeakAllocations; \
+        } \
+        LONG64 peakBytes = g_MemoryState.PeakBytesAllocated; \
+        while (currentBytes > peakBytes) { \
+            InterlockedCompareExchange64(&g_MemoryState.PeakBytesAllocated, currentBytes, peakBytes); \
+            peakBytes = g_MemoryState.PeakBytesAllocated; \
         } \
     } while (0)
 
@@ -81,6 +101,7 @@ static SHADOWSTRIKE_MEMORY_STATE g_MemoryState = { 0 };
         InterlockedIncrement64(&g_MemoryState.TotalFrees); \
         InterlockedAdd64(&g_MemoryState.TotalBytesFreed, (LONG64)(Size)); \
         InterlockedDecrement64(&g_MemoryState.CurrentAllocations); \
+        InterlockedAdd64(&g_MemoryState.CurrentBytesAllocated, -(LONG64)(Size)); \
     } while (0)
 
 /**
@@ -102,7 +123,73 @@ static SHADOWSTRIKE_MEMORY_STATE g_MemoryState = { 0 };
 #pragma alloc_text(PAGE, ShadowStrikeCaptureUserBufferSecure)
 #pragma alloc_text(PAGE, ShadowStrikeProbeUserBufferRead)
 #pragma alloc_text(PAGE, ShadowStrikeProbeUserBufferWrite)
+#pragma alloc_text(PAGE, ShadowStrikeReleaseUserBuffer)
 #endif
+
+// ============================================================================
+// INTERNAL HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Optimized secure memory fill using word-sized writes.
+ *
+ * Uses volatile writes to prevent compiler optimization and
+ * word-aligned access for better performance.
+ */
+static
+VOID
+ShadowStrikeSecureFillMemory(
+    _Out_writes_bytes_(Length) PVOID Destination,
+    _In_ SIZE_T Length,
+    _In_ UCHAR Pattern
+    )
+{
+    volatile UCHAR* BytePtr;
+    volatile SIZE_T* WordPtr;
+    SIZE_T WordPattern;
+    SIZE_T i;
+
+    if (Destination == NULL || Length == 0) {
+        return;
+    }
+
+    //
+    // Build word-sized pattern
+    //
+    WordPattern = (SIZE_T)Pattern;
+    WordPattern |= WordPattern << 8;
+    WordPattern |= WordPattern << 16;
+#ifdef _WIN64
+    WordPattern |= WordPattern << 32;
+#endif
+
+    //
+    // Handle unaligned prefix
+    //
+    BytePtr = (volatile UCHAR*)Destination;
+    while (Length > 0 && ((ULONG_PTR)BytePtr & (sizeof(SIZE_T) - 1)) != 0) {
+        *BytePtr++ = Pattern;
+        Length--;
+    }
+
+    //
+    // Word-aligned bulk fill
+    //
+    WordPtr = (volatile SIZE_T*)BytePtr;
+    while (Length >= sizeof(SIZE_T)) {
+        *WordPtr++ = WordPattern;
+        Length -= sizeof(SIZE_T);
+    }
+
+    //
+    // Handle unaligned suffix
+    //
+    BytePtr = (volatile UCHAR*)WordPtr;
+    while (Length > 0) {
+        *BytePtr++ = Pattern;
+        Length--;
+    }
+}
 
 // ============================================================================
 // SUBSYSTEM INITIALIZATION
@@ -117,26 +204,33 @@ ShadowStrikeInitializeMemoryUtils(
     PAGED_CODE();
 
     //
-    // Prevent double initialization
+    // Thread-safe initialization using interlocked compare-exchange
+    // This prevents race conditions if two threads call init simultaneously
     //
-    if (g_MemoryState.Initialized) {
+    if (InterlockedCompareExchange(&g_MemoryState.Initialized, 1, 0) != 0) {
+        //
+        // Already initialized by another thread
+        //
         return STATUS_ALREADY_INITIALIZED;
     }
 
     //
-    // Zero the state structure
+    // Zero the statistics (Initialized already set to 1)
     //
-    RtlZeroMemory(&g_MemoryState, sizeof(g_MemoryState));
+    g_MemoryState.TotalAllocations = 0;
+    g_MemoryState.TotalFrees = 0;
+    g_MemoryState.TotalBytesAllocated = 0;
+    g_MemoryState.TotalBytesFreed = 0;
+    g_MemoryState.AllocationFailures = 0;
+    g_MemoryState.CurrentAllocations = 0;
+    g_MemoryState.CurrentBytesAllocated = 0;
+    g_MemoryState.PeakAllocations = 0;
+    g_MemoryState.PeakBytesAllocated = 0;
 
     //
-    // Initialize spin lock for statistics
+    // Memory barrier to ensure all writes are visible
     //
-    KeInitializeSpinLock(&g_MemoryState.StatsLock);
-
-    //
-    // Mark as initialized
-    //
-    g_MemoryState.Initialized = TRUE;
+    KeMemoryBarrier();
 
     return STATUS_SUCCESS;
 }
@@ -149,7 +243,10 @@ ShadowStrikeCleanupMemoryUtils(
 {
     PAGED_CODE();
 
-    if (!g_MemoryState.Initialized) {
+    if (InterlockedCompareExchange(&g_MemoryState.Initialized, 0, 1) != 1) {
+        //
+        // Not initialized or already cleaned up
+        //
         return;
     }
 
@@ -161,13 +258,18 @@ ShadowStrikeCleanupMemoryUtils(
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike] WARNING: Memory leak detected! Outstanding allocations: %lld\n",
-            g_MemoryState.CurrentAllocations
+            "[ShadowStrike] WARNING: Memory leak detected!\n"
+            "  Outstanding allocations: %lld\n"
+            "  Outstanding bytes: %lld\n"
+            "  Total allocations: %lld\n"
+            "  Total frees: %lld\n",
+            g_MemoryState.CurrentAllocations,
+            g_MemoryState.CurrentBytesAllocated,
+            g_MemoryState.TotalAllocations,
+            g_MemoryState.TotalFrees
         );
     }
 #endif
-
-    g_MemoryState.Initialized = FALSE;
 }
 
 // ============================================================================
@@ -225,7 +327,7 @@ ShadowStrikeAllocatePoolWithTag(
     //
     // ExAllocatePool2 automatically zeros memory and uses NX pools
     //
-    POOL_FLAGS PoolFlags = POOL_FLAG_UNINITIALIZED;
+    POOL_FLAGS PoolFlags = 0;
 
     if (PoolType == PagedPool || PoolType == PagedPoolCacheAligned) {
         PoolFlags = POOL_FLAG_PAGED;
@@ -239,13 +341,9 @@ ShadowStrikeAllocatePoolWithTag(
 
     Buffer = ExAllocatePool2(PoolFlags, NumberOfBytes, Tag);
 
-    if (Buffer != NULL) {
-        //
-        // ExAllocatePool2 with POOL_FLAG_UNINITIALIZED doesn't zero
-        // We want zeroed memory for security, so zero it
-        //
-        RtlZeroMemory(Buffer, NumberOfBytes);
-    }
+    //
+    // ExAllocatePool2 zeros memory by default (unless POOL_FLAG_UNINITIALIZED)
+    //
 
 #else
     //
@@ -380,6 +478,9 @@ ShadowStrikeAllocateAligned(
     PVOID RawBuffer = NULL;
     PVOID AlignedBuffer = NULL;
     SIZE_T TotalSize = 0;
+    SIZE_T HeaderSize = 0;
+    SIZE_T PaddingSize = 0;
+    SIZE_T TempSize = 0;
     PSHADOWSTRIKE_ALIGNED_HEADER Header = NULL;
 
     //
@@ -402,18 +503,26 @@ ShadowStrikeAllocateAligned(
     // - Alignment padding (worst case: Alignment - 1)
     // - Header structure for tracking
     //
-    SIZE_T HeaderSize = sizeof(SHADOWSTRIKE_ALIGNED_HEADER);
-    SIZE_T PaddingSize = Alignment - 1;
+    HeaderSize = sizeof(SHADOWSTRIKE_ALIGNED_HEADER);
+    PaddingSize = Alignment - 1;
 
     //
     // Safe size calculation with overflow checks
     //
-    if (!ShadowStrikeSafeAdd(NumberOfBytes, HeaderSize, &TotalSize)) {
+    if (!ShadowStrikeSafeAdd(NumberOfBytes, HeaderSize, &TempSize)) {
         MEMORY_TRACK_FAILURE();
         return NULL;
     }
 
-    if (!ShadowStrikeSafeAdd(TotalSize, PaddingSize, &TotalSize)) {
+    if (!ShadowStrikeSafeAdd(TempSize, PaddingSize, &TotalSize)) {
+        MEMORY_TRACK_FAILURE();
+        return NULL;
+    }
+
+    //
+    // Final overflow check against maximum
+    //
+    if (TotalSize > SHADOWSTRIKE_MAX_ALLOCATION_SIZE) {
         MEMORY_TRACK_FAILURE();
         return NULL;
     }
@@ -427,11 +536,20 @@ ShadowStrikeAllocateAligned(
     }
 
     //
-    // Calculate aligned address
+    // Calculate aligned address using overflow-safe function
     // We need space for the header just before the aligned buffer
     //
     ULONG_PTR RawAddress = (ULONG_PTR)RawBuffer + HeaderSize;
-    ULONG_PTR AlignedAddress = ShadowStrikeAlignUp(RawAddress, Alignment);
+    SIZE_T AlignedAddress;
+
+    if (!ShadowStrikeAlignUpSafe(RawAddress, Alignment, &AlignedAddress)) {
+        //
+        // Overflow - should not happen given our size checks, but be safe
+        //
+        ShadowStrikeFreePoolWithTag(RawBuffer, SHADOWSTRIKE_ALIGNED_TAG);
+        MEMORY_TRACK_FAILURE();
+        return NULL;
+    }
 
     AlignedBuffer = (PVOID)AlignedAddress;
 
@@ -441,6 +559,7 @@ ShadowStrikeAllocateAligned(
     Header = (PSHADOWSTRIKE_ALIGNED_HEADER)((ULONG_PTR)AlignedBuffer - sizeof(SHADOWSTRIKE_ALIGNED_HEADER));
     Header->OriginalPointer = RawBuffer;
     Header->Alignment = Alignment;
+    Header->AllocationSize = NumberOfBytes;
     Header->Magic = SHADOWSTRIKE_ALIGNED_MAGIC;
     Header->PoolTag = Tag;
 
@@ -473,7 +592,7 @@ ShadowStrikeReallocate(
     // Handle zero new size as free
     //
     if (NewSize == 0) {
-        ShadowStrikeFreePoolWithTag(OldBuffer, Tag);
+        ShadowStrikeSecureFree(OldBuffer, OldSize, Tag);
         return NULL;
     }
 
@@ -502,9 +621,9 @@ ShadowStrikeReallocate(
     RtlCopyMemory(NewBuffer, OldBuffer, CopySize);
 
     //
-    // Free old buffer
+    // Securely free old buffer
     //
-    ShadowStrikeFreePoolWithTag(OldBuffer, Tag);
+    ShadowStrikeSecureFree(OldBuffer, OldSize, Tag);
 
     return NewBuffer;
 }
@@ -521,7 +640,7 @@ ShadowStrikeFreePool(
 {
     if (P != NULL) {
         ExFreePool(P);
-        MEMORY_TRACK_FREE(0); // Size unknown in this path
+        MEMORY_TRACK_FREE(0);
     }
 }
 
@@ -534,7 +653,7 @@ ShadowStrikeFreePoolWithTag(
 {
     if (P != NULL) {
         ExFreePoolWithTag(P, Tag);
-        MEMORY_TRACK_FREE(0); // Size unknown in this path
+        MEMORY_TRACK_FREE(0);
     }
 }
 
@@ -545,6 +664,7 @@ ShadowStrikeFreeAligned(
     )
 {
     PSHADOWSTRIKE_ALIGNED_HEADER Header = NULL;
+    SIZE_T AllocationSize = 0;
 
     if (P == NULL) {
         return;
@@ -575,9 +695,21 @@ ShadowStrikeFreeAligned(
     }
 
     //
+    // Save allocation size for secure wipe
+    //
+    AllocationSize = Header->AllocationSize;
+
+    //
     // Clear magic to prevent double-free detection issues
     //
     Header->Magic = 0;
+
+    //
+    // Secure wipe the user data portion
+    //
+    if (AllocationSize > 0) {
+        ShadowStrikeSecureZeroMemory(P, AllocationSize);
+    }
 
     //
     // Free the original raw allocation
@@ -594,13 +726,26 @@ ShadowStrikeSecureFree(
     )
 {
     if (P == NULL || Size == 0) {
+        if (P != NULL) {
+            ShadowStrikeFreePoolWithTag(P, Tag);
+        }
         return;
     }
 
     //
-    // Securely wipe the memory before freeing
+    // At DISPATCH_LEVEL, limit wipe size to prevent DPC timeout
     //
-    ShadowStrikeSecureWipeMemory(P, Size);
+    if (KeGetCurrentIrql() >= DISPATCH_LEVEL && Size > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
+        //
+        // Just zero what we can safely do at DISPATCH_LEVEL
+        //
+        ShadowStrikeSecureZeroMemory(P, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
+    } else {
+        //
+        // Full secure wipe
+        //
+        ShadowStrikeSecureWipeMemory(P, Size);
+    }
 
     //
     // Free the memory
@@ -757,6 +902,26 @@ ShadowStrikeLookasideFree(
     }
 
     //
+    // CRITICAL FIX: Check IRQL for paged lookasides
+    // Freeing to a paged lookaside at DISPATCH_LEVEL causes BSOD
+    //
+    if (Lookaside->IsPaged && KeGetCurrentIrql() > APC_LEVEL) {
+#if DBG
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike] ERROR: Attempt to free to paged lookaside at IRQL %d\n",
+            KeGetCurrentIrql()
+        );
+#endif
+        //
+        // Cannot safely free at this IRQL - memory will leak
+        // This is a programming error that should be fixed
+        //
+        return;
+    }
+
+    //
     // Update statistics
     //
     InterlockedIncrement64(&Lookaside->TotalFrees);
@@ -845,6 +1010,7 @@ ShadowStrikeCaptureUserBuffer(
     _In_reads_bytes_(BufferSize) PVOID UserBuffer,
     _In_ SIZE_T BufferSize,
     _In_ ULONG ProbeAlignment,
+    _In_ ULONG Tag,
     _Out_ PSHADOWSTRIKE_SAFE_BUFFER SafeBuffer,
     _In_ POOL_TYPE PoolType
     )
@@ -877,26 +1043,29 @@ ShadowStrikeCaptureUserBuffer(
     }
 
     //
+    // CRITICAL FIX: Validate entire user address range
+    //
+    if (!ShadowStrikeIsValidUserAddressRange(UserBuffer, BufferSize)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    //
     // Probe the user buffer
     //
     __try {
-        if (UserBuffer < MmHighestUserAddress) {
-            ProbeForRead(UserBuffer, BufferSize, ProbeAlignment);
-        } else {
-            return STATUS_ACCESS_VIOLATION;
-        }
+        ProbeForRead(UserBuffer, BufferSize, ProbeAlignment);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
 
     //
-    // Allocate kernel buffer
+    // Allocate kernel buffer with the specified tag
     //
     SafeBuffer->KernelBuffer = ShadowStrikeAllocatePoolWithTag(
         PoolType,
         BufferSize,
-        SHADOWSTRIKE_BUFFER_TAG
+        Tag
     );
 
     if (SafeBuffer->KernelBuffer == NULL) {
@@ -911,7 +1080,7 @@ ShadowStrikeCaptureUserBuffer(
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         Status = GetExceptionCode();
-        ShadowStrikeFreePoolWithTag(SafeBuffer->KernelBuffer, SHADOWSTRIKE_BUFFER_TAG);
+        ShadowStrikeFreePoolWithTag(SafeBuffer->KernelBuffer, Tag);
         RtlZeroMemory(SafeBuffer, sizeof(SHADOWSTRIKE_SAFE_BUFFER));
         return Status;
     }
@@ -921,7 +1090,7 @@ ShadowStrikeCaptureUserBuffer(
     //
     SafeBuffer->OriginalUserBuffer = UserBuffer;
     SafeBuffer->Size = BufferSize;
-    SafeBuffer->PoolTag = SHADOWSTRIKE_BUFFER_TAG;
+    SafeBuffer->PoolTag = Tag;
     SafeBuffer->IsPaged = (PoolType == PagedPool);
     SafeBuffer->IsSecure = FALSE;
 
@@ -940,28 +1109,36 @@ ShadowStrikeCaptureUserBufferSecure(
 
     PAGED_CODE();
 
+    //
+    // CRITICAL FIX: Use SHADOWSTRIKE_SECURE_TAG for the actual allocation
+    // The original code allocated with BUFFER_TAG then changed the descriptor,
+    // causing tag mismatch on free
+    //
     Status = ShadowStrikeCaptureUserBuffer(
         UserBuffer,
         BufferSize,
         sizeof(UCHAR),
+        SHADOWSTRIKE_SECURE_TAG,  // Use correct tag from the start
         SafeBuffer,
         NonPagedPoolNx
     );
 
     if (NT_SUCCESS(Status)) {
         SafeBuffer->IsSecure = TRUE;
-        SafeBuffer->PoolTag = SHADOWSTRIKE_SECURE_TAG;
+        // PoolTag is already SHADOWSTRIKE_SECURE_TAG from the allocation
     }
 
     return Status;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowStrikeReleaseUserBuffer(
     _Inout_ PSHADOWSTRIKE_SAFE_BUFFER SafeBuffer
     )
 {
+    PAGED_CODE();
+
     if (SafeBuffer == NULL || SafeBuffer->KernelBuffer == NULL) {
         return;
     }
@@ -974,7 +1151,7 @@ ShadowStrikeReleaseUserBuffer(
     }
 
     //
-    // Free the kernel buffer
+    // Free the kernel buffer with matching tag
     //
     ShadowStrikeFreePoolWithTag(SafeBuffer->KernelBuffer, SafeBuffer->PoolTag);
 
@@ -1002,12 +1179,15 @@ ShadowStrikeProbeUserBufferRead(
         Alignment = sizeof(UCHAR);
     }
 
+    //
+    // Validate address range first
+    //
+    if (!ShadowStrikeIsValidUserAddressRange(Buffer, Length)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+
     __try {
-        if (Buffer < MmHighestUserAddress) {
-            ProbeForRead(Buffer, Length, Alignment);
-        } else {
-            return STATUS_ACCESS_VIOLATION;
-        }
+        ProbeForRead(Buffer, Length, Alignment);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
@@ -1034,12 +1214,15 @@ ShadowStrikeProbeUserBufferWrite(
         Alignment = sizeof(UCHAR);
     }
 
+    //
+    // Validate address range first
+    //
+    if (!ShadowStrikeIsValidUserAddressRange(Buffer, Length)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+
     __try {
-        if (Buffer < MmHighestUserAddress) {
-            ProbeForWrite(Buffer, Length, Alignment);
-        } else {
-            return STATUS_ACCESS_VIOLATION;
-        }
+        ProbeForWrite(Buffer, Length, Alignment);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
@@ -1080,6 +1263,13 @@ ShadowStrikeMapMemory(
     }
 
     if (Length > SHADOWSTRIKE_MAX_ALLOCATION_SIZE) {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    //
+    // Explicit check that Length fits in ULONG for IoAllocateMdl
+    //
+    if (Length > MAXULONG) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
@@ -1229,7 +1419,7 @@ ShadowStrikeCreateMdl(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Length > SHADOWSTRIKE_MAX_ALLOCATION_SIZE) {
+    if (Length > SHADOWSTRIKE_MAX_ALLOCATION_SIZE || Length > MAXULONG) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
@@ -1270,23 +1460,18 @@ ShadowStrikeSecureZeroMemory(
     _In_ SIZE_T Length
     )
 {
-    volatile UCHAR* VolatilePointer = NULL;
-
     if (Destination == NULL || Length == 0) {
         return;
     }
 
     //
-    // Use volatile pointer to prevent compiler optimization
+    // Use RtlSecureZeroMemory which is optimized and guaranteed
+    // not to be optimized away by the compiler
     //
-    VolatilePointer = (volatile UCHAR*)Destination;
-
-    while (Length--) {
-        *VolatilePointer++ = 0;
-    }
+    RtlSecureZeroMemory(Destination, Length);
 
     //
-    // Memory barrier to ensure all writes complete
+    // Memory barrier to ensure all writes complete before returning
     //
     KeMemoryBarrier();
 }
@@ -1298,51 +1483,46 @@ ShadowStrikeSecureWipeMemory(
     _In_ SIZE_T Length
     )
 {
-    volatile UCHAR* VolatilePointer = NULL;
-    SIZE_T i;
-
     if (Destination == NULL || Length == 0) {
         return;
     }
 
     //
-    // DoD 5220.22-M secure wipe: three passes with different patterns
+    // At high IRQL with large buffers, just do a single zero pass
+    // to avoid DPC timeout
+    //
+    if (KeGetCurrentIrql() >= DISPATCH_LEVEL && Length > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
+        ShadowStrikeSecureZeroMemory(Destination, Length);
+        return;
+    }
+
+    //
+    // DoD 5220.22-M secure wipe: four passes with different patterns
+    // Using optimized word-aligned writes for performance
     //
 
     //
     // Pass 1: Zero pattern
     //
-    VolatilePointer = (volatile UCHAR*)Destination;
-    for (i = 0; i < Length; i++) {
-        VolatilePointer[i] = SHADOWSTRIKE_WIPE_PATTERN_1;
-    }
+    ShadowStrikeSecureFillMemory(Destination, Length, SHADOWSTRIKE_WIPE_PATTERN_1);
     KeMemoryBarrier();
 
     //
     // Pass 2: 0xFF pattern
     //
-    VolatilePointer = (volatile UCHAR*)Destination;
-    for (i = 0; i < Length; i++) {
-        VolatilePointer[i] = SHADOWSTRIKE_WIPE_PATTERN_2;
-    }
+    ShadowStrikeSecureFillMemory(Destination, Length, SHADOWSTRIKE_WIPE_PATTERN_2);
     KeMemoryBarrier();
 
     //
     // Pass 3: 0xAA pattern
     //
-    VolatilePointer = (volatile UCHAR*)Destination;
-    for (i = 0; i < Length; i++) {
-        VolatilePointer[i] = SHADOWSTRIKE_WIPE_PATTERN_3;
-    }
+    ShadowStrikeSecureFillMemory(Destination, Length, SHADOWSTRIKE_WIPE_PATTERN_3);
     KeMemoryBarrier();
 
     //
-    // Final pass: Zero
+    // Final pass: Zero (using RtlSecureZeroMemory for guarantee)
     //
-    VolatilePointer = (volatile UCHAR*)Destination;
-    for (i = 0; i < Length; i++) {
-        VolatilePointer[i] = 0;
-    }
+    RtlSecureZeroMemory(Destination, Length);
     KeMemoryBarrier();
 }
 
@@ -1392,8 +1572,8 @@ ShadowStrikeIsKernelAddress(
     )
 {
     //
-    // On x64, kernel addresses are above 0xFFFF800000000000
-    // MmHighestUserAddress points to the highest valid user-mode address
+    // On x64, kernel addresses are above MmSystemRangeStart
+    // This is a range check only - does NOT validate accessibility
     //
     return (Address >= MmSystemRangeStart);
 }
@@ -1406,58 +1586,56 @@ ShadowStrikeIsUserAddress(
 {
     //
     // User addresses are below MmHighestUserAddress
+    // This is a range check only - does NOT validate accessibility
     //
     return (Address < MmHighestUserAddress);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
-ShadowStrikeIsMemoryValid(
+ShadowStrikeIsValidUserAddressRange(
     _In_ PVOID Address,
-    _In_ SIZE_T Length,
-    _In_ BOOLEAN WriteAccess
+    _In_ SIZE_T Length
     )
 {
-    PVOID EndAddress = NULL;
+    ULONG_PTR StartAddr;
+    ULONG_PTR EndAddr;
+    ULONG_PTR HighestUser;
 
     if (Address == NULL || Length == 0) {
+        return FALSE;
+    }
+
+    StartAddr = (ULONG_PTR)Address;
+    HighestUser = (ULONG_PTR)MmHighestUserAddress;
+
+    //
+    // Check start address is in user space
+    //
+    if (StartAddr >= HighestUser) {
         return FALSE;
     }
 
     //
     // Check for address overflow
     //
-    if ((ULONG_PTR)Address > (ULONG_PTR)(-1) - Length) {
+    if (StartAddr > (ULONG_PTR)(-1) - Length) {
         return FALSE;
     }
 
-    EndAddress = (PVOID)((ULONG_PTR)Address + Length - 1);
+    //
+    // Calculate end address (last byte, not one past)
+    //
+    EndAddr = StartAddr + Length - 1;
 
     //
-    // For kernel addresses, use MmIsAddressValid
-    // Note: This only checks if the page is currently mapped, not if it's safe to access
+    // Check end address is still in user space
     //
-    if (ShadowStrikeIsKernelAddress(Address)) {
-        //
-        // Check first and last byte at minimum
-        // For comprehensive checking, would need to check each page
-        //
-        if (!MmIsAddressValid(Address)) {
-            return FALSE;
-        }
-
-        if (Length > 1 && !MmIsAddressValid(EndAddress)) {
-            return FALSE;
-        }
-
-        return TRUE;
+    if (EndAddr >= HighestUser) {
+        return FALSE;
     }
 
-    //
-    // For user addresses, we cannot use MmIsAddressValid
-    // Caller should use probing functions instead
-    //
-    return FALSE;
+    return TRUE;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1565,9 +1743,14 @@ ShadowStrikeFreeContiguous(
 
     //
     // Secure wipe before freeing (physical memory could be reused)
+    // Limit size at DISPATCH_LEVEL to avoid DPC timeout
     //
     if (NumberOfBytes > 0) {
-        ShadowStrikeSecureZeroMemory(BaseAddress, NumberOfBytes);
+        if (KeGetCurrentIrql() >= DISPATCH_LEVEL && NumberOfBytes > SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE) {
+            ShadowStrikeSecureZeroMemory(BaseAddress, SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE);
+        } else {
+            ShadowStrikeSecureZeroMemory(BaseAddress, NumberOfBytes);
+        }
     }
 
     MmFreeContiguousMemory(BaseAddress);

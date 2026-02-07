@@ -31,13 +31,17 @@
  * - Non-paged pool minimization strategies
  * - IRQL-aware operation selection
  *
- * MITRE ATT&CK Coverage:
- * - T1055: Process Injection (safe memory mapping)
- * - T1106: Native API (secure buffer handling)
- * - T1003: Credential Dumping (secure memory wipe)
+ * CRITICAL FIXES IN VERSION 2.1.0:
+ * - Fixed ShadowStrikeAlignUp integer overflow vulnerability
+ * - Fixed pool tag mismatch in secure buffer capture
+ * - Added IRQL validation in paged lookaside free
+ * - Fixed user address range validation
+ * - Removed unreliable MmIsAddressValid-based validation
+ * - Added proper initialization synchronization
+ * - Improved secure wipe performance
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -137,6 +141,11 @@ extern "C" {
 #define SHADOWSTRIKE_WIPE_PATTERN_1         0x00
 #define SHADOWSTRIKE_WIPE_PATTERN_2         0xFF
 #define SHADOWSTRIKE_WIPE_PATTERN_3         0xAA
+
+/**
+ * @brief Maximum size for secure wipe at DISPATCH_LEVEL (avoid DPC timeout)
+ */
+#define SHADOWSTRIKE_MAX_DISPATCH_WIPE_SIZE (64 * 1024)
 
 // ============================================================================
 // ALLOCATION CONVENIENCE MACROS
@@ -373,6 +382,9 @@ typedef struct _SHADOWSTRIKE_ALIGNED_HEADER {
     /// Requested alignment
     SIZE_T Alignment;
 
+    /// Allocation size (for tracking)
+    SIZE_T AllocationSize;
+
     /// Magic value for validation
     ULONG Magic;
 
@@ -392,8 +404,10 @@ typedef struct _SHADOWSTRIKE_ALIGNED_HEADER {
  *
  * Must be called during driver initialization before any memory operations.
  * Sets up internal tracking structures and validates system state.
+ * Thread-safe: Uses interlocked operations to prevent double initialization.
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_ALREADY_INITIALIZED if already initialized
  *
  * @irql PASSIVE_LEVEL
  */
@@ -591,7 +605,7 @@ ShadowStrikeFreeAligned(
  * @param Size     Size of allocation
  * @param Tag      Pool tag
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= DISPATCH_LEVEL (size limited at DISPATCH_LEVEL)
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -714,6 +728,7 @@ ShadowStrikeLookasideGetStats(
  * @param UserBuffer       User-mode buffer address
  * @param BufferSize       Size of buffer
  * @param ProbeAlignment   Alignment for probe (usually sizeof(UCHAR))
+ * @param Tag              Pool tag for allocation
  * @param SafeBuffer       Receives safe buffer descriptor
  * @param PoolType         Pool type for kernel copy
  *
@@ -727,6 +742,7 @@ ShadowStrikeCaptureUserBuffer(
     _In_reads_bytes_(BufferSize) PVOID UserBuffer,
     _In_ SIZE_T BufferSize,
     _In_ ULONG ProbeAlignment,
+    _In_ ULONG Tag,
     _Out_ PSHADOWSTRIKE_SAFE_BUFFER SafeBuffer,
     _In_ POOL_TYPE PoolType
     );
@@ -735,7 +751,7 @@ ShadowStrikeCaptureUserBuffer(
  * @brief Safely capture user-mode buffer (security-sensitive version).
  *
  * Same as ShadowStrikeCaptureUserBuffer but marks buffer for secure
- * wiping on release.
+ * wiping on release. Uses SHADOWSTRIKE_SECURE_TAG.
  *
  * @param UserBuffer       User-mode buffer address
  * @param BufferSize       Size of buffer
@@ -761,9 +777,9 @@ ShadowStrikeCaptureUserBufferSecure(
  *
  * @param SafeBuffer   Safe buffer to release
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (secure wipe may be slow)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 ShadowStrikeReleaseUserBuffer(
     _Inout_ PSHADOWSTRIKE_SAFE_BUFFER SafeBuffer
@@ -936,11 +952,14 @@ ShadowStrikeSecureZeroMemory(
  * Pass 1: 0x00
  * Pass 2: 0xFF
  * Pass 3: 0xAA
+ * Pass 4: 0x00 (final)
  *
  * @param Destination  Memory to wipe
  * @param Length       Number of bytes
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL for large buffers, <= DISPATCH_LEVEL for small
+ *
+ * @note For large buffers (>64KB), should be called at <= APC_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -975,13 +994,16 @@ ShadowStrikeSecureCompare(
 // ============================================================================
 
 /**
- * @brief Check if address is valid kernel-mode address.
+ * @brief Check if address is in kernel address space.
  *
- * @param Address  Address to validate
+ * @param Address  Address to check
  *
- * @return TRUE if valid kernel address
+ * @return TRUE if address is >= MmSystemRangeStart
  *
  * @irql <= DISPATCH_LEVEL
+ *
+ * @note This does NOT validate that the address is mapped or accessible.
+ *       It only checks the address range.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
@@ -990,13 +1012,16 @@ ShadowStrikeIsKernelAddress(
     );
 
 /**
- * @brief Check if address is valid user-mode address.
+ * @brief Check if address is in user address space.
  *
- * @param Address  Address to validate
+ * @param Address  Address to check
  *
- * @return TRUE if valid user address
+ * @return TRUE if address is < MmHighestUserAddress
  *
  * @irql <= DISPATCH_LEVEL
+ *
+ * @note This does NOT validate that the address is mapped or accessible.
+ *       It only checks the address range.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
@@ -1005,22 +1030,26 @@ ShadowStrikeIsUserAddress(
     );
 
 /**
- * @brief Validate memory range is accessible.
+ * @brief Check if user address range is valid (range check only).
  *
- * @param Address      Start address
- * @param Length       Length in bytes
- * @param WriteAccess  TRUE to validate write access
+ * Validates that the entire range falls within user address space
+ * and doesn't overflow.
  *
- * @return TRUE if entire range is accessible
+ * @param Address  Start address
+ * @param Length   Length in bytes
+ *
+ * @return TRUE if range is valid user address range
  *
  * @irql <= DISPATCH_LEVEL
+ *
+ * @note This does NOT validate accessibility. Use probe functions
+ *       or structured exception handling for actual access.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
-ShadowStrikeIsMemoryValid(
+ShadowStrikeIsValidUserAddressRange(
     _In_ PVOID Address,
-    _In_ SIZE_T Length,
-    _In_ BOOLEAN WriteAccess
+    _In_ SIZE_T Length
     );
 
 /**
@@ -1106,7 +1135,45 @@ ShadowStrikeFreeContiguous(
 // ============================================================================
 
 /**
+ * @brief Align size up to specified alignment (with overflow protection).
+ *
+ * @param Value      Value to align
+ * @param Alignment  Alignment (must be power of 2)
+ * @param Result     Receives aligned value
+ *
+ * @return TRUE if successful, FALSE on overflow
+ */
+FORCEINLINE
+BOOLEAN
+ShadowStrikeAlignUpSafe(
+    _In_ SIZE_T Value,
+    _In_ SIZE_T Alignment,
+    _Out_ PSIZE_T Result
+    )
+{
+    SIZE_T Mask = Alignment - 1;
+
+    //
+    // Check for overflow before adding
+    //
+    if (Value > ((SIZE_T)-1) - Mask) {
+        *Result = 0;
+        return FALSE;
+    }
+
+    *Result = (Value + Mask) & ~Mask;
+    return TRUE;
+}
+
+/**
  * @brief Align size up to specified alignment.
+ *
+ * @param Value      Value to align
+ * @param Alignment  Alignment (must be power of 2)
+ *
+ * @return Aligned value, or SIZE_T max aligned down on overflow
+ *
+ * @note Prefer ShadowStrikeAlignUpSafe for explicit overflow handling
  */
 FORCEINLINE
 SIZE_T
@@ -1115,7 +1182,16 @@ ShadowStrikeAlignUp(
     _In_ SIZE_T Alignment
     )
 {
-    return (Value + Alignment - 1) & ~(Alignment - 1);
+    SIZE_T Result;
+
+    if (!ShadowStrikeAlignUpSafe(Value, Alignment, &Result)) {
+        //
+        // Overflow - return maximum aligned value
+        //
+        return ((SIZE_T)-1) & ~(Alignment - 1);
+    }
+
+    return Result;
 }
 
 /**

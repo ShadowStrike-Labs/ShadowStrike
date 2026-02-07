@@ -275,13 +275,21 @@ ShadowStrikeCloneUnicodeStringNonPaged(
 
 /**
  * @brief Free UNICODE_STRING allocated by clone functions.
+ *
+ * @note This function intentionally does NOT use PAGED_CODE() because
+ *       ShadowStrikeCloneUnicodeStringNonPaged allocates from NonPagedPoolNx,
+ *       and callers may need to free at DISPATCH_LEVEL.
+ *       ExFreePoolWithTag is safe at any IRQL <= DISPATCH_LEVEL.
  */
 VOID
 ShadowStrikeFreeUnicodeString(
     _Inout_ PUNICODE_STRING String
     )
 {
-    PAGED_CODE();
+    //
+    // NO PAGED_CODE() - Must support DISPATCH_LEVEL for NonPaged allocations
+    // ExFreePoolWithTag is IRQL-safe at <= DISPATCH_LEVEL
+    //
 
     if (String == NULL) {
         return;
@@ -603,6 +611,12 @@ ShadowStrikeGetDirectoryPath(
 
 /**
  * @brief Normalize path (resolve . and .., convert separators).
+ *
+ * Security hardening:
+ * - Explicit bounds checking on component array
+ * - Returns error on path depth overflow (prevents silent truncation)
+ * - Validates component pointers are within input buffer bounds
+ * - Uses modern pool allocation APIs where available
  */
 NTSTATUS
 ShadowStrikeNormalizePath(
@@ -610,12 +624,10 @@ ShadowStrikeNormalizePath(
     _Out_ PUNICODE_STRING NormalizedPath
     )
 {
-    NTSTATUS status;
     PWCHAR outputBuffer = NULL;
-    PWCHAR components[256];  // Max path depth
+    PWCHAR components[256];  // Max path depth - enforced with error on overflow
     ULONG componentCount = 0;
     USHORT inputLengthChars;
-    PWCHAR current;
     PWCHAR componentStart;
     SIZE_T outputIndex = 0;
     ULONG i;
@@ -637,11 +649,26 @@ ShadowStrikeNormalizePath(
     // Allocate output buffer (same size as input max)
     //
     allocationSize = (SIZE_T)InputPath->Length + sizeof(WCHAR);
+
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    outputBuffer = (PWCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        allocationSize,
+        SHADOW_PATH_TAG
+    );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
     outputBuffer = (PWCHAR)ExAllocatePoolWithTag(
         PagedPool,
         allocationSize,
         SHADOW_PATH_TAG
     );
+#pragma warning(pop)
+    if (outputBuffer != NULL) {
+        RtlZeroMemory(outputBuffer, allocationSize);
+    }
+#endif
 
     if (outputBuffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -650,8 +677,7 @@ ShadowStrikeNormalizePath(
     //
     // Parse path into components
     //
-    current = InputPath->Buffer;
-    componentStart = current;
+    componentStart = InputPath->Buffer;
 
     for (i = 0; i <= inputLengthChars; i++) {
         WCHAR ch = (i < inputLengthChars) ? InputPath->Buffer[i] : L'\0';
@@ -673,10 +699,13 @@ ShadowStrikeNormalizePath(
             } else if (componentLen > 0) {
                 //
                 // Normal component - add to list
+                // CRITICAL: Check for array overflow and return error
                 //
-                if (componentCount < 256) {
-                    components[componentCount++] = componentStart;
+                if (componentCount >= 256) {
+                    ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+                    return STATUS_NAME_TOO_LONG;
                 }
+                components[componentCount++] = componentStart;
             }
 
             componentStart = &InputPath->Buffer[i + 1];
@@ -691,10 +720,20 @@ ShadowStrikeNormalizePath(
         SIZE_T compLen = 0;
 
         //
-        // Find component length
+        // SECURITY: Validate component pointer is within input buffer bounds
         //
-        while (comp[compLen] != L'\\' && comp[compLen] != L'/' &&
-               comp[compLen] != L'\0' && (comp + compLen) < (InputPath->Buffer + inputLengthChars)) {
+        if (comp < InputPath->Buffer || comp >= (InputPath->Buffer + inputLengthChars)) {
+            ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        //
+        // Find component length with explicit bounds checking
+        //
+        while ((comp + compLen) < (InputPath->Buffer + inputLengthChars) &&
+               comp[compLen] != L'\\' &&
+               comp[compLen] != L'/' &&
+               comp[compLen] != L'\0') {
             compLen++;
         }
 
@@ -711,6 +750,14 @@ ShadowStrikeNormalizePath(
         }
 
         //
+        // Verify we won't overflow output buffer
+        //
+        if (outputIndex + compLen >= allocationSize / sizeof(WCHAR)) {
+            ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+
+        //
         // Copy component
         //
         RtlCopyMemory(&outputBuffer[outputIndex], comp, compLen * sizeof(WCHAR));
@@ -722,6 +769,14 @@ ShadowStrikeNormalizePath(
     //
     outputBuffer[outputIndex] = L'\0';
 
+    //
+    // Validate final length fits in USHORT
+    //
+    if (outputIndex * sizeof(WCHAR) > MAXUSHORT || allocationSize > MAXUSHORT) {
+        ExFreePoolWithTag(outputBuffer, SHADOW_PATH_TAG);
+        return STATUS_NAME_TOO_LONG;
+    }
+
     NormalizedPath->Buffer = outputBuffer;
     NormalizedPath->Length = (USHORT)(outputIndex * sizeof(WCHAR));
     NormalizedPath->MaximumLength = (USHORT)allocationSize;
@@ -731,6 +786,11 @@ ShadowStrikeNormalizePath(
 
 /**
  * @brief Convert DOS path to NT path.
+ *
+ * Security hardening:
+ * - Uses pool allocation instead of stack for large buffer (prevents stack overflow)
+ * - Proper cleanup on all error paths
+ * - Uses modern pool allocation APIs where available
  */
 NTSTATUS
 ShadowStrikeDosPathToNtPath(
@@ -743,10 +803,11 @@ ShadowStrikeDosPathToNtPath(
     HANDLE linkHandle = NULL;
     UNICODE_STRING linkName;
     WCHAR linkNameBuffer[64];
-    WCHAR targetBuffer[SHADOW_MAX_PATH];
+    PWCHAR targetBuffer = NULL;
     ULONG returnedLength;
     SIZE_T allocationSize;
     USHORT dosPathLengthChars;
+    UNICODE_STRING targetString;
 
     PAGED_CODE();
 
@@ -768,6 +829,34 @@ ShadowStrikeDosPathToNtPath(
     dosPathLengthChars = DosPath->Length / sizeof(WCHAR);
 
     //
+    // Allocate target buffer from pool instead of stack
+    // Stack is typically 12-24KB, this buffer could be 64KB+
+    //
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    targetBuffer = (PWCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        SHADOW_MAX_PATH * sizeof(WCHAR),
+        SHADOW_PATH_TAG
+    );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    targetBuffer = (PWCHAR)ExAllocatePoolWithTag(
+        PagedPool,
+        SHADOW_MAX_PATH * sizeof(WCHAR),
+        SHADOW_PATH_TAG
+    );
+#pragma warning(pop)
+    if (targetBuffer != NULL) {
+        RtlZeroMemory(targetBuffer, SHADOW_MAX_PATH * sizeof(WCHAR));
+    }
+#endif
+
+    if (targetBuffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
     // Build symbolic link name: \DosDevices\X:
     //
     status = RtlStringCbPrintfW(
@@ -778,6 +867,7 @@ ShadowStrikeDosPathToNtPath(
     );
 
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
         return status;
     }
 
@@ -801,16 +891,16 @@ ShadowStrikeDosPathToNtPath(
     );
 
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
         return status;
     }
 
     //
     // Query link target
     //
-    UNICODE_STRING targetString;
     targetString.Buffer = targetBuffer;
     targetString.Length = 0;
-    targetString.MaximumLength = sizeof(targetBuffer);
+    targetString.MaximumLength = (USHORT)(SHADOW_MAX_PATH * sizeof(WCHAR));
 
     status = ZwQuerySymbolicLinkObject(
         linkHandle,
@@ -821,6 +911,7 @@ ShadowStrikeDosPathToNtPath(
     ZwClose(linkHandle);
 
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
         return status;
     }
 
@@ -830,13 +921,36 @@ ShadowStrikeDosPathToNtPath(
     //
     allocationSize = targetString.Length + DosPath->Length - (2 * sizeof(WCHAR)) + sizeof(WCHAR);
 
+    //
+    // Validate allocation size fits in USHORT for UNICODE_STRING
+    //
+    if (allocationSize > MAXUSHORT) {
+        ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
+        return STATUS_NAME_TOO_LONG;
+    }
+
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    NtPath->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        allocationSize,
+        SHADOW_PATH_TAG
+    );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
     NtPath->Buffer = (PWCH)ExAllocatePoolWithTag(
         PagedPool,
         allocationSize,
         SHADOW_PATH_TAG
     );
+#pragma warning(pop)
+    if (NtPath->Buffer != NULL) {
+        RtlZeroMemory(NtPath->Buffer, allocationSize);
+    }
+#endif
 
     if (NtPath->Buffer == NULL) {
+        ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -860,11 +974,21 @@ ShadowStrikeDosPathToNtPath(
     NtPath->MaximumLength = (USHORT)allocationSize;
     NtPath->Buffer[NtPath->Length / sizeof(WCHAR)] = L'\0';
 
+    //
+    // Free the temporary target buffer
+    //
+    ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
+
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Convert NT path to DOS path.
+ *
+ * Security hardening:
+ * - Uses pool allocation instead of stack for large buffer (prevents stack overflow)
+ * - Proper cleanup on all error paths
+ * - Uses modern pool allocation APIs where available
  */
 NTSTATUS
 ShadowStrikeNtPathToDosPath(
@@ -875,7 +999,7 @@ ShadowStrikeNtPathToDosPath(
     NTSTATUS status;
     WCHAR driveLetter;
     WCHAR linkNameBuffer[64];
-    WCHAR targetBuffer[SHADOW_MAX_PATH];
+    PWCHAR targetBuffer = NULL;
     UNICODE_STRING linkName;
     UNICODE_STRING targetString;
     OBJECT_ATTRIBUTES objectAttributes;
@@ -891,6 +1015,34 @@ ShadowStrikeNtPathToDosPath(
 
     if (ShadowStrikeIsStringEmpty(NtPath)) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Allocate target buffer from pool instead of stack
+    // Stack is typically 12-24KB, this buffer could be 64KB+
+    //
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    targetBuffer = (PWCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        SHADOW_MAX_PATH * sizeof(WCHAR),
+        SHADOW_PATH_TAG
+    );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    targetBuffer = (PWCHAR)ExAllocatePoolWithTag(
+        PagedPool,
+        SHADOW_MAX_PATH * sizeof(WCHAR),
+        SHADOW_PATH_TAG
+    );
+#pragma warning(pop)
+    if (targetBuffer != NULL) {
+        RtlZeroMemory(targetBuffer, SHADOW_MAX_PATH * sizeof(WCHAR));
+    }
+#endif
+
+    if (targetBuffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
@@ -930,7 +1082,7 @@ ShadowStrikeNtPathToDosPath(
 
         targetString.Buffer = targetBuffer;
         targetString.Length = 0;
-        targetString.MaximumLength = sizeof(targetBuffer);
+        targetString.MaximumLength = (USHORT)(SHADOW_MAX_PATH * sizeof(WCHAR));
 
         status = ZwQuerySymbolicLinkObject(
             linkHandle,
@@ -954,13 +1106,36 @@ ShadowStrikeNtPathToDosPath(
             USHORT remainingLength = NtPath->Length - targetString.Length;
             allocationSize = sizeof(WCHAR) * 2 + remainingLength + sizeof(WCHAR);
 
+            //
+            // Validate allocation size fits in USHORT
+            //
+            if (allocationSize > MAXUSHORT) {
+                ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
+                return STATUS_NAME_TOO_LONG;
+            }
+
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+            DosPath->Buffer = (PWCH)ExAllocatePool2(
+                POOL_FLAG_PAGED,
+                allocationSize,
+                SHADOW_PATH_TAG
+            );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
             DosPath->Buffer = (PWCH)ExAllocatePoolWithTag(
                 PagedPool,
                 allocationSize,
                 SHADOW_PATH_TAG
             );
+#pragma warning(pop)
+            if (DosPath->Buffer != NULL) {
+                RtlZeroMemory(DosPath->Buffer, allocationSize);
+            }
+#endif
 
             if (DosPath->Buffer == NULL) {
+                ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
@@ -982,10 +1157,12 @@ ShadowStrikeNtPathToDosPath(
             DosPath->MaximumLength = (USHORT)allocationSize;
             DosPath->Buffer[DosPath->Length / sizeof(WCHAR)] = L'\0';
 
+            ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
             return STATUS_SUCCESS;
         }
     }
 
+    ExFreePoolWithTag(targetBuffer, SHADOW_PATH_TAG);
     return STATUS_NOT_FOUND;
 }
 
@@ -1858,6 +2035,11 @@ ShadowStrikeStringToUpper(
 
 /**
  * @brief Convert ANSI string to UNICODE string.
+ *
+ * Security hardening:
+ * - Fixed bug: RtlAnsiStringToUnicodeSize returns ULONG size, NOT NTSTATUS
+ * - Validates size fits in USHORT before allocation
+ * - Uses modern pool allocation APIs where available
  */
 NTSTATUS
 ShadowStrikeAnsiToUnicode(
@@ -1874,25 +2056,50 @@ ShadowStrikeAnsiToUnicode(
     UnicodeString->Length = 0;
     UnicodeString->MaximumLength = 0;
 
-    if (AnsiString == NULL || AnsiString->Buffer == NULL) {
+    if (AnsiString == NULL || AnsiString->Buffer == NULL || AnsiString->Length == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
     //
     // Calculate required size
+    // NOTE: RtlAnsiStringToUnicodeSize returns a ULONG byte count, NOT NTSTATUS!
+    // This was a critical bug in the original implementation.
     //
-    status = RtlAnsiStringToUnicodeSize(AnsiString);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
     unicodeLength = RtlAnsiStringToUnicodeSize(AnsiString);
 
+    //
+    // Validate we got a reasonable size (0 indicates error or empty)
+    //
+    if (unicodeLength == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate size fits in USHORT for UNICODE_STRING.MaximumLength
+    //
+    if (unicodeLength > MAXUSHORT) {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    UnicodeString->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        unicodeLength,
+        SHADOW_STRING_TAG
+    );
+#else
+#pragma warning(push)
+#pragma warning(disable: 4996)
     UnicodeString->Buffer = (PWCH)ExAllocatePoolWithTag(
         PagedPool,
         unicodeLength,
         SHADOW_STRING_TAG
     );
+#pragma warning(pop)
+    if (UnicodeString->Buffer != NULL) {
+        RtlZeroMemory(UnicodeString->Buffer, unicodeLength);
+    }
+#endif
 
     if (UnicodeString->Buffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1904,6 +2111,7 @@ ShadowStrikeAnsiToUnicode(
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(UnicodeString->Buffer, SHADOW_STRING_TAG);
         UnicodeString->Buffer = NULL;
+        UnicodeString->Length = 0;
         UnicodeString->MaximumLength = 0;
     }
 

@@ -15,15 +15,19 @@
  * - Secure file reading with size limits
  * - Volume information retrieval
  * - Reparse point and symbolic link handling
+ * - Zone identifier extraction with actual content parsing
  *
  * Security Guarantees:
  * - All functions validate input parameters
  * - Buffer sizes are always checked before operations
  * - No integer overflows in size calculations
- * - Pool allocations use tagged pools for leak detection
+ * - Pool allocations use ExAllocatePool2 for automatic zeroing
+ * - IRQL constraints are strictly enforced
+ * - Bounds checking on all stream/reparse parsing
+ * - Thread-safe initialization with interlocked operations
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -96,12 +100,26 @@
 /**
  * @brief Symbolic link reparse tag
  */
+#ifndef IO_REPARSE_TAG_SYMLINK
 #define IO_REPARSE_TAG_SYMLINK 0xA000000C
+#endif
 
 /**
  * @brief Mount point (junction) reparse tag
  */
+#ifndef IO_REPARSE_TAG_MOUNT_POINT
 #define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003
+#endif
+
+/**
+ * @brief Maximum Zone.Identifier stream content size to read
+ */
+#define SHADOW_ZONE_ID_MAX_CONTENT_SIZE 1024
+
+/**
+ * @brief Allocation tag for stream buffers
+ */
+#define SHADOW_STREAM_TAG 'sSsS'
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -208,9 +226,9 @@ typedef struct _SHADOW_NT_HEADERS {
 // ============================================================================
 
 /**
- * @brief File utilities initialization state
+ * @brief File utilities initialization state (0 = not init, 1 = init)
  */
-static BOOLEAN g_FileUtilsInitialized = FALSE;
+static volatile LONG g_FileUtilsInitialized = 0;
 
 /**
  * @brief Lookaside list for file read buffers
@@ -218,9 +236,9 @@ static BOOLEAN g_FileUtilsInitialized = FALSE;
 static NPAGED_LOOKASIDE_LIST g_FileBufferLookaside;
 
 /**
- * @brief Lookaside list initialized flag
+ * @brief Lookaside list initialized flag (0 = not init, 1 = init)
  */
-static BOOLEAN g_LookasideInitialized = FALSE;
+static volatile LONG g_LookasideInitialized = 0;
 
 // ============================================================================
 // EXTENSION TABLES
@@ -283,7 +301,6 @@ static const UCHAR g_Magic7Z[] = { 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C }; // 7z
 static const UCHAR g_MagicGZ[] = { 0x1F, 0x8B };                        // gzip
 static const UCHAR g_MagicLNK[] = { 0x4C, 0x00, 0x00, 0x00 };          // LNK
 static const UCHAR g_MagicMSI[] = { 0xD0, 0xCF, 0x11, 0xE0 };          // OLE
-static const UCHAR g_MagicJAR[] = { 0x50, 0x4B, 0x03, 0x04 };          // Same as ZIP
 
 static const SHADOW_FILE_SIGNATURE g_FileSignatures[] = {
     { g_MagicPDF, sizeof(g_MagicPDF), 0, ShadowFileTypePDF },
@@ -297,17 +314,69 @@ static const SHADOW_FILE_SIGNATURE g_FileSignatures[] = {
 };
 
 // ============================================================================
+// INTERNAL HELPER PROTOTYPES
+// ============================================================================
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+static
+NTSTATUS
+ShadowpParseZoneIdentifierContent(
+    _In_reads_bytes_(ContentSize) PUCHAR Content,
+    _In_ ULONG ContentSize,
+    _Out_ PUCHAR ZoneId
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+static
+NTSTATUS
+ShadowpOpenZoneIdentifierStream(
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PHANDLE StreamHandle,
+    _Out_ PFILE_OBJECT* StreamFileObject
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+BOOLEAN
+ShadowpValidateStreamInfo(
+    _In_ PFILE_STREAM_INFORMATION StreamInfo,
+    _In_ ULONG BufferSize,
+    _In_ ULONG CurrentOffset
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+BOOLEAN
+ShadowpValidateReparseBuffer(
+    _In_ PREPARSE_DATA_BUFFER ReparseData,
+    _In_ ULONG BufferSize
+    );
+
+// ============================================================================
 // INITIALIZATION / CLEANUP
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeInitializeFileUtils(
     VOID
     )
 {
+    LONG previousValue;
+
     PAGED_CODE();
 
-    if (g_FileUtilsInitialized) {
+    //
+    // Thread-safe initialization using interlocked compare-exchange
+    //
+    previousValue = InterlockedCompareExchange(&g_FileUtilsInitialized, 1, 0);
+    if (previousValue != 0) {
+        //
+        // Already initialized by another thread
+        //
         return STATUS_SUCCESS;
     }
 
@@ -324,39 +393,52 @@ ShadowStrikeInitializeFileUtils(
         0                               // Depth (0 = system default)
     );
 
-    g_LookasideInitialized = TRUE;
-    g_FileUtilsInitialized = TRUE;
+    InterlockedExchange(&g_LookasideInitialized, 1);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] FileUtils initialized successfully\n");
 
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 VOID
 ShadowStrikeCleanupFileUtils(
     VOID
     )
 {
+    LONG previousValue;
+
     PAGED_CODE();
 
-    if (!g_FileUtilsInitialized) {
+    //
+    // Thread-safe cleanup
+    //
+    previousValue = InterlockedCompareExchange(&g_FileUtilsInitialized, 0, 1);
+    if (previousValue != 1) {
+        //
+        // Not initialized or already cleaned up
+        //
         return;
     }
 
-    if (g_LookasideInitialized) {
+    if (InterlockedCompareExchange(&g_LookasideInitialized, 0, 1) == 1) {
         ExDeleteNPagedLookasideList(&g_FileBufferLookaside);
-        g_LookasideInitialized = FALSE;
     }
 
-    g_FileUtilsInitialized = FALSE;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] FileUtils cleaned up\n");
 }
 
 // ============================================================================
 // FILE NAME OPERATIONS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileName(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _Out_ PUNICODE_STRING FileName
+    PFLT_CALLBACK_DATA Data,
+    PUNICODE_STRING FileName
     )
 {
     NTSTATUS status;
@@ -413,20 +495,20 @@ ShadowStrikeGetFileName(
     }
 
     //
-    // Allocate buffer for output string
+    // Calculate allocation size with overflow check
     //
     allocationSize = (SIZE_T)nameInfo->Name.Length + sizeof(WCHAR);
-
-    //
-    // Check for overflow
-    //
-    if (allocationSize < nameInfo->Name.Length) {
+    if (allocationSize < nameInfo->Name.Length ||
+        allocationSize > SHADOW_MAX_PATH_BYTES) {
         FltReleaseFileNameInformation(nameInfo);
         return STATUS_INTEGER_OVERFLOW;
     }
 
-    FileName->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    //
+    // Allocate buffer for output string using ExAllocatePool2
+    //
+    FileName->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         allocationSize,
         SHADOW_FILEPATH_TAG
     );
@@ -442,18 +524,19 @@ ShadowStrikeGetFileName(
     RtlCopyMemory(FileName->Buffer, nameInfo->Name.Buffer, nameInfo->Name.Length);
     FileName->Buffer[nameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
     FileName->Length = nameInfo->Name.Length;
-    FileName->MaximumLength = (USHORT)allocationSize;
+    FileName->MaximumLength = (USHORT)min(allocationSize, MAXUSHORT);
 
     FltReleaseFileNameInformation(nameInfo);
 
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileNameFromFileObject(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PUNICODE_STRING FileName
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PUNICODE_STRING FileName
     )
 {
     NTSTATUS status;
@@ -512,17 +595,20 @@ ShadowStrikeGetFileNameFromFileObject(
     }
 
     //
-    // Allocate and copy
+    // Calculate allocation size with overflow check
     //
     allocationSize = (SIZE_T)nameInfo->Name.Length + sizeof(WCHAR);
-
-    if (allocationSize < nameInfo->Name.Length) {
+    if (allocationSize < nameInfo->Name.Length ||
+        allocationSize > SHADOW_MAX_PATH_BYTES) {
         FltReleaseFileNameInformation(nameInfo);
         return STATUS_INTEGER_OVERFLOW;
     }
 
-    FileName->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    //
+    // Allocate and copy
+    //
+    FileName->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         allocationSize,
         SHADOW_FILEPATH_TAG
     );
@@ -535,16 +621,17 @@ ShadowStrikeGetFileNameFromFileObject(
     RtlCopyMemory(FileName->Buffer, nameInfo->Name.Buffer, nameInfo->Name.Length);
     FileName->Buffer[nameInfo->Name.Length / sizeof(WCHAR)] = L'\0';
     FileName->Length = nameInfo->Name.Length;
-    FileName->MaximumLength = (USHORT)allocationSize;
+    FileName->MaximumLength = (USHORT)min(allocationSize, MAXUSHORT);
 
     FltReleaseFileNameInformation(nameInfo);
 
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 VOID
 ShadowStrikeFreeFileName(
-    _Inout_ PUNICODE_STRING FileName
+    PUNICODE_STRING FileName
     )
 {
     if (FileName == NULL) {
@@ -560,10 +647,11 @@ ShadowStrikeFreeFileName(
     FileName->MaximumLength = 0;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetShortFileName(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _Out_ PUNICODE_STRING ShortName
+    PFLT_CALLBACK_DATA Data,
+    PUNICODE_STRING ShortName
     )
 {
     NTSTATUS status;
@@ -611,9 +699,13 @@ ShadowStrikeGetShortFileName(
     }
 
     allocationSize = (SIZE_T)nameInfo->FinalComponent.Length + sizeof(WCHAR);
+    if (allocationSize < nameInfo->FinalComponent.Length) {
+        FltReleaseFileNameInformation(nameInfo);
+        return STATUS_INTEGER_OVERFLOW;
+    }
 
-    ShortName->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    ShortName->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         allocationSize,
         SHADOW_FILEPATH_TAG
     );
@@ -627,7 +719,7 @@ ShadowStrikeGetShortFileName(
                   nameInfo->FinalComponent.Length);
     ShortName->Buffer[nameInfo->FinalComponent.Length / sizeof(WCHAR)] = L'\0';
     ShortName->Length = nameInfo->FinalComponent.Length;
-    ShortName->MaximumLength = (USHORT)allocationSize;
+    ShortName->MaximumLength = (USHORT)min(allocationSize, MAXUSHORT);
 
     FltReleaseFileNameInformation(nameInfo);
 
@@ -638,11 +730,12 @@ ShadowStrikeGetShortFileName(
 // FILE IDENTIFICATION
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileId(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PULONG64 FileId
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PULONG64 FileId
     )
 {
     NTSTATUS status;
@@ -673,11 +766,12 @@ ShadowStrikeGetFileId(
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileId128(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PFILE_ID_128 FileId128
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PFILE_ID_128 FileId128
     )
 {
     NTSTATUS status;
@@ -708,17 +802,19 @@ ShadowStrikeGetFileId128(
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetVolumeSerial(
-    _In_ PFLT_INSTANCE Instance,
-    _Out_ PULONG VolumeSerial
+    PFLT_INSTANCE Instance,
+    PULONG VolumeSerial
     )
 {
     NTSTATUS status;
-    UCHAR buffer[sizeof(FLT_VOLUME_PROPERTIES) + 512];
-    PFLT_VOLUME_PROPERTIES volumeProps = (PFLT_VOLUME_PROPERTIES)buffer;
-    ULONG returnLength;
     PFLT_VOLUME volume = NULL;
+    union {
+        FILE_FS_VOLUME_INFORMATION VolumeInfo;
+        UCHAR Buffer[sizeof(FILE_FS_VOLUME_INFORMATION) + 64 * sizeof(WCHAR)];
+    } volumeBuffer;
 
     PAGED_CODE();
 
@@ -729,31 +825,21 @@ ShadowStrikeGetVolumeSerial(
     }
 
     //
-    // Get volume from instance
+    // Query volume information directly using FltQueryVolumeInformation
+    // This gives us the actual volume serial number
     //
-    status = FltGetVolumeFromInstance(Instance, &volume);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
+    RtlZeroMemory(&volumeBuffer, sizeof(volumeBuffer));
 
-    //
-    // Query volume properties
-    //
-    status = FltGetVolumeProperties(
-        volume,
-        volumeProps,
-        sizeof(buffer),
-        &returnLength
+    status = FltQueryVolumeInformation(
+        Instance,
+        NULL,
+        &volumeBuffer.VolumeInfo,
+        sizeof(volumeBuffer),
+        FileFsVolumeInformation
     );
 
-    FltObjectDereference(volume);
-
     if (NT_SUCCESS(status)) {
-        //
-        // Volume serial is in device characteristics for some file systems
-        // For NTFS, we need to query FSVolumeInformation
-        //
-        *VolumeSerial = volumeProps->DeviceCharacteristics;
+        *VolumeSerial = volumeBuffer.VolumeInfo.VolumeSerialNumber;
     }
 
     return status;
@@ -763,11 +849,12 @@ ShadowStrikeGetVolumeSerial(
 // FILE SIZE AND ATTRIBUTES
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileSize(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PLONGLONG FileSize
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PLONGLONG FileSize
     )
 {
     NTSTATUS status;
@@ -798,11 +885,12 @@ ShadowStrikeGetFileSize(
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileAttributes(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PULONG FileAttributes
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PULONG FileAttributes
     )
 {
     NTSTATUS status;
@@ -833,11 +921,12 @@ ShadowStrikeGetFileAttributes(
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileBasicInfo(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PFILE_BASIC_INFORMATION BasicInfo
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PFILE_BASIC_INFORMATION BasicInfo
     )
 {
     ULONG returnLength;
@@ -860,11 +949,12 @@ ShadowStrikeGetFileBasicInfo(
     );
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileStandardInfo(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PFILE_STANDARD_INFORMATION StandardInfo
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PFILE_STANDARD_INFORMATION StandardInfo
     )
 {
     ULONG returnLength;
@@ -887,11 +977,12 @@ ShadowStrikeGetFileStandardInfo(
     );
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileInfo(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PSHADOW_FILE_INFO FileInfo
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PSHADOW_FILE_INFO FileInfo
     )
 {
     NTSTATUS status;
@@ -902,6 +993,8 @@ ShadowStrikeGetFileInfo(
     SHADOW_FILE_TYPE fileType = ShadowFileTypeUnknown;
     BOOLEAN isPE = FALSE;
     BOOLEAN is64Bit = FALSE;
+    BOOLEAN hasZoneId = FALSE;
+    UCHAR zoneId = 0;
 
     PAGED_CODE();
 
@@ -983,12 +1076,12 @@ ShadowStrikeGetFileInfo(
     }
 
     //
-    // Get volume serial
+    // Get volume serial using proper API
     //
     ShadowStrikeGetVolumeSerial(Instance, &FileInfo->VolumeSerial);
 
     //
-    // Skip content-based detection for directories
+    // Skip content-based detection for directories or empty files
     //
     if (!FileInfo->IsDirectory && FileInfo->FileSize > 0) {
         //
@@ -1009,6 +1102,19 @@ ShadowStrikeGetFileInfo(
                 FileInfo->FileType = is64Bit ? ShadowFileTypePE64 : ShadowFileTypePE32;
             }
         }
+
+        //
+        // Check for Zone.Identifier (Mark-of-the-Web)
+        //
+        if (NT_SUCCESS(ShadowStrikeGetZoneIdentifier(Instance, FileObject, &hasZoneId, &zoneId))) {
+            FileInfo->HasZoneId = hasZoneId;
+            FileInfo->ZoneId = zoneId;
+        }
+
+        //
+        // Check for ADS
+        //
+        ShadowStrikeHasAlternateDataStreams(Instance, FileObject, &FileInfo->HasADS);
     }
 
     return STATUS_SUCCESS;
@@ -1023,7 +1129,7 @@ ShadowStrikeGetFileInfo(
  */
 static
 BOOLEAN
-ShadowStrikeCheckExtensionList(
+ShadowpCheckExtensionList(
     _In_ PCUNICODE_STRING Extension,
     _In_ const PCWSTR* ExtensionList
     )
@@ -1045,11 +1151,12 @@ ShadowStrikeCheckExtensionList(
     return FALSE;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeDetectFileType(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PSHADOW_FILE_TYPE FileType
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PSHADOW_FILE_TYPE FileType
     )
 {
     NTSTATUS status;
@@ -1117,10 +1224,11 @@ ShadowStrikeDetectFileType(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeDetectFileTypeByExtension(
-    _In_ PCUNICODE_STRING FileName,
-    _Out_ PSHADOW_FILE_TYPE FileType
+    PCUNICODE_STRING FileName,
+    PSHADOW_FILE_TYPE FileType
     )
 {
     NTSTATUS status;
@@ -1133,7 +1241,7 @@ ShadowStrikeDetectFileTypeByExtension(
     }
 
     //
-    // Extract extension
+    // Extract extension using StringUtils
     //
     status = ShadowStrikeGetFileExtension(FileName, &extension);
     if (!NT_SUCCESS(status)) {
@@ -1143,7 +1251,7 @@ ShadowStrikeDetectFileTypeByExtension(
     //
     // Check executable extensions
     //
-    if (ShadowStrikeCheckExtensionList(&extension, g_ExecutableExtensions)) {
+    if (ShadowpCheckExtensionList(&extension, g_ExecutableExtensions)) {
         *FileType = ShadowFileTypePE32;  // Generic PE
         return STATUS_SUCCESS;
     }
@@ -1151,7 +1259,7 @@ ShadowStrikeDetectFileTypeByExtension(
     //
     // Check script extensions
     //
-    if (ShadowStrikeCheckExtensionList(&extension, g_ScriptExtensions)) {
+    if (ShadowpCheckExtensionList(&extension, g_ScriptExtensions)) {
         *FileType = ShadowFileTypeScript;
         return STATUS_SUCCESS;
     }
@@ -1159,7 +1267,7 @@ ShadowStrikeDetectFileTypeByExtension(
     //
     // Check archive extensions
     //
-    if (ShadowStrikeCheckExtensionList(&extension, g_ArchiveExtensions)) {
+    if (ShadowpCheckExtensionList(&extension, g_ArchiveExtensions)) {
         *FileType = ShadowFileTypeArchive;
         return STATUS_SUCCESS;
     }
@@ -1167,7 +1275,7 @@ ShadowStrikeDetectFileTypeByExtension(
     //
     // Check document extensions
     //
-    if (ShadowStrikeCheckExtensionList(&extension, g_DocumentExtensions)) {
+    if (ShadowpCheckExtensionList(&extension, g_DocumentExtensions)) {
         UNICODE_STRING pdfExt;
         RtlInitUnicodeString(&pdfExt, L".pdf");
         if (RtlEqualUnicodeString(&extension, &pdfExt, TRUE)) {
@@ -1182,12 +1290,13 @@ ShadowStrikeDetectFileTypeByExtension(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeIsFilePE(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PBOOLEAN IsPE,
-    _Out_opt_ PBOOLEAN Is64Bit
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PBOOLEAN IsPE,
+    PBOOLEAN Is64Bit
     )
 {
     NTSTATUS status;
@@ -1195,8 +1304,6 @@ ShadowStrikeIsFilePE(
     ULONG bytesRead = 0;
     PSHADOW_DOS_HEADER dosHeader;
     PSHADOW_NT_HEADERS ntHeaders;
-    PSHADOW_OPTIONAL_HEADER32 optHeader32;
-    PSHADOW_OPTIONAL_HEADER64 optHeader64;
     LONG peOffset;
 
     PAGED_CODE();
@@ -1242,11 +1349,29 @@ ShadowStrikeIsFilePE(
     }
 
     //
-    // Validate PE offset
+    // Validate PE offset - strict bounds checking
     //
     peOffset = dosHeader->e_lfanew;
-    if (peOffset < 0 || peOffset > (LONG)(bytesRead - sizeof(SHADOW_NT_HEADERS))) {
-        return STATUS_SUCCESS;
+    if (peOffset < (LONG)sizeof(SHADOW_DOS_HEADER)) {
+        return STATUS_SUCCESS;  // Invalid PE offset (too small)
+    }
+
+    if (peOffset < 0) {
+        return STATUS_SUCCESS;  // Negative offset
+    }
+
+    //
+    // Ensure we have enough data to read NT headers
+    //
+    if ((ULONG)peOffset + sizeof(SHADOW_NT_HEADERS) > bytesRead) {
+        return STATUS_SUCCESS;  // Not enough data read
+    }
+
+    //
+    // Prevent buffer overflow
+    //
+    if ((ULONG)peOffset + sizeof(SHADOW_NT_HEADERS) > sizeof(headerBuffer)) {
+        return STATUS_SUCCESS;  // Would overflow our buffer
     }
 
     //
@@ -1266,9 +1391,13 @@ ShadowStrikeIsFilePE(
     // Determine bitness from optional header magic
     //
     if (Is64Bit != NULL) {
-        ULONG optHeaderOffset = peOffset + sizeof(ULONG) + sizeof(SHADOW_FILE_HEADER);
+        ULONG optHeaderOffset = (ULONG)peOffset + sizeof(ULONG) + sizeof(SHADOW_FILE_HEADER);
 
-        if (optHeaderOffset + sizeof(USHORT) <= bytesRead) {
+        //
+        // Bounds check for optional header magic read
+        //
+        if (optHeaderOffset + sizeof(USHORT) <= bytesRead &&
+            optHeaderOffset + sizeof(USHORT) <= sizeof(headerBuffer)) {
             USHORT magic = *(PUSHORT)(headerBuffer + optHeaderOffset);
 
             if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
@@ -1282,9 +1411,10 @@ ShadowStrikeIsFilePE(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsExecutableExtension(
-    _In_ PCUNICODE_STRING FileName
+    PCUNICODE_STRING FileName
     )
 {
     UNICODE_STRING extension;
@@ -1297,12 +1427,13 @@ ShadowStrikeIsExecutableExtension(
         return FALSE;
     }
 
-    return ShadowStrikeCheckExtensionList(&extension, g_ExecutableExtensions);
+    return ShadowpCheckExtensionList(&extension, g_ExecutableExtensions);
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsScriptExtension(
-    _In_ PCUNICODE_STRING FileName
+    PCUNICODE_STRING FileName
     )
 {
     UNICODE_STRING extension;
@@ -1315,25 +1446,75 @@ ShadowStrikeIsScriptExtension(
         return FALSE;
     }
 
-    return ShadowStrikeCheckExtensionList(&extension, g_ScriptExtensions);
+    return ShadowpCheckExtensionList(&extension, g_ScriptExtensions);
 }
 
 // ============================================================================
 // ALTERNATE DATA STREAMS (ADS)
 // ============================================================================
 
+/**
+ * @brief Validate stream information entry within buffer bounds
+ */
+static
+BOOLEAN
+ShadowpValidateStreamInfo(
+    _In_ PFILE_STREAM_INFORMATION StreamInfo,
+    _In_ ULONG BufferSize,
+    _In_ ULONG CurrentOffset
+    )
+{
+    ULONG minRequired;
+    ULONG nameEnd;
+
+    //
+    // Check that the structure header fits
+    //
+    minRequired = FIELD_OFFSET(FILE_STREAM_INFORMATION, StreamName);
+    if (CurrentOffset + minRequired > BufferSize) {
+        return FALSE;
+    }
+
+    //
+    // Check that stream name fits within buffer
+    //
+    if (StreamInfo->StreamNameLength > BufferSize - CurrentOffset - minRequired) {
+        return FALSE;
+    }
+
+    //
+    // Verify NextEntryOffset doesn't go backwards or overflow
+    //
+    if (StreamInfo->NextEntryOffset != 0) {
+        if (StreamInfo->NextEntryOffset < minRequired + StreamInfo->StreamNameLength) {
+            return FALSE;  // Overlapping entries
+        }
+        if (CurrentOffset + StreamInfo->NextEntryOffset < CurrentOffset) {
+            return FALSE;  // Integer overflow
+        }
+        if (CurrentOffset + StreamInfo->NextEntryOffset >= BufferSize) {
+            return FALSE;  // Beyond buffer
+        }
+    }
+
+    return TRUE;
+}
+
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeHasAlternateDataStreams(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PBOOLEAN HasADS
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PBOOLEAN HasADS
     )
 {
     NTSTATUS status;
-    UCHAR buffer[4096];
+    PUCHAR buffer = NULL;
     PFILE_STREAM_INFORMATION streamInfo;
     ULONG returnLength;
     ULONG streamCount = 0;
+    ULONG currentOffset = 0;
+    const ULONG bufferSize = 4096;
 
     PAGED_CODE();
 
@@ -1343,11 +1524,24 @@ ShadowStrikeHasAlternateDataStreams(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Allocate buffer from pool instead of stack
+    //
+    buffer = (PUCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        bufferSize,
+        SHADOW_STREAM_TAG
+    );
+
+    if (buffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     status = FltQueryInformationFile(
         Instance,
         FileObject,
         buffer,
-        sizeof(buffer),
+        bufferSize,
         FileStreamInformation,
         &returnLength
     );
@@ -1356,6 +1550,7 @@ ShadowStrikeHasAlternateDataStreams(
         //
         // Some file systems don't support streams
         //
+        ExFreePoolWithTag(buffer, SHADOW_STREAM_TAG);
         if (status == STATUS_INVALID_PARAMETER ||
             status == STATUS_NOT_IMPLEMENTED) {
             return STATUS_SUCCESS;
@@ -1364,17 +1559,32 @@ ShadowStrikeHasAlternateDataStreams(
     }
 
     //
-    // Count streams
+    // Count streams with proper bounds checking
     //
+    currentOffset = 0;
     streamInfo = (PFILE_STREAM_INFORMATION)buffer;
-    while (streamInfo != NULL) {
+
+    while (currentOffset < returnLength) {
+        //
+        // Validate this entry before accessing it
+        //
+        if (!ShadowpValidateStreamInfo(streamInfo, returnLength, currentOffset)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] Invalid stream info at offset %u\n", currentOffset);
+            break;
+        }
+
         streamCount++;
 
         if (streamInfo->NextEntryOffset == 0) {
             break;
         }
-        streamInfo = (PFILE_STREAM_INFORMATION)((PUCHAR)streamInfo + streamInfo->NextEntryOffset);
+
+        currentOffset += streamInfo->NextEntryOffset;
+        streamInfo = (PFILE_STREAM_INFORMATION)(buffer + currentOffset);
     }
+
+    ExFreePoolWithTag(buffer, SHADOW_STREAM_TAG);
 
     //
     // More than one stream means ADS present
@@ -1385,9 +1595,10 @@ ShadowStrikeHasAlternateDataStreams(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsAlternateDataStream(
-    _In_ PCUNICODE_STRING FileName
+    PCUNICODE_STRING FileName
     )
 {
     USHORT i;
@@ -1426,20 +1637,129 @@ ShadowStrikeIsAlternateDataStream(
     return FALSE;
 }
 
+/**
+ * @brief Parse Zone.Identifier stream content to extract ZoneId value
+ *
+ * Format is:
+ * [ZoneTransfer]
+ * ZoneId=3
+ *
+ * Zone values:
+ * 0 = Local machine
+ * 1 = Local intranet
+ * 2 = Trusted sites
+ * 3 = Internet
+ * 4 = Restricted sites
+ */
+static
 NTSTATUS
-ShadowStrikeGetZoneIdentifier(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PBOOLEAN HasZoneId,
+ShadowpParseZoneIdentifierContent(
+    _In_reads_bytes_(ContentSize) PUCHAR Content,
+    _In_ ULONG ContentSize,
     _Out_ PUCHAR ZoneId
     )
 {
+    ULONG i;
+    ULONG searchLimit;
+    BOOLEAN foundZoneId = FALSE;
+    UCHAR zoneValue = 0;
+
+    //
+    // SECURITY: Initialize output parameter first (defense in depth)
+    //
+    *ZoneId = 0;
+
+    //
+    // SECURITY: Validate input parameters
+    //
+    if (Content == NULL || ContentSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // SECURITY FIX: Prevent integer underflow
+    // "ZoneId=X" requires minimum 8 bytes (7 for prefix + 1 for digit)
+    // Without this check, ContentSize < 8 would cause unsigned underflow
+    // in the loop condition, leading to buffer over-read (CVE-class bug)
+    //
+    #define ZONE_ID_PREFIX_LEN  7   // strlen("ZoneId=")
+    #define ZONE_ID_MIN_LEN     8   // "ZoneId=" + at least one digit
+
+    if (ContentSize < ZONE_ID_MIN_LEN) {
+        //
+        // Content too small to contain a valid ZoneId entry
+        //
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // SECURITY: Calculate safe search limit to prevent buffer over-read
+    // We need at least 8 bytes from position i: "ZoneId=X"
+    // So the last valid starting position is ContentSize - 8
+    //
+    searchLimit = ContentSize - ZONE_ID_PREFIX_LEN;
+
+    //
+    // Search for "ZoneId=" in content
+    // Content is typically UTF-8 or ASCII from Zone.Identifier ADS
+    //
+    for (i = 0; i < searchLimit; i++) {
+        if (RtlCompareMemory(Content + i, "ZoneId=", ZONE_ID_PREFIX_LEN) == ZONE_ID_PREFIX_LEN) {
+            //
+            // Found ZoneId= prefix, now parse the digit
+            // SECURITY: Bounds check is guaranteed by searchLimit calculation
+            //
+            UCHAR digit = Content[i + ZONE_ID_PREFIX_LEN];
+
+            //
+            // Valid Zone IDs per Windows Security Zones:
+            // 0 = Local Machine (most trusted)
+            // 1 = Local Intranet
+            // 2 = Trusted Sites
+            // 3 = Internet
+            // 4 = Restricted Sites (least trusted)
+            //
+            if (digit >= '0' && digit <= '4') {
+                zoneValue = digit - '0';
+                foundZoneId = TRUE;
+                break;
+            }
+            //
+            // Invalid digit - continue searching in case of malformed content
+            // with multiple ZoneId entries (defense against evasion)
+            //
+        }
+    }
+
+    #undef ZONE_ID_PREFIX_LEN
+    #undef ZONE_ID_MIN_LEN
+
+    if (foundZoneId) {
+        *ZoneId = zoneValue;
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_NOT_FOUND;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+ShadowStrikeGetZoneIdentifier(
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PBOOLEAN HasZoneId,
+    PUCHAR ZoneId
+    )
+{
     NTSTATUS status;
-    UCHAR buffer[4096];
+    PUCHAR buffer = NULL;
     PFILE_STREAM_INFORMATION streamInfo;
     ULONG returnLength;
     UNICODE_STRING zoneIdStream;
     UNICODE_STRING streamName;
+    ULONG currentOffset = 0;
+    BOOLEAN foundStream = FALSE;
+    const ULONG bufferSize = 4096;
 
     PAGED_CODE();
 
@@ -1452,16 +1772,30 @@ ShadowStrikeGetZoneIdentifier(
 
     RtlInitUnicodeString(&zoneIdStream, SHADOW_ZONE_IDENTIFIER_STREAM);
 
+    //
+    // Allocate buffer from pool
+    //
+    buffer = (PUCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        bufferSize,
+        SHADOW_STREAM_TAG
+    );
+
+    if (buffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     status = FltQueryInformationFile(
         Instance,
         FileObject,
         buffer,
-        sizeof(buffer),
+        bufferSize,
         FileStreamInformation,
         &returnLength
     );
 
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(buffer, SHADOW_STREAM_TAG);
         if (status == STATUS_INVALID_PARAMETER ||
             status == STATUS_NOT_IMPLEMENTED) {
             return STATUS_SUCCESS;
@@ -1470,28 +1804,205 @@ ShadowStrikeGetZoneIdentifier(
     }
 
     //
-    // Search for Zone.Identifier stream
+    // Search for Zone.Identifier stream with bounds checking
     //
+    currentOffset = 0;
     streamInfo = (PFILE_STREAM_INFORMATION)buffer;
-    while (streamInfo != NULL) {
+
+    while (currentOffset < returnLength) {
+        //
+        // Validate entry bounds
+        //
+        if (!ShadowpValidateStreamInfo(streamInfo, returnLength, currentOffset)) {
+            break;
+        }
+
+        //
+        // Build UNICODE_STRING for comparison
+        //
         streamName.Buffer = streamInfo->StreamName;
-        streamName.Length = (USHORT)streamInfo->StreamNameLength;
+        streamName.Length = (USHORT)min(streamInfo->StreamNameLength, MAXUSHORT);
         streamName.MaximumLength = streamName.Length;
 
         if (RtlEqualUnicodeString(&streamName, &zoneIdStream, TRUE)) {
-            *HasZoneId = TRUE;
-            //
-            // To get actual Zone ID value, we would need to open and read
-            // the stream content. For now, just indicate presence.
-            //
-            *ZoneId = 3;  // Default to "Internet" zone
-            return STATUS_SUCCESS;
+            foundStream = TRUE;
+            break;
         }
 
         if (streamInfo->NextEntryOffset == 0) {
             break;
         }
-        streamInfo = (PFILE_STREAM_INFORMATION)((PUCHAR)streamInfo + streamInfo->NextEntryOffset);
+
+        currentOffset += streamInfo->NextEntryOffset;
+        streamInfo = (PFILE_STREAM_INFORMATION)(buffer + currentOffset);
+    }
+
+    ExFreePoolWithTag(buffer, SHADOW_STREAM_TAG);
+
+    if (!foundStream) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Zone.Identifier stream exists - now read its content
+    // We need to open the ADS and read its content to get the actual zone value
+    //
+    *HasZoneId = TRUE;
+
+    //
+    // Attempt to read the Zone.Identifier stream content
+    // This requires opening the stream separately
+    //
+    {
+        UNICODE_STRING fileName;
+        UNICODE_STRING adsPath;
+        OBJECT_ATTRIBUTES objAttrs;
+        IO_STATUS_BLOCK ioStatus;
+        HANDLE streamHandle = NULL;
+        PFILE_OBJECT streamFileObject = NULL;
+        PUCHAR streamContent = NULL;
+        ULONG bytesRead = 0;
+        const ULONG streamContentSize = SHADOW_ZONE_ID_MAX_CONTENT_SIZE;
+
+        //
+        // Get the file name
+        //
+        status = ShadowStrikeGetFileNameFromFileObject(Instance, FileObject, &fileName);
+        if (!NT_SUCCESS(status)) {
+            //
+            // Can't get file name, return with just HasZoneId = TRUE
+            // Default to zone 3 (Internet) as a conservative assumption
+            //
+            *ZoneId = 3;
+            return STATUS_SUCCESS;
+        }
+
+        //
+        // Build ADS path: filename + :Zone.Identifier
+        //
+        adsPath.MaximumLength = fileName.Length + (USHORT)sizeof(SHADOW_ZONE_IDENTIFIER_STREAM);
+        adsPath.Buffer = (PWCH)ExAllocatePool2(
+            POOL_FLAG_PAGED,
+            adsPath.MaximumLength,
+            SHADOW_FILEPATH_TAG
+        );
+
+        if (adsPath.Buffer == NULL) {
+            ShadowStrikeFreeFileName(&fileName);
+            *ZoneId = 3;  // Default to Internet
+            return STATUS_SUCCESS;
+        }
+
+        RtlCopyMemory(adsPath.Buffer, fileName.Buffer, fileName.Length);
+        RtlCopyMemory(
+            (PUCHAR)adsPath.Buffer + fileName.Length,
+            SHADOW_ZONE_IDENTIFIER_STREAM,
+            sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR)
+        );
+        adsPath.Length = fileName.Length + (USHORT)(sizeof(SHADOW_ZONE_IDENTIFIER_STREAM) - sizeof(WCHAR));
+
+        ShadowStrikeFreeFileName(&fileName);
+
+        //
+        // Open the Zone.Identifier stream
+        //
+        InitializeObjectAttributes(
+            &objAttrs,
+            &adsPath,
+            OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+            NULL,
+            NULL
+        );
+
+        status = FltCreateFileEx(
+            NULL,  // Filter - use NULL for regular open
+            Instance,
+            &streamHandle,
+            &streamFileObject,
+            FILE_GENERIC_READ,
+            &objAttrs,
+            &ioStatus,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL,
+            0,
+            IO_IGNORE_SHARE_ACCESS_CHECK
+        );
+
+        ExFreePoolWithTag(adsPath.Buffer, SHADOW_FILEPATH_TAG);
+
+        if (!NT_SUCCESS(status)) {
+            //
+            // Can't open stream, default to zone 3
+            //
+            *ZoneId = 3;
+            return STATUS_SUCCESS;
+        }
+
+        //
+        // Allocate buffer and read stream content
+        //
+        streamContent = (PUCHAR)ExAllocatePool2(
+            POOL_FLAG_PAGED,
+            streamContentSize,
+            SHADOW_STREAM_TAG
+        );
+
+        if (streamContent != NULL) {
+            LARGE_INTEGER offset;
+            offset.QuadPart = 0;
+
+            status = FltReadFile(
+                Instance,
+                streamFileObject,
+                &offset,
+                streamContentSize - 1,  // Leave room for null
+                streamContent,
+                FLTFL_IO_OPERATION_DO_NOT_UPDATE_BYTE_OFFSET,
+                &bytesRead,
+                NULL,
+                NULL
+            );
+
+            if (NT_SUCCESS(status) || status == STATUS_END_OF_FILE) {
+                if (bytesRead > 0) {
+                    streamContent[bytesRead] = '\0';
+
+                    //
+                    // Parse the content to extract ZoneId value
+                    //
+                    status = ShadowpParseZoneIdentifierContent(
+                        streamContent,
+                        bytesRead,
+                        ZoneId
+                    );
+
+                    if (!NT_SUCCESS(status)) {
+                        //
+                        // Parsing failed, default to zone 3
+                        //
+                        *ZoneId = 3;
+                    }
+                } else {
+                    *ZoneId = 3;  // Empty stream, default to Internet
+                }
+            } else {
+                *ZoneId = 3;  // Read failed, default to Internet
+            }
+
+            ExFreePoolWithTag(streamContent, SHADOW_STREAM_TAG);
+        } else {
+            *ZoneId = 3;  // Allocation failed, default to Internet
+        }
+
+        //
+        // Cleanup
+        //
+        ObDereferenceObject(streamFileObject);
+        FltClose(streamHandle);
     }
 
     return STATUS_SUCCESS;
@@ -1501,17 +2012,18 @@ ShadowStrikeGetZoneIdentifier(
 // VOLUME OPERATIONS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetVolumeInfo(
-    _In_ PFLT_INSTANCE Instance,
-    _Out_ PSHADOW_VOLUME_INFO VolumeInfo
+    PFLT_INSTANCE Instance,
+    PSHADOW_VOLUME_INFO VolumeInfo
     )
 {
     NTSTATUS status;
     PFLT_VOLUME volume = NULL;
-    UCHAR propertiesBuffer[sizeof(FLT_VOLUME_PROPERTIES) + 512];
-    PFLT_VOLUME_PROPERTIES volumeProps = (PFLT_VOLUME_PROPERTIES)propertiesBuffer;
+    PFLT_VOLUME_PROPERTIES volumeProps = NULL;
     ULONG returnLength;
+    const ULONG propsBufferSize = sizeof(FLT_VOLUME_PROPERTIES) + 512;
 
     PAGED_CODE();
 
@@ -1522,10 +2034,24 @@ ShadowStrikeGetVolumeInfo(
     }
 
     //
+    // Allocate volume properties buffer from pool
+    //
+    volumeProps = (PFLT_VOLUME_PROPERTIES)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        propsBufferSize,
+        SHADOW_FILE_TAG
+    );
+
+    if (volumeProps == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
     // Get volume from instance
     //
     status = FltGetVolumeFromInstance(Instance, &volume);
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(volumeProps, SHADOW_FILE_TAG);
         return status;
     }
 
@@ -1535,16 +2061,18 @@ ShadowStrikeGetVolumeInfo(
     status = FltGetVolumeProperties(
         volume,
         volumeProps,
-        sizeof(propertiesBuffer),
+        propsBufferSize,
         &returnLength
     );
 
-    if (NT_SUCCESS(status)) {
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
         //
         // Determine volume type from device type and characteristics
         //
         switch (volumeProps->DeviceType) {
             case FILE_DEVICE_NETWORK_FILE_SYSTEM:
+            case FILE_DEVICE_DFS:
+            case FILE_DEVICE_DFS_FILE_SYSTEM:
                 VolumeInfo->VolumeType = ShadowVolumeNetwork;
                 VolumeInfo->IsNetworkDrive = TRUE;
                 break;
@@ -1564,6 +2092,8 @@ ShadowStrikeGetVolumeInfo(
             default:
                 if (BooleanFlagOn(volumeProps->DeviceCharacteristics, FILE_REMOVABLE_MEDIA)) {
                     VolumeInfo->VolumeType = ShadowVolumeRemovable;
+                } else if (BooleanFlagOn(volumeProps->DeviceCharacteristics, FILE_FLOPPY_DISKETTE)) {
+                    VolumeInfo->VolumeType = ShadowVolumeRemovable;
                 } else {
                     VolumeInfo->VolumeType = ShadowVolumeFixed;
                 }
@@ -1571,15 +2101,20 @@ ShadowStrikeGetVolumeInfo(
         }
 
         //
-        // Copy file system name
+        // Copy file system name safely
         //
         if (volumeProps->FileSystemDriverName.Length > 0 &&
-            volumeProps->FileSystemDriverName.Length < sizeof(VolumeInfo->FileSystemName)) {
+            volumeProps->FileSystemDriverName.Buffer != NULL) {
+            USHORT copyLength = min(
+                volumeProps->FileSystemDriverName.Length,
+                (USHORT)(sizeof(VolumeInfo->FileSystemName) - sizeof(WCHAR))
+            );
             RtlCopyMemory(
                 VolumeInfo->FileSystemName,
                 volumeProps->FileSystemDriverName.Buffer,
-                volumeProps->FileSystemDriverName.Length
+                copyLength
             );
+            VolumeInfo->FileSystemName[copyLength / sizeof(WCHAR)] = L'\0';
         }
 
         //
@@ -1587,17 +2122,26 @@ ShadowStrikeGetVolumeInfo(
         //
         VolumeInfo->IsReadOnly = BooleanFlagOn(volumeProps->DeviceCharacteristics,
                                                 FILE_READ_ONLY_DEVICE);
+
+        status = STATUS_SUCCESS;
     }
 
+    //
+    // Get volume serial number using proper API
+    //
+    ShadowStrikeGetVolumeSerial(Instance, &VolumeInfo->VolumeSerial);
+
     FltObjectDereference(volume);
+    ExFreePoolWithTag(volumeProps, SHADOW_FILE_TAG);
 
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetVolumeType(
-    _In_ PFLT_INSTANCE Instance,
-    _Out_ PSHADOW_VOLUME_TYPE VolumeType
+    PFLT_INSTANCE Instance,
+    PSHADOW_VOLUME_TYPE VolumeType
     )
 {
     NTSTATUS status;
@@ -1615,9 +2159,10 @@ ShadowStrikeGetVolumeType(
     return status;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsNetworkVolume(
-    _In_ PFLT_INSTANCE Instance
+    PFLT_INSTANCE Instance
     )
 {
     SHADOW_VOLUME_TYPE volumeType;
@@ -1631,9 +2176,10 @@ ShadowStrikeIsNetworkVolume(
     return FALSE;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsRemovableVolume(
-    _In_ PFLT_INSTANCE Instance
+    PFLT_INSTANCE Instance
     )
 {
     SHADOW_VOLUME_TYPE volumeType;
@@ -1651,13 +2197,14 @@ ShadowStrikeIsRemovableVolume(
 // FILE READING
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeReadFileHeader(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_writes_bytes_(BufferSize) PVOID Buffer,
-    _In_ ULONG BufferSize,
-    _Out_ PULONG BytesRead
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PVOID Buffer,
+    ULONG BufferSize,
+    PULONG BytesRead
     )
 {
     PAGED_CODE();
@@ -1672,19 +2219,19 @@ ShadowStrikeReadFileHeader(
     );
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeReadFileAtOffset(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _In_ LONGLONG Offset,
-    _Out_writes_bytes_(BufferSize) PVOID Buffer,
-    _In_ ULONG BufferSize,
-    _Out_ PULONG BytesRead
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    LONGLONG Offset,
+    PVOID Buffer,
+    ULONG BufferSize,
+    PULONG BytesRead
     )
 {
     NTSTATUS status;
     LARGE_INTEGER byteOffset;
-    ULONG ioFlags = 0;
 
     PAGED_CODE();
 
@@ -1698,6 +2245,13 @@ ShadowStrikeReadFileAtOffset(
     // Validate offset is not negative
     //
     if (Offset < 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate BufferSize is within safe limits
+    //
+    if (BufferSize > SHADOW_MAX_FILE_READ_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1728,12 +2282,13 @@ ShadowStrikeReadFileAtOffset(
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeInitFileReadContext(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _In_ ULONG ChunkSize,
-    _Out_ PSHADOW_FILE_READ_CONTEXT Context
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    ULONG ChunkSize,
+    PSHADOW_FILE_READ_CONTEXT Context
     )
 {
     NTSTATUS status;
@@ -1748,6 +2303,13 @@ ShadowStrikeInitFileReadContext(
     }
 
     //
+    // Validate chunk size
+    //
+    if (ChunkSize > SHADOW_MAX_FILE_READ_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
     // Get file size
     //
     status = ShadowStrikeGetFileSize(Instance, FileObject, &fileSize);
@@ -1756,16 +2318,19 @@ ShadowStrikeInitFileReadContext(
     }
 
     //
-    // Allocate read buffer
+    // Allocate read buffer - prefer lookaside for standard chunk size
     //
-    if (g_LookasideInitialized && ChunkSize == SHADOW_FILE_READ_CHUNK_SIZE) {
+    if (InterlockedCompareExchange(&g_LookasideInitialized, 1, 1) == 1 &&
+        ChunkSize == SHADOW_FILE_READ_CHUNK_SIZE) {
         Context->Buffer = ExAllocateFromNPagedLookasideList(&g_FileBufferLookaside);
+        Context->UsedLookaside = TRUE;
     } else {
-        Context->Buffer = ExAllocatePoolWithTag(
-            NonPagedPoolNx,
+        Context->Buffer = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
             ChunkSize,
             SHADOW_FILEBUF_TAG
         );
+        Context->UsedLookaside = FALSE;
     }
 
     if (Context->Buffer == NULL) {
@@ -1784,9 +2349,10 @@ ShadowStrikeInitFileReadContext(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeReadNextChunk(
-    _Inout_ PSHADOW_FILE_READ_CONTEXT Context
+    PSHADOW_FILE_READ_CONTEXT Context
     )
 {
     NTSTATUS status;
@@ -1836,9 +2402,10 @@ ShadowStrikeReadNextChunk(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 VOID
 ShadowStrikeCleanupFileReadContext(
-    _Inout_ PSHADOW_FILE_READ_CONTEXT Context
+    PSHADOW_FILE_READ_CONTEXT Context
     )
 {
     if (Context == NULL) {
@@ -1846,7 +2413,9 @@ ShadowStrikeCleanupFileReadContext(
     }
 
     if (Context->Buffer != NULL) {
-        if (g_LookasideInitialized && Context->BufferSize == SHADOW_FILE_READ_CHUNK_SIZE) {
+        if (Context->UsedLookaside &&
+            InterlockedCompareExchange(&g_LookasideInitialized, 1, 1) == 1 &&
+            Context->BufferSize == SHADOW_FILE_READ_CHUNK_SIZE) {
             ExFreeToNPagedLookasideList(&g_FileBufferLookaside, Context->Buffer);
         } else {
             ExFreePoolWithTag(Context->Buffer, SHADOW_FILEBUF_TAG);
@@ -1861,12 +2430,81 @@ ShadowStrikeCleanupFileReadContext(
 // REPARSE POINT OPERATIONS
 // ============================================================================
 
+/**
+ * @brief Validate reparse data buffer structure
+ */
+static
+BOOLEAN
+ShadowpValidateReparseBuffer(
+    _In_ PREPARSE_DATA_BUFFER ReparseData,
+    _In_ ULONG BufferSize
+    )
+{
+    ULONG minSize;
+
+    //
+    // Minimum size for reparse data header
+    //
+    minSize = REPARSE_DATA_BUFFER_HEADER_SIZE;
+    if (BufferSize < minSize) {
+        return FALSE;
+    }
+
+    //
+    // Validate based on reparse tag
+    //
+    if (ReparseData->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+        minSize = FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer);
+        if (BufferSize < minSize) {
+            return FALSE;
+        }
+
+        //
+        // Validate name offsets and lengths don't exceed buffer
+        //
+        if (ReparseData->SymbolicLinkReparseBuffer.SubstituteNameOffset +
+            ReparseData->SymbolicLinkReparseBuffer.SubstituteNameLength >
+            ReparseData->ReparseDataLength) {
+            return FALSE;
+        }
+
+        if (ReparseData->SymbolicLinkReparseBuffer.PrintNameOffset +
+            ReparseData->SymbolicLinkReparseBuffer.PrintNameLength >
+            ReparseData->ReparseDataLength) {
+            return FALSE;
+        }
+    } else if (ReparseData->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+        minSize = FIELD_OFFSET(REPARSE_DATA_BUFFER, MountPointReparseBuffer.PathBuffer);
+        if (BufferSize < minSize) {
+            return FALSE;
+        }
+
+        //
+        // Validate name offsets and lengths
+        //
+        if (ReparseData->MountPointReparseBuffer.SubstituteNameOffset +
+            ReparseData->MountPointReparseBuffer.SubstituteNameLength >
+            ReparseData->ReparseDataLength) {
+            return FALSE;
+        }
+
+        if (ReparseData->MountPointReparseBuffer.PrintNameOffset +
+            ReparseData->MountPointReparseBuffer.PrintNameLength >
+            ReparseData->ReparseDataLength) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeIsReparsePoint(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PBOOLEAN IsReparse,
-    _Out_opt_ PULONG ReparseTag
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PBOOLEAN IsReparse,
+    PULONG ReparseTag
     )
 {
     NTSTATUS status;
@@ -1904,10 +2542,11 @@ ShadowStrikeIsReparsePoint(
     return status;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsSymbolicLink(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject
     )
 {
     BOOLEAN isReparse;
@@ -1922,20 +2561,22 @@ ShadowStrikeIsSymbolicLink(
     return FALSE;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetReparseTarget(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PUNICODE_STRING TargetPath
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PUNICODE_STRING TargetPath
     )
 {
     NTSTATUS status;
-    UCHAR buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-    PREPARSE_DATA_BUFFER reparseData = (PREPARSE_DATA_BUFFER)buffer;
+    PUCHAR buffer = NULL;
+    PREPARSE_DATA_BUFFER reparseData;
     ULONG returnLength;
     PWCHAR targetBuffer;
     USHORT targetLength;
     SIZE_T allocationSize;
+    const ULONG bufferSize = MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
 
     PAGED_CODE();
 
@@ -1948,6 +2589,21 @@ ShadowStrikeGetReparseTarget(
     }
 
     //
+    // Allocate buffer from pool (too large for stack)
+    //
+    buffer = (PUCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        bufferSize,
+        SHADOW_FILE_TAG
+    );
+
+    if (buffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    reparseData = (PREPARSE_DATA_BUFFER)buffer;
+
+    //
     // Query reparse point data
     //
     status = FltFsControlFile(
@@ -1957,48 +2613,88 @@ ShadowStrikeGetReparseTarget(
         NULL,
         0,
         buffer,
-        sizeof(buffer),
+        bufferSize,
         &returnLength
     );
 
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
         return status;
+    }
+
+    //
+    // Validate reparse buffer structure
+    //
+    if (!ShadowpValidateReparseBuffer(reparseData, returnLength)) {
+        ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
+        return STATUS_INVALID_BUFFER_SIZE;
     }
 
     //
     // Extract target path based on reparse type
     //
     if (reparseData->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
-        targetBuffer = (PWCHAR)((PUCHAR)reparseData->SymbolicLinkReparseBuffer.PathBuffer +
-                       reparseData->SymbolicLinkReparseBuffer.SubstituteNameOffset);
+        USHORT offset = reparseData->SymbolicLinkReparseBuffer.SubstituteNameOffset;
         targetLength = reparseData->SymbolicLinkReparseBuffer.SubstituteNameLength;
+
+        //
+        // Additional bounds check
+        //
+        if (offset + targetLength > reparseData->ReparseDataLength) {
+            ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        targetBuffer = (PWCHAR)((PUCHAR)reparseData->SymbolicLinkReparseBuffer.PathBuffer + offset);
+
     } else if (reparseData->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
-        targetBuffer = (PWCHAR)((PUCHAR)reparseData->MountPointReparseBuffer.PathBuffer +
-                       reparseData->MountPointReparseBuffer.SubstituteNameOffset);
+        USHORT offset = reparseData->MountPointReparseBuffer.SubstituteNameOffset;
         targetLength = reparseData->MountPointReparseBuffer.SubstituteNameLength;
+
+        //
+        // Additional bounds check
+        //
+        if (offset + targetLength > reparseData->ReparseDataLength) {
+            ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        targetBuffer = (PWCHAR)((PUCHAR)reparseData->MountPointReparseBuffer.PathBuffer + offset);
+
     } else {
+        ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
         return STATUS_NOT_SUPPORTED;
+    }
+
+    //
+    // Calculate allocation size with overflow check
+    //
+    allocationSize = (SIZE_T)targetLength + sizeof(WCHAR);
+    if (allocationSize < targetLength || allocationSize > SHADOW_MAX_PATH_BYTES) {
+        ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
+        return STATUS_INTEGER_OVERFLOW;
     }
 
     //
     // Allocate and copy target path
     //
-    allocationSize = (SIZE_T)targetLength + sizeof(WCHAR);
-
-    TargetPath->Buffer = (PWCH)ExAllocatePoolWithTag(
-        PagedPool,
+    TargetPath->Buffer = (PWCH)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         allocationSize,
         SHADOW_FILEPATH_TAG
     );
 
     if (TargetPath->Buffer == NULL) {
+        ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlCopyMemory(TargetPath->Buffer, targetBuffer, targetLength);
     TargetPath->Buffer[targetLength / sizeof(WCHAR)] = L'\0';
     TargetPath->Length = targetLength;
-    TargetPath->MaximumLength = (USHORT)allocationSize;
+    TargetPath->MaximumLength = (USHORT)min(allocationSize, MAXUSHORT);
+
+    ExFreePoolWithTag(buffer, SHADOW_FILE_TAG);
 
     return STATUS_SUCCESS;
 }
@@ -2007,22 +2703,23 @@ ShadowStrikeGetReparseTarget(
 // SECURITY OPERATIONS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeGetFileOwner(
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject,
-    _Out_ PSID* OwnerSid,
-    _Out_ PULONG SidLength
+    PFLT_INSTANCE Instance,
+    PFILE_OBJECT FileObject,
+    PSID* OwnerSid,
+    PULONG SidLength
     )
 {
     NTSTATUS status;
-    UCHAR securityBuffer[512];
-    PSECURITY_DESCRIPTOR securityDescriptor = (PSECURITY_DESCRIPTOR)securityBuffer;
+    PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     ULONG lengthNeeded;
     PSID owner;
     BOOLEAN ownerDefaulted;
     ULONG sidLength;
     PSID sidCopy;
+    const ULONG secBufferSize = 512;
 
     PAGED_CODE();
 
@@ -2034,6 +2731,19 @@ ShadowStrikeGetFileOwner(
     }
 
     //
+    // Allocate security descriptor buffer from pool
+    //
+    securityDescriptor = (PSECURITY_DESCRIPTOR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        secBufferSize,
+        SHADOW_FILE_TAG
+    );
+
+    if (securityDescriptor == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
     // Query security descriptor
     //
     status = FltQuerySecurityObject(
@@ -2041,11 +2751,12 @@ ShadowStrikeGetFileOwner(
         FileObject,
         OWNER_SECURITY_INFORMATION,
         securityDescriptor,
-        sizeof(securityBuffer),
+        secBufferSize,
         &lengthNeeded
     );
 
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
         return status;
     }
 
@@ -2059,7 +2770,16 @@ ShadowStrikeGetFileOwner(
     );
 
     if (!NT_SUCCESS(status) || owner == NULL) {
+        ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
         return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Validate SID before using
+    //
+    if (!RtlValidSid(owner)) {
+        ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
+        return STATUS_INVALID_SID;
     }
 
     //
@@ -2067,31 +2787,44 @@ ShadowStrikeGetFileOwner(
     //
     sidLength = RtlLengthSid(owner);
 
-    sidCopy = (PSID)ExAllocatePoolWithTag(
-        PagedPool,
+    //
+    // Sanity check SID length
+    //
+    if (sidLength == 0 || sidLength > SECURITY_MAX_SID_SIZE) {
+        ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
+        return STATUS_INVALID_SID;
+    }
+
+    sidCopy = (PSID)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         sidLength,
         SHADOW_FILE_TAG
     );
 
     if (sidCopy == NULL) {
+        ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     status = RtlCopySid(sidLength, sidCopy, owner);
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(sidCopy, SHADOW_FILE_TAG);
+        ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
         return status;
     }
 
     *OwnerSid = sidCopy;
     *SidLength = sidLength;
 
+    ExFreePoolWithTag(securityDescriptor, SHADOW_FILE_TAG);
+
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 VOID
 ShadowStrikeFreeFileSid(
-    _In_ PSID Sid
+    PSID Sid
     )
 {
     if (Sid != NULL) {
@@ -2103,14 +2836,22 @@ ShadowStrikeFreeFileSid(
 // CALLBACK DATA HELPERS
 // ============================================================================
 
+_Use_decl_annotations_
 SHADOW_FILE_DISPOSITION
 ShadowStrikeGetFileDisposition(
-    _In_ PFLT_CALLBACK_DATA Data
+    PFLT_CALLBACK_DATA Data
     )
 {
     ULONG createDisposition;
 
     if (Data == NULL) {
+        return ShadowDispositionOpen;
+    }
+
+    //
+    // Validate Iopb is present
+    //
+    if (Data->Iopb == NULL) {
         return ShadowDispositionOpen;
     }
 
@@ -2138,15 +2879,34 @@ ShadowStrikeGetFileDisposition(
     }
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsWriteAccess(
-    _In_ PFLT_CALLBACK_DATA Data
+    PFLT_CALLBACK_DATA Data
     )
 {
     ACCESS_MASK desiredAccess;
     ULONG createDisposition;
 
-    if (Data == NULL || Data->Iopb->MajorFunction != IRP_MJ_CREATE) {
+    if (Data == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Validate Iopb is present
+    //
+    if (Data->Iopb == NULL) {
+        return FALSE;
+    }
+
+    if (Data->Iopb->MajorFunction != IRP_MJ_CREATE) {
+        return FALSE;
+    }
+
+    //
+    // Validate SecurityContext is present
+    //
+    if (Data->Iopb->Parameters.Create.SecurityContext == NULL) {
         return FALSE;
     }
 
@@ -2175,14 +2935,39 @@ ShadowStrikeIsWriteAccess(
     return FALSE;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsExecuteAccess(
-    _In_ PFLT_CALLBACK_DATA Data
+    PFLT_CALLBACK_DATA Data
     )
 {
     ACCESS_MASK desiredAccess;
 
-    if (Data == NULL || Data->Iopb->MajorFunction != IRP_MJ_CREATE) {
+    if (Data == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Validate Iopb is present
+    //
+    if (Data->Iopb == NULL) {
+        return FALSE;
+    }
+
+    if (Data->Iopb->MajorFunction != IRP_MJ_CREATE) {
+        //
+        // Check for section acquisition (common for execution)
+        //
+        if (Data->Iopb->MajorFunction == IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION) {
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    //
+    // Validate SecurityContext is present
+    //
+    if (Data->Iopb->Parameters.Create.SecurityContext == NULL) {
         return FALSE;
     }
 
@@ -2195,21 +2980,15 @@ ShadowStrikeIsExecuteAccess(
         return TRUE;
     }
 
-    //
-    // Check for section mapping (common for execution)
-    //
-    if (Data->Iopb->MajorFunction == IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION) {
-        return TRUE;
-    }
-
     return FALSE;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 ShadowStrikeIsDirectory(
-    _In_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _Out_ PBOOLEAN IsDirectory
+    PFLT_CALLBACK_DATA Data,
+    PCFLT_RELATED_OBJECTS FltObjects,
+    PBOOLEAN IsDirectory
     )
 {
     NTSTATUS status;
@@ -2220,14 +2999,21 @@ ShadowStrikeIsDirectory(
 
     *IsDirectory = FALSE;
 
-    if (Data == NULL || FltObjects == NULL || FltObjects->FileObject == NULL) {
+    if (Data == NULL || FltObjects == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // First check CREATE options
+    // Validate FltObjects members
     //
-    if (Data->Iopb->MajorFunction == IRP_MJ_CREATE) {
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate Iopb if checking CREATE options
+    //
+    if (Data->Iopb != NULL && Data->Iopb->MajorFunction == IRP_MJ_CREATE) {
         if (BooleanFlagOn(Data->Iopb->Parameters.Create.Options, FILE_DIRECTORY_FILE)) {
             *IsDirectory = TRUE;
             return STATUS_SUCCESS;
@@ -2253,9 +3039,10 @@ ShadowStrikeIsDirectory(
     return status;
 }
 
+_Use_decl_annotations_
 BOOLEAN
 ShadowStrikeIsKernelModeOperation(
-    _In_ PFLT_CALLBACK_DATA Data
+    PFLT_CALLBACK_DATA Data
     )
 {
     if (Data == NULL) {

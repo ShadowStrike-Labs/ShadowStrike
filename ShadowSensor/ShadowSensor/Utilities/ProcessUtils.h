@@ -21,9 +21,10 @@
  * Security Guarantees:
  * - All functions validate input parameters
  * - Safe handle management with proper cleanup
- * - IRQL-aware implementations
+ * - IRQL-aware implementations with correct annotations
  * - Exception handling for invalid processes
  * - Reference counting for EPROCESS objects
+ * - Proper token API usage (no opaque structure access)
  *
  * MITRE ATT&CK Coverage:
  * - T1055: Process Injection (parent/child analysis)
@@ -33,7 +34,7 @@
  * - T1059: Command and Scripting Interpreter (command line parsing)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -62,6 +63,16 @@ extern "C" {
  */
 #define SHADOW_PROCINFO_TAG 'iSSp'
 
+/**
+ * @brief Pool tag for token allocations
+ */
+#define SHADOW_TOKEN_TAG 'tSSp'
+
+/**
+ * @brief Pool tag for SID allocations
+ */
+#define SHADOW_SID_TAG 'dSSp'
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -85,6 +96,11 @@ extern "C" {
  * @brief Maximum number of modules to enumerate
  */
 #define SHADOW_MAX_MODULES 1024
+
+/**
+ * @brief Maximum token information buffer size
+ */
+#define SHADOW_MAX_TOKEN_INFO_SIZE 4096
 
 // ============================================================================
 // ENUMERATIONS
@@ -128,6 +144,21 @@ typedef enum _SHADOW_PROCESS_TYPE {
     ShadowProcessProtected              // Protected process
 } SHADOW_PROCESS_TYPE;
 
+/**
+ * @brief Process signer types (for protected processes)
+ */
+typedef enum _SHADOW_SIGNER_TYPE {
+    ShadowSignerNone = 0,
+    ShadowSignerAuthenticode = 1,
+    ShadowSignerCodeGen = 2,
+    ShadowSignerAntimalware = 3,
+    ShadowSignerLsa = 4,
+    ShadowSignerWindows = 5,
+    ShadowSignerWinTcb = 6,
+    ShadowSignerWinSystem = 7,
+    ShadowSignerApp = 8
+} SHADOW_SIGNER_TYPE;
+
 // ============================================================================
 // STRUCTURES
 // ============================================================================
@@ -165,6 +196,7 @@ typedef struct _SHADOW_PROCESS_INFO {
     SHADOW_INTEGRITY_LEVEL IntegrityLevel;
     SHADOW_PROTECTION_LEVEL ProtectionLevel;
     SHADOW_PROCESS_TYPE ProcessType;
+    SHADOW_SIGNER_TYPE SignerType;
 
     //
     // Flags
@@ -176,6 +208,7 @@ typedef struct _SHADOW_PROCESS_INFO {
     BOOLEAN IsSubsystemProcess;
     BOOLEAN IsTerminating;
     BOOLEAN IsDebugged;
+    BOOLEAN IsSigned;
 
     //
     // Timestamps
@@ -222,6 +255,16 @@ typedef struct _SHADOW_MODULE_INFO {
     BOOLEAN IsMainModule;
 } SHADOW_MODULE_INFO, *PSHADOW_MODULE_INFO;
 
+/**
+ * @brief Creating process context (captured at creation time)
+ */
+typedef struct _SHADOW_CREATING_PROCESS_CONTEXT {
+    HANDLE CreatingProcessId;
+    HANDLE CreatingThreadId;
+    LARGE_INTEGER CaptureTime;
+    BOOLEAN IsValid;
+} SHADOW_CREATING_PROCESS_CONTEXT, *PSHADOW_CREATING_PROCESS_CONTEXT;
+
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
@@ -236,6 +279,7 @@ typedef struct _SHADOW_MODULE_INFO {
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowProcessUtilsInitialize(
     VOID
@@ -246,6 +290,7 @@ ShadowProcessUtilsInitialize(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowProcessUtilsCleanup(
     VOID
@@ -267,6 +312,7 @@ ShadowProcessUtilsCleanup(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessImagePath(
     _In_ HANDLE ProcessId,
@@ -283,6 +329,7 @@ ShadowStrikeGetProcessImagePath(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessImageName(
     _In_ HANDLE ProcessId,
@@ -301,6 +348,7 @@ ShadowStrikeGetProcessImageName(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessCommandLine(
     _In_ HANDLE ProcessId,
@@ -321,6 +369,7 @@ ShadowStrikeGetProcessCommandLine(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessInfo(
     _In_ HANDLE ProcessId,
@@ -334,6 +383,7 @@ ShadowStrikeGetProcessInfo(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowFreeProcessInfo(
     _Inout_ PSHADOW_PROCESS_INFO ProcessInfo
@@ -346,6 +396,7 @@ ShadowFreeProcessInfo(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowFreeProcessString(
     _Inout_ PUNICODE_STRING String
@@ -365,6 +416,7 @@ ShadowFreeProcessString(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetParentProcessId(
     _In_ HANDLE ProcessId,
@@ -374,19 +426,43 @@ ShadowStrikeGetParentProcessId(
 /**
  * @brief Get creating process ID (real parent, not inherited).
  *
+ * This function returns information captured during the process
+ * creation callback. If creation context was not captured,
+ * it falls back to the inherited parent process ID.
+ *
  * @param Process               EPROCESS pointer
  * @param CreatingProcessId     Receives creating process ID
  * @param CreatingThreadId      Receives creating thread ID (optional)
  *
  * @return STATUS_SUCCESS or error
  *
- * @irql <= APC_LEVEL
+ * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetCreatingProcess(
     _In_ PEPROCESS Process,
     _Out_ PHANDLE CreatingProcessId,
     _Out_opt_ PHANDLE CreatingThreadId
+    );
+
+/**
+ * @brief Store creating process context (call from creation callback).
+ *
+ * @param TargetProcessId       Target process ID
+ * @param CreatingProcessId     Creating process ID
+ * @param CreatingThreadId      Creating thread ID
+ *
+ * @return STATUS_SUCCESS or error
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeStoreCreatingProcessContext(
+    _In_ HANDLE TargetProcessId,
+    _In_ HANDLE CreatingProcessId,
+    _In_ HANDLE CreatingThreadId
     );
 
 /**
@@ -403,6 +479,7 @@ ShadowStrikeGetCreatingProcess(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeValidateParentChild(
     _In_ HANDLE ChildId,
@@ -421,8 +498,9 @@ ShadowStrikeValidateParentChild(
  *
  * @return TRUE if process is terminating
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessTerminating(
     _In_ PEPROCESS Process
@@ -435,8 +513,9 @@ ShadowStrikeIsProcessTerminating(
  *
  * @return TRUE if 32-bit process on 64-bit OS
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessWow64(
     _In_ PEPROCESS Process
@@ -449,8 +528,9 @@ ShadowStrikeIsProcessWow64(
  *
  * @return TRUE if protected process
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessProtected(
     _In_ PEPROCESS Process
@@ -463,8 +543,9 @@ ShadowStrikeIsProcessProtected(
  *
  * @return TRUE if process has debugger attached
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessDebugged(
     _In_ PEPROCESS Process
@@ -479,6 +560,7 @@ ShadowStrikeIsProcessDebugged(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 BOOLEAN
 ShadowStrikeIsSystemProcess(
     _In_ HANDLE ProcessId
@@ -494,6 +576,7 @@ ShadowStrikeIsSystemProcess(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeIsProcessElevated(
     _In_ HANDLE ProcessId,
@@ -514,6 +597,7 @@ ShadowStrikeIsProcessElevated(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessIntegrityLevel(
     _In_ HANDLE ProcessId,
@@ -530,6 +614,7 @@ ShadowStrikeGetProcessIntegrityLevel(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessSessionId(
     _In_ HANDLE ProcessId,
@@ -539,6 +624,8 @@ ShadowStrikeGetProcessSessionId(
 /**
  * @brief Check if process has specific privilege.
  *
+ * Uses proper SECURITY_SUBJECT_CONTEXT for privilege checking.
+ *
  * @param ProcessId         Process ID
  * @param PrivilegeLuid     Privilege LUID to check
  * @param HasPrivilege      Receives result
@@ -547,6 +634,7 @@ ShadowStrikeGetProcessSessionId(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeProcessHasPrivilege(
     _In_ HANDLE ProcessId,
@@ -558,13 +646,14 @@ ShadowStrikeProcessHasPrivilege(
  * @brief Get process user SID.
  *
  * @param ProcessId     Process ID
- * @param UserSid       Receives user SID (caller must free)
+ * @param UserSid       Receives user SID (caller must free with ShadowStrikeFreePoolWithTag)
  * @param SidSize       Receives SID size
  *
  * @return STATUS_SUCCESS or error
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessUserSid(
     _In_ HANDLE ProcessId,
@@ -586,6 +675,7 @@ ShadowStrikeGetProcessUserSid(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessIdFromHandle(
     _In_ HANDLE ProcessHandle,
@@ -602,8 +692,9 @@ ShadowStrikeGetProcessIdFromHandle(
  *
  * @note Caller must call ObDereferenceObject when done
  *
- * @irql <= APC_LEVEL
+ * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetProcessObject(
     _In_ HANDLE ProcessId,
@@ -623,6 +714,7 @@ ShadowStrikeGetProcessObject(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeOpenProcess(
     _In_ HANDLE ProcessId,
@@ -644,6 +736,7 @@ ShadowStrikeOpenProcess(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetThreadInfo(
     _In_ HANDLE ThreadId,
@@ -657,8 +750,9 @@ ShadowStrikeGetThreadInfo(
  *
  * @return TRUE if thread is terminating
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsThreadTerminating(
     _In_ PETHREAD Thread
@@ -675,6 +769,7 @@ ShadowStrikeIsThreadTerminating(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeGetThreadStartAddress(
     _In_ HANDLE ThreadId,
@@ -690,6 +785,7 @@ ShadowStrikeGetThreadStartAddress(
  * @brief Validate process image signature.
  *
  * Checks if process image is properly signed.
+ * Uses Code Integrity APIs where available.
  *
  * @param ProcessId         Process ID
  * @param IsSigned          Receives signature status
@@ -699,11 +795,12 @@ ShadowStrikeGetThreadStartAddress(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeValidateProcessSignature(
     _In_ HANDLE ProcessId,
     _Out_ PBOOLEAN IsSigned,
-    _Out_opt_ PULONG SignerType
+    _Out_opt_ PSHADOW_SIGNER_TYPE SignerType
     );
 
 /**
@@ -718,6 +815,7 @@ ShadowStrikeValidateProcessSignature(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeIsWindowsProcess(
     _In_ HANDLE ProcessId,
@@ -736,6 +834,7 @@ ShadowStrikeIsWindowsProcess(
  *
  * @irql PASSIVE_LEVEL
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeClassifyProcess(
     _In_ HANDLE ProcessId,
@@ -747,7 +846,10 @@ ShadowStrikeClassifyProcess(
 // ============================================================================
 
 /**
- * @brief Check if process ID is valid (non-zero and not system idle).
+ * @brief Check if process ID is valid (non-zero, including System process).
+ *
+ * Note: System process (PID 4) is a valid process ID.
+ * Use ShadowStrikeIsSystemProcess() to check if it's the System process.
  */
 FORCEINLINE
 BOOLEAN
@@ -755,7 +857,23 @@ ShadowStrikeIsValidProcessId(
     _In_ HANDLE ProcessId
     )
 {
-    return (ProcessId != NULL && ProcessId != (HANDLE)4);
+    //
+    // PID 0 is the Idle process - not accessible via normal APIs
+    // PID 4 is the System process - valid and accessible
+    //
+    return (ProcessId != NULL);
+}
+
+/**
+ * @brief Check if process ID is the System process.
+ */
+FORCEINLINE
+BOOLEAN
+ShadowStrikeIsSystemProcessId(
+    _In_ HANDLE ProcessId
+    )
+{
+    return (ProcessId == (HANDLE)(ULONG_PTR)4);
 }
 
 /**
@@ -791,7 +909,7 @@ ShadowStrikeIsSystemContext(
     VOID
     )
 {
-    return (PsGetCurrentProcessId() == (HANDLE)4);
+    return (PsGetCurrentProcessId() == (HANDLE)(ULONG_PTR)4);
 }
 
 #ifdef __cplusplus

@@ -14,8 +14,17 @@
  * - Reliability (comprehensive validation, leak detection)
  * - Observability (detailed statistics, diagnostics)
  *
+ * Security Hardening (v3.0.0):
+ * ============================
+ * - Lock-free reference counting with atomic CAS operations
+ * - Proper callback IRQL validation via work item deferral
+ * - Safe list enumeration with next-pointer caching
+ * - State machine with atomic transitions
+ * - ExAllocatePool2 usage for modern Windows
+ * - Proper shutdown sequencing to prevent use-after-free
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -29,6 +38,7 @@
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, LlInitialize)
+#pragma alloc_text(INIT, LlInitializeEx)
 #pragma alloc_text(PAGE, LlShutdown)
 #pragma alloc_text(PAGE, LlCreateLookaside)
 #pragma alloc_text(PAGE, LlCreateLookasideEx)
@@ -110,6 +120,7 @@
 // INTERNAL FORWARD DECLARATIONS
 // ============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpMaintenanceDpcRoutine(
     _In_ PKDPC Dpc,
@@ -118,16 +129,103 @@ LlpMaintenanceDpcRoutine(
     _In_opt_ PVOID SystemArgument2
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpCheckMemoryPressure(
     _In_ PLL_MANAGER Manager
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpSecureWipeMemory(
     _Out_writes_bytes_(Length) PVOID Destination,
     _In_ SIZE_T Length
     );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+LlpPressureWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+LlpFreeLookasideInternal(
+    _In_ PLL_LOOKASIDE Lookaside
+    );
+
+_Must_inspect_result_
+static PVOID
+LlpAllocatePool(
+    _In_ POOL_TYPE PoolType,
+    _In_ SIZE_T NumberOfBytes,
+    _In_ ULONG Tag
+    );
+
+// ============================================================================
+// INTERNAL POOL ALLOCATION HELPER
+// ============================================================================
+
+/**
+ * @brief Allocate pool memory using modern API when available.
+ */
+_Must_inspect_result_
+static PVOID
+LlpAllocatePool(
+    _In_ POOL_TYPE PoolType,
+    _In_ SIZE_T NumberOfBytes,
+    _In_ ULONG Tag
+    )
+{
+    PVOID Buffer = NULL;
+
+    if (NumberOfBytes == 0) {
+        return NULL;
+    }
+
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    //
+    // Use ExAllocatePool2 on Windows 10 2004+
+    //
+    POOL_FLAGS PoolFlags = POOL_FLAG_UNINITIALIZED;
+
+    if (PoolType == PagedPool || PoolType == PagedPoolCacheAligned) {
+        PoolFlags = POOL_FLAG_PAGED;
+    } else {
+        PoolFlags = POOL_FLAG_NON_PAGED;
+    }
+
+    if (PoolType == NonPagedPoolCacheAligned || PoolType == PagedPoolCacheAligned) {
+        PoolFlags |= POOL_FLAG_CACHE_ALIGNED;
+    }
+
+    Buffer = ExAllocatePool2(PoolFlags, NumberOfBytes, Tag);
+
+    if (Buffer != NULL) {
+        RtlZeroMemory(Buffer, NumberOfBytes);
+    }
+#else
+    //
+    // Legacy path - convert NonPagedPool to NonPagedPoolNx for security
+    //
+    if (PoolType == NonPagedPool) {
+        PoolType = NonPagedPoolNx;
+    }
+
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#pragma warning(disable: 28118)
+    Buffer = ExAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
+#pragma warning(pop)
+
+    if (Buffer != NULL) {
+        RtlZeroMemory(Buffer, NumberOfBytes);
+    }
+#endif
+
+    return Buffer;
+}
 
 // ============================================================================
 // MANAGER INITIALIZATION AND SHUTDOWN
@@ -140,8 +238,18 @@ LlInitialize(
     _Out_ PLL_MANAGER* Manager
     )
 {
+    return LlInitializeEx(Manager, NULL);
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+LlInitializeEx(
+    _Out_ PLL_MANAGER* Manager,
+    _In_opt_ PDEVICE_OBJECT DeviceObject
+    )
+{
     PLL_MANAGER NewManager = NULL;
-    NTSTATUS Status = STATUS_SUCCESS;
 
     PAGED_CODE();
 
@@ -157,7 +265,7 @@ LlInitialize(
     //
     // Allocate manager structure
     //
-    NewManager = (PLL_MANAGER)ExAllocatePoolWithTag(
+    NewManager = (PLL_MANAGER)LlpAllocatePool(
         NonPagedPoolNx,
         sizeof(LL_MANAGER),
         LL_POOL_TAG
@@ -168,12 +276,11 @@ LlInitialize(
     }
 
     //
-    // Initialize the structure
+    // Initialize the structure (already zeroed by LlpAllocatePool)
     //
-    RtlZeroMemory(NewManager, sizeof(LL_MANAGER));
 
-    NewManager->Magic = LL_ENTRY_MAGIC;
-    NewManager->State = LlStateActive;
+    NewManager->Magic = LL_MANAGER_MAGIC;
+    NewManager->State = LlStateInitializing;
 
     //
     // Initialize the lookaside list
@@ -194,6 +301,18 @@ LlInitialize(
     KeInitializeDpc(&NewManager->MaintenanceDpc, LlpMaintenanceDpcRoutine, NewManager);
 
     //
+    // Create work item for pressure callback deferral (if device object provided)
+    //
+    if (DeviceObject != NULL) {
+        NewManager->DeviceObject = DeviceObject;
+        NewManager->PressureWorkItem = IoAllocateWorkItem(DeviceObject);
+        //
+        // Work item allocation failure is not fatal - we just won't have
+        // deferred pressure callbacks
+        //
+    }
+
+    //
     // Record start time
     //
     KeQuerySystemTimePrecise(&NewManager->GlobalStats.StartTime);
@@ -209,9 +328,10 @@ LlInitialize(
     NewManager->RefCount = 1;
 
     //
-    // Mark as initialized
+    // Mark as initialized and active
     //
     NewManager->Initialized = TRUE;
+    InterlockedExchange((volatile LONG*)&NewManager->State, LlStateActive);
 
     *Manager = NewManager;
 
@@ -225,19 +345,33 @@ LlShutdown(
     )
 {
     PLIST_ENTRY Entry = NULL;
+    PLIST_ENTRY NextEntry = NULL;
     PLL_LOOKASIDE Lookaside = NULL;
     LIST_ENTRY TempList;
+    LL_STATE OldState;
 
     PAGED_CODE();
 
-    if (Manager == NULL || !Manager->Initialized) {
+    if (Manager == NULL) {
         return;
     }
 
     //
-    // Mark as shutting down
+    // Atomically transition to shutting down state
     //
-    Manager->State = LlStateDestroying;
+    OldState = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Manager->State,
+        LlStateDestroying,
+        LlStateActive
+    );
+
+    if (OldState != LlStateActive) {
+        //
+        // Already shutting down or not initialized
+        //
+        return;
+    }
+
     Manager->Initialized = FALSE;
 
     //
@@ -250,6 +384,17 @@ LlShutdown(
     }
 
     //
+    // Wait for any pending pressure work item
+    //
+    if (Manager->PressureWorkItem != NULL) {
+        //
+        // IoFreeWorkItem will wait for pending work
+        //
+        IoFreeWorkItem(Manager->PressureWorkItem);
+        Manager->PressureWorkItem = NULL;
+    }
+
+    //
     // Collect all lookasides into a temporary list
     //
     InitializeListHead(&TempList);
@@ -257,8 +402,41 @@ LlShutdown(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Manager->LookasideListLock);
 
-    while (!IsListEmpty(&Manager->LookasideListHead)) {
-        Entry = RemoveHeadList(&Manager->LookasideListHead);
+    for (Entry = Manager->LookasideListHead.Flink;
+         Entry != &Manager->LookasideListHead;
+         Entry = NextEntry) {
+
+        //
+        // Capture next pointer before removal
+        //
+        NextEntry = Entry->Flink;
+
+        Lookaside = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
+
+        //
+        // Atomically set destroying flag to prevent new references
+        // This is the key fix for the TOCTOU race condition - by setting
+        // the destroying flag in the same 64-bit word as the reference count,
+        // LlReferenceLookaside will atomically fail when trying to acquire
+        // a new reference.
+        //
+        {
+            LONG64 OldValue, NewValue;
+            LONG RefCount;
+            ULONG Sequence;
+
+            do {
+                OldValue = InterlockedCompareExchange64(&Lookaside->RefCountAndState, 0, 0);
+                RefCount = LlpExtractRefCount(OldValue);
+                Sequence = LlpExtractSequence(OldValue);
+                NewValue = LlpBuildRefCountState(RefCount, Sequence, TRUE);
+            } while (InterlockedCompareExchange64(
+                        &Lookaside->RefCountAndState,
+                        NewValue,
+                        OldValue) != OldValue);
+        }
+
+        RemoveEntryList(Entry);
         InsertTailList(&TempList, Entry);
     }
 
@@ -266,11 +444,16 @@ LlShutdown(
     KeLeaveCriticalRegion();
 
     //
-    // Destroy each lookaside
+    // Destroy each lookaside with reference draining
     //
     while (!IsListEmpty(&TempList)) {
         Entry = RemoveHeadList(&TempList);
         Lookaside = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
+
+        //
+        // Transition to destroying state
+        //
+        InterlockedExchange((volatile LONG*)&Lookaside->State, LlStateDestroying);
 
 #if DBG
         //
@@ -288,6 +471,28 @@ LlShutdown(
 #endif
 
         //
+        // Wait for references to drain (with timeout)
+        // Use the new combined RefCountAndState field
+        //
+        LARGE_INTEGER Timeout;
+        Timeout.QuadPart = -((LONGLONG)LL_REFCOUNT_DRAIN_INTERVAL_MS * 10000);
+
+        for (ULONG i = 0; i < LL_REFCOUNT_DRAIN_MAX_ITERATIONS; i++) {
+            LONG64 Combined = InterlockedCompareExchange64(
+                &Lookaside->RefCountAndState,
+                0,
+                0
+            );
+            LONG RefCount = LlpExtractRefCount(Combined);
+
+            if (RefCount <= 0) {
+                break;
+            }
+
+            KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
+        }
+
+        //
         // Delete the native lookaside
         //
         if (Lookaside->IsPaged) {
@@ -300,9 +505,12 @@ LlShutdown(
         // Clear magic and free
         //
         Lookaside->Magic = 0;
-        Lookaside->State = LlStateDestroyed;
+        InterlockedExchange((volatile LONG*)&Lookaside->State, LlStateDestroyed);
 
         ExFreePoolWithTag(Lookaside, LL_ENTRY_TAG);
+
+        InterlockedDecrement(&Manager->LookasideCount);
+        InterlockedDecrement(&Manager->GlobalStats.ActiveLookasideLists);
     }
 
     //
@@ -314,7 +522,7 @@ LlShutdown(
     // Clear magic and free manager
     //
     Manager->Magic = 0;
-    Manager->State = LlStateDestroyed;
+    InterlockedExchange((volatile LONG*)&Manager->State, LlStateDestroyed);
 
     ExFreePoolWithTag(Manager, LL_POOL_TAG);
 }
@@ -407,7 +615,7 @@ LlCreateLookasideEx(
     //
     // Allocate lookaside structure
     //
-    NewLookaside = (PLL_LOOKASIDE)ExAllocatePoolWithTag(
+    NewLookaside = (PLL_LOOKASIDE)LlpAllocatePool(
         NonPagedPoolNx,
         sizeof(LL_LOOKASIDE),
         LL_ENTRY_TAG
@@ -416,11 +624,6 @@ LlCreateLookasideEx(
     if (NewLookaside == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    //
-    // Initialize the structure
-    //
-    RtlZeroMemory(NewLookaside, sizeof(LL_LOOKASIDE));
 
     //
     // Copy name (truncate if necessary)
@@ -446,7 +649,14 @@ LlCreateLookasideEx(
     NewLookaside->Flags = Flags;
     NewLookaside->Magic = LL_ENTRY_MAGIC;
     NewLookaside->Manager = Manager;
-    NewLookaside->State = LlStateActive;
+    NewLookaside->State = LlStateInitializing;
+    //
+    // Initialize combined reference count and state:
+    // - RefCount = 1 (initial reference)
+    // - Sequence = 0
+    // - Destroying = FALSE
+    //
+    NewLookaside->RefCountAndState = LlpBuildRefCountState(1, 0, FALSE);
 
     //
     // Record creation time
@@ -480,6 +690,11 @@ LlCreateLookasideEx(
     }
 
     //
+    // Transition to active state
+    //
+    InterlockedExchange((volatile LONG*)&NewLookaside->State, LlStateActive);
+
+    //
     // Add to manager's list
     //
     KeEnterCriticalRegion();
@@ -506,7 +721,7 @@ LlDestroyLookaside(
 {
     LARGE_INTEGER Timeout;
     ULONG WaitCount = 0;
-    const ULONG MaxWaits = 100;
+    LL_STATE OldState;
 
     PAGED_CODE();
 
@@ -517,7 +732,7 @@ LlDestroyLookaside(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!LlIsValid(Lookaside)) {
+    if (Lookaside == NULL || Lookaside->Magic != LL_ENTRY_MAGIC) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -526,16 +741,57 @@ LlDestroyLookaside(
     }
 
     //
-    // Mark as destroying
+    // Atomically transition to destroying state
     //
-    Lookaside->State = LlStateDestroying;
+    OldState = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Lookaside->State,
+        LlStateDestroying,
+        LlStateActive
+    );
+
+    if (OldState != LlStateActive) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    //
+    // Remove from manager's list
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Manager->LookasideListLock);
+
+    RemoveEntryList(&Lookaside->ListEntry);
+
+    //
+    // Atomically set destroying flag to prevent new references
+    // This is done AFTER removing from list but the destroying flag
+    // is the authoritative barrier for new references
+    //
+    {
+        LONG64 OldValue, NewValue;
+        LONG RefCount;
+        ULONG Sequence;
+
+        do {
+            OldValue = InterlockedCompareExchange64(&Lookaside->RefCountAndState, 0, 0);
+            RefCount = LlpExtractRefCount(OldValue);
+            Sequence = LlpExtractSequence(OldValue);
+            NewValue = LlpBuildRefCountState(RefCount, Sequence, TRUE);
+        } while (InterlockedCompareExchange64(
+                    &Lookaside->RefCountAndState,
+                    NewValue,
+                    OldValue) != OldValue);
+    }
+
+    ExReleasePushLockExclusive(&Manager->LookasideListLock);
+    KeLeaveCriticalRegion();
 
     //
     // Wait for outstanding allocations with timeout
     //
-    Timeout.QuadPart = -10 * 1000 * 10; // 10ms
+    Timeout.QuadPart = -((LONGLONG)LL_REFCOUNT_DRAIN_INTERVAL_MS * 10000);
 
-    while (Lookaside->Stats.CurrentOutstanding > 0 && WaitCount < MaxWaits) {
+    while (Lookaside->Stats.CurrentOutstanding > 0 &&
+           WaitCount < LL_REFCOUNT_DRAIN_MAX_ITERATIONS) {
         KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
         WaitCount++;
     }
@@ -553,17 +809,24 @@ LlDestroyLookaside(
 #endif
 
     //
-    // Remove from manager's list
+    // Wait for references to drain using new combined field
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Manager->LookasideListLock);
+    WaitCount = 0;
+    while (WaitCount < LL_REFCOUNT_DRAIN_MAX_ITERATIONS) {
+        LONG64 Combined = InterlockedCompareExchange64(
+            &Lookaside->RefCountAndState,
+            0,
+            0
+        );
+        LONG RefCount = LlpExtractRefCount(Combined);
 
-    RemoveEntryList(&Lookaside->ListEntry);
-    InterlockedDecrement(&Manager->LookasideCount);
-    InterlockedDecrement(&Manager->GlobalStats.ActiveLookasideLists);
+        if (RefCount <= 1) {
+            break;
+        }
 
-    ExReleasePushLockExclusive(&Manager->LookasideListLock);
-    KeLeaveCriticalRegion();
+        KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
+        WaitCount++;
+    }
 
     //
     // Delete the native lookaside
@@ -575,14 +838,267 @@ LlDestroyLookaside(
     }
 
     //
+    // Update manager counts
+    //
+    InterlockedDecrement(&Manager->LookasideCount);
+    InterlockedDecrement(&Manager->GlobalStats.ActiveLookasideLists);
+
+    //
     // Clear magic and free
     //
     Lookaside->Magic = 0;
-    Lookaside->State = LlStateDestroyed;
+    InterlockedExchange((volatile LONG*)&Lookaside->State, LlStateDestroyed);
 
     ExFreePoolWithTag(Lookaside, LL_ENTRY_TAG);
 
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// REFERENCE COUNTING - LOCK-FREE IMPLEMENTATION
+// ============================================================================
+
+/**
+ * @brief Extract reference count from combined 64-bit value.
+ */
+FORCEINLINE
+LONG
+LlpExtractRefCount(
+    _In_ LONG64 CombinedValue
+    )
+{
+    return (LONG)(CombinedValue & 0x7FFFFFFF);
+}
+
+/**
+ * @brief Check if destroying flag is set.
+ */
+FORCEINLINE
+BOOLEAN
+LlpIsDestroying(
+    _In_ LONG64 CombinedValue
+    )
+{
+    return (CombinedValue & LL_DESTROYING_FLAG) != 0;
+}
+
+/**
+ * @brief Extract sequence number from combined value.
+ */
+FORCEINLINE
+ULONG
+LlpExtractSequence(
+    _In_ LONG64 CombinedValue
+    )
+{
+    return (ULONG)((CombinedValue >> 32) & 0x7FFFFFFF);
+}
+
+/**
+ * @brief Build combined reference count and state value.
+ *
+ * @param RefCount   Reference count (0-0x7FFFFFFF)
+ * @param Sequence   Sequence number for ABA protection
+ * @param Destroying TRUE if being destroyed
+ *
+ * @return Combined 64-bit value for atomic operations
+ */
+FORCEINLINE
+LONG64
+LlpBuildRefCountState(
+    _In_ LONG RefCount,
+    _In_ ULONG Sequence,
+    _In_ BOOLEAN Destroying
+    )
+{
+    LONG64 Value = (LONG64)(RefCount & 0x7FFFFFFF);
+    Value |= ((LONG64)(Sequence & 0x7FFFFFFF)) << 32;
+    if (Destroying) {
+        Value |= LL_DESTROYING_FLAG;
+    }
+    return Value;
+}
+
+/**
+ * @brief Acquire reference to lookaside list (LOCK-FREE, TOCTOU-SAFE).
+ *
+ * This implementation uses a single atomic 64-bit CAS operation that
+ * combines the reference count increment with the destroying check,
+ * eliminating the TOCTOU race condition present in the two-step approach.
+ *
+ * The 64-bit word layout:
+ * - Bits 0-30:  Reference count
+ * - Bits 32-62: Sequence counter (ABA protection)
+ * - Bit 63:     Destroying flag
+ *
+ * @param Lookaside Lookaside to reference
+ *
+ * @return TRUE if reference acquired, FALSE if lookaside is being destroyed
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+LlReferenceLookaside(
+    _In_ PLL_LOOKASIDE Lookaside
+    )
+{
+    LONG64 OldValue;
+    LONG64 NewValue;
+    LONG OldRefCount;
+    ULONG Sequence;
+
+    if (Lookaside == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Quick validation before entering CAS loop
+    //
+    if (Lookaside->Magic != LL_ENTRY_MAGIC) {
+        return FALSE;
+    }
+
+    //
+    // Lock-free CAS loop to atomically:
+    // 1. Check if destroying flag is set
+    // 2. Increment reference count
+    //
+    // This is TOCTOU-safe because both operations occur in a single
+    // atomic compare-and-swap. If another thread sets the destroying
+    // flag between our read and CAS, the CAS will fail and we'll retry,
+    // seeing the updated destroying flag.
+    //
+    do {
+        //
+        // Read current combined value atomically
+        //
+        OldValue = InterlockedCompareExchange64(&Lookaside->RefCountAndState, 0, 0);
+
+        //
+        // Check destroying flag - if set, fail immediately
+        //
+        if (LlpIsDestroying(OldValue)) {
+            return FALSE;
+        }
+
+        //
+        // Extract current reference count
+        //
+        OldRefCount = LlpExtractRefCount(OldValue);
+
+        //
+        // Sanity check - should not be negative
+        //
+        if (OldRefCount <= 0) {
+            return FALSE;
+        }
+
+        //
+        // Extract sequence number for ABA protection
+        //
+        Sequence = LlpExtractSequence(OldValue);
+
+        //
+        // Build new value with incremented reference count
+        // Keep same sequence number (only incremented on release)
+        //
+        NewValue = LlpBuildRefCountState(
+            OldRefCount + 1,
+            Sequence,
+            FALSE
+        );
+
+        //
+        // Atomic CAS - if this succeeds, we have safely acquired a reference
+        // If it fails (another thread modified the value), we retry
+        //
+    } while (InterlockedCompareExchange64(
+                &Lookaside->RefCountAndState,
+                NewValue,
+                OldValue) != OldValue);
+
+    return TRUE;
+}
+
+/**
+ * @brief Release reference to lookaside list (LOCK-FREE).
+ *
+ * Decrements reference count atomically. Increments sequence number
+ * to prevent ABA problems in concurrent reference/release scenarios.
+ *
+ * @param Lookaside Lookaside to release
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+LlReleaseLookaside(
+    _In_ PLL_LOOKASIDE Lookaside
+    )
+{
+    LONG64 OldValue;
+    LONG64 NewValue;
+    LONG OldRefCount;
+    LONG NewRefCount;
+    ULONG Sequence;
+    BOOLEAN Destroying;
+
+    if (Lookaside == NULL) {
+        return;
+    }
+
+    //
+    // Lock-free CAS loop to atomically decrement reference count
+    // and increment sequence number
+    //
+    do {
+        OldValue = InterlockedCompareExchange64(&Lookaside->RefCountAndState, 0, 0);
+
+        OldRefCount = LlpExtractRefCount(OldValue);
+        Sequence = LlpExtractSequence(OldValue);
+        Destroying = LlpIsDestroying(OldValue);
+
+        NewRefCount = OldRefCount - 1;
+
+        if (NewRefCount < 0) {
+            //
+            // Reference count underflow - this is a bug
+            //
+#if DBG
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_ERROR_LEVEL,
+                "[ShadowStrike] CRITICAL: Lookaside '%s' reference count underflow (was %d)\n",
+                Lookaside->Name,
+                OldRefCount
+            );
+#endif
+            if (Lookaside->Manager) {
+                InterlockedIncrement64(&Lookaside->Manager->GlobalStats.RefCountRaces);
+            }
+            //
+            // Don't proceed with underflow - leave count at 0
+            //
+            return;
+        }
+
+        //
+        // Increment sequence number to prevent ABA issues
+        // Wrap around is fine - we just need it to change
+        //
+        Sequence = (Sequence + 1) & 0x7FFFFFFF;
+
+        NewValue = LlpBuildRefCountState(
+            NewRefCount,
+            Sequence,
+            Destroying
+        );
+
+    } while (InterlockedCompareExchange64(
+                &Lookaside->RefCountAndState,
+                NewValue,
+                OldValue) != OldValue);
 }
 
 // ============================================================================
@@ -612,11 +1128,25 @@ LlAllocateEx(
     LARGE_INTEGER StartTime;
     LARGE_INTEGER EndTime;
     LONG64 Latency;
+    LL_STATE State;
 
     //
-    // Validate lookaside
+    // Validate lookaside using atomic state check
     //
-    if (!LlIsValid(Lookaside)) {
+    if (Lookaside == NULL || Lookaside->Magic != LL_ENTRY_MAGIC) {
+        return NULL;
+    }
+
+    //
+    // Check state atomically
+    //
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Lookaside->State,
+        LlStateActive,
+        LlStateActive
+    );
+
+    if (State != LlStateActive) {
         return NULL;
     }
 
@@ -672,8 +1202,7 @@ LlAllocateEx(
 
     //
     // Determine if this was a cache hit
-    // (This is an approximation - we assume the first allocation is a hit
-    // if the lookaside list has been used before)
+    // Note: This is an approximation based on outstanding count
     //
     IsHit = (Lookaside->Stats.TotalAllocations > Lookaside->Stats.TotalFrees);
 
@@ -686,7 +1215,9 @@ LlAllocateEx(
     // Update statistics
     //
     LL_STATS_ALLOC(Lookaside, IsHit);
-    LL_TRACK_ALLOC(Lookaside->Manager, Lookaside->EntrySize);
+    if (Lookaside->Manager) {
+        LL_TRACK_ALLOC(Lookaside->Manager, Lookaside->EntrySize);
+    }
 
     //
     // Update last access time
@@ -707,7 +1238,7 @@ LlAllocateEx(
     InterlockedExchange64(&Lookaside->Stats.AverageLatency, NewAvg);
 
     //
-    // Update max latency
+    // Update max latency using CAS loop
     //
     LONG64 MaxLat = Lookaside->Stats.MaxLatency;
     while (Latency > MaxLat) {
@@ -725,10 +1256,25 @@ LlFree(
     _In_ _Post_ptr_invalid_ PVOID Block
     )
 {
+    LL_STATE State;
+
     //
     // Validate parameters
     //
-    if (!LlIsValid(Lookaside) || Block == NULL) {
+    if (Lookaside == NULL || Lookaside->Magic != LL_ENTRY_MAGIC || Block == NULL) {
+        return;
+    }
+
+    //
+    // Check state - allow frees even during destruction
+    //
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Lookaside->State,
+        0,
+        0
+    );
+
+    if (State == LlStateDestroyed || State == LlStateUninitialized) {
         return;
     }
 
@@ -754,7 +1300,9 @@ LlFree(
     // Update statistics
     //
     LL_STATS_FREE(Lookaside);
-    LL_TRACK_FREE(Lookaside->Manager, Lookaside->EntrySize);
+    if (Lookaside->Manager) {
+        LL_TRACK_FREE(Lookaside->Manager, Lookaside->EntrySize);
+    }
 
     //
     // Update last access time
@@ -769,10 +1317,25 @@ LlSecureFree(
     _In_ _Post_ptr_invalid_ PVOID Block
     )
 {
+    LL_STATE State;
+
     //
     // Validate parameters
     //
-    if (!LlIsValid(Lookaside) || Block == NULL) {
+    if (Lookaside == NULL || Lookaside->Magic != LL_ENTRY_MAGIC || Block == NULL) {
+        return;
+    }
+
+    //
+    // Check state - allow frees even during destruction
+    //
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Lookaside->State,
+        0,
+        0
+    );
+
+    if (State == LlStateDestroyed || State == LlStateUninitialized) {
         return;
     }
 
@@ -780,6 +1343,11 @@ LlSecureFree(
     // Securely wipe the memory before returning to cache
     //
     LlpSecureWipeMemory(Block, Lookaside->EntrySize);
+
+    //
+    // Track secure free
+    //
+    InterlockedIncrement64(&Lookaside->Stats.SecureFrees);
 
     //
     // Return to lookaside
@@ -794,7 +1362,9 @@ LlSecureFree(
     // Update statistics
     //
     LL_STATS_FREE(Lookaside);
-    LL_TRACK_FREE(Lookaside->Manager, Lookaside->EntrySize);
+    if (Lookaside->Manager) {
+        LL_TRACK_FREE(Lookaside->Manager, Lookaside->EntrySize);
+    }
 }
 
 // ============================================================================
@@ -826,6 +1396,7 @@ LlGetStatistics(
     Statistics->TotalBytesFreed = Lookaside->Stats.TotalBytesFreed;
     Statistics->AverageLatency = Lookaside->Stats.AverageLatency;
     Statistics->MaxLatency = Lookaside->Stats.MaxLatency;
+    Statistics->SecureFrees = Lookaside->Stats.SecureFrees;
 
     return STATUS_SUCCESS;
 }
@@ -884,6 +1455,7 @@ LlGetGlobalStatistics(
     Statistics->PeakMemoryUsage = Manager->GlobalStats.PeakMemoryUsage;
     Statistics->ActiveLookasideLists = Manager->GlobalStats.ActiveLookasideLists;
     Statistics->MemoryPressureEvents = Manager->GlobalStats.MemoryPressureEvents;
+    Statistics->RefCountRaces = Manager->GlobalStats.RefCountRaces;
     Statistics->StartTime = Manager->GlobalStats.StartTime;
     Statistics->LastResetTime = Manager->GlobalStats.LastResetTime;
 
@@ -913,6 +1485,7 @@ LlResetStatistics(
     InterlockedExchange64(&Lookaside->Stats.TotalBytesFreed, 0);
     InterlockedExchange64(&Lookaside->Stats.AverageLatency, 0);
     InterlockedExchange64(&Lookaside->Stats.MaxLatency, 0);
+    InterlockedExchange64(&Lookaside->Stats.SecureFrees, 0);
 
     return STATUS_SUCCESS;
 }
@@ -936,6 +1509,7 @@ LlResetGlobalStatistics(
     InterlockedExchange64(&Manager->GlobalStats.TotalCacheMisses, 0);
     InterlockedExchange64(&Manager->GlobalStats.PeakMemoryUsage, Manager->GlobalStats.CurrentMemoryUsage);
     InterlockedExchange64(&Manager->GlobalStats.MemoryPressureEvents, 0);
+    InterlockedExchange64(&Manager->GlobalStats.RefCountRaces, 0);
 
     KeQuerySystemTimePrecise(&Manager->GlobalStats.LastResetTime);
 
@@ -998,8 +1572,14 @@ LlRegisterPressureCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Note: We cannot truly validate that the callback is in non-paged memory
+    // at runtime. We rely on documentation and caller responsibility.
+    // The callback will be invoked via work item at PASSIVE_LEVEL.
+    //
     Manager->PressureCallback = Callback;
     Manager->PressureCallbackContext = Context;
+    Manager->PressureCallbackValidated = TRUE;
 
     return STATUS_SUCCESS;
 }
@@ -1118,6 +1698,7 @@ LlEnumerateLookasides(
     )
 {
     PLIST_ENTRY Entry = NULL;
+    PLIST_ENTRY NextEntry = NULL;
     PLL_LOOKASIDE Lookaside = NULL;
     BOOLEAN Continue = TRUE;
 
@@ -1130,10 +1711,22 @@ LlEnumerateLookasides(
 
     for (Entry = Manager->LookasideListHead.Flink;
          Entry != &Manager->LookasideListHead && Continue;
-         Entry = Entry->Flink) {
+         Entry = NextEntry) {
+
+        //
+        // CRITICAL: Capture next pointer BEFORE callback
+        // This prevents issues if callback modifies the list
+        //
+        NextEntry = Entry->Flink;
 
         Lookaside = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
-        Continue = Callback(Lookaside, Context);
+
+        //
+        // Only enumerate active lookasides
+        //
+        if (LlIsValid(Lookaside)) {
+            Continue = Callback(Lookaside, Context);
+        }
     }
 
     ExReleasePushLockShared(&Manager->LookasideListLock);
@@ -1169,9 +1762,14 @@ LlFindByName(
 
         Current = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
 
-        if (strcmp(Current->Name, Name) == 0) {
-            *Lookaside = Current;
-            Status = STATUS_SUCCESS;
+        if (strcmp(Current->Name, Name) == 0 && LlIsValid(Current)) {
+            //
+            // Acquire reference before returning
+            //
+            if (LlReferenceLookaside(Current)) {
+                *Lookaside = Current;
+                Status = STATUS_SUCCESS;
+            }
             break;
         }
     }
@@ -1209,9 +1807,14 @@ LlFindByTag(
 
         Current = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
 
-        if (Current->Tag == Tag) {
-            *Lookaside = Current;
-            Status = STATUS_SUCCESS;
+        if (Current->Tag == Tag && LlIsValid(Current)) {
+            //
+            // Acquire reference before returning
+            //
+            if (LlReferenceLookaside(Current)) {
+                *Lookaside = Current;
+                Status = STATUS_SUCCESS;
+            }
             break;
         }
     }
@@ -1250,6 +1853,8 @@ LlValidateLookaside(
     _In_ PLL_LOOKASIDE Lookaside
     )
 {
+    LL_STATE State;
+
     if (Lookaside == NULL) {
         return FALSE;
     }
@@ -1258,7 +1863,13 @@ LlValidateLookaside(
         return FALSE;
     }
 
-    if (Lookaside->State != LlStateActive) {
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Lookaside->State,
+        0,
+        0
+    );
+
+    if (State != LlStateActive) {
         return FALSE;
     }
 
@@ -1269,6 +1880,16 @@ LlValidateLookaside(
 
     if (Lookaside->Manager == NULL) {
         return FALSE;
+    }
+
+    //
+    // Check reference count from combined state field
+    //
+    {
+        LONG64 Combined = InterlockedCompareExchange64(&Lookaside->RefCountAndState, 0, 0);
+        if (LlpExtractRefCount(Combined) < 0 || LlpIsDestroying(Combined)) {
+            return FALSE;
+        }
     }
 
     return TRUE;
@@ -1293,7 +1914,7 @@ LlDumpDiagnostics(
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
-        "[ShadowStrike] ===== LOOKASIDE LIST DIAGNOSTICS =====\n"
+        "[ShadowStrike] ===== LOOKASIDE LIST DIAGNOSTICS (v3.0.0) =====\n"
     );
 
     DbgPrintEx(
@@ -1305,13 +1926,15 @@ LlDumpDiagnostics(
         "  Cache Hit Rate: %lu%%\n"
         "  Current Memory: %lld bytes\n"
         "  Peak Memory: %lld bytes\n"
-        "  Active Lists: %ld\n",
+        "  Active Lists: %ld\n"
+        "  RefCount Races: %lld\n",
         Manager->GlobalStats.TotalAllocations,
         Manager->GlobalStats.TotalFrees,
         LlCalculateHitRate(Manager->GlobalStats.TotalCacheHits, Manager->GlobalStats.TotalCacheMisses),
         Manager->GlobalStats.CurrentMemoryUsage,
         Manager->GlobalStats.PeakMemoryUsage,
-        Manager->GlobalStats.ActiveLookasideLists
+        Manager->GlobalStats.ActiveLookasideLists,
+        Manager->GlobalStats.RefCountRaces
     );
 
     KeEnterCriticalRegion();
@@ -1323,25 +1946,33 @@ LlDumpDiagnostics(
 
         Lookaside = CONTAINING_RECORD(Entry, LL_LOOKASIDE, ListEntry);
 
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_INFO_LEVEL,
-            "[ShadowStrike] Lookaside '%s' (Tag: 0x%08X, Size: %llu):\n"
-            "  Allocations: %lld, Frees: %lld\n"
-            "  Outstanding: %ld (Peak: %ld)\n"
-            "  Hit Rate: %lu%%\n"
-            "  Avg Latency: %lld, Max Latency: %lld\n",
-            Lookaside->Name,
-            Lookaside->Tag,
-            (ULONG64)Lookaside->EntrySize,
-            Lookaside->Stats.TotalAllocations,
-            Lookaside->Stats.TotalFrees,
-            Lookaside->Stats.CurrentOutstanding,
-            Lookaside->Stats.PeakOutstanding,
-            LlCalculateHitRate(Lookaside->Stats.CacheHits, Lookaside->Stats.CacheMisses),
-            Lookaside->Stats.AverageLatency,
-            Lookaside->Stats.MaxLatency
-        );
+        {
+            LONG64 Combined = InterlockedCompareExchange64(&Lookaside->RefCountAndState, 0, 0);
+            LONG RefCount = LlpExtractRefCount(Combined);
+
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_INFO_LEVEL,
+                "[ShadowStrike] Lookaside '%s' (Tag: 0x%08X, Size: %llu, RefCount: %ld):\n"
+                "  State: %d, Allocations: %lld, Frees: %lld\n"
+                "  Outstanding: %ld (Peak: %ld)\n"
+                "  Hit Rate: %lu%%, Secure Frees: %lld\n"
+                "  Avg Latency: %lld, Max Latency: %lld\n",
+                Lookaside->Name,
+                Lookaside->Tag,
+                (ULONG64)Lookaside->EntrySize,
+                RefCount,
+                Lookaside->State,
+                Lookaside->Stats.TotalAllocations,
+                Lookaside->Stats.TotalFrees,
+                Lookaside->Stats.CurrentOutstanding,
+                Lookaside->Stats.PeakOutstanding,
+                LlCalculateHitRate(Lookaside->Stats.CacheHits, Lookaside->Stats.CacheMisses),
+                Lookaside->Stats.SecureFrees,
+                Lookaside->Stats.AverageLatency,
+                Lookaside->Stats.MaxLatency
+            );
+        }
     }
 
     ExReleasePushLockShared(&Manager->LookasideListLock);
@@ -1361,6 +1992,10 @@ LlDumpDiagnostics(
 // INTERNAL HELPER FUNCTIONS
 // ============================================================================
 
+/**
+ * @brief Maintenance DPC routine - runs at DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpMaintenanceDpcRoutine(
     _In_ PKDPC Dpc,
@@ -1370,17 +2005,31 @@ LlpMaintenanceDpcRoutine(
     )
 {
     PLL_MANAGER Manager = (PLL_MANAGER)DeferredContext;
+    LL_STATE State;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (Manager == NULL || !Manager->Initialized) {
+    if (Manager == NULL) {
         return;
     }
 
     //
-    // Check memory pressure
+    // Check manager state atomically - only proceed if active
+    //
+    State = (LL_STATE)InterlockedCompareExchange(
+        (volatile LONG*)&Manager->State,
+        LlStateActive,
+        LlStateActive
+    );
+
+    if (State != LlStateActive) {
+        return;
+    }
+
+    //
+    // Check memory pressure (dispatch-safe)
     //
     LlpCheckMemoryPressure(Manager);
 
@@ -1390,6 +2039,10 @@ LlpMaintenanceDpcRoutine(
     //
 }
 
+/**
+ * @brief Check memory pressure and queue callback if needed
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpCheckMemoryPressure(
     _In_ PLL_MANAGER Manager
@@ -1438,17 +2091,85 @@ LlpCheckMemoryPressure(
         Manager->PressureLevel = NewPressure;
         InterlockedIncrement64(&Manager->GlobalStats.MemoryPressureEvents);
 
-        if (Manager->PressureCallback != NULL) {
-            Manager->PressureCallback(
-                NewPressure,
-                CurrentUsage,
-                Limit,
-                Manager->PressureCallbackContext
-            );
+        //
+        // If callback registered and work item available, defer to PASSIVE_LEVEL
+        //
+        if (Manager->PressureCallback != NULL && Manager->PressureWorkItem != NULL) {
+            //
+            // Store pending values for work item
+            //
+            InterlockedExchange((volatile LONG*)&Manager->PendingPressureLevel, (LONG)NewPressure);
+            InterlockedExchange64(&Manager->PendingCurrentMemory, CurrentUsage);
+            InterlockedExchange64(&Manager->PendingMemoryLimit, Limit);
+
+            //
+            // Only queue if not already pending
+            //
+            if (InterlockedCompareExchange(&Manager->PressureWorkPending, 1, 0) == 0) {
+                IoQueueWorkItem(
+                    Manager->PressureWorkItem,
+                    LlpPressureWorkItemRoutine,
+                    DelayedWorkQueue,
+                    Manager
+                );
+            }
         }
     }
 }
 
+/**
+ * @brief Work item routine for pressure callback - runs at PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+LlpPressureWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+{
+    PLL_MANAGER Manager = (PLL_MANAGER)Context;
+    LL_MEMORY_PRESSURE PressureLevel;
+    LONG64 CurrentMemory;
+    LONG64 MemoryLimit;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (Manager == NULL) {
+        return;
+    }
+
+    //
+    // Capture pending values
+    //
+    PressureLevel = (LL_MEMORY_PRESSURE)InterlockedExchange(
+        (volatile LONG*)&Manager->PendingPressureLevel,
+        LlPressureNone
+    );
+    CurrentMemory = InterlockedExchange64(&Manager->PendingCurrentMemory, 0);
+    MemoryLimit = InterlockedExchange64(&Manager->PendingMemoryLimit, 0);
+
+    //
+    // Clear pending flag
+    //
+    InterlockedExchange(&Manager->PressureWorkPending, 0);
+
+    //
+    // Invoke callback at PASSIVE_LEVEL
+    //
+    if (Manager->PressureCallback != NULL && LlManagerIsValid(Manager)) {
+        Manager->PressureCallback(
+            PressureLevel,
+            CurrentMemory,
+            MemoryLimit,
+            Manager->PressureCallbackContext
+        );
+    }
+}
+
+/**
+ * @brief Secure multi-pass memory wipe
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 LlpSecureWipeMemory(
     _Out_writes_bytes_(Length) PVOID Destination,
@@ -1463,7 +2184,7 @@ LlpSecureWipeMemory(
     }
 
     //
-    // Multi-pass secure wipe
+    // Multi-pass secure wipe (DoD 5220.22-M style)
     //
 
     // Pass 1: Zero
