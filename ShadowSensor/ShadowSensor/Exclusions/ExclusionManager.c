@@ -744,3 +744,402 @@ ShadowStrikeExclusionIsEnabled(
 {
     return g_ExclusionManager.Enabled;
 }
+
+// ============================================================================
+// REMOVAL FUNCTIONS
+// ============================================================================
+
+BOOLEAN
+ShadowStrikeRemovePathExclusion(
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    PLIST_ENTRY listEntry;
+    PLIST_ENTRY nextEntry;
+    PSHADOWSTRIKE_PATH_EXCLUSION entry;
+    PSHADOWSTRIKE_PATH_EXCLUSION toRemove = NULL;
+    BOOLEAN removed = FALSE;
+
+    if (Path == NULL || Path->Length == 0 || !g_ExclusionManager.Initialized) {
+        return FALSE;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PathLock);
+
+    for (listEntry = g_ExclusionManager.PathExclusions.Flink;
+         listEntry != &g_ExclusionManager.PathExclusions;
+         listEntry = nextEntry) {
+
+        nextEntry = listEntry->Flink;
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
+
+        //
+        // Check if this entry matches the path to remove
+        // System exclusions cannot be removed
+        //
+        if (!(entry->Flags & ShadowStrikeExclusionFlagSystem)) {
+            UNICODE_STRING entryPath;
+            entryPath.Buffer = entry->Path;
+            entryPath.Length = entry->PathLength * sizeof(WCHAR);
+            entryPath.MaximumLength = entryPath.Length;
+
+            if (RtlCompareUnicodeString(&entryPath, Path, TRUE) == 0) {
+                RemoveEntryList(&entry->ListEntry);
+                toRemove = entry;
+                removed = TRUE;
+                InterlockedDecrement(&g_ExclusionManager.Stats.PathExclusionCount);
+                break;
+            }
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free memory outside lock
+    //
+    if (toRemove != NULL) {
+        ExFreePoolWithTag(toRemove, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+    }
+
+    return removed;
+}
+
+BOOLEAN
+ShadowStrikeRemoveExtensionExclusion(
+    _In_ PCUNICODE_STRING Extension
+    )
+{
+    ULONG hash;
+    ULONG bucketIndex;
+    PSHADOWSTRIKE_EXTENSION_BUCKET bucket;
+    PLIST_ENTRY listEntry;
+    PLIST_ENTRY nextEntry;
+    PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
+    PSHADOWSTRIKE_EXTENSION_EXCLUSION toRemove = NULL;
+    BOOLEAN removed = FALSE;
+
+    if (Extension == NULL || Extension->Length == 0 || !g_ExclusionManager.Initialized) {
+        return FALSE;
+    }
+
+    hash = ShadowStrikeExtensionHash(Extension);
+    bucketIndex = hash;
+    bucket = &g_ExclusionManager.ExtensionBuckets[bucketIndex];
+
+    if (bucket->EntryCount == 0) {
+        return FALSE;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.ExtensionLock);
+
+    for (listEntry = bucket->ListHead.Flink;
+         listEntry != &bucket->ListHead;
+         listEntry = nextEntry) {
+
+        nextEntry = listEntry->Flink;
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_EXTENSION_EXCLUSION, ListEntry);
+
+        //
+        // System exclusions cannot be removed
+        //
+        if (!(entry->Flags & ShadowStrikeExclusionFlagSystem)) {
+            if (entry->ExtensionLength == Extension->Length / sizeof(WCHAR)) {
+                UNICODE_STRING entryExt;
+                entryExt.Buffer = entry->Extension;
+                entryExt.Length = entry->ExtensionLength * sizeof(WCHAR);
+                entryExt.MaximumLength = entryExt.Length;
+
+                if (RtlCompareUnicodeString(&entryExt, Extension, TRUE) == 0) {
+                    RemoveEntryList(&entry->ListEntry);
+                    toRemove = entry;
+                    removed = TRUE;
+                    InterlockedDecrement(&bucket->EntryCount);
+                    InterlockedDecrement(&g_ExclusionManager.Stats.ExtensionExclusionCount);
+                    break;
+                }
+            }
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.ExtensionLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free memory outside lock
+    //
+    if (toRemove != NULL) {
+        ExFreePoolWithTag(toRemove, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+    }
+
+    return removed;
+}
+
+BOOLEAN
+ShadowStrikeRemoveProcessExclusion(
+    _In_ PCUNICODE_STRING ProcessName
+    )
+{
+    ULONG hash;
+    ULONG bucketIndex;
+    PSHADOWSTRIKE_PROCESS_BUCKET bucket;
+    PLIST_ENTRY listEntry;
+    PLIST_ENTRY nextEntry;
+    PSHADOWSTRIKE_PROCESS_EXCLUSION entry;
+    PSHADOWSTRIKE_PROCESS_EXCLUSION toRemove = NULL;
+    BOOLEAN removed = FALSE;
+
+    if (ProcessName == NULL || ProcessName->Length == 0 || !g_ExclusionManager.Initialized) {
+        return FALSE;
+    }
+
+    hash = ShadowStrikeProcessNameHash(ProcessName);
+    bucketIndex = hash;
+    bucket = &g_ExclusionManager.ProcessBuckets[bucketIndex];
+
+    if (bucket->EntryCount == 0) {
+        return FALSE;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.ProcessLock);
+
+    for (listEntry = bucket->ListHead.Flink;
+         listEntry != &bucket->ListHead;
+         listEntry = nextEntry) {
+
+        nextEntry = listEntry->Flink;
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROCESS_EXCLUSION, ListEntry);
+
+        //
+        // System exclusions cannot be removed
+        //
+        if (!(entry->Flags & ShadowStrikeExclusionFlagSystem)) {
+            if (entry->NameLength == ProcessName->Length / sizeof(WCHAR)) {
+                UNICODE_STRING entryName;
+                entryName.Buffer = entry->ProcessName;
+                entryName.Length = entry->NameLength * sizeof(WCHAR);
+                entryName.MaximumLength = entryName.Length;
+
+                if (RtlCompareUnicodeString(&entryName, ProcessName, TRUE) == 0) {
+                    RemoveEntryList(&entry->ListEntry);
+                    toRemove = entry;
+                    removed = TRUE;
+                    InterlockedDecrement(&bucket->EntryCount);
+                    InterlockedDecrement(&g_ExclusionManager.Stats.ProcessExclusionCount);
+                    break;
+                }
+            }
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.ProcessLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free memory outside lock
+    //
+    if (toRemove != NULL) {
+        ExFreePoolWithTag(toRemove, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+    }
+
+    return removed;
+}
+
+// ============================================================================
+// PID EXCLUSION MANAGEMENT
+// ============================================================================
+
+NTSTATUS
+ShadowStrikeAddPidExclusion(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG TTLSeconds
+    )
+{
+    ULONG i;
+    ULONG freeSlot = MAXULONG;
+    LARGE_INTEGER currentTime;
+    NTSTATUS status = STATUS_INSUFFICIENT_RESOURCES;
+
+    if (ProcessId == NULL || !g_ExclusionManager.Initialized) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeQuerySystemTime(&currentTime);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PidLock);
+
+    //
+    // First pass: Check if already exists and find free slot
+    //
+    for (i = 0; i < SHADOWSTRIKE_MAX_PID_EXCLUSIONS; i++) {
+        if (g_ExclusionManager.PidExclusions[i].Valid) {
+            //
+            // Check for duplicate
+            //
+            if (g_ExclusionManager.PidExclusions[i].ProcessId == ProcessId) {
+                //
+                // Already exists - update TTL if requested
+                //
+                if (TTLSeconds > 0) {
+                    g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart =
+                        currentTime.QuadPart + ((LONGLONG)TTLSeconds * 10000000LL);
+                } else {
+                    g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart = 0;
+                }
+                status = STATUS_SUCCESS;
+                goto Done;
+            }
+
+            //
+            // Check for expired entries we can reclaim
+            //
+            if (g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart != 0 &&
+                currentTime.QuadPart > g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart) {
+                //
+                // Expired - reclaim this slot
+                //
+                g_ExclusionManager.PidExclusions[i].Valid = FALSE;
+                InterlockedDecrement(&g_ExclusionManager.Stats.PidExclusionCount);
+                if (freeSlot == MAXULONG) {
+                    freeSlot = i;
+                }
+            }
+        } else {
+            //
+            // Found free slot
+            //
+            if (freeSlot == MAXULONG) {
+                freeSlot = i;
+            }
+        }
+    }
+
+    //
+    // Add to free slot
+    //
+    if (freeSlot != MAXULONG) {
+        RtlZeroMemory(&g_ExclusionManager.PidExclusions[freeSlot],
+                      sizeof(SHADOWSTRIKE_PID_EXCLUSION));
+
+        g_ExclusionManager.PidExclusions[freeSlot].ProcessId = ProcessId;
+        g_ExclusionManager.PidExclusions[freeSlot].Valid = TRUE;
+        g_ExclusionManager.PidExclusions[freeSlot].HitCount = 0;
+
+        if (TTLSeconds > 0) {
+            g_ExclusionManager.PidExclusions[freeSlot].ExpireTime.QuadPart =
+                currentTime.QuadPart + ((LONGLONG)TTLSeconds * 10000000LL);
+        } else {
+            g_ExclusionManager.PidExclusions[freeSlot].ExpireTime.QuadPart = 0;
+        }
+
+        InterlockedIncrement(&g_ExclusionManager.Stats.PidExclusionCount);
+        status = STATUS_SUCCESS;
+    }
+
+Done:
+    ExReleasePushLockExclusive(&g_ExclusionManager.PidLock);
+    KeLeaveCriticalRegion();
+
+    return status;
+}
+
+BOOLEAN
+ShadowStrikeRemovePidExclusion(
+    _In_ HANDLE ProcessId
+    )
+{
+    ULONG i;
+    BOOLEAN removed = FALSE;
+
+    if (ProcessId == NULL || !g_ExclusionManager.Initialized) {
+        return FALSE;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PidLock);
+
+    for (i = 0; i < SHADOWSTRIKE_MAX_PID_EXCLUSIONS; i++) {
+        if (g_ExclusionManager.PidExclusions[i].Valid &&
+            g_ExclusionManager.PidExclusions[i].ProcessId == ProcessId) {
+
+            g_ExclusionManager.PidExclusions[i].Valid = FALSE;
+            g_ExclusionManager.PidExclusions[i].ProcessId = NULL;
+            g_ExclusionManager.PidExclusions[i].HitCount = 0;
+            g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart = 0;
+
+            InterlockedDecrement(&g_ExclusionManager.Stats.PidExclusionCount);
+            removed = TRUE;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.PidLock);
+    KeLeaveCriticalRegion();
+
+    return removed;
+}
+
+// ============================================================================
+// STATISTICS FUNCTIONS
+// ============================================================================
+
+VOID
+ShadowStrikeExclusionGetStats(
+    _Out_ PSHADOWSTRIKE_EXCLUSION_STATS Stats
+    )
+{
+    if (Stats == NULL) {
+        return;
+    }
+
+    if (!g_ExclusionManager.Initialized) {
+        RtlZeroMemory(Stats, sizeof(SHADOWSTRIKE_EXCLUSION_STATS));
+        return;
+    }
+
+    //
+    // Copy statistics atomically
+    // Since we're reading volatile fields, we use memory barriers
+    //
+    Stats->TotalChecks = g_ExclusionManager.Stats.TotalChecks;
+    Stats->PathMatches = g_ExclusionManager.Stats.PathMatches;
+    Stats->ExtensionMatches = g_ExclusionManager.Stats.ExtensionMatches;
+    Stats->ProcessNameMatches = g_ExclusionManager.Stats.ProcessNameMatches;
+    Stats->PidMatches = g_ExclusionManager.Stats.PidMatches;
+    Stats->TotalBypassed = g_ExclusionManager.Stats.TotalBypassed;
+    Stats->PathExclusionCount = g_ExclusionManager.Stats.PathExclusionCount;
+    Stats->ExtensionExclusionCount = g_ExclusionManager.Stats.ExtensionExclusionCount;
+    Stats->ProcessExclusionCount = g_ExclusionManager.Stats.ProcessExclusionCount;
+    Stats->PidExclusionCount = g_ExclusionManager.Stats.PidExclusionCount;
+
+    MemoryBarrier();
+}
+
+VOID
+ShadowStrikeExclusionResetStats(
+    VOID
+    )
+{
+    if (!g_ExclusionManager.Initialized) {
+        return;
+    }
+
+    //
+    // Reset match counters but preserve exclusion counts
+    // Using interlocked exchange for thread safety
+    //
+    InterlockedExchange64(&g_ExclusionManager.Stats.TotalChecks, 0);
+    InterlockedExchange64(&g_ExclusionManager.Stats.PathMatches, 0);
+    InterlockedExchange64(&g_ExclusionManager.Stats.ExtensionMatches, 0);
+    InterlockedExchange64(&g_ExclusionManager.Stats.ProcessNameMatches, 0);
+    InterlockedExchange64(&g_ExclusionManager.Stats.PidMatches, 0);
+    InterlockedExchange64(&g_ExclusionManager.Stats.TotalBypassed, 0);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Exclusion statistics reset\n");
+}

@@ -476,6 +476,9 @@ typedef struct _SHADOW_KTM_MONITOR_STATE {
     /// @brief TRUE if communication port is open
     BOOLEAN CommunicationPortOpen;
 
+    /// @brief Stored filter handle for port operations
+    PFLT_FILTER FilterHandle;
+
 } SHADOW_KTM_MONITOR_STATE, *PSHADOW_KTM_MONITOR_STATE;
 
 // ============================================================================

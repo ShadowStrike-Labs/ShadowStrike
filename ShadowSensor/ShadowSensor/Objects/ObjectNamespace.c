@@ -34,8 +34,10 @@
  * ============================================================================
  */
 
+
 #include "ObjectNamespace.h"
 #include <ntstrsafe.h>
+
 
 #ifndef INVALID_HANDLE_VALUE
 #define INVALID_HANDLE_VALUE ((HANDLE)(LONG_PTR)-1)
@@ -450,12 +452,12 @@ ShadowCreateNamespaceObject(
     );
 
     //
-    // ENTERPRISE FIX: Full implementation for different object types
-    // This is what CrowdStrike Falcon does - type-specific creation
+    // ENTERPRISE IMPLEMENTATION: Full object type handling
+    // CrowdStrike Falcon-level type-specific creation with complete coverage
     //
     if (ObjectType == *ExEventObjectType) {
         //
-        // Create Event object
+        // Create Event object (notification or synchronization)
         //
         status = ZwCreateEvent(
             ObjectHandle,
@@ -464,13 +466,68 @@ ShadowCreateNamespaceObject(
             NotificationEvent,
             FALSE
         );
+
+        if (NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                       "[ShadowStrike] Created Event object: %ws\n", ObjectName);
+        }
     }
-    else if (ObjectType == *IoFileObjectType) {
+    else if (ObjectType == *ExSemaphoreObjectType) {
         //
-        // Create Section object (for shared memory)
+        // Create Semaphore object (for resource counting)
+        //
+        status = ZwCreateSemaphore(
+            ObjectHandle,
+            SEMAPHORE_ALL_ACCESS,
+            &objectAttributes,
+            0,      // Initial count
+            MAXLONG // Maximum count
+        );
+
+        if (NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                       "[ShadowStrike] Created Semaphore object: %ws\n", ObjectName);
+        }
+    }
+    else if (ObjectType == *ExMutantObjectType) {
+        //
+        // Create Mutant (Mutex) object (for mutual exclusion)
+        //
+        status = ZwCreateMutant(
+            ObjectHandle,
+            MUTANT_ALL_ACCESS,
+            &objectAttributes,
+            FALSE   // Not initially owned
+        );
+
+        if (NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                       "[ShadowStrike] Created Mutant object: %ws\n", ObjectName);
+        }
+    }
+    else if (ObjectType == *ExTimerObjectType) {
+        //
+        // Create Timer object (for timed operations)
+        //
+        status = ZwCreateTimer(
+            ObjectHandle,
+            TIMER_ALL_ACCESS,
+            &objectAttributes,
+            NotificationTimer
+        );
+
+        if (NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                       "[ShadowStrike] Created Timer object: %ws\n", ObjectName);
+        }
+    }
+    else if (ObjectType == *MmSectionObjectType) {
+        //
+        // Create Section object (for shared memory IPC)
+        // This is critical for kernel<->user communication
         //
         LARGE_INTEGER maxSize;
-        maxSize.QuadPart = 64 * 1024; // 64KB default
+        maxSize.QuadPart = 64 * 1024; // 64KB default shared memory region
 
         status = ZwCreateSection(
             ObjectHandle,
@@ -481,14 +538,59 @@ ShadowCreateNamespaceObject(
             SEC_COMMIT,
             NULL
         );
+
+        if (NT_SUCCESS(status)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                       "[ShadowStrike] Created Section object: %ws\n", ObjectName);
+        }
+    }
+    else if (ObjectType == *IoFileObjectType) {
+        //
+        // File objects are not directly created via this path
+        // They require proper file system operations
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] File objects must be created via IoCreateFile\n");
+        status = STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    else if (ObjectType == *PsProcessType) {
+        //
+        // Process objects cannot be created - security violation
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Process object creation denied - security violation\n");
+        status = STATUS_ACCESS_DENIED;
+    }
+    else if (ObjectType == *PsThreadType) {
+        //
+        // Thread objects cannot be created - security violation
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Thread object creation denied - security violation\n");
+        status = STATUS_ACCESS_DENIED;
+    }
+    else if (ObjectType == *SeTokenObjectType) {
+        //
+        // Token objects cannot be created - security violation
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Token object creation denied - security violation\n");
+        status = STATUS_ACCESS_DENIED;
     }
     else {
         //
-        // Generic object creation - use ObCreateObject
+        // Unknown or unsupported object type
+        // Log full details for diagnostic purposes
         //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Generic object type not fully supported\n");
-        status = STATUS_NOT_IMPLEMENTED;
+                   "[ShadowStrike] Unsupported object type requested for: %ws (Type=%p)\n",
+                   ObjectName, ObjectType);
+
+        //
+        // Return specific error indicating the object type is not supported
+        // This allows callers to handle gracefully rather than crashing
+        //
+        status = STATUS_OBJECT_TYPE_MISMATCH;
     }
 
     //
@@ -647,6 +749,17 @@ ShadowReferenceNamespace(
 
 /**
  * @brief Release a reference to the namespace.
+ *
+ * Decrements the namespace reference count atomically. If underflow is detected,
+ * this indicates a severe programming error (double-dereference) that could lead
+ * to use-after-free vulnerabilities. Such conditions are treated as fatal.
+ *
+ * Thread Safety:
+ * - Uses atomic operations for reference count manipulation
+ * - Safe to call from any IRQL <= DISPATCH_LEVEL
+ * - Lock-free fast path for normal operation
+ *
+ * @irql <= DISPATCH_LEVEL
  */
 VOID
 ShadowDereferenceNamespace(
@@ -654,32 +767,102 @@ ShadowDereferenceNamespace(
     )
 {
     PSHADOW_NAMESPACE_STATE state = &g_NamespaceState;
+    LONG currentRefCount;
+    LONG newRefCount;
 
-    if (state->LockInitialized) {
-        LONG newRefCount = InterlockedDecrement(&state->ReferenceCount);
-
-        //
-        // ENTERPRISE FIX: Reference underflow is fatal in production builds
-        //
-        if (newRefCount < 0) {
-#if DBG
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] FATAL: Namespace reference count underflow!\n");
-#else
-            //
-            // In production builds, bugcheck immediately
-            // This prevents use-after-free exploits
-            //
-            KeBugCheckEx(
-                DRIVER_VERIFIER_DETECTED_VIOLATION,
-                0x1000, // Custom code: Reference underflow
-                (ULONG_PTR)state,
-                (ULONG_PTR)newRefCount,
-                0
-            );
-#endif
-        }
+    //
+    // CRITICAL: Validate state before any modification
+    // If lock was never initialized, the namespace was never properly created
+    // and we should not touch the reference count at all
+    //
+    if (!state->LockInitialized) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Dereference called on uninitialized namespace - ignored\n");
+        return;
     }
+
+    //
+    // Read current value first to validate before decrement
+    // This prevents underflow from corrupting state
+    //
+    currentRefCount = InterlockedCompareExchange(&state->ReferenceCount, 0, 0);
+
+    if (currentRefCount <= 0) {
+        //
+        // FATAL: Reference count is already zero or negative
+        // This indicates a double-dereference bug - a serious programming error
+        // that can lead to use-after-free exploits
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] FATAL: Namespace dereference with refcount=%ld "
+                   "(double-dereference detected)\n", currentRefCount);
+
+        //
+        // Capture diagnostic information before bugcheck
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] State: Initialized=%d, Destroying=%d, LockInit=%d\n",
+                   state->Initialized, state->Destroying, state->LockInitialized);
+
+        //
+        // Bugcheck with MANUALLY_INITIATED_CRASH1 which is appropriate for
+        // driver-detected fatal conditions. Parameters provide diagnostic context:
+        //   Param1: ShadowStrike signature ('SSNR' = ShadowStrike Namespace Refcount)
+        //   Param2: Pointer to namespace state for crash dump analysis
+        //   Param3: Current reference count at time of failure
+        //   Param4: Return address for stack analysis
+        //
+        KeBugCheckEx(
+            MANUALLY_INITIATED_CRASH1,
+            (ULONG_PTR)0x53534E52,           // 'SSNR' signature
+            (ULONG_PTR)state,                 // State pointer for dump analysis
+            (ULONG_PTR)currentRefCount,       // Current refcount
+            (ULONG_PTR)_ReturnAddress()       // Caller address
+        );
+
+        //
+        // UNREACHABLE: KeBugCheckEx never returns
+        //
+    }
+
+    //
+    // Safe to decrement - we verified refcount > 0
+    //
+    newRefCount = InterlockedDecrement(&state->ReferenceCount);
+
+    //
+    // Post-decrement validation (belt and suspenders)
+    // This catches race conditions where multiple threads decrement simultaneously
+    //
+    if (newRefCount < 0) {
+        //
+        // Race condition detected - another thread also decremented
+        // Attempt to restore and bugcheck
+        //
+        InterlockedIncrement(&state->ReferenceCount);
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] FATAL: Namespace refcount race - underflow after decrement\n");
+
+        KeBugCheckEx(
+            MANUALLY_INITIATED_CRASH1,
+            (ULONG_PTR)0x53534E52,           // 'SSNR' signature
+            (ULONG_PTR)state,
+            (ULONG_PTR)newRefCount,
+            (ULONG_PTR)_ReturnAddress()
+        );
+    }
+
+    //
+    // Trace-level logging for debugging reference leaks
+    // Only in checked builds to avoid performance impact
+    //
+#if DBG
+    if (newRefCount == 0 && state->Destroying) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                   "[ShadowStrike] Namespace reference count reached zero during shutdown\n");
+    }
+#endif
 }
 
 // ============================================================================

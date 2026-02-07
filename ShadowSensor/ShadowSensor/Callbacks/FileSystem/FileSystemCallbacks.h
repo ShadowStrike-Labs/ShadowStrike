@@ -62,6 +62,18 @@ ShadowStrikePreWrite(
     );
 
 /**
+ * @brief Post-operation callback for IRP_MJ_WRITE.
+ *        Handles cache invalidation, ransomware detection, and telemetry.
+ */
+FLT_POSTOP_CALLBACK_STATUS
+ShadowStrikePostWrite(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
+    );
+
+/**
  * @brief Pre-operation callback for IRP_MJ_SET_INFORMATION.
  *        Handles file deletion and renaming (Self-Protection).
  */
