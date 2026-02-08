@@ -55,6 +55,7 @@ Never acquire ProcessListLock while holding a bucket lock.
 #include "../../Communication/CommPort.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Behavioral/ThreatScoring.h"
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -327,6 +328,12 @@ typedef struct _PN_MONITOR_STATE {
     PVOID ParentChainTracker;   // PPCT_TRACKER
     PVOID CommandLineParser;    // PCLP_PARSER
     PVOID TokenAnalyzer;        // PTA_ANALYZER
+
+    //
+    // Centralized threat scoring engine
+    // Provides unified multi-factor threat assessment across all detections
+    //
+    PTS_SCORING_ENGINE ThreatScoringEngine;
 
     //
     // Statistics - all use interlocked operations
@@ -658,6 +665,42 @@ Return Value:
     }
 
     //
+    // Initialize centralized threat scoring engine
+    // This provides unified multi-factor threat assessment with:
+    // - O(1) process lookup via hash table
+    // - PID reuse protection via process creation time validation
+    // - Factor aging and decay for temporal relevance
+    // - Configurable thresholds for verdicts (suspicious/malicious/blocked)
+    //
+    Status = TsInitialize(&g_ProcessMonitor.ThreatScoringEngine);
+    if (!NT_SUCCESS(Status)) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/ProcessNotify] Failed to initialize ThreatScoring engine: 0x%08X\n",
+            Status
+            );
+        IoFreeWorkItem(g_ProcessMonitor.CleanupWorkItem);
+        g_ProcessMonitor.CleanupWorkItem = NULL;
+        ExDeleteNPagedLookasideList(&g_ProcessMonitor.ContextLookaside);
+        ExDeleteNPagedLookasideList(&g_ProcessMonitor.NotificationLookaside);
+        return Status;
+    }
+
+    //
+    // Configure threat scoring thresholds aligned with our suspicion levels
+    // Suspicious: 50 (PN_SUSPICION_MEDIUM maps roughly here)
+    // Malicious: 80 (PN_SUSPICION_HIGH area)
+    // Blocked: 95 (PN_SUSPICION_CRITICAL)
+    //
+    TsSetThresholds(
+        g_ProcessMonitor.ThreatScoringEngine,
+        50,     // SuspiciousThreshold
+        80,     // MaliciousThreshold
+        95      // BlockedThreshold
+        );
+
+    //
     // Initialize cleanup timer
     //
     KeInitializeTimer(&g_ProcessMonitor.CleanupTimer);
@@ -833,6 +876,15 @@ Routine Description:
     KeReleaseSpinLock(&g_ProcessMonitor.NotificationLock, OldIrql);
 
     //
+    // Shutdown centralized threat scoring engine
+    // This will drain outstanding references and free all process contexts
+    //
+    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+        TsShutdown(g_ProcessMonitor.ThreatScoringEngine);
+        g_ProcessMonitor.ThreatScoringEngine = NULL;
+    }
+
+    //
     // Delete lookaside lists - safe now that all contexts are freed
     //
     if (g_ProcessMonitor.LookasideInitialized) {
@@ -978,6 +1030,28 @@ Arguments:
     }
 
     //
+    // Register process with centralized threat scoring engine
+    // This provides PID reuse protection via creation time validation
+    // and enables unified multi-factor threat assessment
+    //
+    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+        Status = TsOnProcessCreate(
+            g_ProcessMonitor.ThreatScoringEngine,
+            ProcessId,
+            ProcessContext->CreateTime
+            );
+        if (!NT_SUCCESS(Status) && Status != STATUS_QUOTA_EXCEEDED) {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_TRACE_LEVEL,
+                "[ShadowStrike/ProcessNotify] TsOnProcessCreate failed for PID %lu: 0x%08X\n",
+                HandleToULong(ProcessId),
+                Status
+                );
+        }
+    }
+
+    //
     // Capture token/security information
     //
     if (g_ProcessMonitor.Config.EnableTokenAnalysis) {
@@ -1005,6 +1079,21 @@ Arguments:
             ProcessContext->Flags |= PN_PROC_FLAG_PPID_SPOOFED;
             InterlockedIncrement64(&g_ProcessMonitor.Stats.PpidSpoofingDetected);
 
+            //
+            // Feed PPID spoofing factor to centralized threat scoring (MITRE T1134.004)
+            // Score: 40 - High severity indicator of malicious intent
+            //
+            if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                TsAddFactor(
+                    g_ProcessMonitor.ThreatScoringEngine,
+                    ProcessId,
+                    TsFactor_MITRE,
+                    "T1134.004-PPID-Spoofing",
+                    40,
+                    "Parent PID spoofing detected - process claims different parent than actual creator"
+                    );
+            }
+
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,
                 DPFLTR_WARNING_LEVEL,
@@ -1023,6 +1112,21 @@ Arguments:
     if (!PnpCheckParentSessionMatch(ProcessContext)) {
         ProcessContext->Flags |= PN_PROC_FLAG_CROSS_SESSION;
         InterlockedIncrement64(&g_ProcessMonitor.Stats.CrossSessionCreations);
+
+        //
+        // Feed cross-session creation factor to threat scoring
+        // Score: 15 - Moderate indicator, can be legitimate (services)
+        //
+        if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Context,
+                "CrossSessionCreation",
+                15,
+                "Process created across session boundary"
+                );
+        }
     }
 
     //
@@ -1031,6 +1135,21 @@ Arguments:
     if (ProcessContext->IsElevated) {
         ProcessContext->Flags |= PN_PROC_FLAG_ELEVATED;
         InterlockedIncrement64(&g_ProcessMonitor.Stats.ElevatedProcesses);
+
+        //
+        // Feed elevation context factor - not inherently malicious but contextually relevant
+        // Score: 5 - Low base score, increases suspicion when combined with other factors
+        //
+        if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Context,
+                "ElevatedProcess",
+                5,
+                "Process running with elevated privileges"
+                );
+        }
     }
 
     if (ProcessContext->IsSystem) {
@@ -1042,16 +1161,59 @@ Arguments:
     }
 
     //
-    // Track dangerous privileges
+    // Track dangerous privileges - these are high-value indicators
     //
     if (ProcessContext->HasDebugPrivilege) {
         ProcessContext->Flags |= PN_PROC_FLAG_HAS_DEBUG_PRIV;
+
+        //
+        // SeDebugPrivilege is a high-value target for attackers (MITRE T1134)
+        // Score: 20 - Significant indicator unless process is known system component
+        //
+        if (g_ProcessMonitor.ThreatScoringEngine != NULL && !ProcessContext->IsSystem) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Behavioral,
+                "SeDebugPrivilege",
+                20,
+                "Process has SeDebugPrivilege - can access other process memory"
+                );
+        }
     }
     if (ProcessContext->HasImpersonatePrivilege) {
         ProcessContext->Flags |= PN_PROC_FLAG_HAS_IMPERSONATE;
+
+        //
+        // SeImpersonatePrivilege enables token manipulation (MITRE T1134)
+        //
+        if (g_ProcessMonitor.ThreatScoringEngine != NULL && !ProcessContext->IsSystem && !ProcessContext->IsService) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Behavioral,
+                "SeImpersonatePrivilege",
+                15,
+                "Process has SeImpersonatePrivilege - can impersonate other security contexts"
+                );
+        }
     }
     if (ProcessContext->HasTcbPrivilege) {
         ProcessContext->Flags |= PN_PROC_FLAG_HAS_TCB;
+
+        //
+        // SeTcbPrivilege is extremely powerful - should only be held by LSASS
+        //
+        if (g_ProcessMonitor.ThreatScoringEngine != NULL && !ProcessContext->IsSystem) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Behavioral,
+                "SeTcbPrivilege",
+                30,
+                "Process has SeTcbPrivilege - can act as part of TCB"
+                );
+        }
     }
     if (ProcessContext->HasAssignPrimaryTokenPrivilege) {
         ProcessContext->Flags |= PN_PROC_FLAG_HAS_ASSIGN_TOKEN;
@@ -1064,6 +1226,34 @@ Arguments:
         Status = PnpVerifyImageSignature(ProcessContext);
         if (NT_SUCCESS(Status) && ProcessContext->IsSignatureValid) {
             ProcessContext->Flags |= PN_PROC_FLAG_SIGNATURE_VALID;
+
+            //
+            // Valid signature provides trust reduction (negative score)
+            //
+            if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                TsAddFactor(
+                    g_ProcessMonitor.ThreatScoringEngine,
+                    ProcessId,
+                    TsFactor_Reputation,
+                    "ValidSignature",
+                    -10,
+                    "Process image has valid code signature"
+                    );
+            }
+        } else {
+            //
+            // Unsigned binary in enterprise environment is suspicious
+            //
+            if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+                TsAddFactor(
+                    g_ProcessMonitor.ThreatScoringEngine,
+                    ProcessId,
+                    TsFactor_Reputation,
+                    "UnsignedBinary",
+                    10,
+                    "Process image lacks valid code signature"
+                    );
+            }
         }
     }
 
@@ -1076,7 +1266,77 @@ Arguments:
     }
 
     //
-    // Calculate suspicion score
+    // Feed analysis-derived factors to centralized threat scoring
+    // These are extracted from PnpAnalyzeProcess results
+    //
+    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+        //
+        // LOLBin detection (MITRE T1218 - System Binary Proxy Execution)
+        //
+        if (ProcessContext->Flags & PN_PROC_FLAG_LOLBIN) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_MITRE,
+                "T1218-LOLBin",
+                15,
+                "Living-off-the-land binary detected"
+                );
+        }
+
+        //
+        // Encoded command detection (MITRE T1059 - Command and Scripting Interpreter)
+        //
+        if (ProcessContext->Flags & PN_PROC_FLAG_ENCODED_CMD) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_MITRE,
+                "T1059-EncodedCommand",
+                25,
+                "Base64/encoded command line detected"
+                );
+        }
+
+        //
+        // Behavioral indicators from command line analysis
+        //
+        if (ProcessContext->BehaviorFlags & PN_BEHAVIOR_SUSPICIOUS_PS) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Behavioral,
+                "SuspiciousPowerShell",
+                15,
+                "Suspicious PowerShell flags detected (-nop, -w hidden, bypass)"
+                );
+        }
+
+        if (ProcessContext->BehaviorFlags & PN_BEHAVIOR_DOWNLOAD_CRADLE) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Behavioral,
+                "DownloadCradle",
+                20,
+                "Download cradle pattern detected in command line"
+                );
+        }
+
+        if (ProcessContext->BehaviorFlags & PN_BEHAVIOR_REFLECTION_LOAD) {
+            TsAddFactor(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                TsFactor_Behavioral,
+                "ReflectionLoad",
+                25,
+                "Reflective loading pattern detected"
+                );
+        }
+    }
+
+    //
+    // Calculate local suspicion score (legacy compatibility)
     //
     SuspicionScore = PnpCalculateSuspicionScore(ProcessContext);
     ProcessContext->SuspicionScore = SuspicionScore;
@@ -1087,9 +1347,62 @@ Arguments:
     }
 
     //
-    // Check if we should block
+    // Query centralized threat scoring engine for authoritative verdict
+    // This aggregates all factors with proper weighting, decay, and thresholds
     //
-    if (g_ProcessMonitor.Config.BlockSuspiciousProcesses &&
+    {
+        TS_VERDICT TsVerdict = TsVerdict_Unknown;
+        ULONG TsNormalizedScore = 0;
+
+        if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+            Status = TsGetVerdict(
+                g_ProcessMonitor.ThreatScoringEngine,
+                ProcessId,
+                &TsVerdict,
+                &TsNormalizedScore
+                );
+
+            if (NT_SUCCESS(Status)) {
+                //
+                // Use centralized verdict for blocking decisions
+                // TsVerdict_Blocked indicates score >= BlockedThreshold (95)
+                //
+                if (TsVerdict == TsVerdict_Blocked) {
+                    ShouldBlock = TRUE;
+
+                    DbgPrintEx(
+                        DPFLTR_IHVDRIVER_ID,
+                        DPFLTR_WARNING_LEVEL,
+                        "[ShadowStrike/ProcessNotify] ThreatScoring BLOCKED verdict: "
+                        "PID=%lu, NormalizedScore=%lu\n",
+                        HandleToULong(ProcessId),
+                        TsNormalizedScore
+                        );
+                } else if (TsVerdict == TsVerdict_Malicious) {
+                    //
+                    // Malicious verdict - block if blocking is enabled
+                    //
+                    if (g_ProcessMonitor.Config.BlockSuspiciousProcesses) {
+                        ShouldBlock = TRUE;
+                    }
+                }
+
+                //
+                // Sync local score with centralized score for reporting
+                //
+                if (TsNormalizedScore > SuspicionScore) {
+                    SuspicionScore = TsNormalizedScore;
+                    ProcessContext->SuspicionScore = SuspicionScore;
+                }
+            }
+        }
+    }
+
+    //
+    // Legacy blocking check (fallback if ThreatScoring unavailable)
+    //
+    if (!ShouldBlock &&
+        g_ProcessMonitor.Config.BlockSuspiciousProcesses &&
         SuspicionScore >= g_ProcessMonitor.Config.MinBlockScore) {
         ShouldBlock = TRUE;
     }
@@ -2398,6 +2711,14 @@ PnpHandleProcessTermination(
     )
 {
     PPN_PROCESS_CONTEXT Context;
+
+    //
+    // Notify centralized threat scoring engine of process exit
+    // This triggers proper cleanup and reference release in the scoring engine
+    //
+    if (g_ProcessMonitor.ThreatScoringEngine != NULL) {
+        TsOnProcessExit(g_ProcessMonitor.ThreatScoringEngine, ProcessId);
+    }
 
     //
     // Look up process context
