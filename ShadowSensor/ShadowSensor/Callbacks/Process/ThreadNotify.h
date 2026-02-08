@@ -15,6 +15,8 @@
  * - Cross-process thread creation tracking
  * - Thread call stack validation
  * - Per-process thread statistics
+ * - Cross-session threat detection
+ * - Rapid thread creation pattern detection
  *
  * Detection Capabilities:
  * - CreateRemoteThread / CreateRemoteThreadEx
@@ -34,7 +36,7 @@
  * - T1106: Native API
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -57,16 +59,20 @@ extern "C" {
 #define TN_POOL_TAG                 'nTsS'  // SsTn - Thread Notify
 #define TN_POOL_TAG_CONTEXT         'cTsS'  // SsTc - Thread Context
 #define TN_POOL_TAG_EVENT           'eTsS'  // SsTe - Thread Event
+#define TN_POOL_TAG_SYSPROCESS      'pTsS'  // SsTp - System Process Cache
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
-#define TN_MAX_TRACKED_PROCESSES    1024
+#define TN_MAX_TRACKED_PROCESSES    4096
 #define TN_MAX_THREADS_PER_PROCESS  4096
 #define TN_THREAD_HISTORY_SIZE      256
 #define TN_INJECTION_SCORE_THRESHOLD 500
 #define TN_SUSPICIOUS_THREAD_WINDOW_MS 5000
+#define TN_MAX_MODULE_WALK_ITERATIONS 2048
+#define TN_RAPID_THREAD_THRESHOLD   10
+#define TN_RAPID_THREAD_WINDOW_100NS (1000LL * 10000LL)  // 1 second in 100ns units
 
 // ============================================================================
 // ENUMERATIONS
@@ -86,7 +92,7 @@ typedef enum _TN_EVENT_TYPE {
 } TN_EVENT_TYPE;
 
 /**
- * @brief Thread injection indicators
+ * @brief Thread injection indicators (bitmask)
  */
 typedef enum _TN_INJECTION_INDICATOR {
     TnIndicator_None                = 0x00000000,
@@ -127,6 +133,17 @@ typedef enum _TN_ACTION {
     TnActionAlert = 2,
     TnActionBlock = 3
 } TN_ACTION;
+
+/**
+ * @brief Monitor initialization state
+ */
+typedef enum _TN_INIT_STATE {
+    TnStateUninitialized = 0,
+    TnStateInitializing = 1,
+    TnStateInitialized = 2,
+    TnStateShuttingDown = 3,
+    TnStateShutdown = 4
+} TN_INIT_STATE;
 
 // ============================================================================
 // STRUCTURES
@@ -199,11 +216,24 @@ typedef struct _TN_THREAD_EVENT {
  * @brief Per-process thread tracking context
  */
 typedef struct _TN_PROCESS_CONTEXT {
+    //
+    // Signature for validation
+    //
+    ULONG Signature;
+
+    //
+    // Process identification
+    //
     HANDLE ProcessId;
     PEPROCESS Process;
 
     //
-    // Thread counts
+    // Session information
+    //
+    ULONG SessionId;
+
+    //
+    // Thread counts (atomic)
     //
     volatile LONG ThreadCount;
     volatile LONG RemoteThreadCount;
@@ -217,30 +247,37 @@ typedef struct _TN_PROCESS_CONTEXT {
     ULONG EventCount;
 
     //
-    // Timing
+    // Timing for rapid creation detection
     //
-    LARGE_INTEGER FirstRemoteThread;
+    LARGE_INTEGER WindowStart;
     LARGE_INTEGER LastRemoteThread;
-    ULONG RemoteThreadsInWindow;
+    volatile LONG RemoteThreadsInWindow;
 
     //
     // Risk assessment
     //
     TN_RISK_LEVEL OverallRisk;
-    ULONG CumulativeScore;
+    volatile ULONG CumulativeScore;
     TN_INJECTION_INDICATOR CumulativeIndicators;
 
     //
-    // Reference counting
+    // Reference counting (atomic)
     //
     volatile LONG RefCount;
 
     //
-    // List entry
+    // Flags
+    //
+    volatile LONG Destroying;
+
+    //
+    // List entry for global list
     //
     LIST_ENTRY ListEntry;
 
 } TN_PROCESS_CONTEXT, *PTN_PROCESS_CONTEXT;
+
+#define TN_PROCESS_CONTEXT_SIGNATURE 'CTHT'
 
 /**
  * @brief Thread notification callback function
@@ -252,12 +289,23 @@ typedef VOID
     );
 
 /**
+ * @brief Callback registration entry
+ */
+typedef struct _TN_CALLBACK_ENTRY {
+    TN_CALLBACK_ROUTINE Callback;
+    PVOID Context;
+    volatile LONG RefCount;
+} TN_CALLBACK_ENTRY, *PTN_CALLBACK_ENTRY;
+
+/**
  * @brief Thread notify monitor state
  */
 typedef struct _TN_MONITOR {
-    BOOLEAN Initialized;
+    //
+    // Initialization state (atomic)
+    //
+    volatile LONG InitState;
     BOOLEAN CallbackRegistered;
-    volatile BOOLEAN ShuttingDown;
 
     //
     // Process tracking
@@ -273,10 +321,10 @@ typedef struct _TN_MONITOR {
     NPAGED_LOOKASIDE_LIST ContextLookaside;
 
     //
-    // User callbacks
+    // User callback (protected by lock)
     //
-    TN_CALLBACK_ROUTINE UserCallback;
-    PVOID UserContext;
+    EX_PUSH_LOCK CallbackLock;
+    PTN_CALLBACK_ENTRY CallbackEntry;
 
     //
     // Configuration
@@ -286,12 +334,14 @@ typedef struct _TN_MONITOR {
         BOOLEAN MonitorSuspendedThreads;
         BOOLEAN ValidateStartAddresses;
         BOOLEAN TrackThreadHistory;
+        BOOLEAN DetectCrossSession;
+        BOOLEAN DetectRapidCreation;
         ULONG InjectionScoreThreshold;
         TN_ACTION DefaultAction;
     } Config;
 
     //
-    // Statistics
+    // Statistics (atomic)
     //
     struct {
         volatile LONG64 TotalThreadsCreated;
@@ -301,6 +351,8 @@ typedef struct _TN_MONITOR {
         volatile LONG64 InjectionAttempts;
         volatile LONG64 BlockedThreads;
         volatile LONG64 AlertsGenerated;
+        volatile LONG64 CrossSessionDetected;
+        volatile LONG64 RapidCreationDetected;
         LARGE_INTEGER StartTime;
     } Stats;
 
@@ -314,13 +366,14 @@ typedef struct _TN_MONITOR {
  * @brief Registers the thread creation notification callback.
  *
  * Initializes the thread monitoring subsystem and registers with
- * PsSetCreateThreadNotifyRoutineEx for comprehensive thread tracking.
+ * PsSetCreateThreadNotifyRoutine for comprehensive thread tracking.
  *
  * @return STATUS_SUCCESS if successful, otherwise an NTSTATUS error code.
  *
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 RegisterThreadNotify(
     VOID
@@ -359,6 +412,19 @@ TnGetMonitor(
     );
 
 /**
+ * @brief Check if thread monitor is ready.
+ *
+ * @return TRUE if monitor is initialized and ready.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+TnIsReady(
+    VOID
+    );
+
+/**
  * @brief Register a user callback for thread events.
  *
  * @param Callback  Callback routine to invoke on thread events.
@@ -369,6 +435,7 @@ TnGetMonitor(
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 TnRegisterCallback(
     _In_ TN_CALLBACK_ROUTINE Callback,
@@ -387,6 +454,27 @@ TnUnregisterCallback(
     );
 
 // ============================================================================
+// PROCESS CLEANUP INTEGRATION
+// ============================================================================
+
+/**
+ * @brief Notify thread monitor of process termination.
+ *
+ * Called by process notify callback to clean up thread tracking state
+ * for a terminating process. This must be called to prevent memory leaks
+ * and stale EPROCESS references.
+ *
+ * @param ProcessId   ID of the terminating process.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+TnNotifyProcessTermination(
+    _In_ HANDLE ProcessId
+    );
+
+// ============================================================================
 // QUERY API
 // ============================================================================
 
@@ -394,13 +482,14 @@ TnUnregisterCallback(
  * @brief Get process thread context.
  *
  * @param ProcessId     Target process ID.
- * @param Context       Receives process context (must be dereferenced when done).
+ * @param Context       Receives process context (must be released when done).
  *
  * @return STATUS_SUCCESS on success.
  *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 TnGetProcessContext(
     _In_ HANDLE ProcessId,
@@ -434,6 +523,7 @@ TnReleaseProcessContext(
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 TnIsRemoteThread(
     _In_ HANDLE TargetProcessId,
@@ -456,6 +546,7 @@ TnIsRemoteThread(
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 TnAnalyzeStartAddress(
     _In_ HANDLE ProcessId,
@@ -502,6 +593,7 @@ TnGetStatistics(
  *
  * @irql Any
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 PCWSTR
 TnGetRiskLevelName(
     _In_ TN_RISK_LEVEL Level
@@ -516,6 +608,7 @@ TnGetRiskLevelName(
  *
  * @irql Any
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 PCWSTR
 TnGetIndicatorName(
     _In_ TN_INJECTION_INDICATOR Indicator

@@ -20,8 +20,8 @@ Implementation Features:
 - Hash table for O(1) process lookup
 - Per-process handle lists with reference counting
 - Lookaside lists for high-frequency allocations
-- Asynchronous handle analysis
-- Comprehensive statistics and telemetry
+- EX_RUNDOWN_REF for safe shutdown synchronization
+- Safe handle enumeration without raw object pointer access
 
 Detection Techniques Covered:
 - T1055: Process Injection (cross-process handle detection)
@@ -30,16 +30,29 @@ Detection Techniques Covered:
 - T1106: Native API (suspicious handle operations)
 - T1548: Abuse Elevation Control Mechanism
 
+SECURITY NOTES:
+- NO use of MmIsAddressValid (unsafe TOCTOU)
+- NO direct access to unreferenced object pointers
+- Proper IRQL validation throughout
+- EX_RUNDOWN_REF for shutdown synchronization
+- Consistent lock hierarchy to prevent deadlocks
+
 @author ShadowStrike Security Team
-@version 2.0.0 (Enterprise Edition)
+@version 3.0.0 (Enterprise Edition - Security Hardened)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
 
 #include "HandleTracker.h"
-#include "../../Utilities/ProcessUtils.h"
-#include "../../Utilities/MemoryUtils.h"
 #include <ntstrsafe.h>
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, HtInitialize)
+#pragma alloc_text(PAGE, HtShutdown)
+#pragma alloc_text(PAGE, HtSnapshotHandles)
+#pragma alloc_text(PAGE, HtFindCrossProcessHandles)
+#pragma alloc_text(PAGE, HtIsSensitiveProcess)
+#endif
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -48,47 +61,171 @@ Detection Techniques Covered:
 #define HT_HASH_BUCKET_COUNT            256
 #define HT_HASH_BUCKET_MASK             (HT_HASH_BUCKET_COUNT - 1)
 #define HT_MAX_TRACKED_PROCESSES        4096
-#define HT_MAX_DUPLICATIONS_PER_PROCESS 1024
-#define HT_HANDLE_CACHE_TIMEOUT_MS      30000
-#define HT_SENSITIVE_PROCESS_THRESHOLD  5
-
-//
-// Pool tags for sub-allocations
-//
-#define HT_POOL_TAG_ENTRY       'eHTK'
-#define HT_POOL_TAG_PROCESS     'pHTK'
-#define HT_POOL_TAG_BUFFER      'bHTK'
-#define HT_POOL_TAG_STRING      'sHTK'
+#define HT_MAX_DUPLICATIONS             4096
+#define HT_DEFAULT_CLEANUP_INTERVAL_MS  60000
+#define HT_DEFAULT_CACHE_TIMEOUT_MS     30000
+#define HT_MAX_BUFFER_SIZE              0x4000000   // 64MB max for handle enumeration
+#define HT_INITIAL_BUFFER_SIZE          0x100000    // 1MB initial
+#define HT_MAX_SENSITIVE_PROCESSES      32
+#define HT_SIGNATURE                    'HtTr'
 
 //
 // Suspicious access masks
 //
 #define HT_PROCESS_INJECTION_ACCESS     (PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD)
-#define HT_PROCESS_FULL_ACCESS          (PROCESS_ALL_ACCESS)
 #define HT_PROCESS_DUMP_ACCESS          (PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
 #define HT_THREAD_HIJACK_ACCESS         (THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME)
 #define HT_TOKEN_STEAL_ACCESS           (TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY)
 
-//
-// Handle type strings (for object type matching)
-//
-#define HT_PROCESS_TYPE_NAME            L"Process"
-#define HT_THREAD_TYPE_NAME             L"Thread"
-#define HT_FILE_TYPE_NAME               L"File"
-#define HT_KEY_TYPE_NAME                L"Key"
-#define HT_SECTION_TYPE_NAME            L"Section"
-#define HT_TOKEN_TYPE_NAME              L"Token"
-#define HT_EVENT_TYPE_NAME              L"Event"
-#define HT_SEMAPHORE_TYPE_NAME          L"Semaphore"
-#define HT_MUTANT_TYPE_NAME             L"Mutant"
-#define HT_TIMER_TYPE_NAME              L"Timer"
-#define HT_PORT_TYPE_NAME               L"ALPC Port"
-#define HT_DEVICE_TYPE_NAME             L"Device"
-#define HT_DRIVER_TYPE_NAME             L"Driver"
+// ============================================================================
+// SYSTEM STRUCTURES (for ZwQuerySystemInformation)
+// ============================================================================
+
+#ifndef SystemExtendedHandleInformation
+#define SystemExtendedHandleInformation 64
+#endif
+
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+    PVOID Object;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR HandleValue;
+    ULONG GrantedAccess;
+    USHORT CreatorBackTraceIndex;
+    USHORT ObjectTypeIndex;
+    ULONG HandleAttributes;
+    ULONG Reserved;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG_PTR NumberOfHandles;
+    ULONG_PTR Reserved;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+} SYSTEM_HANDLE_INFORMATION_EX, *PSYSTEM_HANDLE_INFORMATION_EX;
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQueryObject(
+    _In_opt_ HANDLE Handle,
+    _In_ ULONG ObjectInformationClass,
+    _Out_writes_bytes_opt_(ObjectInformationLength) PVOID ObjectInformation,
+    _In_ ULONG ObjectInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+#define ObjectTypeInformation 2
+
+typedef struct _OBJECT_TYPE_INFORMATION {
+    UNICODE_STRING TypeName;
+    ULONG TotalNumberOfObjects;
+    ULONG TotalNumberOfHandles;
+    ULONG TotalPagedPoolUsage;
+    ULONG TotalNonPagedPoolUsage;
+    ULONG TotalNamePoolUsage;
+    ULONG TotalHandleTableUsage;
+    ULONG HighWaterNumberOfObjects;
+    ULONG HighWaterNumberOfHandles;
+    ULONG HighWaterPagedPoolUsage;
+    ULONG HighWaterNonPagedPoolUsage;
+    ULONG HighWaterNamePoolUsage;
+    ULONG HighWaterHandleTableUsage;
+    ULONG InvalidAttributes;
+    GENERIC_MAPPING GenericMapping;
+    ULONG ValidAccessMask;
+    BOOLEAN SecurityRequired;
+    BOOLEAN MaintainHandleCount;
+    UCHAR TypeIndex;
+    CHAR ReservedByte;
+    ULONG PoolType;
+    ULONG DefaultPagedPoolCharge;
+    ULONG DefaultNonPagedPoolCharge;
+} OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
 
 // ============================================================================
 // PRIVATE STRUCTURES
 // ============================================================================
+
+//
+// Handle entry (internal)
+//
+typedef struct _HT_HANDLE_ENTRY {
+    LIST_ENTRY ListEntry;
+    HANDLE HandleValue;
+    HT_HANDLE_TYPE Type;
+    ACCESS_MASK GrantedAccess;
+    HANDLE TargetProcessId;
+    BOOLEAN IsDuplicated;
+    HANDLE DuplicatedFromProcess;
+    HT_SUSPICION SuspicionFlags;
+    ULONG SuspicionScore;
+    USHORT ObjectTypeIndex;
+    WCHAR ObjectName[HT_MAX_OBJECT_NAME_LENGTH / sizeof(WCHAR)];
+    USHORT ObjectNameLength;
+} HT_HANDLE_ENTRY, *PHT_HANDLE_ENTRY;
+
+//
+// Process handles snapshot (internal)
+//
+typedef struct _HT_PROCESS_HANDLES {
+    ULONG Signature;
+    volatile LONG RefCount;
+    HANDLE ProcessId;
+    PEPROCESS ProcessObject;
+
+    //
+    // Handle list (protected by Lock)
+    //
+    LIST_ENTRY HandleList;
+    EX_PUSH_LOCK Lock;
+    volatile LONG HandleCount;
+
+    //
+    // Aggregated data
+    //
+    HT_SUSPICION AggregatedSuspicion;
+    ULONG SuspicionScore;
+
+    //
+    // Statistics
+    //
+    ULONG ProcessHandleCount;
+    ULONG ThreadHandleCount;
+    ULONG FileHandleCount;
+    ULONG TokenHandleCount;
+    ULONG SectionHandleCount;
+    ULONG OtherHandleCount;
+    ULONG CrossProcessHandleCount;
+    ULONG HighPrivilegeHandleCount;
+    ULONG DuplicatedHandleCount;
+
+    //
+    // Snapshot time
+    //
+    LARGE_INTEGER SnapshotTime;
+
+    //
+    // Hash table linkage
+    //
+    LIST_ENTRY HashEntry;
+    ULONG HashBucket;
+    BOOLEAN InHashTable;
+
+    //
+    // Global list linkage
+    //
+    LIST_ENTRY GlobalEntry;
+
+} HT_PROCESS_HANDLES, *PHT_PROCESS_HANDLES;
 
 //
 // Handle duplication record
@@ -103,11 +240,10 @@ typedef struct _HT_DUPLICATION_RECORD {
     HT_HANDLE_TYPE HandleType;
     LARGE_INTEGER Timestamp;
     HT_SUSPICION SuspicionFlags;
-    PVOID TargetObject;
 } HT_DUPLICATION_RECORD, *PHT_DUPLICATION_RECORD;
 
 //
-// Hash bucket for process lookup
+// Hash bucket
 //
 typedef struct _HT_HASH_BUCKET {
     LIST_ENTRY ProcessList;
@@ -118,27 +254,36 @@ typedef struct _HT_HASH_BUCKET {
 //
 // Sensitive process entry
 //
-typedef struct _HT_SENSITIVE_PROCESS {
-    HANDLE ProcessId;
+typedef struct _HT_SENSITIVE_PROCESS_ENTRY {
     ULONG Hash;
-    WCHAR ImageName[64];
-    ULONG AccessCount;
-    LIST_ENTRY ListEntry;
-} HT_SENSITIVE_PROCESS, *PHT_SENSITIVE_PROCESS;
+    WCHAR Name[64];
+    USHORT NameLength;
+} HT_SENSITIVE_PROCESS_ENTRY, *PHT_SENSITIVE_PROCESS_ENTRY;
 
 //
-// Extended tracker with private data
+// Main tracker structure (internal)
 //
-typedef struct _HT_TRACKER_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    HT_TRACKER Public;
+typedef struct _HT_TRACKER {
+    ULONG Signature;
+    volatile LONG Initialized;
 
     //
-    // Process hash table
+    // Rundown protection for safe shutdown
     //
-    HT_HASH_BUCKET HashBuckets[HT_HASH_BUCKET_COUNT];
+    EX_RUNDOWN_REF RundownRef;
+
+    //
+    // Global process list
+    //
+    LIST_ENTRY ProcessList;
+    EX_PUSH_LOCK ProcessListLock;
+    volatile LONG ProcessCount;
+
+    //
+    // Hash table for process lookup
+    //
+    PHT_HASH_BUCKET HashBuckets;
+    ULONG HashBucketCount;
 
     //
     // Lookaside lists
@@ -156,149 +301,42 @@ typedef struct _HT_TRACKER_INTERNAL {
     volatile LONG DuplicationCount;
 
     //
-    // Sensitive process tracking
+    // Sensitive process list
     //
-    LIST_ENTRY SensitiveProcessList;
-    EX_PUSH_LOCK SensitiveProcessLock;
-    volatile LONG SensitiveProcessCount;
-    ULONG SensitiveProcessHashes[32];
-    ULONG SensitiveProcessHashCount;
+    HT_SENSITIVE_PROCESS_ENTRY SensitiveProcesses[HT_MAX_SENSITIVE_PROCESSES];
+    ULONG SensitiveProcessCount;
 
     //
     // Configuration
     //
-    struct {
-        BOOLEAN EnableCrossProcessDetection;
-        BOOLEAN EnableDuplicationTracking;
-        BOOLEAN EnableSensitiveProcessMonitoring;
-        ULONG MaxHandlesPerProcess;
-        ULONG MaxDuplications;
-        ULONG SuspicionThreshold;
-    } Config;
+    HT_CONFIG Config;
 
     //
-    // Extended statistics
+    // Statistics
     //
-    struct {
-        volatile LONG64 TotalEnumerations;
-        volatile LONG64 DuplicationsRecorded;
-        volatile LONG64 SensitiveAccessDetected;
-        volatile LONG64 HighPrivilegeHandles;
-        volatile LONG64 TokenHandlesTracked;
-        volatile LONG64 InjectionHandlesDetected;
-    } ExtendedStats;
+    HT_STATISTICS Stats;
 
     //
     // Cleanup timer
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
+    volatile LONG CleanupTimerActive;
 
     //
     // Worker thread
     //
-    HANDLE WorkerThread;
+    PETHREAD WorkerThreadObject;
     KEVENT ShutdownEvent;
     KEVENT WorkAvailableEvent;
-    BOOLEAN ShutdownRequested;
+    volatile LONG ShutdownRequested;
 
-} HT_TRACKER_INTERNAL, *PHT_TRACKER_INTERNAL;
-
-//
-// Extended process handles with private data
-//
-typedef struct _HT_PROCESS_HANDLES_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    HT_PROCESS_HANDLES Public;
-
-    //
-    // Reference counting
-    //
-    volatile LONG RefCount;
-
-    //
-    // Hash table entry
-    //
-    LIST_ENTRY HashEntry;
-    ULONG HashBucket;
-    BOOLEAN InHashTable;
-
-    //
-    // Process information
-    //
-    UNICODE_STRING ImagePath;
-    WCHAR ImagePathBuffer[260];
-    PEPROCESS ProcessObject;
-
-    //
-    // Handle statistics
-    //
-    ULONG ProcessHandleCount;
-    ULONG ThreadHandleCount;
-    ULONG FileHandleCount;
-    ULONG TokenHandleCount;
-    ULONG SectionHandleCount;
-    ULONG OtherHandleCount;
-
-    //
-    // Suspicion tracking
-    //
-    ULONG SuspicionScore;
-    ULONG CrossProcessHandleCount;
-    ULONG HighPrivilegeHandleCount;
-    ULONG DuplicatedHandleCount;
-
-    //
-    // Snapshot time
-    //
-    LARGE_INTEGER SnapshotTime;
-
-} HT_PROCESS_HANDLES_INTERNAL, *PHT_PROCESS_HANDLES_INTERNAL;
-
-//
-// Extended handle entry with private data
-//
-typedef struct _HT_HANDLE_ENTRY_INTERNAL {
-    //
-    // Public structure (must be first)
-    //
-    HT_HANDLE_ENTRY Public;
-
-    //
-    // Object name buffer
-    //
-    WCHAR ObjectNameBuffer[260];
-
-    //
-    // Extended information
-    //
-    ULONG ObjectTypeIndex;
-    ULONG HandleAttributes;
-    ULONG CreatorBackTraceIndex;
-
-    //
-    // For process/thread handles
-    //
-    UNICODE_STRING TargetImagePath;
-    WCHAR TargetImagePathBuffer[260];
-
-    //
-    // Suspicion score
-    //
-    ULONG SuspicionScore;
-
-} HT_HANDLE_ENTRY_INTERNAL, *PHT_HANDLE_ENTRY_INTERNAL;
+} HT_TRACKER, *PHT_TRACKER;
 
 // ============================================================================
 // PRIVATE FUNCTION PROTOTYPES
 // ============================================================================
 
-//
-// Hash functions
-//
 static ULONG
 HtpHashProcessId(
     _In_ HANDLE ProcessId
@@ -307,94 +345,74 @@ HtpHashProcessId(
 static ULONG
 HtpHashString(
     _In_ PCWSTR String,
-    _In_ ULONG Length
+    _In_ ULONG CharCount
     );
 
-//
-// Allocation functions
-//
-static PHT_HANDLE_ENTRY_INTERNAL
+static PHT_HANDLE_ENTRY
 HtpAllocateHandleEntry(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     );
 
 static VOID
 HtpFreeHandleEntry(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_HANDLE_ENTRY_INTERNAL Entry
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_HANDLE_ENTRY Entry
     );
 
-static PHT_PROCESS_HANDLES_INTERNAL
+static PHT_PROCESS_HANDLES
 HtpAllocateProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+    _In_ PHT_TRACKER Tracker,
     _In_ HANDLE ProcessId
     );
 
 static VOID
-HtpFreeProcessHandlesInternal(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_PROCESS_HANDLES_INTERNAL Handles
-    );
-
-static PHT_DUPLICATION_RECORD
-HtpAllocateDuplicationRecord(
-    _In_ PHT_TRACKER_INTERNAL Tracker
-    );
-
-static VOID
-HtpFreeDuplicationRecord(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_DUPLICATION_RECORD Record
-    );
-
-//
-// Reference counting
-//
-static VOID
 HtpReferenceProcessHandles(
-    _Inout_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _Inout_ PHT_PROCESS_HANDLES Handles
     );
 
 static VOID
 HtpDereferenceProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _Inout_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _In_ PHT_TRACKER Tracker,
+    _Inout_ PHT_PROCESS_HANDLES Handles
     );
 
-//
-// Hash table operations
-//
-static PHT_PROCESS_HANDLES_INTERNAL
-HtpLookupProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ HANDLE ProcessId
+static PHT_DUPLICATION_RECORD
+HtpAllocateDuplicationRecord(
+    _In_ PHT_TRACKER Tracker
+    );
+
+static VOID
+HtpFreeDuplicationRecord(
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_DUPLICATION_RECORD Record
     );
 
 static NTSTATUS
 HtpInsertProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_PROCESS_HANDLES Handles
     );
 
 static VOID
 HtpRemoveProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_PROCESS_HANDLES Handles
     );
 
-//
-// Handle enumeration
-//
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 HtpEnumerateProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+    _In_ PHT_TRACKER Tracker,
     _In_ HANDLE ProcessId,
-    _Inout_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _Inout_ PHT_PROCESS_HANDLES Handles
     );
 
 static HT_HANDLE_TYPE
-HtpGetHandleType(
-    _In_ POBJECT_TYPE ObjectType
+HtpGetHandleTypeFromIndex(
+    _In_ PHT_TRACKER Tracker,
+    _In_ HANDLE ProcessHandle,
+    _In_ HANDLE HandleValue,
+    _In_ USHORT ObjectTypeIndex
     );
 
 static HT_HANDLE_TYPE
@@ -402,32 +420,23 @@ HtpGetHandleTypeFromName(
     _In_ PCUNICODE_STRING TypeName
     );
 
-static NTSTATUS
-HtpGetObjectName(
-    _In_ PVOID Object,
-    _Out_ PUNICODE_STRING ObjectName,
-    _In_ ULONG MaxLength
-    );
-
-//
-// Suspicion analysis
-//
 static HT_SUSPICION
 HtpAnalyzeHandleSuspicion(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_HANDLE_ENTRY_INTERNAL Entry,
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_HANDLE_ENTRY Entry,
     _In_ HANDLE OwnerProcessId
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
-HtpIsSensitiveProcess(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+HtpIsSensitiveProcessInternal(
+    _In_ PHT_TRACKER Tracker,
     _In_ HANDLE ProcessId
     );
 
 static BOOLEAN
 HtpIsSensitiveProcessByName(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+    _In_ PHT_TRACKER Tracker,
     _In_ PCUNICODE_STRING ImageName
     );
 
@@ -447,19 +456,19 @@ HtpCalculateSuspicionScore(
     _In_ HT_SUSPICION Flags
     );
 
-//
-// Initialization helpers
-//
 static VOID
 HtpInitializeSensitiveProcessList(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     );
 
-//
-// Timer and worker routines
-//
+static BOOLEAN
+HtpExtractFileName(
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_ PUNICODE_STRING FileName
+    );
+
 static VOID
-HtpCleanupTimerDpc(
+HtpCleanupDpcRoutine(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
     _In_opt_ PVOID SystemArgument1,
@@ -467,123 +476,172 @@ HtpCleanupTimerDpc(
     );
 
 static VOID
-HtpWorkerThread(
+HtpWorkerThreadRoutine(
     _In_ PVOID StartContext
     );
 
 static VOID
 HtpCleanupStaleDuplications(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     );
 
-//
-// Utility functions
-//
-static BOOLEAN
-HtpExtractFileName(
-    _In_ PCUNICODE_STRING FullPath,
-    _Out_ PUNICODE_STRING FileName
+static VOID
+HtpFreeAllHandleEntries(
+    _In_ PHT_TRACKER Tracker,
+    _Inout_ PHT_PROCESS_HANDLES Handles
     );
+
+// ============================================================================
+// INLINE HELPERS
+// ============================================================================
+
+FORCEINLINE
+BOOLEAN
+HtpIsValidTracker(
+    _In_opt_ PHT_TRACKER Tracker
+    )
+{
+    return (Tracker != NULL &&
+            Tracker->Signature == HT_SIGNATURE &&
+            Tracker->Initialized != 0);
+}
+
+FORCEINLINE
+BOOLEAN
+HtpIsValidProcessHandles(
+    _In_opt_ PHT_PROCESS_HANDLES Handles
+    )
+{
+    return (Handles != NULL && Handles->Signature == HT_SIGNATURE);
+}
+
+FORCEINLINE
+BOOLEAN
+HtpAcquireRundownProtection(
+    _In_ PHT_TRACKER Tracker
+    )
+{
+    return ExAcquireRundownProtection(&Tracker->RundownRef);
+}
+
+FORCEINLINE
+VOID
+HtpReleaseRundownProtection(
+    _In_ PHT_TRACKER Tracker
+    )
+{
+    ExReleaseRundownProtection(&Tracker->RundownRef);
+}
 
 // ============================================================================
 // PUBLIC FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
+_Use_decl_annotations_
 NTSTATUS
 HtInitialize(
-    _Out_ PHT_TRACKER* Tracker
+    PHT_TRACKER* OutTracker,
+    PHT_CONFIG Config
     )
-/*++
-Routine Description:
-    Initializes the handle tracker subsystem.
-
-Arguments:
-    Tracker - Receives pointer to initialized tracker.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     NTSTATUS Status;
-    PHT_TRACKER_INTERNAL Internal = NULL;
+    PHT_TRACKER Tracker = NULL;
     HANDLE ThreadHandle = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
     LARGE_INTEGER DueTime;
     ULONG i;
+    SIZE_T HashTableSize;
 
-    if (Tracker == NULL) {
+    PAGED_CODE();
+
+    if (OutTracker == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    *Tracker = NULL;
+    *OutTracker = NULL;
 
     //
-    // Allocate internal tracker structure
+    // Allocate tracker structure from NonPagedPoolNx
     //
-    Internal = (PHT_TRACKER_INTERNAL)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(HT_TRACKER_INTERNAL),
+    Tracker = (PHT_TRACKER)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(HT_TRACKER),
         HT_POOL_TAG
         );
 
-    if (Internal == NULL) {
+    if (Tracker == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(Internal, sizeof(HT_TRACKER_INTERNAL));
+    RtlZeroMemory(Tracker, sizeof(HT_TRACKER));
+    Tracker->Signature = HT_SIGNATURE;
 
     //
-    // Initialize public structure
+    // Initialize rundown protection
     //
-    InitializeListHead(&Internal->Public.ProcessList);
-    ExInitializePushLock(&Internal->Public.ProcessLock);
+    ExInitializeRundownProtection(&Tracker->RundownRef);
 
     //
-    // Initialize hash buckets
+    // Initialize global process list
     //
+    InitializeListHead(&Tracker->ProcessList);
+    ExInitializePushLock(&Tracker->ProcessListLock);
+
+    //
+    // Allocate and initialize hash buckets
+    //
+    Tracker->HashBucketCount = HT_HASH_BUCKET_COUNT;
+    HashTableSize = (SIZE_T)HT_HASH_BUCKET_COUNT * sizeof(HT_HASH_BUCKET);
+
+    Tracker->HashBuckets = (PHT_HASH_BUCKET)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        HashTableSize,
+        HT_POOL_TAG
+        );
+
+    if (Tracker->HashBuckets == NULL) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
+
+    RtlZeroMemory(Tracker->HashBuckets, HashTableSize);
+
     for (i = 0; i < HT_HASH_BUCKET_COUNT; i++) {
-        InitializeListHead(&Internal->HashBuckets[i].ProcessList);
-        ExInitializePushLock(&Internal->HashBuckets[i].Lock);
-        Internal->HashBuckets[i].Count = 0;
+        InitializeListHead(&Tracker->HashBuckets[i].ProcessList);
+        ExInitializePushLock(&Tracker->HashBuckets[i].Lock);
     }
 
     //
     // Initialize duplication tracking
     //
-    InitializeListHead(&Internal->DuplicationList);
-    ExInitializePushLock(&Internal->DuplicationLock);
-
-    //
-    // Initialize sensitive process tracking
-    //
-    InitializeListHead(&Internal->SensitiveProcessList);
-    ExInitializePushLock(&Internal->SensitiveProcessLock);
+    InitializeListHead(&Tracker->DuplicationList);
+    ExInitializePushLock(&Tracker->DuplicationLock);
 
     //
     // Initialize lookaside lists
     //
     ExInitializeNPagedLookasideList(
-        &Internal->HandleEntryLookaside,
+        &Tracker->HandleEntryLookaside,
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        sizeof(HT_HANDLE_ENTRY_INTERNAL),
+        sizeof(HT_HANDLE_ENTRY),
         HT_POOL_TAG_ENTRY,
         0
         );
 
     ExInitializeNPagedLookasideList(
-        &Internal->ProcessHandlesLookaside,
+        &Tracker->ProcessHandlesLookaside,
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        sizeof(HT_PROCESS_HANDLES_INTERNAL),
+        sizeof(HT_PROCESS_HANDLES),
         HT_POOL_TAG_PROCESS,
         0
         );
 
     ExInitializeNPagedLookasideList(
-        &Internal->DuplicationLookaside,
+        &Tracker->DuplicationLookaside,
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
@@ -592,33 +650,52 @@ Return Value:
         0
         );
 
-    Internal->LookasideInitialized = TRUE;
+    Tracker->LookasideInitialized = TRUE;
 
     //
-    // Initialize default configuration
+    // Apply configuration
     //
-    Internal->Config.EnableCrossProcessDetection = TRUE;
-    Internal->Config.EnableDuplicationTracking = TRUE;
-    Internal->Config.EnableSensitiveProcessMonitoring = TRUE;
-    Internal->Config.MaxHandlesPerProcess = HT_MAX_HANDLES_PER_PROCESS;
-    Internal->Config.MaxDuplications = HT_MAX_DUPLICATIONS_PER_PROCESS;
-    Internal->Config.SuspicionThreshold = 50;
+    if (Config != NULL) {
+        Tracker->Config = *Config;
+    } else {
+        Tracker->Config.EnableCrossProcessDetection = TRUE;
+        Tracker->Config.EnableDuplicationTracking = TRUE;
+        Tracker->Config.EnableSensitiveProcessMonitoring = TRUE;
+        Tracker->Config.MaxHandlesPerProcess = HT_MAX_HANDLES_PER_PROCESS;
+        Tracker->Config.MaxDuplications = HT_MAX_DUPLICATIONS;
+        Tracker->Config.SuspicionThreshold = 50;
+        Tracker->Config.CleanupIntervalMs = HT_DEFAULT_CLEANUP_INTERVAL_MS;
+        Tracker->Config.CacheTimeoutMs = HT_DEFAULT_CACHE_TIMEOUT_MS;
+    }
+
+    //
+    // Validate configuration limits
+    //
+    if (Tracker->Config.MaxHandlesPerProcess == 0) {
+        Tracker->Config.MaxHandlesPerProcess = HT_MAX_HANDLES_PER_PROCESS;
+    }
+    if (Tracker->Config.MaxDuplications == 0) {
+        Tracker->Config.MaxDuplications = HT_MAX_DUPLICATIONS;
+    }
+    if (Tracker->Config.CleanupIntervalMs < 1000) {
+        Tracker->Config.CleanupIntervalMs = HT_DEFAULT_CLEANUP_INTERVAL_MS;
+    }
 
     //
     // Initialize sensitive process list
     //
-    HtpInitializeSensitiveProcessList(Internal);
+    HtpInitializeSensitiveProcessList(Tracker);
 
     //
     // Initialize statistics
     //
-    KeQuerySystemTime(&Internal->Public.Stats.StartTime);
+    KeQuerySystemTime(&Tracker->Stats.StartTime);
 
     //
     // Initialize worker thread synchronization
     //
-    KeInitializeEvent(&Internal->ShutdownEvent, NotificationEvent, FALSE);
-    KeInitializeEvent(&Internal->WorkAvailableEvent, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&Tracker->ShutdownEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&Tracker->WorkAvailableEvent, SynchronizationEvent, FALSE);
 
     //
     // Create worker thread
@@ -631,139 +708,195 @@ Return Value:
         &ObjectAttributes,
         NULL,
         NULL,
-        HtpWorkerThread,
-        Internal
+        HtpWorkerThreadRoutine,
+        Tracker
         );
 
     if (!NT_SUCCESS(Status)) {
         goto Cleanup;
     }
 
+    //
+    // Get thread object reference
+    //
     Status = ObReferenceObjectByHandle(
         ThreadHandle,
         THREAD_ALL_ACCESS,
         *PsThreadType,
         KernelMode,
-        (PVOID*)&Internal->WorkerThread,
+        (PVOID*)&Tracker->WorkerThreadObject,
         NULL
         );
 
     ZwClose(ThreadHandle);
+    ThreadHandle = NULL;
 
     if (!NT_SUCCESS(Status)) {
+        //
+        // Signal thread to exit since it's running
+        //
+        InterlockedExchange(&Tracker->ShutdownRequested, 1);
+        KeSetEvent(&Tracker->ShutdownEvent, IO_NO_INCREMENT, FALSE);
         goto Cleanup;
     }
 
     //
     // Initialize cleanup timer
     //
-    KeInitializeTimer(&Internal->CleanupTimer);
-    KeInitializeDpc(&Internal->CleanupDpc, HtpCleanupTimerDpc, Internal);
+    KeInitializeTimer(&Tracker->CleanupTimer);
+    KeInitializeDpc(&Tracker->CleanupDpc, HtpCleanupDpcRoutine, Tracker);
 
     //
-    // Start cleanup timer (every 60 seconds)
+    // Start cleanup timer
     //
-    DueTime.QuadPart = -((LONGLONG)60000 * 10000);
+    DueTime.QuadPart = -((LONGLONG)Tracker->Config.CleanupIntervalMs * 10000);
     KeSetTimerEx(
-        &Internal->CleanupTimer,
+        &Tracker->CleanupTimer,
         DueTime,
-        60000,
-        &Internal->CleanupDpc
+        Tracker->Config.CleanupIntervalMs,
+        &Tracker->CleanupDpc
         );
-    Internal->CleanupTimerActive = TRUE;
+    InterlockedExchange(&Tracker->CleanupTimerActive, 1);
 
     //
     // Mark as initialized
     //
-    Internal->Public.Initialized = TRUE;
-    *Tracker = (PHT_TRACKER)Internal;
+    InterlockedExchange(&Tracker->Initialized, 1);
+    *OutTracker = Tracker;
 
     return STATUS_SUCCESS;
 
 Cleanup:
-    if (Internal->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&Internal->HandleEntryLookaside);
-        ExDeleteNPagedLookasideList(&Internal->ProcessHandlesLookaside);
-        ExDeleteNPagedLookasideList(&Internal->DuplicationLookaside);
-    }
-
-    ExFreePoolWithTag(Internal, HT_POOL_TAG);
-    return Status;
-}
-
-VOID
-HtShutdown(
-    _Inout_ PHT_TRACKER Tracker
-    )
-/*++
-Routine Description:
-    Shuts down the handle tracker subsystem.
-
-Arguments:
-    Tracker - Tracker instance to shutdown.
---*/
-{
-    PHT_TRACKER_INTERNAL Internal = (PHT_TRACKER_INTERNAL)Tracker;
-    PLIST_ENTRY Entry;
-    PHT_PROCESS_HANDLES_INTERNAL Handles;
-    PHT_DUPLICATION_RECORD DupRecord;
-    ULONG i;
-
-    if (Internal == NULL || !Internal->Public.Initialized) {
-        return;
-    }
-
-    Internal->Public.Initialized = FALSE;
-    Internal->ShutdownRequested = TRUE;
-
     //
-    // Cancel cleanup timer
+    // Wait for worker thread if it was created
     //
-    if (Internal->CleanupTimerActive) {
-        KeCancelTimer(&Internal->CleanupTimer);
-        Internal->CleanupTimerActive = FALSE;
-    }
-
-    //
-    // Signal worker thread to exit
-    //
-    KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
-    KeSetEvent(&Internal->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
-
-    if (Internal->WorkerThread != NULL) {
+    if (Tracker->WorkerThreadObject != NULL) {
+        InterlockedExchange(&Tracker->ShutdownRequested, 1);
+        KeSetEvent(&Tracker->ShutdownEvent, IO_NO_INCREMENT, FALSE);
         KeWaitForSingleObject(
-            Internal->WorkerThread,
+            Tracker->WorkerThreadObject,
             Executive,
             KernelMode,
             FALSE,
             NULL
             );
-        ObDereferenceObject(Internal->WorkerThread);
-        Internal->WorkerThread = NULL;
+        ObDereferenceObject(Tracker->WorkerThreadObject);
+    }
+
+    if (Tracker->LookasideInitialized) {
+        ExDeleteNPagedLookasideList(&Tracker->HandleEntryLookaside);
+        ExDeleteNPagedLookasideList(&Tracker->ProcessHandlesLookaside);
+        ExDeleteNPagedLookasideList(&Tracker->DuplicationLookaside);
+    }
+
+    if (Tracker->HashBuckets != NULL) {
+        ExFreePoolWithTag(Tracker->HashBuckets, HT_POOL_TAG);
+    }
+
+    ExFreePoolWithTag(Tracker, HT_POOL_TAG);
+    return Status;
+}
+
+_Use_decl_annotations_
+VOID
+HtShutdown(
+    PHT_TRACKER* TrackerPtr
+    )
+{
+    PHT_TRACKER Tracker;
+    PLIST_ENTRY Entry;
+    PHT_PROCESS_HANDLES Handles;
+    PHT_DUPLICATION_RECORD DupRecord;
+    ULONG i;
+
+    PAGED_CODE();
+
+    if (TrackerPtr == NULL || *TrackerPtr == NULL) {
+        return;
+    }
+
+    Tracker = *TrackerPtr;
+    *TrackerPtr = NULL;
+
+    if (!HtpIsValidTracker(Tracker)) {
+        return;
+    }
+
+    //
+    // Mark as not initialized to prevent new operations
+    //
+    InterlockedExchange(&Tracker->Initialized, 0);
+    InterlockedExchange(&Tracker->ShutdownRequested, 1);
+
+    //
+    // Wait for all outstanding operations to complete
+    //
+    ExWaitForRundownProtectionRelease(&Tracker->RundownRef);
+
+    //
+    // Cancel cleanup timer
+    //
+    if (InterlockedExchange(&Tracker->CleanupTimerActive, 0)) {
+        KeCancelTimer(&Tracker->CleanupTimer);
+        KeFlushQueuedDpcs();
+    }
+
+    //
+    // Signal worker thread to exit and wait
+    //
+    KeSetEvent(&Tracker->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(&Tracker->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
+
+    if (Tracker->WorkerThreadObject != NULL) {
+        KeWaitForSingleObject(
+            Tracker->WorkerThreadObject,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
+        ObDereferenceObject(Tracker->WorkerThreadObject);
+        Tracker->WorkerThreadObject = NULL;
     }
 
     //
     // Free all process handles from hash table
     //
-    for (i = 0; i < HT_HASH_BUCKET_COUNT; i++) {
+    for (i = 0; i < Tracker->HashBucketCount; i++) {
         KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Internal->HashBuckets[i].Lock);
+        ExAcquirePushLockExclusive(&Tracker->HashBuckets[i].Lock);
 
-        while (!IsListEmpty(&Internal->HashBuckets[i].ProcessList)) {
-            Entry = RemoveHeadList(&Internal->HashBuckets[i].ProcessList);
-            Handles = CONTAINING_RECORD(Entry, HT_PROCESS_HANDLES_INTERNAL, HashEntry);
+        while (!IsListEmpty(&Tracker->HashBuckets[i].ProcessList)) {
+            Entry = RemoveHeadList(&Tracker->HashBuckets[i].ProcessList);
+            Handles = CONTAINING_RECORD(Entry, HT_PROCESS_HANDLES, HashEntry);
             Handles->InHashTable = FALSE;
+            InterlockedDecrement(&Tracker->HashBuckets[i].Count);
 
-            ExReleasePushLockExclusive(&Internal->HashBuckets[i].Lock);
+            ExReleasePushLockExclusive(&Tracker->HashBuckets[i].Lock);
             KeLeaveCriticalRegion();
 
-            HtpFreeProcessHandlesInternal(Internal, Handles);
+            //
+            // Free all handle entries
+            //
+            HtpFreeAllHandleEntries(Tracker, Handles);
+
+            //
+            // Free process object reference
+            //
+            if (Handles->ProcessObject != NULL) {
+                ObDereferenceObject(Handles->ProcessObject);
+            }
+
+            //
+            // Return to lookaside list
+            //
+            ExFreeToNPagedLookasideList(&Tracker->ProcessHandlesLookaside, Handles);
 
             KeEnterCriticalRegion();
-            ExAcquirePushLockExclusive(&Internal->HashBuckets[i].Lock);
+            ExAcquirePushLockExclusive(&Tracker->HashBuckets[i].Lock);
         }
 
-        ExReleasePushLockExclusive(&Internal->HashBuckets[i].Lock);
+        ExReleasePushLockExclusive(&Tracker->HashBuckets[i].Lock);
         KeLeaveCriticalRegion();
     }
 
@@ -771,166 +904,252 @@ Arguments:
     // Free all duplication records
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Internal->DuplicationLock);
+    ExAcquirePushLockExclusive(&Tracker->DuplicationLock);
 
-    while (!IsListEmpty(&Internal->DuplicationList)) {
-        Entry = RemoveHeadList(&Internal->DuplicationList);
+    while (!IsListEmpty(&Tracker->DuplicationList)) {
+        Entry = RemoveHeadList(&Tracker->DuplicationList);
         DupRecord = CONTAINING_RECORD(Entry, HT_DUPLICATION_RECORD, ListEntry);
+        InterlockedDecrement(&Tracker->DuplicationCount);
 
-        ExReleasePushLockExclusive(&Internal->DuplicationLock);
+        ExReleasePushLockExclusive(&Tracker->DuplicationLock);
         KeLeaveCriticalRegion();
 
-        HtpFreeDuplicationRecord(Internal, DupRecord);
+        ExFreeToNPagedLookasideList(&Tracker->DuplicationLookaside, DupRecord);
 
         KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Internal->DuplicationLock);
+        ExAcquirePushLockExclusive(&Tracker->DuplicationLock);
     }
 
-    ExReleasePushLockExclusive(&Internal->DuplicationLock);
+    ExReleasePushLockExclusive(&Tracker->DuplicationLock);
     KeLeaveCriticalRegion();
 
     //
     // Delete lookaside lists
     //
-    if (Internal->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&Internal->HandleEntryLookaside);
-        ExDeleteNPagedLookasideList(&Internal->ProcessHandlesLookaside);
-        ExDeleteNPagedLookasideList(&Internal->DuplicationLookaside);
+    if (Tracker->LookasideInitialized) {
+        ExDeleteNPagedLookasideList(&Tracker->HandleEntryLookaside);
+        ExDeleteNPagedLookasideList(&Tracker->ProcessHandlesLookaside);
+        ExDeleteNPagedLookasideList(&Tracker->DuplicationLookaside);
     }
 
     //
-    // Free tracker
+    // Free hash buckets
     //
-    ExFreePoolWithTag(Internal, HT_POOL_TAG);
+    if (Tracker->HashBuckets != NULL) {
+        ExFreePoolWithTag(Tracker->HashBuckets, HT_POOL_TAG);
+    }
+
+    //
+    // Invalidate signature and free tracker
+    //
+    Tracker->Signature = 0;
+    ExFreePoolWithTag(Tracker, HT_POOL_TAG);
 }
 
+_Use_decl_annotations_
 NTSTATUS
 HtSnapshotHandles(
-    _In_ PHT_TRACKER Tracker,
-    _In_ HANDLE ProcessId,
-    _Out_ PHT_PROCESS_HANDLES* Handles
+    PHT_TRACKER Tracker,
+    HANDLE ProcessId,
+    PHT_PROCESS_HANDLES* OutHandles
     )
-/*++
-Routine Description:
-    Takes a snapshot of all handles for a process.
-
-Arguments:
-    Tracker - Tracker instance.
-    ProcessId - Process to snapshot.
-    Handles - Receives handle snapshot.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
-    PHT_TRACKER_INTERNAL Internal = (PHT_TRACKER_INTERNAL)Tracker;
-    PHT_PROCESS_HANDLES_INTERNAL InternalHandles = NULL;
     NTSTATUS Status;
+    PHT_PROCESS_HANDLES Handles = NULL;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Handles == NULL) {
+    PAGED_CODE();
+
+    if (!HtpIsValidTracker(Tracker) || OutHandles == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    *Handles = NULL;
+    *OutHandles = NULL;
+
+    //
+    // Acquire rundown protection
+    //
+    if (!HtpAcquireRundownProtection(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     //
     // Allocate process handles structure
     //
-    InternalHandles = HtpAllocateProcessHandles(Internal, ProcessId);
-    if (InternalHandles == NULL) {
+    Handles = HtpAllocateProcessHandles(Tracker, ProcessId);
+    if (Handles == NULL) {
+        HtpReleaseRundownProtection(Tracker);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Enumerate handles
+    // Enumerate handles (this is the expensive operation)
     //
-    Status = HtpEnumerateProcessHandles(Internal, ProcessId, InternalHandles);
+    Status = HtpEnumerateProcessHandles(Tracker, ProcessId, Handles);
     if (!NT_SUCCESS(Status)) {
-        HtpFreeProcessHandlesInternal(Internal, InternalHandles);
+        HtpDereferenceProcessHandles(Tracker, Handles);
+        HtpReleaseRundownProtection(Tracker);
         return Status;
     }
 
     //
     // Update statistics
     //
-    InterlockedIncrement64(&Internal->ExtendedStats.TotalEnumerations);
-    InterlockedAdd64(&Internal->Public.Stats.HandlesTracked, InternalHandles->Public.HandleCount);
+    InterlockedIncrement64(&Tracker->Stats.TotalEnumerations);
+    InterlockedAdd64(&Tracker->Stats.HandlesTracked, Handles->HandleCount);
 
-    if (InternalHandles->CrossProcessHandleCount > 0) {
-        InterlockedAdd64(&Internal->Public.Stats.CrossProcessHandles, InternalHandles->CrossProcessHandleCount);
+    if (Handles->CrossProcessHandleCount > 0) {
+        InterlockedAdd64(&Tracker->Stats.CrossProcessHandles, Handles->CrossProcessHandleCount);
     }
 
-    if (InternalHandles->Public.AggregatedSuspicion != HtSuspicion_None) {
-        InterlockedIncrement64(&Internal->Public.Stats.SuspiciousHandles);
+    if (Handles->AggregatedSuspicion != HtSuspicion_None) {
+        InterlockedIncrement64(&Tracker->Stats.SuspiciousHandles);
     }
 
     //
-    // Add to tracker list
+    // Insert into hash table for caching
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Internal->Public.ProcessLock);
-    InsertTailList(&Internal->Public.ProcessList, &InternalHandles->Public.ListEntry);
-    InterlockedIncrement(&Internal->Public.ProcessCount);
-    ExReleasePushLockExclusive(&Internal->Public.ProcessLock);
-    KeLeaveCriticalRegion();
+    HtpInsertProcessHandles(Tracker, Handles);
 
-    //
-    // Insert into hash table
-    //
-    HtpInsertProcessHandles(Internal, InternalHandles);
+    *OutHandles = Handles;
 
-    *Handles = &InternalHandles->Public;
+    HtpReleaseRundownProtection(Tracker);
+    return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+HtGetHandlesInfo(
+    PHT_PROCESS_HANDLES Handles,
+    PHT_PROCESS_HANDLES_INFO Info
+    )
+{
+    if (!HtpIsValidProcessHandles(Handles) || Info == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Info, sizeof(HT_PROCESS_HANDLES_INFO));
+
+    Info->ProcessId = Handles->ProcessId;
+    Info->HandleCount = Handles->HandleCount;
+    Info->AggregatedSuspicion = Handles->AggregatedSuspicion;
+    Info->SuspicionScore = Handles->SuspicionScore;
+    Info->ProcessHandleCount = Handles->ProcessHandleCount;
+    Info->ThreadHandleCount = Handles->ThreadHandleCount;
+    Info->FileHandleCount = Handles->FileHandleCount;
+    Info->TokenHandleCount = Handles->TokenHandleCount;
+    Info->SectionHandleCount = Handles->SectionHandleCount;
+    Info->OtherHandleCount = Handles->OtherHandleCount;
+    Info->CrossProcessHandleCount = Handles->CrossProcessHandleCount;
+    Info->HighPrivilegeHandleCount = Handles->HighPrivilegeHandleCount;
+    Info->SnapshotTime = Handles->SnapshotTime;
 
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
-HtRecordDuplication(
-    _In_ PHT_TRACKER Tracker,
-    _In_ HANDLE SourceProcess,
-    _In_ HANDLE TargetProcess,
-    _In_ HANDLE SourceHandle,
-    _In_ HANDLE TargetHandle
+HtGetHandleByIndex(
+    PHT_PROCESS_HANDLES Handles,
+    ULONG Index,
+    PHT_HANDLE_INFO Info
     )
-/*++
-Routine Description:
-    Records a handle duplication event.
-
-Arguments:
-    Tracker - Tracker instance.
-    SourceProcess - Source process ID.
-    TargetProcess - Target process ID.
-    SourceHandle - Source handle value.
-    TargetHandle - Target handle value (in target process).
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
-    PHT_TRACKER_INTERNAL Internal = (PHT_TRACKER_INTERNAL)Tracker;
-    PHT_DUPLICATION_RECORD Record = NULL;
-    HT_SUSPICION Suspicion = HtSuspicion_None;
+    PLIST_ENTRY Entry;
+    PHT_HANDLE_ENTRY HandleEntry;
+    ULONG CurrentIndex = 0;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    if (!HtpIsValidProcessHandles(Handles) || Info == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!Internal->Config.EnableDuplicationTracking) {
+    RtlZeroMemory(Info, sizeof(HT_HANDLE_INFO));
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Handles->Lock);
+
+    for (Entry = Handles->HandleList.Flink;
+         Entry != &Handles->HandleList;
+         Entry = Entry->Flink) {
+
+        if (CurrentIndex == Index) {
+            HandleEntry = CONTAINING_RECORD(Entry, HT_HANDLE_ENTRY, ListEntry);
+
+            Info->HandleValue = HandleEntry->HandleValue;
+            Info->Type = HandleEntry->Type;
+            Info->GrantedAccess = HandleEntry->GrantedAccess;
+            Info->TargetProcessId = HandleEntry->TargetProcessId;
+            Info->IsDuplicated = HandleEntry->IsDuplicated;
+            Info->DuplicatedFromProcess = HandleEntry->DuplicatedFromProcess;
+            Info->SuspicionFlags = HandleEntry->SuspicionFlags;
+            Info->SuspicionScore = HandleEntry->SuspicionScore;
+            Info->ObjectNameLength = HandleEntry->ObjectNameLength;
+
+            if (HandleEntry->ObjectNameLength > 0) {
+                RtlCopyMemory(
+                    Info->ObjectName,
+                    HandleEntry->ObjectName,
+                    min(HandleEntry->ObjectNameLength, sizeof(Info->ObjectName) - sizeof(WCHAR))
+                    );
+            }
+
+            ExReleasePushLockShared(&Handles->Lock);
+            KeLeaveCriticalRegion();
+            return STATUS_SUCCESS;
+        }
+
+        CurrentIndex++;
+    }
+
+    ExReleasePushLockShared(&Handles->Lock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_NO_MORE_ENTRIES;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+HtRecordDuplication(
+    PHT_TRACKER Tracker,
+    HANDLE SourceProcess,
+    HANDLE TargetProcess,
+    HANDLE SourceHandle,
+    HANDLE TargetHandle,
+    ACCESS_MASK GrantedAccess,
+    HT_HANDLE_TYPE HandleType
+    )
+{
+    PHT_DUPLICATION_RECORD Record = NULL;
+    HT_SUSPICION Suspicion = HtSuspicion_None;
+
+    if (!HtpIsValidTracker(Tracker)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!Tracker->Config.EnableDuplicationTracking) {
         return STATUS_SUCCESS;
+    }
+
+    //
+    // Acquire rundown protection
+    //
+    if (!HtpAcquireRundownProtection(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
     // Check duplication limit
     //
-    if ((ULONG)Internal->DuplicationCount >= Internal->Config.MaxDuplications) {
+    if ((ULONG)Tracker->DuplicationCount >= Tracker->Config.MaxDuplications) {
+        HtpReleaseRundownProtection(Tracker);
         return STATUS_QUOTA_EXCEEDED;
     }
 
     //
     // Allocate duplication record
     //
-    Record = HtpAllocateDuplicationRecord(Internal);
+    Record = HtpAllocateDuplicationRecord(Tracker);
     if (Record == NULL) {
+        HtpReleaseRundownProtection(Tracker);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -941,6 +1160,8 @@ Return Value:
     Record->TargetProcessId = TargetProcess;
     Record->SourceHandle = SourceHandle;
     Record->TargetHandle = TargetHandle;
+    Record->GrantedAccess = GrantedAccess;
+    Record->HandleType = HandleType;
     KeQuerySystemTime(&Record->Timestamp);
 
     //
@@ -951,8 +1172,12 @@ Return Value:
         Suspicion |= HtSuspicion_DuplicatedIn;
     }
 
-    if (HtpIsSensitiveProcess(Internal, SourceProcess)) {
-        Suspicion |= HtSuspicion_SensitiveTarget;
+    if (HandleType == HtType_Process && HtpIsInjectionCapableAccess(GrantedAccess)) {
+        Suspicion |= HtSuspicion_InjectionCapable;
+    }
+
+    if (HandleType == HtType_Token && (GrantedAccess & HT_TOKEN_STEAL_ACCESS)) {
+        Suspicion |= HtSuspicion_TokenSteal;
     }
 
     Record->SuspicionFlags = Suspicion;
@@ -961,61 +1186,59 @@ Return Value:
     // Insert into duplication list
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Internal->DuplicationLock);
-    InsertTailList(&Internal->DuplicationList, &Record->ListEntry);
-    InterlockedIncrement(&Internal->DuplicationCount);
-    ExReleasePushLockExclusive(&Internal->DuplicationLock);
+    ExAcquirePushLockExclusive(&Tracker->DuplicationLock);
+    InsertTailList(&Tracker->DuplicationList, &Record->ListEntry);
+    InterlockedIncrement(&Tracker->DuplicationCount);
+    ExReleasePushLockExclusive(&Tracker->DuplicationLock);
     KeLeaveCriticalRegion();
 
     //
     // Update statistics
     //
-    InterlockedIncrement64(&Internal->ExtendedStats.DuplicationsRecorded);
+    InterlockedIncrement64(&Tracker->Stats.DuplicationsRecorded);
 
     if (Suspicion != HtSuspicion_None) {
-        InterlockedIncrement64(&Internal->Public.Stats.SuspiciousHandles);
+        InterlockedIncrement64(&Tracker->Stats.SuspiciousHandles);
     }
 
+    HtpReleaseRundownProtection(Tracker);
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 HtAnalyzeHandles(
-    _In_ PHT_TRACKER Tracker,
-    _In_ PHT_PROCESS_HANDLES Handles,
-    _Out_ PHT_SUSPICION Flags
+    PHT_TRACKER Tracker,
+    PHT_PROCESS_HANDLES Handles,
+    HT_SUSPICION* Flags,
+    PULONG Score
     )
-/*++
-Routine Description:
-    Analyzes handles for suspicious patterns.
-
-Arguments:
-    Tracker - Tracker instance.
-    Handles - Handle snapshot to analyze.
-    Flags - Receives aggregated suspicion flags.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
-    PHT_TRACKER_INTERNAL Internal = (PHT_TRACKER_INTERNAL)Tracker;
-    PHT_PROCESS_HANDLES_INTERNAL InternalHandles;
-    HT_SUSPICION AggregatedSuspicion = HtSuspicion_None;
     PLIST_ENTRY Entry;
     PHT_HANDLE_ENTRY HandleEntry;
+    HT_SUSPICION AggregatedSuspicion = HtSuspicion_None;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Handles == NULL || Flags == NULL) {
+    if (!HtpIsValidTracker(Tracker) || !HtpIsValidProcessHandles(Handles) || Flags == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Flags = HtSuspicion_None;
-
-    InternalHandles = CONTAINING_RECORD(Handles, HT_PROCESS_HANDLES_INTERNAL, Public);
+    if (Score != NULL) {
+        *Score = 0;
+    }
 
     //
-    // Analyze each handle
+    // Acquire rundown protection
     //
-    KeAcquireSpinLockAtDpcLevel(&Handles->Lock);
+    if (!HtpAcquireRundownProtection(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Aggregate suspicion from all handles
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Handles->Lock);
 
     for (Entry = Handles->HandleList.Flink;
          Entry != &Handles->HandleList;
@@ -1025,90 +1248,90 @@ Return Value:
         AggregatedSuspicion |= HandleEntry->SuspicionFlags;
     }
 
-    KeReleaseSpinLockFromDpcLevel(&Handles->Lock);
+    ExReleasePushLockShared(&Handles->Lock);
+    KeLeaveCriticalRegion();
 
     //
     // Check for many handles (potential handle table attack)
     //
-    if ((ULONG)Handles->HandleCount > Internal->Config.MaxHandlesPerProcess / 2) {
+    if ((ULONG)Handles->HandleCount > Tracker->Config.MaxHandlesPerProcess / 2) {
         AggregatedSuspicion |= HtSuspicion_ManyHandles;
     }
 
     //
-    // Update aggregated suspicion
+    // Update handle structure
     //
     Handles->AggregatedSuspicion = AggregatedSuspicion;
-    InternalHandles->SuspicionScore = HtpCalculateSuspicionScore(AggregatedSuspicion);
+    Handles->SuspicionScore = HtpCalculateSuspicionScore(AggregatedSuspicion);
 
     *Flags = AggregatedSuspicion;
+    if (Score != NULL) {
+        *Score = Handles->SuspicionScore;
+    }
 
+    HtpReleaseRundownProtection(Tracker);
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 HtFindCrossProcessHandles(
-    _In_ PHT_TRACKER Tracker,
-    _In_ HANDLE TargetProcessId,
-    _Out_writes_to_(Max, *Count) PHT_HANDLE_ENTRY* Entries,
-    _In_ ULONG Max,
-    _Out_ PULONG Count
+    PHT_TRACKER Tracker,
+    HANDLE TargetProcessId,
+    PHT_HANDLE_INFO Entries,
+    ULONG MaxEntries,
+    PULONG Count
     )
-/*++
-Routine Description:
-    Finds all handles in other processes that reference the target process.
-
-Arguments:
-    Tracker - Tracker instance.
-    TargetProcessId - Target process to find handles for.
-    Entries - Array to receive handle entries.
-    Max - Maximum entries to return.
-    Count - Receives actual count.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
-    PHT_TRACKER_INTERNAL Internal = (PHT_TRACKER_INTERNAL)Tracker;
+    NTSTATUS Status = STATUS_SUCCESS;
     PLIST_ENTRY ProcessEntry, HandleEntry;
-    PHT_PROCESS_HANDLES_INTERNAL ProcessHandles;
+    PHT_PROCESS_HANDLES ProcessHandles;
     PHT_HANDLE_ENTRY Entry;
     ULONG FoundCount = 0;
     ULONG i;
 
-    if (Internal == NULL || !Internal->Public.Initialized ||
-        Entries == NULL || Count == NULL) {
+    PAGED_CODE();
+
+    if (!HtpIsValidTracker(Tracker) || Entries == NULL || Count == NULL || MaxEntries == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Count = 0;
 
     //
-    // Search all process handle lists
+    // Acquire rundown protection
     //
-    for (i = 0; i < HT_HASH_BUCKET_COUNT && FoundCount < Max; i++) {
-        KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&Internal->HashBuckets[i].Lock);
+    if (!HtpAcquireRundownProtection(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
-        for (ProcessEntry = Internal->HashBuckets[i].ProcessList.Flink;
-             ProcessEntry != &Internal->HashBuckets[i].ProcessList && FoundCount < Max;
+    //
+    // Search all hash buckets
+    //
+    for (i = 0; i < Tracker->HashBucketCount && FoundCount < MaxEntries; i++) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Tracker->HashBuckets[i].Lock);
+
+        for (ProcessEntry = Tracker->HashBuckets[i].ProcessList.Flink;
+             ProcessEntry != &Tracker->HashBuckets[i].ProcessList && FoundCount < MaxEntries;
              ProcessEntry = ProcessEntry->Flink) {
 
-            ProcessHandles = CONTAINING_RECORD(ProcessEntry, HT_PROCESS_HANDLES_INTERNAL, HashEntry);
+            ProcessHandles = CONTAINING_RECORD(ProcessEntry, HT_PROCESS_HANDLES, HashEntry);
 
             //
             // Skip if this is the target process itself
             //
-            if (ProcessHandles->Public.ProcessId == TargetProcessId) {
+            if (ProcessHandles->ProcessId == TargetProcessId) {
                 continue;
             }
 
             //
             // Search this process's handles
             //
-            KeAcquireSpinLockAtDpcLevel(&ProcessHandles->Public.Lock);
+            ExAcquirePushLockShared(&ProcessHandles->Lock);
 
-            for (HandleEntry = ProcessHandles->Public.HandleList.Flink;
-                 HandleEntry != &ProcessHandles->Public.HandleList && FoundCount < Max;
+            for (HandleEntry = ProcessHandles->HandleList.Flink;
+                 HandleEntry != &ProcessHandles->HandleList && FoundCount < MaxEntries;
                  HandleEntry = HandleEntry->Flink) {
 
                 Entry = CONTAINING_RECORD(HandleEntry, HT_HANDLE_ENTRY, ListEntry);
@@ -1117,84 +1340,131 @@ Return Value:
                 // Check if this handle references the target process
                 //
                 if (Entry->TargetProcessId == TargetProcessId) {
-                    Entries[FoundCount++] = Entry;
+                    PHT_HANDLE_INFO Info = &Entries[FoundCount];
+
+                    Info->HandleValue = Entry->HandleValue;
+                    Info->Type = Entry->Type;
+                    Info->GrantedAccess = Entry->GrantedAccess;
+                    Info->TargetProcessId = Entry->TargetProcessId;
+                    Info->IsDuplicated = Entry->IsDuplicated;
+                    Info->DuplicatedFromProcess = Entry->DuplicatedFromProcess;
+                    Info->SuspicionFlags = Entry->SuspicionFlags;
+                    Info->SuspicionScore = Entry->SuspicionScore;
+                    Info->ObjectNameLength = Entry->ObjectNameLength;
+
+                    if (Entry->ObjectNameLength > 0) {
+                        RtlCopyMemory(
+                            Info->ObjectName,
+                            Entry->ObjectName,
+                            min(Entry->ObjectNameLength, sizeof(Info->ObjectName) - sizeof(WCHAR))
+                            );
+                    }
+
+                    FoundCount++;
                 }
             }
 
-            KeReleaseSpinLockFromDpcLevel(&ProcessHandles->Public.Lock);
+            ExReleasePushLockShared(&ProcessHandles->Lock);
         }
 
-        ExReleasePushLockShared(&Internal->HashBuckets[i].Lock);
+        ExReleasePushLockShared(&Tracker->HashBuckets[i].Lock);
         KeLeaveCriticalRegion();
     }
 
     *Count = FoundCount;
 
-    return STATUS_SUCCESS;
+    //
+    // Check if we hit the limit (more entries may exist)
+    //
+    if (FoundCount == MaxEntries) {
+        Status = STATUS_BUFFER_TOO_SMALL;
+    }
+
+    HtpReleaseRundownProtection(Tracker);
+    return Status;
 }
 
+_Use_decl_annotations_
 VOID
-HtFreeHandles(
-    _In_ PHT_PROCESS_HANDLES Handles
+HtReleaseHandles(
+    PHT_TRACKER Tracker,
+    PHT_PROCESS_HANDLES Handles
     )
-/*++
-Routine Description:
-    Frees a process handles snapshot.
-
-Arguments:
-    Handles - Handles to free.
---*/
 {
-    PHT_PROCESS_HANDLES_INTERNAL InternalHandles;
-    PLIST_ENTRY Entry;
-    PHT_HANDLE_ENTRY_INTERNAL HandleEntry;
-    KIRQL OldIrql;
-
-    if (Handles == NULL) {
+    if (!HtpIsValidTracker(Tracker) || !HtpIsValidProcessHandles(Handles)) {
         return;
     }
 
-    InternalHandles = CONTAINING_RECORD(Handles, HT_PROCESS_HANDLES_INTERNAL, Public);
+    //
+    // Remove from hash table first
+    //
+    HtpRemoveProcessHandles(Tracker, Handles);
 
     //
-    // Free all handle entries
+    // Dereference (will free when refcount hits zero)
     //
-    KeAcquireSpinLock(&Handles->Lock, &OldIrql);
+    HtpDereferenceProcessHandles(Tracker, Handles);
+}
 
-    while (!IsListEmpty(&Handles->HandleList)) {
-        Entry = RemoveHeadList(&Handles->HandleList);
-        HandleEntry = CONTAINING_RECORD(Entry, HT_HANDLE_ENTRY_INTERNAL, Public.ListEntry);
-        InterlockedDecrement(&Handles->HandleCount);
-
-        KeReleaseSpinLock(&Handles->Lock, OldIrql);
-
-        //
-        // Free string buffer if allocated
-        //
-        if (HandleEntry->Public.ObjectName.Buffer != NULL &&
-            HandleEntry->Public.ObjectName.Buffer != HandleEntry->ObjectNameBuffer) {
-            ExFreePoolWithTag(HandleEntry->Public.ObjectName.Buffer, HT_POOL_TAG_STRING);
-        }
-
-        ExFreePoolWithTag(HandleEntry, HT_POOL_TAG_ENTRY);
-
-        KeAcquireSpinLock(&Handles->Lock, &OldIrql);
-    }
-
-    KeReleaseSpinLock(&Handles->Lock, OldIrql);
-
-    //
-    // Free process object reference
-    //
-    if (InternalHandles->ProcessObject != NULL) {
-        ObDereferenceObject(InternalHandles->ProcessObject);
-        InternalHandles->ProcessObject = NULL;
+_Use_decl_annotations_
+NTSTATUS
+HtGetStatistics(
+    PHT_TRACKER Tracker,
+    PHT_STATISTICS Stats
+    )
+{
+    if (Tracker == NULL || Tracker->Signature != HT_SIGNATURE || Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Free process handles structure
+    // Copy statistics (all fields are volatile, so this is safe at any IRQL)
     //
-    ExFreePoolWithTag(InternalHandles, HT_POOL_TAG_PROCESS);
+    Stats->HandlesTracked = Tracker->Stats.HandlesTracked;
+    Stats->SuspiciousHandles = Tracker->Stats.SuspiciousHandles;
+    Stats->CrossProcessHandles = Tracker->Stats.CrossProcessHandles;
+    Stats->TotalEnumerations = Tracker->Stats.TotalEnumerations;
+    Stats->DuplicationsRecorded = Tracker->Stats.DuplicationsRecorded;
+    Stats->SensitiveAccessDetected = Tracker->Stats.SensitiveAccessDetected;
+    Stats->HighPrivilegeHandles = Tracker->Stats.HighPrivilegeHandles;
+    Stats->TokenHandlesTracked = Tracker->Stats.TokenHandlesTracked;
+    Stats->InjectionHandlesDetected = Tracker->Stats.InjectionHandlesDetected;
+    Stats->StartTime = Tracker->Stats.StartTime;
+
+    return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+HtIsSensitiveProcess(
+    PHT_TRACKER Tracker,
+    HANDLE ProcessId,
+    PBOOLEAN IsSensitive
+    )
+{
+    PAGED_CODE();
+
+    if (!HtpIsValidTracker(Tracker) || IsSensitive == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *IsSensitive = FALSE;
+
+    if (!Tracker->Config.EnableSensitiveProcessMonitoring) {
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Acquire rundown protection
+    //
+    if (!HtpAcquireRundownProtection(Tracker)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    *IsSensitive = HtpIsSensitiveProcessInternal(Tracker, ProcessId);
+
+    HtpReleaseRundownProtection(Tracker);
+    return STATUS_SUCCESS;
 }
 
 // ============================================================================
@@ -1208,6 +1478,9 @@ HtpHashProcessId(
 {
     ULONG_PTR Value = (ULONG_PTR)ProcessId;
 
+    //
+    // MurmurHash3 finalizer
+    //
     Value ^= (Value >> 16);
     Value *= 0x85ebca6b;
     Value ^= (Value >> 13);
@@ -1220,45 +1493,42 @@ HtpHashProcessId(
 static ULONG
 HtpHashString(
     _In_ PCWSTR String,
-    _In_ ULONG Length
+    _In_ ULONG CharCount
     )
 {
     ULONG Hash = 5381;
     ULONG i;
 
-    for (i = 0; i < Length && String[i] != L'\0'; i++) {
+    for (i = 0; i < CharCount && String[i] != L'\0'; i++) {
         WCHAR Ch = String[i];
+
+        //
+        // Case-insensitive hash
+        //
         if (Ch >= L'A' && Ch <= L'Z') {
             Ch += (L'a' - L'A');
         }
+
         Hash = ((Hash << 5) + Hash) + (ULONG)Ch;
     }
 
     return Hash;
 }
 
-static PHT_HANDLE_ENTRY_INTERNAL
+static PHT_HANDLE_ENTRY
 HtpAllocateHandleEntry(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     )
 {
-    PHT_HANDLE_ENTRY_INTERNAL Entry;
+    PHT_HANDLE_ENTRY Entry;
 
-    Entry = (PHT_HANDLE_ENTRY_INTERNAL)ExAllocateFromNPagedLookasideList(
+    Entry = (PHT_HANDLE_ENTRY)ExAllocateFromNPagedLookasideList(
         &Tracker->HandleEntryLookaside
         );
 
     if (Entry != NULL) {
-        RtlZeroMemory(Entry, sizeof(HT_HANDLE_ENTRY_INTERNAL));
-        InitializeListHead(&Entry->Public.ListEntry);
-
-        Entry->Public.ObjectName.Buffer = Entry->ObjectNameBuffer;
-        Entry->Public.ObjectName.Length = 0;
-        Entry->Public.ObjectName.MaximumLength = sizeof(Entry->ObjectNameBuffer);
-
-        Entry->TargetImagePath.Buffer = Entry->TargetImagePathBuffer;
-        Entry->TargetImagePath.Length = 0;
-        Entry->TargetImagePath.MaximumLength = sizeof(Entry->TargetImagePathBuffer);
+        RtlZeroMemory(Entry, sizeof(HT_HANDLE_ENTRY));
+        InitializeListHead(&Entry->ListEntry);
     }
 
     return Entry;
@@ -1266,48 +1536,40 @@ HtpAllocateHandleEntry(
 
 static VOID
 HtpFreeHandleEntry(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_HANDLE_ENTRY_INTERNAL Entry
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_HANDLE_ENTRY Entry
     )
 {
-    if (Entry->Public.ObjectName.Buffer != NULL &&
-        Entry->Public.ObjectName.Buffer != Entry->ObjectNameBuffer) {
-        ExFreePoolWithTag(Entry->Public.ObjectName.Buffer, HT_POOL_TAG_STRING);
-    }
-
     ExFreeToNPagedLookasideList(&Tracker->HandleEntryLookaside, Entry);
 }
 
-static PHT_PROCESS_HANDLES_INTERNAL
+static PHT_PROCESS_HANDLES
 HtpAllocateProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+    _In_ PHT_TRACKER Tracker,
     _In_ HANDLE ProcessId
     )
 {
-    PHT_PROCESS_HANDLES_INTERNAL Handles;
+    PHT_PROCESS_HANDLES Handles;
     NTSTATUS Status;
     PEPROCESS Process = NULL;
 
-    Handles = (PHT_PROCESS_HANDLES_INTERNAL)ExAllocateFromNPagedLookasideList(
+    Handles = (PHT_PROCESS_HANDLES)ExAllocateFromNPagedLookasideList(
         &Tracker->ProcessHandlesLookaside
         );
 
     if (Handles != NULL) {
-        RtlZeroMemory(Handles, sizeof(HT_PROCESS_HANDLES_INTERNAL));
+        RtlZeroMemory(Handles, sizeof(HT_PROCESS_HANDLES));
 
-        Handles->Public.ProcessId = ProcessId;
+        Handles->Signature = HT_SIGNATURE;
         Handles->RefCount = 1;
-        InitializeListHead(&Handles->Public.HandleList);
-        KeInitializeSpinLock(&Handles->Public.Lock);
-        InitializeListHead(&Handles->Public.ListEntry);
+        Handles->ProcessId = ProcessId;
+        InitializeListHead(&Handles->HandleList);
+        ExInitializePushLock(&Handles->Lock);
         InitializeListHead(&Handles->HashEntry);
-
-        Handles->ImagePath.Buffer = Handles->ImagePathBuffer;
-        Handles->ImagePath.Length = 0;
-        Handles->ImagePath.MaximumLength = sizeof(Handles->ImagePathBuffer);
+        InitializeListHead(&Handles->GlobalEntry);
 
         //
-        // Get process object
+        // Get process object reference (for lifetime management)
         //
         Status = PsLookupProcessByProcessId(ProcessId, &Process);
         if (NT_SUCCESS(Status)) {
@@ -1321,45 +1583,83 @@ HtpAllocateProcessHandles(
 }
 
 static VOID
-HtpFreeProcessHandlesInternal(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_PROCESS_HANDLES_INTERNAL Handles
+HtpReferenceProcessHandles(
+    _Inout_ PHT_PROCESS_HANDLES Handles
+    )
+{
+    InterlockedIncrement(&Handles->RefCount);
+}
+
+static VOID
+HtpDereferenceProcessHandles(
+    _In_ PHT_TRACKER Tracker,
+    _Inout_ PHT_PROCESS_HANDLES Handles
+    )
+{
+    LONG NewRefCount;
+
+    NewRefCount = InterlockedDecrement(&Handles->RefCount);
+    NT_ASSERT(NewRefCount >= 0);
+
+    if (NewRefCount == 0) {
+        //
+        // Free all handle entries
+        //
+        HtpFreeAllHandleEntries(Tracker, Handles);
+
+        //
+        // Free process object reference
+        //
+        if (Handles->ProcessObject != NULL) {
+            ObDereferenceObject(Handles->ProcessObject);
+            Handles->ProcessObject = NULL;
+        }
+
+        //
+        // Invalidate signature
+        //
+        Handles->Signature = 0;
+
+        //
+        // Return to lookaside list
+        //
+        ExFreeToNPagedLookasideList(&Tracker->ProcessHandlesLookaside, Handles);
+    }
+}
+
+static VOID
+HtpFreeAllHandleEntries(
+    _In_ PHT_TRACKER Tracker,
+    _Inout_ PHT_PROCESS_HANDLES Handles
     )
 {
     PLIST_ENTRY Entry;
-    PHT_HANDLE_ENTRY_INTERNAL HandleEntry;
-    KIRQL OldIrql;
+    PHT_HANDLE_ENTRY HandleEntry;
 
-    //
-    // Free all handle entries
-    //
-    KeAcquireSpinLock(&Handles->Public.Lock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Handles->Lock);
 
-    while (!IsListEmpty(&Handles->Public.HandleList)) {
-        Entry = RemoveHeadList(&Handles->Public.HandleList);
-        HandleEntry = CONTAINING_RECORD(Entry, HT_HANDLE_ENTRY_INTERNAL, Public.ListEntry);
-        InterlockedDecrement(&Handles->Public.HandleCount);
+    while (!IsListEmpty(&Handles->HandleList)) {
+        Entry = RemoveHeadList(&Handles->HandleList);
+        HandleEntry = CONTAINING_RECORD(Entry, HT_HANDLE_ENTRY, ListEntry);
+        InterlockedDecrement(&Handles->HandleCount);
 
-        KeReleaseSpinLock(&Handles->Public.Lock, OldIrql);
+        ExReleasePushLockExclusive(&Handles->Lock);
+        KeLeaveCriticalRegion();
+
         HtpFreeHandleEntry(Tracker, HandleEntry);
-        KeAcquireSpinLock(&Handles->Public.Lock, &OldIrql);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Handles->Lock);
     }
 
-    KeReleaseSpinLock(&Handles->Public.Lock, OldIrql);
-
-    //
-    // Free process object reference
-    //
-    if (Handles->ProcessObject != NULL) {
-        ObDereferenceObject(Handles->ProcessObject);
-    }
-
-    ExFreeToNPagedLookasideList(&Tracker->ProcessHandlesLookaside, Handles);
+    ExReleasePushLockExclusive(&Handles->Lock);
+    KeLeaveCriticalRegion();
 }
 
 static PHT_DUPLICATION_RECORD
 HtpAllocateDuplicationRecord(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     )
 {
     PHT_DUPLICATION_RECORD Record;
@@ -1378,86 +1678,45 @@ HtpAllocateDuplicationRecord(
 
 static VOID
 HtpFreeDuplicationRecord(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+    _In_ PHT_TRACKER Tracker,
     _In_ PHT_DUPLICATION_RECORD Record
     )
 {
     ExFreeToNPagedLookasideList(&Tracker->DuplicationLookaside, Record);
 }
 
-static VOID
-HtpReferenceProcessHandles(
-    _Inout_ PHT_PROCESS_HANDLES_INTERNAL Handles
-    )
-{
-    InterlockedIncrement(&Handles->RefCount);
-}
-
-static VOID
-HtpDereferenceProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _Inout_ PHT_PROCESS_HANDLES_INTERNAL Handles
-    )
-{
-    if (InterlockedDecrement(&Handles->RefCount) == 0) {
-        HtpFreeProcessHandlesInternal(Tracker, Handles);
-    }
-}
-
-static PHT_PROCESS_HANDLES_INTERNAL
-HtpLookupProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ HANDLE ProcessId
-    )
-{
-    ULONG Hash;
-    PLIST_ENTRY Entry;
-    PHT_PROCESS_HANDLES_INTERNAL Handles;
-
-    Hash = HtpHashProcessId(ProcessId);
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Tracker->HashBuckets[Hash].Lock);
-
-    for (Entry = Tracker->HashBuckets[Hash].ProcessList.Flink;
-         Entry != &Tracker->HashBuckets[Hash].ProcessList;
-         Entry = Entry->Flink) {
-
-        Handles = CONTAINING_RECORD(Entry, HT_PROCESS_HANDLES_INTERNAL, HashEntry);
-
-        if (Handles->Public.ProcessId == ProcessId) {
-            HtpReferenceProcessHandles(Handles);
-            ExReleasePushLockShared(&Tracker->HashBuckets[Hash].Lock);
-            KeLeaveCriticalRegion();
-            return Handles;
-        }
-    }
-
-    ExReleasePushLockShared(&Tracker->HashBuckets[Hash].Lock);
-    KeLeaveCriticalRegion();
-
-    return NULL;
-}
-
 static NTSTATUS
 HtpInsertProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_PROCESS_HANDLES Handles
     )
 {
     ULONG Hash;
 
-    Hash = HtpHashProcessId(Handles->Public.ProcessId);
+    Hash = HtpHashProcessId(Handles->ProcessId);
     Handles->HashBucket = Hash;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
 
-    InsertTailList(&Tracker->HashBuckets[Hash].ProcessList, &Handles->HashEntry);
-    InterlockedIncrement(&Tracker->HashBuckets[Hash].Count);
-    Handles->InHashTable = TRUE;
+    if (!Handles->InHashTable) {
+        InsertTailList(&Tracker->HashBuckets[Hash].ProcessList, &Handles->HashEntry);
+        InterlockedIncrement(&Tracker->HashBuckets[Hash].Count);
+        Handles->InHashTable = TRUE;
+        HtpReferenceProcessHandles(Handles);
+    }
 
     ExReleasePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Also add to global list
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
+    InsertTailList(&Tracker->ProcessList, &Handles->GlobalEntry);
+    InterlockedIncrement(&Tracker->ProcessCount);
+    ExReleasePushLockExclusive(&Tracker->ProcessListLock);
     KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
@@ -1465,11 +1724,12 @@ HtpInsertProcessHandles(
 
 static VOID
 HtpRemoveProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_PROCESS_HANDLES Handles
     )
 {
     ULONG Hash;
+    BOOLEAN WasInHashTable = FALSE;
 
     if (!Handles->InHashTable) {
         return;
@@ -1485,43 +1745,97 @@ HtpRemoveProcessHandles(
         InitializeListHead(&Handles->HashEntry);
         InterlockedDecrement(&Tracker->HashBuckets[Hash].Count);
         Handles->InHashTable = FALSE;
+        WasInHashTable = TRUE;
     }
 
     ExReleasePushLockExclusive(&Tracker->HashBuckets[Hash].Lock);
     KeLeaveCriticalRegion();
+
+    //
+    // Remove from global list
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Tracker->ProcessListLock);
+    if (!IsListEmpty(&Handles->GlobalEntry)) {
+        RemoveEntryList(&Handles->GlobalEntry);
+        InitializeListHead(&Handles->GlobalEntry);
+        InterlockedDecrement(&Tracker->ProcessCount);
+    }
+    ExReleasePushLockExclusive(&Tracker->ProcessListLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Release reference from hash table
+    //
+    if (WasInHashTable) {
+        HtpDereferenceProcessHandles(Tracker, Handles);
+    }
 }
 
+_Use_decl_annotations_
 static NTSTATUS
 HtpEnumerateProcessHandles(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ HANDLE ProcessId,
-    _Inout_ PHT_PROCESS_HANDLES_INTERNAL Handles
+    PHT_TRACKER Tracker,
+    HANDLE ProcessId,
+    PHT_PROCESS_HANDLES Handles
     )
 {
     NTSTATUS Status;
     PVOID Buffer = NULL;
-    ULONG BufferSize = 0x10000;
+    ULONG BufferSize = HT_INITIAL_BUFFER_SIZE;
     ULONG ReturnLength = 0;
     PSYSTEM_HANDLE_INFORMATION_EX HandleInfo = NULL;
-    ULONG i;
-    HANDLE ProcessHandle = NULL;
-    KIRQL OldIrql;
+    ULONG_PTR i;
+    PEPROCESS TargetProcess = NULL;
+    HANDLE TargetProcessHandle = NULL;
+
+    PAGED_CODE();
 
     //
-    // We need to use ZwQuerySystemInformation with SystemExtendedHandleInformation
-    // to get all handles in the system, then filter for our target process
+    // Verify target process exists
     //
+    Status = PsLookupProcessByProcessId(ProcessId, &TargetProcess);
+    if (!NT_SUCCESS(Status)) {
+        return STATUS_NOT_FOUND;
+    }
 
     //
-    // Allocate buffer for handle information
+    // Open handle to target process for handle queries
+    //
+    Status = ObOpenObjectByPointer(
+        TargetProcess,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        &TargetProcessHandle
+        );
+
+    ObDereferenceObject(TargetProcess);
+    TargetProcess = NULL;
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Allocate buffer for handle information (paged pool - we're at PASSIVE_LEVEL)
     //
     do {
         if (Buffer != NULL) {
             ExFreePoolWithTag(Buffer, HT_POOL_TAG_BUFFER);
+            Buffer = NULL;
         }
 
-        Buffer = ExAllocatePoolWithTag(PagedPool, BufferSize, HT_POOL_TAG_BUFFER);
+        Buffer = ExAllocatePool2(
+            POOL_FLAG_PAGED,
+            BufferSize,
+            HT_POOL_TAG_BUFFER
+            );
+
         if (Buffer == NULL) {
+            ZwClose(TargetProcessHandle);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -1533,30 +1847,34 @@ HtpEnumerateProcessHandles(
             );
 
         if (Status == STATUS_INFO_LENGTH_MISMATCH) {
-            BufferSize = ReturnLength + 0x1000;
+            BufferSize = ReturnLength + 0x10000;
+            if (BufferSize > HT_MAX_BUFFER_SIZE) {
+                ExFreePoolWithTag(Buffer, HT_POOL_TAG_BUFFER);
+                ZwClose(TargetProcessHandle);
+                return STATUS_BUFFER_OVERFLOW;
+            }
         }
 
-    } while (Status == STATUS_INFO_LENGTH_MISMATCH && BufferSize < 0x4000000);
+    } while (Status == STATUS_INFO_LENGTH_MISMATCH);
 
     if (!NT_SUCCESS(Status)) {
-        if (Buffer != NULL) {
-            ExFreePoolWithTag(Buffer, HT_POOL_TAG_BUFFER);
-        }
+        ExFreePoolWithTag(Buffer, HT_POOL_TAG_BUFFER);
+        ZwClose(TargetProcessHandle);
         return Status;
     }
 
     HandleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)Buffer;
 
     //
-    // Process each handle
+    // Process each handle belonging to our target process
     //
     for (i = 0; i < HandleInfo->NumberOfHandles &&
-         (ULONG)Handles->Public.HandleCount < Tracker->Config.MaxHandlesPerProcess; i++) {
+         (ULONG)Handles->HandleCount < Tracker->Config.MaxHandlesPerProcess; i++) {
 
         PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX HandleEntry = &HandleInfo->Handles[i];
-        PHT_HANDLE_ENTRY_INTERNAL NewEntry;
-        PVOID Object = NULL;
-        POBJECT_TYPE ObjectType = NULL;
+        PHT_HANDLE_ENTRY NewEntry;
+        HANDLE DuplicatedHandle = NULL;
+        NTSTATUS DupStatus;
 
         //
         // Filter for our target process
@@ -1574,76 +1892,95 @@ HtpEnumerateProcessHandles(
         }
 
         //
-        // Populate entry
+        // Populate basic entry data from system information
+        // NOTE: We do NOT access HandleEntry->Object directly - it's an unreferenced pointer!
         //
-        NewEntry->Public.Handle = (HANDLE)HandleEntry->HandleValue;
-        NewEntry->Public.GrantedAccess = HandleEntry->GrantedAccess;
-        NewEntry->Public.ObjectPointer = HandleEntry->Object;
+        NewEntry->HandleValue = (HANDLE)HandleEntry->HandleValue;
+        NewEntry->GrantedAccess = HandleEntry->GrantedAccess;
         NewEntry->ObjectTypeIndex = HandleEntry->ObjectTypeIndex;
-        NewEntry->HandleAttributes = HandleEntry->HandleAttributes;
 
         //
-        // Try to get object type
+        // Safely determine handle type by duplicating the handle to our process
+        // and querying its type. This is the ONLY safe way to access handle information.
         //
-        __try {
-            Object = HandleEntry->Object;
-            if (Object != NULL && MmIsAddressValid(Object)) {
-                ObjectType = ObGetObjectType(Object);
-                if (ObjectType != NULL) {
-                    NewEntry->Public.Type = HtpGetHandleType(ObjectType);
+        DupStatus = ZwDuplicateObject(
+            TargetProcessHandle,
+            (HANDLE)HandleEntry->HandleValue,
+            ZwCurrentProcess(),
+            &DuplicatedHandle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS
+            );
+
+        if (NT_SUCCESS(DupStatus) && DuplicatedHandle != NULL) {
+            //
+            // Query handle type using the safely duplicated handle
+            //
+            NewEntry->Type = HtpGetHandleTypeFromIndex(
+                Tracker,
+                ZwCurrentProcess(),
+                DuplicatedHandle,
+                HandleEntry->ObjectTypeIndex
+                );
+
+            //
+            // For process/thread handles, get target process ID safely
+            //
+            if (NewEntry->Type == HtType_Process) {
+                PROCESS_BASIC_INFORMATION BasicInfo;
+                ULONG RetLen;
+
+                Status = ZwQueryInformationProcess(
+                    DuplicatedHandle,
+                    ProcessBasicInformation,
+                    &BasicInfo,
+                    sizeof(BasicInfo),
+                    &RetLen
+                    );
+
+                if (NT_SUCCESS(Status)) {
+                    NewEntry->TargetProcessId = (HANDLE)BasicInfo.UniqueProcessId;
+                }
+            } else if (NewEntry->Type == HtType_Thread) {
+                THREAD_BASIC_INFORMATION ThreadInfo;
+                ULONG RetLen;
+
+                Status = ZwQueryInformationThread(
+                    DuplicatedHandle,
+                    ThreadBasicInformation,
+                    &ThreadInfo,
+                    sizeof(ThreadInfo),
+                    &RetLen
+                    );
+
+                if (NT_SUCCESS(Status)) {
+                    NewEntry->TargetProcessId = ThreadInfo.ClientId.UniqueProcess;
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Ignore exceptions
+
+            ZwClose(DuplicatedHandle);
+            DuplicatedHandle = NULL;
         }
 
         //
-        // For process/thread handles, get target info
+        // Check for cross-process handle
         //
-        if (NewEntry->Public.Type == HtType_Process ||
-            NewEntry->Public.Type == HtType_Thread) {
-
-            __try {
-                if (Object != NULL && MmIsAddressValid(Object)) {
-                    if (NewEntry->Public.Type == HtType_Process) {
-                        PEPROCESS TargetProcess = (PEPROCESS)Object;
-                        NewEntry->Public.TargetProcessId = PsGetProcessId(TargetProcess);
-                    } else {
-                        PETHREAD TargetThread = (PETHREAD)Object;
-                        PEPROCESS OwningProcess = IoThreadToProcess(TargetThread);
-                        if (OwningProcess != NULL) {
-                            NewEntry->Public.TargetProcessId = PsGetProcessId(OwningProcess);
-                        }
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore exceptions
-            }
-
-            //
-            // Check for cross-process
-            //
-            if (NewEntry->Public.TargetProcessId != NULL &&
-                NewEntry->Public.TargetProcessId != ProcessId) {
-                Handles->CrossProcessHandleCount++;
-            }
+        if (NewEntry->TargetProcessId != NULL &&
+            NewEntry->TargetProcessId != ProcessId) {
+            Handles->CrossProcessHandleCount++;
         }
-
-        //
-        // Check for duplicated handle
-        //
-        NewEntry->Public.IsDuplicated = FALSE; // Would need ObQueryHandleFlags
 
         //
         // Analyze suspicion
         //
-        NewEntry->Public.SuspicionFlags = HtpAnalyzeHandleSuspicion(Tracker, NewEntry, ProcessId);
-        NewEntry->SuspicionScore = HtpCalculateSuspicionScore(NewEntry->Public.SuspicionFlags);
+        NewEntry->SuspicionFlags = HtpAnalyzeHandleSuspicion(Tracker, NewEntry, ProcessId);
+        NewEntry->SuspicionScore = HtpCalculateSuspicionScore(NewEntry->SuspicionFlags);
 
         //
-        // Update statistics
+        // Update type statistics
         //
-        switch (NewEntry->Public.Type) {
+        switch (NewEntry->Type) {
         case HtType_Process:
             Handles->ProcessHandleCount++;
             break;
@@ -1655,7 +1992,7 @@ HtpEnumerateProcessHandles(
             break;
         case HtType_Token:
             Handles->TokenHandleCount++;
-            InterlockedIncrement64(&Tracker->ExtendedStats.TokenHandlesTracked);
+            InterlockedIncrement64(&Tracker->Stats.TokenHandlesTracked);
             break;
         case HtType_Section:
             Handles->SectionHandleCount++;
@@ -1665,78 +2002,97 @@ HtpEnumerateProcessHandles(
             break;
         }
 
-        if (NewEntry->Public.SuspicionFlags & HtSuspicion_HighPrivilege) {
+        if (NewEntry->SuspicionFlags & HtSuspicion_HighPrivilege) {
             Handles->HighPrivilegeHandleCount++;
-            InterlockedIncrement64(&Tracker->ExtendedStats.HighPrivilegeHandles);
+            InterlockedIncrement64(&Tracker->Stats.HighPrivilegeHandles);
+        }
+
+        if (NewEntry->SuspicionFlags & HtSuspicion_InjectionCapable) {
+            InterlockedIncrement64(&Tracker->Stats.InjectionHandlesDetected);
         }
 
         //
         // Insert into handle list
         //
-        KeAcquireSpinLock(&Handles->Public.Lock, &OldIrql);
-        InsertTailList(&Handles->Public.HandleList, &NewEntry->Public.ListEntry);
-        InterlockedIncrement(&Handles->Public.HandleCount);
-        KeReleaseSpinLock(&Handles->Public.Lock, OldIrql);
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Handles->Lock);
+        InsertTailList(&Handles->HandleList, &NewEntry->ListEntry);
+        InterlockedIncrement(&Handles->HandleCount);
+        ExReleasePushLockExclusive(&Handles->Lock);
+        KeLeaveCriticalRegion();
     }
 
     //
     // Calculate aggregated suspicion
     //
-    Handles->Public.AggregatedSuspicion = HtSuspicion_None;
+    Handles->AggregatedSuspicion = HtSuspicion_None;
 
     if (Handles->CrossProcessHandleCount > 0) {
-        Handles->Public.AggregatedSuspicion |= HtSuspicion_CrossProcess;
+        Handles->AggregatedSuspicion |= HtSuspicion_CrossProcess;
     }
 
     if (Handles->HighPrivilegeHandleCount > 0) {
-        Handles->Public.AggregatedSuspicion |= HtSuspicion_HighPrivilege;
+        Handles->AggregatedSuspicion |= HtSuspicion_HighPrivilege;
     }
 
-    if ((ULONG)Handles->Public.HandleCount > Tracker->Config.MaxHandlesPerProcess / 2) {
-        Handles->Public.AggregatedSuspicion |= HtSuspicion_ManyHandles;
+    if ((ULONG)Handles->HandleCount > Tracker->Config.MaxHandlesPerProcess / 2) {
+        Handles->AggregatedSuspicion |= HtSuspicion_ManyHandles;
     }
+
+    Handles->SuspicionScore = HtpCalculateSuspicionScore(Handles->AggregatedSuspicion);
 
     ExFreePoolWithTag(Buffer, HT_POOL_TAG_BUFFER);
+    ZwClose(TargetProcessHandle);
 
     return STATUS_SUCCESS;
 }
 
 static HT_HANDLE_TYPE
-HtpGetHandleType(
-    _In_ POBJECT_TYPE ObjectType
+HtpGetHandleTypeFromIndex(
+    _In_ PHT_TRACKER Tracker,
+    _In_ HANDLE ProcessHandle,
+    _In_ HANDLE HandleValue,
+    _In_ USHORT ObjectTypeIndex
     )
 {
-    UNICODE_STRING TypeName;
+    NTSTATUS Status;
+    POBJECT_TYPE_INFORMATION TypeInfo = NULL;
+    ULONG TypeInfoSize = sizeof(OBJECT_TYPE_INFORMATION) + 256;
+    ULONG ReturnLength;
+    HT_HANDLE_TYPE Type = HtType_Unknown;
 
-    if (ObjectType == NULL) {
+    UNREFERENCED_PARAMETER(Tracker);
+    UNREFERENCED_PARAMETER(ProcessHandle);
+    UNREFERENCED_PARAMETER(ObjectTypeIndex);
+
+    //
+    // Query object type information using the handle
+    //
+    TypeInfo = (POBJECT_TYPE_INFORMATION)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        TypeInfoSize,
+        HT_POOL_TAG_BUFFER
+        );
+
+    if (TypeInfo == NULL) {
         return HtType_Unknown;
     }
 
-    //
-    // Compare against known types
-    //
-    if (ObjectType == *PsProcessType) {
-        return HtType_Process;
+    Status = ZwQueryObject(
+        HandleValue,
+        ObjectTypeInformation,
+        TypeInfo,
+        TypeInfoSize,
+        &ReturnLength
+        );
+
+    if (NT_SUCCESS(Status) && TypeInfo->TypeName.Buffer != NULL) {
+        Type = HtpGetHandleTypeFromName(&TypeInfo->TypeName);
     }
 
-    if (ObjectType == *PsThreadType) {
-        return HtType_Thread;
-    }
+    ExFreePoolWithTag(TypeInfo, HT_POOL_TAG_BUFFER);
 
-    if (ObjectType == *IoFileObjectType) {
-        return HtType_File;
-    }
-
-    if (ObjectType == *SeTokenObjectType) {
-        return HtType_Token;
-    }
-
-    //
-    // For other types, we would need to check the type name
-    // This is simplified for now
-    //
-
-    return HtType_Unknown;
+    return Type;
 }
 
 static HT_HANDLE_TYPE
@@ -1744,48 +2100,42 @@ HtpGetHandleTypeFromName(
     _In_ PCUNICODE_STRING TypeName
     )
 {
-    if (TypeName == NULL || TypeName->Buffer == NULL) {
+    static const struct {
+        PCWSTR Name;
+        USHORT Length;
+        HT_HANDLE_TYPE Type;
+    } TypeMap[] = {
+        { L"Process",     14, HtType_Process },
+        { L"Thread",      12, HtType_Thread },
+        { L"File",        8,  HtType_File },
+        { L"Key",         6,  HtType_Key },
+        { L"Section",     14, HtType_Section },
+        { L"Token",       10, HtType_Token },
+        { L"Event",       10, HtType_Event },
+        { L"Semaphore",   18, HtType_Semaphore },
+        { L"Mutant",      12, HtType_Mutex },
+        { L"Timer",       10, HtType_Timer },
+        { L"ALPC Port",   18, HtType_Port },
+        { L"Device",      12, HtType_Device },
+        { L"Driver",      12, HtType_Driver },
+    };
+
+    ULONG i;
+
+    if (TypeName == NULL || TypeName->Buffer == NULL || TypeName->Length == 0) {
         return HtType_Unknown;
     }
 
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_PROCESS_TYPE_NAME), TRUE)) {
-        return HtType_Process;
-    }
+    for (i = 0; i < RTL_NUMBER_OF(TypeMap); i++) {
+        UNICODE_STRING CompareString;
 
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_THREAD_TYPE_NAME), TRUE)) {
-        return HtType_Thread;
-    }
+        CompareString.Buffer = (PWCH)TypeMap[i].Name;
+        CompareString.Length = TypeMap[i].Length;
+        CompareString.MaximumLength = TypeMap[i].Length + sizeof(WCHAR);
 
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_FILE_TYPE_NAME), TRUE)) {
-        return HtType_File;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_KEY_TYPE_NAME), TRUE)) {
-        return HtType_Key;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_SECTION_TYPE_NAME), TRUE)) {
-        return HtType_Section;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_TOKEN_TYPE_NAME), TRUE)) {
-        return HtType_Token;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_EVENT_TYPE_NAME), TRUE)) {
-        return HtType_Event;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_SEMAPHORE_TYPE_NAME), TRUE)) {
-        return HtType_Semaphore;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_MUTANT_TYPE_NAME), TRUE)) {
-        return HtType_Mutex;
-    }
-
-    if (RtlEqualUnicodeString(TypeName, &(UNICODE_STRING)RTL_CONSTANT_STRING(HT_TIMER_TYPE_NAME), TRUE)) {
-        return HtType_Timer;
+        if (RtlEqualUnicodeString(TypeName, &CompareString, TRUE)) {
+            return TypeMap[i].Type;
+        }
     }
 
     return HtType_Unknown;
@@ -1793,8 +2143,8 @@ HtpGetHandleTypeFromName(
 
 static HT_SUSPICION
 HtpAnalyzeHandleSuspicion(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ PHT_HANDLE_ENTRY_INTERNAL Entry,
+    _In_ PHT_TRACKER Tracker,
+    _In_ PHT_HANDLE_ENTRY Entry,
     _In_ HANDLE OwnerProcessId
     )
 {
@@ -1803,56 +2153,76 @@ HtpAnalyzeHandleSuspicion(
     //
     // Check for cross-process handle
     //
-    if (Entry->Public.TargetProcessId != NULL &&
-        Entry->Public.TargetProcessId != OwnerProcessId) {
+    if (Entry->TargetProcessId != NULL &&
+        Entry->TargetProcessId != OwnerProcessId) {
         Suspicion |= HtSuspicion_CrossProcess;
 
         //
-        // Check if target is sensitive process
+        // Check if target is sensitive process (only at PASSIVE_LEVEL)
         //
-        if (HtpIsSensitiveProcess(Tracker, Entry->Public.TargetProcessId)) {
-            Suspicion |= HtSuspicion_SensitiveTarget;
-            InterlockedIncrement64(&Tracker->ExtendedStats.SensitiveAccessDetected);
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            if (HtpIsSensitiveProcessInternal(Tracker, Entry->TargetProcessId)) {
+                Suspicion |= HtSuspicion_SensitiveTarget;
+                InterlockedIncrement64(&Tracker->Stats.SensitiveAccessDetected);
+
+                //
+                // LSASS access is credential access
+                //
+                if (Entry->Type == HtType_Process &&
+                    (Entry->GrantedAccess & HT_PROCESS_DUMP_ACCESS) == HT_PROCESS_DUMP_ACCESS) {
+                    Suspicion |= HtSuspicion_CredentialAccess;
+                }
+            }
         }
     }
 
     //
     // Check for high privilege access
     //
-    if (HtpIsHighPrivilegeAccess(Entry->Public.Type, Entry->Public.GrantedAccess)) {
+    if (HtpIsHighPrivilegeAccess(Entry->Type, Entry->GrantedAccess)) {
         Suspicion |= HtSuspicion_HighPrivilege;
     }
 
     //
     // Check for injection-capable access
     //
-    if (Entry->Public.Type == HtType_Process) {
-        if (HtpIsInjectionCapableAccess(Entry->Public.GrantedAccess)) {
-            InterlockedIncrement64(&Tracker->ExtendedStats.InjectionHandlesDetected);
+    if (Entry->Type == HtType_Process) {
+        if (HtpIsInjectionCapableAccess(Entry->GrantedAccess)) {
+            Suspicion |= HtSuspicion_InjectionCapable;
+        }
+    }
+
+    //
+    // Check for token steal access
+    //
+    if (Entry->Type == HtType_Token) {
+        if (Entry->GrantedAccess & HT_TOKEN_STEAL_ACCESS) {
+            Suspicion |= HtSuspicion_TokenSteal;
         }
     }
 
     //
     // Check for duplicated handle
     //
-    if (Entry->Public.IsDuplicated) {
+    if (Entry->IsDuplicated) {
         Suspicion |= HtSuspicion_DuplicatedIn;
     }
 
     //
     // Check for system handle (PID 4)
     //
-    if (OwnerProcessId == (HANDLE)4) {
+    if (OwnerProcessId == (HANDLE)(ULONG_PTR)4) {
         Suspicion |= HtSuspicion_SystemHandle;
     }
 
     return Suspicion;
 }
 
+_Use_decl_annotations_
 static BOOLEAN
-HtpIsSensitiveProcess(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
-    _In_ HANDLE ProcessId
+HtpIsSensitiveProcessInternal(
+    PHT_TRACKER Tracker,
+    HANDLE ProcessId
     )
 {
     NTSTATUS Status;
@@ -1860,19 +2230,17 @@ HtpIsSensitiveProcess(
     PUNICODE_STRING ImageFileName = NULL;
     BOOLEAN IsSensitive = FALSE;
 
+    PAGED_CODE();
+
     Status = PsLookupProcessByProcessId(ProcessId, &Process);
     if (!NT_SUCCESS(Status)) {
         return FALSE;
     }
 
-    __try {
-        Status = SeLocateProcessImageName(Process, &ImageFileName);
-        if (NT_SUCCESS(Status) && ImageFileName != NULL) {
-            IsSensitive = HtpIsSensitiveProcessByName(Tracker, ImageFileName);
-            ExFreePool(ImageFileName);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        IsSensitive = FALSE;
+    Status = SeLocateProcessImageName(Process, &ImageFileName);
+    if (NT_SUCCESS(Status) && ImageFileName != NULL) {
+        IsSensitive = HtpIsSensitiveProcessByName(Tracker, ImageFileName);
+        ExFreePool(ImageFileName);
     }
 
     ObDereferenceObject(Process);
@@ -1882,7 +2250,7 @@ HtpIsSensitiveProcess(
 
 static BOOLEAN
 HtpIsSensitiveProcessByName(
-    _In_ PHT_TRACKER_INTERNAL Tracker,
+    _In_ PHT_TRACKER Tracker,
     _In_ PCUNICODE_STRING ImageName
     )
 {
@@ -1896,9 +2264,22 @@ HtpIsSensitiveProcessByName(
 
     Hash = HtpHashString(FileName.Buffer, FileName.Length / sizeof(WCHAR));
 
-    for (i = 0; i < Tracker->SensitiveProcessHashCount; i++) {
-        if (Tracker->SensitiveProcessHashes[i] == Hash) {
-            return TRUE;
+    //
+    // Check hash match, then verify with full string comparison to prevent collisions
+    //
+    for (i = 0; i < Tracker->SensitiveProcessCount; i++) {
+        if (Tracker->SensitiveProcesses[i].Hash == Hash) {
+            //
+            // Full string comparison to confirm (prevents false positives from hash collisions)
+            //
+            UNICODE_STRING SensitiveName;
+            SensitiveName.Buffer = Tracker->SensitiveProcesses[i].Name;
+            SensitiveName.Length = Tracker->SensitiveProcesses[i].NameLength;
+            SensitiveName.MaximumLength = sizeof(Tracker->SensitiveProcesses[i].Name);
+
+            if (RtlEqualUnicodeString(&FileName, &SensitiveName, TRUE)) {
+                return TRUE;
+            }
         }
     }
 
@@ -1916,7 +2297,7 @@ HtpIsHighPrivilegeAccess(
         if ((Access & PROCESS_ALL_ACCESS) == PROCESS_ALL_ACCESS) {
             return TRUE;
         }
-        if (Access & (PROCESS_VM_WRITE | PROCESS_CREATE_THREAD)) {
+        if (Access & (PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION)) {
             return TRUE;
         }
         break;
@@ -1925,13 +2306,19 @@ HtpIsHighPrivilegeAccess(
         if ((Access & THREAD_ALL_ACCESS) == THREAD_ALL_ACCESS) {
             return TRUE;
         }
-        if (Access & (THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME)) {
+        if (Access & (THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT)) {
             return TRUE;
         }
         break;
 
     case HtType_Token:
         if (Access & (TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_ASSIGN_PRIMARY)) {
+            return TRUE;
+        }
+        break;
+
+    case HtType_Section:
+        if (Access & (SECTION_MAP_WRITE | SECTION_MAP_EXECUTE)) {
             return TRUE;
         }
         break;
@@ -1970,11 +2357,11 @@ HtpCalculateSuspicionScore(
     ULONG Score = 0;
 
     if (Flags & HtSuspicion_CrossProcess) {
-        Score += 20;
+        Score += 15;
     }
 
     if (Flags & HtSuspicion_HighPrivilege) {
-        Score += 25;
+        Score += 20;
     }
 
     if (Flags & HtSuspicion_DuplicatedIn) {
@@ -1982,7 +2369,7 @@ HtpCalculateSuspicionScore(
     }
 
     if (Flags & HtSuspicion_SensitiveTarget) {
-        Score += 40;
+        Score += 35;
     }
 
     if (Flags & HtSuspicion_ManyHandles) {
@@ -1991,6 +2378,18 @@ HtpCalculateSuspicionScore(
 
     if (Flags & HtSuspicion_SystemHandle) {
         Score += 5;
+    }
+
+    if (Flags & HtSuspicion_InjectionCapable) {
+        Score += 25;
+    }
+
+    if (Flags & HtSuspicion_TokenSteal) {
+        Score += 30;
+    }
+
+    if (Flags & HtSuspicion_CredentialAccess) {
+        Score += 40;
     }
 
     if (Score > 100) {
@@ -2002,13 +2401,10 @@ HtpCalculateSuspicionScore(
 
 static VOID
 HtpInitializeSensitiveProcessList(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     )
 {
-    //
-    // Sensitive processes that should be monitored for access
-    //
-    static const PCWSTR SensitiveProcesses[] = {
+    static const PCWSTR SensitiveProcessNames[] = {
         L"lsass.exe",
         L"csrss.exe",
         L"smss.exe",
@@ -2021,32 +2417,79 @@ HtpInitializeSensitiveProcessList(
         L"conhost.exe",
         L"dwm.exe",
         L"taskmgr.exe",
-        L"securityhealthservice.exe",
-        L"msmpeng.exe",
-        L"mssense.exe"
+        L"SecurityHealthService.exe",
+        L"MsMpEng.exe",
+        L"MsSense.exe",
+        L"ShadowSensor.exe"
     };
 
     ULONG i;
+    ULONG Count = 0;
 
-    Tracker->SensitiveProcessHashCount = 0;
+    for (i = 0; i < RTL_NUMBER_OF(SensitiveProcessNames) &&
+         Count < HT_MAX_SENSITIVE_PROCESSES; i++) {
 
-    for (i = 0; i < RTL_NUMBER_OF(SensitiveProcesses) &&
-         Tracker->SensitiveProcessHashCount < RTL_NUMBER_OF(Tracker->SensitiveProcessHashes); i++) {
+        SIZE_T NameLen = wcslen(SensitiveProcessNames[i]);
 
-        Tracker->SensitiveProcessHashes[Tracker->SensitiveProcessHashCount++] =
-            HtpHashString(SensitiveProcesses[i], (ULONG)wcslen(SensitiveProcesses[i]));
+        if (NameLen < RTL_NUMBER_OF(Tracker->SensitiveProcesses[0].Name)) {
+            RtlCopyMemory(
+                Tracker->SensitiveProcesses[Count].Name,
+                SensitiveProcessNames[i],
+                (NameLen + 1) * sizeof(WCHAR)
+                );
+
+            Tracker->SensitiveProcesses[Count].NameLength = (USHORT)(NameLen * sizeof(WCHAR));
+            Tracker->SensitiveProcesses[Count].Hash = HtpHashString(
+                SensitiveProcessNames[i],
+                (ULONG)NameLen
+                );
+
+            Count++;
+        }
     }
+
+    Tracker->SensitiveProcessCount = Count;
+}
+
+static BOOLEAN
+HtpExtractFileName(
+    _In_ PCUNICODE_STRING FullPath,
+    _Out_ PUNICODE_STRING FileName
+    )
+{
+    USHORT i;
+    USHORT LastSlash = 0;
+
+    if (FullPath == NULL || FullPath->Buffer == NULL || FullPath->Length == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < FullPath->Length / sizeof(WCHAR); i++) {
+        if (FullPath->Buffer[i] == L'\\' || FullPath->Buffer[i] == L'/') {
+            LastSlash = i + 1;
+        }
+    }
+
+    if (LastSlash >= FullPath->Length / sizeof(WCHAR)) {
+        return FALSE;
+    }
+
+    FileName->Buffer = &FullPath->Buffer[LastSlash];
+    FileName->Length = FullPath->Length - (LastSlash * sizeof(WCHAR));
+    FileName->MaximumLength = FileName->Length;
+
+    return TRUE;
 }
 
 static VOID
-HtpCleanupTimerDpc(
+HtpCleanupDpcRoutine(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
 {
-    PHT_TRACKER_INTERNAL Tracker = (PHT_TRACKER_INTERNAL)DeferredContext;
+    PHT_TRACKER Tracker = (PHT_TRACKER)DeferredContext;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
@@ -2063,11 +2506,11 @@ HtpCleanupTimerDpc(
 }
 
 static VOID
-HtpWorkerThread(
+HtpWorkerThreadRoutine(
     _In_ PVOID StartContext
     )
 {
-    PHT_TRACKER_INTERNAL Tracker = (PHT_TRACKER_INTERNAL)StartContext;
+    PHT_TRACKER Tracker = (PHT_TRACKER)StartContext;
     PVOID WaitObjects[2];
     NTSTATUS Status;
 
@@ -2092,9 +2535,9 @@ HtpWorkerThread(
 
         if (Status == STATUS_WAIT_1) {
             //
-            // Cleanup stale duplication records
+            // Perform cleanup of stale duplication records
             //
-            if (Tracker->Public.Initialized && !Tracker->ShutdownRequested) {
+            if (Tracker->Initialized && !Tracker->ShutdownRequested) {
                 HtpCleanupStaleDuplications(Tracker);
             }
         }
@@ -2105,7 +2548,7 @@ HtpWorkerThread(
 
 static VOID
 HtpCleanupStaleDuplications(
-    _In_ PHT_TRACKER_INTERNAL Tracker
+    _In_ PHT_TRACKER Tracker
     )
 {
     LARGE_INTEGER CurrentTime;
@@ -2115,7 +2558,7 @@ HtpCleanupStaleDuplications(
     LIST_ENTRY StaleList;
 
     KeQuerySystemTime(&CurrentTime);
-    TimeoutInterval.QuadPart = (LONGLONG)HT_HANDLE_CACHE_TIMEOUT_MS * 10000;
+    TimeoutInterval.QuadPart = (LONGLONG)Tracker->Config.CacheTimeoutMs * 10000;
 
     InitializeListHead(&StaleList);
 
@@ -2147,30 +2590,4 @@ HtpCleanupStaleDuplications(
         Record = CONTAINING_RECORD(Entry, HT_DUPLICATION_RECORD, ListEntry);
         HtpFreeDuplicationRecord(Tracker, Record);
     }
-}
-
-static BOOLEAN
-HtpExtractFileName(
-    _In_ PCUNICODE_STRING FullPath,
-    _Out_ PUNICODE_STRING FileName
-    )
-{
-    USHORT i;
-    USHORT LastSlash = 0;
-
-    if (FullPath == NULL || FullPath->Buffer == NULL || FullPath->Length == 0) {
-        return FALSE;
-    }
-
-    for (i = 0; i < FullPath->Length / sizeof(WCHAR); i++) {
-        if (FullPath->Buffer[i] == L'\\' || FullPath->Buffer[i] == L'/') {
-            LastSlash = i + 1;
-        }
-    }
-
-    FileName->Buffer = &FullPath->Buffer[LastSlash];
-    FileName->Length = FullPath->Length - (LastSlash * sizeof(WCHAR));
-    FileName->MaximumLength = FileName->Length + sizeof(WCHAR);
-
-    return TRUE;
 }

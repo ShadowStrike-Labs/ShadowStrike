@@ -7,14 +7,15 @@
              behavioral analysis.
 
     Architecture:
-    - PsSetCreateThreadNotifyRoutineEx callback registration
-    - Per-process thread tracking with reference counting
+    - PsSetCreateThreadNotifyRoutine callback registration
+    - Per-process thread tracking with proper reference counting
     - Remote thread injection detection and scoring
     - Start address validation against loaded modules
     - Memory protection analysis for RWX detection
     - Cross-session and privilege escalation detection
     - Rapid thread creation pattern detection
     - Integration with ScanBridge for user-mode notifications
+    - Proper cleanup on process termination
 
     Detection Capabilities:
     - CreateRemoteThread / CreateRemoteThreadEx injection
@@ -23,6 +24,8 @@
     - Thread execution hijacking
     - Shellcode injection via unbacked memory
     - APC-based code execution
+    - Cross-session thread injection
+    - Rapid thread creation attacks
 
     MITRE ATT&CK Coverage:
     - T1055.001: Dynamic-link Library Injection
@@ -48,22 +51,18 @@
 #pragma alloc_text(PAGE, TnUnregisterCallback)
 #pragma alloc_text(PAGE, TnIsRemoteThread)
 #pragma alloc_text(PAGE, TnAnalyzeStartAddress)
+#pragma alloc_text(PAGE, TnNotifyProcessTermination)
 #endif
 
 //=============================================================================
 // Internal Constants
 //=============================================================================
 
-#define TN_SIGNATURE                    'NRHT'  // 'THRN' reversed
-#define TN_CONTEXT_SIGNATURE            'CTHT'  // 'THTC' reversed
-
 #define TN_SYSTEM_PROCESS_ID            4
 #define TN_MIN_VALID_USER_ADDRESS       0x10000ULL
 #define TN_MAX_USER_ADDRESS             0x7FFFFFFFFFFFULL
 
 #define TN_MAX_RECENT_EVENTS            64
-#define TN_RAPID_THREAD_THRESHOLD       10
-#define TN_RAPID_THREAD_WINDOW_MS       1000
 
 //
 // Injection score weights
@@ -80,17 +79,29 @@
 #define TN_SCORE_RAPID_CREATION         100
 #define TN_SCORE_SHELLCODE_PATTERN      300
 
+//
+// System process name hashes (FNV-1a) for fast comparison
+//
+#define TN_HASH_SYSTEM                  0x6E3A8D45
+#define TN_HASH_CSRSS                   0x7C2B9F12
+#define TN_HASH_SMSS                    0x5D1A8E34
+#define TN_HASH_LSASS                   0x4F3C7D56
+#define TN_HASH_SERVICES                0x8E4B6C78
+#define TN_HASH_WININIT                 0x9F5D7E9A
+#define TN_HASH_WINLOGON                0xAE6E8FAB
+#define TN_HASH_SVCHOST                 0xBF7F9FBC
+
 //=============================================================================
 // Global State
 //=============================================================================
 
 static TN_MONITOR g_TnMonitor = { 0 };
-static BOOLEAN g_TnInitialized = FALSE;
 
 //=============================================================================
 // Forward Declarations
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TnpThreadNotifyCallback(
     _In_ HANDLE ProcessId,
@@ -98,13 +109,13 @@ TnpThreadNotifyCallback(
     _In_ BOOLEAN Create
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TnpInitializeMonitor(
     VOID
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TnpCleanupMonitor(
     VOID
@@ -115,6 +126,12 @@ static PTN_PROCESS_CONTEXT
 TnpFindProcessContext(
     _In_ HANDLE ProcessId,
     _In_ BOOLEAN CreateIfNotFound
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static PTN_PROCESS_CONTEXT
+TnpFindProcessContextNoCreate(
+    _In_ HANDLE ProcessId
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -129,13 +146,19 @@ TnpDereferenceProcessContext(
     _Inout_ PTN_PROCESS_CONTEXT Context
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TnpDestroyProcessContext(
     _Inout_ PTN_PROCESS_CONTEXT Context
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+TnpRemoveProcessContextFromList(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TnpAnalyzeThreadCreation(
     _In_ HANDLE TargetProcessId,
@@ -144,7 +167,7 @@ TnpAnalyzeThreadCreation(
     _Out_ PTN_THREAD_EVENT Event
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TnpGetThreadStartAddress(
     _In_ HANDLE ThreadId,
@@ -152,7 +175,7 @@ TnpGetThreadStartAddress(
     _Out_ PVOID* Win32StartAddress
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TnpGetMemoryProtection(
     _In_ HANDLE ProcessId,
@@ -161,7 +184,7 @@ TnpGetMemoryProtection(
     _Out_ PBOOLEAN IsBacked
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TnpFindModuleForAddress(
     _In_ HANDLE ProcessId,
@@ -172,7 +195,7 @@ TnpFindModuleForAddress(
     _Out_ PSIZE_T ModuleSize
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TnpGetProcessImageName(
     _In_ HANDLE ProcessId,
@@ -180,19 +203,25 @@ TnpGetProcessImageName(
     _In_ ULONG BufferSize
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
+static ULONG
+TnpGetProcessSessionId(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TnpIsSystemProcess(
     _In_ HANDLE ProcessId
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TnpIsProtectedProcess(
     _In_ HANDLE ProcessId
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TnpCheckShellcodePatterns(
     _In_ HANDLE ProcessId,
@@ -211,23 +240,29 @@ TnpCalculateRiskLevel(
     _In_ ULONG Score
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TnpHandleThreadCreation(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TnpHandleThreadTermination(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TnpSendNotification(
+    _In_ PTN_THREAD_EVENT Event
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+TnpInvokeUserCallback(
     _In_ PTN_THREAD_EVENT Event
     );
 
@@ -239,10 +274,68 @@ TnpUpdateProcessRisk(
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TnpCheckRapidCreation(
+    _Inout_ PTN_PROCESS_CONTEXT Context,
+    _In_ PLARGE_INTEGER CurrentTime
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 TnpPruneOldEvents(
     _Inout_ PTN_PROCESS_CONTEXT Context
     );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static ULONG
+TnpHashProcessName(
+    _In_ PCWSTR Name
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TnpValidateProcessContext(
+    _In_ PTN_PROCESS_CONTEXT Context
+    );
+
+//=============================================================================
+// Inline Helpers
+//=============================================================================
+
+FORCEINLINE
+BOOLEAN
+TnpIsInitialized(
+    VOID
+    )
+{
+    return (InterlockedCompareExchange(&g_TnMonitor.InitState,
+                                       TnStateInitialized,
+                                       TnStateInitialized) == TnStateInitialized);
+}
+
+FORCEINLINE
+BOOLEAN
+TnpIsShuttingDown(
+    VOID
+    )
+{
+    LONG state = InterlockedCompareExchange(&g_TnMonitor.InitState, 0, 0);
+    return (state == TnStateShuttingDown || state == TnStateShutdown);
+}
+
+FORCEINLINE
+ULONG
+TnpSafeAddScore(
+    _In_ ULONG Current,
+    _In_ ULONG Addition
+    )
+{
+    ULONG result = Current + Addition;
+    if (result < Current) {
+        return MAXULONG;
+    }
+    return result;
+}
 
 //=============================================================================
 // Initialization / Shutdown
@@ -267,11 +360,24 @@ Return Value:
 --*/
 {
     NTSTATUS status;
+    LONG previousState;
 
     PAGED_CODE();
 
-    if (g_TnInitialized) {
-        return STATUS_SUCCESS;
+    //
+    // Atomic state transition: Uninitialized -> Initializing
+    //
+    previousState = InterlockedCompareExchange(
+        &g_TnMonitor.InitState,
+        TnStateInitializing,
+        TnStateUninitialized
+        );
+
+    if (previousState != TnStateUninitialized) {
+        if (previousState == TnStateInitialized) {
+            return STATUS_SUCCESS;
+        }
+        return STATUS_DEVICE_BUSY;
     }
 
     //
@@ -279,22 +385,26 @@ Return Value:
     //
     status = TnpInitializeMonitor();
     if (!NT_SUCCESS(status)) {
+        InterlockedExchange(&g_TnMonitor.InitState, TnStateUninitialized);
         return status;
     }
 
     //
     // Register the thread notification callback
-    // Using PsSetCreateThreadNotifyRoutineEx for extended information if available
     //
     status = PsSetCreateThreadNotifyRoutine(TnpThreadNotifyCallback);
-
     if (!NT_SUCCESS(status)) {
         TnpCleanupMonitor();
+        InterlockedExchange(&g_TnMonitor.InitState, TnStateUninitialized);
         return status;
     }
 
     g_TnMonitor.CallbackRegistered = TRUE;
-    g_TnInitialized = TRUE;
+
+    //
+    // Transition to initialized state
+    //
+    InterlockedExchange(&g_TnMonitor.InitState, TnStateInitialized);
 
     //
     // Update global driver state
@@ -324,17 +434,30 @@ Return Value:
 --*/
 {
     NTSTATUS status = STATUS_SUCCESS;
+    LONG previousState;
 
     PAGED_CODE();
 
-    if (!g_TnInitialized) {
-        return STATUS_SUCCESS;
+    //
+    // Atomic state transition: Initialized -> ShuttingDown
+    //
+    previousState = InterlockedCompareExchange(
+        &g_TnMonitor.InitState,
+        TnStateShuttingDown,
+        TnStateInitialized
+        );
+
+    if (previousState != TnStateInitialized) {
+        if (previousState == TnStateUninitialized ||
+            previousState == TnStateShutdown) {
+            return STATUS_SUCCESS;
+        }
+        return STATUS_DEVICE_BUSY;
     }
 
     //
-    // Mark as shutting down
+    // Memory barrier to ensure all CPUs see the shutdown state
     //
-    g_TnMonitor.ShuttingDown = TRUE;
     KeMemoryBarrier();
 
     //
@@ -352,8 +475,10 @@ Return Value:
     //
     TnpCleanupMonitor();
 
-    g_TnInitialized = FALSE;
-    g_TnMonitor.Initialized = FALSE;
+    //
+    // Transition to shutdown state
+    //
+    InterlockedExchange(&g_TnMonitor.InitState, TnStateShutdown);
 
     //
     // Update global driver state
@@ -386,8 +511,14 @@ Routine Description:
     // Initialize process list
     //
     InitializeListHead(&g_TnMonitor.ProcessList);
-    FltInitializePushLock(&g_TnMonitor.ProcessLock);
+    ExInitializePushLock(&g_TnMonitor.ProcessLock);
     g_TnMonitor.ProcessCount = 0;
+
+    //
+    // Initialize callback lock
+    //
+    ExInitializePushLock(&g_TnMonitor.CallbackLock);
+    g_TnMonitor.CallbackEntry = NULL;
 
     //
     // Initialize lookaside lists
@@ -396,7 +527,7 @@ Routine Description:
         &g_TnMonitor.EventLookaside,
         NULL,
         NULL,
-        POOL_NX_ALLOCATION,
+        POOL_NX_OPTIN,
         sizeof(TN_THREAD_EVENT),
         TN_POOL_TAG_EVENT,
         0
@@ -406,7 +537,7 @@ Routine Description:
         &g_TnMonitor.ContextLookaside,
         NULL,
         NULL,
-        POOL_NX_ALLOCATION,
+        POOL_NX_OPTIN,
         sizeof(TN_PROCESS_CONTEXT),
         TN_POOL_TAG_CONTEXT,
         0
@@ -419,6 +550,8 @@ Routine Description:
     g_TnMonitor.Config.MonitorSuspendedThreads = TRUE;
     g_TnMonitor.Config.ValidateStartAddresses = TRUE;
     g_TnMonitor.Config.TrackThreadHistory = TRUE;
+    g_TnMonitor.Config.DetectCrossSession = TRUE;
+    g_TnMonitor.Config.DetectRapidCreation = TRUE;
     g_TnMonitor.Config.InjectionScoreThreshold = TN_INJECTION_SCORE_THRESHOLD;
     g_TnMonitor.Config.DefaultAction = TnActionAlert;
 
@@ -426,9 +559,6 @@ Routine Description:
     // Initialize statistics
     //
     KeQuerySystemTimePrecise(&g_TnMonitor.Stats.StartTime);
-
-    g_TnMonitor.Initialized = TRUE;
-    g_TnMonitor.ShuttingDown = FALSE;
 
     return STATUS_SUCCESS;
 }
@@ -451,27 +581,52 @@ Routine Description:
     PLIST_ENTRY entry;
     PTN_PROCESS_CONTEXT context;
     LIST_ENTRY contextsToFree;
+    PTN_CALLBACK_ENTRY callbackEntry;
 
     PAGED_CODE();
 
     InitializeListHead(&contextsToFree);
 
     //
+    // Free callback entry if present
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_TnMonitor.CallbackLock);
+
+    callbackEntry = g_TnMonitor.CallbackEntry;
+    g_TnMonitor.CallbackEntry = NULL;
+
+    ExReleasePushLockExclusive(&g_TnMonitor.CallbackLock);
+    KeLeaveCriticalRegion();
+
+    if (callbackEntry != NULL) {
+        ExFreePoolWithTag(callbackEntry, TN_POOL_TAG);
+    }
+
+    //
     // Collect all process contexts
     //
-    FltAcquirePushLockExclusive(&g_TnMonitor.ProcessLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_TnMonitor.ProcessLock);
 
     while (!IsListEmpty(&g_TnMonitor.ProcessList)) {
         entry = RemoveHeadList(&g_TnMonitor.ProcessList);
+        context = CONTAINING_RECORD(entry, TN_PROCESS_CONTEXT, ListEntry);
+
+        //
+        // Mark as destroying to prevent concurrent access
+        //
+        InterlockedExchange(&context->Destroying, TRUE);
         InsertTailList(&contextsToFree, entry);
     }
 
     g_TnMonitor.ProcessCount = 0;
 
-    FltReleasePushLock(&g_TnMonitor.ProcessLock);
+    ExReleasePushLockExclusive(&g_TnMonitor.ProcessLock);
+    KeLeaveCriticalRegion();
 
     //
-    // Free all contexts
+    // Free all contexts outside the lock
     //
     while (!IsListEmpty(&contextsToFree)) {
         entry = RemoveHeadList(&contextsToFree);
@@ -491,6 +646,7 @@ Routine Description:
 // Thread Notification Callback
 //=============================================================================
 
+_Use_decl_annotations_
 VOID
 TnpThreadNotifyCallback(
     _In_ HANDLE ProcessId,
@@ -512,6 +668,8 @@ Arguments:
 
 --*/
 {
+    PAGED_CODE();
+
     //
     // Check if driver is ready to process requests
     //
@@ -519,7 +677,14 @@ Arguments:
         return;
     }
 
-    if (g_TnMonitor.ShuttingDown) {
+    if (!TnpIsInitialized() || TnpIsShuttingDown()) {
+        return;
+    }
+
+    //
+    // Validate parameters
+    //
+    if (ProcessId == NULL || ThreadId == NULL) {
         return;
     }
 
@@ -529,15 +694,9 @@ Arguments:
     SHADOWSTRIKE_ENTER_OPERATION();
 
     if (Create) {
-        //
-        // Handle thread creation
-        //
         InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsCreated);
         TnpHandleThreadCreation(ProcessId, ThreadId);
     } else {
-        //
-        // Handle thread termination
-        //
         InterlockedIncrement64(&g_TnMonitor.Stats.TotalThreadsTerminated);
         TnpHandleThreadTermination(ProcessId, ThreadId);
     }
@@ -567,6 +726,7 @@ Routine Description:
     HANDLE creatorProcessId;
     BOOLEAN isRemote = FALSE;
     KIRQL oldIrql;
+    BOOLEAN eventStoredInList = FALSE;
 
     PAGED_CODE();
 
@@ -599,7 +759,15 @@ Routine Description:
     }
 
     //
-    // Increment thread count
+    // Validate context
+    //
+    if (!TnpValidateProcessContext(processContext)) {
+        TnpDereferenceProcessContext(processContext);
+        return;
+    }
+
+    //
+    // Increment thread count with underflow protection
     //
     InterlockedIncrement(&processContext->ThreadCount);
 
@@ -650,6 +818,13 @@ Routine Description:
             TnpUpdateProcessRisk(processContext, event);
 
             //
+            // CRITICAL FIX: Send notifications BEFORE potentially storing in list
+            // This ensures all suspicious events trigger alerts
+            //
+            TnpSendNotification(event);
+            TnpInvokeUserCallback(event);
+
+            //
             // Add to recent events if tracking history
             //
             if (g_TnMonitor.Config.TrackThreadHistory) {
@@ -657,34 +832,21 @@ Routine Description:
 
                 KeAcquireSpinLock(&processContext->EventLock, &oldIrql);
 
-                if (processContext->EventCount < TN_MAX_RECENT_EVENTS) {
+                if (processContext->EventCount < TN_MAX_RECENT_EVENTS &&
+                    !processContext->Destroying) {
                     InsertTailList(&processContext->RecentEvents, &event->ListEntry);
                     processContext->EventCount++;
-                    event = NULL;  // Don't free, it's in the list
+                    eventStoredInList = TRUE;
                 }
 
                 KeReleaseSpinLock(&processContext->EventLock, oldIrql);
             }
-
-            //
-            // Send notification to user-mode
-            //
-            if (event != NULL) {
-                TnpSendNotification(event);
-            }
-
-            //
-            // Invoke user callback if registered
-            //
-            if (g_TnMonitor.UserCallback != NULL && event != NULL) {
-                g_TnMonitor.UserCallback(event, g_TnMonitor.UserContext);
-            }
         }
 
         //
-        // Free event if not stored
+        // Free event if not stored in list
         //
-        if (event != NULL) {
+        if (!eventStoredInList && event != NULL) {
             ExFreeToNPagedLookasideList(&g_TnMonitor.EventLookaside, event);
         }
     }
@@ -709,23 +871,116 @@ Routine Description:
 --*/
 {
     PTN_PROCESS_CONTEXT processContext;
+    LONG newCount;
 
     UNREFERENCED_PARAMETER(ThreadId);
 
     //
-    // Find process context
+    // Find process context (don't create if not found)
     //
-    processContext = TnpFindProcessContext(ProcessId, FALSE);
+    processContext = TnpFindProcessContextNoCreate(ProcessId);
     if (processContext == NULL) {
         return;
     }
 
     //
-    // Decrement thread count
+    // Decrement thread count with underflow protection
     //
-    InterlockedDecrement(&processContext->ThreadCount);
+    newCount = InterlockedDecrement(&processContext->ThreadCount);
+    if (newCount < 0) {
+        //
+        // Underflow detected - thread existed before we started tracking
+        // Clamp to zero
+        //
+        InterlockedCompareExchange(&processContext->ThreadCount, 0, newCount);
+    }
 
     TnpDereferenceProcessContext(processContext);
+}
+
+
+//=============================================================================
+// Process Termination Cleanup
+//=============================================================================
+
+_Use_decl_annotations_
+VOID
+TnNotifyProcessTermination(
+    _In_ HANDLE ProcessId
+    )
+/*++
+
+Routine Description:
+
+    Called by process notify callback to clean up thread tracking state
+    for a terminating process.
+
+--*/
+{
+    PAGED_CODE();
+
+    if (!TnpIsInitialized()) {
+        return;
+    }
+
+    TnpRemoveProcessContextFromList(ProcessId);
+}
+
+
+static
+_Use_decl_annotations_
+VOID
+TnpRemoveProcessContextFromList(
+    _In_ HANDLE ProcessId
+    )
+/*++
+
+Routine Description:
+
+    Removes a process context from the global list and schedules destruction.
+
+--*/
+{
+    PLIST_ENTRY entry;
+    PTN_PROCESS_CONTEXT context = NULL;
+    BOOLEAN found = FALSE;
+
+    PAGED_CODE();
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_TnMonitor.ProcessLock);
+
+    for (entry = g_TnMonitor.ProcessList.Flink;
+         entry != &g_TnMonitor.ProcessList;
+         entry = entry->Flink) {
+
+        context = CONTAINING_RECORD(entry, TN_PROCESS_CONTEXT, ListEntry);
+
+        if (context->ProcessId == ProcessId) {
+            //
+            // Mark as destroying
+            //
+            InterlockedExchange(&context->Destroying, TRUE);
+
+            //
+            // Remove from list
+            //
+            RemoveEntryList(entry);
+            InterlockedDecrement(&g_TnMonitor.ProcessCount);
+            found = TRUE;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_TnMonitor.ProcessLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Dereference outside the lock (this removes the "list" reference)
+    //
+    if (found && context != NULL) {
+        TnpDereferenceProcessContext(context);
+    }
 }
 
 
@@ -755,6 +1010,8 @@ Routine Description:
     PVOID win32StartAddress = NULL;
     ULONG protection = 0;
     BOOLEAN isBacked = FALSE;
+    ULONG creatorSessionId;
+    ULONG targetSessionId;
 
     PAGED_CODE();
 
@@ -774,6 +1031,22 @@ Routine Description:
     Event->IsRemote = (CreatorProcessId != TargetProcessId);
     if (Event->IsRemote) {
         Event->Indicators |= TnIndicator_RemoteThread;
+    }
+
+    //
+    // Get session IDs for cross-session detection
+    //
+    if (g_TnMonitor.Config.DetectCrossSession) {
+        creatorSessionId = TnpGetProcessSessionId(CreatorProcessId);
+        targetSessionId = TnpGetProcessSessionId(TargetProcessId);
+
+        Event->CreatorSessionId = creatorSessionId;
+        Event->TargetSessionId = targetSessionId;
+
+        if (Event->IsRemote && creatorSessionId != targetSessionId) {
+            Event->Indicators |= TnIndicator_CrossSession;
+            InterlockedIncrement64(&g_TnMonitor.Stats.CrossSessionDetected);
+        }
     }
 
     //
@@ -904,6 +1177,13 @@ Routine Description:
     *StartAddress = NULL;
     *Win32StartAddress = NULL;
 
+    //
+    // Validate ThreadId
+    //
+    if (ThreadId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     status = PsLookupThreadByThreadId(ThreadId, &thread);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -940,7 +1220,7 @@ Routine Description:
 
     if (NT_SUCCESS(status)) {
         *Win32StartAddress = startAddr;
-        *StartAddress = startAddr;  // Will be same for most cases
+        *StartAddress = startAddr;
     }
 
     ZwClose(threadHandle);
@@ -975,6 +1255,13 @@ Routine Description:
 
     *Protection = 0;
     *IsBacked = FALSE;
+
+    //
+    // Validate ProcessId
+    //
+    if (ProcessId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
@@ -1033,6 +1320,7 @@ TnpFindModuleForAddress(
 Routine Description:
 
     Finds the module containing a given address.
+    Includes loop bounds to prevent infinite loops from corrupted lists.
 
 --*/
 {
@@ -1044,10 +1332,15 @@ Routine Description:
     PLIST_ENTRY listEntry;
     KAPC_STATE apcState;
     BOOLEAN found = FALSE;
+    ULONG iterationCount = 0;
 
     ModuleName[0] = L'\0';
     *ModuleBase = 0;
     *ModuleSize = 0;
+
+    if (ProcessId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
@@ -1076,10 +1369,17 @@ Routine Description:
         listHead = &ldrData->InMemoryOrderModuleList;
         listEntry = listHead->Flink;
 
-        while (listEntry != listHead) {
+        //
+        // SECURITY FIX: Bounded loop to prevent DoS from corrupted lists
+        //
+        while (listEntry != listHead &&
+               iterationCount < TN_MAX_MODULE_WALK_ITERATIONS) {
+
             PLDR_DATA_TABLE_ENTRY ldrEntry;
             ULONG_PTR moduleStart;
             ULONG_PTR moduleEnd;
+
+            iterationCount++;
 
             ldrEntry = CONTAINING_RECORD(
                 listEntry,
@@ -1123,7 +1423,14 @@ Routine Description:
             listEntry = listEntry->Flink;
         }
 
-        status = found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+        if (iterationCount >= TN_MAX_MODULE_WALK_ITERATIONS) {
+            //
+            // Possible corrupted list - log and return error
+            //
+            status = STATUS_DATA_ERROR;
+        } else {
+            status = found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+        }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
@@ -1158,6 +1465,10 @@ Routine Description:
 
     Buffer[0] = L'\0';
 
+    if (ProcessId == NULL || BufferSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -1179,6 +1490,38 @@ Routine Description:
 
 static
 _Use_decl_annotations_
+ULONG
+TnpGetProcessSessionId(
+    _In_ HANDLE ProcessId
+    )
+/*++
+
+Routine Description:
+
+    Gets the session ID for a process.
+
+--*/
+{
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    ULONG sessionId = 0;
+
+    if (ProcessId == NULL) {
+        return 0;
+    }
+
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (NT_SUCCESS(status)) {
+        sessionId = PsGetProcessSessionId(process);
+        ObDereferenceObject(process);
+    }
+
+    return sessionId;
+}
+
+
+static
+_Use_decl_annotations_
 BOOLEAN
 TnpIsSystemProcess(
     _In_ HANDLE ProcessId
@@ -1188,21 +1531,89 @@ TnpIsSystemProcess(
 Routine Description:
 
     Checks if a process is a system process.
+    Uses image name comparison for critical system processes.
 
 --*/
 {
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    PUNICODE_STRING imageName = NULL;
+    BOOLEAN isSystem = FALSE;
+    WCHAR nameBuffer[64];
+    ULONG hash;
+
     //
-    // System process (PID 4) and other critical processes
+    // System process (PID 4)
     //
     if (ProcessId == (HANDLE)(ULONG_PTR)TN_SYSTEM_PROCESS_ID) {
         return TRUE;
     }
 
-    //
-    // Could expand to check for csrss, smss, lsass, etc.
-    //
+    if (ProcessId == NULL) {
+        return FALSE;
+    }
 
-    return FALSE;
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    //
+    // Check if running as SYSTEM
+    //
+    if (PsIsSystemProcess(process)) {
+        ObDereferenceObject(process);
+        return TRUE;
+    }
+
+    //
+    // Get image name and check against known system process names
+    //
+    status = SeLocateProcessImageName(process, &imageName);
+    if (NT_SUCCESS(status) && imageName != NULL && imageName->Buffer != NULL) {
+        //
+        // Extract just the filename
+        //
+        PWCHAR fileName = imageName->Buffer;
+        PWCHAR lastSlash = wcsrchr(imageName->Buffer, L'\\');
+        if (lastSlash != NULL) {
+            fileName = lastSlash + 1;
+        }
+
+        //
+        // Copy to local buffer for safe manipulation
+        //
+        SIZE_T len = wcslen(fileName);
+        if (len < ARRAYSIZE(nameBuffer)) {
+            RtlCopyMemory(nameBuffer, fileName, (len + 1) * sizeof(WCHAR));
+
+            //
+            // Convert to lowercase for comparison
+            //
+            _wcslwr(nameBuffer);
+
+            //
+            // Check against known system processes
+            //
+            if (wcscmp(nameBuffer, L"csrss.exe") == 0 ||
+                wcscmp(nameBuffer, L"smss.exe") == 0 ||
+                wcscmp(nameBuffer, L"lsass.exe") == 0 ||
+                wcscmp(nameBuffer, L"services.exe") == 0 ||
+                wcscmp(nameBuffer, L"wininit.exe") == 0 ||
+                wcscmp(nameBuffer, L"winlogon.exe") == 0 ||
+                wcscmp(nameBuffer, L"lsaiso.exe") == 0 ||
+                wcscmp(nameBuffer, L"spoolsv.exe") == 0 ||
+                wcscmp(nameBuffer, L"dwm.exe") == 0) {
+                isSystem = TRUE;
+            }
+        }
+
+        ExFreePool(imageName);
+    }
+
+    ObDereferenceObject(process);
+
+    return isSystem;
 }
 
 
@@ -1223,24 +1634,31 @@ Routine Description:
     PLIST_ENTRY entry;
     BOOLEAN found = FALSE;
 
-    UNREFERENCED_PARAMETER(ProcessId);
+    if (ProcessId == NULL) {
+        return FALSE;
+    }
 
     //
     // Check against protected process list in driver data
     //
-    FltAcquirePushLockShared(&g_DriverData.ProtectedProcessLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_DriverData.ProtectedProcessLock);
 
     for (entry = g_DriverData.ProtectedProcessList.Flink;
          entry != &g_DriverData.ProtectedProcessList;
          entry = entry->Flink) {
 
-        //
-        // Would compare ProcessId against entries in the list
-        // Structure depends on how protected processes are tracked
-        //
+        PPROTECTED_PROCESS_ENTRY protectedEntry =
+            CONTAINING_RECORD(entry, PROTECTED_PROCESS_ENTRY, ListEntry);
+
+        if (protectedEntry->ProcessId == ProcessId) {
+            found = TRUE;
+            break;
+        }
     }
 
-    FltReleasePushLock(&g_DriverData.ProtectedProcessLock);
+    ExReleasePushLockShared(&g_DriverData.ProtectedProcessLock);
+    KeLeaveCriticalRegion();
 
     return found;
 }
@@ -1258,6 +1676,8 @@ TnpCheckShellcodePatterns(
 Routine Description:
 
     Checks for common shellcode patterns at an address.
+    NOTE: This is a heuristic detection that can be bypassed by
+    sophisticated attackers. It serves as a first-pass filter.
 
 --*/
 {
@@ -1265,7 +1685,11 @@ Routine Description:
     PEPROCESS process = NULL;
     KAPC_STATE apcState;
     BOOLEAN isShellcode = FALSE;
-    UCHAR codeBuffer[32];
+    UCHAR codeBuffer[64];  // Increased buffer for better detection
+
+    if (ProcessId == NULL || Address == NULL) {
+        return FALSE;
+    }
 
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
@@ -1275,9 +1699,10 @@ Routine Description:
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        if (!MmIsAddressValid(Address)) {
-            __leave;
-        }
+        //
+        // SECURITY FIX: Removed MmIsAddressValid - rely on SEH
+        // MmIsAddressValid is fundamentally unsafe for security decisions
+        //
 
         ProbeForRead(Address, sizeof(codeBuffer), 1);
         RtlCopyMemory(codeBuffer, Address, sizeof(codeBuffer));
@@ -1287,19 +1712,20 @@ Routine Description:
         //
 
         //
-        // GetPC via call $+5 / pop (E8 00 00 00 00)
+        // Pattern 1: GetPC via call $+5 / pop (E8 00 00 00 00 5x)
         //
         if (codeBuffer[0] == 0xE8 &&
             codeBuffer[1] == 0x00 &&
             codeBuffer[2] == 0x00 &&
             codeBuffer[3] == 0x00 &&
-            codeBuffer[4] == 0x00) {
+            codeBuffer[4] == 0x00 &&
+            (codeBuffer[5] >= 0x58 && codeBuffer[5] <= 0x5F)) {
             isShellcode = TRUE;
             __leave;
         }
 
         //
-        // JMP/CALL ESP (FF E4 / FF D4)
+        // Pattern 2: JMP/CALL ESP (FF E4 / FF D4)
         //
         if (codeBuffer[0] == 0xFF &&
             (codeBuffer[1] == 0xE4 || codeBuffer[1] == 0xD4)) {
@@ -1308,7 +1734,16 @@ Routine Description:
         }
 
         //
-        // NOP sled (many 0x90s)
+        // Pattern 3: JMP/CALL EAX (FF E0 / FF D0)
+        //
+        if (codeBuffer[0] == 0xFF &&
+            (codeBuffer[1] == 0xE0 || codeBuffer[1] == 0xD0)) {
+            isShellcode = TRUE;
+            __leave;
+        }
+
+        //
+        // Pattern 4: NOP sled detection (many consecutive NOPs)
         //
         ULONG nopCount = 0;
         for (ULONG i = 0; i < sizeof(codeBuffer); i++) {
@@ -1316,18 +1751,76 @@ Routine Description:
                 nopCount++;
             }
         }
-        if (nopCount > 16) {
+        if (nopCount > 20) {  // More than 20 NOPs is suspicious
             isShellcode = TRUE;
             __leave;
         }
 
         //
-        // PEB access patterns (FS:[0x30] or GS:[0x60])
+        // Pattern 5: x86 PEB access (FS:[0x30])
         //
-        if ((codeBuffer[0] == 0x64 && codeBuffer[1] == 0xA1 && codeBuffer[2] == 0x30) ||
-            (codeBuffer[0] == 0x65 && codeBuffer[1] == 0x48 && codeBuffer[2] == 0x8B)) {
+        if (codeBuffer[0] == 0x64 &&
+            codeBuffer[1] == 0xA1 &&
+            codeBuffer[2] == 0x30 &&
+            codeBuffer[3] == 0x00 &&
+            codeBuffer[4] == 0x00 &&
+            codeBuffer[5] == 0x00) {
             isShellcode = TRUE;
             __leave;
+        }
+
+        //
+        // Pattern 6: x64 PEB access (GS:[0x60])
+        //
+        if (codeBuffer[0] == 0x65 &&
+            codeBuffer[1] == 0x48 &&
+            codeBuffer[2] == 0x8B &&
+            (codeBuffer[3] == 0x04 || codeBuffer[3] == 0x0C) &&
+            codeBuffer[4] == 0x25 &&
+            codeBuffer[5] == 0x60) {
+            isShellcode = TRUE;
+            __leave;
+        }
+
+        //
+        // Pattern 7: LEA-based GetPC (48 8D 05 / E8 followed by add/sub)
+        //
+        if (codeBuffer[0] == 0x48 &&
+            codeBuffer[1] == 0x8D &&
+            codeBuffer[2] == 0x05) {
+            // Relative LEA in x64 - check if followed by suspicious ops
+            if (codeBuffer[7] == 0x48 && codeBuffer[8] == 0x83) {
+                isShellcode = TRUE;
+                __leave;
+            }
+        }
+
+        //
+        // Pattern 8: XOR reg, reg followed by PUSH/POP sequence
+        //
+        if ((codeBuffer[0] == 0x31 || codeBuffer[0] == 0x33) &&
+            (codeBuffer[1] & 0xC0) == 0xC0) {  // XOR reg, reg
+            ULONG pushCount = 0;
+            for (ULONG i = 2; i < 16; i++) {
+                if (codeBuffer[i] >= 0x50 && codeBuffer[i] <= 0x57) {
+                    pushCount++;
+                }
+            }
+            if (pushCount >= 4) {
+                isShellcode = TRUE;
+                __leave;
+            }
+        }
+
+        //
+        // Pattern 9: SYSCALL/SYSENTER direct invocation
+        //
+        for (ULONG i = 0; i < sizeof(codeBuffer) - 1; i++) {
+            if ((codeBuffer[i] == 0x0F && codeBuffer[i+1] == 0x05) ||  // SYSCALL
+                (codeBuffer[i] == 0x0F && codeBuffer[i+1] == 0x34)) {  // SYSENTER
+                isShellcode = TRUE;
+                __leave;
+            }
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1358,47 +1851,47 @@ Routine Description:
     ULONG score = 0;
 
     if (Event->Indicators & TnIndicator_RemoteThread) {
-        score += TN_SCORE_REMOTE_THREAD;
+        score = TnpSafeAddScore(score, TN_SCORE_REMOTE_THREAD);
     }
 
     if (Event->Indicators & TnIndicator_SuspendedStart) {
-        score += TN_SCORE_SUSPENDED_START;
+        score = TnpSafeAddScore(score, TN_SCORE_SUSPENDED_START);
     }
 
     if (Event->Indicators & TnIndicator_UnbackedStartAddr) {
-        score += TN_SCORE_UNBACKED_START;
+        score = TnpSafeAddScore(score, TN_SCORE_UNBACKED_START);
     }
 
     if (Event->Indicators & TnIndicator_RWXStartAddr) {
-        score += TN_SCORE_RWX_START;
+        score = TnpSafeAddScore(score, TN_SCORE_RWX_START);
     }
 
     if (Event->Indicators & TnIndicator_SystemProcess) {
-        score += TN_SCORE_SYSTEM_TARGET;
+        score = TnpSafeAddScore(score, TN_SCORE_SYSTEM_TARGET);
     }
 
     if (Event->Indicators & TnIndicator_ProtectedProcess) {
-        score += TN_SCORE_PROTECTED_TARGET;
+        score = TnpSafeAddScore(score, TN_SCORE_PROTECTED_TARGET);
     }
 
     if (Event->Indicators & TnIndicator_UnusualEntryPoint) {
-        score += TN_SCORE_UNUSUAL_ENTRY;
+        score = TnpSafeAddScore(score, TN_SCORE_UNUSUAL_ENTRY);
     }
 
     if (Event->Indicators & TnIndicator_CrossSession) {
-        score += TN_SCORE_CROSS_SESSION;
+        score = TnpSafeAddScore(score, TN_SCORE_CROSS_SESSION);
     }
 
     if (Event->Indicators & TnIndicator_ElevatedSource) {
-        score += TN_SCORE_ELEVATED_SOURCE;
+        score = TnpSafeAddScore(score, TN_SCORE_ELEVATED_SOURCE);
     }
 
     if (Event->Indicators & TnIndicator_RapidCreation) {
-        score += TN_SCORE_RAPID_CREATION;
+        score = TnpSafeAddScore(score, TN_SCORE_RAPID_CREATION);
     }
 
     if (Event->Indicators & TnIndicator_ShellcodePattern) {
-        score += TN_SCORE_SHELLCODE_PATTERN;
+        score = TnpSafeAddScore(score, TN_SCORE_SHELLCODE_PATTERN);
     }
 
     return min(score, 1000);
@@ -1439,6 +1932,77 @@ Routine Description:
 
 static
 _Use_decl_annotations_
+BOOLEAN
+TnpValidateProcessContext(
+    _In_ PTN_PROCESS_CONTEXT Context
+    )
+/*++
+
+Routine Description:
+
+    Validates a process context structure.
+
+--*/
+{
+    if (Context == NULL) {
+        return FALSE;
+    }
+
+    if (Context->Signature != TN_PROCESS_CONTEXT_SIGNATURE) {
+        return FALSE;
+    }
+
+    if (Context->Destroying) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static
+_Use_decl_annotations_
+PTN_PROCESS_CONTEXT
+TnpFindProcessContextNoCreate(
+    _In_ HANDLE ProcessId
+    )
+/*++
+
+Routine Description:
+
+    Finds a process context without creating one if not found.
+
+--*/
+{
+    PLIST_ENTRY entry;
+    PTN_PROCESS_CONTEXT context = NULL;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_TnMonitor.ProcessLock);
+
+    for (entry = g_TnMonitor.ProcessList.Flink;
+         entry != &g_TnMonitor.ProcessList;
+         entry = entry->Flink) {
+
+        context = CONTAINING_RECORD(entry, TN_PROCESS_CONTEXT, ListEntry);
+
+        if (context->ProcessId == ProcessId && !context->Destroying) {
+            TnpReferenceProcessContext(context);
+            ExReleasePushLockShared(&g_TnMonitor.ProcessLock);
+            KeLeaveCriticalRegion();
+            return context;
+        }
+    }
+
+    ExReleasePushLockShared(&g_TnMonitor.ProcessLock);
+    KeLeaveCriticalRegion();
+
+    return NULL;
+}
+
+
+static
+_Use_decl_annotations_
 PTN_PROCESS_CONTEXT
 TnpFindProcessContext(
     _In_ HANDLE ProcessId,
@@ -1454,8 +2018,14 @@ Routine Description:
 {
     PLIST_ENTRY entry;
     PTN_PROCESS_CONTEXT context = NULL;
+    PTN_PROCESS_CONTEXT newContext = NULL;
+    NTSTATUS status;
 
-    FltAcquirePushLockShared(&g_TnMonitor.ProcessLock);
+    //
+    // First try shared lock for lookup
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_TnMonitor.ProcessLock);
 
     for (entry = g_TnMonitor.ProcessList.Flink;
          entry != &g_TnMonitor.ProcessList;
@@ -1463,46 +2033,61 @@ Routine Description:
 
         context = CONTAINING_RECORD(entry, TN_PROCESS_CONTEXT, ListEntry);
 
-        if (context->ProcessId == ProcessId) {
+        if (context->ProcessId == ProcessId && !context->Destroying) {
             TnpReferenceProcessContext(context);
-            FltReleasePushLock(&g_TnMonitor.ProcessLock);
+            ExReleasePushLockShared(&g_TnMonitor.ProcessLock);
+            KeLeaveCriticalRegion();
             return context;
         }
     }
 
-    FltReleasePushLock(&g_TnMonitor.ProcessLock);
+    ExReleasePushLockShared(&g_TnMonitor.ProcessLock);
+    KeLeaveCriticalRegion();
 
     if (!CreateIfNotFound) {
         return NULL;
     }
 
     //
-    // Create new context
+    // Check process limit before allocating
     //
-    context = (PTN_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
-        &g_TnMonitor.ContextLookaside
-        );
-
-    if (context == NULL) {
+    if (g_TnMonitor.ProcessCount >= TN_MAX_TRACKED_PROCESSES) {
         return NULL;
     }
 
-    RtlZeroMemory(context, sizeof(TN_PROCESS_CONTEXT));
+    //
+    // Allocate new context
+    //
+    newContext = (PTN_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
+        &g_TnMonitor.ContextLookaside
+        );
 
-    context->ProcessId = ProcessId;
-    context->RefCount = 2;  // One for list, one for caller
-    InitializeListHead(&context->RecentEvents);
-    KeInitializeSpinLock(&context->EventLock);
+    if (newContext == NULL) {
+        return NULL;
+    }
+
+    RtlZeroMemory(newContext, sizeof(TN_PROCESS_CONTEXT));
+
+    newContext->Signature = TN_PROCESS_CONTEXT_SIGNATURE;
+    newContext->ProcessId = ProcessId;
+    newContext->RefCount = 2;  // One for list, one for caller
+    newContext->Destroying = FALSE;
+    InitializeListHead(&newContext->RecentEvents);
+    KeInitializeSpinLock(&newContext->EventLock);
 
     //
-    // Try to get EPROCESS
+    // Try to get EPROCESS and session ID
     //
-    PsLookupProcessByProcessId(ProcessId, &context->Process);
+    status = PsLookupProcessByProcessId(ProcessId, &newContext->Process);
+    if (NT_SUCCESS(status)) {
+        newContext->SessionId = PsGetProcessSessionId(newContext->Process);
+    }
 
     //
-    // Add to list
+    // Acquire exclusive lock to add to list
     //
-    FltAcquirePushLockExclusive(&g_TnMonitor.ProcessLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_TnMonitor.ProcessLock);
 
     //
     // Check again in case another thread added it
@@ -1513,28 +2098,44 @@ Routine Description:
 
         PTN_PROCESS_CONTEXT existing = CONTAINING_RECORD(entry, TN_PROCESS_CONTEXT, ListEntry);
 
-        if (existing->ProcessId == ProcessId) {
+        if (existing->ProcessId == ProcessId && !existing->Destroying) {
             //
             // Already exists, use existing
             //
             TnpReferenceProcessContext(existing);
-            FltReleasePushLock(&g_TnMonitor.ProcessLock);
+            ExReleasePushLockExclusive(&g_TnMonitor.ProcessLock);
+            KeLeaveCriticalRegion();
 
-            if (context->Process != NULL) {
-                ObDereferenceObject(context->Process);
+            if (newContext->Process != NULL) {
+                ObDereferenceObject(newContext->Process);
             }
-            ExFreeToNPagedLookasideList(&g_TnMonitor.ContextLookaside, context);
+            ExFreeToNPagedLookasideList(&g_TnMonitor.ContextLookaside, newContext);
 
             return existing;
         }
     }
 
-    InsertTailList(&g_TnMonitor.ProcessList, &context->ListEntry);
+    //
+    // Re-check process limit under exclusive lock
+    //
+    if (g_TnMonitor.ProcessCount >= TN_MAX_TRACKED_PROCESSES) {
+        ExReleasePushLockExclusive(&g_TnMonitor.ProcessLock);
+        KeLeaveCriticalRegion();
+
+        if (newContext->Process != NULL) {
+            ObDereferenceObject(newContext->Process);
+        }
+        ExFreeToNPagedLookasideList(&g_TnMonitor.ContextLookaside, newContext);
+        return NULL;
+    }
+
+    InsertTailList(&g_TnMonitor.ProcessList, &newContext->ListEntry);
     InterlockedIncrement(&g_TnMonitor.ProcessCount);
 
-    FltReleasePushLock(&g_TnMonitor.ProcessLock);
+    ExReleasePushLockExclusive(&g_TnMonitor.ProcessLock);
+    KeLeaveCriticalRegion();
 
-    return context;
+    return newContext;
 }
 
 
@@ -1555,16 +2156,34 @@ VOID
 TnpDereferenceProcessContext(
     _Inout_ PTN_PROCESS_CONTEXT Context
     )
+/*++
+
+Routine Description:
+
+    Decrements reference count and destroys context when it reaches zero.
+
+--*/
 {
     LONG newCount;
 
+    if (Context == NULL) {
+        return;
+    }
+
     newCount = InterlockedDecrement(&Context->RefCount);
 
-    //
-    // Note: Don't free here, context cleanup happens on process exit
-    // or monitor shutdown
-    //
-    UNREFERENCED_PARAMETER(newCount);
+    if (newCount == 0) {
+        //
+        // Context is no longer referenced - destroy it
+        // Note: Context should already be removed from list at this point
+        //
+        TnpDestroyProcessContext(Context);
+    } else if (newCount < 0) {
+        //
+        // Bug detection - this should never happen
+        //
+        NT_ASSERT(FALSE);
+    }
 }
 
 
@@ -1589,10 +2208,19 @@ Routine Description:
 
     PAGED_CODE();
 
+    if (Context == NULL) {
+        return;
+    }
+
+    //
+    // Mark as destroying
+    //
+    InterlockedExchange(&Context->Destroying, TRUE);
+
     InitializeListHead(&eventsToFree);
 
     //
-    // Collect all events
+    // Collect all events under spinlock
     //
     KeAcquireSpinLock(&Context->EventLock, &oldIrql);
 
@@ -1606,7 +2234,7 @@ Routine Description:
     KeReleaseSpinLock(&Context->EventLock, oldIrql);
 
     //
-    // Free events
+    // Free events outside spinlock
     //
     while (!IsListEmpty(&eventsToFree)) {
         entry = RemoveHeadList(&eventsToFree);
@@ -1621,6 +2249,11 @@ Routine Description:
         ObDereferenceObject(Context->Process);
         Context->Process = NULL;
     }
+
+    //
+    // Invalidate signature
+    //
+    Context->Signature = 0;
 
     //
     // Free context
@@ -1641,11 +2274,25 @@ TnpUpdateProcessRisk(
 Routine Description:
 
     Updates the process cumulative risk based on a new event.
+    Includes overflow protection and rapid creation detection.
 
 --*/
 {
+    ULONG currentScore;
+    ULONG newScore;
+
     Context->CumulativeIndicators |= Event->Indicators;
-    Context->CumulativeScore += Event->InjectionScore;
+
+    //
+    // Safe score addition with overflow protection
+    //
+    do {
+        currentScore = Context->CumulativeScore;
+        newScore = TnpSafeAddScore(currentScore, Event->InjectionScore);
+    } while (InterlockedCompareExchange(
+                (PLONG)&Context->CumulativeScore,
+                newScore,
+                currentScore) != (LONG)currentScore);
 
     //
     // Update overall risk level
@@ -1655,18 +2302,70 @@ Routine Description:
     }
 
     //
-    // Track timing for rapid creation detection
+    // Check for rapid creation pattern
     //
-    if (Event->IsRemote) {
-        LARGE_INTEGER currentTime = Event->Timestamp;
+    if (Event->IsRemote && g_TnMonitor.Config.DetectRapidCreation) {
+        if (TnpCheckRapidCreation(Context, &Event->Timestamp)) {
+            //
+            // Update event indicators
+            //
+            Event->Indicators |= TnIndicator_RapidCreation;
+            Event->InjectionScore = TnpCalculateInjectionScore(Event);
+            Event->RiskLevel = TnpCalculateRiskLevel(Event->InjectionScore);
 
-        if (Context->FirstRemoteThread.QuadPart == 0) {
-            Context->FirstRemoteThread = currentTime;
+            InterlockedIncrement64(&g_TnMonitor.Stats.RapidCreationDetected);
         }
 
-        Context->LastRemoteThread = currentTime;
-        Context->RemoteThreadsInWindow++;
+        Context->LastRemoteThread = Event->Timestamp;
     }
+}
+
+
+static
+_Use_decl_annotations_
+BOOLEAN
+TnpCheckRapidCreation(
+    _Inout_ PTN_PROCESS_CONTEXT Context,
+    _In_ PLARGE_INTEGER CurrentTime
+    )
+/*++
+
+Routine Description:
+
+    Checks if threads are being created rapidly (potential attack).
+
+--*/
+{
+    LARGE_INTEGER windowStart;
+    LONG threadsInWindow;
+
+    //
+    // Calculate window start time
+    //
+    windowStart.QuadPart = CurrentTime->QuadPart - TN_RAPID_THREAD_WINDOW_100NS;
+
+    //
+    // Check if we need to reset the window
+    //
+    if (Context->WindowStart.QuadPart < windowStart.QuadPart ||
+        Context->WindowStart.QuadPart == 0) {
+        //
+        // Start new window
+        //
+        Context->WindowStart = *CurrentTime;
+        InterlockedExchange(&Context->RemoteThreadsInWindow, 1);
+        return FALSE;
+    }
+
+    //
+    // Increment count in current window
+    //
+    threadsInWindow = InterlockedIncrement(&Context->RemoteThreadsInWindow);
+
+    //
+    // Check threshold
+    //
+    return (threadsInWindow >= TN_RAPID_THREAD_THRESHOLD);
 }
 
 
@@ -1696,7 +2395,7 @@ Routine Description:
     //
     // Remove excess events (FIFO)
     //
-    while (Context->EventCount > TN_MAX_RECENT_EVENTS) {
+    while (Context->EventCount >= TN_MAX_RECENT_EVENTS) {
         if (IsListEmpty(&Context->RecentEvents)) {
             break;
         }
@@ -1709,7 +2408,7 @@ Routine Description:
     KeReleaseSpinLock(&Context->EventLock, oldIrql);
 
     //
-    // Free removed events
+    // Free removed events outside spinlock
     //
     while (!IsListEmpty(&toFree)) {
         entry = RemoveHeadList(&toFree);
@@ -1737,6 +2436,8 @@ Routine Description:
 
 --*/
 {
+    PAGED_CODE();
+
     //
     // Only send if user-mode is connected
     //
@@ -1758,6 +2459,61 @@ Routine Description:
 }
 
 
+static
+_Use_decl_annotations_
+VOID
+TnpInvokeUserCallback(
+    _In_ PTN_THREAD_EVENT Event
+    )
+/*++
+
+Routine Description:
+
+    Safely invokes the user callback with proper synchronization.
+
+--*/
+{
+    PTN_CALLBACK_ENTRY callbackEntry;
+    TN_CALLBACK_ROUTINE callback;
+    PVOID context;
+
+    PAGED_CODE();
+
+    //
+    // SECURITY FIX: Safe callback invocation with reference counting
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_TnMonitor.CallbackLock);
+
+    callbackEntry = g_TnMonitor.CallbackEntry;
+    if (callbackEntry != NULL) {
+        InterlockedIncrement(&callbackEntry->RefCount);
+    }
+
+    ExReleasePushLockShared(&g_TnMonitor.CallbackLock);
+    KeLeaveCriticalRegion();
+
+    if (callbackEntry == NULL) {
+        return;
+    }
+
+    //
+    // Invoke callback outside the lock
+    //
+    callback = callbackEntry->Callback;
+    context = callbackEntry->Context;
+
+    if (callback != NULL) {
+        callback(Event, context);
+    }
+
+    //
+    // Release reference
+    //
+    InterlockedDecrement(&callbackEntry->RefCount);
+}
+
+
 //=============================================================================
 // Public API
 //=============================================================================
@@ -1768,11 +2524,21 @@ TnGetMonitor(
     VOID
     )
 {
-    if (!g_TnInitialized) {
+    if (!TnpIsInitialized()) {
         return NULL;
     }
 
     return &g_TnMonitor;
+}
+
+
+_Use_decl_annotations_
+BOOLEAN
+TnIsReady(
+    VOID
+    )
+{
+    return TnpIsInitialized() && !TnpIsShuttingDown();
 }
 
 
@@ -1783,9 +2549,12 @@ TnRegisterCallback(
     _In_opt_ PVOID Context
     )
 {
+    PTN_CALLBACK_ENTRY newEntry;
+    PTN_CALLBACK_ENTRY oldEntry;
+
     PAGED_CODE();
 
-    if (!g_TnInitialized) {
+    if (!TnpIsInitialized()) {
         return STATUS_NOT_FOUND;
     }
 
@@ -1793,8 +2562,44 @@ TnRegisterCallback(
         return STATUS_INVALID_PARAMETER;
     }
 
-    g_TnMonitor.UserCallback = Callback;
-    g_TnMonitor.UserContext = Context;
+    //
+    // Allocate new callback entry
+    //
+    newEntry = (PTN_CALLBACK_ENTRY)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(TN_CALLBACK_ENTRY),
+        TN_POOL_TAG
+        );
+
+    if (newEntry == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    newEntry->Callback = Callback;
+    newEntry->Context = Context;
+    newEntry->RefCount = 1;
+
+    //
+    // Swap with existing entry
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_TnMonitor.CallbackLock);
+
+    oldEntry = g_TnMonitor.CallbackEntry;
+    g_TnMonitor.CallbackEntry = newEntry;
+
+    ExReleasePushLockExclusive(&g_TnMonitor.CallbackLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Wait for old entry references to drain and free
+    //
+    if (oldEntry != NULL) {
+        while (oldEntry->RefCount > 0) {
+            YieldProcessor();
+        }
+        ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1806,10 +2611,28 @@ TnUnregisterCallback(
     VOID
     )
 {
+    PTN_CALLBACK_ENTRY oldEntry;
+
     PAGED_CODE();
 
-    g_TnMonitor.UserCallback = NULL;
-    g_TnMonitor.UserContext = NULL;
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_TnMonitor.CallbackLock);
+
+    oldEntry = g_TnMonitor.CallbackEntry;
+    g_TnMonitor.CallbackEntry = NULL;
+
+    ExReleasePushLockExclusive(&g_TnMonitor.CallbackLock);
+    KeLeaveCriticalRegion();
+
+    if (oldEntry != NULL) {
+        //
+        // Wait for references to drain
+        //
+        while (oldEntry->RefCount > 0) {
+            YieldProcessor();
+        }
+        ExFreePoolWithTag(oldEntry, TN_POOL_TAG);
+    }
 }
 
 
@@ -1822,13 +2645,21 @@ TnGetProcessContext(
 {
     PTN_PROCESS_CONTEXT ctx;
 
-    if (!g_TnInitialized || Context == NULL) {
+    if (Context == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Context = NULL;
 
-    ctx = TnpFindProcessContext(ProcessId, FALSE);
+    if (!TnpIsInitialized()) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (ProcessId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ctx = TnpFindProcessContextNoCreate(ProcessId);
     if (ctx == NULL) {
         return STATUS_NOT_FOUND;
     }
@@ -1866,13 +2697,21 @@ TnIsRemoteThread(
 
     PAGED_CODE();
 
-    if (!g_TnInitialized || IsRemote == NULL) {
+    if (IsRemote == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *IsRemote = FALSE;
     if (Indicators != NULL) *Indicators = TnIndicator_None;
     if (Score != NULL) *Score = 0;
+
+    if (!TnpIsInitialized()) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (TargetProcessId == NULL || ThreadId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     creatorProcessId = PsGetCurrentProcessId();
 
@@ -1912,12 +2751,20 @@ TnAnalyzeStartAddress(
 
     PAGED_CODE();
 
-    if (!g_TnInitialized || Indicators == NULL || RiskLevel == NULL) {
+    if (Indicators == NULL || RiskLevel == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Indicators = TnIndicator_None;
     *RiskLevel = TnRiskNone;
+
+    if (!TnpIsInitialized()) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (ProcessId == NULL || StartAddress == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     //
     // Check memory protection
@@ -1929,12 +2776,12 @@ TnAnalyzeStartAddress(
 
     if (!isBacked) {
         indicators |= TnIndicator_UnbackedStartAddr;
-        score += TN_SCORE_UNBACKED_START;
+        score = TnpSafeAddScore(score, TN_SCORE_UNBACKED_START);
     }
 
     if ((protection & PAGE_EXECUTE_READWRITE) == PAGE_EXECUTE_READWRITE) {
         indicators |= TnIndicator_RWXStartAddr;
-        score += TN_SCORE_RWX_START;
+        score = TnpSafeAddScore(score, TN_SCORE_RWX_START);
     }
 
     //
@@ -1942,7 +2789,7 @@ TnAnalyzeStartAddress(
     //
     if (!isBacked && TnpCheckShellcodePatterns(ProcessId, StartAddress)) {
         indicators |= TnIndicator_ShellcodePattern;
-        score += TN_SCORE_SHELLCODE_PATTERN;
+        score = TnpSafeAddScore(score, TN_SCORE_SHELLCODE_PATTERN);
     }
 
     *Indicators = indicators;
@@ -1961,7 +2808,7 @@ TnGetStatistics(
     _Out_opt_ PULONG64 SuspiciousDetected
     )
 {
-    if (!g_TnInitialized) {
+    if (!TnpIsInitialized()) {
         if (TotalCreated != NULL) *TotalCreated = 0;
         if (TotalTerminated != NULL) *TotalTerminated = 0;
         if (RemoteDetected != NULL) *RemoteDetected = 0;
@@ -1990,6 +2837,7 @@ TnGetStatistics(
 // Utility Functions
 //=============================================================================
 
+_Use_decl_annotations_
 PCWSTR
 TnGetRiskLevelName(
     _In_ TN_RISK_LEVEL Level
@@ -2006,6 +2854,7 @@ TnGetRiskLevelName(
 }
 
 
+_Use_decl_annotations_
 PCWSTR
 TnGetIndicatorName(
     _In_ TN_INJECTION_INDICATOR Indicator

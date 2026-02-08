@@ -33,9 +33,15 @@ Performance Characteristics:
 - Lookaside lists for high-frequency allocations
 - Early exit for trusted/excluded processes
 - Configurable analysis depth
+- Rate limiting for user-mode notifications
+
+Lock Ordering (MUST BE FOLLOWED):
+1. ProcessListLock (outer)
+2. HashTable[n].Lock (inner)
+Never acquire ProcessListLock while holding a bucket lock.
 
 @author ShadowStrike Security Team
-@version 2.0.0 (Enterprise Edition)
+@version 3.0.0 (Enterprise Edition - Security Hardened)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
@@ -54,6 +60,8 @@ Performance Characteristics:
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, ShadowStrikeInitializeProcessMonitoring)
 #pragma alloc_text(PAGE, ShadowStrikeCleanupProcessMonitoring)
+#pragma alloc_text(PAGE, PnpCleanupWorkRoutine)
+#pragma alloc_text(PAGE, PnpCleanupStaleContexts)
 #endif
 
 // ============================================================================
@@ -62,12 +70,17 @@ Performance Characteristics:
 
 #define PN_POOL_TAG                     'TNPP'  // PPNT reversed
 #define PN_CONTEXT_POOL_TAG             'xCNP'  // PNCx
+#define PN_WORK_ITEM_TAG                'WKNP'  // PNWK
 #define PN_MAX_PROCESS_CONTEXTS         4096
 #define PN_MAX_PENDING_NOTIFICATIONS    1024
 #define PN_CLEANUP_INTERVAL_MS          60000   // 1 minute
 #define PN_CONTEXT_TIMEOUT_MS           300000  // 5 minutes
 #define PN_MAX_COMMAND_LINE_CAPTURE     8192
 #define PN_MAX_IMAGE_PATH_CAPTURE       2048
+#define PN_USER_MODE_TIMEOUT_MS         5000    // 5 second timeout for user-mode
+#define PN_MAX_NOTIFICATIONS_PER_SECOND 1000    // Rate limit
+#define PN_RATE_LIMIT_WINDOW_MS         1000    // 1 second window
+#define PN_MAX_PENDING_POOL_BYTES       (4 * 1024 * 1024)  // 4MB max pending
 
 //
 // Suspicion score thresholds
@@ -93,6 +106,21 @@ Performance Characteristics:
 #define PN_PROC_FLAG_BLOCKED            0x00000400
 #define PN_PROC_FLAG_TRUSTED            0x00000800
 #define PN_PROC_FLAG_REMOTE_THREAD      0x00001000
+#define PN_PROC_FLAG_HAS_DEBUG_PRIV     0x00002000
+#define PN_PROC_FLAG_HAS_IMPERSONATE    0x00004000
+#define PN_PROC_FLAG_HAS_TCB            0x00008000
+#define PN_PROC_FLAG_HAS_ASSIGN_TOKEN   0x00010000
+#define PN_PROC_FLAG_SIGNATURE_VALID    0x00020000
+
+//
+// Behavior flags for command-line analysis
+//
+#define PN_BEHAVIOR_SUSPICIOUS_PS       0x00000001
+#define PN_BEHAVIOR_DOWNLOAD_CRADLE     0x00000002
+#define PN_BEHAVIOR_SUSPICIOUS_CMD      0x00000004
+#define PN_BEHAVIOR_LONG_CMDLINE        0x00000008
+#define PN_BEHAVIOR_BASE64_ENCODED      0x00000010
+#define PN_BEHAVIOR_REFLECTION_LOAD     0x00000020
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -112,7 +140,7 @@ typedef struct _PN_PROCESS_CONTEXT {
     PEPROCESS ProcessObject;
 
     //
-    // Process information
+    // Process information - Buffers are always null-terminated
     //
     UNICODE_STRING ImagePath;
     UNICODE_STRING CommandLine;
@@ -139,6 +167,10 @@ typedef struct _PN_PROCESS_CONTEXT {
     BOOLEAN IsService;
     BOOLEAN HasDebugPrivilege;
     BOOLEAN HasImpersonatePrivilege;
+    BOOLEAN HasTcbPrivilege;
+    BOOLEAN HasAssignPrimaryTokenPrivilege;
+    BOOLEAN HasLoadDriverPrivilege;
+    BOOLEAN IsSignatureValid;
     LUID AuthenticationId;
 
     //
@@ -155,15 +187,21 @@ typedef struct _PN_PROCESS_CONTEXT {
     HANDLE RealParentProcessId;     // Actual parent from kernel
 
     //
-    // Reference counting
+    // Reference counting - must use interlocked operations
     //
     volatile LONG RefCount;
 
     //
-    // List linkage
+    // List linkage - protected by respective locks
     //
-    LIST_ENTRY ListEntry;
-    LIST_ENTRY HashEntry;
+    LIST_ENTRY ListEntry;           // Protected by ProcessListLock
+    LIST_ENTRY HashEntry;           // Protected by Bucket->Lock
+
+    //
+    // Insertion tracking for safety
+    //
+    volatile LONG InsertedInList;
+    volatile LONG InsertedInHash;
 
 } PN_PROCESS_CONTEXT, *PPN_PROCESS_CONTEXT;
 
@@ -191,13 +229,51 @@ typedef struct _PN_HASH_BUCKET {
 } PN_HASH_BUCKET, *PPN_HASH_BUCKET;
 
 //
+// Rate limiting structure
+//
+typedef struct _PN_RATE_LIMITER {
+    volatile LONG64 WindowStartTime;    // In 100ns units
+    volatile LONG NotificationsInWindow;
+    volatile LONG DroppedNotifications;
+} PN_RATE_LIMITER, *PPN_RATE_LIMITER;
+
+//
+// Pool tracking for memory limits
+//
+typedef struct _PN_POOL_TRACKER {
+    volatile LONG64 CurrentAllocation;
+    volatile LONG64 PeakAllocation;
+    LONG64 MaxAllocation;
+} PN_POOL_TRACKER, *PPN_POOL_TRACKER;
+
+//
+// Process monitor configuration - immutable after initialization
+// All fields are read atomically or are inherently atomic (BOOLEAN/ULONG)
+//
+typedef struct _PN_CONFIG {
+    BOOLEAN EnablePpidSpoofingDetection;
+    BOOLEAN EnableCommandLineAnalysis;
+    BOOLEAN EnableTokenAnalysis;
+    BOOLEAN EnableParentChainTracking;
+    BOOLEAN EnableSignatureVerification;
+    BOOLEAN BlockSuspiciousProcesses;
+    ULONG MinBlockScore;
+    ULONG AnalysisTimeoutMs;
+    ULONG MaxNotificationsPerSecond;
+    //
+    // Configuration is frozen after initialization
+    //
+    volatile BOOLEAN Frozen;
+} PN_CONFIG, *PPN_CONFIG;
+
+//
 // Process monitor state
 //
 typedef struct _PN_MONITOR_STATE {
     //
     // Initialization
     //
-    BOOLEAN Initialized;
+    volatile BOOLEAN Initialized;
 
     //
     // Process context tracking
@@ -223,14 +299,26 @@ typedef struct _PN_MONITOR_STATE {
     //
     NPAGED_LOOKASIDE_LIST ContextLookaside;
     NPAGED_LOOKASIDE_LIST NotificationLookaside;
-    BOOLEAN LookasideInitialized;
+    volatile BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup timer
+    // Cleanup timer and work item
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
-    BOOLEAN CleanupTimerActive;
+    PIO_WORKITEM CleanupWorkItem;
+    volatile BOOLEAN CleanupTimerActive;
+    volatile LONG CleanupWorkPending;
+
+    //
+    // Rate limiting
+    //
+    PN_RATE_LIMITER RateLimiter;
+
+    //
+    // Pool tracking
+    //
+    PN_POOL_TRACKER PoolTracker;
 
     //
     // Sub-analyzers (optional integration)
@@ -241,7 +329,9 @@ typedef struct _PN_MONITOR_STATE {
     PVOID TokenAnalyzer;        // PTA_ANALYZER
 
     //
-    // Statistics
+    // Statistics - all use interlocked operations
+    // Note: LONG64 can overflow after ~9 quintillion operations
+    // This is acceptable for practical purposes (would take centuries)
     //
     struct {
         volatile LONG64 ProcessCreations;
@@ -254,26 +344,26 @@ typedef struct _PN_MONITOR_STATE {
         volatile LONG64 LOLBinsDetected;
         volatile LONG64 CrossSessionCreations;
         volatile LONG64 AnalysisErrors;
+        volatile LONG64 RateLimitDrops;
+        volatile LONG64 PoolLimitDrops;
+        volatile LONG64 UserModeTimeouts;
         LARGE_INTEGER StartTime;
     } Stats;
 
     //
-    // Configuration
+    // Configuration - frozen after init
     //
-    struct {
-        BOOLEAN EnablePpidSpoofingDetection;
-        BOOLEAN EnableCommandLineAnalysis;
-        BOOLEAN EnableTokenAnalysis;
-        BOOLEAN EnableParentChainTracking;
-        BOOLEAN BlockSuspiciousProcesses;
-        ULONG MinBlockScore;
-        ULONG AnalysisTimeoutMs;
-    } Config;
+    PN_CONFIG Config;
 
     //
     // Shutdown flag
     //
     volatile BOOLEAN ShutdownRequested;
+
+    //
+    // Device object for work items
+    //
+    PDEVICE_OBJECT DeviceObject;
 
 } PN_MONITOR_STATE, *PPN_MONITOR_STATE;
 
@@ -302,7 +392,7 @@ PnpLookupProcessContext(
     _In_ HANDLE ProcessId
     );
 
-static VOID
+static NTSTATUS
 PnpInsertProcessContext(
     _In_ PPN_PROCESS_CONTEXT Context
     );
@@ -372,6 +462,12 @@ PnpCleanupTimerDpc(
     );
 
 static VOID
+PnpCleanupWorkRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    );
+
+static VOID
 PnpCleanupStaleContexts(
     VOID
     );
@@ -383,8 +479,9 @@ PnpCaptureTokenInfo(
     );
 
 static BOOLEAN
-PnpIsSystemProcess(
-    _In_ HANDLE ProcessId
+PnpIsKnownSystemProcess(
+    _In_ HANDLE ProcessId,
+    _In_opt_ PEPROCESS Process
     );
 
 static BOOLEAN
@@ -394,6 +491,38 @@ PnpIsTrustedProcess(
 
 static BOOLEAN
 PnpCheckParentSessionMatch(
+    _In_ PPN_PROCESS_CONTEXT Context
+    );
+
+static BOOLEAN
+PnpCheckRateLimit(
+    VOID
+    );
+
+static BOOLEAN
+PnpCheckPoolLimit(
+    _In_ SIZE_T AllocationSize
+    );
+
+static VOID
+PnpTrackPoolAllocation(
+    _In_ SIZE_T Size
+    );
+
+static VOID
+PnpTrackPoolFree(
+    _In_ SIZE_T Size
+    );
+
+static BOOLEAN
+PnpSafeWcsStrI(
+    _In_ PCWCH Buffer,
+    _In_ USHORT BufferLengthBytes,
+    _In_ PCWSTR Pattern
+    );
+
+static NTSTATUS
+PnpVerifyImageSignature(
     _In_ PPN_PROCESS_CONTEXT Context
     );
 
@@ -425,6 +554,14 @@ Return Value:
     }
 
     RtlZeroMemory(&g_ProcessMonitor, sizeof(PN_MONITOR_STATE));
+
+    //
+    // Get device object for work items
+    //
+    g_ProcessMonitor.DeviceObject = g_DriverData.DeviceObject;
+    if (g_ProcessMonitor.DeviceObject == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
 
     //
     // Initialize process list
@@ -472,20 +609,53 @@ Return Value:
     g_ProcessMonitor.LookasideInitialized = TRUE;
 
     //
+    // Initialize pool tracking
+    //
+    g_ProcessMonitor.PoolTracker.MaxAllocation = PN_MAX_PENDING_POOL_BYTES;
+    g_ProcessMonitor.PoolTracker.CurrentAllocation = 0;
+    g_ProcessMonitor.PoolTracker.PeakAllocation = 0;
+
+    //
+    // Initialize rate limiter
+    //
+    KeQuerySystemTime((PLARGE_INTEGER)&g_ProcessMonitor.RateLimiter.WindowStartTime);
+    g_ProcessMonitor.RateLimiter.NotificationsInWindow = 0;
+    g_ProcessMonitor.RateLimiter.DroppedNotifications = 0;
+
+    //
     // Initialize default configuration
+    // Configuration is FROZEN after this point - reads are safe without locks
     //
     g_ProcessMonitor.Config.EnablePpidSpoofingDetection = TRUE;
     g_ProcessMonitor.Config.EnableCommandLineAnalysis = TRUE;
     g_ProcessMonitor.Config.EnableTokenAnalysis = TRUE;
     g_ProcessMonitor.Config.EnableParentChainTracking = TRUE;
+    g_ProcessMonitor.Config.EnableSignatureVerification = TRUE;
     g_ProcessMonitor.Config.BlockSuspiciousProcesses = FALSE;  // Audit mode by default
     g_ProcessMonitor.Config.MinBlockScore = PN_SUSPICION_CRITICAL;
-    g_ProcessMonitor.Config.AnalysisTimeoutMs = 5000;
+    g_ProcessMonitor.Config.AnalysisTimeoutMs = PN_USER_MODE_TIMEOUT_MS;
+    g_ProcessMonitor.Config.MaxNotificationsPerSecond = PN_MAX_NOTIFICATIONS_PER_SECOND;
+
+    //
+    // Freeze configuration - must be set with memory barrier
+    //
+    MemoryBarrier();
+    g_ProcessMonitor.Config.Frozen = TRUE;
 
     //
     // Initialize statistics
     //
     KeQuerySystemTime(&g_ProcessMonitor.Stats.StartTime);
+
+    //
+    // Allocate cleanup work item
+    //
+    g_ProcessMonitor.CleanupWorkItem = IoAllocateWorkItem(g_ProcessMonitor.DeviceObject);
+    if (g_ProcessMonitor.CleanupWorkItem == NULL) {
+        ExDeleteNPagedLookasideList(&g_ProcessMonitor.ContextLookaside);
+        ExDeleteNPagedLookasideList(&g_ProcessMonitor.NotificationLookaside);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     //
     // Initialize cleanup timer
@@ -505,12 +675,16 @@ Return Value:
         );
     g_ProcessMonitor.CleanupTimerActive = TRUE;
 
+    //
+    // Mark as initialized with memory barrier
+    //
+    MemoryBarrier();
     g_ProcessMonitor.Initialized = TRUE;
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
-        "[ShadowStrike/ProcessNotify] Process monitoring initialized\n"
+        "[ShadowStrike/ProcessNotify] Process monitoring initialized (v3.0)\n"
         );
 
     return STATUS_SUCCESS;
@@ -525,12 +699,17 @@ ShadowStrikeCleanupProcessMonitoring(
 /*++
 Routine Description:
     Cleans up the process monitoring subsystem.
+
+    This function is designed to be safe against races with the callback
+    and cleanup DPC/work item.
 --*/
 {
     PLIST_ENTRY Entry;
     PPN_PROCESS_CONTEXT Context;
     PPN_NOTIFICATION_ENTRY Notification;
     KIRQL OldIrql;
+    LIST_ENTRY FreeList;
+    ULONG i;
 
     PAGED_CODE();
 
@@ -538,46 +717,107 @@ Routine Description:
         return;
     }
 
-    g_ProcessMonitor.ShutdownRequested = TRUE;
-    g_ProcessMonitor.Initialized = FALSE;
+    //
+    // Signal shutdown first - prevents new work from starting
+    //
+    InterlockedExchange8((volatile CHAR*)&g_ProcessMonitor.ShutdownRequested, TRUE);
+    MemoryBarrier();
+    InterlockedExchange8((volatile CHAR*)&g_ProcessMonitor.Initialized, FALSE);
+    MemoryBarrier();
 
     //
-    // Cancel cleanup timer
+    // Cancel cleanup timer and wait for any DPC to complete
     //
     if (g_ProcessMonitor.CleanupTimerActive) {
         KeCancelTimer(&g_ProcessMonitor.CleanupTimer);
+
+        //
+        // CRITICAL: Wait for any queued/running DPC to complete
+        // This prevents use-after-free when DPC accesses freed resources
+        //
+        KeFlushQueuedDpcs();
+
         g_ProcessMonitor.CleanupTimerActive = FALSE;
     }
 
     //
-    // Free all process contexts
+    // Wait for any pending cleanup work item to complete
+    // Spin-wait with yield - work item should complete quickly
     //
+    while (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, 0, 0) != 0) {
+        LARGE_INTEGER Interval;
+        Interval.QuadPart = -10000;  // 1ms
+        KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+    }
+
+    //
+    // Free cleanup work item
+    //
+    if (g_ProcessMonitor.CleanupWorkItem != NULL) {
+        IoFreeWorkItem(g_ProcessMonitor.CleanupWorkItem);
+        g_ProcessMonitor.CleanupWorkItem = NULL;
+    }
+
+    //
+    // Collect all process contexts to free
+    // Use proper lock ordering: ProcessListLock first, then bucket locks
+    //
+    InitializeListHead(&FreeList);
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
 
+    //
+    // Move all entries to free list
+    //
     while (!IsListEmpty(&g_ProcessMonitor.ProcessList)) {
         Entry = RemoveHeadList(&g_ProcessMonitor.ProcessList);
         Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, ListEntry);
 
         //
-        // Remove from hash table
+        // Mark as removed from list
         //
-        if (!IsListEmpty(&Context->HashEntry)) {
-            RemoveEntryList(&Context->HashEntry);
-            InitializeListHead(&Context->HashEntry);
-        }
+        InitializeListHead(&Context->ListEntry);
+        InterlockedExchange(&Context->InsertedInList, FALSE);
 
-        ExReleasePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
-        KeLeaveCriticalRegion();
-
-        PnpFreeProcessContext(Context);
-
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
+        InsertTailList(&FreeList, &Context->ListEntry);
+        InterlockedDecrement(&g_ProcessMonitor.ProcessCount);
     }
 
     ExReleasePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Now remove from hash tables and free - outside ProcessListLock
+    //
+    while (!IsListEmpty(&FreeList)) {
+        Entry = RemoveHeadList(&FreeList);
+        Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, ListEntry);
+
+        //
+        // Remove from hash table under correct bucket lock
+        //
+        if (InterlockedCompareExchange(&Context->InsertedInHash, FALSE, TRUE)) {
+            ULONG BucketIndex = PnpHashProcessId(Context->ProcessId);
+            PPN_HASH_BUCKET Bucket = &g_ProcessMonitor.HashTable[BucketIndex];
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&Bucket->Lock);
+
+            if (!IsListEmpty(&Context->HashEntry)) {
+                RemoveEntryList(&Context->HashEntry);
+                InitializeListHead(&Context->HashEntry);
+            }
+
+            ExReleasePushLockExclusive(&Bucket->Lock);
+            KeLeaveCriticalRegion();
+        }
+
+        //
+        // Free the context
+        //
+        PnpFreeProcessContext(Context);
+    }
 
     //
     // Free pending notifications
@@ -593,22 +833,26 @@ Routine Description:
     KeReleaseSpinLock(&g_ProcessMonitor.NotificationLock, OldIrql);
 
     //
-    // Delete lookaside lists
+    // Delete lookaside lists - safe now that all contexts are freed
     //
     if (g_ProcessMonitor.LookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_ProcessMonitor.ContextLookaside);
         ExDeleteNPagedLookasideList(&g_ProcessMonitor.NotificationLookaside);
+        g_ProcessMonitor.LookasideInitialized = FALSE;
     }
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
         "[ShadowStrike/ProcessNotify] Process monitoring shutdown. "
-        "Stats: Created=%lld, Terminated=%lld, Blocked=%lld, PpidSpoof=%lld\n",
+        "Stats: Created=%lld, Terminated=%lld, Blocked=%lld, PpidSpoof=%lld, "
+        "RateLimitDrops=%lld, PoolLimitDrops=%lld\n",
         g_ProcessMonitor.Stats.ProcessCreations,
         g_ProcessMonitor.Stats.ProcessTerminations,
         g_ProcessMonitor.Stats.ProcessesBlocked,
-        g_ProcessMonitor.Stats.PpidSpoofingDetected
+        g_ProcessMonitor.Stats.PpidSpoofingDetected,
+        g_ProcessMonitor.Stats.RateLimitDrops,
+        g_ProcessMonitor.Stats.PoolLimitDrops
         );
 }
 
@@ -650,7 +894,7 @@ Arguments:
     }
 
     //
-    // Always increment raw statistics
+    // Always increment raw statistics (even if not processing)
     //
     if (IsCreation) {
         InterlockedIncrement64(&g_ProcessMonitor.Stats.ProcessCreations);
@@ -661,7 +905,9 @@ Arguments:
 
     //
     // Check if we should process this event
+    // Read volatile flags with memory barrier
     //
+    MemoryBarrier();
     if (!g_ProcessMonitor.Initialized ||
         g_ProcessMonitor.ShutdownRequested) {
         return;
@@ -690,9 +936,17 @@ Arguments:
     //
 
     //
-    // Check for system process (skip detailed analysis)
+    // Check for known system process (skip detailed analysis for performance)
     //
-    if (PnpIsSystemProcess(ProcessId)) {
+    if (PnpIsKnownSystemProcess(ProcessId, Process)) {
+        goto Cleanup;
+    }
+
+    //
+    // Check rate limit before allocating resources
+    //
+    if (!PnpCheckRateLimit()) {
+        InterlockedIncrement64(&g_ProcessMonitor.Stats.RateLimitDrops);
         goto Cleanup;
     }
 
@@ -726,18 +980,20 @@ Arguments:
     //
     // Capture token/security information
     //
-    Status = PnpCaptureTokenInfo(Process, ProcessContext);
-    if (!NT_SUCCESS(Status)) {
-        //
-        // Non-fatal - continue with limited info
-        //
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_TRACE_LEVEL,
-            "[ShadowStrike/ProcessNotify] Token capture failed for PID %lu: 0x%08X\n",
-            HandleToULong(ProcessId),
-            Status
-            );
+    if (g_ProcessMonitor.Config.EnableTokenAnalysis) {
+        Status = PnpCaptureTokenInfo(Process, ProcessContext);
+        if (!NT_SUCCESS(Status)) {
+            //
+            // Non-fatal - continue with limited info
+            //
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_TRACE_LEVEL,
+                "[ShadowStrike/ProcessNotify] Token capture failed for PID %lu: 0x%08X\n",
+                HandleToULong(ProcessId),
+                Status
+                );
+        }
     }
 
     //
@@ -786,6 +1042,32 @@ Arguments:
     }
 
     //
+    // Track dangerous privileges
+    //
+    if (ProcessContext->HasDebugPrivilege) {
+        ProcessContext->Flags |= PN_PROC_FLAG_HAS_DEBUG_PRIV;
+    }
+    if (ProcessContext->HasImpersonatePrivilege) {
+        ProcessContext->Flags |= PN_PROC_FLAG_HAS_IMPERSONATE;
+    }
+    if (ProcessContext->HasTcbPrivilege) {
+        ProcessContext->Flags |= PN_PROC_FLAG_HAS_TCB;
+    }
+    if (ProcessContext->HasAssignPrimaryTokenPrivilege) {
+        ProcessContext->Flags |= PN_PROC_FLAG_HAS_ASSIGN_TOKEN;
+    }
+
+    //
+    // Verify image signature if enabled
+    //
+    if (g_ProcessMonitor.Config.EnableSignatureVerification) {
+        Status = PnpVerifyImageSignature(ProcessContext);
+        if (NT_SUCCESS(Status) && ProcessContext->IsSignatureValid) {
+            ProcessContext->Flags |= PN_PROC_FLAG_SIGNATURE_VALID;
+        }
+    }
+
+    //
     // Run full analysis
     //
     Status = PnpAnalyzeProcess(ProcessContext);
@@ -823,7 +1105,20 @@ Arguments:
     //
     // Insert context into tracking structures
     //
-    PnpInsertProcessContext(ProcessContext);
+    Status = PnpInsertProcessContext(ProcessContext);
+    if (!NT_SUCCESS(Status)) {
+        //
+        // Failed to insert - will be freed in cleanup
+        //
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ProcessNotify] Failed to insert context for PID %lu: 0x%08X\n",
+            HandleToULong(ProcessId),
+            Status
+            );
+        goto Cleanup;
+    }
 
     //
     // Send notification to user-mode
@@ -840,8 +1135,9 @@ Arguments:
 
     //
     // Apply blocking decision
+    // CRITICAL: Verify CreateInfo is not NULL before dereferencing
     //
-    if (ShouldBlock) {
+    if (ShouldBlock && CreateInfo != NULL) {
         CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
         ProcessContext->Flags |= PN_PROC_FLAG_BLOCKED;
         InterlockedIncrement64(&g_ProcessMonitor.Stats.ProcessesBlocked);
@@ -882,6 +1178,14 @@ PnpAllocateProcessContext(
 {
     PPN_PROCESS_CONTEXT Context;
 
+    //
+    // Check pool limits before allocation
+    //
+    if (!PnpCheckPoolLimit(sizeof(PN_PROCESS_CONTEXT))) {
+        InterlockedIncrement64(&g_ProcessMonitor.Stats.PoolLimitDrops);
+        return NULL;
+    }
+
     Context = (PPN_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
         &g_ProcessMonitor.ContextLookaside
         );
@@ -891,6 +1195,10 @@ PnpAllocateProcessContext(
         Context->RefCount = 1;
         InitializeListHead(&Context->ListEntry);
         InitializeListHead(&Context->HashEntry);
+        Context->InsertedInList = FALSE;
+        Context->InsertedInHash = FALSE;
+
+        PnpTrackPoolAllocation(sizeof(PN_PROCESS_CONTEXT));
     }
 
     return Context;
@@ -907,18 +1215,30 @@ PnpFreeProcessContext(
     }
 
     //
+    // Verify context is not still in lists
+    //
+    NT_ASSERT(!Context->InsertedInList);
+    NT_ASSERT(!Context->InsertedInHash);
+
+    //
     // Free allocated strings
     //
     if (Context->ImagePath.Buffer != NULL) {
+        PnpTrackPoolFree(Context->ImagePath.MaximumLength);
         ShadowStrikeFreePoolWithTag(Context->ImagePath.Buffer, PN_POOL_TAG);
+        Context->ImagePath.Buffer = NULL;
     }
 
     if (Context->CommandLine.Buffer != NULL) {
+        PnpTrackPoolFree(Context->CommandLine.MaximumLength);
         ShadowStrikeFreePoolWithTag(Context->CommandLine.Buffer, PN_POOL_TAG);
+        Context->CommandLine.Buffer = NULL;
     }
 
     if (Context->ImageFileName.Buffer != NULL) {
+        PnpTrackPoolFree(Context->ImageFileName.MaximumLength);
         ShadowStrikeFreePoolWithTag(Context->ImageFileName.Buffer, PN_POOL_TAG);
+        Context->ImageFileName.Buffer = NULL;
     }
 
     //
@@ -929,6 +1249,7 @@ PnpFreeProcessContext(
         Context->ProcessObject = NULL;
     }
 
+    PnpTrackPoolFree(sizeof(PN_PROCESS_CONTEXT));
     ExFreeToNPagedLookasideList(&g_ProcessMonitor.ContextLookaside, Context);
 }
 
@@ -941,11 +1262,13 @@ PnpHashProcessId(
     ULONG_PTR Value = (ULONG_PTR)ProcessId;
 
     //
-    // Simple hash function for process IDs
+    // MurmurHash3-style mixing for good distribution
     //
     Value = Value ^ (Value >> 16);
     Value = Value * 0x85EBCA6B;
     Value = Value ^ (Value >> 13);
+    Value = Value * 0xC2B2AE35;
+    Value = Value ^ (Value >> 16);
 
     return (ULONG)(Value % PN_HASH_BUCKET_COUNT);
 }
@@ -960,6 +1283,7 @@ PnpLookupProcessContext(
     PPN_HASH_BUCKET Bucket;
     PLIST_ENTRY Entry;
     PPN_PROCESS_CONTEXT Context = NULL;
+    PPN_PROCESS_CONTEXT FoundContext = NULL;
 
     BucketIndex = PnpHashProcessId(ProcessId);
     Bucket = &g_ProcessMonitor.HashTable[BucketIndex];
@@ -974,27 +1298,59 @@ PnpLookupProcessContext(
         Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, HashEntry);
 
         if (Context->ProcessId == ProcessId) {
+            //
+            // Found - take reference before releasing lock
+            //
             PnpReferenceContext(Context);
-            ExReleasePushLockShared(&Bucket->Lock);
-            KeLeaveCriticalRegion();
-            return Context;
+            FoundContext = Context;
+            break;
         }
     }
 
     ExReleasePushLockShared(&Bucket->Lock);
     KeLeaveCriticalRegion();
 
-    return NULL;
+    return FoundContext;
 }
 
 
-static VOID
+static NTSTATUS
 PnpInsertProcessContext(
     _In_ PPN_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    Inserts a process context into tracking structures.
+
+    Lock ordering: ProcessListLock THEN Bucket->Lock
+
+Arguments:
+    Context - The context to insert.
+
+Return Value:
+    STATUS_SUCCESS or error code.
+--*/
 {
     ULONG BucketIndex;
     PPN_HASH_BUCKET Bucket;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    //
+    // Verify context is not already inserted
+    //
+    if (InterlockedCompareExchange(&Context->InsertedInList, FALSE, FALSE) ||
+        InterlockedCompareExchange(&Context->InsertedInHash, FALSE, FALSE)) {
+        NT_ASSERT(FALSE);
+        return STATUS_ALREADY_REGISTERED;
+    }
+
+    //
+    // Check max context limit
+    //
+    if (InterlockedCompareExchange(&g_ProcessMonitor.ProcessCount, 0, 0) >=
+        PN_MAX_PROCESS_CONTEXTS) {
+        return STATUS_QUOTA_EXCEEDED;
+    }
 
     //
     // Reference for list storage
@@ -1002,12 +1358,16 @@ PnpInsertProcessContext(
     PnpReferenceContext(Context);
 
     //
-    // Insert into main list
+    // Lock ordering: ProcessListLock first, then bucket lock
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
 
+    //
+    // Insert into main list
+    //
     InsertTailList(&g_ProcessMonitor.ProcessList, &Context->ListEntry);
+    InterlockedExchange(&Context->InsertedInList, TRUE);
     InterlockedIncrement(&g_ProcessMonitor.ProcessCount);
 
     ExReleasePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
@@ -1023,9 +1383,12 @@ PnpInsertProcessContext(
     ExAcquirePushLockExclusive(&Bucket->Lock);
 
     InsertTailList(&Bucket->List, &Context->HashEntry);
+    InterlockedExchange(&Context->InsertedInHash, TRUE);
 
     ExReleasePushLockExclusive(&Bucket->Lock);
     KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
 }
 
 
@@ -1033,13 +1396,38 @@ static VOID
 PnpRemoveProcessContext(
     _In_ PPN_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    Removes a process context from tracking structures.
+
+    Lock ordering: ProcessListLock THEN Bucket->Lock
+--*/
 {
     ULONG BucketIndex;
     PPN_HASH_BUCKET Bucket;
     BOOLEAN WasInList = FALSE;
+    BOOLEAN WasInHash = FALSE;
 
     //
-    // Remove from hash table first
+    // Lock ordering: ProcessListLock first
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
+
+    if (InterlockedCompareExchange(&Context->InsertedInList, FALSE, TRUE)) {
+        if (!IsListEmpty(&Context->ListEntry)) {
+            RemoveEntryList(&Context->ListEntry);
+            InitializeListHead(&Context->ListEntry);
+            InterlockedDecrement(&g_ProcessMonitor.ProcessCount);
+            WasInList = TRUE;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Then bucket lock
     //
     BucketIndex = PnpHashProcessId(Context->ProcessId);
     Bucket = &g_ProcessMonitor.HashTable[BucketIndex];
@@ -1047,34 +1435,21 @@ PnpRemoveProcessContext(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Bucket->Lock);
 
-    if (!IsListEmpty(&Context->HashEntry)) {
-        RemoveEntryList(&Context->HashEntry);
-        InitializeListHead(&Context->HashEntry);
+    if (InterlockedCompareExchange(&Context->InsertedInHash, FALSE, TRUE)) {
+        if (!IsListEmpty(&Context->HashEntry)) {
+            RemoveEntryList(&Context->HashEntry);
+            InitializeListHead(&Context->HashEntry);
+            WasInHash = TRUE;
+        }
     }
 
     ExReleasePushLockExclusive(&Bucket->Lock);
     KeLeaveCriticalRegion();
 
     //
-    // Remove from main list
+    // Release list reference if was inserted
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
-
-    if (!IsListEmpty(&Context->ListEntry)) {
-        RemoveEntryList(&Context->ListEntry);
-        InitializeListHead(&Context->ListEntry);
-        InterlockedDecrement(&g_ProcessMonitor.ProcessCount);
-        WasInList = TRUE;
-    }
-
-    ExReleasePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Release list reference
-    //
-    if (WasInList) {
+    if (WasInList || WasInHash) {
         PnpDereferenceContext(Context);
     }
 }
@@ -1085,7 +1460,9 @@ PnpReferenceContext(
     _Inout_ PPN_PROCESS_CONTEXT Context
     )
 {
-    InterlockedIncrement(&Context->RefCount);
+    LONG NewCount = InterlockedIncrement(&Context->RefCount);
+    NT_ASSERT(NewCount > 1);
+    UNREFERENCED_PARAMETER(NewCount);
 }
 
 
@@ -1094,7 +1471,10 @@ PnpDereferenceContext(
     _Inout_ PPN_PROCESS_CONTEXT Context
     )
 {
-    if (InterlockedDecrement(&Context->RefCount) == 0) {
+    LONG NewCount = InterlockedDecrement(&Context->RefCount);
+    NT_ASSERT(NewCount >= 0);
+
+    if (NewCount == 0) {
         PnpFreeProcessContext(Context);
     }
 }
@@ -1115,6 +1495,7 @@ PnpCaptureProcessInfo(
     NTSTATUS Status = STATUS_SUCCESS;
     PWCHAR Buffer = NULL;
     SIZE_T BufferSize;
+    SIZE_T SafeBufferSize;
 
     //
     // Basic identification
@@ -1136,10 +1517,12 @@ PnpCaptureProcessInfo(
 
     //
     // Reference process object
+    // Note: We hold this reference for the lifetime of the context
+    // This is intentional to prevent process object reuse issues
     //
     Status = ObReferenceObjectByPointer(
         Process,
-        PROCESS_ALL_ACCESS,
+        PROCESS_QUERY_LIMITED_INFORMATION,
         *PsProcessType,
         KernelMode
         );
@@ -1148,49 +1531,87 @@ PnpCaptureProcessInfo(
     }
 
     //
-    // Capture image path
+    // Capture image path with safe size calculation
     //
     if (CreateInfo->ImageFileName != NULL &&
-        CreateInfo->ImageFileName->Length > 0) {
+        CreateInfo->ImageFileName->Length > 0 &&
+        CreateInfo->ImageFileName->Buffer != NULL) {
 
-        BufferSize = CreateInfo->ImageFileName->Length + sizeof(WCHAR);
+        //
+        // Validate length and prevent overflow
+        //
+        if (CreateInfo->ImageFileName->Length <= PN_MAX_IMAGE_PATH_CAPTURE * sizeof(WCHAR)) {
 
-        if (BufferSize <= PN_MAX_IMAGE_PATH_CAPTURE * sizeof(WCHAR)) {
-            Buffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-                NonPagedPoolNx,
-                BufferSize,
-                PN_POOL_TAG
-                );
+            //
+            // Safe size calculation: check for overflow
+            //
+            SafeBufferSize = (SIZE_T)CreateInfo->ImageFileName->Length + sizeof(WCHAR);
+            if (SafeBufferSize > CreateInfo->ImageFileName->Length) {  // Overflow check
 
-            if (Buffer != NULL) {
-                RtlCopyMemory(
-                    Buffer,
-                    CreateInfo->ImageFileName->Buffer,
-                    CreateInfo->ImageFileName->Length
-                    );
-                Buffer[CreateInfo->ImageFileName->Length / sizeof(WCHAR)] = L'\0';
-
-                Context->ImagePath.Buffer = Buffer;
-                Context->ImagePath.Length = CreateInfo->ImageFileName->Length;
-                Context->ImagePath.MaximumLength = (USHORT)BufferSize;
-
-                //
-                // Extract filename
-                //
-                PWCHAR LastSlash = wcsrchr(Buffer, L'\\');
-                if (LastSlash != NULL) {
-                    USHORT FileNameLen = (USHORT)((wcslen(LastSlash + 1)) * sizeof(WCHAR));
-                    PWCHAR FileNameBuffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
+                if (PnpCheckPoolLimit(SafeBufferSize)) {
+                    Buffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
                         NonPagedPoolNx,
-                        FileNameLen + sizeof(WCHAR),
+                        SafeBufferSize,
                         PN_POOL_TAG
                         );
-                    if (FileNameBuffer != NULL) {
-                        RtlCopyMemory(FileNameBuffer, LastSlash + 1, FileNameLen);
-                        FileNameBuffer[FileNameLen / sizeof(WCHAR)] = L'\0';
-                        Context->ImageFileName.Buffer = FileNameBuffer;
-                        Context->ImageFileName.Length = FileNameLen;
-                        Context->ImageFileName.MaximumLength = FileNameLen + sizeof(WCHAR);
+
+                    if (Buffer != NULL) {
+                        PnpTrackPoolAllocation(SafeBufferSize);
+
+                        RtlCopyMemory(
+                            Buffer,
+                            CreateInfo->ImageFileName->Buffer,
+                            CreateInfo->ImageFileName->Length
+                            );
+
+                        //
+                        // ALWAYS null-terminate for safe string operations
+                        //
+                        Buffer[CreateInfo->ImageFileName->Length / sizeof(WCHAR)] = L'\0';
+
+                        Context->ImagePath.Buffer = Buffer;
+                        Context->ImagePath.Length = CreateInfo->ImageFileName->Length;
+                        Context->ImagePath.MaximumLength = (USHORT)SafeBufferSize;
+
+                        //
+                        // Extract filename using safe search
+                        //
+                        PWCHAR LastSlash = NULL;
+                        PWCHAR Ptr = Buffer;
+                        USHORT RemainingChars = CreateInfo->ImageFileName->Length / sizeof(WCHAR);
+
+                        while (RemainingChars > 0 && *Ptr != L'\0') {
+                            if (*Ptr == L'\\') {
+                                LastSlash = Ptr;
+                            }
+                            Ptr++;
+                            RemainingChars--;
+                        }
+
+                        if (LastSlash != NULL && (LastSlash + 1) < (Buffer + Context->ImagePath.Length / sizeof(WCHAR))) {
+                            PWCHAR FileName = LastSlash + 1;
+                            SIZE_T FileNameLen = wcslen(FileName) * sizeof(WCHAR);
+                            SIZE_T FileNameBufferSize = FileNameLen + sizeof(WCHAR);
+
+                            if (FileNameLen > 0 && FileNameLen < 512 * sizeof(WCHAR) &&
+                                PnpCheckPoolLimit(FileNameBufferSize)) {
+
+                                PWCHAR FileNameBuffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
+                                    NonPagedPoolNx,
+                                    FileNameBufferSize,
+                                    PN_POOL_TAG
+                                    );
+
+                                if (FileNameBuffer != NULL) {
+                                    PnpTrackPoolAllocation(FileNameBufferSize);
+                                    RtlCopyMemory(FileNameBuffer, FileName, FileNameLen);
+                                    FileNameBuffer[FileNameLen / sizeof(WCHAR)] = L'\0';
+                                    Context->ImageFileName.Buffer = FileNameBuffer;
+                                    Context->ImageFileName.Length = (USHORT)FileNameLen;
+                                    Context->ImageFileName.MaximumLength = (USHORT)FileNameBufferSize;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1198,10 +1619,11 @@ PnpCaptureProcessInfo(
     }
 
     //
-    // Capture command line
+    // Capture command line with safe size calculation
     //
     if (CreateInfo->CommandLine != NULL &&
-        CreateInfo->CommandLine->Length > 0) {
+        CreateInfo->CommandLine->Length > 0 &&
+        CreateInfo->CommandLine->Buffer != NULL) {
 
         USHORT CaptureLength = CreateInfo->CommandLine->Length;
 
@@ -1212,20 +1634,31 @@ PnpCaptureProcessInfo(
             CaptureLength = PN_MAX_COMMAND_LINE_CAPTURE * sizeof(WCHAR);
         }
 
-        BufferSize = CaptureLength + sizeof(WCHAR);
-        Buffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            BufferSize,
-            PN_POOL_TAG
-            );
+        //
+        // Safe size calculation with overflow check
+        //
+        SafeBufferSize = (SIZE_T)CaptureLength + sizeof(WCHAR);
+        if (SafeBufferSize > CaptureLength && PnpCheckPoolLimit(SafeBufferSize)) {
 
-        if (Buffer != NULL) {
-            RtlCopyMemory(Buffer, CreateInfo->CommandLine->Buffer, CaptureLength);
-            Buffer[CaptureLength / sizeof(WCHAR)] = L'\0';
+            Buffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
+                NonPagedPoolNx,
+                SafeBufferSize,
+                PN_POOL_TAG
+                );
 
-            Context->CommandLine.Buffer = Buffer;
-            Context->CommandLine.Length = CaptureLength;
-            Context->CommandLine.MaximumLength = (USHORT)BufferSize;
+            if (Buffer != NULL) {
+                PnpTrackPoolAllocation(SafeBufferSize);
+                RtlCopyMemory(Buffer, CreateInfo->CommandLine->Buffer, CaptureLength);
+
+                //
+                // ALWAYS null-terminate
+                //
+                Buffer[CaptureLength / sizeof(WCHAR)] = L'\0';
+
+                Context->CommandLine.Buffer = Buffer;
+                Context->CommandLine.Length = CaptureLength;
+                Context->CommandLine.MaximumLength = (USHORT)SafeBufferSize;
+            }
         }
     }
 
@@ -1241,14 +1674,11 @@ PnpCaptureTokenInfo(
 {
     NTSTATUS Status = STATUS_SUCCESS;
     PACCESS_TOKEN Token = NULL;
-    PTOKEN_STATISTICS TokenStats = NULL;
-    SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
-    BOOLEAN IsImpersonating = FALSE;
     ULONG SessionId = 0;
 
     __try {
         //
-        // Get primary token
+        // Get primary token of the TARGET process (not current thread)
         //
         Token = PsReferencePrimaryToken(Process);
         if (Token == NULL) {
@@ -1264,10 +1694,10 @@ PnpCaptureTokenInfo(
         }
 
         //
-        // Check token type
+        // Check for restricted token (typically low integrity)
         //
         if (SeTokenIsRestricted(Token)) {
-            Context->IntegrityLevel = 0;  // Restricted = low
+            Context->IntegrityLevel = 0;  // Low
         }
 
         //
@@ -1278,22 +1708,58 @@ PnpCaptureTokenInfo(
         }
 
         //
-        // Check for specific privileges
+        // Check for dangerous privileges using SeSinglePrivilegeCheck pattern
+        // Note: We check if the privilege EXISTS in the token, not if it's enabled
         //
-        LUID DebugPrivilege = {SE_DEBUG_PRIVILEGE, 0};
-        LUID ImpersonatePrivilege = {SE_IMPERSONATE_PRIVILEGE, 0};
 
-        BOOLEAN DebugPresent = FALSE;
-        BOOLEAN ImpersonatePresent = FALSE;
+        //
+        // SE_DEBUG_PRIVILEGE (20) - Can debug any process
+        //
+        {
+            LUID DebugPrivilege = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
+            PRIVILEGE_SET PrivSet;
+            PrivSet.PrivilegeCount = 1;
+            PrivSet.Control = PRIVILEGE_SET_ALL_NECESSARY;
+            PrivSet.Privilege[0].Luid = DebugPrivilege;
+            PrivSet.Privilege[0].Attributes = 0;
 
-        Status = SePrivilegeCheck(
-            &DebugPrivilege,
-            1,
-            Token,
-            KernelMode
-            );
-        if (NT_SUCCESS(Status)) {
-            Context->HasDebugPrivilege = TRUE;
+            BOOLEAN Result = FALSE;
+            Status = SePrivilegeCheck(&PrivSet, &Process->Pcb, UserMode);
+            if (NT_SUCCESS(Status)) {
+                Context->HasDebugPrivilege = TRUE;
+            }
+        }
+
+        //
+        // SE_IMPERSONATE_PRIVILEGE (29) - Can impersonate tokens
+        //
+        {
+            LUID ImpersonatePrivilege = RtlConvertLongToLuid(SE_IMPERSONATE_PRIVILEGE);
+            Context->HasImpersonatePrivilege = SeSinglePrivilegeCheck(ImpersonatePrivilege, UserMode);
+        }
+
+        //
+        // SE_TCB_PRIVILEGE (7) - Act as part of OS
+        //
+        {
+            LUID TcbPrivilege = RtlConvertLongToLuid(SE_TCB_PRIVILEGE);
+            Context->HasTcbPrivilege = SeSinglePrivilegeCheck(TcbPrivilege, UserMode);
+        }
+
+        //
+        // SE_ASSIGNPRIMARYTOKEN_PRIVILEGE (3) - Assign process token
+        //
+        {
+            LUID AssignTokenPrivilege = RtlConvertLongToLuid(SE_ASSIGNPRIMARYTOKEN_PRIVILEGE);
+            Context->HasAssignPrimaryTokenPrivilege = SeSinglePrivilegeCheck(AssignTokenPrivilege, UserMode);
+        }
+
+        //
+        // SE_LOAD_DRIVER_PRIVILEGE (10) - Load kernel drivers
+        //
+        {
+            LUID LoadDriverPrivilege = RtlConvertLongToLuid(SE_LOAD_DRIVER_PRIVILEGE);
+            Context->HasLoadDriverPrivilege = SeSinglePrivilegeCheck(LoadDriverPrivilege, UserMode);
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1327,24 +1793,19 @@ PnpCaptureTokenInfo(
     }
 
     //
-    // Check if SYSTEM process
+    // Determine if SYSTEM or service process
+    // Session 0 + elevated is typically a service
     //
-    {
-        SECURITY_SUBJECT_CONTEXT SubjectContext;
-        SeCaptureSubjectContext(&SubjectContext);
+    if (Context->SessionId == 0 && Context->IsElevated) {
+        Context->IsService = TRUE;
 
-        if (SeTokenIsAdmin(SubjectContext.PrimaryToken)) {
-            //
-            // Further check for SYSTEM SID
-            //
-            // Simplified: If session 0 and elevated, likely system service
-            //
-            if (Context->SessionId == 0 && Context->IsElevated) {
-                Context->IsService = TRUE;
-            }
+        //
+        // Check for SYSTEM specifically by checking for TCB privilege
+        // (Only SYSTEM and very privileged services have this)
+        //
+        if (Context->HasTcbPrivilege) {
+            Context->IsSystem = TRUE;
         }
-
-        SeReleaseSubjectContext(&SubjectContext);
     }
 
     return STATUS_SUCCESS;
@@ -1383,7 +1844,7 @@ Routine Description:
         // Exception: Some legitimate scenarios like AppInfo service elevation
         // Check if creating process is a known system process
         //
-        if (PnpIsSystemProcess(Context->CreatingProcessId)) {
+        if (PnpIsKnownSystemProcess(Context->CreatingProcessId, NULL)) {
             //
             // System process creating with different parent is often legitimate
             // (e.g., services.exe, svchost.exe doing elevation)
@@ -1393,7 +1854,7 @@ Routine Description:
 
         //
         // Exception: Self-parenting (process setting itself as parent)
-        // This is sometimes done for orphaning
+        // This is sometimes done for orphaning - VERY suspicious
         //
         if (Context->ParentProcessId == Context->ProcessId) {
             return TRUE;  // Definitely suspicious
@@ -1434,7 +1895,7 @@ PnpAnalyzeProcess(
 /*++
 Routine Description:
     Performs comprehensive process analysis including:
-    - Command line pattern matching
+    - Command line pattern matching (case-insensitive)
     - LOLBin detection
     - Encoded command detection
     - Behavioral indicators
@@ -1447,82 +1908,102 @@ Routine Description:
         Context->CommandLine.Buffer != NULL &&
         Context->CommandLine.Length > 0) {
 
-        //
-        // Check for encoded/obfuscated commands
-        //
         PWCHAR CmdLine = Context->CommandLine.Buffer;
-        SIZE_T CmdLen = Context->CommandLine.Length / sizeof(WCHAR);
+        USHORT CmdLenBytes = Context->CommandLine.Length;
+        SIZE_T CmdLenChars = CmdLenBytes / sizeof(WCHAR);
 
         //
         // Pattern: PowerShell encoded command (-enc, -e, -encodedcommand)
+        // Use case-insensitive matching
         //
-        if (wcsstr(CmdLine, L"-enc") != NULL ||
-            wcsstr(CmdLine, L"-EncodedCommand") != NULL ||
-            wcsstr(CmdLine, L"-e ") != NULL) {
+        if (PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-enc") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-EncodedCommand") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-e ") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-ec ")) {
 
             Context->Flags |= PN_PROC_FLAG_ENCODED_CMD;
+            Context->BehaviorFlags |= PN_BEHAVIOR_BASE64_ENCODED;
             InterlockedIncrement64(&g_ProcessMonitor.Stats.EncodedCommands);
         }
 
         //
         // Pattern: PowerShell bypass flags
         //
-        if (wcsstr(CmdLine, L"-nop") != NULL ||      // NoProfile
-            wcsstr(CmdLine, L"-noni") != NULL ||     // NonInteractive
-            wcsstr(CmdLine, L"-w hidden") != NULL || // WindowStyle Hidden
-            wcsstr(CmdLine, L"-ep bypass") != NULL || // ExecutionPolicy Bypass
-            wcsstr(CmdLine, L"bypass") != NULL) {
+        if (PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-nop") ||      // NoProfile
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-noni") ||     // NonInteractive
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-w hidden") || // WindowStyle Hidden
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-windowstyle hidden") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-ep bypass") || // ExecutionPolicy Bypass
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"-executionpolicy bypass") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"bypass")) {
 
-            Context->BehaviorFlags |= 0x0001;  // Suspicious PS flags
+            Context->BehaviorFlags |= PN_BEHAVIOR_SUSPICIOUS_PS;
         }
 
         //
         // Pattern: Download cradle indicators
         //
-        if (wcsstr(CmdLine, L"DownloadString") != NULL ||
-            wcsstr(CmdLine, L"DownloadFile") != NULL ||
-            wcsstr(CmdLine, L"WebClient") != NULL ||
-            wcsstr(CmdLine, L"Invoke-WebRequest") != NULL ||
-            wcsstr(CmdLine, L"wget") != NULL ||
-            wcsstr(CmdLine, L"curl") != NULL ||
-            wcsstr(CmdLine, L"bitsadmin") != NULL) {
+        if (PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"DownloadString") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"DownloadFile") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"DownloadData") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"WebClient") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"Invoke-WebRequest") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"Invoke-RestMethod") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"wget ") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"curl ") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"bitsadmin") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"Start-BitsTransfer")) {
 
-            Context->BehaviorFlags |= 0x0002;  // Download cradle
+            Context->BehaviorFlags |= PN_BEHAVIOR_DOWNLOAD_CRADLE;
+        }
+
+        //
+        // Pattern: Reflection/memory loading (fileless)
+        //
+        if (PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"[Reflection.Assembly]") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"Reflection.Assembly") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"::Load(") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"FromBase64String")) {
+
+            Context->BehaviorFlags |= PN_BEHAVIOR_REFLECTION_LOAD;
         }
 
         //
         // Pattern: Suspicious cmd.exe usage
         //
-        if (wcsstr(CmdLine, L"/c ") != NULL ||
-            wcsstr(CmdLine, L"/k ") != NULL) {
+        if (PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"/c ") ||
+            PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"/k ")) {
 
             //
             // Check for chained commands or suspicious patterns
             //
-            if (wcsstr(CmdLine, L"&&") != NULL ||
-                wcsstr(CmdLine, L"| ") != NULL ||
-                wcsstr(CmdLine, L"^") != NULL) {
+            if (PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"&&") ||
+                PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"| ") ||
+                PnpSafeWcsStrI(CmdLine, CmdLenBytes, L"^")) {
 
-                Context->BehaviorFlags |= 0x0004;  // Suspicious cmd
+                Context->BehaviorFlags |= PN_BEHAVIOR_SUSPICIOUS_CMD;
             }
         }
 
         //
         // Check command line length (very long = suspicious)
         //
-        if (CmdLen > 2048) {
-            Context->BehaviorFlags |= 0x0008;  // Long command line
+        if (CmdLenChars > 2048) {
+            Context->BehaviorFlags |= PN_BEHAVIOR_LONG_CMDLINE;
         }
     }
 
     //
-    // LOLBin detection
+    // LOLBin detection (case-insensitive)
     //
-    if (Context->ImageFileName.Buffer != NULL) {
+    if (Context->ImageFileName.Buffer != NULL &&
+        Context->ImageFileName.Length > 0) {
+
         PWCHAR FileName = Context->ImageFileName.Buffer;
 
         //
-        // Common LOLBins
+        // Common LOLBins - Living Off The Land Binaries
+        // These are legitimate Windows binaries often abused by attackers
         //
         static const PCWSTR LOLBins[] = {
             L"mshta.exe",
@@ -1541,7 +2022,26 @@ Routine Description:
             L"msconfig.exe",
             L"cmstp.exe",
             L"forfiles.exe",
-            L"pcalua.exe"
+            L"pcalua.exe",
+            L"presentationhost.exe",
+            L"te.exe",
+            L"dnscmd.exe",
+            L"ftp.exe",
+            L"hh.exe",
+            L"ieexec.exe",
+            L"infdefaultinstall.exe",
+            L"mavinject.exe",
+            L"msdeploy.exe",
+            L"msdt.exe",
+            L"msiexec.exe",
+            L"odbcconf.exe",
+            L"pcwrun.exe",
+            L"rcsi.exe",
+            L"sfc.exe",
+            L"syncappvpublishingserver.exe",
+            L"tracker.exe",
+            L"verclsid.exe",
+            L"xwizard.exe"
         };
 
         for (ULONG i = 0; i < ARRAYSIZE(LOLBins); i++) {
@@ -1564,12 +2064,13 @@ PnpCalculateSuspicionScore(
 /*++
 Routine Description:
     Calculates a suspicion score based on accumulated indicators.
+    Score ranges from 0-100.
 --*/
 {
     ULONG Score = 0;
 
     //
-    // PPID spoofing is highly suspicious
+    // PPID spoofing is highly suspicious (major red flag)
     //
     if (Context->Flags & PN_PROC_FLAG_PPID_SPOOFED) {
         Score += 40;
@@ -1589,10 +2090,17 @@ Routine Description:
         Score += 15;
 
         //
-        // LOLBin + encoded = more suspicious
+        // LOLBin + encoded = much more suspicious
         //
         if (Context->Flags & PN_PROC_FLAG_ENCODED_CMD) {
             Score += 15;
+        }
+
+        //
+        // LOLBin + download cradle = very suspicious
+        //
+        if (Context->BehaviorFlags & PN_BEHAVIOR_DOWNLOAD_CRADLE) {
+            Score += 20;
         }
     }
 
@@ -1604,22 +2112,34 @@ Routine Description:
     }
 
     //
+    // Unsigned binary (if signature verification enabled)
+    //
+    if (g_ProcessMonitor.Config.EnableSignatureVerification &&
+        !(Context->Flags & PN_PROC_FLAG_SIGNATURE_VALID)) {
+        Score += 5;
+    }
+
+    //
     // Behavioral flags
     //
-    if (Context->BehaviorFlags & 0x0001) {  // Suspicious PS flags
+    if (Context->BehaviorFlags & PN_BEHAVIOR_SUSPICIOUS_PS) {
         Score += 15;
     }
 
-    if (Context->BehaviorFlags & 0x0002) {  // Download cradle
+    if (Context->BehaviorFlags & PN_BEHAVIOR_DOWNLOAD_CRADLE) {
         Score += 20;
     }
 
-    if (Context->BehaviorFlags & 0x0004) {  // Suspicious cmd
+    if (Context->BehaviorFlags & PN_BEHAVIOR_SUSPICIOUS_CMD) {
         Score += 10;
     }
 
-    if (Context->BehaviorFlags & 0x0008) {  // Long command line
+    if (Context->BehaviorFlags & PN_BEHAVIOR_LONG_CMDLINE) {
         Score += 5;
+    }
+
+    if (Context->BehaviorFlags & PN_BEHAVIOR_REFLECTION_LOAD) {
+        Score += 25;
     }
 
     //
@@ -1630,9 +2150,17 @@ Routine Description:
     }
 
     //
-    // Debug privilege (rare in normal apps)
+    // Dangerous privileges (rare in normal apps)
     //
     if (Context->HasDebugPrivilege && !Context->IsSystem) {
+        Score += 15;
+    }
+
+    if (Context->HasTcbPrivilege && !Context->IsSystem) {
+        Score += 20;  // Very suspicious if not SYSTEM
+    }
+
+    if (Context->HasAssignPrimaryTokenPrivilege && !Context->IsSystem) {
         Score += 15;
     }
 
@@ -1661,8 +2189,8 @@ PnpSendProcessNotification(
     NTSTATUS Status = STATUS_SUCCESS;
     PSHADOWSTRIKE_PROCESS_NOTIFICATION Notification = NULL;
     PSHADOWSTRIKE_PROCESS_VERDICT_REPLY Reply = NULL;
-    ULONG NotificationSize;
-    ULONG ReplySize = sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY);
+    SIZE_T NotificationSize;
+    SIZE_T ReplySize = sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY);
     BOOLEAN RequireReply = FALSE;
     PUCHAR BufferPtr;
 
@@ -1689,7 +2217,7 @@ PnpSendProcessNotification(
     }
 
     //
-    // Calculate sizes
+    // Calculate sizes with validation
     //
     if (Context->ImagePath.Buffer != NULL) {
         ImagePathLen = Context->ImagePath.Length;
@@ -1707,32 +2235,62 @@ PnpSendProcessNotification(
     }
 
     //
-    // Calculate total size
+    // Safe size calculation with overflow checking
     //
-    NotificationSize = sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) +
-                       ImagePathLen +
-                       CmdLineLen;
+    SIZE_T BaseSize = sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION);
+    SIZE_T DataSize = (SIZE_T)ImagePathLen + (SIZE_T)CmdLineLen;
 
+    //
+    // Check for overflow
+    //
+    if (DataSize < ImagePathLen || DataSize < CmdLineLen) {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    NotificationSize = BaseSize + DataSize;
+    if (NotificationSize < BaseSize || NotificationSize < DataSize) {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    //
+    // Check against max message size
+    //
     if (NotificationSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
         //
         // Truncate command line to fit
         //
-        ULONG MaxData = SHADOWSTRIKE_MAX_MESSAGE_SIZE - sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) - ImagePathLen;
-        if (CmdLineLen > MaxData) {
-            CmdLineLen = (USHORT)MaxData;
+        SIZE_T MaxData = SHADOWSTRIKE_MAX_MESSAGE_SIZE - BaseSize - ImagePathLen;
+        if (MaxData < SHADOWSTRIKE_MAX_MESSAGE_SIZE) {  // Underflow check
+            if (CmdLineLen > MaxData) {
+                CmdLineLen = (USHORT)MaxData;
+            }
+        } else {
+            CmdLineLen = 0;
         }
         NotificationSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
     }
 
     //
+    // Check pool limits
+    //
+    if (!PnpCheckPoolLimit(NotificationSize)) {
+        InterlockedIncrement64(&g_ProcessMonitor.Stats.PoolLimitDrops);
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
     // Allocate notification buffer
     //
-    Notification = (PSHADOWSTRIKE_PROCESS_NOTIFICATION)ShadowStrikeAllocateMessageBuffer(NotificationSize);
+    Notification = (PSHADOWSTRIKE_PROCESS_NOTIFICATION)ShadowStrikeAllocateMessageBuffer(
+        (ULONG)NotificationSize
+        );
     if (Notification == NULL) {
         SHADOWSTRIKE_INC_STAT(MessagesDropped);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    PnpTrackPoolAllocation(NotificationSize);
     RtlZeroMemory(Notification, NotificationSize);
 
     //
@@ -1764,22 +2322,45 @@ PnpSendProcessNotification(
     // Allocate reply buffer if needed
     //
     if (RequireReply) {
-        Reply = (PSHADOWSTRIKE_PROCESS_VERDICT_REPLY)ShadowStrikeAllocateMessageBuffer(ReplySize);
+        Reply = (PSHADOWSTRIKE_PROCESS_VERDICT_REPLY)ShadowStrikeAllocateMessageBuffer(
+            (ULONG)ReplySize
+            );
         if (Reply == NULL) {
             RequireReply = FALSE;
+        } else {
+            PnpTrackPoolAllocation(ReplySize);
         }
     }
 
     //
-    // Send notification
+    // Send notification with timeout
     //
-    Status = ShadowStrikeSendProcessNotification(
+    Status = ShadowStrikeSendProcessNotificationWithTimeout(
         Notification,
-        NotificationSize,
+        (ULONG)NotificationSize,
         RequireReply,
         Reply,
-        RequireReply ? &ReplySize : NULL
+        RequireReply ? (PULONG)&ReplySize : NULL,
+        g_ProcessMonitor.Config.AnalysisTimeoutMs
         );
+
+    //
+    // Handle timeout
+    //
+    if (Status == STATUS_TIMEOUT) {
+        InterlockedIncrement64(&g_ProcessMonitor.Stats.UserModeTimeouts);
+        //
+        // On timeout, default to allow (fail-open for availability)
+        // Log for investigation
+        //
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/ProcessNotify] User-mode timeout for PID %lu, defaulting to ALLOW\n",
+            HandleToULong(Context->ProcessId)
+            );
+        Status = STATUS_SUCCESS;
+    }
 
     //
     // Handle verdict
@@ -1794,10 +2375,12 @@ PnpSendProcessNotification(
     // Cleanup
     //
     if (Notification != NULL) {
+        PnpTrackPoolFree(NotificationSize);
         ShadowStrikeFreeMessageBuffer(Notification);
     }
 
     if (Reply != NULL) {
+        PnpTrackPoolFree(ReplySize);
         ShadowStrikeFreeMessageBuffer(Reply);
     }
 
@@ -1851,23 +2434,40 @@ PnpHandleProcessTermination(
 // ============================================================================
 
 static BOOLEAN
-PnpIsSystemProcess(
-    _In_ HANDLE ProcessId
+PnpIsKnownSystemProcess(
+    _In_ HANDLE ProcessId,
+    _In_opt_ PEPROCESS Process
     )
+/*++
+Routine Description:
+    Determines if a process is a known system process.
+
+    This is a PERFORMANCE optimization, not a security control.
+    We skip detailed analysis for core system processes that
+    are always present and trusted.
+--*/
 {
     ULONG Pid = HandleToULong(ProcessId);
 
     //
-    // System (4) and Idle (0)
+    // System (4) and Idle (0) - always system
     //
     if (Pid <= 4) {
         return TRUE;
     }
 
     //
-    // Could add additional checks for known system PIDs
-    // But PIDs are dynamic, so this is limited
+    // For other processes, we could check:
+    // 1. Protected process status
+    // 2. Image path against known system binaries
+    // 3. Token for SYSTEM SID
     //
+    // However, PIDs are dynamic and attackers can abuse any process,
+    // so we only skip the absolute minimum here.
+    //
+
+    UNREFERENCED_PARAMETER(Process);
+
     return FALSE;
 }
 
@@ -1876,27 +2476,66 @@ static BOOLEAN
 PnpIsTrustedProcess(
     _In_ PPN_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    Determines if a process should be considered trusted.
+
+    SECURITY NOTE: This check can be bypassed and should NOT be the
+    sole basis for allowing potentially malicious behavior.
+
+    Trust is only granted when:
+    1. Binary is in a protected system path
+    2. Binary has valid signature
+    3. No suspicious indicators are present
+--*/
 {
     //
-    // Check if process is in protected process list
+    // Never trust if PPID spoofed
     //
-    if (Context->ImagePath.Buffer != NULL) {
+    if (Context->Flags & PN_PROC_FLAG_PPID_SPOOFED) {
+        return FALSE;
+    }
+
+    //
+    // Never trust if encoded commands
+    //
+    if (Context->Flags & PN_PROC_FLAG_ENCODED_CMD) {
+        return FALSE;
+    }
+
+    //
+    // Require valid signature for trust
+    //
+    if (g_ProcessMonitor.Config.EnableSignatureVerification) {
+        if (!(Context->Flags & PN_PROC_FLAG_SIGNATURE_VALID)) {
+            return FALSE;
+        }
+    }
+
+    //
+    // Check for Windows system paths
+    //
+    if (Context->ImagePath.Buffer != NULL && Context->ImagePath.Length > 0) {
         //
-        // Check for Windows system paths
+        // Use case-insensitive, length-bounded search
         //
-        if (wcsstr(Context->ImagePath.Buffer, L"\\Windows\\System32\\") != NULL ||
-            wcsstr(Context->ImagePath.Buffer, L"\\Windows\\SysWOW64\\") != NULL) {
+        if (PnpSafeWcsStrI(Context->ImagePath.Buffer,
+                          Context->ImagePath.Length,
+                          L"\\Windows\\System32\\") ||
+            PnpSafeWcsStrI(Context->ImagePath.Buffer,
+                          Context->ImagePath.Length,
+                          L"\\Windows\\SysWOW64\\") ||
+            PnpSafeWcsStrI(Context->ImagePath.Buffer,
+                          Context->ImagePath.Length,
+                          L"\\Windows\\WinSxS\\")) {
 
             //
-            // Still validate: not all system32 binaries are trustworthy
-            // when executed with suspicious parameters
+            // Additional validation: check for path traversal attempts
             //
-            if (Context->Flags & PN_PROC_FLAG_ENCODED_CMD) {
-                return FALSE;  // Suspicious even if system binary
-            }
-
-            if (Context->Flags & PN_PROC_FLAG_PPID_SPOOFED) {
-                return FALSE;  // PPID spoofing overrides trust
+            if (PnpSafeWcsStrI(Context->ImagePath.Buffer,
+                              Context->ImagePath.Length,
+                              L"..")) {
+                return FALSE;  // Path traversal attempt
             }
 
             return TRUE;
@@ -1911,39 +2550,282 @@ static BOOLEAN
 PnpCheckParentSessionMatch(
     _In_ PPN_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    Checks if parent and child sessions match.
+    Cross-session process creation can indicate token manipulation.
+--*/
 {
     //
-    // Session 0 isolation: Non-session-0 process shouldn't be created
-    // by session-0 process in normal circumstances (except via services)
+    // Same session = normal
     //
-    if (Context->SessionId != Context->ParentSessionId) {
-        //
-        // Cross-session creation
-        //
+    if (Context->SessionId == Context->ParentSessionId) {
+        return TRUE;
+    }
 
-        //
-        // Exception: Parent is session 0 (service), child is user session
-        // This is normal for service-launched processes
-        //
-        if (Context->ParentSessionId == 0 && Context->SessionId != 0) {
-            return TRUE;  // Normal service launch
-        }
+    //
+    // Exception: Parent is session 0 (service), child is user session
+    // This is normal for service-launched processes
+    //
+    if (Context->ParentSessionId == 0 && Context->SessionId != 0) {
+        return TRUE;
+    }
 
+    //
+    // User session creating session-0 process is suspicious
+    //
+    if (Context->ParentSessionId != 0 && Context->SessionId == 0) {
+        return FALSE;
+    }
+
+    //
+    // Different user sessions is unusual
+    //
+    return FALSE;
+}
+
+
+static BOOLEAN
+PnpCheckRateLimit(
+    VOID
+    )
+/*++
+Routine Description:
+    Implements token bucket rate limiting for notifications.
+
+Return Value:
+    TRUE if notification is allowed, FALSE if rate limited.
+--*/
+{
+    LARGE_INTEGER CurrentTime;
+    LONG64 WindowStart;
+    LONG64 WindowDuration;
+    LONG CurrentCount;
+
+    KeQuerySystemTime(&CurrentTime);
+
+    //
+    // Window duration in 100ns units
+    //
+    WindowDuration = (LONG64)PN_RATE_LIMIT_WINDOW_MS * 10000;
+
+    //
+    // Check if we need to reset the window
+    //
+    WindowStart = InterlockedCompareExchange64(
+        &g_ProcessMonitor.RateLimiter.WindowStartTime,
+        0, 0);
+
+    if ((CurrentTime.QuadPart - WindowStart) > WindowDuration) {
         //
-        // Exception: User session creating in session 0 via elevation
-        // (Requires further validation with token analysis)
+        // Try to reset window
         //
-        if (Context->ParentSessionId != 0 && Context->SessionId == 0) {
+        if (InterlockedCompareExchange64(
+                &g_ProcessMonitor.RateLimiter.WindowStartTime,
+                CurrentTime.QuadPart,
+                WindowStart) == WindowStart) {
             //
-            // This is suspicious - user creating session-0 process
+            // We reset the window, reset counter
             //
-            return FALSE;
+            InterlockedExchange(&g_ProcessMonitor.RateLimiter.NotificationsInWindow, 0);
         }
+    }
 
+    //
+    // Increment and check count
+    //
+    CurrentCount = InterlockedIncrement(&g_ProcessMonitor.RateLimiter.NotificationsInWindow);
+
+    if (CurrentCount > (LONG)g_ProcessMonitor.Config.MaxNotificationsPerSecond) {
+        InterlockedIncrement(&g_ProcessMonitor.RateLimiter.DroppedNotifications);
         return FALSE;
     }
 
     return TRUE;
+}
+
+
+static BOOLEAN
+PnpCheckPoolLimit(
+    _In_ SIZE_T AllocationSize
+    )
+/*++
+Routine Description:
+    Checks if allocation would exceed pool limits.
+--*/
+{
+    LONG64 Current = InterlockedCompareExchange64(
+        &g_ProcessMonitor.PoolTracker.CurrentAllocation, 0, 0);
+
+    if ((Current + (LONG64)AllocationSize) > g_ProcessMonitor.PoolTracker.MaxAllocation) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static VOID
+PnpTrackPoolAllocation(
+    _In_ SIZE_T Size
+    )
+{
+    LONG64 NewValue = InterlockedAdd64(
+        &g_ProcessMonitor.PoolTracker.CurrentAllocation,
+        (LONG64)Size);
+
+    //
+    // Update peak
+    //
+    LONG64 Peak = InterlockedCompareExchange64(
+        &g_ProcessMonitor.PoolTracker.PeakAllocation, 0, 0);
+
+    while (NewValue > Peak) {
+        LONG64 OldPeak = InterlockedCompareExchange64(
+            &g_ProcessMonitor.PoolTracker.PeakAllocation,
+            NewValue,
+            Peak);
+        if (OldPeak == Peak) {
+            break;
+        }
+        Peak = OldPeak;
+    }
+}
+
+
+static VOID
+PnpTrackPoolFree(
+    _In_ SIZE_T Size
+    )
+{
+    InterlockedAdd64(
+        &g_ProcessMonitor.PoolTracker.CurrentAllocation,
+        -(LONG64)Size);
+}
+
+
+static BOOLEAN
+PnpSafeWcsStrI(
+    _In_ PCWCH Buffer,
+    _In_ USHORT BufferLengthBytes,
+    _In_ PCWSTR Pattern
+    )
+/*++
+Routine Description:
+    Case-insensitive substring search with length bounds.
+    Does NOT rely on null-termination.
+
+Arguments:
+    Buffer - The buffer to search in
+    BufferLengthBytes - Length of buffer in BYTES
+    Pattern - Null-terminated pattern to search for
+
+Return Value:
+    TRUE if pattern found, FALSE otherwise.
+--*/
+{
+    SIZE_T BufferLenChars;
+    SIZE_T PatternLen;
+    SIZE_T i, j;
+
+    if (Buffer == NULL || Pattern == NULL || BufferLengthBytes == 0) {
+        return FALSE;
+    }
+
+    BufferLenChars = BufferLengthBytes / sizeof(WCHAR);
+    PatternLen = wcslen(Pattern);
+
+    if (PatternLen == 0 || PatternLen > BufferLenChars) {
+        return FALSE;
+    }
+
+    //
+    // Simple case-insensitive search
+    //
+    for (i = 0; i <= BufferLenChars - PatternLen; i++) {
+        BOOLEAN Match = TRUE;
+
+        for (j = 0; j < PatternLen; j++) {
+            WCHAR BufChar = Buffer[i + j];
+            WCHAR PatChar = Pattern[j];
+
+            //
+            // Convert to uppercase for comparison
+            //
+            if (BufChar >= L'a' && BufChar <= L'z') {
+                BufChar -= (L'a' - L'A');
+            }
+            if (PatChar >= L'a' && PatChar <= L'z') {
+                PatChar -= (L'a' - L'A');
+            }
+
+            if (BufChar != PatChar) {
+                Match = FALSE;
+                break;
+            }
+        }
+
+        if (Match) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static NTSTATUS
+PnpVerifyImageSignature(
+    _In_ PPN_PROCESS_CONTEXT Context
+    )
+/*++
+Routine Description:
+    Verifies the digital signature of the process image.
+
+    This uses CI.dll exports if available, or falls back to
+    checking basic signature status from the process object.
+--*/
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    //
+    // Check if process object has signature info
+    // This is available via PsGetProcessSignatureLevel on Win8.1+
+    //
+    if (Context->ProcessObject != NULL) {
+        UCHAR SignatureLevel = 0;
+        UCHAR SectionSignatureLevel = 0;
+
+        //
+        // PsGetProcessSignatureLevel is available on Windows 8.1+
+        // We use it if available, otherwise we can't verify
+        //
+        #if (NTDDI_VERSION >= NTDDI_WINBLUE)
+        Status = PsGetProcessSignatureLevel(
+            Context->ProcessObject,
+            &SignatureLevel,
+            &SectionSignatureLevel
+            );
+
+        if (NT_SUCCESS(Status)) {
+            //
+            // Any signature level > 0 indicates some form of signing
+            // SE_SIGNING_LEVEL_MICROSOFT (8) or higher is MS-signed
+            // SE_SIGNING_LEVEL_AUTHENTICODE (4) is third-party signed
+            //
+            if (SignatureLevel >= SE_SIGNING_LEVEL_AUTHENTICODE) {
+                Context->IsSignatureValid = TRUE;
+            }
+        }
+        #else
+        //
+        // Older OS - can't easily verify, default to unknown
+        //
+        Status = STATUS_NOT_SUPPORTED;
+        #endif
+    }
+
+    return Status;
 }
 
 
@@ -1958,6 +2840,13 @@ PnpCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
+/*++
+Routine Description:
+    DPC callback for cleanup timer.
+
+    CRITICAL: This runs at DISPATCH_LEVEL. Cannot call paged code
+    or acquire push locks. Must queue a work item.
+--*/
 {
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
@@ -1969,9 +2858,52 @@ PnpCleanupTimerDpc(
     }
 
     //
-    // Queue work item for cleanup (can't do paged operations in DPC)
+    // Don't queue if work is already pending
     //
-    PnpCleanupStaleContexts();
+    if (InterlockedCompareExchange(&g_ProcessMonitor.CleanupWorkPending, TRUE, FALSE) == FALSE) {
+        //
+        // Queue work item for cleanup (runs at PASSIVE_LEVEL)
+        //
+        if (g_ProcessMonitor.CleanupWorkItem != NULL) {
+            IoQueueWorkItem(
+                g_ProcessMonitor.CleanupWorkItem,
+                PnpCleanupWorkRoutine,
+                DelayedWorkQueue,
+                NULL
+                );
+        } else {
+            //
+            // No work item - clear pending flag
+            //
+            InterlockedExchange(&g_ProcessMonitor.CleanupWorkPending, FALSE);
+        }
+    }
+}
+
+
+static VOID
+PnpCleanupWorkRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+/*++
+Routine Description:
+    Work item routine for cleanup. Runs at PASSIVE_LEVEL.
+--*/
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
+
+    PAGED_CODE();
+
+    if (!g_ProcessMonitor.ShutdownRequested) {
+        PnpCleanupStaleContexts();
+    }
+
+    //
+    // Clear pending flag
+    //
+    InterlockedExchange(&g_ProcessMonitor.CleanupWorkPending, FALSE);
 }
 
 
@@ -1984,7 +2916,8 @@ Routine Description:
     Removes process contexts for terminated processes.
 
     This runs periodically to clean up contexts that weren't
-    properly removed during process termination.
+    properly removed during process termination, and to check
+    for orphaned contexts where the process has exited.
 --*/
 {
     LARGE_INTEGER CurrentTime;
@@ -1992,12 +2925,18 @@ Routine Description:
     PLIST_ENTRY Entry, Next;
     PPN_PROCESS_CONTEXT Context;
     LIST_ENTRY StaleList;
+    NTSTATUS Status;
+
+    PAGED_CODE();
 
     InitializeListHead(&StaleList);
 
     KeQuerySystemTime(&CurrentTime);
     TimeoutInterval.QuadPart = (LONGLONG)PN_CONTEXT_TIMEOUT_MS * 10000;
 
+    //
+    // Collect stale contexts while holding lock
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessMonitor.ProcessListLock);
 
@@ -2008,6 +2947,8 @@ Routine Description:
         Next = Entry->Flink;
         Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, ListEntry);
 
+        BOOLEAN ShouldRemove = FALSE;
+
         //
         // Check if process has terminated (TerminateTime set)
         //
@@ -2016,21 +2957,40 @@ Routine Description:
             // Check if enough time has passed since termination
             //
             if ((CurrentTime.QuadPart - Context->TerminateTime.QuadPart) > TimeoutInterval.QuadPart) {
+                ShouldRemove = TRUE;
+            }
+        } else {
+            //
+            // Process hasn't called termination callback
+            // Check if it's actually still running
+            //
+            if (Context->ProcessObject != NULL) {
                 //
-                // Remove from lists
+                // Check if process has exited
                 //
-                RemoveEntryList(&Context->ListEntry);
-                InitializeListHead(&Context->ListEntry);
-
-                if (!IsListEmpty(&Context->HashEntry)) {
+                if (PsGetProcessExitStatus(Context->ProcessObject) != STATUS_PENDING) {
                     //
-                    // Need to remove from hash table under its lock
-                    // For simplicity, just mark for later cleanup
+                    // Process has exited but we missed termination callback
                     //
-                    InsertTailList(&StaleList, &Context->ListEntry);
-                    InterlockedDecrement(&g_ProcessMonitor.ProcessCount);
+                    KeQuerySystemTime(&Context->TerminateTime);
+                    ShouldRemove = TRUE;
                 }
             }
+        }
+
+        if (ShouldRemove) {
+            //
+            // Remove from main list
+            //
+            RemoveEntryList(&Context->ListEntry);
+            InitializeListHead(&Context->ListEntry);
+            InterlockedExchange(&Context->InsertedInList, FALSE);
+            InterlockedDecrement(&g_ProcessMonitor.ProcessCount);
+
+            //
+            // Add to stale list for hash removal outside this lock
+            //
+            InsertTailList(&StaleList, &Context->ListEntry);
         }
     }
 
@@ -2038,31 +2998,33 @@ Routine Description:
     KeLeaveCriticalRegion();
 
     //
-    // Free stale contexts outside the main lock
+    // Remove from hash tables and free - outside ProcessListLock
     //
     while (!IsListEmpty(&StaleList)) {
         Entry = RemoveHeadList(&StaleList);
         Context = CONTAINING_RECORD(Entry, PN_PROCESS_CONTEXT, ListEntry);
 
         //
-        // Remove from hash table
+        // Remove from hash table under correct bucket lock
         //
-        ULONG BucketIndex = PnpHashProcessId(Context->ProcessId);
-        PPN_HASH_BUCKET Bucket = &g_ProcessMonitor.HashTable[BucketIndex];
+        if (InterlockedCompareExchange(&Context->InsertedInHash, FALSE, TRUE)) {
+            ULONG BucketIndex = PnpHashProcessId(Context->ProcessId);
+            PPN_HASH_BUCKET Bucket = &g_ProcessMonitor.HashTable[BucketIndex];
 
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Bucket->Lock);
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&Bucket->Lock);
 
-        if (!IsListEmpty(&Context->HashEntry)) {
-            RemoveEntryList(&Context->HashEntry);
-            InitializeListHead(&Context->HashEntry);
+            if (!IsListEmpty(&Context->HashEntry)) {
+                RemoveEntryList(&Context->HashEntry);
+                InitializeListHead(&Context->HashEntry);
+            }
+
+            ExReleasePushLockExclusive(&Bucket->Lock);
+            KeLeaveCriticalRegion();
         }
 
-        ExReleasePushLockExclusive(&Bucket->Lock);
-        KeLeaveCriticalRegion();
-
         //
-        // Release the list reference
+        // Release the list reference (will free if last ref)
         //
         PnpDereferenceContext(Context);
     }
@@ -2086,19 +3048,23 @@ ShadowStrikeGetProcessMonitorStats(
     }
 
     if (ProcessCreations != NULL) {
-        *ProcessCreations = (ULONG64)g_ProcessMonitor.Stats.ProcessCreations;
+        *ProcessCreations = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.ProcessCreations, 0, 0);
     }
 
     if (ProcessesBlocked != NULL) {
-        *ProcessesBlocked = (ULONG64)g_ProcessMonitor.Stats.ProcessesBlocked;
+        *ProcessesBlocked = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.ProcessesBlocked, 0, 0);
     }
 
     if (PpidSpoofingDetected != NULL) {
-        *PpidSpoofingDetected = (ULONG64)g_ProcessMonitor.Stats.PpidSpoofingDetected;
+        *PpidSpoofingDetected = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.PpidSpoofingDetected, 0, 0);
     }
 
     if (SuspiciousProcesses != NULL) {
-        *SuspiciousProcesses = (ULONG64)g_ProcessMonitor.Stats.SuspiciousProcesses;
+        *SuspiciousProcesses = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.SuspiciousProcesses, 0, 0);
     }
 
     return STATUS_SUCCESS;
@@ -2132,6 +3098,48 @@ ShadowStrikeQueryProcessContext(
     }
 
     PnpDereferenceContext(Context);
+
+    return STATUS_SUCCESS;
+}
+
+
+NTSTATUS
+ShadowStrikeGetProcessMonitorExtendedStats(
+    _Out_ PULONG64 RateLimitDrops,
+    _Out_ PULONG64 PoolLimitDrops,
+    _Out_ PULONG64 UserModeTimeouts,
+    _Out_ PULONG64 CurrentPoolUsage,
+    _Out_ PULONG64 PeakPoolUsage
+    )
+{
+    if (!g_ProcessMonitor.Initialized) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (RateLimitDrops != NULL) {
+        *RateLimitDrops = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.RateLimitDrops, 0, 0);
+    }
+
+    if (PoolLimitDrops != NULL) {
+        *PoolLimitDrops = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.PoolLimitDrops, 0, 0);
+    }
+
+    if (UserModeTimeouts != NULL) {
+        *UserModeTimeouts = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.Stats.UserModeTimeouts, 0, 0);
+    }
+
+    if (CurrentPoolUsage != NULL) {
+        *CurrentPoolUsage = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.PoolTracker.CurrentAllocation, 0, 0);
+    }
+
+    if (PeakPoolUsage != NULL) {
+        *PeakPoolUsage = (ULONG64)InterlockedCompareExchange64(
+            &g_ProcessMonitor.PoolTracker.PeakAllocation, 0, 0);
+    }
 
     return STATUS_SUCCESS;
 }

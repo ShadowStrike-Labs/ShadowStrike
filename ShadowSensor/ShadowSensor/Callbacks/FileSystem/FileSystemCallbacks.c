@@ -69,6 +69,7 @@ Performance Characteristics:
 
 #define FSC_POOL_TAG                    'cSFS'  // SFSc - FileSystem Callbacks
 #define FSC_CONTEXT_POOL_TAG            'xCFS'  // SFCx - Context
+#define FSC_WORKITEM_POOL_TAG           'wWFS'  // SFWw - Work Item
 #define FSC_MAX_FILE_NAME_LENGTH        32768
 #define FSC_MAX_VOLUME_NAME_LENGTH      512
 #define FSC_ENTROPY_SAMPLE_SIZE         4096
@@ -76,6 +77,7 @@ Performance Characteristics:
 #define FSC_RANSOMWARE_RENAME_THRESHOLD  50     // Renames per second
 #define FSC_RANSOMWARE_DELETE_THRESHOLD  100    // Deletes per second
 #define FSC_MAX_TRACKED_VOLUMES         64
+#define FSC_MAX_TRACKED_PROCESSES       4096    // Limit to prevent pool exhaustion
 #define FSC_CLEANUP_INTERVAL_MS         60000   // 1 minute
 #define FSC_STATS_INTERVAL_MS           30000   // 30 seconds
 
@@ -264,6 +266,29 @@ typedef struct _FSC_EXTENSION_INFO {
 } FSC_EXTENSION_INFO, *PFSC_EXTENSION_INFO;
 
 //
+// Work item context for deferred cleanup operations
+//
+typedef struct _FSC_CLEANUP_WORK_ITEM {
+    WORK_QUEUE_ITEM WorkItem;
+    BOOLEAN ResetMetrics;
+    BOOLEAN CleanupStale;
+} FSC_CLEANUP_WORK_ITEM, *PFSC_CLEANUP_WORK_ITEM;
+
+//
+// Volume list entry for tracking attached volumes
+//
+typedef struct _FSC_VOLUME_LIST_ENTRY {
+    LIST_ENTRY ListEntry;
+    PFLT_VOLUME Volume;
+    PFLT_INSTANCE Instance;
+    FLT_FILESYSTEM_TYPE FileSystemType;
+    BOOLEAN IsNetworkVolume;
+    BOOLEAN IsRemovableVolume;
+    WCHAR VolumeNameBuffer[FSC_MAX_VOLUME_NAME_LENGTH];
+    USHORT VolumeNameLength;
+} FSC_VOLUME_LIST_ENTRY, *PFSC_VOLUME_LIST_ENTRY;
+
+//
 // Global filesystem callback state
 //
 typedef struct _FSC_GLOBAL_STATE {
@@ -273,13 +298,19 @@ typedef struct _FSC_GLOBAL_STATE {
     BOOLEAN Initialized;
 
     //
+    // Rundown protection for safe shutdown
+    //
+    EX_RUNDOWN_REF RundownRef;
+    BOOLEAN RundownInitialized;
+
+    //
     // Context registration
     //
     FLT_CONTEXT_REGISTRATION ContextRegistration[4];
     BOOLEAN ContextsRegistered;
 
     //
-    // Volume tracking
+    // Volume tracking - actual list of volumes
     //
     LIST_ENTRY VolumeList;
     EX_PUSH_LOCK VolumeLock;
@@ -317,11 +348,19 @@ typedef struct _FSC_GLOBAL_STATE {
     } Stats;
 
     //
-    // Cleanup timer
+    // Rate limiting state (protected by interlocked operations)
+    //
+    volatile LONG64 CurrentSecondStart100ns;
+    volatile LONG CurrentSecondLogs;
+
+    //
+    // Cleanup timer and work item
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
     BOOLEAN CleanupTimerActive;
+    volatile LONG CleanupWorkItemPending;
+    PIO_WORKITEM CleanupWorkItem;
 
     //
     // Shutdown flag
@@ -488,6 +527,12 @@ FscpCleanupTimerDpc(
     );
 
 static VOID
+FscpCleanupWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    );
+
+static VOID
 FscpCleanupStaleContexts(
     VOID
     );
@@ -495,6 +540,30 @@ FscpCleanupStaleContexts(
 static VOID
 FscpResetTimeWindowedMetrics(
     VOID
+    );
+
+static BOOLEAN
+FscpAcquireRundownProtection(
+    VOID
+    );
+
+static VOID
+FscpReleaseRundownProtection(
+    VOID
+    );
+
+static BOOLEAN
+FscpShouldLogOperation(
+    VOID
+    );
+
+//
+// Safe string comparison for UNICODE_STRING (IRQL-safe)
+//
+static BOOLEAN
+FscpCompareExtensionSafe(
+    _In_ PCUNICODE_STRING Extension,
+    _In_ PCWSTR CompareStr
     );
 
 // ============================================================================
@@ -821,22 +890,57 @@ Return Value:
     }
 
     //
-    // Add to volume list
+    // Add to volume list with proper tracking
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_FscState.VolumeLock);
+    {
+        PFSC_VOLUME_LIST_ENTRY VolumeListEntry = NULL;
+
+        VolumeListEntry = (PFSC_VOLUME_LIST_ENTRY)ExAllocatePoolWithTag(
+            NonPagedPoolNx,
+            sizeof(FSC_VOLUME_LIST_ENTRY),
+            FSC_POOL_TAG
+            );
+
+        if (VolumeListEntry != NULL) {
+            RtlZeroMemory(VolumeListEntry, sizeof(FSC_VOLUME_LIST_ENTRY));
+            VolumeListEntry->Volume = FltObjects->Volume;
+            VolumeListEntry->Instance = FltObjects->Instance;
+            VolumeListEntry->FileSystemType = VolumeFilesystemType;
+            VolumeListEntry->IsNetworkVolume = IsNetworkVolume;
+            VolumeListEntry->IsRemovableVolume = IsRemovable;
+
+            //
+            // Copy volume name before releasing context
+            //
+            if (VolumeContext->VolumeName.Length > 0 &&
+                VolumeContext->VolumeName.Length < sizeof(VolumeListEntry->VolumeNameBuffer)) {
+                RtlCopyMemory(
+                    VolumeListEntry->VolumeNameBuffer,
+                    VolumeContext->VolumeName.Buffer,
+                    VolumeContext->VolumeName.Length
+                    );
+                VolumeListEntry->VolumeNameLength = VolumeContext->VolumeName.Length / sizeof(WCHAR);
+            }
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&g_FscState.VolumeLock);
+
+            InsertTailList(&g_FscState.VolumeList, &VolumeListEntry->ListEntry);
+            InterlockedIncrement(&g_FscState.VolumeCount);
+
+            ExReleasePushLockExclusive(&g_FscState.VolumeLock);
+            KeLeaveCriticalRegion();
+        } else {
+            //
+            // Allocation failed - just increment count
+            //
+            InterlockedIncrement(&g_FscState.VolumeCount);
+        }
+    }
 
     //
-    // Note: In production, we'd store volume context references in our list
-    // For now, just increment count
+    // Log BEFORE releasing context to avoid use-after-free
     //
-    InterlockedIncrement(&g_FscState.VolumeCount);
-
-    ExReleasePushLockExclusive(&g_FscState.VolumeLock);
-    KeLeaveCriticalRegion();
-
-    FltReleaseContext((PFLT_CONTEXT)VolumeContext);
-
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
@@ -848,6 +952,11 @@ Return Value:
         );
 
     InterlockedIncrement64(&g_FscState.Stats.ContextAllocations);
+
+    //
+    // Release context AFTER all accesses are complete
+    //
+    FltReleaseContext((PFLT_CONTEXT)VolumeContext);
 
     return STATUS_SUCCESS;
 }
@@ -978,6 +1087,7 @@ Return Value:
 {
     NTSTATUS Status = STATUS_SUCCESS;
     LARGE_INTEGER DueTime;
+    LARGE_INTEGER CurrentTime;
 
     PAGED_CODE();
 
@@ -986,6 +1096,12 @@ Return Value:
     }
 
     RtlZeroMemory(&g_FscState, sizeof(FSC_GLOBAL_STATE));
+
+    //
+    // Initialize rundown protection FIRST
+    //
+    ExInitializeRundownProtection(&g_FscState.RundownRef);
+    g_FscState.RundownInitialized = TRUE;
 
     //
     // Initialize volume list
@@ -1025,15 +1141,24 @@ Return Value:
     g_FscState.LookasideInitialized = TRUE;
 
     //
-    // Initialize statistics
+    // Initialize statistics and rate limiting
     //
     KeQuerySystemTime(&g_FscState.Stats.StartTime);
+    KeQuerySystemTime(&CurrentTime);
+    g_FscState.CurrentSecondStart100ns = CurrentTime.QuadPart;
 
     //
     // Initialize cleanup timer
     //
     KeInitializeTimer(&g_FscState.CleanupTimer);
     KeInitializeDpc(&g_FscState.CleanupDpc, FscpCleanupTimerDpc, NULL);
+
+    //
+    // Allocate work item for deferred cleanup (requires device object)
+    // Note: Work item will be allocated lazily when needed if we don't have device object yet
+    //
+    g_FscState.CleanupWorkItem = NULL;
+    g_FscState.CleanupWorkItemPending = 0;
 
     //
     // Start cleanup timer
@@ -1067,10 +1192,12 @@ ShadowStrikeCleanupFileSystemCallbacks(
 /*++
 Routine Description:
     Cleans up the filesystem callback subsystem.
+    Implements proper rundown protection to ensure all in-flight operations complete.
 --*/
 {
     PLIST_ENTRY Entry;
     PFSC_PROCESS_FILE_CONTEXT ProcessContext;
+    PFSC_VOLUME_LIST_ENTRY VolumeEntry;
 
     PAGED_CODE();
 
@@ -1078,16 +1205,55 @@ Routine Description:
         return;
     }
 
+    //
+    // Signal shutdown FIRST
+    //
     g_FscState.ShutdownRequested = TRUE;
     g_FscState.Initialized = FALSE;
 
     //
-    // Cancel cleanup timer
+    // Wait for all in-flight operations to complete using rundown protection
+    //
+    if (g_FscState.RundownInitialized) {
+        ExWaitForRundownProtectionRelease(&g_FscState.RundownRef);
+    }
+
+    //
+    // Cancel cleanup timer and wait for DPC to complete
     //
     if (g_FscState.CleanupTimerActive) {
         KeCancelTimer(&g_FscState.CleanupTimer);
+
+        //
+        // CRITICAL: Flush queued DPCs to ensure our DPC is not running
+        //
+        KeFlushQueuedDpcs();
+
         g_FscState.CleanupTimerActive = FALSE;
     }
+
+    //
+    // Free work item if allocated
+    //
+    if (g_FscState.CleanupWorkItem != NULL) {
+        IoFreeWorkItem(g_FscState.CleanupWorkItem);
+        g_FscState.CleanupWorkItem = NULL;
+    }
+
+    //
+    // Free all volume list entries
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_FscState.VolumeLock);
+
+    while (!IsListEmpty(&g_FscState.VolumeList)) {
+        Entry = RemoveHeadList(&g_FscState.VolumeList);
+        VolumeEntry = CONTAINING_RECORD(Entry, FSC_VOLUME_LIST_ENTRY, ListEntry);
+        ExFreePoolWithTag(VolumeEntry, FSC_POOL_TAG);
+    }
+
+    ExReleasePushLockExclusive(&g_FscState.VolumeLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free all process contexts
@@ -1117,6 +1283,7 @@ Routine Description:
     if (g_FscState.LookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_FscState.OperationContextLookaside);
         ExDeleteNPagedLookasideList(&g_FscState.ProcessContextLookaside);
+        g_FscState.LookasideInitialized = FALSE;
     }
 
     DbgPrintEx(
@@ -1195,10 +1362,27 @@ FscpLookupProcessContext(
     _In_ HANDLE ProcessId,
     _In_ BOOLEAN CreateIfNotFound
     )
+/*++
+Routine Description:
+    Looks up or creates a process file context with proper synchronization.
+    Uses lock-protected reference counting to prevent race conditions.
+
+Arguments:
+    ProcessId - Process ID to look up.
+    CreateIfNotFound - If TRUE, create context if not found.
+
+Return Value:
+    Referenced process context, or NULL on failure.
+    Caller must call FscpDereferenceProcessContext when done.
+--*/
 {
     PLIST_ENTRY Entry;
     PFSC_PROCESS_FILE_CONTEXT Context = NULL;
+    PFSC_PROCESS_FILE_CONTEXT NewContext = NULL;
 
+    //
+    // First, try to find existing context under shared lock
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_FscState.ProcessContextLock);
 
@@ -1209,7 +1393,10 @@ FscpLookupProcessContext(
         Context = CONTAINING_RECORD(Entry, FSC_PROCESS_FILE_CONTEXT, ListEntry);
 
         if (Context->ProcessId == ProcessId) {
-            FscpReferenceProcessContext(Context);
+            //
+            // Found - increment ref count while holding lock to prevent race
+            //
+            InterlockedIncrement(&Context->RefCount);
             ExReleasePushLockShared(&g_FscState.ProcessContextLock);
             KeLeaveCriticalRegion();
             return Context;
@@ -1224,55 +1411,77 @@ FscpLookupProcessContext(
     }
 
     //
-    // Create new context
+    // Check process context limit to prevent pool exhaustion
     //
-    Context = (PFSC_PROCESS_FILE_CONTEXT)ExAllocateFromNPagedLookasideList(
-        &g_FscState.ProcessContextLookaside
-        );
-
-    if (Context == NULL) {
+    if (g_FscState.ProcessContextCount >= FSC_MAX_TRACKED_PROCESSES) {
         return NULL;
     }
 
-    RtlZeroMemory(Context, sizeof(FSC_PROCESS_FILE_CONTEXT));
-    Context->ProcessId = ProcessId;
-    Context->RefCount = 1;
-    KeQuerySystemTime(&Context->WindowStartTime);
-    KeQuerySystemTime(&Context->LastActivityTime);
-    InitializeListHead(&Context->ListEntry);
+    //
+    // Allocate new context outside lock
+    //
+    NewContext = (PFSC_PROCESS_FILE_CONTEXT)ExAllocateFromNPagedLookasideList(
+        &g_FscState.ProcessContextLookaside
+        );
+
+    if (NewContext == NULL) {
+        return NULL;
+    }
+
+    RtlZeroMemory(NewContext, sizeof(FSC_PROCESS_FILE_CONTEXT));
+    NewContext->ProcessId = ProcessId;
+    NewContext->RefCount = 2;  // One for list, one for caller
+    KeQuerySystemTime(&NewContext->WindowStartTime);
+    KeQuerySystemTime(&NewContext->LastActivityTime);
+    InitializeListHead(&NewContext->ListEntry);
 
     //
-    // Insert into list
+    // Insert into list under exclusive lock with race check
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_FscState.ProcessContextLock);
 
     //
-    // Check for race condition
+    // Re-check limit under lock
+    //
+    if (g_FscState.ProcessContextCount >= FSC_MAX_TRACKED_PROCESSES) {
+        ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
+        KeLeaveCriticalRegion();
+        ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, NewContext);
+        return NULL;
+    }
+
+    //
+    // Check for race condition - another thread may have inserted
     //
     for (Entry = g_FscState.ProcessContextList.Flink;
          Entry != &g_FscState.ProcessContextList;
          Entry = Entry->Flink) {
 
-        PFSC_PROCESS_FILE_CONTEXT Existing = CONTAINING_RECORD(Entry, FSC_PROCESS_FILE_CONTEXT, ListEntry);
+        Context = CONTAINING_RECORD(Entry, FSC_PROCESS_FILE_CONTEXT, ListEntry);
 
-        if (Existing->ProcessId == ProcessId) {
-            FscpReferenceProcessContext(Existing);
+        if (Context->ProcessId == ProcessId) {
+            //
+            // Race - use existing, increment ref under lock
+            //
+            InterlockedIncrement(&Context->RefCount);
             ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
             KeLeaveCriticalRegion();
-            ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, Context);
-            return Existing;
+            ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, NewContext);
+            return Context;
         }
     }
 
-    InsertTailList(&g_FscState.ProcessContextList, &Context->ListEntry);
+    //
+    // Insert our new context
+    //
+    InsertTailList(&g_FscState.ProcessContextList, &NewContext->ListEntry);
     InterlockedIncrement(&g_FscState.ProcessContextCount);
-    FscpReferenceProcessContext(Context);
 
     ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
     KeLeaveCriticalRegion();
 
-    return Context;
+    return NewContext;
 }
 
 
@@ -1281,7 +1490,9 @@ FscpReferenceProcessContext(
     _Inout_ PFSC_PROCESS_FILE_CONTEXT Context
     )
 {
-    InterlockedIncrement(&Context->RefCount);
+    if (Context != NULL) {
+        InterlockedIncrement(&Context->RefCount);
+    }
 }
 
 
@@ -1289,26 +1500,191 @@ static VOID
 FscpDereferenceProcessContext(
     _Inout_ PFSC_PROCESS_FILE_CONTEXT Context
     )
-{
-    if (InterlockedDecrement(&Context->RefCount) == 0) {
-        //
-        // Remove from list and free
-        //
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&g_FscState.ProcessContextLock);
+/*++
+Routine Description:
+    Decrements reference count on process context.
+    Uses lock-protected decrement to prevent race conditions.
 
+Arguments:
+    Context - Context to dereference.
+--*/
+{
+    LONG NewRefCount;
+    BOOLEAN ShouldFree = FALSE;
+
+    if (Context == NULL) {
+        return;
+    }
+
+    //
+    // CRITICAL: Acquire lock BEFORE decrementing to prevent race where
+    // another thread could reference this context between our decrement
+    // and our removal from the list.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_FscState.ProcessContextLock);
+
+    NewRefCount = InterlockedDecrement(&Context->RefCount);
+
+    if (NewRefCount == 0) {
+        //
+        // Last reference - remove from list under lock
+        //
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
             InitializeListHead(&Context->ListEntry);
             InterlockedDecrement(&g_FscState.ProcessContextCount);
         }
+        ShouldFree = TRUE;
+    }
 
-        ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
-        KeLeaveCriticalRegion();
+    ExReleasePushLockExclusive(&g_FscState.ProcessContextLock);
+    KeLeaveCriticalRegion();
 
+    //
+    // Free outside lock
+    //
+    if (ShouldFree) {
         ExFreeToNPagedLookasideList(&g_FscState.ProcessContextLookaside, Context);
     }
 }
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+static BOOLEAN
+FscpAcquireRundownProtection(
+    VOID
+    )
+/*++
+Routine Description:
+    Acquires rundown protection to safely perform operations.
+    Must be called before any operation that accesses global state.
+
+Return Value:
+    TRUE if protection acquired, FALSE if shutdown in progress.
+--*/
+{
+    if (!g_FscState.RundownInitialized || g_FscState.ShutdownRequested) {
+        return FALSE;
+    }
+
+    return ExAcquireRundownProtection(&g_FscState.RundownRef);
+}
+
+
+static VOID
+FscpReleaseRundownProtection(
+    VOID
+    )
+/*++
+Routine Description:
+    Releases rundown protection after operation completes.
+--*/
+{
+    if (g_FscState.RundownInitialized) {
+        ExReleaseRundownProtection(&g_FscState.RundownRef);
+    }
+}
+
+
+static BOOLEAN
+FscpShouldLogOperation(
+    VOID
+    )
+/*++
+Routine Description:
+    Rate-limited logging check using atomic operations.
+    Thread-safe implementation without TOCTOU issues.
+
+Return Value:
+    TRUE if logging should proceed, FALSE if rate limited.
+--*/
+{
+    LARGE_INTEGER CurrentTime;
+    LONG64 CurrentSecond;
+    LONG64 StoredSecond;
+    LONG CurrentLogs;
+
+    KeQuerySystemTime(&CurrentTime);
+    CurrentSecond = CurrentTime.QuadPart / 10000000LL;  // Convert to seconds
+    StoredSecond = g_FscState.CurrentSecondStart100ns / 10000000LL;
+
+    if (CurrentSecond != StoredSecond) {
+        //
+        // New second - reset atomically
+        // Use InterlockedCompareExchange64 to handle race
+        //
+        if (InterlockedCompareExchange64(
+                &g_FscState.CurrentSecondStart100ns,
+                CurrentTime.QuadPart,
+                g_FscState.CurrentSecondStart100ns) != g_FscState.CurrentSecondStart100ns) {
+            //
+            // Another thread updated - re-read
+            //
+        }
+        InterlockedExchange(&g_FscState.CurrentSecondLogs, 0);
+    }
+
+    CurrentLogs = InterlockedIncrement(&g_FscState.CurrentSecondLogs);
+    return (CurrentLogs <= 100);  // Allow 100 logs per second
+}
+
+
+static BOOLEAN
+FscpCompareExtensionSafe(
+    _In_ PCUNICODE_STRING Extension,
+    _In_ PCWSTR CompareStr
+    )
+/*++
+Routine Description:
+    IRQL-safe case-insensitive extension comparison.
+    Uses RtlCompareUnicodeString instead of _wcsicmp.
+
+Arguments:
+    Extension - Extension to compare.
+    CompareStr - Null-terminated string to compare against.
+
+Return Value:
+    TRUE if extensions match (case-insensitive).
+--*/
+{
+    UNICODE_STRING CompareString;
+    UNICODE_STRING ExtString;
+    USHORT CompareLen;
+
+    if (Extension == NULL || Extension->Buffer == NULL || CompareStr == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Skip leading dot in extension
+    //
+    ExtString = *Extension;
+    if (ExtString.Length >= sizeof(WCHAR) && ExtString.Buffer[0] == L'.') {
+        ExtString.Buffer++;
+        ExtString.Length -= sizeof(WCHAR);
+        if (ExtString.MaximumLength >= sizeof(WCHAR)) {
+            ExtString.MaximumLength -= sizeof(WCHAR);
+        }
+    }
+
+    //
+    // Build comparison string (without null terminator in length)
+    //
+    CompareLen = 0;
+    while (CompareStr[CompareLen] != L'\0' && CompareLen < 32) {
+        CompareLen++;
+    }
+
+    CompareString.Buffer = (PWCH)CompareStr;
+    CompareString.Length = CompareLen * sizeof(WCHAR);
+    CompareString.MaximumLength = CompareString.Length;
+
+    return RtlEqualUnicodeString(&ExtString, &CompareString, TRUE);
+}
+
 
 // ============================================================================
 // FILE CLASSIFICATION
@@ -1318,40 +1694,28 @@ static ULONG
 FscpClassifyFileByExtension(
     _In_ PCUNICODE_STRING Extension
     )
+/*++
+Routine Description:
+    Classifies file by extension using IRQL-safe comparison.
+
+Arguments:
+    Extension - File extension.
+
+Return Value:
+    Classification flags.
+--*/
 {
     ULONG i;
-    WCHAR ExtBuffer[32];
-    UNICODE_STRING ExtString;
 
     if (Extension == NULL || Extension->Length == 0 || Extension->Buffer == NULL) {
         return 0;
     }
 
     //
-    // Skip the leading dot if present
-    //
-    ExtString = *Extension;
-    if (ExtString.Length >= sizeof(WCHAR) && ExtString.Buffer[0] == L'.') {
-        ExtString.Buffer++;
-        ExtString.Length -= sizeof(WCHAR);
-        ExtString.MaximumLength -= sizeof(WCHAR);
-    }
-
-    //
-    // Copy to local buffer for comparison
-    //
-    if (ExtString.Length >= sizeof(ExtBuffer)) {
-        return 0;
-    }
-
-    RtlCopyMemory(ExtBuffer, ExtString.Buffer, ExtString.Length);
-    ExtBuffer[ExtString.Length / sizeof(WCHAR)] = L'\0';
-
-    //
-    // Search extension table
+    // Search extension table using safe comparison
     //
     for (i = 0; i < FSC_EXTENSION_TABLE_COUNT; i++) {
-        if (_wcsicmp(ExtBuffer, g_ExtensionTable[i].Extension) == 0) {
+        if (FscpCompareExtensionSafe(Extension, g_ExtensionTable[i].Extension)) {
             return g_ExtensionTable[i].Classification;
         }
     }
@@ -1364,40 +1728,28 @@ static ULONG
 FscpGetScanPriority(
     _In_ PCUNICODE_STRING Extension
     )
+/*++
+Routine Description:
+    Gets scan priority for file extension using IRQL-safe comparison.
+
+Arguments:
+    Extension - File extension.
+
+Return Value:
+    Scan priority (0-100).
+--*/
 {
     ULONG i;
-    WCHAR ExtBuffer[32];
-    UNICODE_STRING ExtString;
 
     if (Extension == NULL || Extension->Length == 0 || Extension->Buffer == NULL) {
         return 50;  // Default priority
     }
 
     //
-    // Skip the leading dot if present
-    //
-    ExtString = *Extension;
-    if (ExtString.Length >= sizeof(WCHAR) && ExtString.Buffer[0] == L'.') {
-        ExtString.Buffer++;
-        ExtString.Length -= sizeof(WCHAR);
-        ExtString.MaximumLength -= sizeof(WCHAR);
-    }
-
-    //
-    // Copy to local buffer for comparison
-    //
-    if (ExtString.Length >= sizeof(ExtBuffer)) {
-        return 50;
-    }
-
-    RtlCopyMemory(ExtBuffer, ExtString.Buffer, ExtString.Length);
-    ExtBuffer[ExtString.Length / sizeof(WCHAR)] = L'\0';
-
-    //
-    // Search extension table
+    // Search extension table using safe comparison
     //
     for (i = 0; i < FSC_EXTENSION_TABLE_COUNT; i++) {
-        if (_wcsicmp(ExtBuffer, g_ExtensionTable[i].Extension) == 0) {
+        if (FscpCompareExtensionSafe(Extension, g_ExtensionTable[i].Extension)) {
             return g_ExtensionTable[i].ScanPriority;
         }
     }
@@ -1589,12 +1941,60 @@ Return Value:
 // ============================================================================
 
 static VOID
+FscpCleanupWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+/*++
+Routine Description:
+    Work item routine that runs at PASSIVE_LEVEL for cleanup operations.
+    Called from DPC to perform operations that require PASSIVE_LEVEL.
+
+Arguments:
+    DeviceObject - Device object (unused).
+    Context - Work item context (unused).
+--*/
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
+
+    PAGED_CODE();
+
+    if (g_FscState.ShutdownRequested) {
+        InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
+        return;
+    }
+
+    //
+    // Perform cleanup operations at PASSIVE_LEVEL
+    //
+    FscpCleanupStaleContexts();
+    FscpResetTimeWindowedMetrics();
+
+    //
+    // Mark work item as complete
+    //
+    InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
+}
+
+
+static VOID
 FscpCleanupTimerDpc(
     _In_ PKDPC Dpc,
     _In_opt_ PVOID DeferredContext,
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
+/*++
+Routine Description:
+    Timer DPC callback - runs at DISPATCH_LEVEL.
+    Queues a work item for operations requiring PASSIVE_LEVEL.
+
+Arguments:
+    Dpc - DPC object.
+    DeferredContext - Deferred context.
+    SystemArgument1/2 - System arguments.
+--*/
 {
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
@@ -1606,14 +2006,31 @@ FscpCleanupTimerDpc(
     }
 
     //
-    // Reset time-windowed metrics
+    // Queue work item for PASSIVE_LEVEL cleanup if not already pending
+    // Note: We use InterlockedCompareExchange to ensure only one work item is queued
     //
-    FscpResetTimeWindowedMetrics();
+    if (InterlockedCompareExchange(&g_FscState.CleanupWorkItemPending, 1, 0) == 0) {
+        //
+        // Allocate work item if needed
+        //
+        if (g_FscState.CleanupWorkItem == NULL && g_DriverData.DeviceObject != NULL) {
+            g_FscState.CleanupWorkItem = IoAllocateWorkItem(g_DriverData.DeviceObject);
+        }
 
-    //
-    // Schedule stale context cleanup via work item
-    // (Can't do paged operations in DPC)
-    //
+        if (g_FscState.CleanupWorkItem != NULL) {
+            IoQueueWorkItem(
+                g_FscState.CleanupWorkItem,
+                FscpCleanupWorkItemRoutine,
+                DelayedWorkQueue,
+                NULL
+                );
+        } else {
+            //
+            // No work item available - clear pending flag
+            //
+            InterlockedExchange(&g_FscState.CleanupWorkItemPending, 0);
+        }
+    }
 }
 
 
@@ -1621,12 +2038,19 @@ static VOID
 FscpCleanupStaleContexts(
     VOID
     )
+/*++
+Routine Description:
+    Cleans up stale process contexts that haven't been accessed recently.
+    Must be called at PASSIVE_LEVEL.
+--*/
 {
     LARGE_INTEGER CurrentTime;
     LARGE_INTEGER TimeoutInterval;
     PLIST_ENTRY Entry, Next;
     PFSC_PROCESS_FILE_CONTEXT Context;
     LIST_ENTRY StaleList;
+
+    PAGED_CODE();
 
     InitializeListHead(&StaleList);
 
@@ -1645,9 +2069,10 @@ FscpCleanupStaleContexts(
 
         //
         // Check if context is stale (no activity for 5 minutes)
+        // Only remove if RefCount is 1 (only list reference)
         //
         if ((CurrentTime.QuadPart - Context->LastActivityTime.QuadPart) > TimeoutInterval.QuadPart) {
-            if (Context->RefCount == 1) {  // Only list reference
+            if (Context->RefCount == 1) {
                 RemoveEntryList(&Context->ListEntry);
                 InitializeListHead(&Context->ListEntry);
                 InterlockedDecrement(&g_FscState.ProcessContextCount);
@@ -1674,10 +2099,17 @@ static VOID
 FscpResetTimeWindowedMetrics(
     VOID
     )
+/*++
+Routine Description:
+    Resets time-windowed metrics for ransomware detection.
+    Must be called at PASSIVE_LEVEL.
+--*/
 {
     PLIST_ENTRY Entry;
     PFSC_PROCESS_FILE_CONTEXT Context;
     LARGE_INTEGER CurrentTime;
+
+    PAGED_CODE();
 
     KeQuerySystemTime(&CurrentTime);
 
@@ -1691,11 +2123,11 @@ FscpResetTimeWindowedMetrics(
         Context = CONTAINING_RECORD(Entry, FSC_PROCESS_FILE_CONTEXT, ListEntry);
 
         //
-        // Reset per-second counters
+        // Reset per-second counters atomically
         //
-        Context->RecentModifications = 0;
-        Context->RecentDeletions = 0;
-        Context->RecentRenames = 0;
+        InterlockedExchange(&Context->RecentModifications, 0);
+        InterlockedExchange(&Context->RecentDeletions, 0);
+        InterlockedExchange(&Context->RecentRenames, 0);
         Context->WindowStartTime = CurrentTime;
     }
 

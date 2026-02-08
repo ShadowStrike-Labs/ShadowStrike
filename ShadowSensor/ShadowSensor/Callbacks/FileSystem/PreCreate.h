@@ -70,6 +70,20 @@ extern "C" {
 #define PC_MESSAGE_TAG                  'gMPC'  // CPMg - Message
 
 // ============================================================================
+// SYSTEM CONSTANTS
+// ============================================================================
+
+/**
+ * @brief Windows System process ID (PID 4)
+ */
+#define PC_SYSTEM_PROCESS_ID            ((HANDLE)(ULONG_PTR)4)
+
+/**
+ * @brief Maximum iterations for wildcard pattern matching (DoS protection)
+ */
+#define PC_MAX_WILDCARD_ITERATIONS      65536
+
+// ============================================================================
 // CONSTANTS
 // ============================================================================
 
@@ -458,9 +472,9 @@ PcAnalyzeFilePath(
  *
  * @return STATUS_SUCCESS on success.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (uses paged pool operations)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 PcClassifyFile(
     _In_ PCUNICODE_STRING Extension,

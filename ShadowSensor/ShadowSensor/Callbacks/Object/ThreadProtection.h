@@ -15,6 +15,7 @@
  * - Thread hijacking detection (context modification attacks)
  * - Anti-debugging protection at thread level
  * - Thread pool and fiber abuse detection
+ * - System thread protection
  *
  * Detection Techniques Covered (MITRE ATT&CK):
  * - T1055.003: Thread Execution Hijacking
@@ -30,8 +31,15 @@
  * - ETW telemetry for suspicious thread operations
  * - ProcessProtection module for coordinated defense
  *
+ * Security Hardening v3.0.0:
+ * - All race conditions eliminated with proper synchronization
+ * - Reference counting for tracker lifetime management
+ * - IRQL-correct synchronization primitives
+ * - Atomic operations for all shared state
+ * - Proper cleanup on all error paths
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition - Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -53,6 +61,20 @@ extern "C" {
 #define TP_POOL_TAG                     'TPPS'  // Thread Protection
 #define TP_CONTEXT_TAG                  'xCTP'  // Context allocations
 #define TP_TRACKER_TAG                  'kTTP'  // Tracker allocations
+
+// ============================================================================
+// MAGIC VALUES FOR VALIDATION
+// ============================================================================
+
+/**
+ * @brief Magic value for protection state validation
+ */
+#define TP_STATE_MAGIC                  0x54505354  // 'TPST'
+
+/**
+ * @brief Magic value for tracker validation
+ */
+#define TP_TRACKER_MAGIC                0x544B5452  // 'TKTR'
 
 // ============================================================================
 // CONSTANTS
@@ -92,6 +114,37 @@ extern "C" {
  * @brief Medium suspicion score threshold
  */
 #define TP_MEDIUM_SUSPICION_THRESHOLD   50
+
+/**
+ * @brief Maximum activity trackers in cache
+ */
+#define TP_MAX_ACTIVITY_TRACKERS        512
+
+/**
+ * @brief Tracker expiry time (2 minutes in 100ns units)
+ */
+#define TP_TRACKER_EXPIRY_100NS         (2LL * 60LL * 10000000LL)
+
+/**
+ * @brief Lookaside list depth for trackers
+ */
+#define TP_TRACKER_LOOKASIDE_DEPTH      64
+
+// ============================================================================
+// SCORE CONSTANTS
+// ============================================================================
+
+#define TP_SCORE_CONTEXT_ACCESS         25
+#define TP_SCORE_SUSPEND_ACCESS         20
+#define TP_SCORE_TERMINATE_ACCESS       30
+#define TP_SCORE_CROSS_PROCESS          15
+#define TP_SCORE_APC_PATTERN            40
+#define TP_SCORE_HIJACK_PATTERN         45
+#define TP_SCORE_IMPERSONATION          25
+#define TP_SCORE_RAPID_ENUM             20
+#define TP_SCORE_MULTI_THREAD           15
+#define TP_SCORE_SELF_PROTECT_BYPASS    50
+#define TP_SCORE_SYSTEM_THREAD          35
 
 // ============================================================================
 // ACCESS MASKS FOR PROTECTION
@@ -201,7 +254,8 @@ typedef enum _TP_SUSPICIOUS_FLAGS {
     TpSuspiciousDebugAccess         = 0x00000100,  ///< Debug-related access
     TpSuspiciousMultiThread         = 0x00000200,  ///< Multiple threads targeted
     TpSuspiciousRemoteThread        = 0x00000400,  ///< Remote thread creation follow-up
-    TpSuspiciousSelfProtectBypass   = 0x00000800   ///< Self-protection bypass attempt
+    TpSuspiciousSelfProtectBypass   = 0x00000800,  ///< Self-protection bypass attempt
+    TpSuspiciousSystemThread        = 0x00001000   ///< Targeting system thread
 } TP_SUSPICIOUS_FLAGS;
 
 /**
@@ -216,8 +270,17 @@ typedef enum _TP_ATTACK_TYPE {
     TpAttackImpersonation       = 5,    ///< Thread impersonation abuse
     TpAttackDebugManipulation   = 6,    ///< Debug register manipulation
     TpAttackTLSCallback         = 7,    ///< TLS callback abuse
+    TpAttackSystemThread        = 8,    ///< System thread attack
     TpAttackUnknown             = 0xFF
 } TP_ATTACK_TYPE;
+
+/**
+ * @brief Tracker allocation source
+ */
+typedef enum _TP_ALLOC_SOURCE {
+    TpAllocSourceLookaside      = 0,
+    TpAllocSourcePool           = 1
+} TP_ALLOC_SOURCE;
 
 // ============================================================================
 // STRUCTURES
@@ -242,6 +305,7 @@ typedef struct _TP_OPERATION_CONTEXT {
     ULONG SourceSessionId;
     BOOLEAN SourceIsElevated;
     BOOLEAN SourceIsProtected;
+    ULONG SourceProtectionFlags;
 
     //
     // Target thread
@@ -278,16 +342,61 @@ typedef struct _TP_OPERATION_CONTEXT {
 } TP_OPERATION_CONTEXT, *PTP_OPERATION_CONTEXT;
 
 /**
+ * @brief Snapshot of tracker data (safe to use after lock release)
+ */
+typedef struct _TP_TRACKER_SNAPSHOT {
+    BOOLEAN Valid;
+    HANDLE SourceProcessId;
+    LONG TotalOperationCount;
+    LONG SuspiciousOperationCount;
+    LONG ContextAccessCount;
+    LONG SuspendAccessCount;
+    ULONG UniqueThreadCount;
+    ULONG UniqueProcessCount;
+    BOOLEAN HasSuspendPattern;
+    BOOLEAN HasContextPattern;
+    BOOLEAN HasAPCPattern;
+    BOOLEAN HasEnumerationPattern;
+    BOOLEAN IsRateLimited;
+    BOOLEAN IsBlacklisted;
+} TP_TRACKER_SNAPSHOT, *PTP_TRACKER_SNAPSHOT;
+
+/**
  * @brief Thread activity tracker (per source process)
  */
 typedef struct _TP_ACTIVITY_TRACKER {
+    //
+    // Validation
+    //
+    ULONG Magic;
+
+    //
+    // List linkage
+    //
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
 
+    //
+    // Reference counting for safe access
+    //
+    volatile LONG ReferenceCount;
+    volatile LONG Deleted;
+
+    //
+    // Allocation tracking
+    //
+    TP_ALLOC_SOURCE AllocSource;
+
+    //
+    // Identity
+    //
     HANDLE SourceProcessId;
     LARGE_INTEGER FirstActivity;
     LARGE_INTEGER LastActivity;
 
+    //
+    // Atomic counters
+    //
     volatile LONG TotalOperationCount;
     volatile LONG SuspiciousOperationCount;
     volatile LONG StrippedOperationCount;
@@ -295,51 +404,100 @@ typedef struct _TP_ACTIVITY_TRACKER {
     volatile LONG SuspendAccessCount;
 
     //
-    // Target tracking
+    // Target tracking (protected by spinlock)
     //
-    ULONG UniqueThreadCount;
-    ULONG UniqueProcessCount;
+    KSPIN_LOCK TargetLock;
+    volatile LONG UniqueThreadCount;
+    volatile LONG UniqueProcessCount;
     HANDLE RecentTargetThreads[16];
     HANDLE RecentTargetProcesses[8];
 
     //
-    // Attack pattern detection
+    // Attack pattern detection (atomic flags)
     //
-    BOOLEAN HasSuspendPattern;
-    BOOLEAN HasContextPattern;
-    BOOLEAN HasAPCPattern;
-    BOOLEAN HasEnumerationPattern;
+    volatile LONG HasSuspendPattern;
+    volatile LONG HasContextPattern;
+    volatile LONG HasAPCPattern;
+    volatile LONG HasEnumerationPattern;
 
     //
-    // Flags
+    // Rate limiting flags (atomic)
     //
-    BOOLEAN IsRateLimited;
-    BOOLEAN IsBlacklisted;
+    volatile LONG IsRateLimited;
+    volatile LONG IsBlacklisted;
 
 } TP_ACTIVITY_TRACKER, *PTP_ACTIVITY_TRACKER;
+
+/**
+ * @brief Rate limiting state (64-bit safe)
+ */
+typedef struct _TP_RATE_LIMIT_STATE {
+    KSPIN_LOCK Lock;
+    LONG CurrentSecondLogs;
+    LARGE_INTEGER CurrentSecondStart;
+} TP_RATE_LIMIT_STATE, *PTP_RATE_LIMIT_STATE;
+
+/**
+ * @brief Thread protection statistics (all atomic)
+ */
+typedef struct _TP_STATISTICS {
+    volatile LONG64 TotalOperations;
+    volatile LONG64 ProtectedTargetOperations;
+    volatile LONG64 AccessStripped;
+    volatile LONG64 OperationsBlocked;
+    volatile LONG64 TerminateAttempts;
+    volatile LONG64 ContextAccessAttempts;
+    volatile LONG64 SuspendAttempts;
+    volatile LONG64 ImpersonationAttempts;
+    volatile LONG64 APCInjectionPatterns;
+    volatile LONG64 HijackPatterns;
+    volatile LONG64 CrossProcessAccess;
+    volatile LONG64 SuspiciousOperations;
+    volatile LONG64 RateLimitedOperations;
+    volatile LONG64 SystemThreadAttempts;
+    LARGE_INTEGER StartTime;
+} TP_STATISTICS, *PTP_STATISTICS;
+
+/**
+ * @brief Thread protection configuration
+ */
+typedef struct _TP_CONFIG {
+    BOOLEAN EnableTerminationProtection;    ///< Block THREAD_TERMINATE
+    BOOLEAN EnableContextProtection;        ///< Block SET_CONTEXT
+    BOOLEAN EnableSuspendProtection;        ///< Block SUSPEND_RESUME
+    BOOLEAN EnableImpersonationProtection;  ///< Block IMPERSONATE
+    BOOLEAN EnableActivityTracking;         ///< Per-process activity
+    BOOLEAN EnablePatternDetection;         ///< Attack pattern detection
+    BOOLEAN EnableRateLimiting;             ///< Log rate limiting
+    BOOLEAN LogStrippedAccess;              ///< Log when access is stripped
+    BOOLEAN NotifyUserMode;                 ///< Send notifications
+    BOOLEAN EnableSystemThreadProtection;   ///< Protect system threads
+    ULONG SuspicionScoreThreshold;          ///< Score to trigger alert
+} TP_CONFIG, *PTP_CONFIG;
 
 /**
  * @brief Thread protection state
  */
 typedef struct _TP_PROTECTION_STATE {
     //
-    // Initialization
+    // Initialization (atomic)
     //
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     ULONG Magic;
 
     //
-    // Reference counting
+    // Reference counting for safe shutdown
     //
     volatile LONG ReferenceCount;
     volatile LONG ShuttingDown;
     KEVENT ShutdownEvent;
+    KEVENT ZeroRefEvent;
 
     //
-    // Activity tracking
+    // Activity tracking (protected by spinlock for DISPATCH_LEVEL safety)
     //
     LIST_ENTRY ActivityList;
-    EX_PUSH_LOCK ActivityLock;
+    KSPIN_LOCK ActivitySpinLock;
     volatile LONG ActiveTrackers;
 
     //
@@ -348,52 +506,25 @@ typedef struct _TP_PROTECTION_STATE {
     LIST_ENTRY ActivityHashTable[64];
 
     //
-    // Rate limiting
+    // Rate limiting (spinlock protected for 64-bit atomicity)
     //
-    volatile LONG CurrentSecondLogs;
-    LARGE_INTEGER CurrentSecondStart;
+    TP_RATE_LIMIT_STATE RateLimit;
 
     //
     // Statistics
     //
-    struct {
-        volatile LONG64 TotalOperations;
-        volatile LONG64 ProtectedTargetOperations;
-        volatile LONG64 AccessStripped;
-        volatile LONG64 OperationsBlocked;
-        volatile LONG64 TerminateAttempts;
-        volatile LONG64 ContextAccessAttempts;
-        volatile LONG64 SuspendAttempts;
-        volatile LONG64 ImpersonationAttempts;
-        volatile LONG64 APCInjectionPatterns;
-        volatile LONG64 HijackPatterns;
-        volatile LONG64 CrossProcessAccess;
-        volatile LONG64 SuspiciousOperations;
-        volatile LONG64 RateLimitedOperations;
-        LARGE_INTEGER StartTime;
-    } Stats;
+    TP_STATISTICS Stats;
 
     //
     // Configuration
     //
-    struct {
-        BOOLEAN EnableTerminationProtection;    ///< Block THREAD_TERMINATE
-        BOOLEAN EnableContextProtection;        ///< Block SET_CONTEXT
-        BOOLEAN EnableSuspendProtection;        ///< Block SUSPEND_RESUME
-        BOOLEAN EnableImpersonationProtection;  ///< Block IMPERSONATE
-        BOOLEAN EnableActivityTracking;         ///< Per-process activity
-        BOOLEAN EnablePatternDetection;         ///< Attack pattern detection
-        BOOLEAN EnableRateLimiting;             ///< Log rate limiting
-        BOOLEAN LogStrippedAccess;              ///< Log when access is stripped
-        BOOLEAN NotifyUserMode;                 ///< Send notifications
-        ULONG SuspicionScoreThreshold;          ///< Score to trigger alert
-    } Config;
+    TP_CONFIG Config;
 
     //
     // Lookaside list for trackers
     //
     NPAGED_LOOKASIDE_LIST TrackerLookaside;
-    BOOLEAN LookasideInitialized;
+    volatile LONG LookasideInitialized;
 
 } TP_PROTECTION_STATE, *PTP_PROTECTION_STATE;
 
@@ -406,8 +537,10 @@ typedef struct _TP_PROTECTION_STATE {
  *
  * Must be called before registering object callbacks.
  * Initializes trackers and detection state.
+ * Thread-safe: uses atomic compare-exchange for initialization guard.
  *
  * @return STATUS_SUCCESS on success.
+ *         STATUS_ALREADY_INITIALIZED if already initialized.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -421,6 +554,7 @@ TpInitializeThreadProtection(
  * @brief Shutdown thread protection subsystem.
  *
  * Frees all resources. Must be called after unregistering object callbacks.
+ * Waits for all outstanding references to drain before cleanup.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -455,9 +589,9 @@ TpThreadHandlePreCallback(
     );
 
 /**
- * @brief Thread handle post-operation callback (optional).
+ * @brief Thread handle post-operation callback.
  *
- * Can be used for additional logging after handle is created.
+ * Used for telemetry correlation and verification.
  *
  * @param RegistrationContext   Registration context.
  * @param OperationInformation  Handle operation details.
@@ -480,9 +614,9 @@ TpThreadHandlePostCallback(
  *
  * @param Context   Operation context to analyze (updated in place).
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 TpAnalyzeOperation(
     _Inout_ PTP_OPERATION_CONTEXT Context
@@ -495,9 +629,9 @@ TpAnalyzeOperation(
  *
  * @return Verdict (allow, strip, monitor, or block).
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 TP_VERDICT
 TpDetermineVerdict(
     _In_ PTP_OPERATION_CONTEXT Context
@@ -550,9 +684,9 @@ TpDetectAttackPattern(
  * @param AccessMask        Requested access mask.
  * @param IsSuspicious      Whether this operation is suspicious.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 TpTrackActivity(
     _In_ HANDLE SourceProcessId,
@@ -563,20 +697,23 @@ TpTrackActivity(
     );
 
 /**
- * @brief Get activity tracker for a source process.
+ * @brief Get a snapshot of activity tracker data (safe copy).
+ *
+ * This function copies tracker data while holding the lock,
+ * returning a snapshot that is safe to use after the function returns.
  *
  * @param SourceProcessId   Source process ID.
- * @param OutTracker        Receives tracker pointer (if found).
+ * @param OutSnapshot       Receives tracker snapshot.
  *
- * @return TRUE if tracker exists.
+ * @return TRUE if tracker exists and snapshot was taken.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
-TpGetActivityTracker(
+TpGetTrackerSnapshot(
     _In_ HANDLE SourceProcessId,
-    _Out_ PTP_ACTIVITY_TRACKER* OutTracker
+    _Out_ PTP_TRACKER_SNAPSHOT OutSnapshot
     );
 
 /**
@@ -586,9 +723,9 @@ TpGetActivityTracker(
  *
  * @return TRUE if rate limited.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 TpIsSourceRateLimited(
     _In_ HANDLE SourceProcessId
@@ -603,6 +740,22 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 TpCleanupExpiredTrackers(
     VOID
+    );
+
+/**
+ * @brief Cleanup tracker for a terminated process.
+ *
+ * Called from process notification callback when a tracked
+ * source process terminates.
+ *
+ * @param ProcessId   Terminated process ID.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+TpCleanupProcessTracker(
+    _In_ HANDLE ProcessId
     );
 
 // ============================================================================
@@ -641,12 +794,27 @@ TpGetProcessProtectionLevel(
     _In_ HANDLE ProcessId
     );
 
+/**
+ * @brief Check if thread is a system thread.
+ *
+ * @param Thread    Thread to check.
+ *
+ * @return TRUE if system thread.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+TpIsSystemThread(
+    _In_ PETHREAD Thread
+    );
+
 // ============================================================================
 // FUNCTION PROTOTYPES - STATISTICS
 // ============================================================================
 
 /**
- * @brief Get thread protection statistics.
+ * @brief Get thread protection statistics (atomic reads).
  *
  * @param TotalOperations       Receives total operations.
  * @param AccessStripped        Receives stripped count.
@@ -668,6 +836,23 @@ TpGetStatistics(
     _Out_opt_ PULONG64 SuspendAttempts,
     _Out_opt_ PULONG64 APCPatterns,
     _Out_opt_ PULONG64 HijackPatterns
+    );
+
+// ============================================================================
+// FUNCTION PROTOTYPES - VALIDATION
+// ============================================================================
+
+/**
+ * @brief Validate thread protection state is initialized and valid.
+ *
+ * @return TRUE if state is valid and usable.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+TpIsStateValid(
+    VOID
     );
 
 // ============================================================================
@@ -763,6 +948,34 @@ TpHashProcessId(
     )
 {
     return ((ULONG)(ULONG_PTR)ProcessId >> 2) & 0x3F;
+}
+
+/**
+ * @brief Atomically read a 64-bit value (safe on 32-bit systems).
+ */
+FORCEINLINE
+LONG64
+TpAtomicRead64(
+    _In_ volatile LONG64* Target
+    )
+{
+#ifdef _WIN64
+    return *Target;
+#else
+    return InterlockedCompareExchange64(Target, 0, 0);
+#endif
+}
+
+/**
+ * @brief Atomically increment a 64-bit value.
+ */
+FORCEINLINE
+VOID
+TpAtomicIncrement64(
+    _Inout_ volatile LONG64* Target
+    )
+{
+    InterlockedIncrement64(Target);
 }
 
 #ifdef __cplusplus

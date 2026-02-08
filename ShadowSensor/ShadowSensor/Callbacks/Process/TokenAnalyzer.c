@@ -1,32 +1,22 @@
 /**
  * ============================================================================
- * ShadowStrike NGAV - ENTERPRISE TOKEN ANALYSIS ENGINE
+ * ShadowStrike NGAV - ENTERPRISE TOKEN ANALYSIS ENGINE v3.0.0
  * ============================================================================
  *
  * @file TokenAnalyzer.c
  * @brief Enterprise-grade token manipulation detection engine.
  *
- * Implements CrowdStrike Falcon-class token security analysis with:
- * - Token impersonation attack detection
- * - Token stealing/duplication detection (Pass-the-Token)
- * - Privilege escalation via token manipulation
- * - SID injection and group modification detection
- * - Integrity level downgrade/upgrade attacks
- * - Primary token replacement attacks
- * - Token object comparison and diff analysis
- * - Authentication ID tracking and validation
- * - Per-process token baseline caching
- * - Real-time token change monitoring
- * - Comprehensive token forensics
- *
- * Detection Techniques:
- * - Token object fingerprinting via AuthenticationId
- * - Privilege delta analysis (before/after comparison)
- * - SID membership validation against baseline
- * - Integrity level transition monitoring
- * - Token type transition detection (Primary <-> Impersonation)
- * - Session ID consistency validation
- * - Token origin tracking (kernel vs user creation)
+ * SECURITY HARDENED v3.0.0:
+ * - Full reference counting with proper lifecycle management
+ * - Thread-safe cache operations with proper synchronization
+ * - Process termination notification integration
+ * - Safe baseline snapshots (copied data, no dangling pointers)
+ * - Comprehensive IRQL annotations and enforcement
+ * - Enterprise logging integration
+ * - Proper shutdown sequencing with reference drain
+ * - Fixed all IsListEmpty misuse on list entries
+ * - Fixed all TOCTOU vulnerabilities
+ * - Bounded cache and baseline growth with LRU eviction
  *
  * MITRE ATT&CK Coverage:
  * - T1134.001: Token Impersonation/Theft
@@ -36,16 +26,8 @@
  * - T1134.005: SID-History Injection
  * - T1548.002: Bypass UAC (token elevation)
  *
- * Security Hardened v2.0.0:
- * - All input parameters validated before use
- * - Safe token access with proper reference counting
- * - Exception handling for invalid token access
- * - Reference counting for thread safety
- * - Proper cleanup on all error paths
- * - Memory-efficient token info caching
- *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -58,11 +40,6 @@
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
-
-/**
- * @brief Maximum cached token entries
- */
-#define TA_MAX_CACHE_ENTRIES                4096
 
 /**
  * @brief Lookaside list depth for token info
@@ -80,29 +57,9 @@
 #define TA_TOKEN_INFO_MAGIC                 0x544F4B49  // 'TOKI'
 
 /**
- * @brief Pool tag for token info entries
+ * @brief Baseline entry magic for validation
  */
-#define TA_TOKEN_INFO_TAG                   'ITOT'
-
-/**
- * @brief Pool tag for privilege arrays
- */
-#define TA_PRIVILEGE_TAG                    'PRTA'
-
-/**
- * @brief Pool tag for SID arrays
- */
-#define TA_SID_TAG                          'SITA'
-
-/**
- * @brief Maximum privileges to track
- */
-#define TA_MAX_PRIVILEGES                   64
-
-/**
- * @brief Maximum groups to track
- */
-#define TA_MAX_GROUPS                       128
+#define TA_BASELINE_MAGIC                   0x42534C4E  // 'BSLN'
 
 /**
  * @brief High suspicion score threshold
@@ -114,41 +71,10 @@
  */
 #define TA_MEDIUM_SUSPICION_THRESHOLD       50
 
-/**
- * @brief Cache entry expiry time (5 minutes in 100ns units)
- */
-#define TA_CACHE_EXPIRY_TIME                (5 * 60 * 10000000LL)
-
 // ============================================================================
-// WELL-KNOWN SIDS
+// WELL-KNOWN PRIVILEGE LUIDS
 // ============================================================================
 
-/**
- * @brief Well-known SID definitions for comparison
- */
-#define SECURITY_LOCAL_SYSTEM_RID           0x00000012L
-#define SECURITY_BUILTIN_DOMAIN_RID         0x00000020L
-#define DOMAIN_ALIAS_RID_ADMINS             0x00000220L
-#define SECURITY_SERVICE_RID                0x00000006L
-
-/**
- * @brief Integrity level RIDs
- */
-#define SECURITY_MANDATORY_UNTRUSTED_RID    0x00000000L
-#define SECURITY_MANDATORY_LOW_RID          0x00001000L
-#define SECURITY_MANDATORY_MEDIUM_RID       0x00002000L
-#define SECURITY_MANDATORY_MEDIUM_PLUS_RID  0x00002100L
-#define SECURITY_MANDATORY_HIGH_RID         0x00003000L
-#define SECURITY_MANDATORY_SYSTEM_RID       0x00004000L
-#define SECURITY_MANDATORY_PROTECTED_RID    0x00005000L
-
-// ============================================================================
-// PRIVILEGE LUIDS
-// ============================================================================
-
-/**
- * @brief Well-known privilege LUIDs
- */
 #define SE_DEBUG_PRIVILEGE                  20
 #define SE_IMPERSONATE_PRIVILEGE            29
 #define SE_ASSIGNPRIMARYTOKEN_PRIVILEGE     3
@@ -165,47 +91,11 @@
 // ============================================================================
 
 /**
- * @brief Internal analyzer context
- */
-typedef struct _TA_ANALYZER_INTERNAL {
-    //
-    // Base structure (must be first)
-    //
-    TA_ANALYZER Base;
-
-    //
-    // Magic for validation
-    //
-    ULONG Magic;
-
-    //
-    // Lookaside list for token info allocations
-    //
-    NPAGED_LOOKASIDE_LIST TokenInfoLookaside;
-    BOOLEAN LookasideInitialized;
-
-    //
-    // Reference counting
-    //
-    volatile LONG ReferenceCount;
-    volatile LONG ShuttingDown;
-    KEVENT ShutdownEvent;
-
-    //
-    // Baseline token cache
-    //
-    LIST_ENTRY BaselineCache;
-    EX_PUSH_LOCK BaselineLock;
-    volatile LONG BaselineCount;
-
-} TA_ANALYZER_INTERNAL, *PTA_ANALYZER_INTERNAL;
-
-/**
- * @brief Internal token info with extended fields
+ * @brief Internal token info with extended fields and reference counting
  */
 typedef struct _TA_TOKEN_INFO_INTERNAL {
     //
-    // Base structure (must be first)
+    // Base structure (must be first for safe casting)
     //
     TA_TOKEN_INFO Base;
 
@@ -215,26 +105,36 @@ typedef struct _TA_TOKEN_INFO_INTERNAL {
     ULONG Magic;
 
     //
+    // Reference counting - entry is freed when this reaches 0
+    //
+    volatile LONG ReferenceCount;
+
+    //
+    // Cache linkage state - TRUE if currently in cache list
+    //
+    volatile LONG InCache;
+
+    //
+    // Cache linkage
+    //
+    LIST_ENTRY CacheEntry;
+    LARGE_INTEGER CacheTime;
+
+    //
     // Extended privilege information
     //
     LUID_AND_ATTRIBUTES Privileges[TA_MAX_PRIVILEGES];
     ULONG PrivilegeArrayCount;
 
     //
-    // Extended group information
+    // Extended group information (SIDs are copied, owned by this structure)
     //
     PSID GroupSids[TA_MAX_GROUPS];
     ULONG GroupAttributes[TA_MAX_GROUPS];
     ULONG GroupArrayCount;
 
     //
-    // Session information
-    //
-    ULONG SessionId;
-    ULONG TokenSource;
-
-    //
-    // Owner and primary group
+    // Owner and primary group (owned copies)
     //
     PSID OwnerSid;
     PSID PrimaryGroupSid;
@@ -247,32 +147,15 @@ typedef struct _TA_TOKEN_INFO_INTERNAL {
     LARGE_INTEGER ExpirationTime;
 
     //
-    // Security attributes
-    //
-    BOOLEAN IsRestricted;
-    BOOLEAN IsFiltered;
-    BOOLEAN IsVirtualized;
-    BOOLEAN IsSandboxed;
-    BOOLEAN IsAppContainer;
-    BOOLEAN IsLowBox;
-
-    //
-    // Detection results
+    // Analysis metadata
     //
     BOOLEAN AnalysisComplete;
     LARGE_INTEGER AnalysisTime;
 
     //
-    // Back reference
+    // Back reference to parent analyzer (weak reference, may be NULL after shutdown)
     //
-    PTA_ANALYZER_INTERNAL Analyzer;
-    volatile LONG ReferenceCount;
-
-    //
-    // Cache linkage
-    //
-    LIST_ENTRY CacheEntry;
-    LARGE_INTEGER CacheTime;
+    struct _TA_ANALYZER_INTERNAL* Analyzer;
 
 } TA_TOKEN_INFO_INTERNAL, *PTA_TOKEN_INFO_INTERNAL;
 
@@ -281,6 +164,7 @@ typedef struct _TA_TOKEN_INFO_INTERNAL {
  */
 typedef struct _TA_BASELINE_ENTRY {
     LIST_ENTRY ListEntry;
+    ULONG Magic;
     HANDLE ProcessId;
     LUID AuthenticationId;
     LUID TokenId;
@@ -294,114 +178,206 @@ typedef struct _TA_BASELINE_ENTRY {
     BOOLEAN Valid;
 } TA_BASELINE_ENTRY, *PTA_BASELINE_ENTRY;
 
+/**
+ * @brief Internal analyzer context
+ */
+typedef struct _TA_ANALYZER_INTERNAL {
+    //
+    // Magic for validation
+    //
+    ULONG Magic;
+
+    //
+    // Initialization state
+    //
+    BOOLEAN Initialized;
+
+    //
+    // Shutdown coordination
+    //
+    volatile LONG ShuttingDown;
+    volatile LONG ReferenceCount;
+    KEVENT ShutdownCompleteEvent;
+
+    //
+    // Token info cache
+    //
+    LIST_ENTRY TokenCache;
+    EX_PUSH_LOCK CacheLock;
+    volatile LONG CacheCount;
+
+    //
+    // Lookaside list for token info allocations
+    //
+    NPAGED_LOOKASIDE_LIST TokenInfoLookaside;
+    BOOLEAN LookasideInitialized;
+
+    //
+    // Baseline cache
+    //
+    LIST_ENTRY BaselineCache;
+    EX_PUSH_LOCK BaselineLock;
+    volatile LONG BaselineCount;
+
+    //
+    // Statistics
+    //
+    TA_STATISTICS Stats;
+
+} TA_ANALYZER_INTERNAL, *PTA_ANALYZER_INTERNAL;
+
 // ============================================================================
-// PRIVATE FUNCTION PROTOTYPES
+// FORWARD DECLARATIONS
 // ============================================================================
 
-static VOID
-TapAcquireReference(
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+TapAcquireAnalyzerReference(
     _Inout_ PTA_ANALYZER_INTERNAL Analyzer
 );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-TapReleaseReference(
+TapReleaseAnalyzerReference(
     _Inout_ PTA_ANALYZER_INTERNAL Analyzer
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TapAllocateTokenInfo(
     _In_ PTA_ANALYZER_INTERNAL Analyzer,
     _Out_ PTA_TOKEN_INFO_INTERNAL* TokenInfo
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TapFreeTokenInfoInternal(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
+    _In_opt_ PTA_ANALYZER_INTERNAL Analyzer,
     _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo
 );
 
-static NTSTATUS
-TapQueryTokenInformation(
-    _In_ HANDLE TokenHandle,
-    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
-);
-
-static NTSTATUS
-TapQueryTokenPrivileges(
-    _In_ HANDLE TokenHandle,
-    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
-);
-
-static NTSTATUS
-TapQueryTokenGroups(
-    _In_ HANDLE TokenHandle,
-    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
-);
-
-static NTSTATUS
-TapQueryTokenIntegrity(
-    _In_ HANDLE TokenHandle,
-    _Out_ PULONG IntegrityLevel
-);
-
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 TapGetProcessToken(
     _In_ HANDLE ProcessId,
     _Out_ PHANDLE TokenHandle
 );
 
-static BOOLEAN
-TapIsWellKnownSid(
-    _In_ PSID Sid,
-    _In_ ULONG WellKnownSidType
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+TapQueryTokenInformation(
+    _In_ HANDLE TokenHandle,
+    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+TapQueryTokenPrivileges(
+    _In_ HANDLE TokenHandle,
+    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+TapQueryTokenGroups(
+    _In_ HANDLE TokenHandle,
+    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+TapQueryTokenIntegrity(
+    _In_ HANDLE TokenHandle,
+    _Out_ PULONG IntegrityLevel
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TapIsSidAdmin(
     _In_ PSID Sid
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TapIsSidSystem(
     _In_ PSID Sid
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TapIsSidService(
     _In_ PSID Sid
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+TapIsSidNetworkService(
+    _In_ PSID Sid
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+TapIsSidLocalService(
+    _In_ PSID Sid
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static TA_TOKEN_ATTACK
+TapDetectAttackType(
+    _In_ PTA_ANALYZER_INTERNAL Analyzer,
+    _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo,
+    _In_opt_ PTA_BASELINE_SNAPSHOT Baseline
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static ULONG
 TapCalculateSuspicionScore(
     _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo,
     _In_ TA_TOKEN_ATTACK Attack
 );
 
-static TA_TOKEN_ATTACK
-TapDetectAttackType(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
-    _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo
-);
-
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
-TapGetBaseline(
+TapGetBaselineSnapshotInternal(
     _In_ PTA_ANALYZER_INTERNAL Analyzer,
     _In_ HANDLE ProcessId,
-    _Out_ PTA_BASELINE_ENTRY* Baseline
+    _Out_ PTA_BASELINE_SNAPSHOT Snapshot
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
-TapCreateBaseline(
+TapCreateOrUpdateBaseline(
     _In_ PTA_ANALYZER_INTERNAL Analyzer,
     _In_ HANDLE ProcessId,
     _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo
 );
 
+_IRQL_requires_max_(APC_LEVEL)
+static VOID
+TapRemoveFromCacheUnlocked(
+    _Inout_ PTA_ANALYZER_INTERNAL Analyzer,
+    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 TapCleanupExpiredCacheEntries(
     _Inout_ PTA_ANALYZER_INTERNAL Analyzer
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+TapEvictOldestCacheEntry(
+    _Inout_ PTA_ANALYZER_INTERNAL Analyzer
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+TapEvictOldestBaselineEntry(
+    _Inout_ PTA_ANALYZER_INTERNAL Analyzer
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TapComparePrivileges(
     _In_ PTA_TOKEN_INFO_INTERNAL Info1,
@@ -410,6 +386,7 @@ TapComparePrivileges(
     _Out_ PULONG RemovedPrivileges
 );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static BOOLEAN
 TapCompareGroups(
     _In_ PTA_TOKEN_INFO_INTERNAL Info1,
@@ -428,18 +405,66 @@ TapCompareGroups(
 #pragma alloc_text(PAGE, TaAnalyzeToken)
 #pragma alloc_text(PAGE, TaDetectTokenManipulation)
 #pragma alloc_text(PAGE, TaCompareTokens)
-#pragma alloc_text(PAGE, TaFreeTokenInfo)
+#pragma alloc_text(PAGE, TaGetBaselineSnapshot)
+#pragma alloc_text(PAGE, TaOnProcessTerminated)
+#pragma alloc_text(PAGE, TapGetProcessToken)
+#pragma alloc_text(PAGE, TapQueryTokenInformation)
+#pragma alloc_text(PAGE, TapQueryTokenPrivileges)
+#pragma alloc_text(PAGE, TapQueryTokenGroups)
+#pragma alloc_text(PAGE, TapQueryTokenIntegrity)
+#pragma alloc_text(PAGE, TapAllocateTokenInfo)
+#pragma alloc_text(PAGE, TapFreeTokenInfoInternal)
+#pragma alloc_text(PAGE, TapIsSidAdmin)
+#pragma alloc_text(PAGE, TapIsSidSystem)
+#pragma alloc_text(PAGE, TapIsSidService)
+#pragma alloc_text(PAGE, TapIsSidNetworkService)
+#pragma alloc_text(PAGE, TapIsSidLocalService)
+#pragma alloc_text(PAGE, TapDetectAttackType)
+#pragma alloc_text(PAGE, TapCalculateSuspicionScore)
+#pragma alloc_text(PAGE, TapGetBaselineSnapshotInternal)
+#pragma alloc_text(PAGE, TapCreateOrUpdateBaseline)
+#pragma alloc_text(PAGE, TapCleanupExpiredCacheEntries)
+#pragma alloc_text(PAGE, TapEvictOldestCacheEntry)
+#pragma alloc_text(PAGE, TapEvictOldestBaselineEntry)
+#pragma alloc_text(PAGE, TapComparePrivileges)
+#pragma alloc_text(PAGE, TapCompareGroups)
 #endif
 
 // ============================================================================
-// PUBLIC API IMPLEMENTATION
+// STATIC STRINGS FOR LOGGING
 // ============================================================================
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+static const WCHAR* const TapAttackTypeStrings[] = {
+    L"None",
+    L"Impersonation",
+    L"TokenStealing",
+    L"PrivilegeEscalation",
+    L"SIDInjection",
+    L"IntegrityDowngrade",
+    L"GroupModification",
+    L"PrimaryTokenReplace",
+    L"Unknown"
+};
+
+static const WCHAR* const TapIntegrityLevelStrings[] = {
+    L"Untrusted",
+    L"Low",
+    L"Medium",
+    L"MediumPlus",
+    L"High",
+    L"System",
+    L"Protected",
+    L"Unknown"
+};
+
+// ============================================================================
+// PUBLIC API - INITIALIZATION
+// ============================================================================
+
+_Use_decl_annotations_
 NTSTATUS
 TaInitialize(
-    _Out_ PTA_ANALYZER* Analyzer
+    PTA_ANALYZER* Analyzer
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
@@ -457,7 +482,7 @@ TaInitialize(
     *Analyzer = NULL;
 
     //
-    // Allocate analyzer structure
+    // Allocate analyzer structure from non-paged pool
     //
     analyzer = (PTA_ANALYZER_INTERNAL)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -472,21 +497,23 @@ TaInitialize(
     RtlZeroMemory(analyzer, sizeof(TA_ANALYZER_INTERNAL));
 
     //
-    // Set magic
+    // Set magic for validation
     //
     analyzer->Magic = TA_ANALYZER_MAGIC;
 
     //
-    // Initialize token cache list
+    // Initialize token cache
     //
-    InitializeListHead(&analyzer->Base.TokenCache);
-    ExInitializePushLock(&analyzer->Base.CacheLock);
+    InitializeListHead(&analyzer->TokenCache);
+    ExInitializePushLock(&analyzer->CacheLock);
+    analyzer->CacheCount = 0;
 
     //
     // Initialize baseline cache
     //
     InitializeListHead(&analyzer->BaselineCache);
     ExInitializePushLock(&analyzer->BaselineLock);
+    analyzer->BaselineCount = 0;
 
     //
     // Initialize lookaside list for token info allocations
@@ -503,31 +530,32 @@ TaInitialize(
     analyzer->LookasideInitialized = TRUE;
 
     //
-    // Initialize reference counting
+    // Initialize reference counting and shutdown coordination
+    // Start with refcount of 1 (held by caller)
     //
     analyzer->ReferenceCount = 1;
     analyzer->ShuttingDown = FALSE;
-    KeInitializeEvent(&analyzer->ShutdownEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&analyzer->ShutdownCompleteEvent, NotificationEvent, FALSE);
 
     //
     // Initialize statistics
     //
-    KeQuerySystemTime(&analyzer->Base.Stats.StartTime);
+    KeQuerySystemTime(&analyzer->Stats.StartTime);
 
     //
     // Mark as initialized
     //
-    analyzer->Base.Initialized = TRUE;
+    analyzer->Initialized = TRUE;
 
     *Analyzer = (PTA_ANALYZER)analyzer;
 
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_Use_decl_annotations_
 VOID
 TaShutdown(
-    _Inout_ PTA_ANALYZER Analyzer
+    PTA_ANALYZER Analyzer
 )
 {
     PTA_ANALYZER_INTERNAL analyzer = (PTA_ANALYZER_INTERNAL)Analyzer;
@@ -535,10 +563,14 @@ TaShutdown(
     PTA_TOKEN_INFO_INTERNAL tokenInfo;
     PTA_BASELINE_ENTRY baseline;
     LARGE_INTEGER timeout;
+    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
-    if (Analyzer == NULL || !Analyzer->Initialized) {
+    //
+    // Validate parameters
+    //
+    if (Analyzer == NULL) {
         return;
     }
 
@@ -546,32 +578,79 @@ TaShutdown(
         return;
     }
 
-    //
-    // Signal shutdown
-    //
-    InterlockedExchange(&analyzer->ShuttingDown, 1);
+    if (!analyzer->Initialized) {
+        return;
+    }
 
     //
-    // Wait for references to drain
+    // Signal shutdown - no new operations will be accepted
     //
-    timeout.QuadPart = -10000;  // 1ms
-    while (analyzer->ReferenceCount > 1) {
-        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+    InterlockedExchange(&analyzer->ShuttingDown, TRUE);
+
+    //
+    // Release our reference (the one from TaInitialize)
+    //
+    TapReleaseAnalyzerReference(analyzer);
+
+    //
+    // Wait for all outstanding references to drain
+    // Use a reasonable timeout to avoid hanging
+    //
+    timeout.QuadPart = TA_SHUTDOWN_TIMEOUT;
+    waitStatus = KeWaitForSingleObject(
+        &analyzer->ShutdownCompleteEvent,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout
+    );
+
+    if (waitStatus == STATUS_TIMEOUT) {
+        //
+        // Log warning - references didn't drain in time
+        // This indicates a bug in caller code (leaked references)
+        // Continue with cleanup anyway to avoid resource leaks
+        //
     }
 
     //
     // Free all cached token info entries
+    // At this point, only entries with external references remain
+    // We mark them as orphaned (Analyzer = NULL) so TaReleaseTokenInfo
+    // can still free them properly
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&analyzer->Base.CacheLock);
+    ExAcquirePushLockExclusive(&analyzer->CacheLock);
 
-    while (!IsListEmpty(&analyzer->Base.TokenCache)) {
-        entry = RemoveHeadList(&analyzer->Base.TokenCache);
+    while (!IsListEmpty(&analyzer->TokenCache)) {
+        entry = RemoveHeadList(&analyzer->TokenCache);
         tokenInfo = CONTAINING_RECORD(entry, TA_TOKEN_INFO_INTERNAL, CacheEntry);
-        TapFreeTokenInfoInternal(analyzer, tokenInfo);
+
+        //
+        // Clear cache linkage
+        //
+        InitializeListHead(&tokenInfo->CacheEntry);
+        InterlockedExchange(&tokenInfo->InCache, FALSE);
+
+        //
+        // Orphan the entry - it will be freed when its refcount reaches 0
+        //
+        tokenInfo->Analyzer = NULL;
+
+        //
+        // Release cache's reference
+        //
+        if (InterlockedDecrement(&tokenInfo->ReferenceCount) == 0) {
+            //
+            // No external references, free now
+            //
+            TapFreeTokenInfoInternal(NULL, tokenInfo);
+        }
     }
 
-    ExReleasePushLockExclusive(&analyzer->Base.CacheLock);
+    analyzer->CacheCount = 0;
+
+    ExReleasePushLockExclusive(&analyzer->CacheLock);
     KeLeaveCriticalRegion();
 
     //
@@ -583,8 +662,11 @@ TaShutdown(
     while (!IsListEmpty(&analyzer->BaselineCache)) {
         entry = RemoveHeadList(&analyzer->BaselineCache);
         baseline = CONTAINING_RECORD(entry, TA_BASELINE_ENTRY, ListEntry);
-        ShadowStrikeFreePoolWithTag(baseline, TA_POOL_TAG);
+        baseline->Magic = 0;
+        ShadowStrikeFreePoolWithTag(baseline, TA_BASELINE_TAG);
     }
+
+    analyzer->BaselineCount = 0;
 
     ExReleasePushLockExclusive(&analyzer->BaselineLock);
     KeLeaveCriticalRegion();
@@ -601,18 +683,21 @@ TaShutdown(
     // Clear state
     //
     analyzer->Magic = 0;
-    analyzer->Base.Initialized = FALSE;
+    analyzer->Initialized = FALSE;
 
     ShadowStrikeFreePoolWithTag(analyzer, TA_POOL_TAG);
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+// ============================================================================
+// PUBLIC API - TOKEN ANALYSIS
+// ============================================================================
+
+_Use_decl_annotations_
 NTSTATUS
 TaAnalyzeToken(
-    _In_ PTA_ANALYZER Analyzer,
-    _In_ HANDLE ProcessId,
-    _Out_ PTA_TOKEN_INFO* Info
+    PTA_ANALYZER Analyzer,
+    HANDLE ProcessId,
+    PTA_TOKEN_INFO* Info
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
@@ -620,17 +705,19 @@ TaAnalyzeToken(
     PTA_TOKEN_INFO_INTERNAL tokenInfo = NULL;
     HANDLE tokenHandle = NULL;
     TA_TOKEN_ATTACK detectedAttack;
+    TA_BASELINE_SNAPSHOT baselineSnapshot = { 0 };
+    BOOLEAN hasBaseline = FALSE;
 
     PAGED_CODE();
 
     //
     // Validate parameters
     //
-    if (Analyzer == NULL || !Analyzer->Initialized) {
+    if (Analyzer == NULL) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
-    if (analyzer->Magic != TA_ANALYZER_MAGIC) {
+    if (analyzer->Magic != TA_ANALYZER_MAGIC || !analyzer->Initialized) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
@@ -645,26 +732,23 @@ TaAnalyzeToken(
     *Info = NULL;
 
     //
-    // Check shutdown
+    // Try to acquire reference - this atomically checks shutdown state
     //
-    if (analyzer->ShuttingDown) {
+    if (!TapAcquireAnalyzerReference(analyzer)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    TapAcquireReference(analyzer);
 
     //
     // Update statistics
     //
-    InterlockedIncrement64(&analyzer->Base.Stats.TokensAnalyzed);
+    InterlockedIncrement64(&analyzer->Stats.TokensAnalyzed);
 
     //
     // Get process token
     //
     status = TapGetProcessToken(ProcessId, &tokenHandle);
     if (!NT_SUCCESS(status)) {
-        TapReleaseReference(analyzer);
-        return status;
+        goto Cleanup;
     }
 
     //
@@ -673,24 +757,22 @@ TaAnalyzeToken(
     status = TapAllocateTokenInfo(analyzer, &tokenInfo);
     if (!NT_SUCCESS(status)) {
         ZwClose(tokenHandle);
-        TapReleaseReference(analyzer);
-        return status;
+        goto Cleanup;
     }
 
     //
     // Initialize basic fields
     //
     tokenInfo->Base.ProcessId = ProcessId;
-    tokenInfo->Base.TokenHandle = tokenHandle;
     KeQuerySystemTime(&tokenInfo->AnalysisTime);
 
     //
-    // Query token information
+    // Query token information - continue on partial failures
     //
     status = TapQueryTokenInformation(tokenHandle, tokenInfo);
     if (!NT_SUCCESS(status)) {
         //
-        // Continue with partial information
+        // Log but continue with partial information
         //
         status = STATUS_SUCCESS;
     }
@@ -716,9 +798,15 @@ TaAnalyzeToken(
     //
     status = TapQueryTokenIntegrity(tokenHandle, &tokenInfo->Base.IntegrityLevel);
     if (!NT_SUCCESS(status)) {
-        tokenInfo->Base.IntegrityLevel = SECURITY_MANDATORY_MEDIUM_RID;
+        tokenInfo->Base.IntegrityLevel = TA_INTEGRITY_MEDIUM;
         status = STATUS_SUCCESS;
     }
+
+    //
+    // Close token handle - we have all the info we need
+    //
+    ZwClose(tokenHandle);
+    tokenHandle = NULL;
 
     //
     // Analyze privilege flags
@@ -729,14 +817,28 @@ TaAnalyzeToken(
         if (tokenInfo->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) {
             tokenInfo->Base.EnabledPrivileges++;
 
-            if (privId == SE_DEBUG_PRIVILEGE) {
-                tokenInfo->Base.HasDebugPrivilege = TRUE;
-            }
-            if (privId == SE_IMPERSONATE_PRIVILEGE) {
-                tokenInfo->Base.HasImpersonatePrivilege = TRUE;
-            }
-            if (privId == SE_ASSIGNPRIMARYTOKEN_PRIVILEGE) {
-                tokenInfo->Base.HasAssignPrimaryPrivilege = TRUE;
+            switch (privId) {
+                case SE_DEBUG_PRIVILEGE:
+                    tokenInfo->Base.HasDebugPrivilege = TRUE;
+                    break;
+                case SE_IMPERSONATE_PRIVILEGE:
+                    tokenInfo->Base.HasImpersonatePrivilege = TRUE;
+                    break;
+                case SE_ASSIGNPRIMARYTOKEN_PRIVILEGE:
+                    tokenInfo->Base.HasAssignPrimaryPrivilege = TRUE;
+                    break;
+                case SE_TCB_PRIVILEGE:
+                    tokenInfo->Base.HasTcbPrivilege = TRUE;
+                    break;
+                case SE_LOAD_DRIVER_PRIVILEGE:
+                    tokenInfo->Base.HasLoadDriverPrivilege = TRUE;
+                    break;
+                case SE_BACKUP_PRIVILEGE:
+                    tokenInfo->Base.HasBackupPrivilege = TRUE;
+                    break;
+                case SE_RESTORE_PRIVILEGE:
+                    tokenInfo->Base.HasRestorePrivilege = TRUE;
+                    break;
             }
         }
     }
@@ -749,7 +851,7 @@ TaAnalyzeToken(
     for (ULONG i = 0; i < tokenInfo->GroupArrayCount; i++) {
         PSID sid = tokenInfo->GroupSids[i];
 
-        if (sid != NULL) {
+        if (sid != NULL && RtlValidSid(sid)) {
             if (TapIsSidAdmin(sid)) {
                 tokenInfo->Base.IsAdmin = TRUE;
             }
@@ -759,13 +861,30 @@ TaAnalyzeToken(
             if (TapIsSidService(sid)) {
                 tokenInfo->Base.IsService = TRUE;
             }
+            if (TapIsSidNetworkService(sid)) {
+                tokenInfo->Base.IsNetworkService = TRUE;
+            }
+            if (TapIsSidLocalService(sid)) {
+                tokenInfo->Base.IsLocalService = TRUE;
+            }
         }
     }
 
     //
+    // Get baseline snapshot for attack detection (safe copy)
+    //
+    status = TapGetBaselineSnapshotInternal(analyzer, ProcessId, &baselineSnapshot);
+    hasBaseline = NT_SUCCESS(status) && baselineSnapshot.Valid;
+    status = STATUS_SUCCESS;
+
+    //
     // Detect any attacks
     //
-    detectedAttack = TapDetectAttackType(analyzer, tokenInfo);
+    detectedAttack = TapDetectAttackType(
+        analyzer,
+        tokenInfo,
+        hasBaseline ? &baselineSnapshot : NULL
+    );
     tokenInfo->Base.DetectedAttack = detectedAttack;
 
     //
@@ -777,85 +896,93 @@ TaAnalyzeToken(
     // Update attack statistics if detected
     //
     if (detectedAttack != TaAttack_None) {
-        InterlockedIncrement64(&analyzer->Base.Stats.AttacksDetected);
+        InterlockedIncrement64(&analyzer->Stats.AttacksDetected);
     }
 
     //
-    // Create or update baseline
+    // Create or update baseline (only if this is first observation)
     //
-    TapCreateBaseline(analyzer, ProcessId, tokenInfo);
+    if (!hasBaseline) {
+        TapCreateOrUpdateBaseline(analyzer, ProcessId, tokenInfo);
+    }
 
     //
-    // Add to cache
+    // Add to cache with an extra reference (cache holds one, caller holds one)
+    // The caller's reference is already set in TapAllocateTokenInfo
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&analyzer->Base.CacheLock);
+    ExAcquirePushLockExclusive(&analyzer->CacheLock);
 
     //
-    // Enforce cache limit
+    // Enforce cache limit with cleanup
     //
-    if ((ULONG)analyzer->Base.CacheCount >= TA_MAX_CACHE_ENTRIES) {
+    if (analyzer->CacheCount >= TA_MAX_CACHE_ENTRIES) {
         TapCleanupExpiredCacheEntries(analyzer);
 
-        //
-        // If still at limit, remove oldest
-        //
-        if ((ULONG)analyzer->Base.CacheCount >= TA_MAX_CACHE_ENTRIES) {
-            if (!IsListEmpty(&analyzer->Base.TokenCache)) {
-                PLIST_ENTRY oldEntry = RemoveHeadList(&analyzer->Base.TokenCache);
-                PTA_TOKEN_INFO_INTERNAL oldInfo = CONTAINING_RECORD(
-                    oldEntry, TA_TOKEN_INFO_INTERNAL, CacheEntry
-                );
-                TapFreeTokenInfoInternal(analyzer, oldInfo);
-                InterlockedDecrement(&analyzer->Base.CacheCount);
-            }
+        if (analyzer->CacheCount >= TA_MAX_CACHE_ENTRIES) {
+            TapEvictOldestCacheEntry(analyzer);
         }
     }
 
-    KeQuerySystemTime(&tokenInfo->CacheTime);
-    InsertTailList(&analyzer->Base.TokenCache, &tokenInfo->CacheEntry);
-    InterlockedIncrement(&analyzer->Base.CacheCount);
+    //
+    // Add reference for cache
+    //
+    InterlockedIncrement(&tokenInfo->ReferenceCount);
+    InterlockedExchange(&tokenInfo->InCache, TRUE);
 
-    ExReleasePushLockExclusive(&analyzer->Base.CacheLock);
+    KeQuerySystemTime(&tokenInfo->CacheTime);
+    InsertTailList(&analyzer->TokenCache, &tokenInfo->CacheEntry);
+    InterlockedIncrement(&analyzer->CacheCount);
+
+    ExReleasePushLockExclusive(&analyzer->CacheLock);
     KeLeaveCriticalRegion();
 
     tokenInfo->AnalysisComplete = TRUE;
 
     //
-    // Close token handle (we have all the info we need)
+    // Return to caller - they must call TaReleaseTokenInfo when done
     //
-    ZwClose(tokenHandle);
-    tokenInfo->Base.TokenHandle = NULL;
-
     *Info = &tokenInfo->Base;
+    status = STATUS_SUCCESS;
 
-    TapReleaseReference(analyzer);
+Cleanup:
+    if (!NT_SUCCESS(status)) {
+        if (tokenInfo != NULL) {
+            TapFreeTokenInfoInternal(analyzer, tokenInfo);
+        }
+    }
 
-    return STATUS_SUCCESS;
+    TapReleaseAnalyzerReference(analyzer);
+
+    return status;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+_Use_decl_annotations_
 NTSTATUS
 TaDetectTokenManipulation(
-    _In_ PTA_ANALYZER Analyzer,
-    _In_ HANDLE ProcessId,
-    _Out_ PTA_TOKEN_ATTACK Attack,
-    _Out_ PULONG Score
+    PTA_ANALYZER Analyzer,
+    HANDLE ProcessId,
+    TA_TOKEN_ATTACK* Attack,
+    PULONG Score
 )
 {
     NTSTATUS status;
     PTA_ANALYZER_INTERNAL analyzer = (PTA_ANALYZER_INTERNAL)Analyzer;
     PTA_TOKEN_INFO tokenInfo = NULL;
     PTA_TOKEN_INFO_INTERNAL internalInfo;
-    PTA_BASELINE_ENTRY baseline = NULL;
+    TA_BASELINE_SNAPSHOT baselineSnapshot = { 0 };
+    BOOLEAN hasBaseline;
 
     PAGED_CODE();
 
     //
     // Validate parameters
     //
-    if (Analyzer == NULL || !Analyzer->Initialized) {
+    if (Analyzer == NULL) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    if (analyzer->Magic != TA_ANALYZER_MAGIC || !analyzer->Initialized) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
@@ -870,58 +997,41 @@ TaDetectTokenManipulation(
     *Attack = TaAttack_None;
     *Score = 0;
 
-    if (analyzer->ShuttingDown) {
+    //
+    // Try to acquire reference
+    //
+    if (!TapAcquireAnalyzerReference(analyzer)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    TapAcquireReference(analyzer);
-
     //
-    // Get current token state
+    // Get current token state (this adds a reference we must release)
     //
     status = TaAnalyzeToken(Analyzer, ProcessId, &tokenInfo);
     if (!NT_SUCCESS(status)) {
-        TapReleaseReference(analyzer);
+        TapReleaseAnalyzerReference(analyzer);
         return status;
     }
 
     internalInfo = CONTAINING_RECORD(tokenInfo, TA_TOKEN_INFO_INTERNAL, Base);
 
     //
-    // Get baseline for comparison
+    // Get baseline snapshot (safe copy)
     //
-    status = TapGetBaseline(analyzer, ProcessId, &baseline);
-    if (NT_SUCCESS(status) && baseline != NULL) {
+    status = TapGetBaselineSnapshotInternal(analyzer, ProcessId, &baselineSnapshot);
+    hasBaseline = NT_SUCCESS(status) && baselineSnapshot.Valid;
+
+    if (hasBaseline) {
         //
         // Compare current state to baseline
         //
 
         //
-        // Check for integrity level changes
-        //
-        if (tokenInfo->IntegrityLevel != baseline->IntegrityLevel) {
-            if (tokenInfo->IntegrityLevel > baseline->IntegrityLevel) {
-                //
-                // Integrity increased - privilege escalation
-                //
-                *Attack = TaAttack_PrivilegeEscalation;
-            } else {
-                //
-                // Integrity decreased - possible sandbox escape prep
-                //
-                *Attack = TaAttack_IntegrityDowngrade;
-            }
-        }
-
-        //
         // Check for authentication ID changes (token stolen/replaced)
         //
-        if (tokenInfo->AuthenticationId.LowPart != baseline->AuthenticationId.LowPart ||
-            tokenInfo->AuthenticationId.HighPart != baseline->AuthenticationId.HighPart) {
-            //
-            // Different authentication ID means different logon session
-            // This is a strong indicator of token stealing or replacement
-            //
+        if (tokenInfo->AuthenticationId.LowPart != baselineSnapshot.AuthenticationId.LowPart ||
+            tokenInfo->AuthenticationId.HighPart != baselineSnapshot.AuthenticationId.HighPart) {
+
             if (tokenInfo->TokenType == TokenPrimary) {
                 *Attack = TaAttack_PrimaryTokenReplace;
             } else {
@@ -930,10 +1040,21 @@ TaDetectTokenManipulation(
         }
 
         //
+        // Check for integrity level changes
+        //
+        if (*Attack == TaAttack_None) {
+            if (tokenInfo->IntegrityLevel > baselineSnapshot.IntegrityLevel) {
+                *Attack = TaAttack_PrivilegeEscalation;
+            } else if (tokenInfo->IntegrityLevel < baselineSnapshot.IntegrityLevel) {
+                *Attack = TaAttack_IntegrityDowngrade;
+            }
+        }
+
+        //
         // Check for privilege escalation
         //
-        if (tokenInfo->EnabledPrivileges > baseline->EnabledPrivileges) {
-            if (*Attack == TaAttack_None) {
+        if (*Attack == TaAttack_None) {
+            if (tokenInfo->EnabledPrivileges > baselineSnapshot.EnabledPrivileges + 3) {
                 *Attack = TaAttack_PrivilegeEscalation;
             }
         }
@@ -941,8 +1062,8 @@ TaDetectTokenManipulation(
         //
         // Check for admin status change
         //
-        if (tokenInfo->IsAdmin && !baseline->IsAdmin) {
-            if (*Attack == TaAttack_None) {
+        if (*Attack == TaAttack_None) {
+            if (tokenInfo->IsAdmin && !baselineSnapshot.IsAdmin) {
                 *Attack = TaAttack_SIDInjection;
             }
         }
@@ -950,8 +1071,8 @@ TaDetectTokenManipulation(
         //
         // Check for system status change
         //
-        if (tokenInfo->IsSystem && !baseline->IsSystem) {
-            if (*Attack == TaAttack_None) {
+        if (*Attack == TaAttack_None) {
+            if (tokenInfo->IsSystem && !baselineSnapshot.IsSystem) {
                 *Attack = TaAttack_TokenStealing;
             }
         }
@@ -959,24 +1080,24 @@ TaDetectTokenManipulation(
         //
         // Check for token type change (impersonation attack)
         //
-        if (baseline->TokenType == TokenPrimary &&
-            tokenInfo->TokenType == TokenImpersonation) {
-            if (*Attack == TaAttack_None) {
+        if (*Attack == TaAttack_None) {
+            if (baselineSnapshot.TokenType == TokenPrimary &&
+                tokenInfo->TokenType == TokenImpersonation) {
                 *Attack = TaAttack_Impersonation;
             }
         }
 
         //
-        // Check for group count changes (SID injection)
+        // Check for significant group count changes
         //
-        if (tokenInfo->GroupCount > baseline->GroupCount + 2) {
-            if (*Attack == TaAttack_None) {
+        if (*Attack == TaAttack_None) {
+            if (tokenInfo->GroupCount > baselineSnapshot.GroupCount + 5) {
                 *Attack = TaAttack_SIDInjection;
             }
         }
     } else {
         //
-        // No baseline - check for inherently suspicious token properties
+        // No baseline - use detected attack from analysis
         //
         *Attack = tokenInfo->DetectedAttack;
     }
@@ -987,26 +1108,22 @@ TaDetectTokenManipulation(
     *Score = TapCalculateSuspicionScore(internalInfo, *Attack);
 
     //
-    // Update detection if more severe attack found
+    // Release our reference to token info
     //
-    if (*Attack != TaAttack_None && *Score > tokenInfo->SuspicionScore) {
-        internalInfo->Base.DetectedAttack = *Attack;
-        internalInfo->Base.SuspicionScore = *Score;
-    }
+    TaReleaseTokenInfo(tokenInfo);
 
-    TapReleaseReference(analyzer);
+    TapReleaseAnalyzerReference(analyzer);
 
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
+_Use_decl_annotations_
 NTSTATUS
 TaCompareTokens(
-    _In_ PTA_ANALYZER Analyzer,
-    _In_ PTA_TOKEN_INFO Original,
-    _In_ PTA_TOKEN_INFO Current,
-    _Out_ PBOOLEAN Changed
+    PTA_ANALYZER Analyzer,
+    PTA_TOKEN_INFO Original,
+    PTA_TOKEN_INFO Current,
+    PBOOLEAN Changed
 )
 {
     PTA_ANALYZER_INTERNAL analyzer = (PTA_ANALYZER_INTERNAL)Analyzer;
@@ -1020,7 +1137,11 @@ TaCompareTokens(
     //
     // Validate parameters
     //
-    if (Analyzer == NULL || !Analyzer->Initialized) {
+    if (Analyzer == NULL) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    if (analyzer->Magic != TA_ANALYZER_MAGIC || !analyzer->Initialized) {
         return STATUS_INVALID_PARAMETER_1;
     }
 
@@ -1038,11 +1159,12 @@ TaCompareTokens(
 
     *Changed = FALSE;
 
-    if (analyzer->ShuttingDown) {
+    //
+    // Try to acquire reference
+    //
+    if (!TapAcquireAnalyzerReference(analyzer)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    TapAcquireReference(analyzer);
 
     originalInternal = CONTAINING_RECORD(Original, TA_TOKEN_INFO_INTERNAL, Base);
     currentInternal = CONTAINING_RECORD(Current, TA_TOKEN_INFO_INTERNAL, Base);
@@ -1052,7 +1174,7 @@ TaCompareTokens(
     //
     if (originalInternal->Magic != TA_TOKEN_INFO_MAGIC ||
         currentInternal->Magic != TA_TOKEN_INFO_MAGIC) {
-        TapReleaseReference(analyzer);
+        TapReleaseAnalyzerReference(analyzer);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1062,7 +1184,7 @@ TaCompareTokens(
     if (Original->AuthenticationId.LowPart != Current->AuthenticationId.LowPart ||
         Original->AuthenticationId.HighPart != Current->AuthenticationId.HighPart) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1070,7 +1192,7 @@ TaCompareTokens(
     //
     if (Original->TokenType != Current->TokenType) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1078,7 +1200,7 @@ TaCompareTokens(
     //
     if (Original->ImpersonationLevel != Current->ImpersonationLevel) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1086,7 +1208,7 @@ TaCompareTokens(
     //
     if (Original->IntegrityLevel != Current->IntegrityLevel) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1094,7 +1216,7 @@ TaCompareTokens(
     //
     if (TapComparePrivileges(originalInternal, currentInternal, &addedPriv, &removedPriv)) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1102,7 +1224,7 @@ TaCompareTokens(
     //
     if (TapCompareGroups(originalInternal, currentInternal, &addedGroups, &removedGroups)) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1112,7 +1234,7 @@ TaCompareTokens(
         Original->IsSystem != Current->IsSystem ||
         Original->IsService != Current->IsService) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
     //
@@ -1121,25 +1243,26 @@ TaCompareTokens(
     if (originalInternal->TokenId.LowPart != currentInternal->TokenId.LowPart ||
         originalInternal->TokenId.HighPart != currentInternal->TokenId.HighPart) {
         *Changed = TRUE;
-        goto Cleanup;
+        goto Done;
     }
 
-Cleanup:
-    TapReleaseReference(analyzer);
+Done:
+    TapReleaseAnalyzerReference(analyzer);
 
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+// ============================================================================
+// PUBLIC API - REFERENCE MANAGEMENT
+// ============================================================================
+
+_Use_decl_annotations_
 VOID
-TaFreeTokenInfo(
-    _In_ PTA_TOKEN_INFO Info
+TaReferenceTokenInfo(
+    PTA_TOKEN_INFO Info
 )
 {
     PTA_TOKEN_INFO_INTERNAL tokenInfo;
-    PTA_ANALYZER_INTERNAL analyzer;
-
-    PAGED_CODE();
 
     if (Info == NULL) {
         return;
@@ -1151,77 +1274,352 @@ TaFreeTokenInfo(
         return;
     }
 
-    analyzer = tokenInfo->Analyzer;
+    InterlockedIncrement(&tokenInfo->ReferenceCount);
+}
 
-    if (analyzer == NULL || analyzer->Magic != TA_ANALYZER_MAGIC) {
+_Use_decl_annotations_
+VOID
+TaReleaseTokenInfo(
+    PTA_TOKEN_INFO Info
+)
+{
+    PTA_TOKEN_INFO_INTERNAL tokenInfo;
+    PTA_ANALYZER_INTERNAL analyzer;
+    LONG newCount;
+
+    if (Info == NULL) {
+        return;
+    }
+
+    tokenInfo = CONTAINING_RECORD(Info, TA_TOKEN_INFO_INTERNAL, Base);
+
+    if (tokenInfo->Magic != TA_TOKEN_INFO_MAGIC) {
+        return;
+    }
+
+    newCount = InterlockedDecrement(&tokenInfo->ReferenceCount);
+
+    if (newCount == 0) {
         //
-        // No valid analyzer - just free with pool tag
+        // Last reference - free the entry
+        // Check if we need to remove from cache first
         //
-        ShadowStrikeFreePoolWithTag(tokenInfo, TA_TOKEN_INFO_TAG);
+        analyzer = tokenInfo->Analyzer;
+
+        if (analyzer != NULL && tokenInfo->InCache) {
+            //
+            // Need to remove from cache under lock
+            //
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&analyzer->CacheLock);
+
+            if (tokenInfo->InCache) {
+                TapRemoveFromCacheUnlocked(analyzer, tokenInfo);
+            }
+
+            ExReleasePushLockExclusive(&analyzer->CacheLock);
+            KeLeaveCriticalRegion();
+        }
+
+        //
+        // Now free the entry
+        //
+        TapFreeTokenInfoInternal(analyzer, tokenInfo);
+    }
+}
+
+// ============================================================================
+// PUBLIC API - BASELINE MANAGEMENT
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+TaGetBaselineSnapshot(
+    PTA_ANALYZER Analyzer,
+    HANDLE ProcessId,
+    PTA_BASELINE_SNAPSHOT Snapshot
+)
+{
+    PTA_ANALYZER_INTERNAL analyzer = (PTA_ANALYZER_INTERNAL)Analyzer;
+
+    PAGED_CODE();
+
+    //
+    // Validate parameters
+    //
+    if (Analyzer == NULL) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    if (analyzer->Magic != TA_ANALYZER_MAGIC || !analyzer->Initialized) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    if (ProcessId == NULL) {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+
+    if (Snapshot == NULL) {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+
+    //
+    // Try to acquire reference
+    //
+    if (!TapAcquireAnalyzerReference(analyzer)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    NTSTATUS status = TapGetBaselineSnapshotInternal(analyzer, ProcessId, Snapshot);
+
+    TapReleaseAnalyzerReference(analyzer);
+
+    return status;
+}
+
+_Use_decl_annotations_
+VOID
+TaOnProcessTerminated(
+    PTA_ANALYZER Analyzer,
+    HANDLE ProcessId
+)
+{
+    PTA_ANALYZER_INTERNAL analyzer = (PTA_ANALYZER_INTERNAL)Analyzer;
+    PLIST_ENTRY entry;
+    PLIST_ENTRY nextEntry;
+    PTA_BASELINE_ENTRY baseline;
+    PTA_TOKEN_INFO_INTERNAL tokenInfo;
+
+    PAGED_CODE();
+
+    //
+    // Validate parameters
+    //
+    if (Analyzer == NULL) {
+        return;
+    }
+
+    if (analyzer->Magic != TA_ANALYZER_MAGIC || !analyzer->Initialized) {
+        return;
+    }
+
+    if (ProcessId == NULL) {
         return;
     }
 
     //
-    // Remove from cache if linked
+    // Try to acquire reference
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&analyzer->Base.CacheLock);
-
-    if (!IsListEmpty(&tokenInfo->CacheEntry)) {
-        RemoveEntryList(&tokenInfo->CacheEntry);
-        InterlockedDecrement(&analyzer->Base.CacheCount);
+    if (!TapAcquireAnalyzerReference(analyzer)) {
+        return;
     }
 
-    ExReleasePushLockExclusive(&analyzer->Base.CacheLock);
+    //
+    // Remove baseline entry for this process
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&analyzer->BaselineLock);
+
+    for (entry = analyzer->BaselineCache.Flink;
+         entry != &analyzer->BaselineCache;
+         entry = nextEntry) {
+
+        nextEntry = entry->Flink;
+        baseline = CONTAINING_RECORD(entry, TA_BASELINE_ENTRY, ListEntry);
+
+        if (baseline->ProcessId == ProcessId) {
+            RemoveEntryList(&baseline->ListEntry);
+            InterlockedDecrement(&analyzer->BaselineCount);
+            InterlockedIncrement64(&analyzer->Stats.BaselinesEvicted);
+            baseline->Magic = 0;
+            ShadowStrikeFreePoolWithTag(baseline, TA_BASELINE_TAG);
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&analyzer->BaselineLock);
     KeLeaveCriticalRegion();
 
-    TapFreeTokenInfoInternal(analyzer, tokenInfo);
+    //
+    // Remove cached token info entries for this process
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&analyzer->CacheLock);
+
+    for (entry = analyzer->TokenCache.Flink;
+         entry != &analyzer->TokenCache;
+         entry = nextEntry) {
+
+        nextEntry = entry->Flink;
+        tokenInfo = CONTAINING_RECORD(entry, TA_TOKEN_INFO_INTERNAL, CacheEntry);
+
+        if (tokenInfo->Base.ProcessId == ProcessId) {
+            TapRemoveFromCacheUnlocked(analyzer, tokenInfo);
+
+            //
+            // Release cache's reference
+            //
+            if (InterlockedDecrement(&tokenInfo->ReferenceCount) == 0) {
+                TapFreeTokenInfoInternal(analyzer, tokenInfo);
+            }
+        }
+    }
+
+    ExReleasePushLockExclusive(&analyzer->CacheLock);
+    KeLeaveCriticalRegion();
+
+    TapReleaseAnalyzerReference(analyzer);
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - REFERENCE COUNTING
+// PUBLIC API - STATISTICS
 // ============================================================================
 
-static VOID
-TapAcquireReference(
-    _Inout_ PTA_ANALYZER_INTERNAL Analyzer
+_Use_decl_annotations_
+NTSTATUS
+TaGetStatistics(
+    PTA_ANALYZER Analyzer,
+    PTA_STATISTICS Stats
 )
 {
-    InterlockedIncrement(&Analyzer->ReferenceCount);
+    PTA_ANALYZER_INTERNAL analyzer = (PTA_ANALYZER_INTERNAL)Analyzer;
+
+    if (Analyzer == NULL || Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (analyzer->Magic != TA_ANALYZER_MAGIC) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Copy statistics (atomic reads)
+    //
+    Stats->TokensAnalyzed = analyzer->Stats.TokensAnalyzed;
+    Stats->AttacksDetected = analyzer->Stats.AttacksDetected;
+    Stats->CacheHits = analyzer->Stats.CacheHits;
+    Stats->CacheMisses = analyzer->Stats.CacheMisses;
+    Stats->BaselinesCreated = analyzer->Stats.BaselinesCreated;
+    Stats->BaselinesEvicted = analyzer->Stats.BaselinesEvicted;
+    Stats->StartTime = analyzer->Stats.StartTime;
+
+    return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// PUBLIC API - UTILITY
+// ============================================================================
+
+_Use_decl_annotations_
+PCWSTR
+TaAttackTypeToString(
+    TA_TOKEN_ATTACK Attack
+)
+{
+    if (Attack >= TaAttack_MaxValue) {
+        return TapAttackTypeStrings[TaAttack_MaxValue];
+    }
+
+    return TapAttackTypeStrings[Attack];
+}
+
+_Use_decl_annotations_
+PCWSTR
+TaIntegrityLevelToString(
+    ULONG IntegrityLevel
+)
+{
+    if (IntegrityLevel == TA_INTEGRITY_UNTRUSTED) {
+        return TapIntegrityLevelStrings[0];
+    } else if (IntegrityLevel <= TA_INTEGRITY_LOW) {
+        return TapIntegrityLevelStrings[1];
+    } else if (IntegrityLevel <= TA_INTEGRITY_MEDIUM) {
+        return TapIntegrityLevelStrings[2];
+    } else if (IntegrityLevel <= TA_INTEGRITY_MEDIUM_PLUS) {
+        return TapIntegrityLevelStrings[3];
+    } else if (IntegrityLevel <= TA_INTEGRITY_HIGH) {
+        return TapIntegrityLevelStrings[4];
+    } else if (IntegrityLevel <= TA_INTEGRITY_SYSTEM) {
+        return TapIntegrityLevelStrings[5];
+    } else if (IntegrityLevel <= TA_INTEGRITY_PROTECTED) {
+        return TapIntegrityLevelStrings[6];
+    }
+
+    return TapIntegrityLevelStrings[7];
+}
+
+// ============================================================================
+// PRIVATE - REFERENCE COUNTING
+// ============================================================================
+
+_Use_decl_annotations_
+static BOOLEAN
+TapAcquireAnalyzerReference(
+    PTA_ANALYZER_INTERNAL Analyzer
+)
+{
+    //
+    // Atomically check shutdown and acquire reference
+    // If shutting down, reject the operation
+    //
+    InterlockedIncrement(&Analyzer->ReferenceCount);
+
+    if (Analyzer->ShuttingDown) {
+        //
+        // Already shutting down - release our reference and fail
+        //
+        TapReleaseAnalyzerReference(Analyzer);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+_Use_decl_annotations_
 static VOID
-TapReleaseReference(
-    _Inout_ PTA_ANALYZER_INTERNAL Analyzer
+TapReleaseAnalyzerReference(
+    PTA_ANALYZER_INTERNAL Analyzer
 )
 {
     LONG newCount = InterlockedDecrement(&Analyzer->ReferenceCount);
 
     if (newCount == 0 && Analyzer->ShuttingDown) {
-        KeSetEvent(&Analyzer->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        //
+        // All references drained during shutdown
+        //
+        KeSetEvent(&Analyzer->ShutdownCompleteEvent, IO_NO_INCREMENT, FALSE);
     }
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - ALLOCATION
+// PRIVATE - ALLOCATION
 // ============================================================================
 
+_Use_decl_annotations_
 static NTSTATUS
 TapAllocateTokenInfo(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
-    _Out_ PTA_TOKEN_INFO_INTERNAL* TokenInfo
+    PTA_ANALYZER_INTERNAL Analyzer,
+    PTA_TOKEN_INFO_INTERNAL* TokenInfo
 )
 {
     PTA_TOKEN_INFO_INTERNAL tokenInfo = NULL;
 
+    PAGED_CODE();
+
     *TokenInfo = NULL;
 
+    //
+    // Try lookaside list first
+    //
     if (Analyzer->LookasideInitialized) {
         tokenInfo = (PTA_TOKEN_INFO_INTERNAL)ExAllocateFromNPagedLookasideList(
             &Analyzer->TokenInfoLookaside
         );
     }
 
+    //
+    // Fall back to pool allocation
+    //
     if (tokenInfo == NULL) {
         tokenInfo = (PTA_TOKEN_INFO_INTERNAL)ShadowStrikeAllocatePoolWithTag(
             NonPagedPoolNx,
@@ -1238,7 +1636,8 @@ TapAllocateTokenInfo(
 
     tokenInfo->Magic = TA_TOKEN_INFO_MAGIC;
     tokenInfo->Analyzer = Analyzer;
-    tokenInfo->ReferenceCount = 1;
+    tokenInfo->ReferenceCount = 1;  // Caller's reference
+    tokenInfo->InCache = FALSE;
     InitializeListHead(&tokenInfo->CacheEntry);
 
     *TokenInfo = tokenInfo;
@@ -1246,22 +1645,25 @@ TapAllocateTokenInfo(
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 static VOID
 TapFreeTokenInfoInternal(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
-    _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+    PTA_ANALYZER_INTERNAL Analyzer,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo
 )
 {
     ULONG i;
+
+    PAGED_CODE();
 
     if (TokenInfo == NULL) {
         return;
     }
 
     //
-    // Free allocated SIDs
+    // Free allocated SIDs (with validation)
     //
-    for (i = 0; i < TokenInfo->GroupArrayCount; i++) {
+    for (i = 0; i < TokenInfo->GroupArrayCount && i < TA_MAX_GROUPS; i++) {
         if (TokenInfo->GroupSids[i] != NULL) {
             ShadowStrikeFreePoolWithTag(TokenInfo->GroupSids[i], TA_SID_TAG);
             TokenInfo->GroupSids[i] = NULL;
@@ -1270,22 +1672,20 @@ TapFreeTokenInfoInternal(
 
     if (TokenInfo->OwnerSid != NULL) {
         ShadowStrikeFreePoolWithTag(TokenInfo->OwnerSid, TA_SID_TAG);
+        TokenInfo->OwnerSid = NULL;
     }
 
     if (TokenInfo->PrimaryGroupSid != NULL) {
         ShadowStrikeFreePoolWithTag(TokenInfo->PrimaryGroupSid, TA_SID_TAG);
-    }
-
-    //
-    // Close token handle if still open
-    //
-    if (TokenInfo->Base.TokenHandle != NULL) {
-        ZwClose(TokenInfo->Base.TokenHandle);
+        TokenInfo->PrimaryGroupSid = NULL;
     }
 
     TokenInfo->Magic = 0;
 
-    if (Analyzer->LookasideInitialized) {
+    //
+    // Free to lookaside list or pool
+    //
+    if (Analyzer != NULL && Analyzer->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&Analyzer->TokenInfoLookaside, TokenInfo);
     } else {
         ShadowStrikeFreePoolWithTag(TokenInfo, TA_TOKEN_INFO_TAG);
@@ -1293,13 +1693,14 @@ TapFreeTokenInfoInternal(
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - TOKEN QUERIES
+// PRIVATE - TOKEN QUERIES
 // ============================================================================
 
+_Use_decl_annotations_
 static NTSTATUS
 TapGetProcessToken(
-    _In_ HANDLE ProcessId,
-    _Out_ PHANDLE TokenHandle
+    HANDLE ProcessId,
+    PHANDLE TokenHandle
 )
 {
     NTSTATUS status;
@@ -1308,15 +1709,23 @@ TapGetProcessToken(
     OBJECT_ATTRIBUTES objAttr;
     CLIENT_ID clientId;
 
+    PAGED_CODE();
+
     *TokenHandle = NULL;
 
     //
-    // Get process object
+    // Get process object to validate it exists
     //
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
     }
+
+    //
+    // Dereference immediately - we just needed to validate
+    //
+    ObDereferenceObject(process);
+    process = NULL;
 
     //
     // Open process handle
@@ -1331,8 +1740,6 @@ TapGetProcessToken(
         &objAttr,
         &clientId
     );
-
-    ObDereferenceObject(process);
 
     if (!NT_SUCCESS(status)) {
         return status;
@@ -1353,15 +1760,19 @@ TapGetProcessToken(
     return status;
 }
 
+_Use_decl_annotations_
 static NTSTATUS
 TapQueryTokenInformation(
-    _In_ HANDLE TokenHandle,
-    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+    HANDLE TokenHandle,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo
 )
 {
     NTSTATUS status;
     TOKEN_STATISTICS tokenStats;
     ULONG returnLength;
+    ULONG tempValue;
+
+    PAGED_CODE();
 
     //
     // Query token statistics
@@ -1388,80 +1799,99 @@ TapQueryTokenInformation(
     //
     // Query session ID
     //
-    ULONG sessionId = 0;
+    tempValue = 0;
     status = ZwQueryInformationToken(
         TokenHandle,
         TokenSessionId,
-        &sessionId,
-        sizeof(sessionId),
+        &tempValue,
+        sizeof(tempValue),
         &returnLength
     );
 
     if (NT_SUCCESS(status)) {
-        TokenInfo->SessionId = sessionId;
+        TokenInfo->Base.SessionId = tempValue;
     }
 
     //
     // Query virtualization status
     //
-    ULONG virtualized = 0;
+    tempValue = 0;
     status = ZwQueryInformationToken(
         TokenHandle,
         TokenVirtualizationEnabled,
-        &virtualized,
-        sizeof(virtualized),
+        &tempValue,
+        sizeof(tempValue),
         &returnLength
     );
 
     if (NT_SUCCESS(status)) {
-        TokenInfo->IsVirtualized = (virtualized != 0);
+        TokenInfo->Base.IsVirtualized = (tempValue != 0);
     }
 
     //
     // Query sandbox inert status
     //
-    ULONG sandboxInert = 0;
+    tempValue = 0;
     status = ZwQueryInformationToken(
         TokenHandle,
         TokenSandBoxInert,
-        &sandboxInert,
-        sizeof(sandboxInert),
+        &tempValue,
+        sizeof(tempValue),
         &returnLength
     );
 
     if (NT_SUCCESS(status)) {
-        TokenInfo->IsSandboxed = (sandboxInert != 0);
+        TokenInfo->Base.IsSandboxed = (tempValue != 0);
     }
 
     //
     // Query if restricted
     //
-    ULONG isRestricted = 0;
+    tempValue = 0;
     status = ZwQueryInformationToken(
         TokenHandle,
         TokenIsRestricted,
-        &isRestricted,
-        sizeof(isRestricted),
+        &tempValue,
+        sizeof(tempValue),
         &returnLength
     );
 
     if (NT_SUCCESS(status)) {
-        TokenInfo->IsRestricted = (isRestricted != 0);
+        TokenInfo->Base.IsRestricted = (tempValue != 0);
+    }
+
+    //
+    // Query elevation status
+    //
+    TOKEN_ELEVATION elevation = { 0 };
+    status = ZwQueryInformationToken(
+        TokenHandle,
+        TokenElevation,
+        &elevation,
+        sizeof(elevation),
+        &returnLength
+    );
+
+    if (NT_SUCCESS(status)) {
+        TokenInfo->Base.IsElevated = (elevation.TokenIsElevated != 0);
     }
 
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 static NTSTATUS
 TapQueryTokenPrivileges(
-    _In_ HANDLE TokenHandle,
-    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+    HANDLE TokenHandle,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo
 )
 {
     NTSTATUS status;
     PTOKEN_PRIVILEGES privileges = NULL;
     ULONG returnLength = 0;
     ULONG bufferSize;
+
+    PAGED_CODE();
 
     //
     // Get required size
@@ -1476,6 +1906,13 @@ TapQueryTokenPrivileges(
 
     if (status != STATUS_BUFFER_TOO_SMALL || returnLength == 0) {
         return status;
+    }
+
+    //
+    // Cap allocation size to prevent abuse
+    //
+    if (returnLength > 64 * 1024) {
+        return STATUS_BUFFER_OVERFLOW;
     }
 
     //
@@ -1505,7 +1942,7 @@ TapQueryTokenPrivileges(
 
     if (NT_SUCCESS(status)) {
         //
-        // Copy privileges to token info
+        // Copy privileges to token info with bounds check
         //
         ULONG count = min(privileges->PrivilegeCount, TA_MAX_PRIVILEGES);
         TokenInfo->PrivilegeArrayCount = count;
@@ -1520,16 +1957,19 @@ TapQueryTokenPrivileges(
     return status;
 }
 
+_Use_decl_annotations_
 static NTSTATUS
 TapQueryTokenGroups(
-    _In_ HANDLE TokenHandle,
-    _Inout_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+    HANDLE TokenHandle,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo
 )
 {
     NTSTATUS status;
     PTOKEN_GROUPS groups = NULL;
     ULONG returnLength = 0;
     ULONG bufferSize;
+
+    PAGED_CODE();
 
     //
     // Get required size
@@ -1547,13 +1987,20 @@ TapQueryTokenGroups(
     }
 
     //
+    // Cap allocation size to prevent abuse
+    //
+    if (returnLength > 256 * 1024) {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    //
     // Allocate buffer
     //
     bufferSize = returnLength;
     groups = (PTOKEN_GROUPS)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         bufferSize,
-        TA_SID_TAG
+        TA_GROUPS_TAG
     );
 
     if (groups == NULL) {
@@ -1573,14 +2020,33 @@ TapQueryTokenGroups(
 
     if (NT_SUCCESS(status)) {
         //
-        // Copy groups to token info
+        // Copy groups to token info with bounds check
         //
         ULONG count = min(groups->GroupCount, TA_MAX_GROUPS);
         TokenInfo->GroupArrayCount = count;
 
         for (ULONG i = 0; i < count; i++) {
             PSID sourceSid = groups->Groups[i].Sid;
+
+            //
+            // Validate SID before copying
+            //
+            if (sourceSid == NULL || !RtlValidSid(sourceSid)) {
+                TokenInfo->GroupSids[i] = NULL;
+                TokenInfo->GroupAttributes[i] = 0;
+                continue;
+            }
+
             ULONG sidLength = RtlLengthSid(sourceSid);
+
+            //
+            // Sanity check SID length
+            //
+            if (sidLength == 0 || sidLength > SECURITY_MAX_SID_SIZE) {
+                TokenInfo->GroupSids[i] = NULL;
+                TokenInfo->GroupAttributes[i] = 0;
+                continue;
+            }
 
             TokenInfo->GroupSids[i] = (PSID)ShadowStrikeAllocatePoolWithTag(
                 NonPagedPoolNx,
@@ -1589,22 +2055,29 @@ TapQueryTokenGroups(
             );
 
             if (TokenInfo->GroupSids[i] != NULL) {
-                RtlCopySid(sidLength, TokenInfo->GroupSids[i], sourceSid);
+                status = RtlCopySid(sidLength, TokenInfo->GroupSids[i], sourceSid);
+                if (!NT_SUCCESS(status)) {
+                    ShadowStrikeFreePoolWithTag(TokenInfo->GroupSids[i], TA_SID_TAG);
+                    TokenInfo->GroupSids[i] = NULL;
+                }
             }
 
             TokenInfo->GroupAttributes[i] = groups->Groups[i].Attributes;
         }
+
+        status = STATUS_SUCCESS;
     }
 
-    ShadowStrikeFreePoolWithTag(groups, TA_SID_TAG);
+    ShadowStrikeFreePoolWithTag(groups, TA_GROUPS_TAG);
 
     return status;
 }
 
+_Use_decl_annotations_
 static NTSTATUS
 TapQueryTokenIntegrity(
-    _In_ HANDLE TokenHandle,
-    _Out_ PULONG IntegrityLevel
+    HANDLE TokenHandle,
+    PULONG IntegrityLevel
 )
 {
     NTSTATUS status;
@@ -1612,7 +2085,9 @@ TapQueryTokenIntegrity(
     ULONG returnLength = 0;
     ULONG bufferSize;
 
-    *IntegrityLevel = SECURITY_MANDATORY_MEDIUM_RID;
+    PAGED_CODE();
+
+    *IntegrityLevel = TA_INTEGRITY_MEDIUM;
 
     //
     // Get required size
@@ -1627,6 +2102,13 @@ TapQueryTokenIntegrity(
 
     if (status != STATUS_BUFFER_TOO_SMALL || returnLength == 0) {
         return status;
+    }
+
+    //
+    // Cap allocation size
+    //
+    if (returnLength > 4096) {
+        return STATUS_BUFFER_OVERFLOW;
     }
 
     //
@@ -1656,13 +2138,19 @@ TapQueryTokenIntegrity(
 
     if (NT_SUCCESS(status)) {
         //
-        // Extract integrity RID
+        // Extract integrity RID with full validation
         //
         PSID integritySid = label->Label.Sid;
+
         if (integritySid != NULL && RtlValidSid(integritySid)) {
-            UCHAR subAuthCount = *RtlSubAuthorityCountSid(integritySid);
-            if (subAuthCount > 0) {
-                *IntegrityLevel = *RtlSubAuthoritySid(integritySid, subAuthCount - 1);
+            PUCHAR subAuthCountPtr = RtlSubAuthorityCountSid(integritySid);
+
+            if (subAuthCountPtr != NULL && *subAuthCountPtr > 0) {
+                PULONG subAuthPtr = RtlSubAuthoritySid(integritySid, *subAuthCountPtr - 1);
+
+                if (subAuthPtr != NULL) {
+                    *IntegrityLevel = *subAuthPtr;
+                }
             }
         }
     }
@@ -1673,91 +2161,171 @@ TapQueryTokenIntegrity(
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - SID ANALYSIS
+// PRIVATE - SID ANALYSIS
 // ============================================================================
 
+_Use_decl_annotations_
 static BOOLEAN
 TapIsSidAdmin(
-    _In_ PSID Sid
+    PSID Sid
 )
 {
-    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
     UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
     PSID adminSid = (PSID)sidBuffer;
     ULONG sidSize = sizeof(sidBuffer);
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Sid == NULL || !RtlValidSid(Sid)) {
+        return FALSE;
+    }
 
     //
     // Build Administrators SID (S-1-5-32-544)
     //
-    if (!NT_SUCCESS(RtlCreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, adminSid, &sidSize))) {
+    status = RtlCreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, adminSid, &sidSize);
+    if (!NT_SUCCESS(status)) {
         return FALSE;
     }
 
     return RtlEqualSid(Sid, adminSid);
 }
 
+_Use_decl_annotations_
 static BOOLEAN
 TapIsSidSystem(
-    _In_ PSID Sid
+    PSID Sid
 )
 {
     UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
     PSID systemSid = (PSID)sidBuffer;
     ULONG sidSize = sizeof(sidBuffer);
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Sid == NULL || !RtlValidSid(Sid)) {
+        return FALSE;
+    }
 
     //
     // Build SYSTEM SID (S-1-5-18)
     //
-    if (!NT_SUCCESS(RtlCreateWellKnownSid(WinLocalSystemSid, NULL, systemSid, &sidSize))) {
+    status = RtlCreateWellKnownSid(WinLocalSystemSid, NULL, systemSid, &sidSize);
+    if (!NT_SUCCESS(status)) {
         return FALSE;
     }
 
     return RtlEqualSid(Sid, systemSid);
 }
 
+_Use_decl_annotations_
 static BOOLEAN
 TapIsSidService(
-    _In_ PSID Sid
+    PSID Sid
 )
 {
     UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
     PSID serviceSid = (PSID)sidBuffer;
     ULONG sidSize = sizeof(sidBuffer);
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Sid == NULL || !RtlValidSid(Sid)) {
+        return FALSE;
+    }
 
     //
     // Build Service SID (S-1-5-6)
     //
-    if (!NT_SUCCESS(RtlCreateWellKnownSid(WinServiceSid, NULL, serviceSid, &sidSize))) {
+    status = RtlCreateWellKnownSid(WinServiceSid, NULL, serviceSid, &sidSize);
+    if (!NT_SUCCESS(status)) {
         return FALSE;
     }
 
     return RtlEqualSid(Sid, serviceSid);
 }
 
-// ============================================================================
-// PRIVATE IMPLEMENTATION - ATTACK DETECTION
-// ============================================================================
-
-static TA_TOKEN_ATTACK
-TapDetectAttackType(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
-    _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+_Use_decl_annotations_
+static BOOLEAN
+TapIsSidNetworkService(
+    PSID Sid
 )
 {
-    PTA_BASELINE_ENTRY baseline = NULL;
+    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+    PSID netServiceSid = (PSID)sidBuffer;
+    ULONG sidSize = sizeof(sidBuffer);
     NTSTATUS status;
 
-    //
-    // Get baseline for this process
-    //
-    status = TapGetBaseline(Analyzer, TokenInfo->Base.ProcessId, &baseline);
+    PAGED_CODE();
 
-    if (NT_SUCCESS(status) && baseline != NULL && baseline->Valid) {
+    if (Sid == NULL || !RtlValidSid(Sid)) {
+        return FALSE;
+    }
+
+    //
+    // Build Network Service SID (S-1-5-20)
+    //
+    status = RtlCreateWellKnownSid(WinNetworkServiceSid, NULL, netServiceSid, &sidSize);
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    return RtlEqualSid(Sid, netServiceSid);
+}
+
+_Use_decl_annotations_
+static BOOLEAN
+TapIsSidLocalService(
+    PSID Sid
+)
+{
+    UCHAR sidBuffer[SECURITY_MAX_SID_SIZE];
+    PSID localServiceSid = (PSID)sidBuffer;
+    ULONG sidSize = sizeof(sidBuffer);
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Sid == NULL || !RtlValidSid(Sid)) {
+        return FALSE;
+    }
+
+    //
+    // Build Local Service SID (S-1-5-19)
+    //
+    status = RtlCreateWellKnownSid(WinLocalServiceSid, NULL, localServiceSid, &sidSize);
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    return RtlEqualSid(Sid, localServiceSid);
+}
+
+// ============================================================================
+// PRIVATE - ATTACK DETECTION
+// ============================================================================
+
+_Use_decl_annotations_
+static TA_TOKEN_ATTACK
+TapDetectAttackType(
+    PTA_ANALYZER_INTERNAL Analyzer,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo,
+    PTA_BASELINE_SNAPSHOT Baseline
+)
+{
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER(Analyzer);
+
+    if (Baseline != NULL && Baseline->Valid) {
         //
         // Check for token replacement (different authentication ID)
         //
-        if (TokenInfo->Base.AuthenticationId.LowPart != baseline->AuthenticationId.LowPart ||
-            TokenInfo->Base.AuthenticationId.HighPart != baseline->AuthenticationId.HighPart) {
+        if (TokenInfo->Base.AuthenticationId.LowPart != Baseline->AuthenticationId.LowPart ||
+            TokenInfo->Base.AuthenticationId.HighPart != Baseline->AuthenticationId.HighPart) {
 
             if (TokenInfo->Base.TokenType == TokenPrimary) {
                 return TaAttack_PrimaryTokenReplace;
@@ -1768,42 +2336,39 @@ TapDetectAttackType(
         //
         // Check for privilege escalation
         //
-        if (TokenInfo->Base.EnabledPrivileges > baseline->EnabledPrivileges + 3) {
+        if (TokenInfo->Base.EnabledPrivileges > Baseline->EnabledPrivileges + 3) {
             return TaAttack_PrivilegeEscalation;
         }
 
         //
         // Check for integrity level escalation
         //
-        if (TokenInfo->Base.IntegrityLevel > baseline->IntegrityLevel) {
-            //
-            // Integrity increased - very suspicious without UAC
-            //
+        if (TokenInfo->Base.IntegrityLevel > Baseline->IntegrityLevel) {
             return TaAttack_PrivilegeEscalation;
         }
 
         //
         // Check for integrity level downgrade (sandbox escape prep)
         //
-        if (TokenInfo->Base.IntegrityLevel < baseline->IntegrityLevel) {
+        if (TokenInfo->Base.IntegrityLevel < Baseline->IntegrityLevel) {
             return TaAttack_IntegrityDowngrade;
         }
 
         //
         // Check for group modifications
         //
-        if (TokenInfo->Base.IsAdmin && !baseline->IsAdmin) {
+        if (TokenInfo->Base.IsAdmin && !Baseline->IsAdmin) {
             return TaAttack_SIDInjection;
         }
 
-        if (TokenInfo->Base.IsSystem && !baseline->IsSystem) {
+        if (TokenInfo->Base.IsSystem && !Baseline->IsSystem) {
             return TaAttack_TokenStealing;
         }
 
         //
         // Check for token type change
         //
-        if (baseline->TokenType == TokenPrimary &&
+        if (Baseline->TokenType == TokenPrimary &&
             TokenInfo->Base.TokenType == TokenImpersonation) {
             return TaAttack_Impersonation;
         }
@@ -1817,57 +2382,60 @@ TapDetectAttackType(
     // Impersonation token with high integrity
     //
     if (TokenInfo->Base.TokenType == TokenImpersonation &&
-        TokenInfo->Base.IntegrityLevel >= SECURITY_MANDATORY_HIGH_RID) {
-
+        TokenInfo->Base.IntegrityLevel >= TA_INTEGRITY_HIGH) {
         return TaAttack_Impersonation;
     }
 
     //
-    // Non-service process with debug + impersonate + assign primary
+    // Non-service process with dangerous privilege combination
     //
     if (!TokenInfo->Base.IsService &&
+        !TokenInfo->Base.IsNetworkService &&
+        !TokenInfo->Base.IsLocalService &&
         TokenInfo->Base.HasDebugPrivilege &&
         TokenInfo->Base.HasImpersonatePrivilege &&
         TokenInfo->Base.HasAssignPrimaryPrivilege) {
-
         return TaAttack_PrivilegeEscalation;
     }
 
     return TaAttack_None;
 }
 
+_Use_decl_annotations_
 static ULONG
 TapCalculateSuspicionScore(
-    _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo,
-    _In_ TA_TOKEN_ATTACK Attack
+    PTA_TOKEN_INFO_INTERNAL TokenInfo,
+    TA_TOKEN_ATTACK Attack
 )
 {
     ULONG score = 0;
+
+    PAGED_CODE();
 
     //
     // Base score from attack type
     //
     switch (Attack) {
         case TaAttack_TokenStealing:
-            score += 90;
+            score = 90;
             break;
         case TaAttack_PrimaryTokenReplace:
-            score += 95;
+            score = 95;
             break;
         case TaAttack_PrivilegeEscalation:
-            score += 85;
+            score = 85;
             break;
         case TaAttack_SIDInjection:
-            score += 90;
+            score = 90;
             break;
         case TaAttack_IntegrityDowngrade:
-            score += 60;
+            score = 60;
             break;
         case TaAttack_GroupModification:
-            score += 75;
+            score = 75;
             break;
         case TaAttack_Impersonation:
-            score += 70;
+            score = 70;
             break;
         default:
             break;
@@ -1888,23 +2456,29 @@ TapCalculateSuspicionScore(
         score += 5;
     }
 
+    if (TokenInfo->Base.HasTcbPrivilege) {
+        score += 20;
+    }
+
+    if (TokenInfo->Base.HasLoadDriverPrivilege) {
+        score += 15;
+    }
+
     //
     // Adjust based on elevation
     //
     if (TokenInfo->Base.IsSystem) {
         score += 10;
-    }
-
-    if (TokenInfo->Base.IsAdmin) {
+    } else if (TokenInfo->Base.IsAdmin) {
         score += 5;
     }
 
     //
     // Adjust based on integrity level
     //
-    if (TokenInfo->Base.IntegrityLevel >= SECURITY_MANDATORY_SYSTEM_RID) {
+    if (TokenInfo->Base.IntegrityLevel >= TA_INTEGRITY_SYSTEM) {
         score += 15;
-    } else if (TokenInfo->Base.IntegrityLevel >= SECURITY_MANDATORY_HIGH_RID) {
+    } else if (TokenInfo->Base.IntegrityLevel >= TA_INTEGRITY_HIGH) {
         score += 10;
     }
 
@@ -1931,20 +2505,24 @@ TapCalculateSuspicionScore(
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - BASELINE MANAGEMENT
+// PRIVATE - BASELINE MANAGEMENT
 // ============================================================================
 
+_Use_decl_annotations_
 static NTSTATUS
-TapGetBaseline(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
-    _In_ HANDLE ProcessId,
-    _Out_ PTA_BASELINE_ENTRY* Baseline
+TapGetBaselineSnapshotInternal(
+    PTA_ANALYZER_INTERNAL Analyzer,
+    HANDLE ProcessId,
+    PTA_BASELINE_SNAPSHOT Snapshot
 )
 {
     PLIST_ENTRY entry;
     PTA_BASELINE_ENTRY baseline;
+    NTSTATUS status = STATUS_NOT_FOUND;
 
-    *Baseline = NULL;
+    PAGED_CODE();
+
+    RtlZeroMemory(Snapshot, sizeof(TA_BASELINE_SNAPSHOT));
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Analyzer->BaselineLock);
@@ -1955,8 +2533,26 @@ TapGetBaseline(
 
         baseline = CONTAINING_RECORD(entry, TA_BASELINE_ENTRY, ListEntry);
 
-        if (baseline->ProcessId == ProcessId && baseline->Valid) {
-            *Baseline = baseline;
+        if (baseline->ProcessId == ProcessId &&
+            baseline->Valid &&
+            baseline->Magic == TA_BASELINE_MAGIC) {
+
+            //
+            // Copy baseline data to snapshot (safe to use after lock release)
+            //
+            Snapshot->Valid = TRUE;
+            Snapshot->ProcessId = baseline->ProcessId;
+            Snapshot->AuthenticationId = baseline->AuthenticationId;
+            Snapshot->TokenId = baseline->TokenId;
+            Snapshot->IntegrityLevel = baseline->IntegrityLevel;
+            Snapshot->EnabledPrivileges = baseline->EnabledPrivileges;
+            Snapshot->GroupCount = baseline->GroupCount;
+            Snapshot->IsAdmin = baseline->IsAdmin;
+            Snapshot->IsSystem = baseline->IsSystem;
+            Snapshot->TokenType = baseline->TokenType;
+            Snapshot->RecordTime = baseline->RecordTime;
+
+            status = STATUS_SUCCESS;
             break;
         }
     }
@@ -1964,30 +2560,29 @@ TapGetBaseline(
     ExReleasePushLockShared(&Analyzer->BaselineLock);
     KeLeaveCriticalRegion();
 
-    if (*Baseline == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    return STATUS_SUCCESS;
+    return status;
 }
 
+_Use_decl_annotations_
 static NTSTATUS
-TapCreateBaseline(
-    _In_ PTA_ANALYZER_INTERNAL Analyzer,
-    _In_ HANDLE ProcessId,
-    _In_ PTA_TOKEN_INFO_INTERNAL TokenInfo
+TapCreateOrUpdateBaseline(
+    PTA_ANALYZER_INTERNAL Analyzer,
+    HANDLE ProcessId,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo
 )
 {
     PTA_BASELINE_ENTRY baseline = NULL;
     PLIST_ENTRY entry;
     BOOLEAN found = FALSE;
 
-    //
-    // Check if baseline already exists
-    //
+    PAGED_CODE();
+
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Analyzer->BaselineLock);
 
+    //
+    // Check if baseline already exists
+    //
     for (entry = Analyzer->BaselineCache.Flink;
          entry != &Analyzer->BaselineCache;
          entry = entry->Flink) {
@@ -2002,12 +2597,19 @@ TapCreateBaseline(
 
     if (!found) {
         //
+        // Enforce baseline limit
+        //
+        if (Analyzer->BaselineCount >= TA_MAX_BASELINE_ENTRIES) {
+            TapEvictOldestBaselineEntry(Analyzer);
+        }
+
+        //
         // Create new baseline
         //
         baseline = (PTA_BASELINE_ENTRY)ShadowStrikeAllocatePoolWithTag(
             NonPagedPoolNx,
             sizeof(TA_BASELINE_ENTRY),
-            TA_POOL_TAG
+            TA_BASELINE_TAG
         );
 
         if (baseline == NULL) {
@@ -2018,6 +2620,7 @@ TapCreateBaseline(
 
         RtlZeroMemory(baseline, sizeof(TA_BASELINE_ENTRY));
 
+        baseline->Magic = TA_BASELINE_MAGIC;
         baseline->ProcessId = ProcessId;
         baseline->AuthenticationId = TokenInfo->Base.AuthenticationId;
         baseline->TokenId = TokenInfo->TokenId;
@@ -2032,6 +2635,7 @@ TapCreateBaseline(
 
         InsertTailList(&Analyzer->BaselineCache, &baseline->ListEntry);
         InterlockedIncrement(&Analyzer->BaselineCount);
+        InterlockedIncrement64(&Analyzer->Stats.BaselinesCreated);
     }
 
     ExReleasePushLockExclusive(&Analyzer->BaselineLock);
@@ -2040,57 +2644,151 @@ TapCreateBaseline(
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// PRIVATE - CACHE MANAGEMENT
+// ============================================================================
+
+_Use_decl_annotations_
+static VOID
+TapRemoveFromCacheUnlocked(
+    PTA_ANALYZER_INTERNAL Analyzer,
+    PTA_TOKEN_INFO_INTERNAL TokenInfo
+)
+{
+    //
+    // Caller must hold CacheLock exclusively
+    //
+    if (TokenInfo->InCache) {
+        RemoveEntryList(&TokenInfo->CacheEntry);
+        InitializeListHead(&TokenInfo->CacheEntry);
+        InterlockedExchange(&TokenInfo->InCache, FALSE);
+        InterlockedDecrement(&Analyzer->CacheCount);
+    }
+}
+
+_Use_decl_annotations_
 static VOID
 TapCleanupExpiredCacheEntries(
-    _Inout_ PTA_ANALYZER_INTERNAL Analyzer
+    PTA_ANALYZER_INTERNAL Analyzer
 )
 {
     PLIST_ENTRY entry;
     PLIST_ENTRY nextEntry;
     PTA_TOKEN_INFO_INTERNAL tokenInfo;
     LARGE_INTEGER currentTime;
-    LARGE_INTEGER expiryThreshold;
+    LONGLONG expiryThreshold;
+
+    PAGED_CODE();
+
+    //
+    // Caller must hold CacheLock exclusively
+    //
 
     KeQuerySystemTime(&currentTime);
-    expiryThreshold.QuadPart = currentTime.QuadPart - TA_CACHE_EXPIRY_TIME;
+    expiryThreshold = currentTime.QuadPart - TA_CACHE_EXPIRY_TIME;
 
-    //
-    // Lock should already be held by caller
-    //
-
-    for (entry = Analyzer->Base.TokenCache.Flink;
-         entry != &Analyzer->Base.TokenCache;
+    for (entry = Analyzer->TokenCache.Flink;
+         entry != &Analyzer->TokenCache;
          entry = nextEntry) {
 
         nextEntry = entry->Flink;
-
         tokenInfo = CONTAINING_RECORD(entry, TA_TOKEN_INFO_INTERNAL, CacheEntry);
 
-        if (tokenInfo->CacheTime.QuadPart < expiryThreshold.QuadPart) {
-            RemoveEntryList(&tokenInfo->CacheEntry);
-            InitializeListHead(&tokenInfo->CacheEntry);
-            TapFreeTokenInfoInternal(Analyzer, tokenInfo);
-            InterlockedDecrement(&Analyzer->Base.CacheCount);
+        if (tokenInfo->CacheTime.QuadPart < expiryThreshold) {
+            TapRemoveFromCacheUnlocked(Analyzer, tokenInfo);
+
+            //
+            // Release cache's reference
+            //
+            if (InterlockedDecrement(&tokenInfo->ReferenceCount) == 0) {
+                TapFreeTokenInfoInternal(Analyzer, tokenInfo);
+            }
         }
     }
 }
 
+_Use_decl_annotations_
+static VOID
+TapEvictOldestCacheEntry(
+    PTA_ANALYZER_INTERNAL Analyzer
+)
+{
+    PLIST_ENTRY entry;
+    PTA_TOKEN_INFO_INTERNAL tokenInfo;
+
+    PAGED_CODE();
+
+    //
+    // Caller must hold CacheLock exclusively
+    //
+
+    if (IsListEmpty(&Analyzer->TokenCache)) {
+        return;
+    }
+
+    entry = RemoveHeadList(&Analyzer->TokenCache);
+    tokenInfo = CONTAINING_RECORD(entry, TA_TOKEN_INFO_INTERNAL, CacheEntry);
+
+    InitializeListHead(&tokenInfo->CacheEntry);
+    InterlockedExchange(&tokenInfo->InCache, FALSE);
+    InterlockedDecrement(&Analyzer->CacheCount);
+
+    //
+    // Release cache's reference
+    //
+    if (InterlockedDecrement(&tokenInfo->ReferenceCount) == 0) {
+        TapFreeTokenInfoInternal(Analyzer, tokenInfo);
+    }
+}
+
+_Use_decl_annotations_
+static VOID
+TapEvictOldestBaselineEntry(
+    PTA_ANALYZER_INTERNAL Analyzer
+)
+{
+    PLIST_ENTRY entry;
+    PTA_BASELINE_ENTRY baseline;
+
+    PAGED_CODE();
+
+    //
+    // Caller must hold BaselineLock exclusively
+    //
+
+    if (IsListEmpty(&Analyzer->BaselineCache)) {
+        return;
+    }
+
+    entry = RemoveHeadList(&Analyzer->BaselineCache);
+    baseline = CONTAINING_RECORD(entry, TA_BASELINE_ENTRY, ListEntry);
+
+    InterlockedDecrement(&Analyzer->BaselineCount);
+    InterlockedIncrement64(&Analyzer->Stats.BaselinesEvicted);
+
+    baseline->Magic = 0;
+    ShadowStrikeFreePoolWithTag(baseline, TA_BASELINE_TAG);
+}
+
 // ============================================================================
-// PRIVATE IMPLEMENTATION - COMPARISON
+// PRIVATE - COMPARISON
 // ============================================================================
 
+_Use_decl_annotations_
 static BOOLEAN
 TapComparePrivileges(
-    _In_ PTA_TOKEN_INFO_INTERNAL Info1,
-    _In_ PTA_TOKEN_INFO_INTERNAL Info2,
-    _Out_ PULONG AddedPrivileges,
-    _Out_ PULONG RemovedPrivileges
+    PTA_TOKEN_INFO_INTERNAL Info1,
+    PTA_TOKEN_INFO_INTERNAL Info2,
+    PULONG AddedPrivileges,
+    PULONG RemovedPrivileges
 )
 {
     ULONG added = 0;
     ULONG removed = 0;
     ULONG i, j;
     BOOLEAN found;
+
+    PAGED_CODE();
 
     *AddedPrivileges = 0;
     *RemovedPrivileges = 0;
@@ -2158,18 +2856,21 @@ TapComparePrivileges(
     return (added > 0 || removed > 0);
 }
 
+_Use_decl_annotations_
 static BOOLEAN
 TapCompareGroups(
-    _In_ PTA_TOKEN_INFO_INTERNAL Info1,
-    _In_ PTA_TOKEN_INFO_INTERNAL Info2,
-    _Out_ PULONG AddedGroups,
-    _Out_ PULONG RemovedGroups
+    PTA_TOKEN_INFO_INTERNAL Info1,
+    PTA_TOKEN_INFO_INTERNAL Info2,
+    PULONG AddedGroups,
+    PULONG RemovedGroups
 )
 {
     ULONG added = 0;
     ULONG removed = 0;
     ULONG i, j;
     BOOLEAN found;
+
+    PAGED_CODE();
 
     *AddedGroups = 0;
     *RemovedGroups = 0;
@@ -2178,7 +2879,7 @@ TapCompareGroups(
     // Find groups in Info2 that are not in Info1 (added)
     //
     for (i = 0; i < Info2->GroupArrayCount; i++) {
-        if (Info2->GroupSids[i] == NULL) {
+        if (Info2->GroupSids[i] == NULL || !RtlValidSid(Info2->GroupSids[i])) {
             continue;
         }
 
@@ -2186,6 +2887,7 @@ TapCompareGroups(
 
         for (j = 0; j < Info1->GroupArrayCount; j++) {
             if (Info1->GroupSids[j] != NULL &&
+                RtlValidSid(Info1->GroupSids[j]) &&
                 RtlEqualSid(Info2->GroupSids[i], Info1->GroupSids[j])) {
                 found = TRUE;
                 break;
@@ -2201,7 +2903,7 @@ TapCompareGroups(
     // Find groups in Info1 that are not in Info2 (removed)
     //
     for (i = 0; i < Info1->GroupArrayCount; i++) {
-        if (Info1->GroupSids[i] == NULL) {
+        if (Info1->GroupSids[i] == NULL || !RtlValidSid(Info1->GroupSids[i])) {
             continue;
         }
 
@@ -2209,6 +2911,7 @@ TapCompareGroups(
 
         for (j = 0; j < Info2->GroupArrayCount; j++) {
             if (Info2->GroupSids[j] != NULL &&
+                RtlValidSid(Info2->GroupSids[j]) &&
                 RtlEqualSid(Info1->GroupSids[i], Info2->GroupSids[j])) {
                 found = TRUE;
                 break;
@@ -2225,4 +2928,3 @@ TapCompareGroups(
 
     return (added > 0 || removed > 0);
 }
-

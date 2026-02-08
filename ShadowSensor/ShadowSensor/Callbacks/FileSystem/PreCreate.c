@@ -121,18 +121,25 @@ typedef struct _PC_EXTENSION_ENTRY {
 //
 typedef struct _PC_GLOBAL_STATE {
     //
-    // Initialization
+    // Initialization state
     //
     BOOLEAN Initialized;
 
     //
-    // Configuration
+    // Rundown protection for safe shutdown
+    // Ensures all in-flight operations complete before resource deletion
+    //
+    EX_RUNDOWN_REF RundownRef;
+    BOOLEAN RundownInitialized;
+
+    //
+    // Configuration (protected by push lock)
     //
     PC_CONFIG Config;
     EX_PUSH_LOCK ConfigLock;
 
     //
-    // Honeypot patterns
+    // Honeypot patterns (protected by push lock)
     //
     PC_HONEYPOT_CONFIG Honeypot;
     EX_PUSH_LOCK HoneypotLock;
@@ -144,10 +151,11 @@ typedef struct _PC_GLOBAL_STATE {
     BOOLEAN LookasideInitialized;
 
     //
-    // Rate limiting for logging
+    // Rate limiting for logging (protected by spinlock for atomicity)
     //
-    volatile LONG CurrentSecondLogs;
-    LARGE_INTEGER CurrentSecondStart;
+    KSPIN_LOCK LogRateLock;
+    LONG CurrentSecondLogs;
+    LONG64 CurrentSecondTicks;
 
     //
     // Operation counter
@@ -155,14 +163,15 @@ typedef struct _PC_GLOBAL_STATE {
     volatile LONG64 OperationCounter;
 
     //
-    // Statistics
+    // Statistics (protected by spinlock for atomic snapshot)
     //
     PC_STATISTICS Stats;
+    KSPIN_LOCK StatsLock;
 
     //
-    // Shutdown flag
+    // Shutdown flag (volatile for visibility across CPUs)
     //
-    volatile BOOLEAN ShutdownRequested;
+    volatile LONG ShutdownRequested;
 
 } PC_GLOBAL_STATE, *PPC_GLOBAL_STATE;
 
@@ -438,6 +447,14 @@ Return Value:
     //
     ExInitializePushLock(&g_PcState.ConfigLock);
     ExInitializePushLock(&g_PcState.HoneypotLock);
+    KeInitializeSpinLock(&g_PcState.LogRateLock);
+    KeInitializeSpinLock(&g_PcState.StatsLock);
+
+    //
+    // Initialize rundown protection for safe shutdown
+    //
+    ExInitializeRundownProtection(&g_PcState.RundownRef);
+    g_PcState.RundownInitialized = TRUE;
 
     //
     // Initialize default configuration
@@ -463,8 +480,20 @@ Return Value:
     // Initialize statistics
     //
     KeQuerySystemTime(&g_PcState.Stats.StartTime);
-    KeQuerySystemTime(&g_PcState.CurrentSecondStart);
 
+    //
+    // Initialize rate limiter using KeQueryTickCount for atomic 64-bit access
+    //
+    {
+        LARGE_INTEGER TickCount;
+        KeQueryTickCount(&TickCount);
+        InterlockedExchange64(&g_PcState.CurrentSecondTicks, TickCount.QuadPart);
+    }
+
+    //
+    // Mark as initialized (memory barrier implicit in Interlocked)
+    //
+    InterlockedExchange(&g_PcState.ShutdownRequested, FALSE);
     g_PcState.Initialized = TRUE;
 
     DbgPrintEx(
@@ -485,6 +514,9 @@ PcShutdown(
 /*++
 Routine Description:
     Shuts down the PreCreate callback subsystem.
+
+    CRITICAL: Uses rundown protection to ensure all in-flight operations
+    complete before deleting resources. This prevents use-after-free.
 --*/
 {
     PAGED_CODE();
@@ -493,8 +525,23 @@ Routine Description:
         return;
     }
 
-    g_PcState.ShutdownRequested = TRUE;
+    //
+    // Signal shutdown - use interlocked for memory barrier
+    //
+    InterlockedExchange(&g_PcState.ShutdownRequested, TRUE);
     g_PcState.Initialized = FALSE;
+
+    //
+    // Wait for all in-flight operations to complete
+    // This blocks until all ExAcquireRundownProtection calls have matching releases
+    //
+    if (g_PcState.RundownInitialized) {
+        ExWaitForRundownProtectionRelease(&g_PcState.RundownRef);
+    }
+
+    //
+    // Now safe to delete resources - no operations in flight
+    //
 
     //
     // Clear honeypot patterns
@@ -506,6 +553,7 @@ Routine Description:
     //
     if (g_PcState.LookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_PcState.ContextLookaside);
+        g_PcState.LookasideInitialized = FALSE;
     }
 
     DbgPrintEx(
@@ -527,6 +575,8 @@ PcpInitializeDefaultConfig(
     VOID
     )
 {
+    PAGED_CODE();
+
     g_PcState.Config.EnableOnAccessScan = TRUE;
     g_PcState.Config.EnableNetworkScan = FALSE;  // Off by default (performance)
     g_PcState.Config.EnableRemovableScan = TRUE;
@@ -561,6 +611,8 @@ PcpInitializeDefaultConfig(
 // MAIN CALLBACK IMPLEMENTATION
 // ============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_same_
 FLT_PREOP_CALLBACK_STATUS
 ShadowStrikePreCreate(
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -585,7 +637,6 @@ Return Value:
 {
     NTSTATUS Status = STATUS_SUCCESS;
     PFLT_FILE_NAME_INFORMATION NameInfo = NULL;
-    PPC_OPERATION_CONTEXT OpContext = NULL;
     HANDLE RequestorPid = NULL;
     PC_ACCESS_TYPE AccessType;
     PC_SUSPICIOUS_FLAGS SuspiciousFlags = PcSuspiciousNone;
@@ -596,6 +647,8 @@ Return Value:
     BOOLEAN IsHoneypot = FALSE;
     BOOLEAN IsCorrelatedRansomware = FALSE;
     BOOLEAN ShouldBlock = FALSE;
+    BOOLEAN CacheKeyValid = FALSE;
+    BOOLEAN RundownAcquired = FALSE;
     SHADOWSTRIKE_CACHE_KEY CacheKey;
     SHADOWSTRIKE_CACHE_RESULT CacheResult;
     PSHADOWSTRIKE_MESSAGE_HEADER RequestMsg = NULL;
@@ -606,48 +659,90 @@ Return Value:
     UNREFERENCED_PARAMETER(CompletionContext);
 
     //
-    // Always increment total operations
+    // Zero-initialize CacheKey to prevent use of uninitialized data
+    //
+    RtlZeroMemory(&CacheKey, sizeof(CacheKey));
+
+    //
+    // Always increment total operations (safe even during shutdown)
     //
     InterlockedIncrement64(&g_PcState.Stats.TotalOperations);
+
+    // ========================================================================
+    // PHASE 0: CRITICAL PARAMETER VALIDATION
+    // ========================================================================
+
+    //
+    // Validate all required parameters to prevent NULL dereference
+    //
+    if (Data == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (Data->Iopb == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (FltObjects == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    // CRITICAL: Validate SecurityContext before any access
+    // This prevents NULL pointer dereference on malformed IRP
+    //
+    if (Data->Iopb->Parameters.Create.SecurityContext == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     // ========================================================================
     // PHASE 1: FAST-FAIL CHECKS
     // ========================================================================
 
     //
-    // Check if subsystem is ready
+    // Check if subsystem is ready (use interlocked read for visibility)
     //
     if (!g_PcState.Initialized ||
-        g_PcState.ShutdownRequested ||
+        InterlockedCompareExchange(&g_PcState.ShutdownRequested, 0, 0) ||
         !SHADOWSTRIKE_IS_READY() ||
         !g_DriverData.Config.RealTimeScanEnabled) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     //
+    // Acquire rundown protection - prevents shutdown while we're active
+    // CRITICAL: Must be acquired before any resource access
+    //
+    if (!g_PcState.RundownInitialized ||
+        !ExAcquireRundownProtection(&g_PcState.RundownRef)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    RundownAcquired = TRUE;
+
+    //
     // Skip paging files
     //
     if (Data->Iopb->OperationFlags & SL_OPEN_PAGING_FILE) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        goto CleanupAllow;
     }
 
     //
     // Skip kernel mode requests (trust the OS)
     //
     if (Data->RequestorMode == KernelMode) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        goto CleanupAllow;
     }
 
     //
     // Skip volume opens (no file name usually, or DASD)
     //
     if (FltObjects->FileObject == NULL) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        goto CleanupAllow;
     }
 
     if (FltObjects->FileObject->FileName.Length == 0 &&
         FltObjects->FileObject->RelatedFileObject == NULL) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        goto CleanupAllow;
     }
 
     SHADOWSTRIKE_ENTER_OPERATION();
@@ -659,17 +754,17 @@ Return Value:
     RequestorPid = PsGetCurrentProcessId();
 
     //
-    // Skip System process (PID 4)
+    // Skip System process (PID 4) - use defined constant
     //
-    if (RequestorPid == (HANDLE)(ULONG_PTR)4) {
-        goto CleanupAllow;
+    if (RequestorPid == PC_SYSTEM_PROCESS_ID) {
+        goto CleanupAllowLeave;
     }
 
     //
     // Skip our own protected processes (prevent deadlock/loops)
     //
     if (ShadowStrikeIsProcessProtected(RequestorPid, NULL)) {
-        goto CleanupAllow;
+        goto CleanupAllowLeave;
     }
 
     // ========================================================================
@@ -686,12 +781,12 @@ Return Value:
         //
         // Can't get name - fail open safely
         //
-        goto CleanupAllow;
+        goto CleanupAllowLeave;
     }
 
     Status = FltParseFileNameInformation(NameInfo);
     if (!NT_SUCCESS(Status)) {
-        goto CleanupAllow;
+        goto CleanupAllowLeave;
     }
 
     // ========================================================================
@@ -713,7 +808,7 @@ Return Value:
         if (ShadowStrikeIsPathExcluded(&NameInfo->Name, &NameInfo->Extension)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
-            goto CleanupAllow;
+            goto CleanupAllowLeave;
         }
 
         //
@@ -722,7 +817,7 @@ Return Value:
         if (ShadowStrikeIsProcessExcluded(RequestorPid, NULL)) {
             SHADOWSTRIKE_INC_STAT(ExclusionMatches);
             InterlockedIncrement64(&g_PcState.Stats.OperationsExcluded);
-            goto CleanupAllow;
+            goto CleanupAllowLeave;
         }
     }
 
@@ -754,6 +849,7 @@ Return Value:
 
         FltReleaseFileNameInformation(NameInfo);
         SHADOWSTRIKE_LEAVE_OPERATION();
+        ExReleaseRundownProtection(&g_PcState.RundownRef);
         return FLT_PREOP_COMPLETE;
     }
 
@@ -761,7 +857,7 @@ Return Value:
     // If directory, skip malware scanning (self-protect already checked)
     //
     if (IsDirectory) {
-        goto CleanupAllow;
+        goto CleanupAllowLeave;
     }
 
     // ========================================================================
@@ -954,9 +1050,12 @@ Return Value:
 
     if (SHADOWSTRIKE_USER_MODE_CONNECTED()) {
         //
-        // Build cache key
+        // Build cache key - track validity for later use
         //
-        if (NT_SUCCESS(ShadowStrikeCacheBuildKey(FltObjects, &CacheKey))) {
+        Status = ShadowStrikeCacheBuildKey(FltObjects, &CacheKey);
+        if (NT_SUCCESS(Status)) {
+            CacheKeyValid = TRUE;
+
             //
             // Check cache
             //
@@ -976,12 +1075,13 @@ Return Value:
 
                     FltReleaseFileNameInformation(NameInfo);
                     SHADOWSTRIKE_LEAVE_OPERATION();
+                    ExReleaseRundownProtection(&g_PcState.RundownRef);
                     return FLT_PREOP_COMPLETE;
                 } else {
                     //
                     // Cache hit: ALLOW
                     //
-                    goto CleanupAllow;
+                    goto CleanupAllowLeave;
                 }
             }
         }
@@ -1075,24 +1175,28 @@ Return Value:
                     ShouldBlock = TRUE;
 
                     //
-                    // Update cache
+                    // Update cache only if key was successfully built
                     //
-                    ShadowStrikeCacheInsert(
-                        &CacheKey,
-                        ShadowStrikeVerdictBlock,
-                        ReplyMsg.ThreatScore,
-                        ReplyMsg.CacheTTL
-                        );
+                    if (CacheKeyValid) {
+                        ShadowStrikeCacheInsert(
+                            &CacheKey,
+                            ShadowStrikeVerdictBlock,
+                            ReplyMsg.ThreatScore,
+                            ReplyMsg.CacheTTL
+                            );
+                    }
                 } else {
                     //
-                    // ALLOW - Update cache
+                    // ALLOW - Update cache only if key was successfully built
                     //
-                    ShadowStrikeCacheInsert(
-                        &CacheKey,
-                        ShadowStrikeVerdictSafe,
-                        0,
-                        ReplyMsg.CacheTTL
-                        );
+                    if (CacheKeyValid) {
+                        ShadowStrikeCacheInsert(
+                            &CacheKey,
+                            ShadowStrikeVerdictSafe,
+                            0,
+                            ReplyMsg.CacheTTL
+                            );
+                    }
                 }
             } else {
                 //
@@ -1133,6 +1237,7 @@ Return Value:
             }
 
             ShadowStrikeFreeMessageBuffer(RequestMsg);
+            RequestMsg = NULL;
         }
     }
 
@@ -1171,6 +1276,7 @@ Return Value:
 
         FltReleaseFileNameInformation(NameInfo);
         SHADOWSTRIKE_LEAVE_OPERATION();
+        ExReleaseRundownProtection(&g_PcState.RundownRef);
         return FLT_PREOP_COMPLETE;
     }
 
@@ -1191,12 +1297,16 @@ Return Value:
             );
     }
 
-CleanupAllow:
+CleanupAllowLeave:
     if (NameInfo != NULL) {
         FltReleaseFileNameInformation(NameInfo);
     }
-
     SHADOWSTRIKE_LEAVE_OPERATION();
+
+CleanupAllow:
+    if (RundownAcquired) {
+        ExReleaseRundownProtection(&g_PcState.RundownRef);
+    }
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -1399,18 +1509,20 @@ PcDetectDoubleExtension(
 /*++
 Routine Description:
     Detects if the file has a double/hidden extension (e.g., invoice.pdf.exe).
+    FIXED: Uses length-aware iteration instead of unsafe wcsrchr.
 --*/
 {
-    PWCHAR FileNameStart;
-    PWCHAR LastSlash;
-    PWCHAR FirstDot;
-    PWCHAR LastDot;
+    PWCHAR FileNameStart = NULL;
+    PWCHAR FirstDot = NULL;
+    PWCHAR LastDot = NULL;
     PWCHAR Current;
+    PWCHAR BufferEnd;
     ULONG DotCount = 0;
     WCHAR HiddenExt[32];
     ULONG HiddenExtLen = 0;
     ULONG i;
     BOOLEAN IsHiddenExecutable = FALSE;
+    USHORT CharCount;
 
     PAGED_CODE();
 
@@ -1428,23 +1540,28 @@ Routine Description:
         return STATUS_SUCCESS;
     }
 
+    CharCount = FileName->Length / sizeof(WCHAR);
+    BufferEnd = FileName->Buffer + CharCount;
+
     //
-    // Find the start of the filename (after last backslash)
+    // Find the start of the filename (after last backslash) using length-aware iteration
+    // CRITICAL: Do not use wcsrchr - UNICODE_STRING may not be null-terminated
     //
-    LastSlash = wcsrchr(FileName->Buffer, L'\\');
-    if (LastSlash != NULL) {
-        FileNameStart = LastSlash + 1;
-    } else {
-        FileNameStart = FileName->Buffer;
+    FileNameStart = FileName->Buffer;
+    for (Current = FileName->Buffer; Current < BufferEnd; Current++) {
+        if (*Current == L'\\') {
+            FileNameStart = Current + 1;
+        }
+    }
+
+    if (FileNameStart >= BufferEnd) {
+        return STATUS_SUCCESS;
     }
 
     //
-    // Count dots and find positions
+    // Count dots and find positions using length-aware iteration
     //
-    FirstDot = NULL;
-    LastDot = NULL;
-
-    for (Current = FileNameStart; *Current != L'\0' && Current < FileName->Buffer + (FileName->Length / sizeof(WCHAR)); Current++) {
+    for (Current = FileNameStart; Current < BufferEnd; Current++) {
         if (*Current == L'.') {
             DotCount++;
             if (FirstDot == NULL) {
@@ -1496,30 +1613,29 @@ Routine Description:
                 AppExtLen--;
             }
 
-            RtlCopyMemory(AppExt, ExtStart, AppExtLen * sizeof(WCHAR));
-            AppExt[AppExtLen] = L'\0';
+            if (AppExtLen > 0 && AppExtLen < 30) {
+                RtlCopyMemory(AppExt, ExtStart, AppExtLen * sizeof(WCHAR));
+                AppExt[AppExtLen] = L'\0';
 
-            //
-            // Check if final extension is executable
-            //
-            if (PcpIsExecutableExtension(AppExt)) {
                 //
-                // Check if hidden extension is a document type
-                // (classic pattern: document.pdf.exe)
+                // Check if final extension is executable
                 //
-                if (_wcsicmp(HiddenExt, L"pdf") == 0 ||
-                    _wcsicmp(HiddenExt, L"doc") == 0 ||
-                    _wcsicmp(HiddenExt, L"docx") == 0 ||
-                    _wcsicmp(HiddenExt, L"xls") == 0 ||
-                    _wcsicmp(HiddenExt, L"xlsx") == 0 ||
-                    _wcsicmp(HiddenExt, L"txt") == 0 ||
-                    _wcsicmp(HiddenExt, L"jpg") == 0 ||
-                    _wcsicmp(HiddenExt, L"png") == 0 ||
-                    _wcsicmp(HiddenExt, L"mp3") == 0 ||
-                    _wcsicmp(HiddenExt, L"mp4") == 0 ||
-                    _wcsicmp(HiddenExt, L"zip") == 0 ||
-                    _wcsicmp(HiddenExt, L"rar") == 0) {
-                    IsHiddenExecutable = TRUE;
+                if (PcpIsExecutableExtension(AppExt)) {
+                    //
+                    // Check if hidden extension is a document type
+                    // (classic pattern: document.pdf.exe)
+                    //
+                    static const PCWSTR DocumentExtensions[] = {
+                        L"pdf", L"doc", L"docx", L"xls", L"xlsx", L"txt",
+                        L"jpg", L"png", L"mp3", L"mp4", L"zip", L"rar"
+                    };
+
+                    for (i = 0; i < ARRAYSIZE(DocumentExtensions); i++) {
+                        if (_wcsicmp(HiddenExt, DocumentExtensions[i]) == 0) {
+                            IsHiddenExecutable = TRUE;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1540,9 +1656,12 @@ PcCheckHoneypot(
 /*++
 Routine Description:
     Checks if file path matches any honeypot patterns.
+    FIXED: All checks now performed under lock to prevent TOCTOU.
 --*/
 {
     ULONG i;
+    BOOLEAN Enabled;
+    ULONG PatternCount;
 
     PAGED_CODE();
 
@@ -1552,15 +1671,29 @@ Routine Description:
 
     *IsHoneypot = FALSE;
 
-    if (!g_PcState.Honeypot.Enabled || g_PcState.Honeypot.PatternCount == 0) {
+    if (FileName->Buffer == NULL || FileName->Length == 0) {
         return STATUS_SUCCESS;
     }
 
+    //
+    // CRITICAL: Acquire lock BEFORE checking Enabled and PatternCount
+    // to prevent TOCTOU race condition
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_PcState.HoneypotLock);
 
-    for (i = 0; i < g_PcState.Honeypot.PatternCount; i++) {
-        if (g_PcState.Honeypot.Patterns[i].Buffer != NULL) {
+    Enabled = g_PcState.Honeypot.Enabled;
+    PatternCount = g_PcState.Honeypot.PatternCount;
+
+    if (!Enabled || PatternCount == 0) {
+        ExReleasePushLockShared(&g_PcState.HoneypotLock);
+        KeLeaveCriticalRegion();
+        return STATUS_SUCCESS;
+    }
+
+    for (i = 0; i < PatternCount && i < PC_MAX_HONEYPOT_PATTERNS; i++) {
+        if (g_PcState.Honeypot.Patterns[i].Buffer != NULL &&
+            g_PcState.Honeypot.Patterns[i].Length > 0) {
             //
             // Check for wildcard match
             //
@@ -1633,12 +1766,100 @@ NTSTATUS
 PcAddHoneypotPattern(
     _In_ PCUNICODE_STRING Pattern
     )
+/*++
+Routine Description:
+    Adds a honeypot pattern with comprehensive validation.
+
+    Security Validations:
+    - Rejects NULL or empty patterns
+    - Rejects overly broad patterns (single "*") that could cause DoS
+    - Rejects excessively long patterns
+    - Validates pattern doesn't contain embedded nulls
+    - Limits total pattern count
+--*/
 {
     PWCHAR Buffer = NULL;
+    USHORT i;
+    ULONG StarCount = 0;
+    ULONG NonWildcardCount = 0;
+    BOOLEAN HasEmbeddedNull = FALSE;
 
     PAGED_CODE();
 
+    //
+    // Basic parameter validation
+    //
     if (Pattern == NULL || Pattern->Buffer == NULL || Pattern->Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Reject excessively long patterns (DoS prevention)
+    //
+    if (Pattern->Length > 1024 * sizeof(WCHAR)) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreCreate] Rejected honeypot pattern: too long (%u chars)\n",
+            Pattern->Length / sizeof(WCHAR)
+            );
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Analyze pattern content for security issues
+    //
+    for (i = 0; i < Pattern->Length / sizeof(WCHAR); i++) {
+        WCHAR Ch = Pattern->Buffer[i];
+
+        if (Ch == L'\0') {
+            HasEmbeddedNull = TRUE;
+            break;
+        }
+
+        if (Ch == L'*') {
+            StarCount++;
+        } else if (Ch != L'?') {
+            NonWildcardCount++;
+        }
+    }
+
+    //
+    // Reject patterns with embedded nulls
+    //
+    if (HasEmbeddedNull) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreCreate] Rejected honeypot pattern: embedded null\n"
+            );
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Reject overly broad patterns that could cause performance issues
+    // Pattern must have at least 3 non-wildcard characters, or be a specific path
+    //
+    if (NonWildcardCount < 3 && StarCount > 0) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreCreate] Rejected honeypot pattern: too broad (stars=%lu, chars=%lu)\n",
+            StarCount,
+            NonWildcardCount
+            );
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Reject patterns that are just wildcards (would match everything)
+    //
+    if (NonWildcardCount == 0) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PreCreate] Rejected honeypot pattern: wildcards only\n"
+            );
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1673,6 +1894,13 @@ PcAddHoneypotPattern(
 
     ExReleasePushLockExclusive(&g_PcState.HoneypotLock);
     KeLeaveCriticalRegion();
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[ShadowStrike/PreCreate] Added honeypot pattern #%lu\n",
+        g_PcState.Honeypot.PatternCount
+        );
 
     return STATUS_SUCCESS;
 }
@@ -1961,55 +2189,76 @@ PcpMatchWildcard(
     )
 /*++
 Routine Description:
-    Simple wildcard pattern matching (* and ?).
+    Iterative wildcard pattern matching (* and ?).
+    CRITICAL: Replaced recursive implementation to prevent stack overflow.
+
+Arguments:
+    String - String to match.
+    Pattern - Pattern with wildcards.
+
+Return Value:
+    TRUE if string matches pattern.
 --*/
 {
+    PCWSTR StringBackup = NULL;
+    PCWSTR PatternBackup = NULL;
+
     if (String == NULL || Pattern == NULL) {
         return FALSE;
     }
 
-    while (*Pattern != L'\0') {
+    while (*String != L'\0') {
         if (*Pattern == L'*') {
-            Pattern++;
+            //
+            // Skip consecutive stars
+            //
+            while (*Pattern == L'*') {
+                Pattern++;
+            }
 
             if (*Pattern == L'\0') {
+                //
+                // Trailing star matches everything
+                //
                 return TRUE;
             }
 
-            while (*String != L'\0') {
-                if (PcpMatchWildcard(String, Pattern)) {
-                    return TRUE;
-                }
-                String++;
-            }
-
-            return FALSE;
-        }
-
-        if (*String == L'\0') {
-            return FALSE;
-        }
-
-        if (*Pattern == L'?') {
+            //
+            // Remember position for backtracking
+            //
+            StringBackup = String;
+            PatternBackup = Pattern;
+        } else if (*Pattern == L'?' ||
+                   ((*String >= L'A' && *String <= L'Z' ? *String + 32 : *String) ==
+                    (*Pattern >= L'A' && *Pattern <= L'Z' ? *Pattern + 32 : *Pattern))) {
+            //
+            // Character match (case-insensitive) or single-char wildcard
+            //
             String++;
             Pattern++;
+        } else if (PatternBackup != NULL) {
+            //
+            // Mismatch - backtrack
+            //
+            StringBackup++;
+            String = StringBackup;
+            Pattern = PatternBackup;
         } else {
-            WCHAR C1 = *String;
-            WCHAR C2 = *Pattern;
-
-            if (C1 >= L'A' && C1 <= L'Z') C1 = C1 - L'A' + L'a';
-            if (C2 >= L'A' && C2 <= L'Z') C2 = C2 - L'A' + L'a';
-
-            if (C1 != C2) {
-                return FALSE;
-            }
-
-            String++;
-            Pattern++;
+            //
+            // Mismatch and no star to backtrack to
+            //
+            return FALSE;
         }
     }
 
-    return (*String == L'\0');
+    //
+    // Skip trailing stars in pattern
+    //
+    while (*Pattern == L'*') {
+        Pattern++;
+    }
+
+    return (*Pattern == L'\0');
 }
 
 
@@ -2090,43 +2339,67 @@ PcpDetectReservedName(
 /*++
 Routine Description:
     Detects Windows reserved device names (CON, PRN, AUX, etc.).
+    FIXED: Uses length-aware iteration instead of unsafe wcsrchr/wcschr/wcslen.
 --*/
 {
-    PWCHAR FileNameStart;
-    PWCHAR LastSlash;
-    PWCHAR DotPos;
+    PWCHAR FileNameStart = NULL;
+    PWCHAR Current;
+    PWCHAR BufferEnd;
+    PWCHAR DotPos = NULL;
     WCHAR NameBuffer[16];
     ULONG NameLen = 0;
     ULONG i;
+    USHORT CharCount;
 
-    if (FileName == NULL || FileName->Buffer == NULL) {
+    if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
+        return FALSE;
+    }
+
+    CharCount = FileName->Length / sizeof(WCHAR);
+    BufferEnd = FileName->Buffer + CharCount;
+
+    //
+    // Find start of filename using length-aware iteration
+    // CRITICAL: Do not use wcsrchr - UNICODE_STRING may not be null-terminated
+    //
+    FileNameStart = FileName->Buffer;
+    for (Current = FileName->Buffer; Current < BufferEnd; Current++) {
+        if (*Current == L'\\') {
+            FileNameStart = Current + 1;
+        }
+    }
+
+    if (FileNameStart >= BufferEnd) {
         return FALSE;
     }
 
     //
-    // Find start of filename
+    // Find first dot in filename using length-aware iteration
+    // CRITICAL: Do not use wcschr - UNICODE_STRING may not be null-terminated
     //
-    LastSlash = wcsrchr(FileName->Buffer, L'\\');
-    if (LastSlash != NULL) {
-        FileNameStart = LastSlash + 1;
-    } else {
-        FileNameStart = FileName->Buffer;
+    for (Current = FileNameStart; Current < BufferEnd; Current++) {
+        if (*Current == L'.') {
+            DotPos = Current;
+            break;
+        }
     }
 
     //
-    // Extract name without extension
+    // Calculate name length (without extension)
     //
-    DotPos = wcschr(FileNameStart, L'.');
     if (DotPos != NULL) {
         NameLen = (ULONG)(DotPos - FileNameStart);
     } else {
-        NameLen = (ULONG)wcslen(FileNameStart);
+        NameLen = (ULONG)(BufferEnd - FileNameStart);
     }
 
     if (NameLen == 0 || NameLen >= 15) {
         return FALSE;
     }
 
+    //
+    // Copy name to local buffer
+    //
     RtlCopyMemory(NameBuffer, FileNameStart, NameLen * sizeof(WCHAR));
     NameBuffer[NameLen] = L'\0';
 
@@ -2183,25 +2456,65 @@ static BOOLEAN
 PcpShouldLogOperation(
     VOID
     )
+/*++
+Routine Description:
+    Rate-limited logging check using atomic operations.
+
+    FIXED: Uses spinlock and KeQueryTickCount for proper atomic access
+    to prevent TOCTOU race conditions on 32-bit and 64-bit systems.
+--*/
 {
-    LARGE_INTEGER CurrentTime;
-    LARGE_INTEGER SecondBoundary;
+    KIRQL OldIrql;
+    LARGE_INTEGER CurrentTicks;
+    LONG64 StoredTicks;
+    LONG64 TicksPerSecond;
+    LONG CurrentLogs;
+    BOOLEAN ShouldLog = FALSE;
 
-    KeQuerySystemTime(&CurrentTime);
+    //
+    // Get current tick count (always available, atomic read)
+    //
+    KeQueryTickCount(&CurrentTicks);
 
-    SecondBoundary.QuadPart = CurrentTime.QuadPart - g_PcState.CurrentSecondStart.QuadPart;
-
-    if (SecondBoundary.QuadPart >= 10000000) {  // 1 second in 100ns units
-        g_PcState.CurrentSecondStart = CurrentTime;
-        InterlockedExchange(&g_PcState.CurrentSecondLogs, 0);
+    //
+    // Calculate ticks per second (typically 100 ticks = 1 second with 10ms interval)
+    //
+    TicksPerSecond = 10000000 / KeQueryTimeIncrement();
+    if (TicksPerSecond == 0) {
+        TicksPerSecond = 100;  // Fallback
     }
 
-    if (g_PcState.CurrentSecondLogs >= PC_LOG_RATE_LIMIT_PER_SEC) {
-        return FALSE;
+    //
+    // Acquire spinlock for atomic update of rate limiter state
+    //
+    KeAcquireSpinLock(&g_PcState.LogRateLock, &OldIrql);
+
+    StoredTicks = g_PcState.CurrentSecondTicks;
+
+    //
+    // Check if we've crossed into a new second
+    //
+    if ((CurrentTicks.QuadPart - StoredTicks) >= TicksPerSecond) {
+        //
+        // New second - reset counter
+        //
+        g_PcState.CurrentSecondTicks = CurrentTicks.QuadPart;
+        g_PcState.CurrentSecondLogs = 1;
+        ShouldLog = TRUE;
+    } else {
+        //
+        // Same second - check rate limit
+        //
+        CurrentLogs = g_PcState.CurrentSecondLogs;
+        if (CurrentLogs < PC_LOG_RATE_LIMIT_PER_SEC) {
+            g_PcState.CurrentSecondLogs = CurrentLogs + 1;
+            ShouldLog = TRUE;
+        }
     }
 
-    InterlockedIncrement(&g_PcState.CurrentSecondLogs);
-    return TRUE;
+    KeReleaseSpinLock(&g_PcState.LogRateLock, OldIrql);
+
+    return ShouldLog;
 }
 
 

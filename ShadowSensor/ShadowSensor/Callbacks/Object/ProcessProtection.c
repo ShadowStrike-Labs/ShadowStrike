@@ -29,9 +29,15 @@ Performance Characteristics:
 - Lock-free statistics using InterlockedXxx
 - Per-second rate limiting for logging
 - Early exit for kernel handles and unprotected targets
+- Reference-counted activity trackers for safe concurrent access
+
+Thread Safety:
+- Uses EX_RUNDOWN_REF for safe shutdown
+- Lock ordering: RundownRef -> CacheLock -> PolicyLock -> ActivityLock
+- Activity trackers use reference counting to prevent use-after-free
 
 @author ShadowStrike Security Team
-@version 2.0.0 (Enterprise Edition)
+@version 2.1.0 (Enterprise Edition)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
@@ -42,6 +48,7 @@ Performance Characteristics:
 #include "../../SelfProtection/SelfProtect.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
+#include "../../Communication/CommPort.h"
 #include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
@@ -51,6 +58,8 @@ Performance Characteristics:
 #pragma alloc_text(PAGE, PpClassifyProcess)
 #pragma alloc_text(PAGE, PpAddAccessPolicy)
 #pragma alloc_text(PAGE, PpRemovePoliciesForCategory)
+#pragma alloc_text(PAGE, PpValidateCachedProcess)
+#pragma alloc_text(PAGE, PpCleanupActivityTrackerForProcess)
 #endif
 
 // ============================================================================
@@ -58,6 +67,18 @@ Performance Characteristics:
 // ============================================================================
 
 static PP_PROTECTION_STATE g_ProcessProtection = {0};
+
+//
+// Well-known process name constants (UNICODE_STRING compatible)
+//
+static const WCHAR g_LsassName[] = L"\\lsass.exe";
+static const WCHAR g_CsrssName[] = L"\\csrss.exe";
+static const WCHAR g_ServicesName[] = L"\\services.exe";
+static const WCHAR g_SvchostName[] = L"\\svchost.exe";
+static const WCHAR g_SmssName[] = L"\\smss.exe";
+static const WCHAR g_WininitName[] = L"\\wininit.exe";
+static const WCHAR g_WinlogonName[] = L"\\winlogon.exe";
+static const WCHAR g_ShadowStrikeName[] = L"ShadowStrike";
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -68,68 +89,63 @@ PppInitializeDefaultConfig(
     VOID
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
-PppInitializeCriticalProcessCache(
+PppRegisterProcessNotifyCallback(
     VOID
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+static VOID
+PppUnregisterProcessNotifyCallback(
+    VOID
+    );
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID
+PppProcessNotifyCallback(
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 PppCleanupActivityTrackers(
     VOID
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 PppCleanupPolicies(
     VOID
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static PPP_ACTIVITY_TRACKER
+PppFindActivityTrackerLocked(
+    _In_ HANDLE SourceProcessId
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static PPP_ACTIVITY_TRACKER
 PppFindOrCreateActivityTracker(
     _In_ HANDLE SourceProcessId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-PppFreeActivityTracker(
+PppReferenceTracker(
     _In_ PPP_ACTIVITY_TRACKER Tracker
     );
 
-static ULONG
-PppHashProcessId(
-    _In_ HANDLE ProcessId
-    );
-
-static BOOLEAN
-PppIsSystemProcess(
-    _In_ HANDLE ProcessId
-    );
-
-static BOOLEAN
-PppIsTrustedSource(
-    _In_ HANDLE SourceProcessId,
-    _In_ HANDLE TargetProcessId
-    );
-
-static PP_PROCESS_CATEGORY
-PppCategorizeByImageName(
-    _In_ PCUNICODE_STRING ImageName
-    );
-
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-PppLogSuspiciousOperation(
-    _In_ PPP_OPERATION_CONTEXT Context
+PppDereferenceTracker(
+    _In_ PPP_ACTIVITY_TRACKER Tracker
     );
 
-static VOID
-PppSendNotification(
-    _In_ PPP_OPERATION_CONTEXT Context
-    );
-
-static NTSTATUS
-PppFindProcessByName(
-    _In_ PCWSTR ProcessName,
-    _Out_ PHANDLE ProcessId
-    );
-
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 PppUpdateActivityTracker(
     _Inout_ PPP_ACTIVITY_TRACKER Tracker,
@@ -137,9 +153,70 @@ PppUpdateActivityTracker(
     _In_ BOOLEAN IsSuspicious
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static ULONG
+PppHashProcessId(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+PppIsSystemProcess(
+    _In_ HANDLE ProcessId
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static BOOLEAN
+PppIsTrustedSource(
+    _In_ HANDLE SourceProcessId,
+    _In_ HANDLE TargetProcessId
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+static PP_PROCESS_CATEGORY
+PppCategorizeByImageName(
+    _In_ PCUNICODE_STRING ImageName
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+PppLogSuspiciousOperation(
+    _In_ PPP_OPERATION_CONTEXT Context
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+static VOID
+PppSendNotification(
+    _In_ PPP_OPERATION_CONTEXT Context
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+PppFindProcessesByName(
+    _In_ PCWSTR ProcessName,
+    _Out_writes_(MaxPids) PHANDLE ProcessIds,
+    _In_ ULONG MaxPids,
+    _Out_ PULONG FoundCount
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
 PppShouldLogOperation(
     VOID
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN
+PppMatchImageNameSuffix(
+    _In_ PCUNICODE_STRING FullPath,
+    _In_ PCWSTR Suffix
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN
+PppImageNameContains(
+    _In_ PCUNICODE_STRING FullPath,
+    _In_ PCWSTR Substring
     );
 
 // ============================================================================
@@ -154,6 +231,11 @@ PpInitializeProcessProtection(
 /*++
 Routine Description:
     Initializes the process protection subsystem.
+
+    Thread Safety:
+    - Must be called at PASSIVE_LEVEL
+    - Must be called before ObRegisterCallbacks
+    - Not thread-safe for concurrent initialization
 
 Return Value:
     STATUS_SUCCESS on success.
@@ -171,6 +253,11 @@ Return Value:
     RtlZeroMemory(&g_ProcessProtection, sizeof(PP_PROTECTION_STATE));
 
     //
+    // Initialize rundown protection for safe shutdown
+    //
+    ExInitializeRundownProtection(&g_ProcessProtection.RundownRef);
+
+    //
     // Initialize synchronization primitives
     //
     ExInitializePushLock(&g_ProcessProtection.CacheLock);
@@ -186,7 +273,7 @@ Return Value:
     //
     // Initialize activity hash table
     //
-    for (i = 0; i < 64; i++) {
+    for (i = 0; i < PP_ACTIVITY_HASH_SIZE; i++) {
         InitializeListHead(&g_ProcessProtection.ActivityHashTable[i]);
     }
 
@@ -199,7 +286,26 @@ Return Value:
     // Initialize statistics
     //
     KeQuerySystemTime(&g_ProcessProtection.Stats.StartTime);
-    KeQuerySystemTime(&g_ProcessProtection.CurrentSecondStart);
+    InterlockedExchange64(
+        &g_ProcessProtection.RateLimiter.CurrentSecondStart,
+        g_ProcessProtection.Stats.StartTime.QuadPart
+        );
+
+    //
+    // Register process notify callback for cleanup
+    //
+    Status = PppRegisterProcessNotifyCallback();
+    if (!NT_SUCCESS(Status)) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PP] Failed to register process notify: 0x%08X\n",
+            Status
+            );
+        //
+        // Non-fatal: activity trackers will leak but protection still works
+        //
+    }
 
     //
     // Detect and cache critical system processes
@@ -223,8 +329,9 @@ Return Value:
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
         "[ShadowStrike/PP] Process protection initialized. "
-        "Cached %ld critical processes\n",
-        g_ProcessProtection.CriticalProcessCount
+        "Cached %ld critical processes, %ld CSRSS instances\n",
+        g_ProcessProtection.CriticalProcessCount,
+        g_ProcessProtection.CsrssCount
         );
 
     return STATUS_SUCCESS;
@@ -239,6 +346,14 @@ PpShutdownProcessProtection(
 /*++
 Routine Description:
     Shuts down the process protection subsystem.
+
+    Uses rundown protection to ensure all in-flight operations
+    complete before freeing resources.
+
+    Thread Safety:
+    - Must be called at PASSIVE_LEVEL
+    - Must be called after unregistering object callbacks
+    - Waits for all in-flight operations to complete
 --*/
 {
     PAGED_CODE();
@@ -247,10 +362,24 @@ Routine Description:
         return;
     }
 
+    //
+    // Mark as not initialized to stop new operations
+    //
     g_ProcessProtection.Initialized = FALSE;
 
     //
-    // Cleanup activity trackers
+    // Wait for all in-flight operations to complete
+    // This blocks until all ExAcquireRundownProtection calls are balanced
+    //
+    ExWaitForRundownProtectionRelease(&g_ProcessProtection.RundownRef);
+
+    //
+    // Unregister process notify callback
+    //
+    PppUnregisterProcessNotifyCallback();
+
+    //
+    // Cleanup activity trackers (safe now, no in-flight operations)
     //
     PppCleanupActivityTrackers();
 
@@ -263,10 +392,11 @@ Routine Description:
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
         "[ShadowStrike/PP] Process protection shutdown. "
-        "Stats: Total=%lld, Stripped=%lld, Blocked=%lld\n",
+        "Stats: Total=%lld, Stripped=%lld, Blocked=%lld, Notifications=%lld\n",
         g_ProcessProtection.Stats.TotalOperations,
         g_ProcessProtection.Stats.AccessStripped,
-        g_ProcessProtection.Stats.OperationsBlocked
+        g_ProcessProtection.Stats.OperationsBlocked,
+        g_ProcessProtection.Stats.NotificationsSent
         );
 }
 
@@ -282,9 +412,94 @@ PppInitializeDefaultConfig(
     g_ProcessProtection.Config.EnableCrossSessionMonitoring = TRUE;
     g_ProcessProtection.Config.EnableActivityTracking = TRUE;
     g_ProcessProtection.Config.EnableRateLimiting = TRUE;
+    g_ProcessProtection.Config.EnableKernelHandleFiltering = FALSE;  // Default off for compat
+    g_ProcessProtection.Config.EnablePolicyEnforcement = TRUE;
     g_ProcessProtection.Config.LogStrippedAccess = TRUE;
     g_ProcessProtection.Config.NotifyUserMode = TRUE;
+    g_ProcessProtection.Config.StrictLsassProtection = TRUE;  // Block VM_READ on LSASS
     g_ProcessProtection.Config.SuspicionScoreThreshold = 50;
+}
+
+
+// ============================================================================
+// PROCESS NOTIFY CALLBACK FOR CLEANUP
+// ============================================================================
+
+_Use_decl_annotations_
+static NTSTATUS
+PppRegisterProcessNotifyCallback(
+    VOID
+    )
+{
+    NTSTATUS Status;
+
+    PAGED_CODE();
+
+    Status = PsSetCreateProcessNotifyRoutineEx(
+        PppProcessNotifyCallback,
+        FALSE  // Register
+        );
+
+    if (NT_SUCCESS(Status)) {
+        g_ProcessProtection.ProcessNotifyRegistered = TRUE;
+    }
+
+    return Status;
+}
+
+
+_Use_decl_annotations_
+static VOID
+PppUnregisterProcessNotifyCallback(
+    VOID
+    )
+{
+    PAGED_CODE();
+
+    if (g_ProcessProtection.ProcessNotifyRegistered) {
+        PsSetCreateProcessNotifyRoutineEx(
+            PppProcessNotifyCallback,
+            TRUE  // Remove
+            );
+        g_ProcessProtection.ProcessNotifyRegistered = FALSE;
+    }
+}
+
+
+_Use_decl_annotations_
+static VOID
+PppProcessNotifyCallback(
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    )
+/*++
+Routine Description:
+    Process creation/termination callback.
+
+    Used to:
+    1. Clean up activity trackers when processes terminate
+    2. Update critical process cache if a protected process restarts
+
+Arguments:
+    Process     - EPROCESS pointer
+    ProcessId   - Process ID
+    CreateInfo  - NULL for termination, non-NULL for creation
+--*/
+{
+    UNREFERENCED_PARAMETER(Process);
+
+    if (CreateInfo == NULL) {
+        //
+        // Process is terminating - clean up its activity tracker
+        //
+        PpCleanupActivityTrackerForProcess(ProcessId);
+
+        //
+        // Also remove from protected process cache if present
+        //
+        PpRemoveProtectedProcess(ProcessId);
+    }
 }
 
 
@@ -305,6 +520,11 @@ Routine Description:
     This is the core of our process protection. Called by ObRegisterCallbacks
     before any handle is created or duplicated to a process.
 
+    Thread Safety:
+    - Uses rundown protection for safe shutdown
+    - All accessed data structures are properly synchronized
+    - Activity trackers use reference counting
+
 Arguments:
     RegistrationContext     - Registration context (unused).
     OperationInformation    - Handle operation details.
@@ -315,30 +535,53 @@ Return Value:
 {
     PP_OPERATION_CONTEXT Context;
     PEPROCESS TargetProcess;
-    PEPROCESS SourceProcess;
     ACCESS_MASK OriginalAccess;
     ACCESS_MASK NewAccess;
     PP_VERDICT Verdict;
+    PP_ACCESS_POLICY MatchedPolicy;
     ULONG ProtectionFlags = 0;
     BOOLEAN IsProtectedTarget = FALSE;
+    BOOLEAN HasPolicy = FALSE;
+    BOOLEAN RundownAcquired = FALSE;
 
     UNREFERENCED_PARAMETER(RegistrationContext);
 
     //
-    // Quick validation
+    // Quick validation - check pointers before any access
     //
-    if (OperationInformation == NULL ||
-        OperationInformation->Object == NULL) {
+    if (OperationInformation == NULL) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->Object == NULL) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->Parameters == NULL) {
         return OB_PREOP_SUCCESS;
     }
 
     //
-    // Check if we're initialized
+    // Check if we're initialized and not shutting down
     //
-    if (!g_ProcessProtection.Initialized ||
-        !SHADOWSTRIKE_IS_READY()) {
+    if (!g_ProcessProtection.Initialized) {
         return OB_PREOP_SUCCESS;
     }
+
+    if (!SHADOWSTRIKE_IS_READY()) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    //
+    // Acquire rundown protection - prevents shutdown during our operation
+    //
+    if (!ExAcquireRundownProtection(&g_ProcessProtection.RundownRef)) {
+        //
+        // Shutdown in progress, allow the operation
+        //
+        return OB_PREOP_SUCCESS;
+    }
+    RundownAcquired = TRUE;
 
     //
     // Increment operation counter
@@ -346,11 +589,15 @@ Return Value:
     InterlockedIncrement64(&g_ProcessProtection.Stats.TotalOperations);
 
     //
-    // Skip kernel-mode handles by default
-    // (Kernel components are generally trusted)
+    // Handle kernel-mode handles based on configuration
     //
     if (OperationInformation->KernelHandle) {
-        return OB_PREOP_SUCCESS;
+        if (!g_ProcessProtection.Config.EnableKernelHandleFiltering) {
+            goto Cleanup;
+        }
+        //
+        // If kernel handle filtering is enabled, continue processing
+        //
     }
 
     //
@@ -369,7 +616,7 @@ Return Value:
     Context.IsKernelHandle = OperationInformation->KernelHandle;
 
     //
-    // Determine operation type
+    // Determine operation type and get original access
     //
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
         Context.OperationType = PpOperationCreate;
@@ -378,7 +625,7 @@ Return Value:
         Context.OperationType = PpOperationDuplicate;
         OriginalAccess = OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
     } else {
-        return OB_PREOP_SUCCESS;
+        goto Cleanup;
     }
 
     Context.OriginalDesiredAccess = OriginalAccess;
@@ -394,7 +641,7 @@ Return Value:
     // (Processes can access themselves freely)
     //
     if (Context.SourceProcessId == Context.TargetProcessId) {
-        return OB_PREOP_SUCCESS;
+        goto Cleanup;
     }
 
     //
@@ -439,7 +686,7 @@ Return Value:
                     );
             }
         }
-        return OB_PREOP_SUCCESS;
+        goto Cleanup;
     }
 
     //
@@ -451,7 +698,7 @@ Return Value:
     // Check if source is trusted (allow our own processes full access)
     //
     if (PppIsTrustedSource(Context.SourceProcessId, Context.TargetProcessId)) {
-        return OB_PREOP_SUCCESS;
+        goto Cleanup;
     }
 
     //
@@ -459,11 +706,12 @@ Return Value:
     //
     if (ShadowStrikeIsProcessProtected(Context.SourceProcessId, NULL)) {
         Context.SourceIsProtected = TRUE;
-        return OB_PREOP_SUCCESS;
+        goto Cleanup;
     }
 
     //
     // Get session information for cross-session detection
+    // Token operations can fail for exiting processes - handle gracefully
     //
     {
         PACCESS_TOKEN SourceToken = NULL;
@@ -471,18 +719,36 @@ Return Value:
         ULONG SourceSession = 0;
         ULONG TargetSession = 0;
 
-        SourceToken = PsReferencePrimaryToken(Context.SourceProcess);
-        if (SourceToken != NULL) {
-            SeQuerySessionIdToken(SourceToken, &SourceSession);
-            Context.SourceSessionId = SourceSession;
-            PsDereferencePrimaryToken(SourceToken);
-        }
+        __try {
+            SourceToken = PsReferencePrimaryToken(Context.SourceProcess);
+            if (SourceToken != NULL) {
+                SeQuerySessionIdToken(SourceToken, &SourceSession);
+                Context.SourceSessionId = SourceSession;
+                PsDereferencePrimaryToken(SourceToken);
+            }
 
-        TargetToken = PsReferencePrimaryToken(TargetProcess);
-        if (TargetToken != NULL) {
-            SeQuerySessionIdToken(TargetToken, &TargetSession);
-            Context.TargetSessionId = TargetSession;
-            PsDereferencePrimaryToken(TargetToken);
+            TargetToken = PsReferencePrimaryToken(TargetProcess);
+            if (TargetToken != NULL) {
+                SeQuerySessionIdToken(TargetToken, &TargetSession);
+                Context.TargetSessionId = TargetSession;
+                PsDereferencePrimaryToken(TargetToken);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            //
+            // Token access failed - process may be exiting
+            // Continue with default session values (0)
+            //
+        }
+    }
+
+    //
+    // Check for matching policy if enabled
+    //
+    if (g_ProcessProtection.Config.EnablePolicyEnforcement) {
+        RtlZeroMemory(&MatchedPolicy, sizeof(PP_ACCESS_POLICY));
+        HasPolicy = PpFindMatchingPolicy(&Context, &MatchedPolicy);
+        if (HasPolicy) {
+            InterlockedIncrement64(&g_ProcessProtection.Stats.PolicyMatches);
         }
     }
 
@@ -516,6 +782,13 @@ Return Value:
                 Context.TargetProtectionLevel,
                 Context.TargetCategory
                 );
+
+            //
+            // If we have a policy, also apply policy-specific denials
+            //
+            if (HasPolicy && MatchedPolicy.DeniedAccess != 0) {
+                NewAccess &= ~MatchedPolicy.DeniedAccess;
+            }
 
             Context.ModifiedDesiredAccess = NewAccess;
             Context.StrippedAccess = OriginalAccess & ~NewAccess;
@@ -614,29 +887,12 @@ Return Value:
         PppSendNotification(&Context);
     }
 
+Cleanup:
+    if (RundownAcquired) {
+        ExReleaseRundownProtection(&g_ProcessProtection.RundownRef);
+    }
+
     return OB_PREOP_SUCCESS;
-}
-
-
-_Use_decl_annotations_
-VOID
-PpProcessHandlePostCallback(
-    _In_ PVOID RegistrationContext,
-    _In_ POB_POST_OPERATION_INFORMATION OperationInformation
-    )
-/*++
-Routine Description:
-    Post-operation callback for additional logging.
---*/
-{
-    UNREFERENCED_PARAMETER(RegistrationContext);
-    UNREFERENCED_PARAMETER(OperationInformation);
-
-    //
-    // Currently not used. Can be implemented for:
-    // - Tracking granted access (may differ from requested)
-    // - Correlating with pre-op decisions
-    //
 }
 
 
@@ -654,10 +910,13 @@ PpAddProtectedProcess(
 {
     LONG Index;
     LONG Count;
+    LARGE_INTEGER CurrentTime;
 
     if (!g_ProcessProtection.Initialized) {
         return STATUS_NOT_FOUND;
     }
+
+    KeQuerySystemTime(&CurrentTime);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessProtection.CacheLock);
@@ -674,6 +933,7 @@ PpAddProtectedProcess(
             //
             g_ProcessProtection.CriticalProcessCache[Index].Category = Category;
             g_ProcessProtection.CriticalProcessCache[Index].ProtectionLevel = ProtectionLevel;
+            g_ProcessProtection.CriticalProcessCache[Index].CacheTime = CurrentTime;
 
             ExReleasePushLockExclusive(&g_ProcessProtection.CacheLock);
             KeLeaveCriticalRegion();
@@ -694,6 +954,7 @@ PpAddProtectedProcess(
     g_ProcessProtection.CriticalProcessCache[Count].Category = Category;
     g_ProcessProtection.CriticalProcessCache[Count].ProtectionLevel = ProtectionLevel;
     g_ProcessProtection.CriticalProcessCache[Count].Flags = 0;
+    g_ProcessProtection.CriticalProcessCache[Count].CacheTime = CurrentTime;
 
     InterlockedIncrement(&g_ProcessProtection.CriticalProcessCount);
 
@@ -791,6 +1052,62 @@ PpIsProcessProtected(
 }
 
 
+_Use_decl_annotations_
+BOOLEAN
+PpValidateCachedProcess(
+    _In_ HANDLE ProcessId,
+    _In_ PCWSTR ExpectedName
+    )
+/*++
+Routine Description:
+    Validates that a cached PID still corresponds to the expected process.
+
+    This prevents attacks where an attacker causes a critical process to
+    restart and the new process gets a different PID.
+--*/
+{
+    NTSTATUS Status;
+    PEPROCESS Process = NULL;
+    PUNICODE_STRING ImageFileName = NULL;
+    BOOLEAN IsValid = FALSE;
+    UNICODE_STRING ExpectedSuffix;
+
+    PAGED_CODE();
+
+    if (ProcessId == NULL || ExpectedName == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Look up the process
+    //
+    Status = PsLookupProcessByProcessId(ProcessId, &Process);
+    if (!NT_SUCCESS(Status) || Process == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Get the image name
+    //
+    Status = SeLocateProcessImageName(Process, &ImageFileName);
+    if (!NT_SUCCESS(Status) || ImageFileName == NULL) {
+        ObDereferenceObject(Process);
+        return FALSE;
+    }
+
+    //
+    // Check if the image name ends with the expected name
+    //
+    RtlInitUnicodeString(&ExpectedSuffix, ExpectedName);
+    IsValid = PpSafeStringEndsWith(ImageFileName, &ExpectedSuffix, TRUE);
+
+    ExFreePool(ImageFileName);
+    ObDereferenceObject(Process);
+
+    return IsValid;
+}
+
+
 // ============================================================================
 // CRITICAL PROCESS DETECTION
 // ============================================================================
@@ -803,80 +1120,106 @@ PpDetectCriticalProcesses(
 /*++
 Routine Description:
     Detects and caches well-known critical system processes.
+
+    This version properly handles multiple instances of processes
+    like CSRSS (one per session).
 --*/
 {
-    NTSTATUS Status = STATUS_SUCCESS;
-    HANDLE Pid = NULL;
+    NTSTATUS Status;
+    HANDLE Pids[PP_MAX_CSRSS_INSTANCES];
+    ULONG FoundCount = 0;
+    ULONG i;
 
     PAGED_CODE();
 
     //
-    // System process (PID 4)
+    // System process (PID 4) - always present
     //
     g_ProcessProtection.SystemPid = (HANDLE)(ULONG_PTR)4;
-    Status = PpAddProtectedProcess(
+    PpAddProtectedProcess(
         g_ProcessProtection.SystemPid,
         PpCategorySystem,
         PpProtectionCritical
         );
 
     //
-    // Find LSASS
+    // Find LSASS - should be exactly one instance
     //
-    Status = PppFindProcessByName(L"lsass.exe", &Pid);
-    if (NT_SUCCESS(Status) && Pid != NULL) {
-        g_ProcessProtection.LsassPid = Pid;
-        PpAddProtectedProcess(Pid, PpCategoryLsass, PpProtectionCritical);
+    Status = PppFindProcessesByName(L"lsass.exe", Pids, 1, &FoundCount);
+    if (NT_SUCCESS(Status) && FoundCount > 0 && Pids[0] != NULL) {
+        g_ProcessProtection.LsassPid = Pids[0];
+        PpAddProtectedProcess(Pids[0], PpCategoryLsass, PpProtectionCritical);
 
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
             "[ShadowStrike/PP] Protected LSASS: PID %lu\n",
-            HandleToULong(Pid)
+            HandleToULong(Pids[0])
             );
     }
 
     //
-    // Find CSRSS (may be multiple instances)
+    // Find ALL CSRSS instances (one per session)
     //
-    Status = PppFindProcessByName(L"csrss.exe", &Pid);
-    if (NT_SUCCESS(Status) && Pid != NULL) {
-        g_ProcessProtection.CsrssPid = Pid;
-        PpAddProtectedProcess(Pid, PpCategorySystem, PpProtectionCritical);
+    RtlZeroMemory(Pids, sizeof(Pids));
+    Status = PppFindProcessesByName(L"csrss.exe", Pids, PP_MAX_CSRSS_INSTANCES, &FoundCount);
+    if (NT_SUCCESS(Status) && FoundCount > 0) {
+        for (i = 0; i < FoundCount && i < PP_MAX_CSRSS_INSTANCES; i++) {
+            if (Pids[i] != NULL) {
+                g_ProcessProtection.CsrssPids[i] = Pids[i];
+                PpAddProtectedProcess(Pids[i], PpCategorySystem, PpProtectionCritical);
+            }
+        }
+        InterlockedExchange(&g_ProcessProtection.CsrssCount, (LONG)FoundCount);
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            "[ShadowStrike/PP] Protected %lu CSRSS instances\n",
+            FoundCount
+            );
     }
 
     //
     // Find services.exe
     //
-    Status = PppFindProcessByName(L"services.exe", &Pid);
-    if (NT_SUCCESS(Status) && Pid != NULL) {
-        g_ProcessProtection.ServicesPid = Pid;
-        PpAddProtectedProcess(Pid, PpCategoryServices, PpProtectionStrict);
+    RtlZeroMemory(Pids, sizeof(Pids));
+    Status = PppFindProcessesByName(L"services.exe", Pids, 1, &FoundCount);
+    if (NT_SUCCESS(Status) && FoundCount > 0 && Pids[0] != NULL) {
+        g_ProcessProtection.ServicesPid = Pids[0];
+        PpAddProtectedProcess(Pids[0], PpCategoryServices, PpProtectionStrict);
     }
 
     //
-    // Find winlogon.exe
+    // Find winlogon.exe (may be multiple - one per session)
     //
-    Status = PppFindProcessByName(L"winlogon.exe", &Pid);
-    if (NT_SUCCESS(Status) && Pid != NULL) {
-        g_ProcessProtection.WinlogonPid = Pid;
-        PpAddProtectedProcess(Pid, PpCategorySystem, PpProtectionStrict);
+    RtlZeroMemory(Pids, sizeof(Pids));
+    Status = PppFindProcessesByName(L"winlogon.exe", Pids, PP_MAX_CSRSS_INSTANCES, &FoundCount);
+    if (NT_SUCCESS(Status) && FoundCount > 0) {
+        g_ProcessProtection.WinlogonPid = Pids[0];  // Store first one
+        for (i = 0; i < FoundCount; i++) {
+            if (Pids[i] != NULL) {
+                PpAddProtectedProcess(Pids[i], PpCategorySystem, PpProtectionStrict);
+            }
+        }
     }
 
     //
     // Find smss.exe
     //
-    Status = PppFindProcessByName(L"smss.exe", &Pid);
-    if (NT_SUCCESS(Status) && Pid != NULL) {
-        PpAddProtectedProcess(Pid, PpCategorySystem, PpProtectionCritical);
+    RtlZeroMemory(Pids, sizeof(Pids));
+    Status = PppFindProcessesByName(L"smss.exe", Pids, 1, &FoundCount);
+    if (NT_SUCCESS(Status) && FoundCount > 0 && Pids[0] != NULL) {
+        PpAddProtectedProcess(Pids[0], PpCategorySystem, PpProtectionCritical);
     }
 
     //
     // Find wininit.exe
     //
-    Status = PppFindProcessByName(L"wininit.exe", &Pid);
-    if (NT_SUCCESS(Status) && Pid != NULL) {
-        PpAddProtectedProcess(Pid, PpCategorySystem, PpProtectionStrict);
+    RtlZeroMemory(Pids, sizeof(Pids));
+    Status = PppFindProcessesByName(L"wininit.exe", Pids, 1, &FoundCount);
+    if (NT_SUCCESS(Status) && FoundCount > 0 && Pids[0] != NULL) {
+        PpAddProtectedProcess(Pids[0], PpCategorySystem, PpProtectionStrict);
     }
 
     return STATUS_SUCCESS;
@@ -891,7 +1234,7 @@ PpClassifyProcess(
     _Out_ PP_PROTECTION_LEVEL* OutProtectionLevel
     )
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS Status;
     PUNICODE_STRING ImageFileName = NULL;
     PP_PROCESS_CATEGORY Category = PpCategoryUnknown;
     PP_PROTECTION_LEVEL Level = PpProtectionNone;
@@ -914,7 +1257,7 @@ PpClassifyProcess(
     }
 
     //
-    // Categorize by image name
+    // Categorize by image name (using length-aware comparison)
     //
     Category = PppCategorizeByImageName(ImageFileName);
 
@@ -952,6 +1295,244 @@ PpClassifyProcess(
 
 
 // ============================================================================
+// POLICY MANAGEMENT
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+PpAddAccessPolicy(
+    _In_ PPP_ACCESS_POLICY Policy
+    )
+{
+    PPP_ACCESS_POLICY NewPolicy = NULL;
+
+    PAGED_CODE();
+
+    if (Policy == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    NewPolicy = (PPP_ACCESS_POLICY)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(PP_ACCESS_POLICY),
+        PP_POLICY_TAG
+        );
+
+    if (NewPolicy == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(NewPolicy, Policy, sizeof(PP_ACCESS_POLICY));
+    InitializeListHead(&NewPolicy->ListEntry);
+
+    //
+    // Clone image name if provided
+    //
+    if (Policy->ImageName.Buffer != NULL && Policy->ImageName.Length > 0) {
+        //
+        // Validate length to prevent integer overflow
+        //
+        if (Policy->ImageName.MaximumLength < Policy->ImageName.Length ||
+            Policy->ImageName.MaximumLength > 32768) {  // Reasonable max
+            ShadowStrikeFreePoolWithTag(NewPolicy, PP_POLICY_TAG);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        NewPolicy->ImageName.Buffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
+            NonPagedPoolNx,
+            Policy->ImageName.MaximumLength,
+            PP_STRING_TAG
+            );
+
+        if (NewPolicy->ImageName.Buffer == NULL) {
+            ShadowStrikeFreePoolWithTag(NewPolicy, PP_POLICY_TAG);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        RtlCopyMemory(
+            NewPolicy->ImageName.Buffer,
+            Policy->ImageName.Buffer,
+            Policy->ImageName.Length
+            );
+        NewPolicy->ImageName.Length = Policy->ImageName.Length;
+        NewPolicy->ImageName.MaximumLength = Policy->ImageName.MaximumLength;
+    } else {
+        RtlZeroMemory(&NewPolicy->ImageName, sizeof(UNICODE_STRING));
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ProcessProtection.PolicyLock);
+
+    InsertTailList(&g_ProcessProtection.PolicyList, &NewPolicy->ListEntry);
+    InterlockedIncrement(&g_ProcessProtection.PolicyCount);
+
+    ExReleasePushLockExclusive(&g_ProcessProtection.PolicyLock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
+}
+
+
+_Use_decl_annotations_
+VOID
+PpRemovePoliciesForCategory(
+    _In_ PP_PROCESS_CATEGORY Category
+    )
+{
+    PLIST_ENTRY Entry;
+    PLIST_ENTRY Next;
+    PPP_ACCESS_POLICY Policy;
+    LIST_ENTRY RemoveList;
+
+    PAGED_CODE();
+
+    InitializeListHead(&RemoveList);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ProcessProtection.PolicyLock);
+
+    for (Entry = g_ProcessProtection.PolicyList.Flink;
+         Entry != &g_ProcessProtection.PolicyList;
+         Entry = Next) {
+
+        Next = Entry->Flink;
+        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
+
+        if (Policy->Category == Category) {
+            RemoveEntryList(Entry);
+            InsertTailList(&RemoveList, Entry);
+            InterlockedDecrement(&g_ProcessProtection.PolicyCount);
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ProcessProtection.PolicyLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free removed policies outside the lock
+    //
+    while (!IsListEmpty(&RemoveList)) {
+        Entry = RemoveHeadList(&RemoveList);
+        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
+
+        if (Policy->ImageName.Buffer != NULL) {
+            ShadowStrikeFreePoolWithTag(Policy->ImageName.Buffer, PP_STRING_TAG);
+        }
+        ShadowStrikeFreePoolWithTag(Policy, PP_POLICY_TAG);
+    }
+}
+
+
+_Use_decl_annotations_
+BOOLEAN
+PpFindMatchingPolicy(
+    _In_ PPP_OPERATION_CONTEXT Context,
+    _Out_ PPP_ACCESS_POLICY OutPolicy
+    )
+/*++
+Routine Description:
+    Finds a matching access policy for the given operation context.
+
+    Policy matching order:
+    1. Exact PID match (highest priority)
+    2. Category match
+    3. Image name match
+
+    Returns a COPY of the policy to avoid holding locks.
+--*/
+{
+    PLIST_ENTRY Entry;
+    PPP_ACCESS_POLICY Policy;
+    PPP_ACCESS_POLICY BestMatch = NULL;
+    ULONG BestMatchScore = 0;
+    ULONG CurrentScore;
+    ULONG i;
+    BOOLEAN IsExempt;
+
+    if (Context == NULL || OutPolicy == NULL) {
+        return FALSE;
+    }
+
+    RtlZeroMemory(OutPolicy, sizeof(PP_ACCESS_POLICY));
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_ProcessProtection.PolicyLock);
+
+    for (Entry = g_ProcessProtection.PolicyList.Flink;
+         Entry != &g_ProcessProtection.PolicyList;
+         Entry = Entry->Flink) {
+
+        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
+        CurrentScore = 0;
+
+        //
+        // Check exemptions first
+        //
+        IsExempt = FALSE;
+        for (i = 0; i < Policy->ExemptCount && i < 8; i++) {
+            if (Policy->ExemptProcessIds[i] == Context->SourceProcessId) {
+                IsExempt = TRUE;
+                break;
+            }
+        }
+        if (IsExempt) {
+            continue;
+        }
+
+        //
+        // Score the match
+        //
+        if (Policy->TargetProcessId != NULL) {
+            if (Policy->TargetProcessId == Context->TargetProcessId) {
+                CurrentScore = 100;  // Exact PID match
+            } else {
+                continue;  // PID specified but doesn't match
+            }
+        } else if (Policy->Category != PpCategoryUnknown) {
+            if (Policy->Category == Context->TargetCategory) {
+                CurrentScore = 50;  // Category match
+            } else {
+                continue;  // Category specified but doesn't match
+            }
+        }
+
+        //
+        // Keep best match
+        //
+        if (CurrentScore > BestMatchScore) {
+            BestMatchScore = CurrentScore;
+            BestMatch = Policy;
+        }
+    }
+
+    if (BestMatch != NULL) {
+        //
+        // Copy the policy (excluding pointers that need special handling)
+        //
+        OutPolicy->TargetProcessId = BestMatch->TargetProcessId;
+        OutPolicy->Category = BestMatch->Category;
+        OutPolicy->ProtectionLevel = BestMatch->ProtectionLevel;
+        OutPolicy->DeniedAccess = BestMatch->DeniedAccess;
+        OutPolicy->AllowedAccess = BestMatch->AllowedAccess;
+        OutPolicy->BlockKernelHandles = BestMatch->BlockKernelHandles;
+        OutPolicy->LogOnly = BestMatch->LogOnly;
+        OutPolicy->RequireSignedExemption = BestMatch->RequireSignedExemption;
+        RtlZeroMemory(&OutPolicy->ImageName, sizeof(UNICODE_STRING));  // Don't copy string
+        RtlCopyMemory(OutPolicy->ExemptProcessIds, BestMatch->ExemptProcessIds,
+                      sizeof(OutPolicy->ExemptProcessIds));
+        OutPolicy->ExemptCount = BestMatch->ExemptCount;
+
+        InterlockedIncrement64(&BestMatch->TimesApplied);
+    }
+
+    ExReleasePushLockShared(&g_ProcessProtection.PolicyLock);
+    KeLeaveCriticalRegion();
+
+    return (BestMatch != NULL);
+}
+
+
+// ============================================================================
 // OPERATION ANALYSIS
 // ============================================================================
 
@@ -980,6 +1561,13 @@ Routine Description:
             Score += 40;
             InterlockedIncrement64(&g_ProcessProtection.Stats.CredentialAccessAttempts);
         }
+
+        //
+        // Any memory access to LSASS is highly suspicious
+        //
+        if (Access & PROCESS_VM_READ) {
+            Score += 20;
+        }
     }
 
     //
@@ -999,7 +1587,7 @@ Routine Description:
     }
 
     //
-    // Check for debug access
+    // Check for debug access (PROCESS_ALL_ACCESS)
     //
     if ((Access & PROCESS_ALL_ACCESS) == PROCESS_ALL_ACCESS) {
         Context->SuspiciousFlags |= PpSuspiciousDebugAttempt;
@@ -1075,12 +1663,9 @@ PpDetermineVerdict(
     }
 
     //
-    // High suspicion score = block/strip
+    // High suspicion score = strip
     //
     if (Context->SuspicionScore >= 80) {
-        //
-        // Critical: strip all dangerous access
-        //
         return PpVerdictStrip;
     }
 
@@ -1091,10 +1676,10 @@ PpDetermineVerdict(
         switch (Context->TargetProtectionLevel) {
             case PpProtectionCritical:
             case PpProtectionAntimalware:
-                return PpVerdictStrip;
             case PpProtectionStrict:
                 return PpVerdictStrip;
             case PpProtectionMedium:
+            case PpProtectionLight:
                 return PpVerdictMonitor;
             default:
                 return PpVerdictMonitor;
@@ -1127,9 +1712,10 @@ PpDetermineVerdict(
 
         case PpProtectionMedium:
             //
-            // Strip only terminate rights
+            // Strip terminate and inject rights
             //
-            if ((Context->OriginalDesiredAccess & PP_DANGEROUS_TERMINATE_ACCESS) != 0) {
+            if ((Context->OriginalDesiredAccess &
+                (PP_DANGEROUS_TERMINATE_ACCESS | PP_DANGEROUS_INJECT_ACCESS)) != 0) {
                 return PpVerdictStrip;
             }
             break;
@@ -1191,15 +1777,12 @@ PpCalculateAllowedAccess(
     }
 
     //
-    // Special handling for LSASS: Also restrict VM_READ for non-admin
-    // (Credential dumping protection)
+    // Special handling for LSASS: Block VM_READ if strict protection enabled
+    // This is the key defense against credential dumping (T1003)
     //
     if (Category == PpCategoryLsass &&
-        g_ProcessProtection.Config.EnableCredentialProtection) {
-        //
-        // Note: We allow VM_READ for debugging purposes but log it
-        // Full blocking would break some legitimate tools
-        //
+        g_ProcessProtection.Config.StrictLsassProtection) {
+        DeniedMask |= PP_LSASS_BLOCKED_ACCESS;
     }
 
     return OriginalAccess & ~DeniedMask;
@@ -1207,8 +1790,288 @@ PpCalculateAllowedAccess(
 
 
 // ============================================================================
-// ACTIVITY TRACKING
+// ACTIVITY TRACKING (WITH REFERENCE COUNTING)
 // ============================================================================
+
+_Use_decl_annotations_
+static VOID
+PppReferenceTracker(
+    _In_ PPP_ACTIVITY_TRACKER Tracker
+    )
+/*++
+Routine Description:
+    Adds a reference to an activity tracker.
+--*/
+{
+    if (Tracker != NULL) {
+        InterlockedIncrement(&Tracker->ReferenceCount);
+    }
+}
+
+
+_Use_decl_annotations_
+static VOID
+PppDereferenceTracker(
+    _In_ PPP_ACTIVITY_TRACKER Tracker
+    )
+/*++
+Routine Description:
+    Releases a reference to an activity tracker.
+    Frees the tracker when the last reference is released.
+--*/
+{
+    LONG NewCount;
+
+    if (Tracker == NULL) {
+        return;
+    }
+
+    NewCount = InterlockedDecrement(&Tracker->ReferenceCount);
+
+    if (NewCount == 0) {
+        //
+        // Mark as freed to help detect use-after-free in debug
+        //
+        InterlockedExchange(&Tracker->State, PpTrackerStateFreed);
+
+        ShadowStrikeFreePoolWithTag(Tracker, PP_TRACKER_TAG);
+    }
+}
+
+
+_Use_decl_annotations_
+static PPP_ACTIVITY_TRACKER
+PppFindActivityTrackerLocked(
+    _In_ HANDLE SourceProcessId
+    )
+/*++
+Routine Description:
+    Finds an activity tracker under the lock.
+
+    CALLER MUST HOLD ActivityLock (shared or exclusive).
+    Does NOT add a reference - caller must do so if needed.
+--*/
+{
+    ULONG HashIndex;
+    PLIST_ENTRY Entry;
+    PPP_ACTIVITY_TRACKER Tracker;
+
+    HashIndex = PppHashProcessId(SourceProcessId) % PP_ACTIVITY_HASH_SIZE;
+
+    for (Entry = g_ProcessProtection.ActivityHashTable[HashIndex].Flink;
+         Entry != &g_ProcessProtection.ActivityHashTable[HashIndex];
+         Entry = Entry->Flink) {
+
+        Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, HashEntry);
+
+        //
+        // Check state to skip trackers being removed
+        //
+        if (InterlockedCompareExchange(&Tracker->State, PpTrackerStateActive, PpTrackerStateActive)
+            == PpTrackerStateActive) {
+
+            if (Tracker->SourceProcessId == SourceProcessId) {
+                return Tracker;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+_Use_decl_annotations_
+static PPP_ACTIVITY_TRACKER
+PppFindOrCreateActivityTracker(
+    _In_ HANDLE SourceProcessId
+    )
+/*++
+Routine Description:
+    Finds or creates an activity tracker for a source process.
+
+    Returns a REFERENCED tracker that must be dereferenced by the caller.
+
+    Thread Safety:
+    - Uses double-checked locking pattern
+    - Returns with reference count incremented
+--*/
+{
+    ULONG HashIndex;
+    PPP_ACTIVITY_TRACKER Tracker = NULL;
+    PPP_ACTIVITY_TRACKER NewTracker = NULL;
+    PPP_ACTIVITY_TRACKER ExistingTracker = NULL;
+
+    HashIndex = PppHashProcessId(SourceProcessId) % PP_ACTIVITY_HASH_SIZE;
+
+    //
+    // First try to find existing tracker with shared lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&g_ProcessProtection.ActivityLock);
+
+    Tracker = PppFindActivityTrackerLocked(SourceProcessId);
+    if (Tracker != NULL) {
+        //
+        // Found - add reference while still holding lock
+        //
+        PppReferenceTracker(Tracker);
+        ExReleasePushLockShared(&g_ProcessProtection.ActivityLock);
+        KeLeaveCriticalRegion();
+        return Tracker;
+    }
+
+    ExReleasePushLockShared(&g_ProcessProtection.ActivityLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Not found - allocate new tracker
+    //
+    NewTracker = (PPP_ACTIVITY_TRACKER)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(PP_ACTIVITY_TRACKER),
+        PP_TRACKER_TAG
+        );
+
+    if (NewTracker == NULL) {
+        return NULL;
+    }
+
+    RtlZeroMemory(NewTracker, sizeof(PP_ACTIVITY_TRACKER));
+    NewTracker->SourceProcessId = SourceProcessId;
+    NewTracker->ReferenceCount = 2;  // One for hash table, one for caller
+    NewTracker->State = PpTrackerStateActive;
+    KeQuerySystemTime(&NewTracker->FirstActivity);
+    KeInitializeSpinLock(&NewTracker->TargetLock);
+    InitializeListHead(&NewTracker->ListEntry);
+    InitializeListHead(&NewTracker->HashEntry);
+
+    //
+    // Insert with exclusive lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ProcessProtection.ActivityLock);
+
+    //
+    // Double-check it wasn't added while we allocated
+    //
+    ExistingTracker = PppFindActivityTrackerLocked(SourceProcessId);
+    if (ExistingTracker != NULL) {
+        //
+        // Someone else added it - use that one
+        //
+        PppReferenceTracker(ExistingTracker);
+        ExReleasePushLockExclusive(&g_ProcessProtection.ActivityLock);
+        KeLeaveCriticalRegion();
+
+        //
+        // Free our unused allocation
+        //
+        ShadowStrikeFreePoolWithTag(NewTracker, PP_TRACKER_TAG);
+        return ExistingTracker;
+    }
+
+    //
+    // Insert new tracker
+    //
+    InsertTailList(&g_ProcessProtection.ActivityList, &NewTracker->ListEntry);
+    InsertTailList(&g_ProcessProtection.ActivityHashTable[HashIndex], &NewTracker->HashEntry);
+    InterlockedIncrement(&g_ProcessProtection.ActiveTrackers);
+
+    ExReleasePushLockExclusive(&g_ProcessProtection.ActivityLock);
+    KeLeaveCriticalRegion();
+
+    return NewTracker;
+}
+
+
+_Use_decl_annotations_
+static VOID
+PppUpdateActivityTracker(
+    _Inout_ PPP_ACTIVITY_TRACKER Tracker,
+    _In_ HANDLE TargetProcessId,
+    _In_ BOOLEAN IsSuspicious
+    )
+/*++
+Routine Description:
+    Updates activity tracker state.
+
+    Thread Safety:
+    - Uses atomic operations for counters
+    - Uses spinlock for target array
+    - Safe for concurrent calls
+--*/
+{
+    LARGE_INTEGER CurrentTime;
+    LONGLONG FirstActivityTime;
+    LONGLONG TimeDiff;
+    KIRQL OldIrql;
+    BOOLEAN AlreadyTracked;
+    ULONG i;
+
+    KeQuerySystemTime(&CurrentTime);
+
+    //
+    // Update last activity atomically (use InterlockedExchange64 for 64-bit values)
+    //
+    InterlockedExchange64(&Tracker->LastActivity.QuadPart, CurrentTime.QuadPart);
+
+    InterlockedIncrement(&Tracker->HandleOperationCount);
+
+    if (IsSuspicious) {
+        InterlockedIncrement(&Tracker->SuspiciousOperationCount);
+    }
+
+    //
+    // Check for rate limiting using atomic operations
+    //
+    FirstActivityTime = InterlockedCompareExchange64(
+        &Tracker->FirstActivity.QuadPart,
+        0,
+        0  // Read current value
+        );
+
+    TimeDiff = CurrentTime.QuadPart - FirstActivityTime;
+
+    if (TimeDiff < PP_ACTIVITY_WINDOW_100NS) {
+        //
+        // Within time window - check threshold
+        //
+        if (Tracker->HandleOperationCount > PP_SUSPICIOUS_HANDLE_THRESHOLD) {
+            if (InterlockedExchange(&Tracker->IsRateLimited, TRUE) == FALSE) {
+                InterlockedIncrement64(&g_ProcessProtection.Stats.RateLimitedOperations);
+            }
+        }
+    } else {
+        //
+        // Reset window atomically
+        //
+        InterlockedExchange64(&Tracker->FirstActivity.QuadPart, CurrentTime.QuadPart);
+        InterlockedExchange(&Tracker->HandleOperationCount, 1);
+        InterlockedExchange(&Tracker->SuspiciousOperationCount, IsSuspicious ? 1 : 0);
+        InterlockedExchange(&Tracker->IsRateLimited, FALSE);
+    }
+
+    //
+    // Track unique targets (protected by spinlock)
+    //
+    KeAcquireSpinLock(&Tracker->TargetLock, &OldIrql);
+
+    if (Tracker->UniqueTargetCount < PP_MAX_TRACKED_TARGETS) {
+        AlreadyTracked = FALSE;
+        for (i = 0; i < Tracker->UniqueTargetCount; i++) {
+            if (Tracker->RecentTargets[i] == TargetProcessId) {
+                AlreadyTracked = TRUE;
+                break;
+            }
+        }
+        if (!AlreadyTracked) {
+            Tracker->RecentTargets[Tracker->UniqueTargetCount++] = TargetProcessId;
+        }
+    }
+
+    KeReleaseSpinLock(&Tracker->TargetLock, OldIrql);
+}
+
 
 _Use_decl_annotations_
 VOID
@@ -1227,6 +2090,11 @@ PpTrackActivity(
     Tracker = PppFindOrCreateActivityTracker(SourceProcessId);
     if (Tracker != NULL) {
         PppUpdateActivityTracker(Tracker, TargetProcessId, IsSuspicious);
+
+        //
+        // Release our reference
+        //
+        PppDereferenceTracker(Tracker);
     }
 }
 
@@ -1246,7 +2114,7 @@ PpIsSourceRateLimited(
         return FALSE;
     }
 
-    HashIndex = PppHashProcessId(SourceProcessId) % 64;
+    HashIndex = PppHashProcessId(SourceProcessId) % PP_ACTIVITY_HASH_SIZE;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_ProcessProtection.ActivityLock);
@@ -1257,7 +2125,10 @@ PpIsSourceRateLimited(
 
         Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, HashEntry);
         if (Tracker->SourceProcessId == SourceProcessId) {
-            IsLimited = Tracker->IsRateLimited;
+            //
+            // Read atomically
+            //
+            IsLimited = (InterlockedCompareExchange(&Tracker->IsRateLimited, 0, 0) != 0);
             break;
         }
     }
@@ -1266,6 +2137,64 @@ PpIsSourceRateLimited(
     KeLeaveCriticalRegion();
 
     return IsLimited;
+}
+
+
+_Use_decl_annotations_
+VOID
+PpCleanupActivityTrackerForProcess(
+    _In_ HANDLE ProcessId
+    )
+/*++
+Routine Description:
+    Cleans up the activity tracker for a terminated process.
+
+    Called from process notify callback when a process exits.
+    This prevents memory leaks from accumulated trackers.
+
+    Thread Safety:
+    - Removes tracker from lists under lock
+    - Uses reference counting for safe deallocation
+--*/
+{
+    ULONG HashIndex;
+    PPP_ACTIVITY_TRACKER Tracker = NULL;
+
+    HashIndex = PppHashProcessId(ProcessId) % PP_ACTIVITY_HASH_SIZE;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ProcessProtection.ActivityLock);
+
+    Tracker = PppFindActivityTrackerLocked(ProcessId);
+    if (Tracker != NULL) {
+        //
+        // Mark as removing to prevent new references
+        //
+        InterlockedExchange(&Tracker->State, PpTrackerStateRemoving);
+
+        //
+        // Remove from lists
+        //
+        RemoveEntryList(&Tracker->ListEntry);
+        RemoveEntryList(&Tracker->HashEntry);
+        InterlockedDecrement(&g_ProcessProtection.ActiveTrackers);
+
+        //
+        // Reinitialize list entries to prevent double-remove issues
+        //
+        InitializeListHead(&Tracker->ListEntry);
+        InitializeListHead(&Tracker->HashEntry);
+    }
+
+    ExReleasePushLockExclusive(&g_ProcessProtection.ActivityLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Release the hash table's reference (outside lock)
+    //
+    if (Tracker != NULL) {
+        PppDereferenceTracker(Tracker);
+    }
 }
 
 
@@ -1307,6 +2236,7 @@ PpGetStatistics(
 // INTERNAL HELPERS
 // ============================================================================
 
+_Use_decl_annotations_
 static ULONG
 PppHashProcessId(
     _In_ HANDLE ProcessId
@@ -1319,16 +2249,21 @@ PppHashProcessId(
 }
 
 
+_Use_decl_annotations_
 static BOOLEAN
 PppIsSystemProcess(
     _In_ HANDLE ProcessId
     )
 {
-    ULONG Pid = HandleToULong(ProcessId);
-    return (Pid <= 4);
+    //
+    // Only PID 4 (System) is implicitly trusted
+    // PID 0 is the Idle process - not a real process
+    //
+    return (HandleToULong(ProcessId) == 4);
 }
 
 
+_Use_decl_annotations_
 static BOOLEAN
 PppIsTrustedSource(
     _In_ HANDLE SourceProcessId,
@@ -1336,7 +2271,7 @@ PppIsTrustedSource(
     )
 {
     //
-    // System process is trusted
+    // System process (PID 4) is trusted
     //
     if (PppIsSystemProcess(SourceProcessId)) {
         return TRUE;
@@ -1360,52 +2295,147 @@ PppIsTrustedSource(
 }
 
 
+_Use_decl_annotations_
+static BOOLEAN
+PppMatchImageNameSuffix(
+    _In_ PCUNICODE_STRING FullPath,
+    _In_ PCWSTR Suffix
+    )
+/*++
+Routine Description:
+    Safely checks if a UNICODE_STRING ends with a suffix.
+
+    Unlike wcsrchr/wcsicmp, this respects the Length field and
+    does NOT rely on NULL termination.
+--*/
+{
+    UNICODE_STRING SuffixString;
+
+    if (FullPath == NULL || FullPath->Buffer == NULL || Suffix == NULL) {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&SuffixString, Suffix);
+
+    return PpSafeStringEndsWith(FullPath, &SuffixString, TRUE);
+}
+
+
+_Use_decl_annotations_
+static BOOLEAN
+PppImageNameContains(
+    _In_ PCUNICODE_STRING FullPath,
+    _In_ PCWSTR Substring
+    )
+/*++
+Routine Description:
+    Safely checks if a UNICODE_STRING contains a substring.
+
+    Uses length-aware comparison, NOT wcsstr which requires NULL termination.
+--*/
+{
+    UNICODE_STRING SubString;
+    USHORT i;
+    USHORT MaxStart;
+    USHORT PathChars;
+    USHORT SubChars;
+    BOOLEAN Match;
+    USHORT j;
+    WCHAR PathChar;
+    WCHAR SubChar;
+
+    if (FullPath == NULL || FullPath->Buffer == NULL || Substring == NULL) {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&SubString, Substring);
+
+    if (SubString.Length == 0 || FullPath->Length < SubString.Length) {
+        return FALSE;
+    }
+
+    PathChars = FullPath->Length / sizeof(WCHAR);
+    SubChars = SubString.Length / sizeof(WCHAR);
+    MaxStart = PathChars - SubChars;
+
+    for (i = 0; i <= MaxStart; i++) {
+        Match = TRUE;
+
+        for (j = 0; j < SubChars; j++) {
+            PathChar = FullPath->Buffer[i + j];
+            SubChar = SubString.Buffer[j];
+
+            //
+            // Case-insensitive comparison
+            //
+            if (PathChar >= L'A' && PathChar <= L'Z') {
+                PathChar = PathChar - L'A' + L'a';
+            }
+            if (SubChar >= L'A' && SubChar <= L'Z') {
+                SubChar = SubChar - L'A' + L'a';
+            }
+
+            if (PathChar != SubChar) {
+                Match = FALSE;
+                break;
+            }
+        }
+
+        if (Match) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+_Use_decl_annotations_
 static PP_PROCESS_CATEGORY
 PppCategorizeByImageName(
     _In_ PCUNICODE_STRING ImageName
     )
-{
-    PWCHAR FileName;
-    PWCHAR LastSlash;
+/*++
+Routine Description:
+    Categorizes a process by its image name.
 
-    if (ImageName == NULL || ImageName->Buffer == NULL) {
+    Uses length-aware string comparisons to avoid buffer overreads.
+--*/
+{
+    if (ImageName == NULL || ImageName->Buffer == NULL || ImageName->Length == 0) {
         return PpCategoryUnknown;
     }
 
     //
-    // Extract filename
+    // Check for LSASS
     //
-    LastSlash = wcsrchr(ImageName->Buffer, L'\\');
-    if (LastSlash != NULL) {
-        FileName = LastSlash + 1;
-    } else {
-        FileName = ImageName->Buffer;
-    }
-
-    //
-    // Match against known process names
-    //
-    if (_wcsicmp(FileName, L"lsass.exe") == 0) {
+    if (PppMatchImageNameSuffix(ImageName, g_LsassName)) {
         return PpCategoryLsass;
     }
 
-    if (_wcsicmp(FileName, L"csrss.exe") == 0 ||
-        _wcsicmp(FileName, L"smss.exe") == 0 ||
-        _wcsicmp(FileName, L"wininit.exe") == 0 ||
-        _wcsicmp(FileName, L"winlogon.exe") == 0) {
+    //
+    // Check for system processes
+    //
+    if (PppMatchImageNameSuffix(ImageName, g_CsrssName) ||
+        PppMatchImageNameSuffix(ImageName, g_SmssName) ||
+        PppMatchImageNameSuffix(ImageName, g_WininitName) ||
+        PppMatchImageNameSuffix(ImageName, g_WinlogonName)) {
         return PpCategorySystem;
     }
 
-    if (_wcsicmp(FileName, L"services.exe") == 0 ||
-        _wcsicmp(FileName, L"svchost.exe") == 0) {
+    //
+    // Check for service processes
+    //
+    if (PppMatchImageNameSuffix(ImageName, g_ServicesName) ||
+        PppMatchImageNameSuffix(ImageName, g_SvchostName)) {
         return PpCategoryServices;
     }
 
     //
-    // Check for known AV/EDR processes
+    // Check for ShadowStrike (our EDR) - contains check is sufficient
+    // NOTE: This is weak protection. In production, use code signing verification.
     //
-    if (wcsstr(FileName, L"ShadowStrike") != NULL ||
-        wcsstr(FileName, L"shadowstrike") != NULL) {
+    if (PppImageNameContains(ImageName, g_ShadowStrikeName)) {
         return PpCategoryAntimalware;
     }
 
@@ -1413,172 +2443,23 @@ PppCategorizeByImageName(
 }
 
 
-static PPP_ACTIVITY_TRACKER
-PppFindOrCreateActivityTracker(
-    _In_ HANDLE SourceProcessId
-    )
-{
-    ULONG HashIndex;
-    PLIST_ENTRY Entry;
-    PPP_ACTIVITY_TRACKER Tracker = NULL;
-    PPP_ACTIVITY_TRACKER NewTracker = NULL;
-
-    HashIndex = PppHashProcessId(SourceProcessId) % 64;
-
-    //
-    // First try to find existing tracker with shared lock
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&g_ProcessProtection.ActivityLock);
-
-    for (Entry = g_ProcessProtection.ActivityHashTable[HashIndex].Flink;
-         Entry != &g_ProcessProtection.ActivityHashTable[HashIndex];
-         Entry = Entry->Flink) {
-
-        Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, HashEntry);
-        if (Tracker->SourceProcessId == SourceProcessId) {
-            ExReleasePushLockShared(&g_ProcessProtection.ActivityLock);
-            KeLeaveCriticalRegion();
-            return Tracker;
-        }
-    }
-
-    ExReleasePushLockShared(&g_ProcessProtection.ActivityLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Not found - allocate new tracker
-    //
-    NewTracker = (PPP_ACTIVITY_TRACKER)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PP_ACTIVITY_TRACKER),
-        PP_CONTEXT_TAG
-        );
-
-    if (NewTracker == NULL) {
-        return NULL;
-    }
-
-    RtlZeroMemory(NewTracker, sizeof(PP_ACTIVITY_TRACKER));
-    NewTracker->SourceProcessId = SourceProcessId;
-    KeQuerySystemTime(&NewTracker->FirstActivity);
-    InitializeListHead(&NewTracker->ListEntry);
-    InitializeListHead(&NewTracker->HashEntry);
-
-    //
-    // Insert with exclusive lock
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_ProcessProtection.ActivityLock);
-
-    //
-    // Double-check it wasn't added while we allocated
-    //
-    for (Entry = g_ProcessProtection.ActivityHashTable[HashIndex].Flink;
-         Entry != &g_ProcessProtection.ActivityHashTable[HashIndex];
-         Entry = Entry->Flink) {
-
-        Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, HashEntry);
-        if (Tracker->SourceProcessId == SourceProcessId) {
-            ExReleasePushLockExclusive(&g_ProcessProtection.ActivityLock);
-            KeLeaveCriticalRegion();
-            ShadowStrikeFreePoolWithTag(NewTracker, PP_CONTEXT_TAG);
-            return Tracker;
-        }
-    }
-
-    //
-    // Insert new tracker
-    //
-    InsertTailList(&g_ProcessProtection.ActivityList, &NewTracker->ListEntry);
-    InsertTailList(&g_ProcessProtection.ActivityHashTable[HashIndex], &NewTracker->HashEntry);
-    InterlockedIncrement(&g_ProcessProtection.ActiveTrackers);
-
-    ExReleasePushLockExclusive(&g_ProcessProtection.ActivityLock);
-    KeLeaveCriticalRegion();
-
-    return NewTracker;
-}
-
-
-static VOID
-PppUpdateActivityTracker(
-    _Inout_ PPP_ACTIVITY_TRACKER Tracker,
-    _In_ HANDLE TargetProcessId,
-    _In_ BOOLEAN IsSuspicious
-    )
-{
-    LARGE_INTEGER CurrentTime;
-    LARGE_INTEGER TimeDiff;
-
-    KeQuerySystemTime(&CurrentTime);
-    Tracker->LastActivity = CurrentTime;
-
-    InterlockedIncrement(&Tracker->HandleOperationCount);
-
-    if (IsSuspicious) {
-        InterlockedIncrement(&Tracker->SuspiciousOperationCount);
-    }
-
-    //
-    // Check for rate limiting
-    //
-    TimeDiff.QuadPart = CurrentTime.QuadPart - Tracker->FirstActivity.QuadPart;
-
-    if (TimeDiff.QuadPart < PP_ACTIVITY_WINDOW_100NS) {
-        //
-        // Within time window - check threshold
-        //
-        if (Tracker->HandleOperationCount > PP_SUSPICIOUS_HANDLE_THRESHOLD) {
-            Tracker->IsRateLimited = TRUE;
-            InterlockedIncrement64(&g_ProcessProtection.Stats.RateLimitedOperations);
-        }
-    } else {
-        //
-        // Reset window
-        //
-        Tracker->FirstActivity = CurrentTime;
-        InterlockedExchange(&Tracker->HandleOperationCount, 1);
-        InterlockedExchange(&Tracker->SuspiciousOperationCount, IsSuspicious ? 1 : 0);
-        Tracker->IsRateLimited = FALSE;
-    }
-
-    //
-    // Track unique targets
-    //
-    if (Tracker->UniqueTargetCount < 16) {
-        BOOLEAN AlreadyTracked = FALSE;
-        for (ULONG i = 0; i < Tracker->UniqueTargetCount; i++) {
-            if (Tracker->RecentTargets[i] == TargetProcessId) {
-                AlreadyTracked = TRUE;
-                break;
-            }
-        }
-        if (!AlreadyTracked) {
-            Tracker->RecentTargets[Tracker->UniqueTargetCount++] = TargetProcessId;
-        }
-    }
-}
-
-
-static VOID
-PppFreeActivityTracker(
-    _In_ PPP_ACTIVITY_TRACKER Tracker
-    )
-{
-    if (Tracker != NULL) {
-        ShadowStrikeFreePoolWithTag(Tracker, PP_CONTEXT_TAG);
-    }
-}
-
-
+_Use_decl_annotations_
 static VOID
 PppCleanupActivityTrackers(
     VOID
     )
+/*++
+Routine Description:
+    Cleans up all activity trackers during shutdown.
+
+    Called AFTER rundown protection has drained all in-flight operations.
+--*/
 {
     PLIST_ENTRY Entry;
     PPP_ACTIVITY_TRACKER Tracker;
+    LIST_ENTRY FreeList;
+
+    InitializeListHead(&FreeList);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessProtection.ActivityLock);
@@ -1587,20 +2468,41 @@ PppCleanupActivityTrackers(
         Entry = RemoveHeadList(&g_ProcessProtection.ActivityList);
         Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, ListEntry);
 
+        //
+        // Remove from hash table
+        //
         if (!IsListEmpty(&Tracker->HashEntry)) {
             RemoveEntryList(&Tracker->HashEntry);
+            InitializeListHead(&Tracker->HashEntry);
         }
 
-        PppFreeActivityTracker(Tracker);
+        //
+        // Add to free list (to free outside lock)
+        //
+        InsertTailList(&FreeList, &Tracker->ListEntry);
     }
 
     g_ProcessProtection.ActiveTrackers = 0;
 
     ExReleasePushLockExclusive(&g_ProcessProtection.ActivityLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Free all trackers outside the lock
+    //
+    while (!IsListEmpty(&FreeList)) {
+        Entry = RemoveHeadList(&FreeList);
+        Tracker = CONTAINING_RECORD(Entry, PP_ACTIVITY_TRACKER, ListEntry);
+
+        //
+        // Release the hash table's reference
+        //
+        PppDereferenceTracker(Tracker);
+    }
 }
 
 
+_Use_decl_annotations_
 static VOID
 PppCleanupPolicies(
     VOID
@@ -1608,28 +2510,39 @@ PppCleanupPolicies(
 {
     PLIST_ENTRY Entry;
     PPP_ACCESS_POLICY Policy;
+    LIST_ENTRY FreeList;
+
+    InitializeListHead(&FreeList);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ProcessProtection.PolicyLock);
 
     while (!IsListEmpty(&g_ProcessProtection.PolicyList)) {
         Entry = RemoveHeadList(&g_ProcessProtection.PolicyList);
-        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
-
-        if (Policy->ImageName.Buffer != NULL) {
-            ShadowStrikeFreePoolWithTag(Policy->ImageName.Buffer, PP_POLICY_TAG);
-        }
-
-        ShadowStrikeFreePoolWithTag(Policy, PP_POLICY_TAG);
+        InsertTailList(&FreeList, Entry);
     }
 
     g_ProcessProtection.PolicyCount = 0;
 
     ExReleasePushLockExclusive(&g_ProcessProtection.PolicyLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Free outside lock
+    //
+    while (!IsListEmpty(&FreeList)) {
+        Entry = RemoveHeadList(&FreeList);
+        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
+
+        if (Policy->ImageName.Buffer != NULL) {
+            ShadowStrikeFreePoolWithTag(Policy->ImageName.Buffer, PP_STRING_TAG);
+        }
+        ShadowStrikeFreePoolWithTag(Policy, PP_POLICY_TAG);
+    }
 }
 
 
+_Use_decl_annotations_
 static VOID
 PppLogSuspiciousOperation(
     _In_ PPP_OPERATION_CONTEXT Context
@@ -1654,31 +2567,79 @@ PppLogSuspiciousOperation(
 }
 
 
+_Use_decl_annotations_
 static VOID
 PppSendNotification(
     _In_ PPP_OPERATION_CONTEXT Context
     )
+/*++
+Routine Description:
+    Sends a notification to user-mode about a suspicious handle operation.
+
+    Uses the ShadowStrike communication port infrastructure.
+--*/
 {
-    //
-    // TODO: Send notification to user-mode via filter communication port
-    // This would integrate with the CommPort module
-    //
-    UNREFERENCED_PARAMETER(Context);
+    NTSTATUS Status;
+    SHADOWSTRIKE_PROCESS_NOTIFICATION Notification;
 
     //
-    // For now, just increment a counter
-    // Full implementation would allocate a message and send via FltSendMessage
+    // Check if CommPort is available
     //
+    if (!SHADOWSTRIKE_IS_READY()) {
+        return;
+    }
+
+    //
+    // Build notification message
+    //
+    RtlZeroMemory(&Notification, sizeof(Notification));
+
+    Notification.Header.Size = sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION);
+    Notification.Header.MessageType = SHADOWSTRIKE_MSG_PROCESS_HANDLE_ALERT;
+
+    Notification.SourceProcessId = Context->SourceProcessId;
+    Notification.TargetProcessId = Context->TargetProcessId;
+    Notification.RequestedAccess = Context->OriginalDesiredAccess;
+    Notification.GrantedAccess = Context->ModifiedDesiredAccess;
+    Notification.SuspicionScore = Context->SuspicionScore;
+    Notification.SuspiciousFlags = Context->SuspiciousFlags;
+    Notification.TargetCategory = (ULONG)Context->TargetCategory;
+    Notification.OperationType = (ULONG)Context->OperationType;
+    Notification.Verdict = (ULONG)Context->Verdict;
+
+    //
+    // Send notification (non-blocking, no reply needed)
+    //
+    Status = ShadowStrikeSendProcessNotification(
+        &Notification,
+        sizeof(Notification),
+        FALSE,      // Don't require reply
+        NULL,
+        NULL
+        );
+
+    if (NT_SUCCESS(Status)) {
+        InterlockedIncrement64(&g_ProcessProtection.Stats.NotificationsSent);
+    }
 }
 
 
+_Use_decl_annotations_
 static BOOLEAN
 PppShouldLogOperation(
     VOID
     )
+/*++
+Routine Description:
+    Rate-limits logging operations to prevent log flooding.
+
+    Uses lock-free atomic operations for thread safety.
+--*/
 {
     LARGE_INTEGER CurrentTime;
-    LARGE_INTEGER SecondBoundary;
+    LONGLONG CurrentSecond;
+    LONGLONG StoredSecond;
+    LONG CurrentLogs;
 
     if (!g_ProcessProtection.Config.EnableRateLimiting) {
         return TRUE;
@@ -1687,49 +2648,80 @@ PppShouldLogOperation(
     KeQuerySystemTime(&CurrentTime);
 
     //
-    // Check if we're in a new second
+    // Get current stored second start (atomic read)
     //
-    SecondBoundary.QuadPart = CurrentTime.QuadPart - g_ProcessProtection.CurrentSecondStart.QuadPart;
+    StoredSecond = InterlockedCompareExchange64(
+        &g_ProcessProtection.RateLimiter.CurrentSecondStart,
+        0,
+        0
+        );
 
-    if (SecondBoundary.QuadPart >= 10000000) {  // 1 second in 100ns units
-        g_ProcessProtection.CurrentSecondStart = CurrentTime;
-        InterlockedExchange(&g_ProcessProtection.CurrentSecondLogs, 0);
+    CurrentSecond = CurrentTime.QuadPart;
+
+    //
+    // Check if we're in a new second (1 second = 10,000,000 100ns units)
+    //
+    if ((CurrentSecond - StoredSecond) >= 10000000LL) {
+        //
+        // Try to reset the counter for new second
+        // Use compare-exchange to handle race conditions
+        //
+        if (InterlockedCompareExchange64(
+                &g_ProcessProtection.RateLimiter.CurrentSecondStart,
+                CurrentSecond,
+                StoredSecond
+                ) == StoredSecond) {
+            //
+            // We won the race - reset counter
+            //
+            InterlockedExchange(&g_ProcessProtection.RateLimiter.CurrentSecondLogs, 0);
+        }
     }
 
     //
-    // Check rate limit
+    // Check if under rate limit and increment atomically
     //
-    if (g_ProcessProtection.CurrentSecondLogs >= PP_MAX_LOG_RATE_PER_SEC) {
+    CurrentLogs = InterlockedIncrement(&g_ProcessProtection.RateLimiter.CurrentSecondLogs);
+
+    if (CurrentLogs > PP_MAX_LOG_RATE_PER_SEC) {
+        //
+        // Over limit - decrement back and return FALSE
+        //
+        InterlockedDecrement(&g_ProcessProtection.RateLimiter.CurrentSecondLogs);
         return FALSE;
     }
 
-    InterlockedIncrement(&g_ProcessProtection.CurrentSecondLogs);
     return TRUE;
 }
 
 
+_Use_decl_annotations_
 static NTSTATUS
-PppFindProcessByName(
+PppFindProcessesByName(
     _In_ PCWSTR ProcessName,
-    _Out_ PHANDLE ProcessId
+    _Out_writes_(MaxPids) PHANDLE ProcessIds,
+    _In_ ULONG MaxPids,
+    _Out_ PULONG FoundCount
     )
 /*++
 Routine Description:
-    Finds a process by its image name.
+    Finds ALL processes matching a given name.
 
-    This is a simplified implementation. A full implementation would
-    enumerate all processes using ZwQuerySystemInformation.
+    Unlike the previous implementation, this returns multiple PIDs
+    to handle processes with multiple instances (e.g., CSRSS, winlogon).
 --*/
 {
-    NTSTATUS Status = STATUS_NOT_FOUND;
+    NTSTATUS Status;
     PSYSTEM_PROCESS_INFORMATION ProcessInfo = NULL;
     PSYSTEM_PROCESS_INFORMATION CurrentProcess;
     PVOID Buffer = NULL;
     ULONG BufferSize = 256 * 1024;  // Start with 256KB
     ULONG ReturnLength = 0;
     UNICODE_STRING TargetName;
+    ULONG Count = 0;
 
-    *ProcessId = NULL;
+    *FoundCount = 0;
+    RtlZeroMemory(ProcessIds, MaxPids * sizeof(HANDLE));
 
     RtlInitUnicodeString(&TargetName, ProcessName);
 
@@ -1753,6 +2745,14 @@ Routine Description:
 
     if (Status == STATUS_INFO_LENGTH_MISMATCH) {
         ShadowStrikeFreePoolWithTag(Buffer, PP_POOL_TAG);
+
+        //
+        // Check for integer overflow
+        //
+        if (ReturnLength > (ULONG_MAX - 8192)) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
         BufferSize = ReturnLength + 4096;
         Buffer = ShadowStrikeAllocatePoolWithTag(PagedPool, BufferSize, PP_POOL_TAG);
         if (Buffer == NULL) {
@@ -1773,7 +2773,7 @@ Routine Description:
     }
 
     //
-    // Search for the process
+    // Search for ALL matching processes
     //
     ProcessInfo = (PSYSTEM_PROCESS_INFORMATION)Buffer;
     CurrentProcess = ProcessInfo;
@@ -1781,9 +2781,10 @@ Routine Description:
     do {
         if (CurrentProcess->ImageName.Buffer != NULL) {
             if (RtlEqualUnicodeString(&CurrentProcess->ImageName, &TargetName, TRUE)) {
-                *ProcessId = CurrentProcess->UniqueProcessId;
-                Status = STATUS_SUCCESS;
-                break;
+                if (Count < MaxPids) {
+                    ProcessIds[Count] = CurrentProcess->UniqueProcessId;
+                    Count++;
+                }
             }
         }
 
@@ -1799,133 +2800,14 @@ Routine Description:
 
     ShadowStrikeFreePoolWithTag(Buffer, PP_POOL_TAG);
 
-    return Status;
+    *FoundCount = Count;
+
+    return (Count > 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
 
 // ============================================================================
-// POLICY MANAGEMENT
-// ============================================================================
-
-_Use_decl_annotations_
-NTSTATUS
-PpAddAccessPolicy(
-    _In_ PPP_ACCESS_POLICY Policy
-    )
-{
-    PPP_ACCESS_POLICY NewPolicy = NULL;
-    NTSTATUS Status = STATUS_SUCCESS;
-
-    PAGED_CODE();
-
-    if (Policy == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    NewPolicy = (PPP_ACCESS_POLICY)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PP_ACCESS_POLICY),
-        PP_POLICY_TAG
-        );
-
-    if (NewPolicy == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    RtlCopyMemory(NewPolicy, Policy, sizeof(PP_ACCESS_POLICY));
-    InitializeListHead(&NewPolicy->ListEntry);
-
-    //
-    // Clone image name if provided
-    //
-    if (Policy->ImageName.Buffer != NULL && Policy->ImageName.Length > 0) {
-        NewPolicy->ImageName.Buffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            Policy->ImageName.MaximumLength,
-            PP_POLICY_TAG
-            );
-
-        if (NewPolicy->ImageName.Buffer == NULL) {
-            ShadowStrikeFreePoolWithTag(NewPolicy, PP_POLICY_TAG);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        RtlCopyMemory(
-            NewPolicy->ImageName.Buffer,
-            Policy->ImageName.Buffer,
-            Policy->ImageName.Length
-            );
-        NewPolicy->ImageName.Length = Policy->ImageName.Length;
-        NewPolicy->ImageName.MaximumLength = Policy->ImageName.MaximumLength;
-    } else {
-        RtlZeroMemory(&NewPolicy->ImageName, sizeof(UNICODE_STRING));
-    }
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_ProcessProtection.PolicyLock);
-
-    InsertTailList(&g_ProcessProtection.PolicyList, &NewPolicy->ListEntry);
-    InterlockedIncrement(&g_ProcessProtection.PolicyCount);
-
-    ExReleasePushLockExclusive(&g_ProcessProtection.PolicyLock);
-    KeLeaveCriticalRegion();
-
-    return STATUS_SUCCESS;
-}
-
-
-_Use_decl_annotations_
-VOID
-PpRemovePoliciesForCategory(
-    _In_ PP_PROCESS_CATEGORY Category
-    )
-{
-    PLIST_ENTRY Entry;
-    PLIST_ENTRY Next;
-    PPP_ACCESS_POLICY Policy;
-    LIST_ENTRY RemoveList;
-
-    PAGED_CODE();
-
-    InitializeListHead(&RemoveList);
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_ProcessProtection.PolicyLock);
-
-    for (Entry = g_ProcessProtection.PolicyList.Flink;
-         Entry != &g_ProcessProtection.PolicyList;
-         Entry = Next) {
-
-        Next = Entry->Flink;
-        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
-
-        if (Policy->Category == Category) {
-            RemoveEntryList(Entry);
-            InsertTailList(&RemoveList, Entry);
-            InterlockedDecrement(&g_ProcessProtection.PolicyCount);
-        }
-    }
-
-    ExReleasePushLockExclusive(&g_ProcessProtection.PolicyLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Free removed policies outside the lock
-    //
-    while (!IsListEmpty(&RemoveList)) {
-        Entry = RemoveHeadList(&RemoveList);
-        Policy = CONTAINING_RECORD(Entry, PP_ACCESS_POLICY, ListEntry);
-
-        if (Policy->ImageName.Buffer != NULL) {
-            ShadowStrikeFreePoolWithTag(Policy->ImageName.Buffer, PP_POLICY_TAG);
-        }
-        ShadowStrikeFreePoolWithTag(Policy, PP_POLICY_TAG);
-    }
-}
-
-
-// ============================================================================
-// LEGACY COMPATIBILITY - Map to existing callback
+// LEGACY COMPATIBILITY
 // ============================================================================
 
 /*
@@ -1938,8 +2820,5 @@ ShadowStrikeProcessPreCallback(
     _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
     )
 {
-    //
-    // Delegate to the enterprise process protection callback
-    //
     return PpProcessHandlePreCallback(RegistrationContext, OperationInformation);
 }

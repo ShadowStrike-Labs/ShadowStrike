@@ -30,8 +30,13 @@
  * - ETW telemetry for suspicious handle operations
  * - User-mode notification for critical events
  *
+ * Thread Safety:
+ * - All public functions are thread-safe
+ * - Uses EX_RUNDOWN_REF for safe shutdown
+ * - Lock ordering: RundownRef -> CacheLock -> PolicyLock -> ActivityLock
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -53,6 +58,8 @@ extern "C" {
 #define PP_POOL_TAG                     'PPPS'  // Process Protection
 #define PP_CONTEXT_TAG                  'xCPP'  // Context allocations
 #define PP_POLICY_TAG                   'lPPP'  // Policy allocations
+#define PP_TRACKER_TAG                  'tTPP'  // Activity tracker allocations
+#define PP_STRING_TAG                   'rSPP'  // String allocations
 
 // ============================================================================
 // CONSTANTS
@@ -82,6 +89,21 @@ extern "C" {
  * @brief Time window for handle activity tracking (100ns units = 10 seconds)
  */
 #define PP_ACTIVITY_WINDOW_100NS        (10LL * 10000000LL)
+
+/**
+ * @brief Maximum CSRSS instances to track (one per session typically)
+ */
+#define PP_MAX_CSRSS_INSTANCES          16
+
+/**
+ * @brief Activity hash table size (must be power of 2)
+ */
+#define PP_ACTIVITY_HASH_SIZE           64
+
+/**
+ * @brief Maximum unique targets to track per source
+ */
+#define PP_MAX_TRACKED_TARGETS          16
 
 // ============================================================================
 // ACCESS MASKS FOR PROTECTION
@@ -136,6 +158,17 @@ extern "C" {
 #define PP_SAFE_READ_ACCESS             \
     (PROCESS_QUERY_LIMITED_INFORMATION |\
      SYNCHRONIZE)
+
+/**
+ * @brief LSASS-specific blocked access (credential protection)
+ */
+#define PP_LSASS_BLOCKED_ACCESS         \
+    (PROCESS_VM_READ |                  \
+     PROCESS_VM_WRITE |                 \
+     PROCESS_VM_OPERATION |             \
+     PROCESS_DUP_HANDLE |               \
+     PROCESS_CREATE_THREAD |            \
+     PROCESS_TERMINATE)
 
 // ============================================================================
 // ENUMERATIONS
@@ -202,6 +235,15 @@ typedef enum _PP_PROCESS_CATEGORY {
     PpCategoryUserDefined       = 5     ///< Custom protected processes
 } PP_PROCESS_CATEGORY;
 
+/**
+ * @brief Tracker reference state
+ */
+typedef enum _PP_TRACKER_STATE {
+    PpTrackerStateActive        = 0,    ///< Tracker is active and in use
+    PpTrackerStateRemoving      = 1,    ///< Tracker is being removed
+    PpTrackerStateFreed         = 2     ///< Tracker has been freed
+} PP_TRACKER_STATE;
+
 // ============================================================================
 // STRUCTURES
 // ============================================================================
@@ -235,6 +277,11 @@ typedef struct _PP_ACCESS_POLICY {
     ULONG ExemptCount;
 
     //
+    // Signature requirement for exemption
+    //
+    BOOLEAN RequireSignedExemption;     ///< Exempt process must be signed
+
+    //
     // Statistics
     //
     volatile LONG64 TimesApplied;
@@ -260,6 +307,7 @@ typedef struct _PP_OPERATION_CONTEXT {
     ULONG SourceSessionId;
     BOOLEAN SourceIsElevated;
     BOOLEAN SourceIsProtected;
+    BOOLEAN SourceIsSigned;
 
     //
     // Target process
@@ -293,10 +341,18 @@ typedef struct _PP_OPERATION_CONTEXT {
 
 /**
  * @brief Handle activity tracker (per source process)
+ *
+ * Uses reference counting for safe concurrent access.
  */
 typedef struct _PP_ACTIVITY_TRACKER {
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
+
+    //
+    // Reference counting for safe access
+    //
+    volatile LONG ReferenceCount;
+    volatile LONG State;                ///< PP_TRACKER_STATE
 
     HANDLE SourceProcessId;
     LARGE_INTEGER FirstActivity;
@@ -307,16 +363,17 @@ typedef struct _PP_ACTIVITY_TRACKER {
     volatile LONG StrippedOperationCount;
 
     //
-    // Target tracking
+    // Target tracking (protected by dedicated spinlock)
     //
+    KSPIN_LOCK TargetLock;
     ULONG UniqueTargetCount;
-    HANDLE RecentTargets[16];
+    HANDLE RecentTargets[PP_MAX_TRACKED_TARGETS];
 
     //
-    // Flags
+    // Flags (atomic access)
     //
-    BOOLEAN IsRateLimited;
-    BOOLEAN IsBlacklisted;
+    volatile LONG IsRateLimited;
+    volatile LONG IsBlacklisted;
 
 } PP_ACTIVITY_TRACKER, *PPP_ACTIVITY_TRACKER;
 
@@ -328,16 +385,26 @@ typedef struct _PP_CRITICAL_PROCESS_ENTRY {
     PP_PROCESS_CATEGORY Category;
     PP_PROTECTION_LEVEL ProtectionLevel;
     ULONG Flags;
+    LARGE_INTEGER CacheTime;            ///< When this entry was cached
 } PP_CRITICAL_PROCESS_ENTRY, *PPP_CRITICAL_PROCESS_ENTRY;
+
+/**
+ * @brief Rate limiter state (lock-free)
+ */
+typedef struct _PP_RATE_LIMITER {
+    volatile LONG64 CurrentSecondStart; ///< Aligned for atomic access
+    volatile LONG CurrentSecondLogs;
+} PP_RATE_LIMITER, *PPP_RATE_LIMITER;
 
 /**
  * @brief Process protection state
  */
 typedef struct _PP_PROTECTION_STATE {
     //
-    // Initialization
+    // Initialization and shutdown
     //
     BOOLEAN Initialized;
+    EX_RUNDOWN_REF RundownRef;          ///< For safe shutdown
 
     //
     // Critical process cache (fast path)
@@ -363,22 +430,27 @@ typedef struct _PP_PROTECTION_STATE {
     //
     // Hash table for activity lookup
     //
-    LIST_ENTRY ActivityHashTable[64];
+    LIST_ENTRY ActivityHashTable[PP_ACTIVITY_HASH_SIZE];
 
     //
-    // Rate limiting
+    // Rate limiting (lock-free)
     //
-    volatile LONG CurrentSecondLogs;
-    LARGE_INTEGER CurrentSecondStart;
+    PP_RATE_LIMITER RateLimiter;
 
     //
-    // Well-known PIDs (cached at init)
+    // Well-known PIDs (cached at init, validated on use)
     //
     HANDLE SystemPid;
     HANDLE LsassPid;
-    HANDLE CsrssPid;
+    HANDLE CsrssPids[PP_MAX_CSRSS_INSTANCES];
+    volatile LONG CsrssCount;
     HANDLE ServicesPid;
     HANDLE WinlogonPid;
+
+    //
+    // Process notify callback handle
+    //
+    BOOLEAN ProcessNotifyRegistered;
 
     //
     // Statistics
@@ -395,6 +467,8 @@ typedef struct _PP_PROTECTION_STATE {
         volatile LONG64 CrossSessionAccess;
         volatile LONG64 SuspiciousOperations;
         volatile LONG64 RateLimitedOperations;
+        volatile LONG64 PolicyMatches;
+        volatile LONG64 NotificationsSent;
         LARGE_INTEGER StartTime;
     } Stats;
 
@@ -408,8 +482,11 @@ typedef struct _PP_PROTECTION_STATE {
         BOOLEAN EnableCrossSessionMonitoring;   ///< Cross-session detection
         BOOLEAN EnableActivityTracking;         ///< Per-process activity
         BOOLEAN EnableRateLimiting;             ///< Log rate limiting
+        BOOLEAN EnableKernelHandleFiltering;    ///< Filter kernel handles too
+        BOOLEAN EnablePolicyEnforcement;        ///< Use policy list
         BOOLEAN LogStrippedAccess;              ///< Log when access is stripped
         BOOLEAN NotifyUserMode;                 ///< Send notifications to user-mode
+        BOOLEAN StrictLsassProtection;          ///< Block VM_READ on LSASS
         ULONG SuspicionScoreThreshold;          ///< Score to trigger alert
     } Config;
 
@@ -438,6 +515,7 @@ PpInitializeProcessProtection(
 /**
  * @brief Shutdown process protection subsystem.
  *
+ * Waits for all in-flight operations to complete.
  * Frees all resources. Must be called after unregistering object callbacks.
  *
  * @irql PASSIVE_LEVEL
@@ -470,23 +548,6 @@ OB_PREOP_CALLBACK_STATUS
 PpProcessHandlePreCallback(
     _In_ PVOID RegistrationContext,
     _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
-    );
-
-/**
- * @brief Process handle post-operation callback (optional).
- *
- * Can be used for additional logging after handle is created.
- *
- * @param RegistrationContext   Registration context.
- * @param OperationInformation  Handle operation details.
- *
- * @irql <= APC_LEVEL
- */
-_IRQL_requires_max_(APC_LEVEL)
-VOID
-PpProcessHandlePostCallback(
-    _In_ PVOID RegistrationContext,
-    _In_ POB_POST_OPERATION_INFORMATION OperationInformation
     );
 
 // ============================================================================
@@ -544,6 +605,23 @@ PpIsProcessProtected(
     _Out_opt_ PP_PROTECTION_LEVEL* OutProtectionLevel
     );
 
+/**
+ * @brief Validate that a cached critical PID is still valid.
+ *
+ * @param ProcessId     Process ID to validate.
+ * @param ExpectedName  Expected image name (e.g., L"lsass.exe").
+ *
+ * @return TRUE if the PID is still valid for the expected process.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+PpValidateCachedProcess(
+    _In_ HANDLE ProcessId,
+    _In_ PCWSTR ExpectedName
+    );
+
 // ============================================================================
 // FUNCTION PROTOTYPES - POLICY MANAGEMENT
 // ============================================================================
@@ -574,6 +652,23 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 PpRemovePoliciesForCategory(
     _In_ PP_PROCESS_CATEGORY Category
+    );
+
+/**
+ * @brief Find matching policy for an operation.
+ *
+ * @param Context   Operation context.
+ * @param OutPolicy Receives matching policy (if found).
+ *
+ * @return TRUE if a matching policy was found.
+ *
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+PpFindMatchingPolicy(
+    _In_ PPP_OPERATION_CONTEXT Context,
+    _Out_ PPP_ACCESS_POLICY OutPolicy
     );
 
 // ============================================================================
@@ -701,6 +796,21 @@ PpIsSourceRateLimited(
     _In_ HANDLE SourceProcessId
     );
 
+/**
+ * @brief Clean up activity tracker for a terminated process.
+ *
+ * Called from process notify callback.
+ *
+ * @param ProcessId     Process ID that terminated.
+ *
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+PpCleanupActivityTrackerForProcess(
+    _In_ HANDLE ProcessId
+    );
+
 // ============================================================================
 // FUNCTION PROTOTYPES - STATISTICS
 // ============================================================================
@@ -783,6 +893,39 @@ PpAccessIsSafeReadOnly(
     //
     return ((Access & PP_FULL_DANGEROUS_ACCESS) == 0) &&
            ((Access & ~PP_SAFE_READ_ACCESS) == 0);
+}
+
+/**
+ * @brief Safe string comparison for UNICODE_STRING (length-aware).
+ *
+ * Unlike wcsicmp, this respects the Length field and does not rely
+ * on NULL termination.
+ */
+FORCEINLINE
+BOOLEAN
+PpSafeStringEndsWith(
+    _In_ PCUNICODE_STRING String,
+    _In_ PCUNICODE_STRING Suffix,
+    _In_ BOOLEAN CaseInsensitive
+    )
+{
+    UNICODE_STRING EndPart;
+
+    if (String == NULL || Suffix == NULL ||
+        String->Buffer == NULL || Suffix->Buffer == NULL) {
+        return FALSE;
+    }
+
+    if (String->Length < Suffix->Length) {
+        return FALSE;
+    }
+
+    EndPart.Length = Suffix->Length;
+    EndPart.MaximumLength = Suffix->Length;
+    EndPart.Buffer = (PWCH)((PUCHAR)String->Buffer +
+                            (String->Length - Suffix->Length));
+
+    return RtlEqualUnicodeString(&EndPart, Suffix, CaseInsensitive);
 }
 
 #ifdef __cplusplus

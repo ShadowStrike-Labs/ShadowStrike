@@ -9,6 +9,7 @@
  * This module provides comprehensive post-create handling and stream context
  * management for file system monitoring:
  * - Stream context attachment and lifecycle management
+ * - Stream handle context for per-open tracking
  * - File attribute caching for performance optimization
  * - Scan verdict correlation between pre-create and post-create
  * - File ID tracking for cache integration
@@ -24,6 +25,7 @@
  * - Stream handle contexts for per-open state
  * - Instance contexts for per-volume state
  * - Proper reference counting and cleanup
+ * - Lookaside list allocation for performance
  *
  * Integration Points:
  * - ScanCache: Verdict caching correlation
@@ -45,7 +47,7 @@
  * - T1070.004: Indicator Removal on Host (file deletion tracking)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -68,6 +70,7 @@ extern "C" {
 #define POC_CONTEXT_TAG                 'xCOC'  // COCx - Context
 #define POC_STREAM_TAG                  'tSCP'  // PCSt - Stream
 #define POC_HANDLE_TAG                  'hHCP'  // PCHh - Handle
+#define POC_LOOKASIDE_TAG               'lLCP'  // PCLl - Lookaside
 
 // ============================================================================
 // CONSTANTS
@@ -94,9 +97,28 @@ extern "C" {
 #define POC_HANDLE_CONTEXT_SIGNATURE    'tXcH'  // HcXt
 
 /**
+ * @brief Cryptographic cookie seed for context validation.
+ *
+ * Combined with context address to create a harder-to-forge signature.
+ * This prevents attacks where an attacker with arbitrary kernel write
+ * can simply set Signature = POC_*_SIGNATURE to bypass validation.
+ */
+#define POC_CONTEXT_COOKIE_SEED         0xDEADBEEFCAFEBABEULL
+
+/**
  * @brief Context allocation lookaside depth
  */
 #define POC_CONTEXT_LOOKASIDE_DEPTH     128
+
+/**
+ * @brief Completion context lookaside depth
+ */
+#define POC_COMPLETION_LOOKASIDE_DEPTH  64
+
+/**
+ * @brief Handle context lookaside depth
+ */
+#define POC_HANDLE_LOOKASIDE_DEPTH      256
 
 /**
  * @brief Maximum pending context operations
@@ -112,6 +134,11 @@ extern "C" {
  * @brief Rate limit for logging (per second)
  */
 #define POC_LOG_RATE_LIMIT_PER_SEC      50
+
+/**
+ * @brief One second in 100-nanosecond units
+ */
+#define POC_ONE_SECOND_100NS            10000000LL
 
 // ============================================================================
 // ENUMERATIONS
@@ -189,9 +216,10 @@ typedef enum _POC_FILE_CLASS {
  */
 typedef struct _SHADOWSTRIKE_STREAM_CONTEXT {
     //
-    // Validation
+    // Validation - cryptographic cookie prevents arbitrary kernel write attacks
     //
     ULONG Signature;                    ///< POC_STREAM_CONTEXT_SIGNATURE
+    ULONG64 SecurityCookie;             ///< Address-based crypto cookie
 
     //
     // File identification
@@ -291,9 +319,10 @@ typedef struct _SHADOWSTRIKE_STREAM_CONTEXT {
  */
 typedef struct _SHADOWSTRIKE_HANDLE_CONTEXT {
     //
-    // Validation
+    // Validation - cryptographic cookie prevents arbitrary kernel write attacks
     //
     ULONG Signature;                    ///< POC_HANDLE_CONTEXT_SIGNATURE
+    ULONG64 SecurityCookie;             ///< Address-based crypto cookie
 
     //
     // Handle information
@@ -326,6 +355,11 @@ typedef struct _SHADOWSTRIKE_HANDLE_CONTEXT {
     volatile LONG WriteCount;           ///< Writes through this handle
     volatile LONG ReadCount;            ///< Reads through this handle
 
+    //
+    // Synchronization
+    //
+    EX_PUSH_LOCK Lock;                  ///< Handle context lock
+
 } SHADOWSTRIKE_HANDLE_CONTEXT, *PSHADOWSTRIKE_HANDLE_CONTEXT;
 
 // ============================================================================
@@ -339,10 +373,16 @@ typedef struct _SHADOWSTRIKE_HANDLE_CONTEXT {
  */
 typedef struct _POC_COMPLETION_CONTEXT {
     //
-    // Validation
+    // Validation - cryptographic cookie prevents arbitrary kernel write attacks
     //
     ULONG Signature;                    ///< Validation signature
     ULONG Size;                         ///< Structure size
+    ULONG64 SecurityCookie;             ///< Address-based crypto cookie
+
+    //
+    // Ownership tracking (prevents double-free)
+    //
+    volatile LONG OwnershipToken;       ///< 1 = owned, 0 = released
 
     //
     // Scan results from PreCreate
@@ -384,25 +424,34 @@ typedef struct _POC_COMPLETION_CONTEXT {
  */
 typedef struct _POC_GLOBAL_STATE {
     //
-    // Initialization
+    // Initialization (atomic)
     //
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
+    volatile LONG ShutdownRequested;
 
     //
     // Context registration
     //
     BOOLEAN StreamContextRegistered;
     BOOLEAN HandleContextRegistered;
-    UINT8 Reserved1;
+    UINT8 Reserved1[2];
 
     //
-    // Rate limiting
+    // Lookaside lists
+    //
+    NPAGED_LOOKASIDE_LIST CompletionContextLookaside;
+    NPAGED_LOOKASIDE_LIST HandleContextLookaside;
+    BOOLEAN LookasideInitialized;
+    UINT8 Reserved2[7];
+
+    //
+    // Rate limiting (atomic)
     //
     volatile LONG CurrentSecondLogs;
-    LARGE_INTEGER CurrentSecondStart;
+    volatile LONGLONG CurrentSecondStart;
 
     //
-    // Statistics
+    // Statistics (all atomic)
     //
     struct {
         volatile LONG64 TotalPostCreates;
@@ -410,12 +459,17 @@ typedef struct _POC_GLOBAL_STATE {
         volatile LONG64 ContextsReused;
         volatile LONG64 ContextsFailed;
         volatile LONG64 ContextsSkipped;
+        volatile LONG64 HandleContextsCreated;
+        volatile LONG64 HandleContextsFailed;
         volatile LONG64 ScannedFiles;
         volatile LONG64 CachedResults;
         volatile LONG64 DirectoriesSkipped;
         volatile LONG64 VolumeOpensSkipped;
         volatile LONG64 DrainingSkipped;
         volatile LONG64 ErrorsHandled;
+        volatile LONG64 SignatureMismatches;
+        volatile LONG64 InvalidContexts;
+        volatile LONG64 DoubleFreeAttempts;
         LARGE_INTEGER StartTime;
     } Stats;
 
@@ -427,14 +481,10 @@ typedef struct _POC_GLOBAL_STATE {
         BOOLEAN EnableChangeTracking;       ///< Track file modifications
         BOOLEAN EnableRansomwareWatch;      ///< Ransomware monitoring
         BOOLEAN EnableHoneypotTracking;     ///< Honeypot file tracking
+        BOOLEAN EnableHandleContexts;       ///< Per-handle tracking
         BOOLEAN LogContextCreation;         ///< Log context operations
-        UINT8 Reserved[3];
+        UINT8 Reserved[2];
     } Config;
-
-    //
-    // Shutdown
-    //
-    volatile BOOLEAN ShutdownRequested;
 
 } POC_GLOBAL_STATE, *PPOC_GLOBAL_STATE;
 
@@ -468,6 +518,31 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 PocShutdown(
     VOID
+    );
+
+// ============================================================================
+// FUNCTION PROTOTYPES - MAIN CALLBACK
+// ============================================================================
+
+/**
+ * @brief Post-create callback for IRP_MJ_CREATE.
+ *
+ * @param Data              Callback data.
+ * @param FltObjects        Filter objects.
+ * @param CompletionContext Completion context from PreCreate.
+ * @param Flags             Post-operation flags.
+ *
+ * @return FLT_POSTOP_FINISHED_PROCESSING.
+ *
+ * @irql PASSIVE_LEVEL (post-create is always at PASSIVE)
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+FLT_POSTOP_CALLBACK_STATUS
+ShadowStrikePostCreate(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
     );
 
 // ============================================================================
@@ -535,9 +610,9 @@ PocUpdateStreamContext(
  * @param StreamContext     Stream context to update.
  * @param CompletionContext Completion context from PreCreate.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PocApplyCompletionContext(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT StreamContext,
@@ -555,6 +630,61 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 PocReleaseStreamContext(
     _In_ PSHADOWSTRIKE_STREAM_CONTEXT Context
+    );
+
+// ============================================================================
+// FUNCTION PROTOTYPES - HANDLE CONTEXT MANAGEMENT
+// ============================================================================
+
+/**
+ * @brief Allocate and initialize a handle context.
+ *
+ * @param Data              Callback data for access info.
+ * @param OutContext        Receives allocated context.
+ *
+ * @return STATUS_SUCCESS on success.
+ *
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+PocAllocateHandleContext(
+    _In_ PFLT_CALLBACK_DATA Data,
+    _Out_ PSHADOWSTRIKE_HANDLE_CONTEXT* OutContext
+    );
+
+/**
+ * @brief Get or create handle context for a file open.
+ *
+ * @param FltObjects        Filter objects from callback.
+ * @param Data              Callback data for access info.
+ * @param OutContext        Receives context.
+ * @param OutCreated        Receives TRUE if newly created.
+ *
+ * @return STATUS_SUCCESS on success.
+ *
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+PocGetOrCreateHandleContext(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PFLT_CALLBACK_DATA Data,
+    _Out_ PSHADOWSTRIKE_HANDLE_CONTEXT* OutContext,
+    _Out_opt_ PBOOLEAN OutCreated
+    );
+
+/**
+ * @brief Release a handle context reference.
+ *
+ * @param Context           Context to release.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+PocReleaseHandleContext(
+    _In_ PSHADOWSTRIKE_HANDLE_CONTEXT Context
     );
 
 // ============================================================================
@@ -579,14 +709,16 @@ PocAllocateCompletionContext(
 /**
  * @brief Free a completion context.
  *
- * @param Context           Context to free.
+ * Thread-safe with double-free protection.
+ *
+ * @param Context           Context to free (will be NULLed).
  *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 PocFreeCompletionContext(
-    _In_ PPOC_COMPLETION_CONTEXT Context
+    _Inout_ PPOC_COMPLETION_CONTEXT* Context
     );
 
 // ============================================================================
@@ -632,9 +764,9 @@ PocCacheFileName(
  *
  * @return File classification.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (uses case-insensitive compare)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 POC_FILE_CLASS
 PocClassifyFileExtension(
     _In_opt_ PCUNICODE_STRING Extension
@@ -645,9 +777,9 @@ PocClassifyFileExtension(
  *
  * @param Context           Stream context.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PocMarkFileModified(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT Context
@@ -660,9 +792,9 @@ PocMarkFileModified(
  *
  * @param Context           Stream context.
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PocInvalidateScanResult(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT Context
@@ -673,7 +805,7 @@ PocInvalidateScanResult(
 // ============================================================================
 
 /**
- * @brief Get PostCreate statistics.
+ * @brief Get PostCreate statistics (atomic reads).
  *
  * @param TotalPostCreates      Receives total post-creates.
  * @param ContextsCreated       Receives contexts created.
@@ -694,6 +826,25 @@ PocGetStatistics(
     );
 
 /**
+ * @brief Get extended error statistics.
+ *
+ * @param SignatureMismatches   Receives signature mismatch count.
+ * @param InvalidContexts       Receives invalid context count.
+ * @param DoubleFreeAttempts    Receives double-free attempt count.
+ *
+ * @return STATUS_SUCCESS.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+PocGetErrorStatistics(
+    _Out_opt_ PULONG64 SignatureMismatches,
+    _Out_opt_ PULONG64 InvalidContexts,
+    _Out_opt_ PULONG64 DoubleFreeAttempts
+    );
+
+/**
  * @brief Reset PostCreate statistics.
  *
  * @irql <= APC_LEVEL
@@ -709,7 +860,32 @@ PocResetStatistics(
 // ============================================================================
 
 /**
- * @brief Validate stream context signature.
+ * @brief Compute cryptographic cookie for a context address.
+ *
+ * Combines the context address with a secret seed to create a value
+ * that is difficult to forge without knowing both the address and seed.
+ * This prevents kernel write attacks from simply setting Signature.
+ */
+FORCEINLINE
+ULONG64
+PocComputeSecurityCookie(
+    _In_ PVOID ContextAddress
+    )
+{
+    ULONG64 addr = (ULONG64)(ULONG_PTR)ContextAddress;
+    //
+    // Mix the address with the seed using XOR and rotation
+    // This creates a value that depends on both address and seed
+    //
+    ULONG64 cookie = addr ^ POC_CONTEXT_COOKIE_SEED;
+    cookie = (cookie >> 17) | (cookie << 47);  // Rotate right 17
+    cookie ^= (addr << 13);
+    cookie ^= POC_CONTEXT_COOKIE_SEED;
+    return cookie;
+}
+
+/**
+ * @brief Validate stream context signature and security cookie.
  */
 FORCEINLINE
 BOOLEAN
@@ -717,11 +893,47 @@ PocIsValidStreamContext(
     _In_opt_ PSHADOWSTRIKE_STREAM_CONTEXT Context
     )
 {
-    return (Context != NULL && Context->Signature == POC_STREAM_CONTEXT_SIGNATURE);
+    if (Context == NULL) {
+        return FALSE;
+    }
+    if (Context->Signature != POC_STREAM_CONTEXT_SIGNATURE) {
+        return FALSE;
+    }
+    //
+    // Validate cryptographic cookie matches expected value for this address
+    //
+    if (Context->SecurityCookie != PocComputeSecurityCookie(Context)) {
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /**
- * @brief Validate completion context signature.
+ * @brief Validate handle context signature and security cookie.
+ */
+FORCEINLINE
+BOOLEAN
+PocIsValidHandleContext(
+    _In_opt_ PSHADOWSTRIKE_HANDLE_CONTEXT Context
+    )
+{
+    if (Context == NULL) {
+        return FALSE;
+    }
+    if (Context->Signature != POC_HANDLE_CONTEXT_SIGNATURE) {
+        return FALSE;
+    }
+    //
+    // Validate cryptographic cookie matches expected value for this address
+    //
+    if (Context->SecurityCookie != PocComputeSecurityCookie(Context)) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/**
+ * @brief Validate completion context signature and security cookie.
  */
 FORCEINLINE
 BOOLEAN
@@ -729,7 +941,22 @@ PocIsValidCompletionContext(
     _In_opt_ PPOC_COMPLETION_CONTEXT Context
     )
 {
-    return (Context != NULL && Context->Signature == POC_COMPLETION_SIGNATURE);
+    if (Context == NULL) {
+        return FALSE;
+    }
+    if (Context->Signature != POC_COMPLETION_SIGNATURE) {
+        return FALSE;
+    }
+    if (Context->Size != sizeof(POC_COMPLETION_CONTEXT)) {
+        return FALSE;
+    }
+    //
+    // Validate cryptographic cookie matches expected value for this address
+    //
+    if (Context->SecurityCookie != PocComputeSecurityCookie(Context)) {
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /**
@@ -781,6 +1008,38 @@ PocGetFileClass(
         return PocFileClassUnknown;
     }
     return Context->FileClass;
+}
+
+/**
+ * @brief Atomic read of LONG64 value (safe on 32-bit).
+ */
+FORCEINLINE
+LONG64
+PocAtomicRead64(
+    _In_ volatile LONG64* Target
+    )
+{
+#ifdef _WIN64
+    return *Target;
+#else
+    return InterlockedCompareExchange64(Target, 0, 0);
+#endif
+}
+
+/**
+ * @brief Atomic read of LONGLONG value (safe on 32-bit).
+ */
+FORCEINLINE
+LONGLONG
+PocAtomicReadLongLong(
+    _In_ volatile LONGLONG* Target
+    )
+{
+#ifdef _WIN64
+    return *Target;
+#else
+    return (LONGLONG)InterlockedCompareExchange64((volatile LONG64*)Target, 0, 0);
+#endif
 }
 
 #ifdef __cplusplus

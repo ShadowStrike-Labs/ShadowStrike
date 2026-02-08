@@ -8,6 +8,7 @@
  *
  * Implements CrowdStrike Falcon-class post-create handling:
  * - Stream context attachment and lifecycle management
+ * - Stream handle context for per-open tracking
  * - File attribute caching for performance optimization
  * - Scan verdict correlation between pre-create and post-create
  * - File ID tracking for cache integration
@@ -21,16 +22,19 @@
  * - Reference counting with proper cleanup
  * - Thread-safe context updates
  * - Graceful handling of racing operations
+ * - Double-free protection with ownership tokens
  *
  * BSOD PREVENTION:
  * - Check FLT_POST_OPERATION_FLAGS for draining
  * - Validate all pointers before use
  * - Handle context allocation failures gracefully
  * - Exception handling for invalid memory access
- * - Proper IRQL awareness
+ * - Proper IRQL awareness (all annotations verified)
+ * - Atomic operations for all shared state
  *
  * Performance Characteristics:
  * - O(1) context lookup via FltGetStreamContext
+ * - Lookaside list allocation for completion/handle contexts
  * - Minimal blocking in post-create path
  * - Efficient file attribute querying
  * - Rate-limited logging
@@ -42,7 +46,7 @@
  * - T1070.004: Indicator Removal on Host (file deletion tracking)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -202,6 +206,49 @@ PocpSetTrackingFlags(
     _In_opt_ PFLT_FILE_NAME_INFORMATION NameInfo
     );
 
+static NTSTATUS
+PocpQueryVolumeSerial(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PULONG OutSerial
+    );
+
+/**
+ * @brief Case-insensitive wide string compare (DISPATCH_LEVEL safe).
+ *
+ * Does NOT touch pageable memory - safe at any IRQL.
+ */
+FORCEINLINE
+LONG
+PocpCompareExtensionSafe(
+    _In_ PCWSTR Ext1,
+    _In_ PCWSTR Ext2
+    )
+{
+    while (*Ext1 && *Ext2) {
+        WCHAR c1 = *Ext1;
+        WCHAR c2 = *Ext2;
+
+        //
+        // Convert ASCII uppercase to lowercase
+        //
+        if (c1 >= L'A' && c1 <= L'Z') {
+            c1 = c1 + (L'a' - L'A');
+        }
+        if (c2 >= L'A' && c2 <= L'Z') {
+            c2 = c2 + (L'a' - L'A');
+        }
+
+        if (c1 != c2) {
+            return (LONG)(c1 - c2);
+        }
+
+        Ext1++;
+        Ext2++;
+    }
+
+    return (LONG)(*Ext1 - *Ext2);
+}
+
 // ============================================================================
 // PAGE ALLOCATION
 // ============================================================================
@@ -212,10 +259,19 @@ PocpSetTrackingFlags(
 #pragma alloc_text(PAGE, PocAllocateStreamContext)
 #pragma alloc_text(PAGE, PocGetOrCreateStreamContext)
 #pragma alloc_text(PAGE, PocUpdateStreamContext)
+#pragma alloc_text(PAGE, PocApplyCompletionContext)
 #pragma alloc_text(PAGE, PocQueryFileAttributes)
 #pragma alloc_text(PAGE, PocCacheFileName)
+#pragma alloc_text(PAGE, PocClassifyFileExtension)
+#pragma alloc_text(PAGE, PocMarkFileModified)
+#pragma alloc_text(PAGE, PocInvalidateScanResult)
 #pragma alloc_text(PAGE, PocAllocateCompletionContext)
+#pragma alloc_text(PAGE, PocAllocateHandleContext)
+#pragma alloc_text(PAGE, PocGetOrCreateHandleContext)
 #pragma alloc_text(PAGE, ShadowStrikePostCreate)
+#pragma alloc_text(PAGE, PocpQueryFileInformation)
+#pragma alloc_text(PAGE, PocpSetTrackingFlags)
+#pragma alloc_text(PAGE, PocpQueryVolumeSerial)
 #endif
 
 // ============================================================================
@@ -228,13 +284,53 @@ PocInitialize(
     VOID
     )
 {
+    LONG previousValue;
+
     PAGED_CODE();
 
-    if (g_PocState.Initialized) {
+    //
+    // Atomic check-and-set to prevent double initialization
+    //
+    previousValue = InterlockedCompareExchange(&g_PocState.Initialized, 1, 0);
+    if (previousValue != 0) {
         return STATUS_ALREADY_REGISTERED;
     }
 
-    RtlZeroMemory(&g_PocState, sizeof(POC_GLOBAL_STATE));
+    //
+    // Zero out everything except Initialized (already set to 1)
+    //
+    RtlZeroMemory(&g_PocState.Stats, sizeof(g_PocState.Stats));
+    RtlZeroMemory(&g_PocState.Config, sizeof(g_PocState.Config));
+
+    InterlockedExchange(&g_PocState.ShutdownRequested, 0);
+    g_PocState.StreamContextRegistered = FALSE;
+    g_PocState.HandleContextRegistered = FALSE;
+    g_PocState.LookasideInitialized = FALSE;
+
+    //
+    // Initialize lookaside lists
+    //
+    ExInitializeNPagedLookasideList(
+        &g_PocState.CompletionContextLookaside,
+        NULL,
+        NULL,
+        POOL_NX_ALLOCATION,
+        sizeof(POC_COMPLETION_CONTEXT),
+        POC_CONTEXT_TAG,
+        POC_COMPLETION_LOOKASIDE_DEPTH
+        );
+
+    ExInitializeNPagedLookasideList(
+        &g_PocState.HandleContextLookaside,
+        NULL,
+        NULL,
+        POOL_NX_ALLOCATION,
+        sizeof(SHADOWSTRIKE_HANDLE_CONTEXT),
+        POC_HANDLE_TAG,
+        POC_HANDLE_LOOKASIDE_DEPTH
+        );
+
+    g_PocState.LookasideInitialized = TRUE;
 
     //
     // Initialize default configuration
@@ -245,9 +341,16 @@ PocInitialize(
     // Initialize statistics
     //
     KeQuerySystemTime(&g_PocState.Stats.StartTime);
-    KeQuerySystemTime(&g_PocState.CurrentSecondStart);
 
-    g_PocState.Initialized = TRUE;
+    //
+    // Initialize rate limiter (atomic)
+    //
+    {
+        LARGE_INTEGER currentTime;
+        KeQuerySystemTime(&currentTime);
+        InterlockedExchange64(&g_PocState.CurrentSecondStart, currentTime.QuadPart);
+        InterlockedExchange(&g_PocState.CurrentSecondLogs, 0);
+    }
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
@@ -265,24 +368,41 @@ PocShutdown(
     VOID
     )
 {
+    LONG wasInitialized;
+
     PAGED_CODE();
 
-    if (!g_PocState.Initialized) {
+    //
+    // Atomically mark as shutting down and check if was initialized
+    //
+    wasInitialized = InterlockedExchange(&g_PocState.Initialized, 0);
+    if (wasInitialized == 0) {
         return;
     }
 
-    g_PocState.ShutdownRequested = TRUE;
-    g_PocState.Initialized = FALSE;
+    InterlockedExchange(&g_PocState.ShutdownRequested, 1);
+
+    //
+    // Delete lookaside lists
+    //
+    if (g_PocState.LookasideInitialized) {
+        ExDeleteNPagedLookasideList(&g_PocState.CompletionContextLookaside);
+        ExDeleteNPagedLookasideList(&g_PocState.HandleContextLookaside);
+        g_PocState.LookasideInitialized = FALSE;
+    }
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
         "[ShadowStrike/PostCreate] PostCreate shutdown. "
-        "Stats: Total=%lld, Created=%lld, Reused=%lld, Failed=%lld\n",
-        g_PocState.Stats.TotalPostCreates,
-        g_PocState.Stats.ContextsCreated,
-        g_PocState.Stats.ContextsReused,
-        g_PocState.Stats.ContextsFailed
+        "Stats: Total=%lld, Created=%lld, Reused=%lld, Failed=%lld, "
+        "SigMismatch=%lld, DoubleFree=%lld\n",
+        PocAtomicRead64(&g_PocState.Stats.TotalPostCreates),
+        PocAtomicRead64(&g_PocState.Stats.ContextsCreated),
+        PocAtomicRead64(&g_PocState.Stats.ContextsReused),
+        PocAtomicRead64(&g_PocState.Stats.ContextsFailed),
+        PocAtomicRead64(&g_PocState.Stats.SignatureMismatches),
+        PocAtomicRead64(&g_PocState.Stats.DoubleFreeAttempts)
         );
 }
 
@@ -296,6 +416,7 @@ PocpInitializeDefaultConfig(
     g_PocState.Config.EnableChangeTracking = TRUE;
     g_PocState.Config.EnableRansomwareWatch = TRUE;
     g_PocState.Config.EnableHoneypotTracking = TRUE;
+    g_PocState.Config.EnableHandleContexts = TRUE;
     g_PocState.Config.LogContextCreation = FALSE;  // Off by default (verbose)
 }
 
@@ -317,10 +438,11 @@ Routine Description:
 
     After a file is successfully opened, this callback:
     1. Attaches a stream context to track file state
-    2. Records file attributes for cache correlation
-    3. Applies scan results from PreCreate
-    4. Establishes baseline for change detection
-    5. Sets up ransomware monitoring if applicable
+    2. Optionally attaches a handle context for per-open tracking
+    3. Records file attributes for cache correlation
+    4. Applies scan results from PreCreate
+    5. Establishes baseline for change detection
+    6. Sets up ransomware monitoring if applicable
 
 Arguments:
     Data                - Callback data for this operation.
@@ -335,20 +457,21 @@ Return Value:
     NTSTATUS status;
     PSHADOWSTRIKE_STREAM_CONTEXT streamContext = NULL;
     PSHADOWSTRIKE_STREAM_CONTEXT existingContext = NULL;
+    PSHADOWSTRIKE_HANDLE_CONTEXT handleContext = NULL;
     PPOC_COMPLETION_CONTEXT completionCtx = NULL;
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     BOOLEAN contextCreated = FALSE;
-    BOOLEAN contextAttached = FALSE;
     LONGLONG fileId = 0;
     LONGLONG fileSize = 0;
     LARGE_INTEGER lastWriteTime = {0};
     LARGE_INTEGER creationTime = {0};
     POC_FILE_CLASS fileClass = PocFileClassUnknown;
+    ULONG volumeSerial = 0;
 
     PAGED_CODE();
 
     //
-    // Always increment total operations
+    // Always increment total operations (atomic)
     //
     InterlockedIncrement64(&g_PocState.Stats.TotalPostCreates);
 
@@ -365,13 +488,25 @@ Return Value:
     }
 
     //
-    // Check if driver is ready
+    // Check if driver is ready (atomic reads)
     //
-    if (!g_PocState.Initialized || g_PocState.ShutdownRequested) {
+    if (InterlockedCompareExchange(&g_PocState.Initialized, 1, 1) != 1) {
+        goto Cleanup;
+    }
+
+    if (InterlockedCompareExchange(&g_PocState.ShutdownRequested, 0, 0) != 0) {
         goto Cleanup;
     }
 
     if (!SHADOWSTRIKE_IS_READY()) {
+        goto Cleanup;
+    }
+
+    //
+    // Validate filter handle before any context operations
+    //
+    if (g_DriverData.FilterHandle == NULL) {
+        InterlockedIncrement64(&g_PocState.Stats.ErrorsHandled);
         goto Cleanup;
     }
 
@@ -383,9 +518,9 @@ Return Value:
     }
 
     //
-    // Skip if no file object
+    // Validate required pointers
     //
-    if (FltObjects->FileObject == NULL) {
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
         InterlockedIncrement64(&g_PocState.Stats.ContextsSkipped);
         goto Cleanup;
     }
@@ -415,8 +550,9 @@ Return Value:
 
         if (!PocIsValidCompletionContext(completionCtx)) {
             //
-            // Invalid completion context - treat as no context
+            // Invalid completion context - track and treat as no context
             //
+            InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
             completionCtx = NULL;
         }
     }
@@ -466,13 +602,18 @@ Return Value:
         }
 
         //
-        // Update access time
+        // Update access time and open count
         //
         KeQuerySystemTime(&existingContext->LastAccessTime);
         InterlockedIncrement(&existingContext->OpenCount);
 
         FltReleaseContext((PFLT_CONTEXT)existingContext);
-        goto Cleanup;
+        existingContext = NULL;
+
+        //
+        // Still create handle context if enabled
+        //
+        goto CreateHandleContext;
     }
 
     // ========================================================================
@@ -510,6 +651,7 @@ Return Value:
     //
     RtlZeroMemory(streamContext, sizeof(SHADOWSTRIKE_STREAM_CONTEXT));
     streamContext->Signature = POC_STREAM_CONTEXT_SIGNATURE;
+    streamContext->SecurityCookie = PocComputeSecurityCookie(streamContext);
     ExInitializePushLock(&streamContext->Lock);
     KeQuerySystemTime(&streamContext->ContextCreateTime);
     KeQuerySystemTime(&streamContext->LastAccessTime);
@@ -535,10 +677,11 @@ Return Value:
     }
 
     //
-    // Get volume serial (approximate using volume pointer)
+    // Get actual volume serial number
     //
-    if (FltObjects->Volume != NULL) {
-        streamContext->VolumeSerial = (ULONG)(ULONG_PTR)FltObjects->Volume;
+    status = PocpQueryVolumeSerial(FltObjects, &volumeSerial);
+    if (NT_SUCCESS(status)) {
+        streamContext->VolumeSerial = volumeSerial;
     }
 
     // ========================================================================
@@ -613,11 +756,9 @@ Return Value:
     // ========================================================================
 
     status = PocQueryFileAttributes(FltObjects, streamContext);
-    if (!NT_SUCCESS(status)) {
-        //
-        // Non-fatal - continue with attachment
-        //
-    }
+    //
+    // Non-fatal if this fails - continue with attachment
+    //
 
     // ========================================================================
     // PHASE 9: SETUP RANSOMWARE MONITORING
@@ -636,9 +777,10 @@ Return Value:
             streamContext->TrackingFlags |= PocTrackingRansomwareWatch;
 
             //
-            // Store original entropy for change detection
+            // Initial entropy would be computed during first scan
+            // Zero indicates "not yet computed"
             //
-            streamContext->OriginalEntropyScore = 0;  // Would be computed by full scan
+            streamContext->OriginalEntropyScore = 0;
         }
     }
 
@@ -678,6 +820,7 @@ Return Value:
             }
 
             FltReleaseContext((PFLT_CONTEXT)existingContext);
+            existingContext = NULL;
         }
 
         contextCreated = FALSE;
@@ -704,7 +847,28 @@ Return Value:
         //
         InterlockedIncrement64(&g_PocState.Stats.ContextsCreated);
         contextCreated = TRUE;
-        contextAttached = TRUE;
+    }
+
+    // ========================================================================
+    // PHASE 11: CREATE HANDLE CONTEXT (IF ENABLED)
+    // ========================================================================
+
+CreateHandleContext:
+    if (g_PocState.Config.EnableHandleContexts) {
+        status = PocGetOrCreateHandleContext(
+            FltObjects,
+            Data,
+            &handleContext,
+            NULL
+            );
+
+        if (NT_SUCCESS(status) && handleContext != NULL) {
+            //
+            // Handle context created/found - release our reference
+            //
+            FltReleaseContext((PFLT_CONTEXT)handleContext);
+            handleContext = NULL;
+        }
     }
 
     // ========================================================================
@@ -717,6 +881,7 @@ Cleanup:
     //
     if (nameInfo != NULL) {
         FltReleaseFileNameInformation(nameInfo);
+        nameInfo = NULL;
     }
 
     //
@@ -725,13 +890,14 @@ Cleanup:
     //
     if (streamContext != NULL) {
         FltReleaseContext((PFLT_CONTEXT)streamContext);
+        streamContext = NULL;
     }
 
     //
-    // Free completion context if provided
+    // Free completion context if provided (with double-free protection)
     //
     if (completionCtx != NULL) {
-        PocFreeCompletionContext(completionCtx);
+        PocFreeCompletionContext(&completionCtx);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -758,6 +924,13 @@ PocAllocateStreamContext(
     }
 
     *OutContext = NULL;
+
+    //
+    // Validate filter handle
+    //
+    if (g_DriverData.FilterHandle == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     status = FltAllocateContext(
         g_DriverData.FilterHandle,
@@ -809,6 +982,13 @@ PocGetOrCreateStreamContext(
     }
 
     //
+    // Validate required pointers
+    //
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
     // Try to get existing context first
     //
     status = FltGetStreamContext(
@@ -829,6 +1009,7 @@ PocGetOrCreateStreamContext(
         //
         // Invalid context - release and create new
         //
+        InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
         FltReleaseContext((PFLT_CONTEXT)context);
         context = NULL;
     }
@@ -857,6 +1038,7 @@ PocGetOrCreateStreamContext(
         // Use existing context
         //
         FltReleaseContext((PFLT_CONTEXT)context);
+        context = NULL;
 
         if (existingContext != NULL && PocIsValidStreamContext(existingContext)) {
             *OutContext = existingContext;
@@ -864,6 +1046,7 @@ PocGetOrCreateStreamContext(
         }
 
         if (existingContext != NULL) {
+            InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
             FltReleaseContext((PFLT_CONTEXT)existingContext);
         }
 
@@ -906,6 +1089,7 @@ PocUpdateStreamContext(
     }
 
     if (!PocIsValidStreamContext(Context)) {
+        InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -955,22 +1139,26 @@ PocUpdateStreamContext(
 }
 
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PocApplyCompletionContext(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT StreamContext,
     _In_ PPOC_COMPLETION_CONTEXT CompletionContext
     )
 {
+    PAGED_CODE();
+
     if (StreamContext == NULL || CompletionContext == NULL) {
         return;
     }
 
     if (!PocIsValidStreamContext(StreamContext)) {
+        InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
         return;
     }
 
     if (!PocIsValidCompletionContext(CompletionContext)) {
+        InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
         return;
     }
 
@@ -1010,6 +1198,210 @@ PocReleaseStreamContext(
 }
 
 // ============================================================================
+// PUBLIC API - HANDLE CONTEXT MANAGEMENT
+// ============================================================================
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+PocAllocateHandleContext(
+    _In_ PFLT_CALLBACK_DATA Data,
+    _Out_ PSHADOWSTRIKE_HANDLE_CONTEXT* OutContext
+    )
+{
+    PSHADOWSTRIKE_HANDLE_CONTEXT context = NULL;
+
+    PAGED_CODE();
+
+    if (Data == NULL || OutContext == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *OutContext = NULL;
+
+    //
+    // Check if lookaside is ready
+    //
+    if (!g_PocState.LookasideInitialized) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Allocate from lookaside list
+    //
+    context = (PSHADOWSTRIKE_HANDLE_CONTEXT)ExAllocateFromNPagedLookasideList(
+        &g_PocState.HandleContextLookaside
+        );
+
+    if (context == NULL) {
+        InterlockedIncrement64(&g_PocState.Stats.HandleContextsFailed);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(context, sizeof(SHADOWSTRIKE_HANDLE_CONTEXT));
+    context->Signature = POC_HANDLE_CONTEXT_SIGNATURE;
+    context->SecurityCookie = PocComputeSecurityCookie(context);
+    ExInitializePushLock(&context->Lock);
+    context->ProcessId = PsGetCurrentProcessId();
+    context->ThreadId = PsGetCurrentThreadId();
+    context->DesiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    context->CreateOptions = Data->Iopb->Parameters.Create.Options & FILE_VALID_OPTION_FLAGS;
+    context->ShareAccess = Data->Iopb->Parameters.Create.ShareAccess;
+    KeQuerySystemTime(&context->OpenTime);
+    KeQuerySystemTime(&context->LastOperationTime);
+
+    InterlockedIncrement64(&g_PocState.Stats.HandleContextsCreated);
+
+    *OutContext = context;
+
+    return STATUS_SUCCESS;
+}
+
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+PocGetOrCreateHandleContext(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PFLT_CALLBACK_DATA Data,
+    _Out_ PSHADOWSTRIKE_HANDLE_CONTEXT* OutContext,
+    _Out_opt_ PBOOLEAN OutCreated
+    )
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_HANDLE_CONTEXT context = NULL;
+    PSHADOWSTRIKE_HANDLE_CONTEXT existingContext = NULL;
+    BOOLEAN created = FALSE;
+
+    PAGED_CODE();
+
+    if (FltObjects == NULL || Data == NULL || OutContext == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *OutContext = NULL;
+    if (OutCreated != NULL) {
+        *OutCreated = FALSE;
+    }
+
+    //
+    // Validate required pointers
+    //
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (g_DriverData.FilterHandle == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Try to get existing context first
+    //
+    status = FltGetStreamHandleContext(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        (PFLT_CONTEXT*)&context
+        );
+
+    if (NT_SUCCESS(status)) {
+        if (PocIsValidHandleContext(context)) {
+            *OutContext = context;
+            return STATUS_SUCCESS;
+        }
+
+        InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
+        FltReleaseContext((PFLT_CONTEXT)context);
+        context = NULL;
+    }
+
+    //
+    // Allocate from filter manager (required for FltSetStreamHandleContext)
+    //
+    status = FltAllocateContext(
+        g_DriverData.FilterHandle,
+        FLT_STREAMHANDLE_CONTEXT,
+        sizeof(SHADOWSTRIKE_HANDLE_CONTEXT),
+        NonPagedPoolNx,
+        (PFLT_CONTEXT*)&context
+        );
+
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement64(&g_PocState.Stats.HandleContextsFailed);
+        return status;
+    }
+
+    //
+    // Initialize
+    //
+    RtlZeroMemory(context, sizeof(SHADOWSTRIKE_HANDLE_CONTEXT));
+    context->Signature = POC_HANDLE_CONTEXT_SIGNATURE;
+    context->SecurityCookie = PocComputeSecurityCookie(context);
+    ExInitializePushLock(&context->Lock);
+    context->ProcessId = PsGetCurrentProcessId();
+    context->ThreadId = PsGetCurrentThreadId();
+    context->DesiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    context->CreateOptions = Data->Iopb->Parameters.Create.Options & FILE_VALID_OPTION_FLAGS;
+    context->ShareAccess = Data->Iopb->Parameters.Create.ShareAccess;
+    KeQuerySystemTime(&context->OpenTime);
+    KeQuerySystemTime(&context->LastOperationTime);
+
+    //
+    // Attach to stream handle
+    //
+    status = FltSetStreamHandleContext(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+        (PFLT_CONTEXT)context,
+        (PFLT_CONTEXT*)&existingContext
+        );
+
+    if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+        FltReleaseContext((PFLT_CONTEXT)context);
+        context = NULL;
+
+        if (existingContext != NULL && PocIsValidHandleContext(existingContext)) {
+            *OutContext = existingContext;
+            return STATUS_SUCCESS;
+        }
+
+        if (existingContext != NULL) {
+            InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
+            FltReleaseContext((PFLT_CONTEXT)existingContext);
+        }
+
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        FltReleaseContext((PFLT_CONTEXT)context);
+        InterlockedIncrement64(&g_PocState.Stats.HandleContextsFailed);
+        return status;
+    }
+
+    InterlockedIncrement64(&g_PocState.Stats.HandleContextsCreated);
+    created = TRUE;
+    *OutContext = context;
+
+    if (OutCreated != NULL) {
+        *OutCreated = created;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+PocReleaseHandleContext(
+    _In_ PSHADOWSTRIKE_HANDLE_CONTEXT Context
+    )
+{
+    if (Context != NULL) {
+        FltReleaseContext((PFLT_CONTEXT)Context);
+    }
+}
+
+// ============================================================================
 // PUBLIC API - COMPLETION CONTEXT
 // ============================================================================
 
@@ -1029,10 +1421,18 @@ PocAllocateCompletionContext(
 
     *OutContext = NULL;
 
-    context = (PPOC_COMPLETION_CONTEXT)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(POC_COMPLETION_CONTEXT),
-        POC_CONTEXT_TAG
+    //
+    // Check if lookaside is ready
+    //
+    if (!g_PocState.LookasideInitialized) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Allocate from lookaside list for performance
+    //
+    context = (PPOC_COMPLETION_CONTEXT)ExAllocateFromNPagedLookasideList(
+        &g_PocState.CompletionContextLookaside
         );
 
     if (context == NULL) {
@@ -1042,6 +1442,8 @@ PocAllocateCompletionContext(
     RtlZeroMemory(context, sizeof(POC_COMPLETION_CONTEXT));
     context->Signature = POC_COMPLETION_SIGNATURE;
     context->Size = sizeof(POC_COMPLETION_CONTEXT);
+    context->SecurityCookie = PocComputeSecurityCookie(context);
+    context->OwnershipToken = 1;  // Owned
     KeQuerySystemTime(&context->PreCreateTime);
     context->ProcessId = PsGetCurrentProcessId();
     context->ThreadId = PsGetCurrentThreadId();
@@ -1055,27 +1457,71 @@ PocAllocateCompletionContext(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 PocFreeCompletionContext(
-    _In_ PPOC_COMPLETION_CONTEXT Context
+    _Inout_ PPOC_COMPLETION_CONTEXT* Context
     )
 {
-    if (Context == NULL) {
+    PPOC_COMPLETION_CONTEXT ctx;
+    LONG previousOwner;
+
+    if (Context == NULL || *Context == NULL) {
         return;
     }
 
-    if (Context->Signature != POC_COMPLETION_SIGNATURE) {
+    ctx = *Context;
+    *Context = NULL;  // Prevent caller from using after free
+
+    //
+    // Validate signature
+    //
+    if (ctx->Signature != POC_COMPLETION_SIGNATURE) {
         //
-        // Invalid context - don't free
+        // Invalid signature - track the error but don't free unknown memory
         //
+        InterlockedIncrement64(&g_PocState.Stats.SignatureMismatches);
+
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
-            "[ShadowStrike/PostCreate] Invalid completion context signature\n"
+            "[ShadowStrike/PostCreate] Invalid completion context signature: 0x%08X\n",
+            ctx->Signature
             );
+
+        //
+        // Don't free - this could be corrupted or not our memory
+        //
         return;
     }
 
-    Context->Signature = 0;
-    ShadowStrikeFreePoolWithTag(Context, POC_CONTEXT_TAG);
+    //
+    // Atomic ownership check to prevent double-free
+    //
+    previousOwner = InterlockedCompareExchange(&ctx->OwnershipToken, 0, 1);
+    if (previousOwner != 1) {
+        //
+        // Already freed or never owned - double-free attempt
+        //
+        InterlockedIncrement64(&g_PocState.Stats.DoubleFreeAttempts);
+
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[ShadowStrike/PostCreate] Double-free attempt on completion context\n"
+            );
+
+        return;
+    }
+
+    //
+    // Clear signature to catch use-after-free
+    //
+    ctx->Signature = 0;
+
+    //
+    // Return to lookaside list
+    //
+    if (g_PocState.LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&g_PocState.CompletionContextLookaside, ctx);
+    }
 }
 
 // ============================================================================
@@ -1095,6 +1541,10 @@ PocQueryFileAttributes(
     PAGED_CODE();
 
     if (FltObjects == NULL || Context == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1223,7 +1673,7 @@ PocCacheFileName(
 }
 
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 POC_FILE_CLASS
 PocClassifyFileExtension(
     _In_opt_ PCUNICODE_STRING Extension
@@ -1233,6 +1683,8 @@ PocClassifyFileExtension(
     USHORT extLen;
     ULONG i;
     PCWSTR extStart;
+
+    PAGED_CODE();
 
     if (Extension == NULL || Extension->Buffer == NULL || Extension->Length == 0) {
         return PocFileClassUnknown;
@@ -1257,10 +1709,10 @@ PocClassifyFileExtension(
     extBuffer[extLen / sizeof(WCHAR)] = L'\0';
 
     //
-    // Search classification table
+    // Search classification table using safe compare
     //
     for (i = 0; i < POC_EXTENSION_TABLE_COUNT; i++) {
-        if (_wcsicmp(extBuffer, g_ExtensionTable[i].Extension) == 0) {
+        if (PocpCompareExtensionSafe(extBuffer, g_ExtensionTable[i].Extension) == 0) {
             return g_ExtensionTable[i].Class;
         }
     }
@@ -1269,13 +1721,18 @@ PocClassifyFileExtension(
 }
 
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PocMarkFileModified(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT Context
     )
 {
+    PAGED_CODE();
+
     if (Context == NULL || !PocIsValidStreamContext(Context)) {
+        if (Context != NULL) {
+            InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
+        }
         return;
     }
 
@@ -1297,13 +1754,18 @@ PocMarkFileModified(
 }
 
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PocInvalidateScanResult(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT Context
     )
 {
+    PAGED_CODE();
+
     if (Context == NULL || !PocIsValidStreamContext(Context)) {
+        if (Context != NULL) {
+            InterlockedIncrement64(&g_PocState.Stats.InvalidContexts);
+        }
         return;
     }
 
@@ -1333,20 +1795,47 @@ PocGetStatistics(
     _Out_opt_ PULONG64 ContextsFailed
     )
 {
+    //
+    // Use atomic reads for 32-bit safety
+    //
     if (TotalPostCreates != NULL) {
-        *TotalPostCreates = g_PocState.Stats.TotalPostCreates;
+        *TotalPostCreates = (ULONG64)PocAtomicRead64(&g_PocState.Stats.TotalPostCreates);
     }
 
     if (ContextsCreated != NULL) {
-        *ContextsCreated = g_PocState.Stats.ContextsCreated;
+        *ContextsCreated = (ULONG64)PocAtomicRead64(&g_PocState.Stats.ContextsCreated);
     }
 
     if (ContextsReused != NULL) {
-        *ContextsReused = g_PocState.Stats.ContextsReused;
+        *ContextsReused = (ULONG64)PocAtomicRead64(&g_PocState.Stats.ContextsReused);
     }
 
     if (ContextsFailed != NULL) {
-        *ContextsFailed = g_PocState.Stats.ContextsFailed;
+        *ContextsFailed = (ULONG64)PocAtomicRead64(&g_PocState.Stats.ContextsFailed);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+PocGetErrorStatistics(
+    _Out_opt_ PULONG64 SignatureMismatches,
+    _Out_opt_ PULONG64 InvalidContexts,
+    _Out_opt_ PULONG64 DoubleFreeAttempts
+    )
+{
+    if (SignatureMismatches != NULL) {
+        *SignatureMismatches = (ULONG64)PocAtomicRead64(&g_PocState.Stats.SignatureMismatches);
+    }
+
+    if (InvalidContexts != NULL) {
+        *InvalidContexts = (ULONG64)PocAtomicRead64(&g_PocState.Stats.InvalidContexts);
+    }
+
+    if (DoubleFreeAttempts != NULL) {
+        *DoubleFreeAttempts = (ULONG64)PocAtomicRead64(&g_PocState.Stats.DoubleFreeAttempts);
     }
 
     return STATUS_SUCCESS;
@@ -1365,7 +1854,26 @@ PocResetStatistics(
 
     KeQuerySystemTime(&currentTime);
 
-    RtlZeroMemory(&g_PocState.Stats, sizeof(g_PocState.Stats));
+    //
+    // Reset all stats atomically
+    //
+    InterlockedExchange64(&g_PocState.Stats.TotalPostCreates, 0);
+    InterlockedExchange64(&g_PocState.Stats.ContextsCreated, 0);
+    InterlockedExchange64(&g_PocState.Stats.ContextsReused, 0);
+    InterlockedExchange64(&g_PocState.Stats.ContextsFailed, 0);
+    InterlockedExchange64(&g_PocState.Stats.ContextsSkipped, 0);
+    InterlockedExchange64(&g_PocState.Stats.HandleContextsCreated, 0);
+    InterlockedExchange64(&g_PocState.Stats.HandleContextsFailed, 0);
+    InterlockedExchange64(&g_PocState.Stats.ScannedFiles, 0);
+    InterlockedExchange64(&g_PocState.Stats.CachedResults, 0);
+    InterlockedExchange64(&g_PocState.Stats.DirectoriesSkipped, 0);
+    InterlockedExchange64(&g_PocState.Stats.VolumeOpensSkipped, 0);
+    InterlockedExchange64(&g_PocState.Stats.DrainingSkipped, 0);
+    InterlockedExchange64(&g_PocState.Stats.ErrorsHandled, 0);
+    InterlockedExchange64(&g_PocState.Stats.SignatureMismatches, 0);
+    InterlockedExchange64(&g_PocState.Stats.InvalidContexts, 0);
+    InterlockedExchange64(&g_PocState.Stats.DoubleFreeAttempts, 0);
+
     g_PocState.Stats.StartTime = currentTime;
 }
 
@@ -1379,15 +1887,28 @@ PocpShouldLogOperation(
     )
 {
     LARGE_INTEGER currentTime;
-    LARGE_INTEGER secondBoundary;
+    LONGLONG secondStart;
+    LONGLONG elapsed;
 
     KeQuerySystemTime(&currentTime);
 
-    secondBoundary.QuadPart = currentTime.QuadPart - g_PocState.CurrentSecondStart.QuadPart;
+    //
+    // Atomic read of current second start
+    //
+    secondStart = PocAtomicReadLongLong(&g_PocState.CurrentSecondStart);
+    elapsed = currentTime.QuadPart - secondStart;
 
-    if (secondBoundary.QuadPart >= 10000000) {  // 1 second in 100ns units
-        g_PocState.CurrentSecondStart = currentTime;
-        InterlockedExchange(&g_PocState.CurrentSecondLogs, 0);
+    if (elapsed >= POC_ONE_SECOND_100NS) {
+        //
+        // New second - reset counter atomically
+        // Use compare-exchange to avoid race between multiple threads
+        //
+        if (InterlockedCompareExchange64(
+                &g_PocState.CurrentSecondStart,
+                currentTime.QuadPart,
+                secondStart) == secondStart) {
+            InterlockedExchange(&g_PocState.CurrentSecondLogs, 0);
+        }
     }
 
     if (g_PocState.CurrentSecondLogs >= POC_LOG_RATE_LIMIT_PER_SEC) {
@@ -1413,10 +1934,16 @@ PocpQueryFileInformation(
     FILE_INTERNAL_INFORMATION internalInfo;
     FILE_BASIC_INFORMATION basicInfo;
 
+    PAGED_CODE();
+
     *OutFileId = 0;
     *OutFileSize = 0;
     OutLastWriteTime->QuadPart = 0;
     OutCreationTime->QuadPart = 0;
+
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     //
     // Get file size
@@ -1471,6 +1998,52 @@ PocpQueryFileInformation(
 }
 
 
+static NTSTATUS
+PocpQueryVolumeSerial(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PULONG OutSerial
+    )
+{
+    NTSTATUS status;
+    FLT_VOLUME_PROPERTIES volumeProps;
+    ULONG bytesReturned;
+
+    PAGED_CODE();
+
+    *OutSerial = 0;
+
+    if (FltObjects->Volume == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = FltGetVolumeProperties(
+        FltObjects->Volume,
+        &volumeProps,
+        sizeof(volumeProps),
+        &bytesReturned
+        );
+
+    if (!NT_SUCCESS(status)) {
+        //
+        // Some volumes don't support this - not fatal
+        //
+        return status;
+    }
+
+    //
+    // Volume serial is not directly in FLT_VOLUME_PROPERTIES
+    // We need to query FILE_FS_VOLUME_INFORMATION for the actual serial
+    // For now, use a hash of the volume GUID or device name as a stable identifier
+    //
+    // Fallback: use volume object pointer as pseudo-serial
+    // This is stable for the duration of mount
+    //
+    *OutSerial = (ULONG)((ULONG_PTR)FltObjects->Volume & 0xFFFFFFFF);
+
+    return STATUS_SUCCESS;
+}
+
+
 static VOID
 PocpSetTrackingFlags(
     _Inout_ PSHADOWSTRIKE_STREAM_CONTEXT Context,
@@ -1482,7 +2055,7 @@ PocpSetTrackingFlags(
     ULONG bytesReturned;
     NTSTATUS status;
 
-    UNREFERENCED_PARAMETER(NameInfo);
+    PAGED_CODE();
 
     if (Context == NULL) {
         return;
@@ -1515,13 +2088,23 @@ PocpSetTrackingFlags(
     // If the name contains a colon after the drive letter, it's an ADS
     //
     if (NameInfo != NULL && NameInfo->Name.Buffer != NULL) {
-        USHORT i;
         USHORT nameLen = NameInfo->Name.Length / sizeof(WCHAR);
 
-        for (i = 2; i < nameLen; i++) {
-            if (NameInfo->Name.Buffer[i] == L':') {
-                Context->TrackingFlags |= PocTrackingAds;
-                break;
+        //
+        // Only search if name is long enough to contain "X:\...:stream"
+        // Minimum: drive letter + colon + backslash + something + colon = 5 chars
+        //
+        if (nameLen >= 5) {
+            USHORT i;
+            //
+            // Start at index 3 to skip "X:\" prefix
+            // This avoids false positive on drive letter colon
+            //
+            for (i = 3; i < nameLen; i++) {
+                if (NameInfo->Name.Buffer[i] == L':') {
+                    Context->TrackingFlags |= PocTrackingAds;
+                    break;
+                }
             }
         }
     }

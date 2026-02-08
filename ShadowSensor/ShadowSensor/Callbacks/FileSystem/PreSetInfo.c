@@ -45,12 +45,23 @@
  * - Lock-free statistics using InterlockedXxx
  * - Configurable thresholds for detection
  *
+ * Security Fixes (v2.1.0):
+ * - Fixed reference counting race condition in context management
+ * - Fixed unvalidated user-mode buffer access vulnerabilities
+ * - Fixed initialization race condition
+ * - Fixed shutdown race with outstanding operations
+ * - Fixed TOCTOU in stale context cleanup
+ * - Fixed non-atomic flag updates
+ * - Implemented proper path matching for sensitive files
+ * - Implemented telemetry event dispatch
+ *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
+#include "PreSetInfo.h"
 #include "FileSystemCallbacks.h"
 #include "../../Core/Globals.h"
 #include "../../Shared/SharedDefs.h"
@@ -72,9 +83,14 @@
 #define PSI_POOL_TAG                        'iSPS'
 
 /**
- * @brief Maximum file path length for comparison
+ * @brief Maximum file path length for comparison (in bytes)
  */
-#define PSI_MAX_PATH_LENGTH                 32768
+#define PSI_MAX_PATH_BYTES                  (32768 * sizeof(WCHAR))
+
+/**
+ * @brief Maximum allowed buffer allocation for rename info
+ */
+#define PSI_MAX_RENAME_BUFFER_SIZE          (65535)
 
 /**
  * @brief Ransomware detection: renames per second threshold
@@ -121,44 +137,77 @@
  */
 #define PSI_CONTEXT_EXPIRY_TIME             (5LL * 60 * 10000000)
 
+/**
+ * @brief Shutdown wait timeout (10 seconds in 100ns)
+ */
+#define PSI_SHUTDOWN_WAIT_TIMEOUT           (10LL * 10000000)
+
+/**
+ * @brief Shutdown poll interval (10ms in 100ns)
+ */
+#define PSI_SHUTDOWN_POLL_INTERVAL          (10 * 10000)
+
 // ============================================================================
 // SENSITIVE FILE PATTERNS
 // ============================================================================
 
 /**
- * @brief Sensitive system files that should not be deleted/renamed
+ * @brief Sensitive system file paths (exact suffix match)
  */
-static const PCWSTR g_SensitiveFilePatterns[] = {
-    L"\\Windows\\System32\\config\\SAM",
-    L"\\Windows\\System32\\config\\SECURITY",
-    L"\\Windows\\System32\\config\\SYSTEM",
-    L"\\Windows\\System32\\config\\SOFTWARE",
-    L"\\Windows\\System32\\config\\DEFAULT",
-    L"\\Windows\\System32\\lsass.exe",
-    L"\\Windows\\System32\\csrss.exe",
-    L"\\Windows\\System32\\smss.exe",
-    L"\\Windows\\System32\\wininit.exe",
-    L"\\Windows\\System32\\winlogon.exe",
-    L"\\Windows\\System32\\services.exe",
-    L"\\Windows\\System32\\ntoskrnl.exe",
-    L"\\Windows\\System32\\hal.dll",
-    L"\\Windows\\System32\\ntdll.dll",
-    L"\\Windows\\System32\\kernel32.dll",
-    L"\\Windows\\System32\\drivers\\",
-    L"\\Windows\\Boot\\",
-    L"\\bootmgr",
-    L"\\$MFT",
-    L"\\$MFTMirr",
-    L"\\$LogFile",
-    L"\\$Volume",
-    L"\\$AttrDef",
-    L"\\$Bitmap",
-    L"\\$Boot",
-    L"\\$BadClus",
-    L"\\$Secure",
-    L"\\$UpCase",
-    L"\\$Extend",
-    NULL
+typedef struct _PSI_SENSITIVE_PATH {
+    PCWSTR Pattern;
+    BOOLEAN IsPrefix;       // TRUE = prefix match, FALSE = suffix match
+    BOOLEAN BlockDelete;
+    BOOLEAN BlockRename;
+    BOOLEAN BlockHardLink;
+} PSI_SENSITIVE_PATH, *PPSI_SENSITIVE_PATH;
+
+static const PSI_SENSITIVE_PATH g_SensitivePaths[] = {
+    // Registry hives - exact suffix match
+    { L"\\Windows\\System32\\config\\SAM",       FALSE, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\SECURITY",  FALSE, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\SYSTEM",    FALSE, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\SOFTWARE",  FALSE, TRUE, TRUE, TRUE },
+    { L"\\Windows\\System32\\config\\DEFAULT",   FALSE, TRUE, TRUE, TRUE },
+
+    // Critical system executables - exact suffix match
+    { L"\\Windows\\System32\\lsass.exe",         FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\csrss.exe",         FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\smss.exe",          FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\wininit.exe",       FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\winlogon.exe",      FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\services.exe",      FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\ntoskrnl.exe",      FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\hal.dll",           FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\ntdll.dll",         FALSE, TRUE, TRUE, FALSE },
+    { L"\\Windows\\System32\\kernel32.dll",      FALSE, TRUE, TRUE, FALSE },
+
+    // Driver directory - prefix match (block operations within)
+    { L"\\Windows\\System32\\drivers\\",         TRUE,  TRUE, TRUE, FALSE },
+
+    // Boot files - prefix match
+    { L"\\Windows\\Boot\\",                      TRUE,  TRUE, TRUE, FALSE },
+    { L"\\EFI\\Microsoft\\Boot\\",               TRUE,  TRUE, TRUE, FALSE },
+
+    // Boot manager - exact suffix match
+    { L"\\bootmgr",                              FALSE, TRUE, TRUE, FALSE },
+    { L"\\BOOTMGR",                              FALSE, TRUE, TRUE, FALSE },
+
+    // NTFS metadata files - exact match (case sensitive for NTFS internals)
+    { L"\\$MFT",                                 FALSE, TRUE, TRUE, FALSE },
+    { L"\\$MFTMirr",                             FALSE, TRUE, TRUE, FALSE },
+    { L"\\$LogFile",                             FALSE, TRUE, TRUE, FALSE },
+    { L"\\$Volume",                              FALSE, TRUE, TRUE, FALSE },
+    { L"\\$AttrDef",                             FALSE, TRUE, TRUE, FALSE },
+    { L"\\$Bitmap",                              FALSE, TRUE, TRUE, FALSE },
+    { L"\\$Boot",                                FALSE, TRUE, TRUE, FALSE },
+    { L"\\$BadClus",                             FALSE, TRUE, TRUE, FALSE },
+    { L"\\$Secure",                              FALSE, TRUE, TRUE, FALSE },
+    { L"\\$UpCase",                              FALSE, TRUE, TRUE, FALSE },
+    { L"\\$Extend",                              FALSE, TRUE, TRUE, FALSE },
+
+    // Sentinel
+    { NULL, FALSE, FALSE, FALSE, FALSE }
 };
 
 /**
@@ -192,6 +241,13 @@ static const PCWSTR g_RansomwareExtensions[] = {
     L".dharma",
     L".wallet",
     L".onion",
+    L".ryuk",
+    L".sodinokibi",
+    L".revil",
+    L".lockbit",
+    L".conti",
+    L".blackcat",
+    L".alphv",
     NULL
 };
 
@@ -228,14 +284,14 @@ typedef struct _PSI_PROCESS_CONTEXT {
     volatile LONG64 TotalAttributeChanges;
 
     //
-    // Behavioral flags
+    // Behavioral flags (use InterlockedOr for updates)
     //
-    ULONG BehaviorFlags;
-    ULONG SuspicionScore;
-    BOOLEAN IsRansomwareSuspect;
-    BOOLEAN IsDestructionSuspect;
-    BOOLEAN IsCredentialAccessSuspect;
-    BOOLEAN IsBlocked;
+    volatile LONG BehaviorFlags;
+    volatile LONG SuspicionScore;
+    volatile LONG IsRansomwareSuspect;
+    volatile LONG IsDestructionSuspect;
+    volatile LONG IsCredentialAccessSuspect;
+    volatile LONG IsBlocked;
 
     //
     // Last activity
@@ -245,34 +301,40 @@ typedef struct _PSI_PROCESS_CONTEXT {
 
     //
     // Reference counting
+    // RefCount includes: 1 for list membership + N for active users
     //
     volatile LONG RefCount;
 
 } PSI_PROCESS_CONTEXT, *PPSI_PROCESS_CONTEXT;
 
 /**
- * @brief Behavior flags for process context
+ * @brief Telemetry event structure for user-mode notification
  */
-#define PSI_BEHAVIOR_MASS_RENAME            0x00000001
-#define PSI_BEHAVIOR_MASS_DELETE            0x00000002
-#define PSI_BEHAVIOR_EXTENSION_CHANGE       0x00000004
-#define PSI_BEHAVIOR_MASS_TRUNCATION        0x00000008
-#define PSI_BEHAVIOR_CREDENTIAL_ACCESS      0x00000010
-#define PSI_BEHAVIOR_SYSTEM_FILE_ACCESS     0x00000020
-#define PSI_BEHAVIOR_AV_TAMPERING           0x00000040
-#define PSI_BEHAVIOR_BOOT_TAMPERING         0x00000080
-#define PSI_BEHAVIOR_TIMESTAMP_STOMP        0x00000100
-#define PSI_BEHAVIOR_HIDDEN_ATTRIBUTE       0x00000200
+typedef struct _PSI_TELEMETRY_EVENT {
+    HANDLE ProcessId;
+    FILE_INFORMATION_CLASS InfoClass;
+    ULONG BlockReason;
+    ULONG SuspicionScore;
+    BOOLEAN WasBlocked;
+    LARGE_INTEGER Timestamp;
+    USHORT FileNameLength;
+    WCHAR FileName[1];  // Variable length
+} PSI_TELEMETRY_EVENT, *PPSI_TELEMETRY_EVENT;
 
 /**
  * @brief Global PreSetInfo state
  */
 typedef struct _PSI_GLOBAL_STATE {
     //
-    // Initialization
+    // Initialization state (use interlocked access)
     //
-    BOOLEAN Initialized;
+    volatile LONG InitState;        // 0=uninit, 1=initializing, 2=initialized
     volatile LONG ShuttingDown;
+
+    //
+    // Outstanding operation tracking for safe shutdown
+    //
+    volatile LONG OutstandingOperations;
 
     //
     // Process context tracking
@@ -305,19 +367,21 @@ typedef struct _PSI_GLOBAL_STATE {
         volatile LONG64 SystemFileBlocks;
         volatile LONG64 ExclusionSkips;
         volatile LONG64 KernelModeSkips;
+        volatile LONG64 TelemetryEventsSent;
+        volatile LONG64 TelemetryEventsFailed;
         LARGE_INTEGER StartTime;
     } Stats;
 
     //
-    // Configuration
+    // Configuration (atomic reads, protected writes)
     //
-    BOOLEAN BlockRansomwareBehavior;
-    BOOLEAN BlockDataDestruction;
-    BOOLEAN BlockCredentialAccess;
-    BOOLEAN MonitorAttributeChanges;
-    ULONG RansomwareRenameThreshold;
-    ULONG RansomwareDeleteThreshold;
-    ULONG DestructionDeleteThreshold;
+    volatile LONG BlockRansomwareBehavior;
+    volatile LONG BlockDataDestruction;
+    volatile LONG BlockCredentialAccess;
+    volatile LONG MonitorAttributeChanges;
+    volatile LONG RansomwareRenameThreshold;
+    volatile LONG RansomwareDeleteThreshold;
+    volatile LONG DestructionDeleteThreshold;
 
 } PSI_GLOBAL_STATE, *PPSI_GLOBAL_STATE;
 
@@ -378,7 +442,10 @@ PsipDetectCredentialAccess(
 
 static BOOLEAN
 PsipIsSensitiveSystemFile(
-    _In_ PCUNICODE_STRING FileName
+    _In_ PCUNICODE_STRING FileName,
+    _Out_opt_ PBOOLEAN BlockDelete,
+    _Out_opt_ PBOOLEAN BlockRename,
+    _Out_opt_ PBOOLEAN BlockHardLink
     );
 
 static BOOLEAN
@@ -392,15 +459,7 @@ PsipDetectExtensionChange(
     _In_ PCUNICODE_STRING NewName
     );
 
-static BOOLEAN
-PsipShouldBlockOperation(
-    _In_ HANDLE ProcessId,
-    _In_ FILE_INFORMATION_CLASS InfoClass,
-    _In_ PCUNICODE_STRING FileName,
-    _In_opt_ PCUNICODE_STRING NewFileName,
-    _Out_ PULONG BlockReason
-    );
-
+_Must_inspect_result_
 static NTSTATUS
 PsipGetRenameDestination(
     _In_ PFLT_CALLBACK_DATA Data,
@@ -413,7 +472,8 @@ PsipSendTelemetryEvent(
     _In_ FILE_INFORMATION_CLASS InfoClass,
     _In_ PCUNICODE_STRING FileName,
     _In_ ULONG BlockReason,
-    _In_ ULONG SuspicionScore
+    _In_ ULONG SuspicionScore,
+    _In_ BOOLEAN WasBlocked
     );
 
 static VOID
@@ -425,6 +485,62 @@ static VOID
 PsipCleanupStaleContexts(
     VOID
     );
+
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN
+PsipIsInitialized(
+    VOID
+    );
+
+// ============================================================================
+// INLINE HELPERS
+// ============================================================================
+
+/**
+ * @brief Check if subsystem is fully initialized and not shutting down.
+ */
+FORCEINLINE
+BOOLEAN
+PsipIsInitialized(
+    VOID
+    )
+{
+    return (g_PsiState.InitState == 2) && (g_PsiState.ShuttingDown == 0);
+}
+
+/**
+ * @brief Enter an operation (increment outstanding count).
+ */
+FORCEINLINE
+BOOLEAN
+PsipEnterOperation(
+    VOID
+    )
+{
+    if (!PsipIsInitialized()) {
+        return FALSE;
+    }
+    InterlockedIncrement(&g_PsiState.OutstandingOperations);
+
+    // Double-check after increment
+    if (g_PsiState.ShuttingDown) {
+        InterlockedDecrement(&g_PsiState.OutstandingOperations);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/**
+ * @brief Leave an operation (decrement outstanding count).
+ */
+FORCEINLINE
+VOID
+PsipLeaveOperation(
+    VOID
+    )
+{
+    InterlockedDecrement(&g_PsiState.OutstandingOperations);
+}
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP
@@ -438,18 +554,43 @@ PsipCleanupStaleContexts(
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowStrikeInitializePreSetInfo(
     VOID
     )
 {
+    LONG prevState;
+
     PAGED_CODE();
 
-    if (g_PsiState.Initialized) {
+    //
+    // Atomically transition from uninitialized (0) to initializing (1)
+    //
+    prevState = InterlockedCompareExchange(&g_PsiState.InitState, 1, 0);
+
+    if (prevState == 2) {
+        // Already fully initialized
         return STATUS_ALREADY_REGISTERED;
     }
 
-    RtlZeroMemory(&g_PsiState, sizeof(PSI_GLOBAL_STATE));
+    if (prevState == 1) {
+        // Another thread is currently initializing - wait for it
+        while (g_PsiState.InitState == 1) {
+            LARGE_INTEGER delay;
+            delay.QuadPart = -10000; // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+        return (g_PsiState.InitState == 2) ? STATUS_ALREADY_REGISTERED : STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // We won the race - initialize
+    //
+    g_PsiState.ShuttingDown = 0;
+    g_PsiState.OutstandingOperations = 0;
+    g_PsiState.ProcessContextCount = 0;
+    g_PsiState.LookasideInitialized = FALSE;
 
     //
     // Initialize process context list
@@ -474,23 +615,28 @@ ShadowStrikeInitializePreSetInfo(
     //
     // Set default configuration
     //
-    g_PsiState.BlockRansomwareBehavior = TRUE;
-    g_PsiState.BlockDataDestruction = TRUE;
-    g_PsiState.BlockCredentialAccess = TRUE;
-    g_PsiState.MonitorAttributeChanges = TRUE;
-    g_PsiState.RansomwareRenameThreshold = PSI_RANSOMWARE_RENAME_THRESHOLD;
-    g_PsiState.RansomwareDeleteThreshold = PSI_RANSOMWARE_DELETE_THRESHOLD;
-    g_PsiState.DestructionDeleteThreshold = PSI_DESTRUCTION_DELETE_THRESHOLD;
+    InterlockedExchange(&g_PsiState.BlockRansomwareBehavior, TRUE);
+    InterlockedExchange(&g_PsiState.BlockDataDestruction, TRUE);
+    InterlockedExchange(&g_PsiState.BlockCredentialAccess, TRUE);
+    InterlockedExchange(&g_PsiState.MonitorAttributeChanges, TRUE);
+    InterlockedExchange(&g_PsiState.RansomwareRenameThreshold, PSI_RANSOMWARE_RENAME_THRESHOLD);
+    InterlockedExchange(&g_PsiState.RansomwareDeleteThreshold, PSI_RANSOMWARE_DELETE_THRESHOLD);
+    InterlockedExchange(&g_PsiState.DestructionDeleteThreshold, PSI_DESTRUCTION_DELETE_THRESHOLD);
 
     //
     // Initialize statistics
     //
+    RtlZeroMemory(&g_PsiState.Stats, sizeof(g_PsiState.Stats));
     KeQuerySystemTime(&g_PsiState.Stats.StartTime);
 
-    g_PsiState.Initialized = TRUE;
+    //
+    // Mark as fully initialized
+    //
+    MemoryBarrier();
+    InterlockedExchange(&g_PsiState.InitState, 2);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/PreSetInfo] Subsystem initialized\n");
+               "[ShadowStrike/PreSetInfo] Subsystem initialized (v2.1.0)\n");
 
     return STATUS_SUCCESS;
 }
@@ -508,15 +654,49 @@ ShadowStrikeCleanupPreSetInfo(
 {
     PLIST_ENTRY entry;
     PPSI_PROCESS_CONTEXT context;
+    LARGE_INTEGER startTime;
+    LARGE_INTEGER currentTime;
+    LARGE_INTEGER timeout;
+    LARGE_INTEGER pollInterval;
 
     PAGED_CODE();
 
-    if (!g_PsiState.Initialized) {
+    //
+    // Check if initialized
+    //
+    if (g_PsiState.InitState != 2) {
         return;
     }
 
+    //
+    // Signal shutdown
+    //
     InterlockedExchange(&g_PsiState.ShuttingDown, 1);
-    g_PsiState.Initialized = FALSE;
+    MemoryBarrier();
+
+    //
+    // Wait for outstanding operations to complete
+    //
+    KeQuerySystemTime(&startTime);
+    timeout.QuadPart = PSI_SHUTDOWN_WAIT_TIMEOUT;
+    pollInterval.QuadPart = -(LONGLONG)PSI_SHUTDOWN_POLL_INTERVAL;
+
+    while (g_PsiState.OutstandingOperations > 0) {
+        KeQuerySystemTime(&currentTime);
+        if ((currentTime.QuadPart - startTime.QuadPart) > timeout.QuadPart) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/PreSetInfo] WARNING: Shutdown timeout with %ld outstanding ops\n",
+                       g_PsiState.OutstandingOperations);
+            break;
+        }
+        KeDelayExecutionThread(KernelMode, FALSE, &pollInterval);
+    }
+
+    //
+    // Now mark as not initialized to prevent new lookups
+    //
+    InterlockedExchange(&g_PsiState.InitState, 0);
+    MemoryBarrier();
 
     //
     // Free all process contexts
@@ -527,9 +707,10 @@ ShadowStrikeCleanupPreSetInfo(
     while (!IsListEmpty(&g_PsiState.ProcessContextList)) {
         entry = RemoveHeadList(&g_PsiState.ProcessContextList);
         context = CONTAINING_RECORD(entry, PSI_PROCESS_CONTEXT, ListEntry);
-
+        InitializeListHead(&context->ListEntry);
         ExFreeToNPagedLookasideList(&g_PsiState.ProcessContextLookaside, context);
     }
+    g_PsiState.ProcessContextCount = 0;
 
     ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
     KeLeaveCriticalRegion();
@@ -544,13 +725,14 @@ ShadowStrikeCleanupPreSetInfo(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike/PreSetInfo] Shutdown complete. Stats: "
-               "Calls=%lld, Deletes=%lld, Renames=%lld, Blocked=%lld\n",
+               "Calls=%lld, Deletes=%lld, Renames=%lld, Blocked=%lld, Telemetry=%lld\n",
                g_PsiState.Stats.TotalCalls,
                g_PsiState.Stats.DeleteOperations,
                g_PsiState.Stats.RenameOperations,
                g_PsiState.Stats.SelfProtectionBlocks +
                g_PsiState.Stats.RansomwareBlocks +
-               g_PsiState.Stats.DestructionBlocks);
+               g_PsiState.Stats.DestructionBlocks,
+               g_PsiState.Stats.TelemetryEventsSent);
 }
 
 // ============================================================================
@@ -575,6 +757,7 @@ ShadowStrikeCleanupPreSetInfo(
  *
  * @irql PASSIVE_LEVEL to APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
 FLT_PREOP_CALLBACK_STATUS
 ShadowStrikePreSetInformation(
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -591,7 +774,12 @@ ShadowStrikePreSetInformation(
     UNICODE_STRING newFileName = { 0 };
     BOOLEAN newFileNameAllocated = FALSE;
     PPSI_PROCESS_CONTEXT processContext = NULL;
+    BOOLEAN operationEntered = FALSE;
+    BOOLEAN blockDelete = FALSE;
+    BOOLEAN blockRename = FALSE;
+    BOOLEAN blockHardLink = FALSE;
 
+    UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
     //
@@ -605,7 +793,7 @@ ShadowStrikePreSetInformation(
     // Fast path: Skip kernel-mode operations
     //
     if (Data->RequestorMode == KernelMode) {
-        if (g_PsiState.Initialized) {
+        if (PsipIsInitialized()) {
             InterlockedIncrement64(&g_PsiState.Stats.KernelModeSkips);
         }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -643,39 +831,47 @@ ShadowStrikePreSetInformation(
             return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    //
+    // Enter operation tracking (for safe shutdown)
+    //
+    if (!PsipEnterOperation()) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    operationEntered = TRUE;
+
     SHADOWSTRIKE_ENTER_OPERATION();
 
     //
     // Update statistics
     //
-    if (g_PsiState.Initialized) {
-        InterlockedIncrement64(&g_PsiState.Stats.TotalCalls);
+    InterlockedIncrement64(&g_PsiState.Stats.TotalCalls);
 
-        switch (infoClass) {
-            case FileDispositionInformation:
-            case FileDispositionInformationEx:
-                InterlockedIncrement64(&g_PsiState.Stats.DeleteOperations);
-                break;
-            case FileRenameInformation:
-            case FileRenameInformationEx:
-                InterlockedIncrement64(&g_PsiState.Stats.RenameOperations);
-                break;
-            case FileLinkInformation:
-            case FileLinkInformationEx:
-                InterlockedIncrement64(&g_PsiState.Stats.HardLinkOperations);
-                break;
-            case FileShortNameInformation:
-                InterlockedIncrement64(&g_PsiState.Stats.ShortNameOperations);
-                break;
-            case FileEndOfFileInformation:
-            case FileAllocationInformation:
-            case FileValidDataLengthInformation:
-                InterlockedIncrement64(&g_PsiState.Stats.TruncationOperations);
-                break;
-            case FileBasicInformation:
-                InterlockedIncrement64(&g_PsiState.Stats.AttributeOperations);
-                break;
-        }
+    switch (infoClass) {
+        case FileDispositionInformation:
+        case FileDispositionInformationEx:
+            InterlockedIncrement64(&g_PsiState.Stats.DeleteOperations);
+            break;
+        case FileRenameInformation:
+        case FileRenameInformationEx:
+            InterlockedIncrement64(&g_PsiState.Stats.RenameOperations);
+            break;
+        case FileLinkInformation:
+        case FileLinkInformationEx:
+            InterlockedIncrement64(&g_PsiState.Stats.HardLinkOperations);
+            break;
+        case FileShortNameInformation:
+            InterlockedIncrement64(&g_PsiState.Stats.ShortNameOperations);
+            break;
+        case FileEndOfFileInformation:
+        case FileAllocationInformation:
+        case FileValidDataLengthInformation:
+            InterlockedIncrement64(&g_PsiState.Stats.TruncationOperations);
+            break;
+        case FileBasicInformation:
+            InterlockedIncrement64(&g_PsiState.Stats.AttributeOperations);
+            break;
+        default:
+            break;
     }
 
     requestorPid = PsGetCurrentProcessId();
@@ -684,11 +880,8 @@ ShadowStrikePreSetInformation(
     // Check process exclusion
     //
     if (ShadowStrikeIsProcessTrusted(requestorPid)) {
-        if (g_PsiState.Initialized) {
-            InterlockedIncrement64(&g_PsiState.Stats.ExclusionSkips);
-        }
-        SHADOWSTRIKE_LEAVE_OPERATION();
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        InterlockedIncrement64(&g_PsiState.Stats.ExclusionSkips);
+        goto AllowOperation;
     }
 
     //
@@ -701,27 +894,20 @@ ShadowStrikePreSetInformation(
         );
 
     if (!NT_SUCCESS(status)) {
-        SHADOWSTRIKE_LEAVE_OPERATION();
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        goto AllowOperation;
     }
 
     status = FltParseFileNameInformation(nameInfo);
     if (!NT_SUCCESS(status)) {
-        FltReleaseFileNameInformation(nameInfo);
-        SHADOWSTRIKE_LEAVE_OPERATION();
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        goto AllowOperation;
     }
 
     //
     // Check path exclusion
     //
     if (ShadowStrikeIsPathExcluded(&nameInfo->Name, NULL)) {
-        if (g_PsiState.Initialized) {
-            InterlockedIncrement64(&g_PsiState.Stats.ExclusionSkips);
-        }
-        FltReleaseFileNameInformation(nameInfo);
-        SHADOWSTRIKE_LEAVE_OPERATION();
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        InterlockedIncrement64(&g_PsiState.Stats.ExclusionSkips);
+        goto AllowOperation;
     }
 
     //
@@ -755,6 +941,8 @@ ShadowStrikePreSetInformation(
             case FileLinkInformationEx:
                 isDeleteOrRename = TRUE;
                 break;
+            default:
+                break;
         }
 
         if (isDeleteOrRename) {
@@ -785,24 +973,39 @@ ShadowStrikePreSetInformation(
     // SENSITIVE SYSTEM FILE CHECK
     // ========================================================================
     //
-    if (PsipIsSensitiveSystemFile(&nameInfo->Name)) {
+    if (PsipIsSensitiveSystemFile(&nameInfo->Name, &blockDelete, &blockRename, &blockHardLink)) {
+        BOOLEAN shouldBlockThis = FALSE;
+
         switch (infoClass) {
             case FileDispositionInformation:
             case FileDispositionInformationEx:
+                shouldBlockThis = blockDelete;
+                break;
             case FileRenameInformation:
             case FileRenameInformationEx:
-                shouldBlock = TRUE;
-                blockReason = PSI_BEHAVIOR_SYSTEM_FILE_ACCESS;
-                InterlockedIncrement64(&g_PsiState.Stats.SystemFileBlocks);
+                shouldBlockThis = blockRename;
+                break;
+            case FileLinkInformation:
+            case FileLinkInformationEx:
+                shouldBlockThis = blockHardLink;
+                break;
+            default:
+                break;
+        }
 
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike/PreSetInfo] BLOCKED: Sensitive file "
-                           "PID=%lu, File=%wZ, Class=%d\n",
-                           HandleToULong(requestorPid),
-                           &nameInfo->Name,
-                           infoClass);
+        if (shouldBlockThis) {
+            shouldBlock = TRUE;
+            blockReason = PSI_BEHAVIOR_SYSTEM_FILE_ACCESS;
+            InterlockedIncrement64(&g_PsiState.Stats.SystemFileBlocks);
 
-                goto CompleteOperation;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/PreSetInfo] BLOCKED: Sensitive file "
+                       "PID=%lu, File=%wZ, Class=%d\n",
+                       HandleToULong(requestorPid),
+                       &nameInfo->Name,
+                       infoClass);
+
+            goto CompleteOperation;
         }
     }
 
@@ -815,9 +1018,9 @@ ShadowStrikePreSetInformation(
         g_PsiState.BlockCredentialAccess) {
 
         //
-        // Check if target is a credential file
+        // Check if target is a credential file (already checked above, but re-check for hard link)
         //
-        if (PsipIsSensitiveSystemFile(&nameInfo->Name)) {
+        if (blockHardLink) {
             processContext = PsipLookupProcessContext(requestorPid, TRUE);
             if (processContext != NULL) {
                 InterlockedIncrement(&processContext->RecentHardLinks);
@@ -850,7 +1053,7 @@ ShadowStrikePreSetInformation(
     // BEHAVIORAL ANALYSIS
     // ========================================================================
     //
-    if (g_PsiState.Initialized && !g_PsiState.ShuttingDown) {
+    if (PsipIsInitialized()) {
         //
         // Update process metrics
         //
@@ -882,7 +1085,7 @@ ShadowStrikePreSetInformation(
 
                         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                                    "[ShadowStrike/PreSetInfo] BLOCKED: Ransomware behavior "
-                                   "PID=%lu, File=%wZ, Score=%lu\n",
+                                   "PID=%lu, File=%wZ, Score=%ld\n",
                                    HandleToULong(requestorPid),
                                    &nameInfo->Name,
                                    processContext->SuspicionScore);
@@ -937,7 +1140,7 @@ ShadowStrikePreSetInformation(
             if (PsipIsRansomwareExtension(&newFileName)) {
                 processContext = PsipLookupProcessContext(requestorPid, TRUE);
                 if (processContext != NULL) {
-                    processContext->BehaviorFlags |= PSI_BEHAVIOR_EXTENSION_CHANGE;
+                    InterlockedOr(&processContext->BehaviorFlags, PSI_BEHAVIOR_EXTENSION_CHANGE);
                     InterlockedIncrement(&processContext->RecentExtensionChanges);
                     InterlockedIncrement64(&processContext->TotalExtensionChanges);
 
@@ -969,29 +1172,41 @@ CompleteOperation:
     // Send telemetry for blocked or suspicious operations
     //
     if (shouldBlock || blockReason != 0) {
+        ULONG score = 0;
         processContext = PsipLookupProcessContext(requestorPid, FALSE);
+        if (processContext != NULL) {
+            score = (ULONG)processContext->SuspicionScore;
+            PsipDereferenceProcessContext(processContext);
+        }
+
         PsipSendTelemetryEvent(
             requestorPid,
             infoClass,
             &nameInfo->Name,
             blockReason,
-            processContext ? processContext->SuspicionScore : 0
+            score,
+            shouldBlock
             );
-        if (processContext != NULL) {
-            PsipDereferenceProcessContext(processContext);
-        }
     }
 
+AllowOperation:
     //
     // Cleanup
     //
     if (newFileNameAllocated && newFileName.Buffer != NULL) {
         ExFreePoolWithTag(newFileName.Buffer, PSI_POOL_TAG);
+        newFileName.Buffer = NULL;
     }
 
-    FltReleaseFileNameInformation(nameInfo);
+    if (nameInfo != NULL) {
+        FltReleaseFileNameInformation(nameInfo);
+    }
 
     SHADOWSTRIKE_LEAVE_OPERATION();
+
+    if (operationEntered) {
+        PsipLeaveOperation();
+    }
 
     //
     // Block or allow
@@ -1010,6 +1225,16 @@ CompleteOperation:
 // PROCESS CONTEXT MANAGEMENT
 // ============================================================================
 
+/**
+ * @brief Lookup or create a process context.
+ *
+ * Thread-safe lookup with optional creation. Returns with reference held.
+ *
+ * @param ProcessId       Process ID to lookup.
+ * @param CreateIfNotFound Create new context if not found.
+ *
+ * @return Context with reference held, or NULL.
+ */
 static PPSI_PROCESS_CONTEXT
 PsipLookupProcessContext(
     _In_ HANDLE ProcessId,
@@ -1018,16 +1243,17 @@ PsipLookupProcessContext(
 {
     PLIST_ENTRY entry;
     PPSI_PROCESS_CONTEXT context = NULL;
+    PPSI_PROCESS_CONTEXT newContext = NULL;
     LARGE_INTEGER currentTime;
 
-    if (!g_PsiState.Initialized || g_PsiState.ShuttingDown) {
+    if (!PsipIsInitialized()) {
         return NULL;
     }
 
     KeQuerySystemTime(&currentTime);
 
     //
-    // Search existing contexts
+    // Search existing contexts (shared lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_PsiState.ProcessContextLock);
@@ -1039,7 +1265,10 @@ PsipLookupProcessContext(
         context = CONTAINING_RECORD(entry, PSI_PROCESS_CONTEXT, ListEntry);
 
         if (context->ProcessId == ProcessId) {
-            PsipReferenceProcessContext(context);
+            //
+            // Found - add reference while still under lock
+            //
+            InterlockedIncrement(&context->RefCount);
 
             //
             // Check if time window needs reset
@@ -1069,58 +1298,68 @@ PsipLookupProcessContext(
     }
 
     //
-    // Create new context
+    // Pre-allocate new context outside the lock
     //
-    context = (PPSI_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
+    newContext = (PPSI_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
         &g_PsiState.ProcessContextLookaside
         );
 
-    if (context == NULL) {
+    if (newContext == NULL) {
         return NULL;
     }
 
-    RtlZeroMemory(context, sizeof(PSI_PROCESS_CONTEXT));
-    context->ProcessId = ProcessId;
-    context->RefCount = 1;
-    context->WindowStartTime = currentTime;
-    context->FirstActivityTime = currentTime;
-    context->LastActivityTime = currentTime;
-    InitializeListHead(&context->ListEntry);
+    RtlZeroMemory(newContext, sizeof(PSI_PROCESS_CONTEXT));
+    newContext->ProcessId = ProcessId;
+    newContext->RefCount = 2;  // 1 for list + 1 for caller
+    newContext->WindowStartTime = currentTime;
+    newContext->FirstActivityTime = currentTime;
+    newContext->LastActivityTime = currentTime;
+    InitializeListHead(&newContext->ListEntry);
 
     //
-    // Insert into list
+    // Insert into list (exclusive lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_PsiState.ProcessContextLock);
 
     //
-    // Check for race condition
+    // Re-check for race condition - another thread may have created it
     //
     for (entry = g_PsiState.ProcessContextList.Flink;
          entry != &g_PsiState.ProcessContextList;
          entry = entry->Flink) {
 
-        PPSI_PROCESS_CONTEXT existing = CONTAINING_RECORD(entry, PSI_PROCESS_CONTEXT, ListEntry);
+        context = CONTAINING_RECORD(entry, PSI_PROCESS_CONTEXT, ListEntry);
 
-        if (existing->ProcessId == ProcessId) {
-            PsipReferenceProcessContext(existing);
+        if (context->ProcessId == ProcessId) {
+            //
+            // Found - someone else created it, use theirs
+            //
+            InterlockedIncrement(&context->RefCount);
             ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
             KeLeaveCriticalRegion();
-            ExFreeToNPagedLookasideList(&g_PsiState.ProcessContextLookaside, context);
-            return existing;
+
+            // Free our pre-allocated context
+            ExFreeToNPagedLookasideList(&g_PsiState.ProcessContextLookaside, newContext);
+            return context;
         }
     }
 
-    InsertTailList(&g_PsiState.ProcessContextList, &context->ListEntry);
+    //
+    // Insert our new context
+    //
+    InsertTailList(&g_PsiState.ProcessContextList, &newContext->ListEntry);
     InterlockedIncrement(&g_PsiState.ProcessContextCount);
-    PsipReferenceProcessContext(context);
 
     ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
     KeLeaveCriticalRegion();
 
-    return context;
+    return newContext;
 }
 
+/**
+ * @brief Add a reference to a process context.
+ */
 static VOID
 PsipReferenceProcessContext(
     _Inout_ PPSI_PROCESS_CONTEXT Context
@@ -1129,31 +1368,67 @@ PsipReferenceProcessContext(
     InterlockedIncrement(&Context->RefCount);
 }
 
+/**
+ * @brief Release a reference to a process context.
+ *
+ * FIXED: Reference counting is now atomic under the lock to prevent
+ * use-after-free race conditions.
+ */
 static VOID
 PsipDereferenceProcessContext(
     _Inout_ PPSI_PROCESS_CONTEXT Context
     )
 {
-    if (InterlockedDecrement(&Context->RefCount) == 0) {
-        //
-        // Remove from list and free
-        //
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&g_PsiState.ProcessContextLock);
+    LONG newRefCount;
+    BOOLEAN shouldFree = FALSE;
 
+    //
+    // CRITICAL FIX: Perform decrement and removal atomically under lock.
+    // This prevents the race where another thread finds this context
+    // in the list after we've decremented but before we've removed it.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_PsiState.ProcessContextLock);
+
+    newRefCount = InterlockedDecrement(&Context->RefCount);
+
+    if (newRefCount == 0) {
+        //
+        // No more references - remove from list
+        //
         if (!IsListEmpty(&Context->ListEntry)) {
             RemoveEntryList(&Context->ListEntry);
             InitializeListHead(&Context->ListEntry);
             InterlockedDecrement(&g_PsiState.ProcessContextCount);
         }
+        shouldFree = TRUE;
+    }
+    else if (newRefCount < 0) {
+        //
+        // BUG: Over-release detected
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike/PreSetInfo] BUG: RefCount went negative for PID=%lu\n",
+                   HandleToULong(Context->ProcessId));
 
-        ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
-        KeLeaveCriticalRegion();
+        // Attempt recovery
+        InterlockedExchange(&Context->RefCount, 0);
+    }
 
+    ExReleasePushLockExclusive(&g_PsiState.ProcessContextLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free outside the lock
+    //
+    if (shouldFree) {
         ExFreeToNPagedLookasideList(&g_PsiState.ProcessContextLookaside, Context);
     }
 }
 
+/**
+ * @brief Reset time-windowed metrics when window expires.
+ */
 static VOID
 PsipResetTimeWindowedMetrics(
     _Inout_ PPSI_PROCESS_CONTEXT Context
@@ -1163,15 +1438,21 @@ PsipResetTimeWindowedMetrics(
 
     KeQuerySystemTime(&currentTime);
 
-    Context->RecentRenames = 0;
-    Context->RecentDeletes = 0;
-    Context->RecentExtensionChanges = 0;
-    Context->RecentTruncations = 0;
-    Context->RecentHardLinks = 0;
-    Context->RecentAttributeChanges = 0;
+    InterlockedExchange(&Context->RecentRenames, 0);
+    InterlockedExchange(&Context->RecentDeletes, 0);
+    InterlockedExchange(&Context->RecentExtensionChanges, 0);
+    InterlockedExchange(&Context->RecentTruncations, 0);
+    InterlockedExchange(&Context->RecentHardLinks, 0);
+    InterlockedExchange(&Context->RecentAttributeChanges, 0);
     Context->WindowStartTime = currentTime;
 }
 
+/**
+ * @brief Cleanup stale process contexts.
+ *
+ * FIXED: Uses InterlockedCompareExchange to atomically claim contexts
+ * for removal, preventing TOCTOU race conditions.
+ */
 static VOID
 PsipCleanupStaleContexts(
     VOID
@@ -1182,6 +1463,7 @@ PsipCleanupStaleContexts(
     LARGE_INTEGER currentTime;
     LARGE_INTEGER expiryThreshold;
     LIST_ENTRY staleList;
+    LONG prevRefCount;
 
     InitializeListHead(&staleList);
 
@@ -1202,11 +1484,20 @@ PsipCleanupStaleContexts(
         // Check if context is stale
         //
         if (context->LastActivityTime.QuadPart < expiryThreshold.QuadPart) {
-            if (context->RefCount == 1) {  // Only list reference
+            //
+            // FIXED: Atomically try to claim the context for removal.
+            // Only remove if RefCount is exactly 1 (list reference only).
+            //
+            prevRefCount = InterlockedCompareExchange(&context->RefCount, 0, 1);
+
+            if (prevRefCount == 1) {
+                // Successfully claimed - remove from list
                 RemoveEntryList(&context->ListEntry);
+                InitializeListHead(&context->ListEntry);
                 InterlockedDecrement(&g_PsiState.ProcessContextCount);
                 InsertTailList(&staleList, &context->ListEntry);
             }
+            // If prevRefCount != 1, someone else has a reference, skip it
         }
     }
 
@@ -1238,8 +1529,6 @@ PsipUpdateProcessMetrics(
     PPSI_PROCESS_CONTEXT context;
     LARGE_INTEGER currentTime;
 
-    UNREFERENCED_PARAMETER(FileName);
-
     context = PsipLookupProcessContext(ProcessId, TRUE);
     if (context == NULL) {
         return;
@@ -1270,7 +1559,7 @@ PsipUpdateProcessMetrics(
                 if (PsipDetectExtensionChange(FileName, NewFileName)) {
                     InterlockedIncrement(&context->RecentExtensionChanges);
                     InterlockedIncrement64(&context->TotalExtensionChanges);
-                    context->BehaviorFlags |= PSI_BEHAVIOR_EXTENSION_CHANGE;
+                    InterlockedOr(&context->BehaviorFlags, PSI_BEHAVIOR_EXTENSION_CHANGE);
                 }
             }
             break;
@@ -1292,6 +1581,9 @@ PsipUpdateProcessMetrics(
             InterlockedIncrement(&context->RecentAttributeChanges);
             InterlockedIncrement64(&context->TotalAttributeChanges);
             break;
+
+        default:
+            break;
     }
 
     PsipDereferenceProcessContext(context);
@@ -1302,22 +1594,24 @@ PsipDetectRansomwareBehavior(
     _In_ PPSI_PROCESS_CONTEXT Context
     )
 {
-    ULONG score = 0;
+    LONG score = 0;
+    LONG renameThreshold = g_PsiState.RansomwareRenameThreshold;
+    LONG deleteThreshold = g_PsiState.RansomwareDeleteThreshold;
 
     //
     // Check for mass rename pattern
     //
-    if (Context->RecentRenames > (LONG)g_PsiState.RansomwareRenameThreshold) {
+    if (Context->RecentRenames > renameThreshold) {
         score += 40;
-        Context->BehaviorFlags |= PSI_BEHAVIOR_MASS_RENAME;
+        InterlockedOr(&Context->BehaviorFlags, PSI_BEHAVIOR_MASS_RENAME);
     }
 
     //
     // Check for mass delete pattern
     //
-    if (Context->RecentDeletes > (LONG)g_PsiState.RansomwareDeleteThreshold) {
+    if (Context->RecentDeletes > deleteThreshold) {
         score += 35;
-        Context->BehaviorFlags |= PSI_BEHAVIOR_MASS_DELETE;
+        InterlockedOr(&Context->BehaviorFlags, PSI_BEHAVIOR_MASS_DELETE);
     }
 
     //
@@ -1325,7 +1619,7 @@ PsipDetectRansomwareBehavior(
     //
     if (Context->RecentExtensionChanges > PSI_EXTENSION_CHANGE_THRESHOLD) {
         score += 30;
-        Context->BehaviorFlags |= PSI_BEHAVIOR_EXTENSION_CHANGE;
+        InterlockedOr(&Context->BehaviorFlags, PSI_BEHAVIOR_EXTENSION_CHANGE);
     }
 
     //
@@ -1347,10 +1641,10 @@ PsipDetectRansomwareBehavior(
         score += 25;
     }
 
-    Context->SuspicionScore = score;
+    InterlockedExchange(&Context->SuspicionScore, score);
 
     if (score >= 70) {
-        Context->IsRansomwareSuspect = TRUE;
+        InterlockedExchange(&Context->IsRansomwareSuspect, TRUE);
         return TRUE;
     }
 
@@ -1362,21 +1656,23 @@ PsipDetectDataDestruction(
     _In_ PPSI_PROCESS_CONTEXT Context
     )
 {
+    LONG threshold = g_PsiState.DestructionDeleteThreshold;
+
     //
     // Mass deletion pattern
     //
-    if (Context->TotalDeletes > g_PsiState.DestructionDeleteThreshold) {
-        Context->IsDestructionSuspect = TRUE;
-        Context->BehaviorFlags |= PSI_BEHAVIOR_MASS_DELETE;
+    if (Context->TotalDeletes > threshold) {
+        InterlockedExchange(&Context->IsDestructionSuspect, TRUE);
+        InterlockedOr(&Context->BehaviorFlags, PSI_BEHAVIOR_MASS_DELETE);
         return TRUE;
     }
 
     //
     // High rate of deletion in time window
     //
-    if (Context->RecentDeletes > (LONG)(g_PsiState.DestructionDeleteThreshold / 10)) {
-        Context->IsDestructionSuspect = TRUE;
-        Context->BehaviorFlags |= PSI_BEHAVIOR_MASS_DELETE;
+    if (Context->RecentDeletes > (threshold / 10)) {
+        InterlockedExchange(&Context->IsDestructionSuspect, TRUE);
+        InterlockedOr(&Context->BehaviorFlags, PSI_BEHAVIOR_MASS_DELETE);
         return TRUE;
     }
 
@@ -1395,8 +1691,8 @@ PsipDetectCredentialAccess(
     // Multiple hard links to sensitive files
     //
     if (Context->TotalHardLinks >= PSI_CREDENTIAL_HARDLINK_THRESHOLD) {
-        Context->IsCredentialAccessSuspect = TRUE;
-        Context->BehaviorFlags |= PSI_BEHAVIOR_CREDENTIAL_ACCESS;
+        InterlockedExchange(&Context->IsCredentialAccessSuspect, TRUE);
+        InterlockedOr(&Context->BehaviorFlags, PSI_BEHAVIOR_CREDENTIAL_ACCESS);
         return TRUE;
     }
 
@@ -1407,26 +1703,91 @@ PsipDetectCredentialAccess(
 // PATTERN DETECTION HELPERS
 // ============================================================================
 
+/**
+ * @brief Check if a file path matches sensitive system files.
+ *
+ * FIXED: Uses proper suffix/prefix matching instead of substring matching
+ * to prevent false positives and bypass attempts.
+ */
 static BOOLEAN
 PsipIsSensitiveSystemFile(
-    _In_ PCUNICODE_STRING FileName
+    _In_ PCUNICODE_STRING FileName,
+    _Out_opt_ PBOOLEAN BlockDelete,
+    _Out_opt_ PBOOLEAN BlockRename,
+    _Out_opt_ PBOOLEAN BlockHardLink
     )
 {
     ULONG i;
     UNICODE_STRING pattern;
+    USHORT patternChars;
+    USHORT fileChars;
+    PWCHAR fileStart;
+    LONG compareResult;
 
-    if (FileName == NULL || FileName->Length == 0) {
+    if (BlockDelete) *BlockDelete = FALSE;
+    if (BlockRename) *BlockRename = FALSE;
+    if (BlockHardLink) *BlockHardLink = FALSE;
+
+    if (FileName == NULL || FileName->Length == 0 || FileName->Buffer == NULL) {
         return FALSE;
     }
 
-    for (i = 0; g_SensitiveFilePatterns[i] != NULL; i++) {
-        RtlInitUnicodeString(&pattern, g_SensitiveFilePatterns[i]);
+    fileChars = FileName->Length / sizeof(WCHAR);
 
-        //
-        // Check if file path contains the pattern
-        //
-        if (ShadowStrikeStringContains(FileName, &pattern, TRUE)) {
-            return TRUE;
+    for (i = 0; g_SensitivePaths[i].Pattern != NULL; i++) {
+        RtlInitUnicodeString(&pattern, g_SensitivePaths[i].Pattern);
+        patternChars = pattern.Length / sizeof(WCHAR);
+
+        if (patternChars > fileChars) {
+            continue;
+        }
+
+        if (g_SensitivePaths[i].IsPrefix) {
+            //
+            // Prefix match: check if file path STARTS with pattern
+            // This handles directory patterns like "\Windows\System32\drivers\"
+            //
+            UNICODE_STRING filePrefix;
+            filePrefix.Buffer = FileName->Buffer;
+            filePrefix.Length = pattern.Length;
+            filePrefix.MaximumLength = pattern.Length;
+
+            // Case-insensitive comparison
+            compareResult = RtlCompareUnicodeString(&filePrefix, &pattern, TRUE);
+            if (compareResult == 0) {
+                if (BlockDelete) *BlockDelete = g_SensitivePaths[i].BlockDelete;
+                if (BlockRename) *BlockRename = g_SensitivePaths[i].BlockRename;
+                if (BlockHardLink) *BlockHardLink = g_SensitivePaths[i].BlockHardLink;
+                return TRUE;
+            }
+        }
+        else {
+            //
+            // Suffix match: check if file path ENDS with pattern
+            // This handles exact file patterns like "\Windows\System32\config\SAM"
+            //
+            fileStart = FileName->Buffer + (fileChars - patternChars);
+
+            UNICODE_STRING fileSuffix;
+            fileSuffix.Buffer = fileStart;
+            fileSuffix.Length = pattern.Length;
+            fileSuffix.MaximumLength = pattern.Length;
+
+            // Case-insensitive comparison
+            compareResult = RtlCompareUnicodeString(&fileSuffix, &pattern, TRUE);
+            if (compareResult == 0) {
+                //
+                // Additional validation: ensure the match is at a path boundary.
+                // The character before the match should be a backslash or this
+                // should be the start of the path.
+                //
+                if (fileStart == FileName->Buffer || *(fileStart - 1) == L'\\' || *(fileStart - 1) == L':') {
+                    if (BlockDelete) *BlockDelete = g_SensitivePaths[i].BlockDelete;
+                    if (BlockRename) *BlockRename = g_SensitivePaths[i].BlockRename;
+                    if (BlockHardLink) *BlockHardLink = g_SensitivePaths[i].BlockHardLink;
+                    return TRUE;
+                }
+            }
         }
     }
 
@@ -1441,8 +1802,9 @@ PsipIsRansomwareExtension(
     ULONG i;
     UNICODE_STRING extension;
     UNICODE_STRING fileExt;
+    USHORT j;
 
-    if (NewFileName == NULL || NewFileName->Length == 0) {
+    if (NewFileName == NULL || NewFileName->Length == 0 || NewFileName->Buffer == NULL) {
         return FALSE;
     }
 
@@ -1453,7 +1815,7 @@ PsipIsRansomwareExtension(
     fileExt.Length = 0;
     fileExt.MaximumLength = 0;
 
-    for (USHORT j = NewFileName->Length / sizeof(WCHAR); j > 0; j--) {
+    for (j = NewFileName->Length / sizeof(WCHAR); j > 0; j--) {
         if (NewFileName->Buffer[j - 1] == L'.') {
             fileExt.Buffer = &NewFileName->Buffer[j - 1];
             fileExt.Length = NewFileName->Length - ((j - 1) * sizeof(WCHAR));
@@ -1493,7 +1855,8 @@ PsipDetectExtensionChange(
     UNICODE_STRING newExt = { 0 };
     USHORT i;
 
-    if (OriginalName == NULL || NewName == NULL) {
+    if (OriginalName == NULL || NewName == NULL ||
+        OriginalName->Buffer == NULL || NewName->Buffer == NULL) {
         return FALSE;
     }
 
@@ -1550,6 +1913,16 @@ PsipDetectExtensionChange(
 // HELPER FUNCTIONS
 // ============================================================================
 
+/**
+ * @brief Extract rename/link destination from SetInformation buffer.
+ *
+ * FIXED: Proper user buffer validation with:
+ * - Buffer length validation
+ * - Integer overflow protection
+ * - try/except for user buffer access
+ * - USHORT truncation protection
+ */
+_Must_inspect_result_
 static NTSTATUS
 PsipGetRenameDestination(
     _In_ PFLT_CALLBACK_DATA Data,
@@ -1557,66 +1930,219 @@ PsipGetRenameDestination(
     )
 {
     PFILE_RENAME_INFORMATION renameInfo;
+    ULONG infoBufferLength;
+    ULONG fileNameLength;
     ULONG bufferLength;
-    PWCHAR buffer;
+    ULONG maxFileNameLength;
+    PWCHAR buffer = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
 
     RtlZeroMemory(NewFileName, sizeof(UNICODE_STRING));
 
+    //
+    // Get the info buffer and its length
+    //
     renameInfo = (PFILE_RENAME_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+    infoBufferLength = Data->Iopb->Parameters.SetFileInformation.Length;
 
+    //
+    // Basic validation
+    //
     if (renameInfo == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (renameInfo->FileNameLength == 0) {
-        return STATUS_INVALID_PARAMETER;
+    if (infoBufferLength < sizeof(FILE_RENAME_INFORMATION)) {
+        return STATUS_BUFFER_TOO_SMALL;
     }
 
     //
-    // Allocate buffer for new file name
+    // Calculate maximum valid file name length based on buffer size
+    // FILE_RENAME_INFORMATION has FileName[1] at the end, so:
+    // MaxFileNameLength = infoBufferLength - FIELD_OFFSET(FILE_RENAME_INFORMATION, FileName)
     //
-    bufferLength = renameInfo->FileNameLength + sizeof(WCHAR);
+    maxFileNameLength = infoBufferLength - FIELD_OFFSET(FILE_RENAME_INFORMATION, FileName);
 
-    buffer = (PWCHAR)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
-        bufferLength,
-        PSI_POOL_TAG
-        );
+    __try {
+        //
+        // Read FileNameLength from potentially user-mode buffer
+        //
+        fileNameLength = renameInfo->FileNameLength;
 
-    if (buffer == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        //
+        // Validate FileNameLength
+        //
+        if (fileNameLength == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if (fileNameLength > maxFileNameLength) {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+
+        //
+        // Prevent excessive allocation (DoS protection)
+        //
+        if (fileNameLength > PSI_MAX_RENAME_BUFFER_SIZE) {
+            return STATUS_NAME_TOO_LONG;
+        }
+
+        //
+        // USHORT truncation protection for UNICODE_STRING
+        //
+        if (fileNameLength > UNICODE_STRING_MAX_BYTES) {
+            return STATUS_NAME_TOO_LONG;
+        }
+
+        //
+        // Calculate allocation size with overflow check
+        //
+        bufferLength = fileNameLength + sizeof(WCHAR);  // +1 for null terminator
+        if (bufferLength < fileNameLength) {
+            // Overflow
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
+        //
+        // Allocate buffer
+        //
+        buffer = (PWCHAR)ExAllocatePoolWithTag(
+            NonPagedPoolNx,
+            bufferLength,
+            PSI_POOL_TAG
+            );
+
+        if (buffer == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        //
+        // Copy file name from potentially user-mode buffer
+        //
+        RtlCopyMemory(buffer, renameInfo->FileName, fileNameLength);
+        buffer[fileNameLength / sizeof(WCHAR)] = L'\0';
+
+        //
+        // Set up the output UNICODE_STRING
+        //
+        NewFileName->Buffer = buffer;
+        NewFileName->Length = (USHORT)fileNameLength;
+        NewFileName->MaximumLength = (USHORT)bufferLength;
+
+        buffer = NULL;  // Transfer ownership to caller
+        status = STATUS_SUCCESS;
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/PreSetInfo] Exception 0x%08X accessing rename buffer\n",
+                   status);
     }
 
-    RtlCopyMemory(buffer, renameInfo->FileName, renameInfo->FileNameLength);
-    buffer[renameInfo->FileNameLength / sizeof(WCHAR)] = L'\0';
+    //
+    // Cleanup on failure
+    //
+    if (buffer != NULL) {
+        ExFreePoolWithTag(buffer, PSI_POOL_TAG);
+    }
 
-    NewFileName->Buffer = buffer;
-    NewFileName->Length = (USHORT)renameInfo->FileNameLength;
-    NewFileName->MaximumLength = (USHORT)bufferLength;
-
-    return STATUS_SUCCESS;
+    return status;
 }
 
+/**
+ * @brief Send telemetry event to user-mode service.
+ *
+ * IMPLEMENTED: Actually sends events via communication port.
+ */
 static VOID
 PsipSendTelemetryEvent(
     _In_ HANDLE ProcessId,
     _In_ FILE_INFORMATION_CLASS InfoClass,
     _In_ PCUNICODE_STRING FileName,
     _In_ ULONG BlockReason,
-    _In_ ULONG SuspicionScore
+    _In_ ULONG SuspicionScore,
+    _In_ BOOLEAN WasBlocked
     )
 {
-    UNREFERENCED_PARAMETER(ProcessId);
-    UNREFERENCED_PARAMETER(InfoClass);
-    UNREFERENCED_PARAMETER(FileName);
-    UNREFERENCED_PARAMETER(BlockReason);
-    UNREFERENCED_PARAMETER(SuspicionScore);
+    NTSTATUS status;
+    PPSI_TELEMETRY_EVENT event = NULL;
+    ULONG eventSize;
+    USHORT fileNameLength;
+    ULONG replyLength = 0;
+
+    if (!PsipIsInitialized()) {
+        return;
+    }
 
     //
-    // TODO: Send telemetry event to user-mode service
-    // This would use the communication port to notify the service
-    // of detected ransomware/destruction/credential access attempts
+    // Calculate event size
     //
+    if (FileName != NULL && FileName->Length > 0 && FileName->Buffer != NULL) {
+        fileNameLength = min(FileName->Length, 1024 * sizeof(WCHAR));  // Cap at 1024 chars
+    } else {
+        fileNameLength = 0;
+    }
+
+    eventSize = FIELD_OFFSET(PSI_TELEMETRY_EVENT, FileName) + fileNameLength + sizeof(WCHAR);
+
+    //
+    // Allocate event structure
+    //
+    event = (PPSI_TELEMETRY_EVENT)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        eventSize,
+        PSI_POOL_TAG
+        );
+
+    if (event == NULL) {
+        InterlockedIncrement64(&g_PsiState.Stats.TelemetryEventsFailed);
+        return;
+    }
+
+    RtlZeroMemory(event, eventSize);
+
+    //
+    // Populate event
+    //
+    event->ProcessId = ProcessId;
+    event->InfoClass = InfoClass;
+    event->BlockReason = BlockReason;
+    event->SuspicionScore = SuspicionScore;
+    event->WasBlocked = WasBlocked;
+    KeQuerySystemTime(&event->Timestamp);
+    event->FileNameLength = fileNameLength;
+
+    if (fileNameLength > 0) {
+        RtlCopyMemory(event->FileName, FileName->Buffer, fileNameLength);
+    }
+    event->FileName[fileNameLength / sizeof(WCHAR)] = L'\0';
+
+    //
+    // Send via communication port
+    // Note: This is non-blocking; if the port is not connected, the event is dropped
+    //
+    status = ShadowStrikeSendMessage(
+        SHADOWSTRIKE_MSG_TYPE_PRESETINFO_TELEMETRY,
+        event,
+        eventSize,
+        NULL,
+        &replyLength
+        );
+
+    if (NT_SUCCESS(status)) {
+        InterlockedIncrement64(&g_PsiState.Stats.TelemetryEventsSent);
+    } else {
+        InterlockedIncrement64(&g_PsiState.Stats.TelemetryEventsFailed);
+
+        // Don't spam logs for expected failures (port not connected)
+        if (status != STATUS_PORT_DISCONNECTED && status != STATUS_CONNECTION_INVALID) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike/PreSetInfo] Telemetry send failed: 0x%08X\n",
+                       status);
+        }
+    }
+
+    ExFreePoolWithTag(event, PSI_POOL_TAG);
 }
 
 // ============================================================================
@@ -1625,16 +2151,9 @@ PsipSendTelemetryEvent(
 
 /**
  * @brief Get PreSetInfo statistics.
- *
- * @param TotalCalls        Receives total callback invocations.
- * @param DeleteOperations  Receives delete operation count.
- * @param RenameOperations  Receives rename operation count.
- * @param BlockedOperations Receives blocked operation count.
- *
- * @return STATUS_SUCCESS on success.
- *
- * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowStrikeGetPreSetInfoStats(
     _Out_opt_ PULONG64 TotalCalls,
@@ -1643,7 +2162,7 @@ ShadowStrikeGetPreSetInfoStats(
     _Out_opt_ PULONG64 BlockedOperations
     )
 {
-    if (!g_PsiState.Initialized) {
+    if (g_PsiState.InitState != 2) {
         return STATUS_NOT_FOUND;
     }
 
@@ -1674,17 +2193,9 @@ ShadowStrikeGetPreSetInfoStats(
 
 /**
  * @brief Query process behavioral context.
- *
- * @param ProcessId             Process ID to query.
- * @param IsRansomwareSuspect   Receives ransomware suspect flag.
- * @param IsDestructionSuspect  Receives destruction suspect flag.
- * @param SuspicionScore        Receives suspicion score.
- * @param BehaviorFlags         Receives behavior flags.
- *
- * @return STATUS_SUCCESS or STATUS_NOT_FOUND.
- *
- * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowStrikeQueryPreSetInfoProcessContext(
     _In_ HANDLE ProcessId,
@@ -1696,7 +2207,9 @@ ShadowStrikeQueryPreSetInfoProcessContext(
 {
     PPSI_PROCESS_CONTEXT context;
 
-    if (!g_PsiState.Initialized) {
+    PAGED_CODE();
+
+    if (g_PsiState.InitState != 2) {
         return STATUS_NOT_FOUND;
     }
 
@@ -1706,19 +2219,19 @@ ShadowStrikeQueryPreSetInfoProcessContext(
     }
 
     if (IsRansomwareSuspect != NULL) {
-        *IsRansomwareSuspect = context->IsRansomwareSuspect;
+        *IsRansomwareSuspect = (BOOLEAN)context->IsRansomwareSuspect;
     }
 
     if (IsDestructionSuspect != NULL) {
-        *IsDestructionSuspect = context->IsDestructionSuspect;
+        *IsDestructionSuspect = (BOOLEAN)context->IsDestructionSuspect;
     }
 
     if (SuspicionScore != NULL) {
-        *SuspicionScore = context->SuspicionScore;
+        *SuspicionScore = (ULONG)context->SuspicionScore;
     }
 
     if (BehaviorFlags != NULL) {
-        *BehaviorFlags = context->BehaviorFlags;
+        *BehaviorFlags = (ULONG)context->BehaviorFlags;
     }
 
     PsipDereferenceProcessContext(context);
@@ -1728,15 +2241,9 @@ ShadowStrikeQueryPreSetInfoProcessContext(
 
 /**
  * @brief Configure PreSetInfo behavioral thresholds.
- *
- * @param RansomwareRenameThreshold     Renames per second to trigger ransomware detection.
- * @param RansomwareDeleteThreshold     Deletes per second to trigger ransomware detection.
- * @param DestructionDeleteThreshold    Total deletes to trigger destruction detection.
- *
- * @return STATUS_SUCCESS.
- *
- * @irql <= DISPATCH_LEVEL
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ShadowStrikeConfigurePreSetInfoThresholds(
     _In_ ULONG RansomwareRenameThreshold,
@@ -1744,22 +2251,100 @@ ShadowStrikeConfigurePreSetInfoThresholds(
     _In_ ULONG DestructionDeleteThreshold
     )
 {
-    if (!g_PsiState.Initialized) {
+    if (g_PsiState.InitState != 2) {
         return STATUS_NOT_FOUND;
     }
 
     if (RansomwareRenameThreshold > 0) {
-        g_PsiState.RansomwareRenameThreshold = RansomwareRenameThreshold;
+        InterlockedExchange(&g_PsiState.RansomwareRenameThreshold, (LONG)RansomwareRenameThreshold);
     }
 
     if (RansomwareDeleteThreshold > 0) {
-        g_PsiState.RansomwareDeleteThreshold = RansomwareDeleteThreshold;
+        InterlockedExchange(&g_PsiState.RansomwareDeleteThreshold, (LONG)RansomwareDeleteThreshold);
     }
 
     if (DestructionDeleteThreshold > 0) {
-        g_PsiState.DestructionDeleteThreshold = DestructionDeleteThreshold;
+        InterlockedExchange(&g_PsiState.DestructionDeleteThreshold, (LONG)DestructionDeleteThreshold);
     }
 
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief Configure PreSetInfo protection features.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeConfigurePreSetInfoProtection(
+    _In_ BOOLEAN BlockRansomware,
+    _In_ BOOLEAN BlockDestruction,
+    _In_ BOOLEAN BlockCredentialAccess,
+    _In_ BOOLEAN MonitorAttributes
+    )
+{
+    if (g_PsiState.InitState != 2) {
+        return STATUS_NOT_FOUND;
+    }
+
+    InterlockedExchange(&g_PsiState.BlockRansomwareBehavior, BlockRansomware);
+    InterlockedExchange(&g_PsiState.BlockDataDestruction, BlockDestruction);
+    InterlockedExchange(&g_PsiState.BlockCredentialAccess, BlockCredentialAccess);
+    InterlockedExchange(&g_PsiState.MonitorAttributeChanges, MonitorAttributes);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Clear behavioral tracking for a specific process.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeClearPreSetInfoProcessContext(
+    _In_ HANDLE ProcessId
+    )
+{
+    PPSI_PROCESS_CONTEXT context;
+
+    PAGED_CODE();
+
+    if (g_PsiState.InitState != 2) {
+        return STATUS_NOT_FOUND;
+    }
+
+    context = PsipLookupProcessContext(ProcessId, FALSE);
+    if (context == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Reset all counters and flags
+    //
+    InterlockedExchange(&context->RecentRenames, 0);
+    InterlockedExchange(&context->RecentDeletes, 0);
+    InterlockedExchange(&context->RecentExtensionChanges, 0);
+    InterlockedExchange(&context->RecentTruncations, 0);
+    InterlockedExchange(&context->RecentHardLinks, 0);
+    InterlockedExchange(&context->RecentAttributeChanges, 0);
+    InterlockedExchange64(&context->TotalRenames, 0);
+    InterlockedExchange64(&context->TotalDeletes, 0);
+    InterlockedExchange64(&context->TotalExtensionChanges, 0);
+    InterlockedExchange64(&context->TotalTruncations, 0);
+    InterlockedExchange64(&context->TotalHardLinks, 0);
+    InterlockedExchange64(&context->TotalAttributeChanges, 0);
+    InterlockedExchange(&context->BehaviorFlags, 0);
+    InterlockedExchange(&context->SuspicionScore, 0);
+    InterlockedExchange(&context->IsRansomwareSuspect, FALSE);
+    InterlockedExchange(&context->IsDestructionSuspect, FALSE);
+    InterlockedExchange(&context->IsCredentialAccessSuspect, FALSE);
+    InterlockedExchange(&context->IsBlocked, FALSE);
+
+    LARGE_INTEGER currentTime;
+    KeQuerySystemTime(&currentTime);
+    context->WindowStartTime = currentTime;
+
+    PsipDereferenceProcessContext(context);
+
+    return STATUS_SUCCESS;
+}

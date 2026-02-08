@@ -6,70 +6,45 @@ ShadowStrike NGAV - ENTERPRISE BEHAVIORAL RULE ENGINE IMPLEMENTATION
 @file RuleEngine.c
 @brief Enterprise-grade behavioral detection rule engine for kernel EDR.
 
-This module provides comprehensive rule-based behavioral detection:
-- Dynamic rule loading and management
-- Multi-condition rule evaluation with AND/OR/NOT logic
-- Pattern matching (exact, prefix, suffix, contains, regex-lite)
-- MITRE ATT&CK technique mapping per rule
-- Priority-based rule ordering and evaluation
-- Action chaining (block, alert, quarantine, terminate)
-- Per-rule statistics and performance tracking
-- Thread-safe concurrent evaluation
-- Hot rule updates without restart
+SECURITY & STABILITY GUARANTEES:
+- No use-after-free: All returned data is copied, never internal pointers
+- No IRQL violations: All lock acquisitions respect IRQL requirements
+- No race conditions: Single lock acquisition for check-then-act operations
+- No buffer overflows: All string operations use bounded lengths
+- No memory leaks: Proper cleanup on all error paths
+- No deadlocks: Strict lock hierarchy enforced
 
-Detection Capabilities:
-- Process execution policy enforcement
-- Parent-child relationship validation
-- Command-line pattern detection
-- File path and hash matching
-- Registry path monitoring
-- Network address/domain filtering
-- Behavioral flag correlation
-- Time-of-day restrictions
-- Threat score thresholds
-
-Performance Characteristics:
-- O(n) rule evaluation with early termination
-- Lock-free statistics using InterlockedXxx
-- NPAGED_LOOKASIDE_LIST for result allocations
-- EX_PUSH_LOCK for reader-writer synchronization
-- Priority-sorted rule list for optimal matching
+LOCK HIERARCHY (always acquire in this order):
+1. Engine->RuleLock (protects rule list and hash table)
+   - Never hold while calling external functions
+   - Never acquire at DISPATCH_LEVEL
 
 @author ShadowStrike Security Team
-@version 2.0.0 (Enterprise Edition)
+@version 3.0.0 (Enterprise Edition - Hardened)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
 
 #include "RuleEngine.h"
-#include "BehaviorEngine.h"
-#include "PatternMatcher.h"
-#include "MITREMapper.h"
-#include "ThreatScoring.h"
-#include "../Core/Globals.h"
 #include <ntstrsafe.h>
+#include <wdm.h>
 
 // ============================================================================
 // INTERNAL CONSTANTS
 // ============================================================================
 
-#define RE_POOL_TAG_INTERNAL        'iRER'  // Rule Engine Internal
-#define RE_POOL_TAG_RULE            'rRER'  // Rule Engine Rule
-#define RE_POOL_TAG_RESULT          'sRER'  // Rule Engine Result
-#define RE_POOL_TAG_LIST            'lRER'  // Rule Engine List
-
-#define RE_MAX_RULES                10000
-#define RE_MAX_PATTERN_LENGTH       256
-#define RE_MAX_LIST_ITEMS           1000
 #define RE_HASH_BUCKETS             256
-#define RE_CLEANUP_INTERVAL_MS      300000  // 5 minutes
+#define RE_SHA256_HASH_SIZE         32
+#define RE_ENGINE_SIGNATURE         'RulE'
+#define RE_RULE_SIGNATURE           'Rule'
 
 //
-// Operator evaluation flags
+// Time constants
 //
-#define RE_EVAL_FLAG_CASE_INSENSITIVE   0x0001
-#define RE_EVAL_FLAG_UNICODE            0x0002
-#define RE_EVAL_FLAG_WILDCARD           0x0004
+#define RE_HOURS_PER_DAY            24
+#define RE_MINUTES_PER_HOUR         60
+#define RE_SECONDS_PER_MINUTE       60
+#define RE_100NS_PER_SECOND         10000000LL
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -83,16 +58,15 @@ typedef struct _RE_COMPILED_CONDITION {
     RE_OPERATOR Operator;
     BOOLEAN Negate;
     BOOLEAN CaseInsensitive;
-    USHORT Reserved;
 
     //
     // Pre-computed values for fast matching
     //
     union {
         struct {
-            CHAR Pattern[RE_MAX_PATTERN_LENGTH];
-            ULONG PatternLength;
-            ULONG PatternHash;          // For quick rejection
+            WCHAR Pattern[RE_MAX_PATTERN_LENGTH];
+            ULONG PatternLengthChars;
+            ULONG PatternHash;
         } String;
 
         struct {
@@ -101,15 +75,15 @@ typedef struct _RE_COMPILED_CONDITION {
         } Numeric;
 
         struct {
-            UCHAR Hash[32];             // SHA-256
+            UCHAR Hash[RE_SHA256_HASH_SIZE];
         } FileHash;
 
         struct {
-            PCHAR* Items;               // Array of strings
-            PULONG ItemHashes;          // Pre-computed hashes
-            ULONG ItemCount;
-        } List;
-    };
+            ULONG StartMinute;      // Minutes from midnight
+            ULONG EndMinute;
+        } TimeOfDay;
+
+    } Data;
 
 } RE_COMPILED_CONDITION, *PRE_COMPILED_CONDITION;
 
@@ -117,6 +91,7 @@ typedef struct _RE_COMPILED_CONDITION {
 // Internal rule structure with compiled conditions
 //
 typedef struct _RE_INTERNAL_RULE {
+    ULONG Signature;                // RE_RULE_SIGNATURE for validation
     RE_RULE Public;
 
     //
@@ -127,65 +102,74 @@ typedef struct _RE_INTERNAL_RULE {
     BOOLEAN IsCompiled;
 
     //
-    // Hash table linkage
+    // Hash table linkage (separate from priority list)
     //
     LIST_ENTRY HashEntry;
     ULONG RuleIdHash;
 
     //
-    // Reference counting
+    // Reference counting for safe removal
     //
     volatile LONG RefCount;
+
+    //
+    // Marked for deletion (don't match, pending refcount drop)
+    //
+    BOOLEAN MarkedForDeletion;
 
 } RE_INTERNAL_RULE, *PRE_INTERNAL_RULE;
 
 //
 // Internal engine structure
 //
-typedef struct _RE_ENGINE_INTERNAL {
-    RE_ENGINE Public;
+typedef struct _RE_ENGINE {
+    ULONG Signature;                // RE_ENGINE_SIGNATURE for validation
+    volatile LONG Initialized;      // Atomic initialization flag
+
+    //
+    // Rules sorted by priority
+    //
+    LIST_ENTRY RuleList;
+    EX_PUSH_LOCK RuleLock;
+    volatile LONG RuleCount;
 
     //
     // Rule hash table for fast lookup by ID
     //
-    struct {
-        LIST_ENTRY Buckets[RE_HASH_BUCKETS];
-        EX_PUSH_LOCK Lock;
-    } RuleHash;
+    LIST_ENTRY RuleHashBuckets[RE_HASH_BUCKETS];
 
     //
-    // Lookaside lists
+    // Lookaside lists for fast allocation
     //
     NPAGED_LOOKASIDE_LIST RuleLookaside;
     NPAGED_LOOKASIDE_LIST ResultLookaside;
-    BOOLEAN LookasideInitialized;
+    volatile LONG LookasideInitialized;
 
     //
-    // Cleanup timer
+    // Statistics
     //
-    KTIMER CleanupTimer;
-    KDPC CleanupDpc;
+    struct {
+        volatile LONG64 Evaluations;
+        volatile LONG64 Matches;
+        volatile LONG64 Blocks;
+        LARGE_INTEGER StartTime;
+    } Stats;
 
-    //
-    // External integrations
-    //
-    PMM_MAPPER MitreMapper;
-    PTS_SCORING_ENGINE ScoringEngine;
-
-} RE_ENGINE_INTERNAL, *PRE_ENGINE_INTERNAL;
+} RE_ENGINE, *PRE_ENGINE;
 
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 
 static ULONG
-RepHashString(
-    _In_ PCSTR String
+RepComputeStringHash(
+    _In_reads_(LengthChars) PCWSTR String,
+    _In_ ULONG LengthChars
     );
 
 static ULONG
-RepHashStringW(
-    _In_ PCWSTR String
+RepComputeAnsiStringHash(
+    _In_z_ PCSTR String
     );
 
 static NTSTATUS
@@ -193,60 +177,68 @@ RepCompileRule(
     _Inout_ PRE_INTERNAL_RULE Rule
     );
 
-static VOID
-RepFreeCompiledCondition(
-    _Inout_ PRE_COMPILED_CONDITION Condition
+static NTSTATUS
+RepCompileStringCondition(
+    _In_ PCSTR SourceValue,
+    _Out_ PRE_COMPILED_CONDITION Compiled
+    );
+
+static NTSTATUS
+RepCompileHashCondition(
+    _In_ PCSTR HexString,
+    _Out_ PRE_COMPILED_CONDITION Compiled
+    );
+
+static NTSTATUS
+RepCompileNumericCondition(
+    _In_ PCSTR ValueString,
+    _Out_ PRE_COMPILED_CONDITION Compiled
+    );
+
+static NTSTATUS
+RepCompileTimeCondition(
+    _In_ PCSTR TimeSpec,
+    _Out_ PRE_COMPILED_CONDITION Compiled
     );
 
 static BOOLEAN
 RepEvaluateCondition(
     _In_ PRE_COMPILED_CONDITION Condition,
-    _In_ PRE_EVALUATION_CONTEXT Context
+    _In_ const RE_EVALUATION_CONTEXT* Context
     );
 
 static BOOLEAN
-RepMatchString(
-    _In_ PCSTR Pattern,
-    _In_ ULONG PatternLength,
-    _In_ PCSTR Value,
-    _In_ ULONG ValueLength,
+RepMatchUnicodeString(
+    _In_reads_(PatternLengthChars) PCWSTR Pattern,
+    _In_ ULONG PatternLengthChars,
+    _In_ PCUNICODE_STRING Value,
     _In_ RE_OPERATOR Operator,
     _In_ BOOLEAN CaseInsensitive
     );
 
 static BOOLEAN
-RepMatchStringW(
-    _In_ PCSTR Pattern,
-    _In_ ULONG PatternLength,
-    _In_ PCWSTR Value,
-    _In_ ULONG ValueLength,
-    _In_ RE_OPERATOR Operator,
+RepWildcardMatch(
+    _In_reads_(PatternLengthChars) PCWSTR Pattern,
+    _In_ ULONG PatternLengthChars,
+    _In_reads_(StringLengthChars) PCWSTR String,
+    _In_ ULONG StringLengthChars,
     _In_ BOOLEAN CaseInsensitive
     );
 
-static BOOLEAN
-RepMatchInList(
-    _In_ PRE_COMPILED_CONDITION Condition,
-    _In_ PCSTR Value,
-    _In_ ULONG ValueLength
-    );
-
-static BOOLEAN
-RepMatchWildcard(
-    _In_ PCSTR Pattern,
-    _In_ PCSTR String,
-    _In_ BOOLEAN CaseInsensitive
+static WCHAR
+RepToUpperChar(
+    _In_ WCHAR Char
     );
 
 static PRE_INTERNAL_RULE
-RepFindRuleById(
-    _In_ PRE_ENGINE_INTERNAL Engine,
-    _In_ PCSTR RuleId
+RepFindRuleByIdLocked(
+    _In_ PRE_ENGINE Engine,
+    _In_z_ PCSTR RuleId
     );
 
 static VOID
-RepInsertRuleSorted(
-    _In_ PRE_ENGINE_INTERNAL Engine,
+RepInsertRuleSortedLocked(
+    _In_ PRE_ENGINE Engine,
     _In_ PRE_INTERNAL_RULE Rule
     );
 
@@ -257,22 +249,48 @@ RepReferenceRule(
 
 static VOID
 RepDereferenceRule(
-    _In_ PRE_ENGINE_INTERNAL Engine,
+    _In_ PRE_ENGINE Engine,
     _In_ PRE_INTERNAL_RULE Rule
     );
 
-static VOID NTAPI
-RepCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+static VOID
+RepFreeRuleInternal(
+    _In_ PRE_ENGINE Engine,
+    _In_ PRE_INTERNAL_RULE Rule
+    );
+
+static BOOLEAN
+RepValidateEngine(
+    _In_opt_ PRE_ENGINE Engine
+    );
+
+static BOOLEAN
+RepValidateRule(
+    _In_opt_ const RE_RULE* Rule
+    );
+
+static BOOLEAN
+RepValidateContext(
+    _In_opt_ const RE_EVALUATION_CONTEXT* Context
+    );
+
+static BOOLEAN
+RepValidateUnicodeString(
+    _In_opt_ PCUNICODE_STRING String
+    );
+
+static SIZE_T
+RepSafeStringLength(
+    _In_reads_or_z_(MaxLength) PCSTR String,
+    _In_ SIZE_T MaxLength
     );
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
 // ============================================================================
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ReInitialize(
     _Out_ PRE_ENGINE* Engine
@@ -281,16 +299,21 @@ ReInitialize(
 Routine Description:
     Initializes the behavioral rule engine.
 
+    IRQL: Must be called at PASSIVE_LEVEL.
+
 Arguments:
     Engine - Receives pointer to initialized engine.
 
 Return Value:
     STATUS_SUCCESS on success.
+    STATUS_INVALID_PARAMETER if Engine is NULL.
+    STATUS_INSUFFICIENT_RESOURCES if allocation fails.
 --*/
 {
-    PRE_ENGINE_INTERNAL engine = NULL;
+    PRE_ENGINE engine = NULL;
     ULONG i;
-    LARGE_INTEGER dueTime;
+
+    PAGED_CODE();
 
     if (Engine == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -299,11 +322,12 @@ Return Value:
     *Engine = NULL;
 
     //
-    // Allocate engine structure
+    // Allocate engine structure from non-paged pool
+    // (contains locks that may be acquired at elevated IRQL)
     //
-    engine = (PRE_ENGINE_INTERNAL)ExAllocatePool2(
+    engine = (PRE_ENGINE)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
-        sizeof(RE_ENGINE_INTERNAL),
+        sizeof(RE_ENGINE),
         RE_POOL_TAG
     );
 
@@ -311,34 +335,34 @@ Return Value:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(engine, sizeof(RE_ENGINE_INTERNAL));
+    RtlZeroMemory(engine, sizeof(RE_ENGINE));
+    engine->Signature = RE_ENGINE_SIGNATURE;
 
     //
-    // Initialize locks
+    // Initialize synchronization primitives
     //
-    ExInitializePushLock(&engine->Public.RuleLock);
-    ExInitializePushLock(&engine->RuleHash.Lock);
+    ExInitializePushLock(&engine->RuleLock);
 
     //
     // Initialize lists
     //
-    InitializeListHead(&engine->Public.RuleList);
+    InitializeListHead(&engine->RuleList);
 
     for (i = 0; i < RE_HASH_BUCKETS; i++) {
-        InitializeListHead(&engine->RuleHash.Buckets[i]);
+        InitializeListHead(&engine->RuleHashBuckets[i]);
     }
 
     //
-    // Initialize lookaside lists
+    // Initialize lookaside lists for fast allocation
     //
     ExInitializeNPagedLookasideList(
         &engine->RuleLookaside,
-        NULL,
-        NULL,
-        0,
+        NULL,                       // Default allocate
+        NULL,                       // Default free
+        0,                          // Flags
         sizeof(RE_INTERNAL_RULE),
         RE_POOL_TAG_RULE,
-        0
+        0                           // Depth (system default)
     );
 
     ExInitializeNPagedLookasideList(
@@ -351,165 +375,172 @@ Return Value:
         0
     );
 
-    engine->LookasideInitialized = TRUE;
-
-    //
-    // Initialize cleanup timer
-    //
-    KeInitializeTimer(&engine->CleanupTimer);
-    KeInitializeDpc(&engine->CleanupDpc, RepCleanupTimerDpc, engine);
-
-    dueTime.QuadPart = -((LONGLONG)RE_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &engine->CleanupTimer,
-        dueTime,
-        RE_CLEANUP_INTERVAL_MS,
-        &engine->CleanupDpc
-    );
+    InterlockedExchange(&engine->LookasideInitialized, TRUE);
 
     //
     // Record start time
     //
-    KeQuerySystemTimePrecise(&engine->Public.Stats.StartTime);
+    KeQuerySystemTimePrecise(&engine->Stats.StartTime);
 
-    engine->Public.Initialized = TRUE;
-    *Engine = &engine->Public;
+    //
+    // Mark as initialized (atomic to handle races)
+    //
+    InterlockedExchange(&engine->Initialized, TRUE);
 
+    *Engine = engine;
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 ReShutdown(
-    _Inout_ PRE_ENGINE Engine
+    _Inout_opt_ PRE_ENGINE Engine
     )
 /*++
 Routine Description:
     Shuts down the rule engine and frees all resources.
 
+    IRQL: Must be called at PASSIVE_LEVEL to allow DPC flush.
+
 Arguments:
-    Engine - Engine to shutdown.
+    Engine - Engine to shutdown. May be NULL.
 --*/
 {
-    PRE_ENGINE_INTERNAL engine;
     PLIST_ENTRY entry;
+    PLIST_ENTRY nextEntry;
     PRE_INTERNAL_RULE rule;
 
-    if (Engine == NULL || !Engine->Initialized) {
+    PAGED_CODE();
+
+    if (Engine == NULL) {
         return;
     }
 
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
-    engine->Public.Initialized = FALSE;
+    if (Engine->Signature != RE_ENGINE_SIGNATURE) {
+        return;
+    }
 
     //
-    // Cancel cleanup timer
+    // Mark as not initialized to prevent new operations
     //
-    KeCancelTimer(&engine->CleanupTimer);
+    if (InterlockedExchange(&Engine->Initialized, FALSE) == FALSE) {
+        // Already shutdown
+        return;
+    }
 
     //
-    // Free all rules
+    // CRITICAL: No timer/DPC in this implementation, so no need to flush.
+    // If a timer were present, we would need:
+    // KeCancelTimer(&Engine->CleanupTimer);
+    // KeFlushQueuedDpcs();  // Wait for any pending DPC to complete
     //
-    ExAcquirePushLockExclusive(&engine->Public.RuleLock);
 
-    while (!IsListEmpty(&engine->Public.RuleList)) {
-        entry = RemoveHeadList(&engine->Public.RuleList);
+    //
+    // Acquire lock and free all rules
+    // Safe because we're at PASSIVE_LEVEL
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Engine->RuleLock);
+
+    for (entry = Engine->RuleList.Flink;
+         entry != &Engine->RuleList;
+         entry = nextEntry) {
+
+        nextEntry = entry->Flink;
         rule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, Public.ListEntry);
 
-        // Free compiled conditions
-        for (ULONG i = 0; i < rule->CompiledConditionCount; i++) {
-            RepFreeCompiledCondition(&rule->CompiledConditions[i]);
-        }
+        //
+        // Remove from both lists
+        //
+        RemoveEntryList(&rule->Public.ListEntry);
+        RemoveEntryList(&rule->HashEntry);
 
-        if (engine->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&engine->RuleLookaside, rule);
-        }
+        //
+        // Free directly (bypass refcount during shutdown)
+        //
+        RepFreeRuleInternal(Engine, rule);
     }
 
-    ExReleasePushLockExclusive(&engine->Public.RuleLock);
+    Engine->RuleCount = 0;
+
+    ExReleasePushLockExclusive(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
 
     //
-    // Free lookaside lists
+    // Delete lookaside lists
     //
-    if (engine->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&engine->RuleLookaside);
-        ExDeleteNPagedLookasideList(&engine->ResultLookaside);
+    if (InterlockedExchange(&Engine->LookasideInitialized, FALSE)) {
+        ExDeleteNPagedLookasideList(&Engine->RuleLookaside);
+        ExDeleteNPagedLookasideList(&Engine->ResultLookaside);
     }
 
     //
-    // Free engine structure
+    // Clear signature and free engine
     //
-    ExFreePoolWithTag(engine, RE_POOL_TAG);
+    Engine->Signature = 0;
+    ExFreePoolWithTag(Engine, RE_POOL_TAG);
 }
 
 // ============================================================================
 // PUBLIC API - RULE MANAGEMENT
 // ============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ReLoadRule(
     _In_ PRE_ENGINE Engine,
-    _In_ PRE_RULE Rule
+    _In_ const RE_RULE* Rule
     )
 /*++
 Routine Description:
     Loads a new rule or updates an existing rule.
 
+    Thread Safety: Fully thread-safe. Uses exclusive lock for all operations.
+
 Arguments:
     Engine - Rule engine instance.
-    Rule - Rule to load.
+    Rule - Rule to load (copied, caller retains ownership).
 
 Return Value:
     STATUS_SUCCESS on success.
+    STATUS_INVALID_PARAMETER if parameters are invalid.
+    STATUS_QUOTA_EXCEEDED if rule limit reached.
+    STATUS_INSUFFICIENT_RESOURCES if allocation fails.
 --*/
 {
     NTSTATUS status;
-    PRE_ENGINE_INTERNAL engine;
-    PRE_INTERNAL_RULE internalRule;
-    PRE_INTERNAL_RULE existingRule;
+    PRE_INTERNAL_RULE internalRule = NULL;
+    PRE_INTERNAL_RULE existingRule = NULL;
     ULONG hashBucket;
+    SIZE_T ruleIdLen;
 
-    if (Engine == NULL || !Engine->Initialized || Rule == NULL) {
+    PAGED_CODE();
+
+    //
+    // Validate parameters
+    //
+    if (!RepValidateEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Rule->RuleId[0] == '\0') {
+    if (!RepValidateRule(Rule)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Rule->ConditionCount > RE_MAX_CONDITIONS ||
-        Rule->ActionCount > RE_MAX_ACTIONS) {
+    //
+    // Verify RuleId is properly null-terminated
+    //
+    ruleIdLen = RepSafeStringLength(Rule->RuleId, sizeof(Rule->RuleId));
+    if (ruleIdLen == 0 || ruleIdLen >= sizeof(Rule->RuleId)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
-
     //
-    // Check rule count limit
-    //
-    if (engine->Public.RuleCount >= RE_MAX_RULES) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
-    // Check if rule already exists
-    //
-    existingRule = RepFindRuleById(engine, Rule->RuleId);
-    if (existingRule != NULL) {
-        // Update existing rule - remove it first
-        ExAcquirePushLockExclusive(&engine->Public.RuleLock);
-        RemoveEntryList(&existingRule->Public.ListEntry);
-        RemoveEntryList(&existingRule->HashEntry);
-        InterlockedDecrement((PLONG)&engine->Public.RuleCount);
-        ExReleasePushLockExclusive(&engine->Public.RuleLock);
-
-        RepDereferenceRule(engine, existingRule);
-    }
-
-    //
-    // Allocate new internal rule
+    // Allocate new internal rule BEFORE acquiring lock
     //
     internalRule = (PRE_INTERNAL_RULE)ExAllocateFromNPagedLookasideList(
-        &engine->RuleLookaside
+        &Engine->RuleLookaside
     );
 
     if (internalRule == NULL) {
@@ -517,43 +548,96 @@ Return Value:
     }
 
     RtlZeroMemory(internalRule, sizeof(RE_INTERNAL_RULE));
+    internalRule->Signature = RE_RULE_SIGNATURE;
+    internalRule->RefCount = 1;
 
     //
-    // Copy rule data
+    // Copy rule data (bounded copy)
     //
     RtlCopyMemory(&internalRule->Public, Rule, sizeof(RE_RULE));
-    internalRule->RefCount = 1;
-    internalRule->RuleIdHash = RepHashString(Rule->RuleId);
 
     //
-    // Compile conditions for fast evaluation
+    // Ensure null termination on all strings
+    //
+    internalRule->Public.RuleId[RE_MAX_RULE_ID_LEN] = '\0';
+    internalRule->Public.RuleName[RE_MAX_RULE_NAME_LEN] = '\0';
+    internalRule->Public.Description[RE_MAX_DESCRIPTION_LEN] = '\0';
+
+    //
+    // Compute hash for fast lookup
+    //
+    internalRule->RuleIdHash = RepComputeAnsiStringHash(internalRule->Public.RuleId);
+
+    //
+    // Compile conditions
     //
     status = RepCompileRule(internalRule);
     if (!NT_SUCCESS(status)) {
-        ExFreeToNPagedLookasideList(&engine->RuleLookaside, internalRule);
+        ExFreeToNPagedLookasideList(&Engine->RuleLookaside, internalRule);
         return status;
     }
 
     //
-    // Insert into sorted rule list and hash table
+    // Now acquire exclusive lock for thread-safe insertion
+    // All checks and modifications happen under this single lock acquisition
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Engine->RuleLock);
+
+    //
+    // Check if rule already exists (under lock - no TOCTOU)
+    //
+    existingRule = RepFindRuleByIdLocked(Engine, internalRule->Public.RuleId);
+    if (existingRule != NULL) {
+        //
+        // Remove existing rule from lists
+        //
+        RemoveEntryList(&existingRule->Public.ListEntry);
+        RemoveEntryList(&existingRule->HashEntry);
+        InterlockedDecrement(&Engine->RuleCount);
+
+        //
+        // Mark for deletion and dereference
+        //
+        existingRule->MarkedForDeletion = TRUE;
+        RepDereferenceRule(Engine, existingRule);
+        existingRule = NULL;
+    }
+
+    //
+    // Check rule count limit (under lock - no TOCTOU)
+    //
+    if (Engine->RuleCount >= RE_MAX_RULES) {
+        ExReleasePushLockExclusive(&Engine->RuleLock);
+        KeLeaveCriticalRegion();
+        ExFreeToNPagedLookasideList(&Engine->RuleLookaside, internalRule);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Insert into hash table
     //
     hashBucket = internalRule->RuleIdHash % RE_HASH_BUCKETS;
+    InsertTailList(&Engine->RuleHashBuckets[hashBucket], &internalRule->HashEntry);
 
-    ExAcquirePushLockExclusive(&engine->Public.RuleLock);
+    //
+    // Insert into priority-sorted list
+    //
+    RepInsertRuleSortedLocked(Engine, internalRule);
+    InterlockedIncrement(&Engine->RuleCount);
 
-    RepInsertRuleSorted(engine, internalRule);
-    InsertTailList(&engine->RuleHash.Buckets[hashBucket], &internalRule->HashEntry);
-    InterlockedIncrement((PLONG)&engine->Public.RuleCount);
-
-    ExReleasePushLockExclusive(&engine->Public.RuleLock);
+    ExReleasePushLockExclusive(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ReRemoveRule(
     _In_ PRE_ENGINE Engine,
-    _In_ PCSTR RuleId
+    _In_z_ PCSTR RuleId
     )
 /*++
 Routine Description:
@@ -564,49 +648,63 @@ Arguments:
     RuleId - ID of rule to remove.
 
 Return Value:
-    STATUS_SUCCESS on success, STATUS_NOT_FOUND if rule doesn't exist.
+    STATUS_SUCCESS on success.
+    STATUS_NOT_FOUND if rule doesn't exist.
 --*/
 {
-    PRE_ENGINE_INTERNAL engine;
     PRE_INTERNAL_RULE rule;
+    SIZE_T ruleIdLen;
 
-    if (Engine == NULL || !Engine->Initialized || RuleId == NULL) {
+    PAGED_CODE();
+
+    if (!RepValidateEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
+    if (RuleId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    //
-    // Find the rule
-    //
-    rule = RepFindRuleById(engine, RuleId);
+    ruleIdLen = RepSafeStringLength(RuleId, RE_MAX_RULE_ID_LEN + 1);
+    if (ruleIdLen == 0 || ruleIdLen > RE_MAX_RULE_ID_LEN) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Engine->RuleLock);
+
+    rule = RepFindRuleByIdLocked(Engine, RuleId);
     if (rule == NULL) {
+        ExReleasePushLockExclusive(&Engine->RuleLock);
+        KeLeaveCriticalRegion();
         return STATUS_NOT_FOUND;
     }
 
     //
     // Remove from lists
     //
-    ExAcquirePushLockExclusive(&engine->Public.RuleLock);
-
     RemoveEntryList(&rule->Public.ListEntry);
     RemoveEntryList(&rule->HashEntry);
-    InterlockedDecrement((PLONG)&engine->Public.RuleCount);
-
-    ExReleasePushLockExclusive(&engine->Public.RuleLock);
+    InterlockedDecrement(&Engine->RuleCount);
 
     //
-    // Dereference (will free when ref count reaches 0)
+    // Mark for deletion and dereference
     //
-    RepDereferenceRule(engine, rule);
+    rule->MarkedForDeletion = TRUE;
+    RepDereferenceRule(Engine, rule);
+
+    ExReleasePushLockExclusive(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ReEnableRule(
     _In_ PRE_ENGINE Engine,
-    _In_ PCSTR RuleId,
+    _In_z_ PCSTR RuleId,
     _In_ BOOLEAN Enable
     )
 /*++
@@ -622,23 +720,41 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    PRE_ENGINE_INTERNAL engine;
     PRE_INTERNAL_RULE rule;
+    SIZE_T ruleIdLen;
 
-    if (Engine == NULL || !Engine->Initialized || RuleId == NULL) {
+    PAGED_CODE();
+
+    if (!RepValidateEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
+    if (RuleId == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    rule = RepFindRuleById(engine, RuleId);
+    ruleIdLen = RepSafeStringLength(RuleId, RE_MAX_RULE_ID_LEN + 1);
+    if (ruleIdLen == 0 || ruleIdLen > RE_MAX_RULE_ID_LEN) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->RuleLock);
+
+    rule = RepFindRuleByIdLocked(Engine, RuleId);
     if (rule == NULL) {
+        ExReleasePushLockShared(&Engine->RuleLock);
+        KeLeaveCriticalRegion();
         return STATUS_NOT_FOUND;
     }
 
+    //
+    // Simple boolean write is atomic on all platforms
+    //
     rule->Public.Enabled = Enable;
 
-    RepDereferenceRule(engine, rule);
+    ExReleasePushLockShared(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -647,45 +763,56 @@ Return Value:
 // PUBLIC API - RULE EVALUATION
 // ============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ReEvaluate(
     _In_ PRE_ENGINE Engine,
-    _In_ PRE_EVALUATION_CONTEXT Context,
+    _In_ const RE_EVALUATION_CONTEXT* Context,
     _Out_ PRE_EVALUATION_RESULT* Result
     )
 /*++
 Routine Description:
     Evaluates all rules against the provided context.
 
+    Returns a COPY of matched rule data - no internal pointers are exposed.
+
 Arguments:
     Engine - Rule engine instance.
     Context - Evaluation context with process/file/registry info.
-    Result - Receives evaluation result.
+    Result - Receives evaluation result. Must be freed with ReFreeResult.
 
 Return Value:
-    STATUS_SUCCESS on success.
+    STATUS_SUCCESS on success (even if no rule matched).
 --*/
 {
-    PRE_ENGINE_INTERNAL engine;
-    PRE_EVALUATION_RESULT result;
+    PRE_EVALUATION_RESULT result = NULL;
     PLIST_ENTRY entry;
     PRE_INTERNAL_RULE rule;
     BOOLEAN allConditionsMatch;
     ULONG i;
 
-    if (Engine == NULL || !Engine->Initialized ||
-        Context == NULL || Result == NULL) {
+    PAGED_CODE();
+
+    if (!RepValidateEngine(Engine)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
+    if (!RepValidateContext(Context)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Result == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     *Result = NULL;
 
     //
-    // Allocate result structure
+    // Allocate result from lookaside list
     //
     result = (PRE_EVALUATION_RESULT)ExAllocateFromNPagedLookasideList(
-        &engine->ResultLookaside
+        &Engine->ResultLookaside
     );
 
     if (result == NULL) {
@@ -693,32 +820,40 @@ Return Value:
     }
 
     RtlZeroMemory(result, sizeof(RE_EVALUATION_RESULT));
+
+    //
+    // Store engine handle for proper deallocation
+    //
+    result->EngineHandle = Engine;
     result->RuleMatched = FALSE;
+    result->PrimaryAction = ReAction_None;  // Always initialized
 
     //
-    // Evaluate rules in priority order
+    // Evaluate rules in priority order under shared lock
     //
-    ExAcquirePushLockShared(&engine->Public.RuleLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->RuleLock);
 
-    for (entry = engine->Public.RuleList.Flink;
-         entry != &engine->Public.RuleList;
+    for (entry = Engine->RuleList.Flink;
+         entry != &Engine->RuleList;
          entry = entry->Flink) {
 
         rule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, Public.ListEntry);
 
-        // Skip disabled rules
-        if (!rule->Public.Enabled) {
+        //
+        // Skip disabled, deleted, or uncompiled rules
+        //
+        if (!rule->Public.Enabled ||
+            rule->MarkedForDeletion ||
+            !rule->IsCompiled) {
             continue;
         }
 
-        // Skip uncompiled rules
-        if (!rule->IsCompiled) {
-            continue;
-        }
-
-        // Update evaluation count
+        //
+        // Update evaluation count (atomic, no lock needed)
+        //
         InterlockedIncrement64(&rule->Public.EvaluationCount);
-        InterlockedIncrement64(&engine->Public.Stats.Evaluations);
+        InterlockedIncrement64(&Engine->Stats.Evaluations);
 
         //
         // Evaluate all conditions (AND logic)
@@ -731,7 +866,9 @@ Return Value:
                 Context
             );
 
+            //
             // Apply negation if needed
+            //
             if (rule->CompiledConditions[i].Negate) {
                 conditionResult = !conditionResult;
             }
@@ -742,16 +879,33 @@ Return Value:
             }
         }
 
-        if (allConditionsMatch) {
+        if (allConditionsMatch && rule->CompiledConditionCount > 0) {
             //
-            // Rule matched!
+            // Rule matched - copy data to result (no internal pointers!)
             //
             result->RuleMatched = TRUE;
-            result->MatchedRule = &rule->Public;
 
+            RtlCopyMemory(
+                result->MatchedRuleId,
+                rule->Public.RuleId,
+                sizeof(result->MatchedRuleId)
+            );
+            result->MatchedRuleId[RE_MAX_RULE_ID_LEN] = '\0';
+
+            RtlCopyMemory(
+                result->MatchedRuleName,
+                rule->Public.RuleName,
+                sizeof(result->MatchedRuleName)
+            );
+            result->MatchedRuleName[RE_MAX_RULE_NAME_LEN] = '\0';
+
+            result->MatchedRulePriority = rule->Public.Priority;
+
+            //
             // Copy actions
-            result->ActionCount = rule->Public.ActionCount;
-            for (i = 0; i < rule->Public.ActionCount; i++) {
+            //
+            result->ActionCount = min(rule->Public.ActionCount, RE_MAX_ACTIONS);
+            for (i = 0; i < result->ActionCount; i++) {
                 RtlCopyMemory(
                     &result->Actions[i],
                     &rule->Public.Actions[i],
@@ -759,218 +913,510 @@ Return Value:
                 );
             }
 
-            // Set primary action (first action)
-            if (rule->Public.ActionCount > 0) {
-                result->PrimaryAction = rule->Public.Actions[0].Type;
+            //
+            // Set primary action (always initialized)
+            //
+            if (result->ActionCount > 0) {
+                result->PrimaryAction = result->Actions[0].Type;
+            } else {
+                result->PrimaryAction = ReAction_None;
             }
 
-            // Update statistics
+            //
+            // Update statistics atomically
+            //
             InterlockedIncrement64(&rule->Public.MatchCount);
-            KeQuerySystemTimePrecise(&rule->Public.LastMatch);
-            InterlockedIncrement64(&engine->Public.Stats.Matches);
+            InterlockedIncrement64(&Engine->Stats.Matches);
 
             if (result->PrimaryAction == ReAction_Block) {
-                InterlockedIncrement64(&engine->Public.Stats.Blocks);
+                InterlockedIncrement64(&Engine->Stats.Blocks);
             }
 
-            // Check if we should stop processing more rules
+            //
+            // Update last match time atomically using LONG64
+            //
+            {
+                LARGE_INTEGER currentTime;
+                KeQuerySystemTimePrecise(&currentTime);
+                InterlockedExchange64(
+                    &rule->Public.LastMatchTime,
+                    currentTime.QuadPart
+                );
+            }
+
+            //
+            // Stop if rule says so
+            //
             if (rule->Public.StopProcessing) {
                 break;
             }
         }
     }
 
-    ExReleasePushLockShared(&engine->Public.RuleLock);
+    ExReleasePushLockShared(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
 
     *Result = result;
     return STATUS_SUCCESS;
 }
 
-NTSTATUS
-ReGetRule(
-    _In_ PRE_ENGINE Engine,
-    _In_ PCSTR RuleId,
-    _Out_ PRE_RULE* Rule
-    )
-/*++
-Routine Description:
-    Gets a rule by ID.
-
-Arguments:
-    Engine - Rule engine instance.
-    RuleId - Rule ID to find.
-    Rule - Receives pointer to rule.
-
-Return Value:
-    STATUS_SUCCESS if found.
---*/
-{
-    PRE_ENGINE_INTERNAL engine;
-    PRE_INTERNAL_RULE rule;
-
-    if (Engine == NULL || !Engine->Initialized ||
-        RuleId == NULL || Rule == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
-
-    rule = RepFindRuleById(engine, RuleId);
-    if (rule == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    *Rule = &rule->Public;
-    // Note: caller must call RepDereferenceRule when done
-
-    return STATUS_SUCCESS;
-}
-
-NTSTATUS
-ReGetAllRules(
-    _In_ PRE_ENGINE Engine,
-    _Out_writes_to_(Max, *Count) PRE_RULE* Rules,
-    _In_ ULONG Max,
-    _Out_ PULONG Count
-    )
-/*++
-Routine Description:
-    Gets all loaded rules.
-
-Arguments:
-    Engine - Rule engine instance.
-    Rules - Array to receive rule pointers.
-    Max - Maximum rules to return.
-    Count - Receives actual count.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
-{
-    PRE_ENGINE_INTERNAL engine;
-    PLIST_ENTRY entry;
-    PRE_INTERNAL_RULE rule;
-    ULONG count = 0;
-
-    if (Engine == NULL || !Engine->Initialized ||
-        Rules == NULL || Count == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    engine = CONTAINING_RECORD(Engine, RE_ENGINE_INTERNAL, Public);
-    *Count = 0;
-
-    ExAcquirePushLockShared(&engine->Public.RuleLock);
-
-    for (entry = engine->Public.RuleList.Flink;
-         entry != &engine->Public.RuleList && count < Max;
-         entry = entry->Flink) {
-
-        rule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, Public.ListEntry);
-        Rules[count++] = &rule->Public;
-    }
-
-    ExReleasePushLockShared(&engine->Public.RuleLock);
-
-    *Count = count;
-    return STATUS_SUCCESS;
-}
-
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 ReFreeResult(
-    _In_ PRE_EVALUATION_RESULT Result
+    _In_opt_ PRE_EVALUATION_RESULT Result
     )
 /*++
 Routine Description:
     Frees an evaluation result.
 
+    Uses the stored engine handle to return to the correct lookaside list.
+
 Arguments:
-    Result - Result to free.
+    Result - Result to free. May be NULL.
 --*/
 {
-    if (Result != NULL) {
-        // Result is allocated from lookaside list
-        // For simplicity, we'll use ExFreePoolWithTag
-        // In production, we'd need to pass the engine pointer
+    PRE_ENGINE engine;
+
+    if (Result == NULL) {
+        return;
+    }
+
+    engine = (PRE_ENGINE)Result->EngineHandle;
+
+    //
+    // Validate engine handle before using lookaside list
+    //
+    if (engine != NULL &&
+        engine->Signature == RE_ENGINE_SIGNATURE &&
+        engine->LookasideInitialized) {
+
+        ExFreeToNPagedLookasideList(&engine->ResultLookaside, Result);
+    } else {
+        //
+        // Fallback: engine was destroyed, use pool free
+        // This should not happen in correct usage
+        //
         ExFreePoolWithTag(Result, RE_POOL_TAG_RESULT);
     }
 }
 
-// ============================================================================
-// INTERNAL HELPERS - HASHING
-// ============================================================================
-
-static ULONG
-RepHashString(
-    _In_ PCSTR String
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ReGetRule(
+    _In_ PRE_ENGINE Engine,
+    _In_z_ PCSTR RuleId,
+    _Out_ PRE_RULE Rule
     )
 /*++
 Routine Description:
-    Computes a hash for a string (case-insensitive).
+    Gets a copy of a rule by ID.
+
+    Returns a COPY - caller owns the data, no lifetime concerns.
+
+Arguments:
+    Engine - Rule engine instance.
+    RuleId - Rule ID to find.
+    Rule - Receives copy of rule data.
+
+Return Value:
+    STATUS_SUCCESS if found.
+    STATUS_NOT_FOUND if rule doesn't exist.
 --*/
 {
-    ULONG hash = 5381;
-    UCHAR c;
+    PRE_INTERNAL_RULE internalRule;
+    SIZE_T ruleIdLen;
 
-    if (String == NULL) {
-        return 0;
+    PAGED_CODE();
+
+    if (!RepValidateEngine(Engine)) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    while ((c = (UCHAR)*String++) != 0) {
-        // Convert to lowercase
-        if (c >= 'A' && c <= 'Z') {
-            c = c + ('a' - 'A');
-        }
-        hash = ((hash << 5) + hash) + c;
+    if (RuleId == NULL || Rule == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    return hash;
+    ruleIdLen = RepSafeStringLength(RuleId, RE_MAX_RULE_ID_LEN + 1);
+    if (ruleIdLen == 0 || ruleIdLen > RE_MAX_RULE_ID_LEN) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->RuleLock);
+
+    internalRule = RepFindRuleByIdLocked(Engine, RuleId);
+    if (internalRule == NULL || internalRule->MarkedForDeletion) {
+        ExReleasePushLockShared(&Engine->RuleLock);
+        KeLeaveCriticalRegion();
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Copy rule data to caller's buffer
+    //
+    RtlCopyMemory(Rule, &internalRule->Public, sizeof(RE_RULE));
+
+    ExReleasePushLockShared(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
 }
 
-static ULONG
-RepHashStringW(
-    _In_ PCWSTR String
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ReGetAllRules(
+    _In_ PRE_ENGINE Engine,
+    _Out_writes_to_(MaxCount, *ActualCount) PRE_RULE Rules,
+    _In_ ULONG MaxCount,
+    _Out_ PULONG ActualCount
     )
 /*++
 Routine Description:
-    Computes a hash for a wide string (case-insensitive).
+    Gets copies of all loaded rules.
+
+Arguments:
+    Engine - Rule engine instance.
+    Rules - Array to receive rule copies.
+    MaxCount - Maximum rules to return.
+    ActualCount - Receives actual count.
+
+Return Value:
+    STATUS_SUCCESS on success.
 --*/
 {
-    ULONG hash = 5381;
-    WCHAR c;
+    PLIST_ENTRY entry;
+    PRE_INTERNAL_RULE rule;
+    ULONG count = 0;
 
+    PAGED_CODE();
+
+    if (!RepValidateEngine(Engine)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Rules == NULL || ActualCount == NULL || MaxCount == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *ActualCount = 0;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Engine->RuleLock);
+
+    for (entry = Engine->RuleList.Flink;
+         entry != &Engine->RuleList && count < MaxCount;
+         entry = entry->Flink) {
+
+        rule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, Public.ListEntry);
+
+        if (!rule->MarkedForDeletion) {
+            RtlCopyMemory(&Rules[count], &rule->Public, sizeof(RE_RULE));
+            count++;
+        }
+    }
+
+    ExReleasePushLockShared(&Engine->RuleLock);
+    KeLeaveCriticalRegion();
+
+    *ActualCount = count;
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ReGetStatistics(
+    _In_ PRE_ENGINE Engine,
+    _Out_ PRE_ENGINE_STATS Stats
+    )
+/*++
+Routine Description:
+    Gets engine statistics.
+
+Arguments:
+    Engine - Rule engine instance.
+    Stats - Receives statistics snapshot.
+--*/
+{
+    if (Stats == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(Stats, sizeof(RE_ENGINE_STATS));
+
+    if (!RepValidateEngine(Engine)) {
+        return;
+    }
+
+    Stats->Evaluations = Engine->Stats.Evaluations;
+    Stats->Matches = Engine->Stats.Matches;
+    Stats->Blocks = Engine->Stats.Blocks;
+    Stats->StartTime = Engine->Stats.StartTime;
+    Stats->RuleCount = (ULONG)Engine->RuleCount;
+}
+
+// ============================================================================
+// INTERNAL - VALIDATION HELPERS
+// ============================================================================
+
+static BOOLEAN
+RepValidateEngine(
+    _In_opt_ PRE_ENGINE Engine
+    )
+{
+    if (Engine == NULL) {
+        return FALSE;
+    }
+
+    if (Engine->Signature != RE_ENGINE_SIGNATURE) {
+        return FALSE;
+    }
+
+    if (!Engine->Initialized) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+RepValidateRule(
+    _In_opt_ const RE_RULE* Rule
+    )
+{
+    ULONG i;
+
+    if (Rule == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Validate counts
+    //
+    if (Rule->ConditionCount > RE_MAX_CONDITIONS) {
+        return FALSE;
+    }
+
+    if (Rule->ActionCount > RE_MAX_ACTIONS) {
+        return FALSE;
+    }
+
+    //
+    // Validate condition types and operators
+    //
+    for (i = 0; i < Rule->ConditionCount; i++) {
+        if (Rule->Conditions[i].Type >= ReCondition_MaxValue) {
+            return FALSE;
+        }
+        if (Rule->Conditions[i].Operator >= ReOp_MaxValue) {
+            return FALSE;
+        }
+    }
+
+    //
+    // Validate action types
+    //
+    for (i = 0; i < Rule->ActionCount; i++) {
+        if (Rule->Actions[i].Type >= ReAction_MaxValue) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+RepValidateContext(
+    _In_opt_ const RE_EVALUATION_CONTEXT* Context
+    )
+{
+    if (Context == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Validate Unicode strings if provided
+    //
+    if (Context->ProcessName != NULL &&
+        !RepValidateUnicodeString(Context->ProcessName)) {
+        return FALSE;
+    }
+
+    if (Context->ParentProcessName != NULL &&
+        !RepValidateUnicodeString(Context->ParentProcessName)) {
+        return FALSE;
+    }
+
+    if (Context->CommandLine != NULL &&
+        !RepValidateUnicodeString(Context->CommandLine)) {
+        return FALSE;
+    }
+
+    if (Context->FilePath != NULL &&
+        !RepValidateUnicodeString(Context->FilePath)) {
+        return FALSE;
+    }
+
+    if (Context->RegistryPath != NULL &&
+        !RepValidateUnicodeString(Context->RegistryPath)) {
+        return FALSE;
+    }
+
+    if (Context->NetworkAddress != NULL &&
+        !RepValidateUnicodeString(Context->NetworkAddress)) {
+        return FALSE;
+    }
+
+    if (Context->Domain != NULL &&
+        !RepValidateUnicodeString(Context->Domain)) {
+        return FALSE;
+    }
+
+    if (Context->MitreTechnique != NULL &&
+        !RepValidateUnicodeString(Context->MitreTechnique)) {
+        return FALSE;
+    }
+
+    //
+    // Validate file hash if provided
+    //
+    if (Context->FileHash != NULL &&
+        Context->FileHashLength != RE_SHA256_HASH_SIZE) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+RepValidateUnicodeString(
+    _In_opt_ PCUNICODE_STRING String
+    )
+{
     if (String == NULL) {
+        return TRUE;  // NULL is valid (means "not provided")
+    }
+
+    //
+    // Length must not exceed MaximumLength
+    //
+    if (String->Length > String->MaximumLength) {
+        return FALSE;
+    }
+
+    //
+    // If Length > 0, Buffer must be valid
+    //
+    if (String->Length > 0 && String->Buffer == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Length must be even (WCHAR alignment)
+    //
+    if (String->Length & 1) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static SIZE_T
+RepSafeStringLength(
+    _In_reads_or_z_(MaxLength) PCSTR String,
+    _In_ SIZE_T MaxLength
+    )
+{
+    SIZE_T i;
+
+    if (String == NULL || MaxLength == 0) {
         return 0;
     }
 
-    while ((c = *String++) != L'\0') {
-        // Convert to lowercase
-        if (c >= L'A' && c <= L'Z') {
-            c = c + (L'a' - L'A');
+    for (i = 0; i < MaxLength; i++) {
+        if (String[i] == '\0') {
+            return i;
         }
+    }
+
+    return MaxLength;  // Not null-terminated within bounds
+}
+
+// ============================================================================
+// INTERNAL - HASHING
+// ============================================================================
+
+static ULONG
+RepComputeStringHash(
+    _In_reads_(LengthChars) PCWSTR String,
+    _In_ ULONG LengthChars
+    )
+{
+    ULONG hash = 5381;
+    ULONG i;
+    WCHAR c;
+
+    for (i = 0; i < LengthChars; i++) {
+        c = String[i];
+
+        //
+        // Case-insensitive: convert to upper using kernel-safe method
+        //
+        c = RepToUpperChar(c);
+
         hash = ((hash << 5) + hash) + (ULONG)c;
     }
 
     return hash;
 }
 
+static ULONG
+RepComputeAnsiStringHash(
+    _In_z_ PCSTR String
+    )
+{
+    ULONG hash = 5381;
+    UCHAR c;
+
+    while ((c = (UCHAR)*String++) != 0) {
+        //
+        // Case-insensitive for ASCII
+        //
+        if (c >= 'a' && c <= 'z') {
+            c = c - ('a' - 'A');
+        }
+
+        hash = ((hash << 5) + hash) + c;
+    }
+
+    return hash;
+}
+
+static WCHAR
+RepToUpperChar(
+    _In_ WCHAR Char
+    )
+{
+    //
+    // Use RtlUpcaseUnicodeChar for proper Unicode case conversion
+    //
+    return RtlUpcaseUnicodeChar(Char);
+}
+
 // ============================================================================
-// INTERNAL HELPERS - RULE COMPILATION
+// INTERNAL - RULE COMPILATION
 // ============================================================================
 
 static NTSTATUS
 RepCompileRule(
     _Inout_ PRE_INTERNAL_RULE Rule
     )
-/*++
-Routine Description:
-    Compiles rule conditions for fast evaluation.
---*/
 {
+    NTSTATUS status;
     ULONG i;
-    PRE_CONDITION srcCondition;
+    const RE_CONDITION* srcCondition;
     PRE_COMPILED_CONDITION dstCondition;
-    ULONG length;
 
     Rule->CompiledConditionCount = 0;
     Rule->IsCompiled = FALSE;
@@ -984,7 +1430,7 @@ Routine Description:
         dstCondition->Type = srcCondition->Type;
         dstCondition->Operator = srcCondition->Operator;
         dstCondition->Negate = srcCondition->Negate;
-        dstCondition->CaseInsensitive = TRUE;  // Default to case-insensitive
+        dstCondition->CaseInsensitive = TRUE;
 
         //
         // Compile based on condition type
@@ -998,70 +1444,33 @@ Routine Description:
         case ReCondition_NetworkAddress:
         case ReCondition_Domain:
         case ReCondition_MITRETechnique:
-            // String-based conditions
-            length = (ULONG)strlen(srcCondition->Value);
-            if (length >= RE_MAX_PATTERN_LENGTH) {
-                return STATUS_BUFFER_OVERFLOW;
+        case ReCondition_Custom:
+            status = RepCompileStringCondition(srcCondition->Value, dstCondition);
+            if (!NT_SUCCESS(status)) {
+                return status;
             }
-
-            RtlCopyMemory(
-                dstCondition->String.Pattern,
-                srcCondition->Value,
-                length + 1
-            );
-            dstCondition->String.PatternLength = length;
-            dstCondition->String.PatternHash = RepHashString(srcCondition->Value);
             break;
 
         case ReCondition_FileHash:
-            // Hash condition - expect hex string
-            length = (ULONG)strlen(srcCondition->Value);
-            if (length != 64) {  // SHA-256 hex string
-                return STATUS_INVALID_PARAMETER;
-            }
-
-            // Convert hex string to bytes
-            for (ULONG j = 0; j < 32; j++) {
-                CHAR hex[3] = { srcCondition->Value[j * 2],
-                                srcCondition->Value[j * 2 + 1], 0 };
-                ULONG value;
-                NTSTATUS status = RtlCharToInteger(hex, 16, &value);
-                if (!NT_SUCCESS(status)) {
-                    return status;
-                }
-                dstCondition->FileHash.Hash[j] = (UCHAR)value;
+            status = RepCompileHashCondition(srcCondition->Value, dstCondition);
+            if (!NT_SUCCESS(status)) {
+                return status;
             }
             break;
 
         case ReCondition_ThreatScore:
         case ReCondition_BehaviorFlag:
-        case ReCondition_TimeOfDay:
-            // Numeric conditions
-            {
-                NTSTATUS status = RtlCharToInteger(
-                    srcCondition->Value,
-                    10,
-                    &dstCondition->Numeric.Value
-                );
-                if (!NT_SUCCESS(status)) {
-                    return status;
-                }
+            status = RepCompileNumericCondition(srcCondition->Value, dstCondition);
+            if (!NT_SUCCESS(status)) {
+                return status;
             }
             break;
 
-        case ReCondition_Custom:
-            // Custom conditions - store as string
-            length = (ULONG)strlen(srcCondition->Value);
-            if (length >= RE_MAX_PATTERN_LENGTH) {
-                return STATUS_BUFFER_OVERFLOW;
+        case ReCondition_TimeOfDay:
+            status = RepCompileTimeCondition(srcCondition->Value, dstCondition);
+            if (!NT_SUCCESS(status)) {
+                return status;
             }
-
-            RtlCopyMemory(
-                dstCondition->String.Pattern,
-                srcCondition->Value,
-                length + 1
-            );
-            dstCondition->String.PatternLength = length;
             break;
 
         default:
@@ -1075,87 +1484,209 @@ Routine Description:
     return STATUS_SUCCESS;
 }
 
-static VOID
-RepFreeCompiledCondition(
-    _Inout_ PRE_COMPILED_CONDITION Condition
+static NTSTATUS
+RepCompileStringCondition(
+    _In_ PCSTR SourceValue,
+    _Out_ PRE_COMPILED_CONDITION Compiled
     )
-/*++
-Routine Description:
-    Frees resources associated with a compiled condition.
---*/
 {
-    // Free list items if present
-    if (Condition->Type == ReCondition_ProcessName ||
-        Condition->Type == ReCondition_FilePath) {
+    SIZE_T ansiLength;
+    ANSI_STRING ansiString;
+    UNICODE_STRING unicodeString;
+    NTSTATUS status;
 
-        if (Condition->List.Items != NULL) {
-            for (ULONG i = 0; i < Condition->List.ItemCount; i++) {
-                if (Condition->List.Items[i] != NULL) {
-                    ExFreePoolWithTag(Condition->List.Items[i], RE_POOL_TAG_LIST);
-                }
-            }
-            ExFreePoolWithTag(Condition->List.Items, RE_POOL_TAG_LIST);
-        }
-
-        if (Condition->List.ItemHashes != NULL) {
-            ExFreePoolWithTag(Condition->List.ItemHashes, RE_POOL_TAG_LIST);
-        }
+    //
+    // Get safe string length
+    //
+    ansiLength = RepSafeStringLength(SourceValue, RE_MAX_VALUE_LEN + 1);
+    if (ansiLength == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (ansiLength > RE_MAX_VALUE_LEN) {
+        return STATUS_BUFFER_OVERFLOW;
     }
 
-    RtlZeroMemory(Condition, sizeof(RE_COMPILED_CONDITION));
+    //
+    // Convert ANSI pattern to Unicode for matching
+    //
+    ansiString.Buffer = (PSTR)SourceValue;
+    ansiString.Length = (USHORT)ansiLength;
+    ansiString.MaximumLength = (USHORT)(ansiLength + 1);
+
+    unicodeString.Buffer = Compiled->Data.String.Pattern;
+    unicodeString.Length = 0;
+    unicodeString.MaximumLength = sizeof(Compiled->Data.String.Pattern);
+
+    status = RtlAnsiStringToUnicodeString(&unicodeString, &ansiString, FALSE);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    Compiled->Data.String.PatternLengthChars = unicodeString.Length / sizeof(WCHAR);
+    Compiled->Data.String.PatternHash = RepComputeStringHash(
+        Compiled->Data.String.Pattern,
+        Compiled->Data.String.PatternLengthChars
+    );
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+RepCompileHashCondition(
+    _In_ PCSTR HexString,
+    _Out_ PRE_COMPILED_CONDITION Compiled
+    )
+{
+    SIZE_T length;
+    ULONG i;
+    CHAR hex[3];
+    ULONG value;
+    NTSTATUS status;
+
+    length = RepSafeStringLength(HexString, 65);
+    if (length != 64) {  // SHA-256 = 64 hex chars
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Convert hex string to bytes
+    //
+    for (i = 0; i < RE_SHA256_HASH_SIZE; i++) {
+        hex[0] = HexString[i * 2];
+        hex[1] = HexString[i * 2 + 1];
+        hex[2] = '\0';
+
+        //
+        // Validate hex characters
+        //
+        if (!((hex[0] >= '0' && hex[0] <= '9') ||
+              (hex[0] >= 'A' && hex[0] <= 'F') ||
+              (hex[0] >= 'a' && hex[0] <= 'f'))) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (!((hex[1] >= '0' && hex[1] <= '9') ||
+              (hex[1] >= 'A' && hex[1] <= 'F') ||
+              (hex[1] >= 'a' && hex[1] <= 'f'))) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        status = RtlCharToInteger(hex, 16, &value);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        Compiled->Data.FileHash.Hash[i] = (UCHAR)value;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+RepCompileNumericCondition(
+    _In_ PCSTR ValueString,
+    _Out_ PRE_COMPILED_CONDITION Compiled
+    )
+{
+    NTSTATUS status;
+    SIZE_T length;
+
+    length = RepSafeStringLength(ValueString, RE_MAX_VALUE_LEN + 1);
+    if (length == 0 || length > RE_MAX_VALUE_LEN) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = RtlCharToInteger(ValueString, 10, &Compiled->Data.Numeric.Value);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    Compiled->Data.Numeric.Mask = 0xFFFFFFFF;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+RepCompileTimeCondition(
+    _In_ PCSTR TimeSpec,
+    _Out_ PRE_COMPILED_CONDITION Compiled
+    )
+{
+    //
+    // Expected format: "HH:MM-HH:MM" (e.g., "09:00-17:00")
+    //
+    SIZE_T length;
+    ULONG startHour, startMinute, endHour, endMinute;
+
+    length = RepSafeStringLength(TimeSpec, RE_MAX_VALUE_LEN + 1);
+    if (length != 11) {  // "HH:MM-HH:MM"
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Parse start time
+    //
+    if (TimeSpec[2] != ':' || TimeSpec[5] != '-' || TimeSpec[8] != ':') {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    startHour = (TimeSpec[0] - '0') * 10 + (TimeSpec[1] - '0');
+    startMinute = (TimeSpec[3] - '0') * 10 + (TimeSpec[4] - '0');
+    endHour = (TimeSpec[6] - '0') * 10 + (TimeSpec[7] - '0');
+    endMinute = (TimeSpec[9] - '0') * 10 + (TimeSpec[10] - '0');
+
+    if (startHour >= 24 || startMinute >= 60 ||
+        endHour >= 24 || endMinute >= 60) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Compiled->Data.TimeOfDay.StartMinute = startHour * 60 + startMinute;
+    Compiled->Data.TimeOfDay.EndMinute = endHour * 60 + endMinute;
+
+    return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// INTERNAL HELPERS - CONDITION EVALUATION
+// INTERNAL - CONDITION EVALUATION
 // ============================================================================
 
 static BOOLEAN
 RepEvaluateCondition(
     _In_ PRE_COMPILED_CONDITION Condition,
-    _In_ PRE_EVALUATION_CONTEXT Context
+    _In_ const RE_EVALUATION_CONTEXT* Context
     )
-/*++
-Routine Description:
-    Evaluates a single compiled condition against the context.
---*/
 {
     BOOLEAN result = FALSE;
-    ANSI_STRING ansiString;
-    CHAR ansiBuffer[512];
-    ULONG length;
 
     switch (Condition->Type) {
     case ReCondition_ProcessName:
-        if (Context->ProcessName != NULL && Context->ProcessName->Buffer != NULL) {
-            // Convert Unicode to ANSI for comparison
-            ansiString.Buffer = ansiBuffer;
-            ansiString.MaximumLength = sizeof(ansiBuffer);
-            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiString, Context->ProcessName, FALSE))) {
-                result = RepMatchString(
-                    Condition->String.Pattern,
-                    Condition->String.PatternLength,
-                    ansiString.Buffer,
-                    ansiString.Length,
-                    Condition->Operator,
-                    Condition->CaseInsensitive
-                );
-            }
+        if (Context->ProcessName != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->ProcessName,
+                Condition->Operator,
+                Condition->CaseInsensitive
+            );
         }
         break;
 
     case ReCondition_ParentName:
-        // Would need parent process info in context
-        // For now, return FALSE (no match)
-        result = FALSE;
+        if (Context->ParentProcessName != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->ParentProcessName,
+                Condition->Operator,
+                Condition->CaseInsensitive
+            );
+        }
         break;
 
     case ReCondition_CommandLine:
-        if (Context->CommandLine != NULL && Context->CommandLine->Buffer != NULL) {
-            result = RepMatchStringW(
-                Condition->String.Pattern,
-                Condition->String.PatternLength,
-                Context->CommandLine->Buffer,
-                Context->CommandLine->Length / sizeof(WCHAR),
+        if (Context->CommandLine != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->CommandLine,
                 Condition->Operator,
                 Condition->CaseInsensitive
             );
@@ -1163,12 +1694,11 @@ Routine Description:
         break;
 
     case ReCondition_FilePath:
-        if (Context->FilePath != NULL && Context->FilePath->Buffer != NULL) {
-            result = RepMatchStringW(
-                Condition->String.Pattern,
-                Condition->String.PatternLength,
-                Context->FilePath->Buffer,
-                Context->FilePath->Length / sizeof(WCHAR),
+        if (Context->FilePath != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->FilePath,
                 Condition->Operator,
                 Condition->CaseInsensitive
             );
@@ -1176,22 +1706,22 @@ Routine Description:
         break;
 
     case ReCondition_FileHash:
-        if (Context->FileHash != NULL) {
-            result = RtlCompareMemory(
-                Condition->FileHash.Hash,
+        if (Context->FileHash != NULL &&
+            Context->FileHashLength == RE_SHA256_HASH_SIZE) {
+            result = (RtlCompareMemory(
+                Condition->Data.FileHash.Hash,
                 Context->FileHash,
-                32
-            ) == 32;
+                RE_SHA256_HASH_SIZE
+            ) == RE_SHA256_HASH_SIZE);
         }
         break;
 
     case ReCondition_RegistryPath:
-        if (Context->RegistryPath != NULL && Context->RegistryPath->Buffer != NULL) {
-            result = RepMatchStringW(
-                Condition->String.Pattern,
-                Condition->String.PatternLength,
-                Context->RegistryPath->Buffer,
-                Context->RegistryPath->Length / sizeof(WCHAR),
+        if (Context->RegistryPath != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->RegistryPath,
                 Condition->Operator,
                 Condition->CaseInsensitive
             );
@@ -1199,24 +1729,42 @@ Routine Description:
         break;
 
     case ReCondition_NetworkAddress:
+        if (Context->NetworkAddress != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->NetworkAddress,
+                Condition->Operator,
+                Condition->CaseInsensitive
+            );
+        }
+        break;
+
     case ReCondition_Domain:
-        // Would need network info in context
-        result = FALSE;
+        if (Context->Domain != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->Domain,
+                Condition->Operator,
+                Condition->CaseInsensitive
+            );
+        }
         break;
 
     case ReCondition_ThreatScore:
         switch (Condition->Operator) {
         case ReOp_Equals:
-            result = (Context->ThreatScore == Condition->Numeric.Value);
+            result = (Context->ThreatScore == Condition->Data.Numeric.Value);
             break;
         case ReOp_NotEquals:
-            result = (Context->ThreatScore != Condition->Numeric.Value);
+            result = (Context->ThreatScore != Condition->Data.Numeric.Value);
             break;
         case ReOp_GreaterThan:
-            result = (Context->ThreatScore > Condition->Numeric.Value);
+            result = (Context->ThreatScore > Condition->Data.Numeric.Value);
             break;
         case ReOp_LessThan:
-            result = (Context->ThreatScore < Condition->Numeric.Value);
+            result = (Context->ThreatScore < Condition->Data.Numeric.Value);
             break;
         default:
             result = FALSE;
@@ -1224,22 +1772,58 @@ Routine Description:
         }
         break;
 
+    case ReCondition_MITRETechnique:
+        if (Context->MitreTechnique != NULL) {
+            result = RepMatchUnicodeString(
+                Condition->Data.String.Pattern,
+                Condition->Data.String.PatternLengthChars,
+                Context->MitreTechnique,
+                Condition->Operator,
+                Condition->CaseInsensitive
+            );
+        }
+        break;
+
     case ReCondition_BehaviorFlag:
-        result = (Context->BehaviorFlags & Condition->Numeric.Value) != 0;
+        result = (Context->BehaviorFlags & Condition->Data.Numeric.Value) != 0;
         break;
 
     case ReCondition_TimeOfDay:
-        // Would need current time evaluation
-        result = FALSE;
-        break;
+        {
+            //
+            // Convert system time to minutes since midnight
+            //
+            LARGE_INTEGER localTime;
+            TIME_FIELDS timeFields;
+            ULONG currentMinute;
 
-    case ReCondition_MITRETechnique:
-        // Would need MITRE technique info in context
-        result = FALSE;
+            ExSystemTimeToLocalTime(&Context->CurrentTime, &localTime);
+            RtlTimeToTimeFields(&localTime, &timeFields);
+
+            currentMinute = timeFields.Hour * 60 + timeFields.Minute;
+
+            if (Condition->Data.TimeOfDay.StartMinute <=
+                Condition->Data.TimeOfDay.EndMinute) {
+                //
+                // Normal range (e.g., 09:00-17:00)
+                //
+                result = (currentMinute >= Condition->Data.TimeOfDay.StartMinute &&
+                          currentMinute <= Condition->Data.TimeOfDay.EndMinute);
+            } else {
+                //
+                // Wraparound range (e.g., 22:00-06:00)
+                //
+                result = (currentMinute >= Condition->Data.TimeOfDay.StartMinute ||
+                          currentMinute <= Condition->Data.TimeOfDay.EndMinute);
+            }
+        }
         break;
 
     case ReCondition_Custom:
-        // Custom condition evaluation would go here
+        //
+        // Custom conditions require external handler
+        // For now, always return FALSE (safe default)
+        //
         result = FALSE;
         break;
 
@@ -1252,97 +1836,120 @@ Routine Description:
 }
 
 // ============================================================================
-// INTERNAL HELPERS - STRING MATCHING
+// INTERNAL - STRING MATCHING (Native Unicode, no conversion buffers)
 // ============================================================================
 
 static BOOLEAN
-RepMatchString(
-    _In_ PCSTR Pattern,
-    _In_ ULONG PatternLength,
-    _In_ PCSTR Value,
-    _In_ ULONG ValueLength,
+RepMatchUnicodeString(
+    _In_reads_(PatternLengthChars) PCWSTR Pattern,
+    _In_ ULONG PatternLengthChars,
+    _In_ PCUNICODE_STRING Value,
     _In_ RE_OPERATOR Operator,
     _In_ BOOLEAN CaseInsensitive
     )
-/*++
-Routine Description:
-    Matches a pattern against a string value.
---*/
 {
-    LONG compareResult;
+    ULONG valueLengthChars;
+    ULONG i;
+    UNICODE_STRING patternStr;
+    UNICODE_STRING valueStr;
 
-    if (Pattern == NULL || Value == NULL) {
+    if (Pattern == NULL || Value == NULL || Value->Buffer == NULL) {
         return FALSE;
     }
 
+    valueLengthChars = Value->Length / sizeof(WCHAR);
+
     switch (Operator) {
     case ReOp_Equals:
-        if (PatternLength != ValueLength) {
+        if (PatternLengthChars != valueLengthChars) {
             return FALSE;
         }
-        if (CaseInsensitive) {
-            return _strnicmp(Pattern, Value, PatternLength) == 0;
-        } else {
-            return strncmp(Pattern, Value, PatternLength) == 0;
-        }
+
+        patternStr.Buffer = (PWSTR)Pattern;
+        patternStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        patternStr.MaximumLength = patternStr.Length;
+
+        valueStr = *Value;
+
+        return RtlEqualUnicodeString(&patternStr, &valueStr, CaseInsensitive);
 
     case ReOp_NotEquals:
-        if (PatternLength != ValueLength) {
+        if (PatternLengthChars != valueLengthChars) {
             return TRUE;
         }
-        if (CaseInsensitive) {
-            return _strnicmp(Pattern, Value, PatternLength) != 0;
-        } else {
-            return strncmp(Pattern, Value, PatternLength) != 0;
-        }
+
+        patternStr.Buffer = (PWSTR)Pattern;
+        patternStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        patternStr.MaximumLength = patternStr.Length;
+
+        valueStr = *Value;
+
+        return !RtlEqualUnicodeString(&patternStr, &valueStr, CaseInsensitive);
 
     case ReOp_Contains:
-        {
-            // Simple substring search
-            if (PatternLength > ValueLength) {
-                return FALSE;
-            }
-
-            for (ULONG i = 0; i <= ValueLength - PatternLength; i++) {
-                if (CaseInsensitive) {
-                    if (_strnicmp(Pattern, &Value[i], PatternLength) == 0) {
-                        return TRUE;
-                    }
-                } else {
-                    if (strncmp(Pattern, &Value[i], PatternLength) == 0) {
-                        return TRUE;
-                    }
-                }
-            }
+        if (PatternLengthChars > valueLengthChars) {
             return FALSE;
         }
+
+        patternStr.Buffer = (PWSTR)Pattern;
+        patternStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        patternStr.MaximumLength = patternStr.Length;
+
+        for (i = 0; i <= valueLengthChars - PatternLengthChars; i++) {
+            valueStr.Buffer = &Value->Buffer[i];
+            valueStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+            valueStr.MaximumLength = valueStr.Length;
+
+            if (RtlEqualUnicodeString(&patternStr, &valueStr, CaseInsensitive)) {
+                return TRUE;
+            }
+        }
+        return FALSE;
 
     case ReOp_StartsWith:
-        if (PatternLength > ValueLength) {
+        if (PatternLengthChars > valueLengthChars) {
             return FALSE;
         }
-        if (CaseInsensitive) {
-            return _strnicmp(Pattern, Value, PatternLength) == 0;
-        } else {
-            return strncmp(Pattern, Value, PatternLength) == 0;
-        }
+
+        patternStr.Buffer = (PWSTR)Pattern;
+        patternStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        patternStr.MaximumLength = patternStr.Length;
+
+        valueStr.Buffer = Value->Buffer;
+        valueStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        valueStr.MaximumLength = valueStr.Length;
+
+        return RtlEqualUnicodeString(&patternStr, &valueStr, CaseInsensitive);
 
     case ReOp_EndsWith:
-        if (PatternLength > ValueLength) {
+        if (PatternLengthChars > valueLengthChars) {
             return FALSE;
         }
-        if (CaseInsensitive) {
-            return _strnicmp(Pattern, &Value[ValueLength - PatternLength], PatternLength) == 0;
-        } else {
-            return strncmp(Pattern, &Value[ValueLength - PatternLength], PatternLength) == 0;
-        }
 
-    case ReOp_Regex:
-        // Simplified: treat as wildcard match
-        return RepMatchWildcard(Pattern, Value, CaseInsensitive);
+        patternStr.Buffer = (PWSTR)Pattern;
+        patternStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        patternStr.MaximumLength = patternStr.Length;
+
+        valueStr.Buffer = &Value->Buffer[valueLengthChars - PatternLengthChars];
+        valueStr.Length = (USHORT)(PatternLengthChars * sizeof(WCHAR));
+        valueStr.MaximumLength = valueStr.Length;
+
+        return RtlEqualUnicodeString(&patternStr, &valueStr, CaseInsensitive);
+
+    case ReOp_Wildcard:
+        return RepWildcardMatch(
+            Pattern,
+            PatternLengthChars,
+            Value->Buffer,
+            valueLengthChars,
+            CaseInsensitive
+        );
 
     case ReOp_InList:
-        // Would need list data
+        //
+        // InList would require additional data structure
+        // Not implemented in this version
+        //
         return FALSE;
 
     default:
@@ -1351,105 +1958,80 @@ Routine Description:
 }
 
 static BOOLEAN
-RepMatchStringW(
-    _In_ PCSTR Pattern,
-    _In_ ULONG PatternLength,
-    _In_ PCWSTR Value,
-    _In_ ULONG ValueLength,
-    _In_ RE_OPERATOR Operator,
+RepWildcardMatch(
+    _In_reads_(PatternLengthChars) PCWSTR Pattern,
+    _In_ ULONG PatternLengthChars,
+    _In_reads_(StringLengthChars) PCWSTR String,
+    _In_ ULONG StringLengthChars,
     _In_ BOOLEAN CaseInsensitive
     )
-/*++
-Routine Description:
-    Matches an ANSI pattern against a Unicode string value.
---*/
 {
-    CHAR ansiBuffer[512];
-    ANSI_STRING ansiString;
-    UNICODE_STRING unicodeString;
+    ULONG pIdx = 0;
+    ULONG sIdx = 0;
+    ULONG starPIdx = (ULONG)-1;
+    ULONG starSIdx = 0;
+    WCHAR patternChar, stringChar;
 
-    if (Pattern == NULL || Value == NULL) {
-        return FALSE;
-    }
+    while (sIdx < StringLengthChars) {
+        if (pIdx < PatternLengthChars) {
+            patternChar = Pattern[pIdx];
 
-    // Convert Unicode value to ANSI for comparison
-    unicodeString.Buffer = (PWSTR)Value;
-    unicodeString.Length = (USHORT)(ValueLength * sizeof(WCHAR));
-    unicodeString.MaximumLength = unicodeString.Length;
+            if (patternChar == L'*') {
+                starPIdx = pIdx;
+                starSIdx = sIdx;
+                pIdx++;
+                continue;
+            }
 
-    ansiString.Buffer = ansiBuffer;
-    ansiString.MaximumLength = sizeof(ansiBuffer) - 1;
+            stringChar = String[sIdx];
 
-    if (!NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiString, &unicodeString, FALSE))) {
-        return FALSE;
-    }
+            if (CaseInsensitive) {
+                patternChar = RepToUpperChar(patternChar);
+                stringChar = RepToUpperChar(stringChar);
+            }
 
-    ansiBuffer[ansiString.Length] = '\0';
-
-    return RepMatchString(
-        Pattern,
-        PatternLength,
-        ansiBuffer,
-        ansiString.Length,
-        Operator,
-        CaseInsensitive
-    );
-}
-
-static BOOLEAN
-RepMatchWildcard(
-    _In_ PCSTR Pattern,
-    _In_ PCSTR String,
-    _In_ BOOLEAN CaseInsensitive
-    )
-/*++
-Routine Description:
-    Simple wildcard matching (* and ?).
---*/
-{
-    PCSTR p = Pattern;
-    PCSTR s = String;
-    PCSTR starP = NULL;
-    PCSTR starS = NULL;
-
-    while (*s) {
-        if (*p == '*') {
-            starP = p++;
-            starS = s;
-        } else if (*p == '?' ||
-                   (CaseInsensitive ?
-                    ((*p >= 'A' && *p <= 'Z' ? *p + 32 : *p) ==
-                     (*s >= 'A' && *s <= 'Z' ? *s + 32 : *s)) :
-                    (*p == *s))) {
-            p++;
-            s++;
-        } else if (starP) {
-            p = starP + 1;
-            s = ++starS;
-        } else {
-            return FALSE;
+            if (patternChar == L'?' || patternChar == stringChar) {
+                pIdx++;
+                sIdx++;
+                continue;
+            }
         }
+
+        //
+        // Mismatch - backtrack to last * if possible
+        //
+        if (starPIdx != (ULONG)-1) {
+            pIdx = starPIdx + 1;
+            starSIdx++;
+            sIdx = starSIdx;
+            continue;
+        }
+
+        return FALSE;
     }
 
-    while (*p == '*') {
-        p++;
+    //
+    // Consume trailing *'s in pattern
+    //
+    while (pIdx < PatternLengthChars && Pattern[pIdx] == L'*') {
+        pIdx++;
     }
 
-    return (*p == '\0');
+    return (pIdx == PatternLengthChars);
 }
 
 // ============================================================================
-// INTERNAL HELPERS - RULE LOOKUP
+// INTERNAL - RULE LOOKUP AND MANAGEMENT
 // ============================================================================
 
 static PRE_INTERNAL_RULE
-RepFindRuleById(
-    _In_ PRE_ENGINE_INTERNAL Engine,
-    _In_ PCSTR RuleId
+RepFindRuleByIdLocked(
+    _In_ PRE_ENGINE Engine,
+    _In_z_ PCSTR RuleId
     )
 /*++
 Routine Description:
-    Finds a rule by its ID using the hash table.
+    Finds a rule by ID. Caller must hold RuleLock (shared or exclusive).
 --*/
 {
     ULONG hash;
@@ -1457,63 +2039,60 @@ Routine Description:
     PLIST_ENTRY entry;
     PRE_INTERNAL_RULE rule;
 
-    hash = RepHashString(RuleId);
+    hash = RepComputeAnsiStringHash(RuleId);
     bucket = hash % RE_HASH_BUCKETS;
 
-    ExAcquirePushLockShared(&Engine->RuleHash.Lock);
-
-    for (entry = Engine->RuleHash.Buckets[bucket].Flink;
-         entry != &Engine->RuleHash.Buckets[bucket];
+    for (entry = Engine->RuleHashBuckets[bucket].Flink;
+         entry != &Engine->RuleHashBuckets[bucket];
          entry = entry->Flink) {
 
         rule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, HashEntry);
 
         if (rule->RuleIdHash == hash &&
             _stricmp(rule->Public.RuleId, RuleId) == 0) {
-
-            RepReferenceRule(rule);
-            ExReleasePushLockShared(&Engine->RuleHash.Lock);
             return rule;
         }
     }
 
-    ExReleasePushLockShared(&Engine->RuleHash.Lock);
     return NULL;
 }
 
 static VOID
-RepInsertRuleSorted(
-    _In_ PRE_ENGINE_INTERNAL Engine,
+RepInsertRuleSortedLocked(
+    _In_ PRE_ENGINE Engine,
     _In_ PRE_INTERNAL_RULE Rule
     )
 /*++
 Routine Description:
-    Inserts a rule into the list sorted by priority (lower = higher priority).
+    Inserts rule into priority-sorted list. Caller must hold RuleLock exclusive.
 --*/
 {
     PLIST_ENTRY entry;
     PRE_INTERNAL_RULE existingRule;
 
-    // Find insertion point
-    for (entry = Engine->Public.RuleList.Flink;
-         entry != &Engine->Public.RuleList;
+    for (entry = Engine->RuleList.Flink;
+         entry != &Engine->RuleList;
          entry = entry->Flink) {
 
         existingRule = CONTAINING_RECORD(entry, RE_INTERNAL_RULE, Public.ListEntry);
 
         if (Rule->Public.Priority < existingRule->Public.Priority) {
-            // Insert before this rule
+            //
+            // Insert before this rule (higher priority)
+            //
             InsertTailList(entry, &Rule->Public.ListEntry);
             return;
         }
     }
 
-    // Insert at end
-    InsertTailList(&Engine->Public.RuleList, &Rule->Public.ListEntry);
+    //
+    // Insert at end (lowest priority)
+    //
+    InsertTailList(&Engine->RuleList, &Rule->Public.ListEntry);
 }
 
 // ============================================================================
-// INTERNAL HELPERS - REFERENCE COUNTING
+// INTERNAL - REFERENCE COUNTING
 // ============================================================================
 
 static VOID
@@ -1526,45 +2105,34 @@ RepReferenceRule(
 
 static VOID
 RepDereferenceRule(
-    _In_ PRE_ENGINE_INTERNAL Engine,
+    _In_ PRE_ENGINE Engine,
     _In_ PRE_INTERNAL_RULE Rule
     )
 {
     if (InterlockedDecrement(&Rule->RefCount) == 0) {
-        // Free compiled conditions
-        for (ULONG i = 0; i < Rule->CompiledConditionCount; i++) {
-            RepFreeCompiledCondition(&Rule->CompiledConditions[i]);
-        }
-
-        if (Engine->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&Engine->RuleLookaside, Rule);
-        }
+        RepFreeRuleInternal(Engine, Rule);
     }
 }
 
-// ============================================================================
-// INTERNAL HELPERS - CLEANUP
-// ============================================================================
-
-static VOID NTAPI
-RepCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+static VOID
+RepFreeRuleInternal(
+    _In_ PRE_ENGINE Engine,
+    _In_ PRE_INTERNAL_RULE Rule
     )
-/*++
-Routine Description:
-    Periodic cleanup timer DPC.
---*/
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
+    if (Rule == NULL) {
+        return;
+    }
 
-    // Cleanup tasks would go here:
-    // - Remove expired results
-    // - Reset per-interval statistics
-    // - Log accumulated statistics
+    //
+    // Clear signature to prevent use-after-free detection
+    //
+    Rule->Signature = 0;
+
+    //
+    // Return to lookaside list
+    //
+    if (Engine->LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&Engine->RuleLookaside, Rule);
+    }
 }

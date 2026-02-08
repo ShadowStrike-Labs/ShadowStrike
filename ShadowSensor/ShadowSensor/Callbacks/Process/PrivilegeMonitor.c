@@ -17,32 +17,25 @@ This module provides comprehensive privilege escalation monitoring:
 - Token stealing and manipulation detection
 - Cross-session privilege escalation
 
-Detection Techniques Covered (MITRE ATT&CK):
-- T1548: Abuse Elevation Control Mechanism
-- T1548.002: Bypass User Account Control
-- T1134: Access Token Manipulation
-- T1134.001: Token Impersonation/Theft
-- T1134.002: Create Process with Token
-- T1134.003: Make and Impersonate Token
-- T1543: Create or Modify System Process
-- T1543.003: Windows Service
-- T1068: Exploitation for Privilege Escalation
-
-Performance Characteristics:
-- O(1) baseline lookup via hash table
-- Lock-free statistics using InterlockedXxx
-- Lookaside lists for high-frequency allocations
-- Configurable monitoring depth
-- Early exit for trusted processes
+SECURITY FIXES APPLIED (v3.0.0):
+- Fixed DPC IRQL violation using work item for cleanup
+- Implemented actual privilege enumeration from token
+- Fixed race conditions in event management
+- Added proper shutdown synchronization with DPC flush
+- Implemented reference counting for events
+- Fixed integrity level detection using actual token query
+- Added baseline count limits
+- Fixed lock ordering for deadlock prevention
+- Replaced unsafe string functions
+- Added monitor validation and self-protection
 
 @author ShadowStrike Security Team
-@version 2.0.0 (Enterprise Edition)
+@version 3.0.0 (Enterprise Edition - Security Hardened)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
 
 #include "PrivilegeMonitor.h"
-#include "TokenAnalyzer.h"
 #include "../../Core/Globals.h"
 #include "../../Utilities/MemoryUtils.h"
 #include "../../Utilities/ProcessUtils.h"
@@ -52,64 +45,47 @@ Performance Characteristics:
 #pragma alloc_text(INIT, PmInitialize)
 #pragma alloc_text(PAGE, PmShutdown)
 #pragma alloc_text(PAGE, PmRecordBaseline)
+#pragma alloc_text(PAGE, PmRemoveBaseline)
+#pragma alloc_text(PAGE, PmMarkProcessTerminated)
+#pragma alloc_text(PAGE, PmCheckForEscalation)
+#pragma alloc_text(PAGE, PmQueryProcessEscalation)
+#pragma alloc_text(PAGE, PmGetConfiguration)
+#pragma alloc_text(PAGE, PmSetConfiguration)
 #endif
 
 // ============================================================================
 // INTERNAL CONSTANTS
 // ============================================================================
 
-#define PM_POOL_TAG_INTERNAL            'NOMP'  // PMON reversed
-#define PM_BASELINE_POOL_TAG            'lBMP'  // PMBl
-#define PM_EVENT_POOL_TAG               'vEMP'  // PMEv
-#define PM_MAX_BASELINES                8192
-#define PM_MAX_EVENTS                   4096
 #define PM_CLEANUP_INTERVAL_MS          60000   // 1 minute
 #define PM_BASELINE_TIMEOUT_MS          600000  // 10 minutes after process exit
-#define PM_MAX_PROCESS_NAME_LEN         260
-
-//
-// Privilege bit flags for tracking
-//
-#define PM_PRIV_DEBUG                   0x00000001
-#define PM_PRIV_IMPERSONATE             0x00000002
-#define PM_PRIV_ASSIGN_PRIMARY          0x00000004
-#define PM_PRIV_TCB                     0x00000008
-#define PM_PRIV_LOAD_DRIVER             0x00000010
-#define PM_PRIV_BACKUP                  0x00000020
-#define PM_PRIV_RESTORE                 0x00000040
-#define PM_PRIV_TAKE_OWNERSHIP          0x00000080
-#define PM_PRIV_CREATE_TOKEN            0x00000100
-#define PM_PRIV_SECURITY                0x00000200
-#define PM_PRIV_SYSTEM_ENVIRONMENT      0x00000400
-#define PM_PRIV_INCREASE_QUOTA          0x00000800
-#define PM_PRIV_INCREASE_PRIORITY       0x00001000
-#define PM_PRIV_CREATE_PAGEFILE         0x00002000
-#define PM_PRIV_SHUTDOWN                0x00004000
-#define PM_PRIV_AUDIT                   0x00008000
-
-//
-// Integrity level values
-//
-#define PM_INTEGRITY_UNTRUSTED          0x0000
-#define PM_INTEGRITY_LOW                0x1000
-#define PM_INTEGRITY_MEDIUM             0x2000
-#define PM_INTEGRITY_MEDIUM_PLUS        0x2100
-#define PM_INTEGRITY_HIGH               0x3000
-#define PM_INTEGRITY_SYSTEM             0x4000
-#define PM_INTEGRITY_PROTECTED          0x5000
-
-//
-// Suspicion thresholds
-//
-#define PM_SUSPICION_LOW                20
-#define PM_SUSPICION_MEDIUM             45
-#define PM_SUSPICION_HIGH               70
-#define PM_SUSPICION_CRITICAL           90
-
-//
-// Hash table constants
-//
 #define PM_HASH_BUCKET_COUNT            256
+#define PM_MONITOR_SIGNATURE            0x4D4F4E50  // 'PMON'
+#define PM_MONITOR_SIGNATURE_DEAD       0x44454144  // 'DEAD'
+
+//
+// Privilege LUID values (from winnt.h)
+//
+#define SE_CREATE_TOKEN_PRIVILEGE           2
+#define SE_ASSIGNPRIMARYTOKEN_PRIVILEGE     3
+#define SE_LOCK_MEMORY_PRIVILEGE            4
+#define SE_INCREASE_QUOTA_PRIVILEGE         5
+#define SE_TCB_PRIVILEGE                    7
+#define SE_SECURITY_PRIVILEGE               8
+#define SE_TAKE_OWNERSHIP_PRIVILEGE         9
+#define SE_LOAD_DRIVER_PRIVILEGE            10
+#define SE_SYSTEM_PROFILE_PRIVILEGE         11
+#define SE_SYSTEMTIME_PRIVILEGE             12
+#define SE_BACKUP_PRIVILEGE                 17
+#define SE_RESTORE_PRIVILEGE                18
+#define SE_SHUTDOWN_PRIVILEGE               19
+#define SE_DEBUG_PRIVILEGE                  20
+#define SE_AUDIT_PRIVILEGE                  21
+#define SE_SYSTEM_ENVIRONMENT_PRIVILEGE     22
+#define SE_IMPERSONATE_PRIVILEGE            29
+#define SE_MANAGE_VOLUME_PRIVILEGE          28
+#define SE_CREATE_PAGEFILE_PRIVILEGE        15
+#define SE_INCREASE_BASE_PRIORITY_PRIVILEGE 14
 
 // ============================================================================
 // INTERNAL STRUCTURES
@@ -123,8 +99,9 @@ typedef struct _PM_PROCESS_BASELINE {
     // Identification
     //
     HANDLE ProcessId;
-    PEPROCESS ProcessObject;
+    HANDLE ParentProcessId;
     WCHAR ProcessName[PM_MAX_PROCESS_NAME_LEN];
+    WCHAR ParentProcessName[PM_MAX_PROCESS_NAME_LEN];
 
     //
     // Original token state
@@ -143,6 +120,8 @@ typedef struct _PM_PROCESS_BASELINE {
     ULONG CurrentIntegrityLevel;
     ULONG CurrentPrivileges;
     BOOLEAN CurrentIsElevated;
+    ULONG CurrentSessionId;
+    LUID CurrentAuthenticationId;
 
     //
     // Tracking
@@ -201,18 +180,46 @@ typedef struct _PM_UAC_BYPASS_PATTERN {
 } PM_UAC_BYPASS_PATTERN, *PPM_UAC_BYPASS_PATTERN;
 
 //
-// Internal monitor state (extends public PM_MONITOR)
+// Work item context for cleanup
+//
+typedef struct _PM_CLEANUP_WORK_CONTEXT {
+    PIO_WORKITEM WorkItem;
+    struct _PM_MONITOR_INTERNAL* Monitor;
+} PM_CLEANUP_WORK_CONTEXT, *PPM_CLEANUP_WORK_CONTEXT;
+
+//
+// Internal monitor state
 //
 typedef struct _PM_MONITOR_INTERNAL {
     //
-    // Public structure (must be first)
+    // Validation signature (for self-protection)
     //
-    PM_MONITOR Public;
+    ULONG Signature;
+
+    //
+    // Initialization state
+    //
+    BOOLEAN Initialized;
+    volatile BOOLEAN ShutdownRequested;
+
+    //
+    // Process baseline tracking
+    //
+    LIST_ENTRY ProcessBaselines;
+    EX_PUSH_LOCK BaselineLock;
+    volatile LONG BaselineCount;
 
     //
     // Hash table for fast baseline lookup
     //
     PM_HASH_BUCKET HashTable[PM_HASH_BUCKET_COUNT];
+
+    //
+    // Event tracking
+    //
+    LIST_ENTRY EventList;
+    KSPIN_LOCK EventLock;
+    volatile LONG EventCount;
 
     //
     // Lookaside lists
@@ -222,28 +229,29 @@ typedef struct _PM_MONITOR_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Cleanup timer
+    // Cleanup timer and work item
     //
     KTIMER CleanupTimer;
     KDPC CleanupDpc;
+    PIO_WORKITEM CleanupWorkItem;
+    PDEVICE_OBJECT DeviceObject;
     BOOLEAN CleanupTimerActive;
+    volatile LONG CleanupInProgress;
 
     //
     // Configuration
     //
-    struct {
-        BOOLEAN EnableIntegrityMonitoring;
-        BOOLEAN EnablePrivilegeMonitoring;
-        BOOLEAN EnableUACBypassDetection;
-        BOOLEAN EnableTokenManipulationDetection;
-        BOOLEAN AlertOnEscalation;
-        ULONG MinAlertScore;
-    } Config;
+    PM_CONFIG Config;
 
     //
-    // Shutdown flag
+    // Statistics
     //
-    volatile BOOLEAN ShutdownRequested;
+    PM_STATISTICS Stats;
+
+    //
+    // Configuration lock
+    //
+    EX_PUSH_LOCK ConfigLock;
 
 } PM_MONITOR_INTERNAL, *PPM_MONITOR_INTERNAL;
 
@@ -253,33 +261,33 @@ typedef struct _PM_MONITOR_INTERNAL {
 
 static const PM_UAC_BYPASS_PATTERN g_UACBypassPatterns[] = {
     //
-    // fodhelper.exe bypass
+    // fodhelper.exe bypass - auto-elevates, abused via registry hijack
     //
     {
         L"fodhelper.exe",
-        NULL,
+        L"explorer.exe",
         NULL,
         "T1548.002 - fodhelper UAC Bypass",
         PM_SUSPICION_HIGH
     },
 
     //
-    // eventvwr.exe bypass
+    // eventvwr.exe bypass - mmc.exe spawned with high integrity
     //
     {
         L"eventvwr.exe",
+        L"explorer.exe",
         NULL,
-        L"mmc.exe",
         "T1548.002 - eventvwr UAC Bypass",
         PM_SUSPICION_HIGH
     },
 
     //
-    // sdclt.exe bypass
+    // sdclt.exe bypass - backup and restore center
     //
     {
         L"sdclt.exe",
-        NULL,
+        L"explorer.exe",
         NULL,
         "T1548.002 - sdclt UAC Bypass",
         PM_SUSPICION_MEDIUM
@@ -290,14 +298,14 @@ static const PM_UAC_BYPASS_PATTERN g_UACBypassPatterns[] = {
     //
     {
         L"computerdefaults.exe",
-        NULL,
+        L"explorer.exe",
         NULL,
         "T1548.002 - computerdefaults UAC Bypass",
         PM_SUSPICION_HIGH
     },
 
     //
-    // cmstp.exe bypass
+    // cmstp.exe bypass - Connection Manager service profile
     //
     {
         L"cmstp.exe",
@@ -308,22 +316,22 @@ static const PM_UAC_BYPASS_PATTERN g_UACBypassPatterns[] = {
     },
 
     //
-    // WSReset.exe bypass
+    // WSReset.exe bypass - Windows Store reset
     //
     {
         L"WSReset.exe",
-        NULL,
+        L"explorer.exe",
         NULL,
         "T1548.002 - WSReset UAC Bypass",
         PM_SUSPICION_HIGH
     },
 
     //
-    // slui.exe bypass
+    // slui.exe bypass - Software Licensing UI
     //
     {
         L"slui.exe",
-        NULL,
+        L"explorer.exe",
         NULL,
         "T1548.002 - slui UAC Bypass",
         PM_SUSPICION_MEDIUM
@@ -338,10 +346,55 @@ static const PM_UAC_BYPASS_PATTERN g_UACBypassPatterns[] = {
         L"/autoclean",
         "T1548.002 - DiskCleanup UAC Bypass",
         PM_SUSPICION_MEDIUM
+    },
+
+    //
+    // SilentCleanup scheduled task bypass
+    //
+    {
+        L"cleanmgr.exe",
+        L"svchost.exe",
+        NULL,
+        "T1548.002 - SilentCleanup UAC Bypass",
+        PM_SUSPICION_HIGH
+    },
+
+    //
+    // msconfig bypass
+    //
+    {
+        L"msconfig.exe",
+        L"explorer.exe",
+        NULL,
+        "T1548.002 - msconfig UAC Bypass",
+        PM_SUSPICION_MEDIUM
     }
 };
 
 #define PM_UAC_BYPASS_PATTERN_COUNT (sizeof(g_UACBypassPatterns) / sizeof(g_UACBypassPatterns[0]))
+
+//
+// Known legitimate elevation processes
+//
+static const PCWSTR g_LegitimateElevationProcesses[] = {
+    L"consent.exe",
+    L"svchost.exe",
+    L"services.exe",
+    L"lsass.exe",
+    L"csrss.exe",
+    L"wininit.exe",
+    L"winlogon.exe",
+    L"smss.exe",
+    L"System",
+    L"dwm.exe",
+    L"taskhostw.exe",
+    L"RuntimeBroker.exe",
+    L"sihost.exe",
+    L"fontdrvhost.exe",
+    L"WmiPrvSE.exe"
+};
+
+#define PM_LEGITIMATE_PROCESS_COUNT (sizeof(g_LegitimateElevationProcesses) / sizeof(g_LegitimateElevationProcesses[0]))
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -371,7 +424,7 @@ PmpInsertBaseline(
     );
 
 static VOID
-PmpRemoveBaseline(
+PmpRemoveBaselineInternal(
     _In_ PPM_MONITOR_INTERNAL Monitor,
     _In_ PPM_PROCESS_BASELINE Baseline
     );
@@ -398,7 +451,7 @@ PmpAllocateEvent(
     );
 
 static VOID
-PmpFreeEvent(
+PmpFreeEventInternal(
     _In_ PPM_MONITOR_INTERNAL Monitor,
     _In_ PPM_ESCALATION_EVENT Event
     );
@@ -426,10 +479,9 @@ PmpConvertPrivilegesToFlags(
     _In_ PACCESS_TOKEN Token
     );
 
-static NTSTATUS
-PmpCompareTokenStates(
-    _In_ PPM_PROCESS_BASELINE Baseline,
-    _Out_ PPM_ESCALATION_EVENT Event
+static ULONG
+PmpGetTokenIntegrityLevel(
+    _In_ PACCESS_TOKEN Token
     );
 
 static PM_ESCALATION_TYPE
@@ -438,7 +490,11 @@ PmpDetermineEscalationType(
     _In_ ULONG OldIntegrity,
     _In_ ULONG NewIntegrity,
     _In_ ULONG OldPrivileges,
-    _In_ ULONG NewPrivileges
+    _In_ ULONG NewPrivileges,
+    _In_ ULONG OldSessionId,
+    _In_ ULONG NewSessionId,
+    _In_ PLUID OldAuthId,
+    _In_ PLUID NewAuthId
     );
 
 static ULONG
@@ -456,31 +512,123 @@ PmpIsLegitimateEscalation(
 static BOOLEAN
 PmpDetectUACBypass(
     _In_ PPM_MONITOR_INTERNAL Monitor,
-    _In_ HANDLE ProcessId,
-    _In_ PCWSTR ProcessName,
-    _Out_ PCHAR TechniqueBuffer,
-    _In_ ULONG TechniqueBufferSize
+    _In_ PPM_PROCESS_BASELINE Baseline,
+    _Out_writes_bytes_(TechniqueBufferSize) PCHAR TechniqueBuffer,
+    _In_ ULONG TechniqueBufferSize,
+    _Out_ PULONG PatternScore
     );
 
-static VOID
-PmpCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
+static KDEFERRED_ROUTINE PmpCleanupTimerDpc;
+
+IO_WORKITEM_ROUTINE PmpCleanupWorkRoutine;
 
 static VOID
 PmpCleanupStaleBaselines(
     _In_ PPM_MONITOR_INTERNAL Monitor
     );
 
-static VOID
-PmpGetPrivilegeString(
-    _In_ ULONG PrivilegeFlags,
-    _Out_writes_(BufferSize) PCHAR Buffer,
-    _In_ ULONG BufferSize
+static BOOLEAN
+PmpCompareUnicodeStringInsensitive(
+    _In_ PCWSTR String1,
+    _In_ PCWSTR String2
     );
+
+static BOOLEAN
+PmpIsValidMonitorInternal(
+    _In_opt_ PPM_MONITOR_INTERNAL Monitor
+    );
+
+// ============================================================================
+// MONITOR VALIDATION
+// ============================================================================
+
+static BOOLEAN
+PmpIsValidMonitorInternal(
+    _In_opt_ PPM_MONITOR_INTERNAL Monitor
+    )
+{
+    if (Monitor == NULL) {
+        return FALSE;
+    }
+
+    __try {
+        if (Monitor->Signature != PM_MONITOR_SIGNATURE) {
+            return FALSE;
+        }
+        if (!Monitor->Initialized) {
+            return FALSE;
+        }
+        if (Monitor->ShutdownRequested) {
+            return FALSE;
+        }
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+
+_Use_decl_annotations_
+BOOLEAN
+PmIsValidMonitor(
+    _In_opt_ PPM_MONITOR Monitor
+    )
+{
+    return PmpIsValidMonitorInternal((PPM_MONITOR_INTERNAL)Monitor);
+}
+
+// ============================================================================
+// STRING COMPARISON (IRQL-SAFE)
+// ============================================================================
+
+static BOOLEAN
+PmpCompareUnicodeStringInsensitive(
+    _In_ PCWSTR String1,
+    _In_ PCWSTR String2
+    )
+/*++
+Routine Description:
+    Compares two null-terminated wide strings case-insensitively.
+    Safe for use at any IRQL as it doesn't use RtlCompareUnicodeString.
+
+Arguments:
+    String1 - First string.
+    String2 - Second string.
+
+Return Value:
+    TRUE if strings are equal (case-insensitive).
+--*/
+{
+    WCHAR c1, c2;
+
+    if (String1 == NULL || String2 == NULL) {
+        return (String1 == String2);
+    }
+
+    while (*String1 != L'\0' && *String2 != L'\0') {
+        c1 = *String1;
+        c2 = *String2;
+
+        //
+        // Convert to uppercase for comparison
+        //
+        if (c1 >= L'a' && c1 <= L'z') {
+            c1 = c1 - L'a' + L'A';
+        }
+        if (c2 >= L'a' && c2 <= L'z') {
+            c2 = c2 - L'a' + L'A';
+        }
+
+        if (c1 != c2) {
+            return FALSE;
+        }
+
+        String1++;
+        String2++;
+    }
+
+    return (*String1 == L'\0' && *String2 == L'\0');
+}
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP
@@ -516,12 +664,12 @@ Return Value:
     *Monitor = NULL;
 
     //
-    // Allocate internal monitor structure
+    // Allocate internal monitor structure from NonPaged pool
     //
     Internal = (PPM_MONITOR_INTERNAL)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(PM_MONITOR_INTERNAL),
-        PM_POOL_TAG_INTERNAL
+        PM_POOL_TAG
         );
 
     if (Internal == NULL) {
@@ -531,19 +679,25 @@ Return Value:
     RtlZeroMemory(Internal, sizeof(PM_MONITOR_INTERNAL));
 
     //
-    // Initialize baseline list
+    // Set signature for validation
     //
-    InitializeListHead(&Internal->Public.ProcessBaselines);
-    ExInitializePushLock(&Internal->Public.BaselineLock);
+    Internal->Signature = PM_MONITOR_SIGNATURE;
 
     //
-    // Initialize event list
+    // Initialize baseline list and lock
     //
-    InitializeListHead(&Internal->Public.EventList);
-    KeInitializeSpinLock(&Internal->Public.EventLock);
+    InitializeListHead(&Internal->ProcessBaselines);
+    ExInitializePushLock(&Internal->BaselineLock);
+
+    //
+    // Initialize event list and lock
+    //
+    InitializeListHead(&Internal->EventList);
+    KeInitializeSpinLock(&Internal->EventLock);
 
     //
     // Initialize hash table
+    // LOCK ORDERING: Always acquire hash bucket lock AFTER baseline lock
     //
     for (i = 0; i < PM_HASH_BUCKET_COUNT; i++) {
         InitializeListHead(&Internal->HashTable[i].List);
@@ -576,48 +730,94 @@ Return Value:
     Internal->LookasideInitialized = TRUE;
 
     //
+    // Initialize configuration lock
+    //
+    ExInitializePushLock(&Internal->ConfigLock);
+
+    //
     // Initialize default configuration
     //
     Internal->Config.EnableIntegrityMonitoring = TRUE;
     Internal->Config.EnablePrivilegeMonitoring = TRUE;
     Internal->Config.EnableUACBypassDetection = TRUE;
     Internal->Config.EnableTokenManipulationDetection = TRUE;
+    Internal->Config.EnableCrossSessionDetection = TRUE;
     Internal->Config.AlertOnEscalation = TRUE;
+    Internal->Config.BlockHighRiskEscalation = FALSE;
     Internal->Config.MinAlertScore = PM_SUSPICION_MEDIUM;
+    Internal->Config.BlockThresholdScore = PM_SUSPICION_CRITICAL;
 
     //
     // Initialize statistics
     //
-    KeQuerySystemTime(&Internal->Public.Stats.StartTime);
+    KeQuerySystemTime(&Internal->Stats.StartTime);
 
     //
-    // Initialize cleanup timer
+    // Get device object for work item (use global if available)
     //
-    KeInitializeTimer(&Internal->CleanupTimer);
-    KeInitializeDpc(&Internal->CleanupDpc, PmpCleanupTimerDpc, Internal);
+    Internal->DeviceObject = ShadowStrikeGetDeviceObject();
+    if (Internal->DeviceObject == NULL) {
+        //
+        // Cannot create work items without device object
+        // Fall back to not using timer-based cleanup
+        //
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[ShadowStrike/PrivilegeMonitor] No device object available, "
+            "timer-based cleanup disabled\n"
+            );
+    } else {
+        //
+        // Allocate cleanup work item
+        //
+        Internal->CleanupWorkItem = IoAllocateWorkItem(Internal->DeviceObject);
+        if (Internal->CleanupWorkItem == NULL) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Cleanup;
+        }
 
-    //
-    // Start cleanup timer (every 1 minute)
-    //
-    DueTime.QuadPart = -((LONGLONG)PM_CLEANUP_INTERVAL_MS * 10000);
-    KeSetTimerEx(
-        &Internal->CleanupTimer,
-        DueTime,
-        PM_CLEANUP_INTERVAL_MS,
-        &Internal->CleanupDpc
-        );
-    Internal->CleanupTimerActive = TRUE;
+        //
+        // Initialize cleanup timer and DPC
+        //
+        KeInitializeTimer(&Internal->CleanupTimer);
+        KeInitializeDpc(&Internal->CleanupDpc, PmpCleanupTimerDpc, Internal);
 
-    Internal->Public.Initialized = TRUE;
+        //
+        // Start cleanup timer (every 1 minute)
+        //
+        DueTime.QuadPart = -((LONGLONG)PM_CLEANUP_INTERVAL_MS * 10000);
+        KeSetTimerEx(
+            &Internal->CleanupTimer,
+            DueTime,
+            PM_CLEANUP_INTERVAL_MS,
+            &Internal->CleanupDpc
+            );
+        Internal->CleanupTimerActive = TRUE;
+    }
+
+    Internal->Initialized = TRUE;
     *Monitor = (PPM_MONITOR)Internal;
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
-        "[ShadowStrike/PrivilegeMonitor] Privilege escalation monitor initialized\n"
+        "[ShadowStrike/PrivilegeMonitor] Privilege escalation monitor initialized (v3.0.0)\n"
         );
 
     return STATUS_SUCCESS;
+
+Cleanup:
+    if (Internal != NULL) {
+        if (Internal->LookasideInitialized) {
+            ExDeleteNPagedLookasideList(&Internal->BaselineLookaside);
+            ExDeleteNPagedLookasideList(&Internal->EventLookaside);
+        }
+        Internal->Signature = PM_MONITOR_SIGNATURE_DEAD;
+        ShadowStrikeFreePoolWithTag(Internal, PM_POOL_TAG);
+    }
+
+    return Status;
 }
 
 
@@ -639,70 +839,118 @@ Arguments:
     PPM_PROCESS_BASELINE Baseline;
     PPM_ESCALATION_EVENT Event;
     KIRQL OldIrql;
+    LIST_ENTRY BaselinesToFree;
+    LIST_ENTRY EventsToFree;
 
     PAGED_CODE();
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    if (!PmpIsValidMonitorInternal(Internal)) {
         return;
     }
 
-    Internal->Public.Initialized = FALSE;
+    //
+    // Mark as shutting down
+    //
+    Internal->Initialized = FALSE;
     Internal->ShutdownRequested = TRUE;
 
     //
-    // Cancel cleanup timer
+    // Cancel cleanup timer and WAIT for DPC completion
     //
     if (Internal->CleanupTimerActive) {
         KeCancelTimer(&Internal->CleanupTimer);
+
+        //
+        // CRITICAL: Wait for any running DPC to complete
+        //
+        KeFlushQueuedDpcs();
+
+        //
+        // Wait for cleanup work item to complete if in progress
+        //
+        while (InterlockedCompareExchange(&Internal->CleanupInProgress, 0, 0) != 0) {
+            LARGE_INTEGER Delay;
+            Delay.QuadPart = -10000; // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        }
+
         Internal->CleanupTimerActive = FALSE;
     }
 
     //
-    // Free all baselines
+    // Free cleanup work item
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Internal->Public.BaselineLock);
-
-    while (!IsListEmpty(&Internal->Public.ProcessBaselines)) {
-        Entry = RemoveHeadList(&Internal->Public.ProcessBaselines);
-        Baseline = CONTAINING_RECORD(Entry, PM_PROCESS_BASELINE, ListEntry);
-
-        //
-        // Remove from hash table
-        //
-        if (!IsListEmpty(&Baseline->HashEntry)) {
-            RemoveEntryList(&Baseline->HashEntry);
-            InitializeListHead(&Baseline->HashEntry);
-        }
-
-        ExReleasePushLockExclusive(&Internal->Public.BaselineLock);
-        KeLeaveCriticalRegion();
-
-        PmpFreeBaseline(Internal, Baseline);
-
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Internal->Public.BaselineLock);
+    if (Internal->CleanupWorkItem != NULL) {
+        IoFreeWorkItem(Internal->CleanupWorkItem);
+        Internal->CleanupWorkItem = NULL;
     }
 
-    ExReleasePushLockExclusive(&Internal->Public.BaselineLock);
+    //
+    // Collect all baselines under lock, then free outside lock
+    //
+    InitializeListHead(&BaselinesToFree);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->BaselineLock);
+
+    while (!IsListEmpty(&Internal->ProcessBaselines)) {
+        Entry = RemoveHeadList(&Internal->ProcessBaselines);
+        Baseline = CONTAINING_RECORD(Entry, PM_PROCESS_BASELINE, ListEntry);
+        InitializeListHead(&Baseline->ListEntry);
+
+        //
+        // Remove from hash table while holding baseline lock
+        //
+        if (!IsListEmpty(&Baseline->HashEntry)) {
+            ULONG BucketIndex = PmpHashProcessId(Baseline->ProcessId);
+            PPM_HASH_BUCKET Bucket = &Internal->HashTable[BucketIndex];
+
+            ExAcquirePushLockExclusive(&Bucket->Lock);
+            RemoveEntryList(&Baseline->HashEntry);
+            InitializeListHead(&Baseline->HashEntry);
+            ExReleasePushLockExclusive(&Bucket->Lock);
+        }
+
+        InsertTailList(&BaselinesToFree, &Baseline->ListEntry);
+    }
+
+    ExReleasePushLockExclusive(&Internal->BaselineLock);
     KeLeaveCriticalRegion();
 
     //
-    // Free all events
+    // Free baselines outside lock
     //
-    KeAcquireSpinLock(&Internal->Public.EventLock, &OldIrql);
-
-    while (!IsListEmpty(&Internal->Public.EventList)) {
-        Entry = RemoveHeadList(&Internal->Public.EventList);
-        Event = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
-        KeReleaseSpinLock(&Internal->Public.EventLock, OldIrql);
-
-        PmpFreeEvent(Internal, Event);
-
-        KeAcquireSpinLock(&Internal->Public.EventLock, &OldIrql);
+    while (!IsListEmpty(&BaselinesToFree)) {
+        Entry = RemoveHeadList(&BaselinesToFree);
+        Baseline = CONTAINING_RECORD(Entry, PM_PROCESS_BASELINE, ListEntry);
+        PmpFreeBaseline(Internal, Baseline);
     }
 
-    KeReleaseSpinLock(&Internal->Public.EventLock, OldIrql);
+    //
+    // Collect all events under lock, then free outside lock
+    //
+    InitializeListHead(&EventsToFree);
+
+    KeAcquireSpinLock(&Internal->EventLock, &OldIrql);
+
+    while (!IsListEmpty(&Internal->EventList)) {
+        Entry = RemoveHeadList(&Internal->EventList);
+        Event = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+        InitializeListHead(&Event->ListEntry);
+        InsertTailList(&EventsToFree, &Event->ListEntry);
+    }
+    Internal->EventCount = 0;
+
+    KeReleaseSpinLock(&Internal->EventLock, OldIrql);
+
+    //
+    // Free events outside lock
+    //
+    while (!IsListEmpty(&EventsToFree)) {
+        Entry = RemoveHeadList(&EventsToFree);
+        Event = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+        PmpFreeEventInternal(Internal, Event);
+    }
 
     //
     // Delete lookaside lists
@@ -710,23 +958,82 @@ Arguments:
     if (Internal->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&Internal->BaselineLookaside);
         ExDeleteNPagedLookasideList(&Internal->EventLookaside);
+        Internal->LookasideInitialized = FALSE;
     }
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
         "[ShadowStrike/PrivilegeMonitor] Shutdown complete. "
-        "Stats: Escalations=%lld, Legitimate=%lld\n",
-        Internal->Public.Stats.EscalationsDetected,
-        Internal->Public.Stats.LegitimateEscalations
+        "Stats: Escalations=%lld, Legitimate=%lld, Blocked=%lld\n",
+        Internal->Stats.EscalationsDetected,
+        Internal->Stats.LegitimateEscalations,
+        Internal->Stats.BlockedEscalations
         );
 
     //
-    // Free monitor
+    // Mark signature as dead and free
     //
-    ShadowStrikeFreePoolWithTag(Internal, PM_POOL_TAG_INTERNAL);
+    Internal->Signature = PM_MONITOR_SIGNATURE_DEAD;
+    ShadowStrikeFreePoolWithTag(Internal, PM_POOL_TAG);
 }
 
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+PmGetConfiguration(
+    _In_ PPM_MONITOR Monitor,
+    _Out_ PPM_CONFIG Config
+    )
+{
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+
+    PAGED_CODE();
+
+    if (!PmpIsValidMonitorInternal(Internal) || Config == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Internal->ConfigLock);
+
+    RtlCopyMemory(Config, &Internal->Config, sizeof(PM_CONFIG));
+
+    ExReleasePushLockShared(&Internal->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+PmSetConfiguration(
+    _In_ PPM_MONITOR Monitor,
+    _In_ PPM_CONFIG Config
+    )
+{
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+
+    PAGED_CODE();
+
+    if (!PmpIsValidMonitorInternal(Internal) || Config == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->ConfigLock);
+
+    RtlCopyMemory(&Internal->Config, Config, sizeof(PM_CONFIG));
+
+    ExReleasePushLockExclusive(&Internal->ConfigLock);
+    KeLeaveCriticalRegion();
+
+    return STATUS_SUCCESS;
+}
 
 // ============================================================================
 // BASELINE MANAGEMENT
@@ -742,9 +1049,6 @@ PmRecordBaseline(
 Routine Description:
     Records a privilege baseline for a process.
 
-    This should be called when a process is created to establish
-    the initial privilege state for later comparison.
-
 Arguments:
     Monitor - Monitor instance.
     ProcessId - Process ID to record baseline for.
@@ -758,6 +1062,7 @@ Return Value:
     PPM_PROCESS_BASELINE Existing = NULL;
     NTSTATUS Status = STATUS_SUCCESS;
     PEPROCESS Process = NULL;
+    PEPROCESS ParentProcess = NULL;
     ULONG IntegrityLevel = 0;
     ULONG Privileges = 0;
     BOOLEAN IsElevated = FALSE;
@@ -766,11 +1071,19 @@ Return Value:
     ULONG SessionId = 0;
     LUID AuthenticationId = {0};
     UNICODE_STRING ImageName = {0};
+    HANDLE ParentProcessId = NULL;
 
     PAGED_CODE();
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    if (!PmpIsValidMonitorInternal(Internal)) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check baseline limit
+    //
+    if ((ULONG)InterlockedCompareExchange(&Internal->BaselineCount, 0, 0) >= PM_MAX_BASELINES) {
+        return STATUS_QUOTA_EXCEEDED;
     }
 
     //
@@ -822,19 +1135,43 @@ Return Value:
     // Populate baseline
     //
     Baseline->ProcessId = ProcessId;
-    Baseline->ProcessObject = Process;  // Keep reference
 
     //
-    // Get process name
+    // Get process name safely
     //
     Status = ShadowStrikeGetProcessImageName(ProcessId, &ImageName);
     if (NT_SUCCESS(Status) && ImageName.Buffer != NULL) {
-        RtlStringCchCopyW(
-            Baseline->ProcessName,
-            PM_MAX_PROCESS_NAME_LEN,
-            ImageName.Buffer
-            );
+        SIZE_T CopyLen = ImageName.Length / sizeof(WCHAR);
+        if (CopyLen >= PM_MAX_PROCESS_NAME_LEN) {
+            CopyLen = PM_MAX_PROCESS_NAME_LEN - 1;
+        }
+        RtlCopyMemory(Baseline->ProcessName, ImageName.Buffer, CopyLen * sizeof(WCHAR));
+        Baseline->ProcessName[CopyLen] = L'\0';
         ShadowFreeProcessString(&ImageName);
+    }
+
+    //
+    // Get parent process info
+    //
+    ParentProcessId = PsGetProcessInheritedFromUniqueProcessId(Process);
+    Baseline->ParentProcessId = ParentProcessId;
+
+    if (ParentProcessId != NULL) {
+        Status = PsLookupProcessByProcessId(ParentProcessId, &ParentProcess);
+        if (NT_SUCCESS(Status)) {
+            UNICODE_STRING ParentImageName = {0};
+            Status = ShadowStrikeGetProcessImageName(ParentProcessId, &ParentImageName);
+            if (NT_SUCCESS(Status) && ParentImageName.Buffer != NULL) {
+                SIZE_T CopyLen = ParentImageName.Length / sizeof(WCHAR);
+                if (CopyLen >= PM_MAX_PROCESS_NAME_LEN) {
+                    CopyLen = PM_MAX_PROCESS_NAME_LEN - 1;
+                }
+                RtlCopyMemory(Baseline->ParentProcessName, ParentImageName.Buffer, CopyLen * sizeof(WCHAR));
+                Baseline->ParentProcessName[CopyLen] = L'\0';
+                ShadowFreeProcessString(&ParentImageName);
+            }
+            ObDereferenceObject(ParentProcess);
+        }
     }
 
     //
@@ -854,6 +1191,8 @@ Return Value:
     Baseline->CurrentIntegrityLevel = IntegrityLevel;
     Baseline->CurrentPrivileges = Privileges;
     Baseline->CurrentIsElevated = IsElevated;
+    Baseline->CurrentSessionId = SessionId;
+    Baseline->CurrentAuthenticationId = AuthenticationId;
 
     //
     // Set flags
@@ -877,16 +1216,91 @@ Return Value:
     //
     PmpInsertBaseline(Internal, Baseline);
 
+    //
+    // Update statistics
+    //
+    InterlockedIncrement64(&Internal->Stats.BaselinesCaptured);
+
+    //
+    // Release process reference (baseline doesn't hold it)
+    //
+    ObDereferenceObject(Process);
+
     return STATUS_SUCCESS;
 }
 
 
 _Use_decl_annotations_
 NTSTATUS
+PmRemoveBaseline(
+    _In_ PPM_MONITOR Monitor,
+    _In_ HANDLE ProcessId
+    )
+{
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+    PPM_PROCESS_BASELINE Baseline;
+
+    PAGED_CODE();
+
+    if (!PmpIsValidMonitorInternal(Internal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Baseline = PmpLookupBaseline(Internal, ProcessId);
+    if (Baseline == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    PmpRemoveBaselineInternal(Internal, Baseline);
+    PmpDereferenceBaseline(Internal, Baseline);  // Release lookup reference
+    InterlockedIncrement64(&Internal->Stats.BaselinesRemoved);
+
+    return STATUS_SUCCESS;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+PmMarkProcessTerminated(
+    _In_ PPM_MONITOR Monitor,
+    _In_ HANDLE ProcessId
+    )
+{
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+    PPM_PROCESS_BASELINE Baseline;
+
+    PAGED_CODE();
+
+    if (!PmpIsValidMonitorInternal(Internal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Baseline = PmpLookupBaseline(Internal, ProcessId);
+    if (Baseline == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Mark as terminated for deferred cleanup
+    //
+    Baseline->IsTerminated = TRUE;
+    KeQuerySystemTime(&Baseline->LastCheckTime);
+
+    PmpDereferenceBaseline(Internal, Baseline);
+
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// ESCALATION DETECTION
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
 PmCheckForEscalation(
     _In_ PPM_MONITOR Monitor,
     _In_ HANDLE ProcessId,
-    _Out_ PPM_ESCALATION_EVENT* Event
+    _Outptr_opt_ PPM_ESCALATION_EVENT* Event
     )
 /*++
 Routine Description:
@@ -895,7 +1309,7 @@ Routine Description:
 Arguments:
     Monitor - Monitor instance.
     ProcessId - Process ID to check.
-    Event - Receives escalation event if detected.
+    Event - Receives escalation event if detected (caller must dereference).
 
 Return Value:
     STATUS_SUCCESS if escalation detected.
@@ -911,15 +1325,32 @@ Return Value:
     BOOLEAN CurrentIsElevated = FALSE;
     BOOLEAN IsSystem = FALSE;
     BOOLEAN IsService = FALSE;
-    ULONG SessionId = 0;
-    LUID AuthenticationId = {0};
+    ULONG CurrentSessionId = 0;
+    LUID CurrentAuthenticationId = {0};
     BOOLEAN EscalationDetected = FALSE;
+    PM_ESCALATION_TYPE EscalationType = PmEscalation_None;
+    CHAR TechniqueBuffer[PM_MAX_TECHNIQUE_LEN] = {0};
+    ULONG PatternScore = 0;
+    PM_CONFIG ConfigSnapshot;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Event == NULL) {
+    PAGED_CODE();
+
+    if (!PmpIsValidMonitorInternal(Internal)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    *Event = NULL;
+    if (Event != NULL) {
+        *Event = NULL;
+    }
+
+    //
+    // Get configuration snapshot
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Internal->ConfigLock);
+    RtlCopyMemory(&ConfigSnapshot, &Internal->Config, sizeof(PM_CONFIG));
+    ExReleasePushLockShared(&Internal->ConfigLock);
+    KeLeaveCriticalRegion();
 
     //
     // Look up baseline
@@ -929,8 +1360,11 @@ Return Value:
         //
         // No baseline - record one now and return
         //
-        PmRecordBaseline(Monitor, ProcessId);
-        return STATUS_NO_MORE_ENTRIES;
+        Status = PmRecordBaseline(Monitor, ProcessId);
+        if (NT_SUCCESS(Status)) {
+            return STATUS_NO_MORE_ENTRIES;
+        }
+        return Status;
     }
 
     //
@@ -943,8 +1377,8 @@ Return Value:
         &CurrentIsElevated,
         &IsSystem,
         &IsService,
-        &SessionId,
-        &AuthenticationId
+        &CurrentSessionId,
+        &CurrentAuthenticationId
         );
 
     if (!NT_SUCCESS(Status)) {
@@ -965,7 +1399,7 @@ Return Value:
     //
     // 1. Integrity level increase
     //
-    if (Internal->Config.EnableIntegrityMonitoring &&
+    if (ConfigSnapshot.EnableIntegrityMonitoring &&
         CurrentIntegrity > Baseline->OriginalIntegrityLevel) {
         EscalationDetected = TRUE;
     }
@@ -973,14 +1407,15 @@ Return Value:
     //
     // 2. Privilege addition
     //
-    if (Internal->Config.EnablePrivilegeMonitoring) {
+    if (ConfigSnapshot.EnablePrivilegeMonitoring) {
         ULONG NewPrivileges = CurrentPrivileges & ~Baseline->OriginalPrivileges;
         if (NewPrivileges != 0) {
             //
             // Check for sensitive privilege additions
             //
             if (NewPrivileges & (PM_PRIV_DEBUG | PM_PRIV_TCB | PM_PRIV_LOAD_DRIVER |
-                                 PM_PRIV_CREATE_TOKEN | PM_PRIV_ASSIGN_PRIMARY)) {
+                                 PM_PRIV_CREATE_TOKEN | PM_PRIV_ASSIGN_PRIMARY |
+                                 PM_PRIV_SECURITY | PM_PRIV_TAKE_OWNERSHIP)) {
                 EscalationDetected = TRUE;
             }
         }
@@ -994,11 +1429,25 @@ Return Value:
     }
 
     //
-    // 4. Authentication ID change (token replacement)
+    // 4. Authentication ID change (token replacement/stealing)
     //
-    if (Internal->Config.EnableTokenManipulationDetection) {
-        if (Baseline->AuthenticationId.LowPart != AuthenticationId.LowPart ||
-            Baseline->AuthenticationId.HighPart != AuthenticationId.HighPart) {
+    if (ConfigSnapshot.EnableTokenManipulationDetection) {
+        if (Baseline->AuthenticationId.LowPart != CurrentAuthenticationId.LowPart ||
+            Baseline->AuthenticationId.HighPart != CurrentAuthenticationId.HighPart) {
+            EscalationDetected = TRUE;
+        }
+    }
+
+    //
+    // 5. Cross-session escalation
+    //
+    if (ConfigSnapshot.EnableCrossSessionDetection) {
+        if (Baseline->OriginalSessionId != CurrentSessionId &&
+            CurrentSessionId == 0 &&
+            Baseline->OriginalSessionId != 0) {
+            //
+            // Moved from user session to session 0
+            //
             EscalationDetected = TRUE;
         }
     }
@@ -1010,6 +1459,8 @@ Return Value:
         Baseline->CurrentIntegrityLevel = CurrentIntegrity;
         Baseline->CurrentPrivileges = CurrentPrivileges;
         Baseline->CurrentIsElevated = CurrentIsElevated;
+        Baseline->CurrentSessionId = CurrentSessionId;
+        Baseline->CurrentAuthenticationId = CurrentAuthenticationId;
 
         PmpDereferenceBaseline(Internal, Baseline);
         return STATUS_NO_MORE_ENTRIES;
@@ -1025,29 +1476,16 @@ Return Value:
     }
 
     //
-    // Populate event
+    // Populate event with self-contained data (no external references)
     //
     NewEvent->ProcessId = ProcessId;
+    NewEvent->ParentProcessId = Baseline->ParentProcessId;
 
     //
-    // Copy process name
+    // Copy process names directly into event (safe from baseline lifetime)
     //
-    RtlInitUnicodeString(&NewEvent->ProcessName, NULL);
-    if (Baseline->ProcessName[0] != L'\0') {
-        SIZE_T NameLen = wcslen(Baseline->ProcessName) * sizeof(WCHAR);
-        PWCHAR NameBuffer = (PWCHAR)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            NameLen + sizeof(WCHAR),
-            PM_EVENT_POOL_TAG
-            );
-        if (NameBuffer != NULL) {
-            RtlCopyMemory(NameBuffer, Baseline->ProcessName, NameLen);
-            NameBuffer[NameLen / sizeof(WCHAR)] = L'\0';
-            NewEvent->ProcessName.Buffer = NameBuffer;
-            NewEvent->ProcessName.Length = (USHORT)NameLen;
-            NewEvent->ProcessName.MaximumLength = (USHORT)(NameLen + sizeof(WCHAR));
-        }
-    }
+    RtlCopyMemory(NewEvent->ProcessName, Baseline->ProcessName, sizeof(NewEvent->ProcessName));
+    RtlCopyMemory(NewEvent->ParentProcessName, Baseline->ParentProcessName, sizeof(NewEvent->ParentProcessName));
 
     //
     // Before/after state
@@ -1056,46 +1494,81 @@ Return Value:
     NewEvent->NewIntegrityLevel = CurrentIntegrity;
     NewEvent->OldPrivileges = Baseline->OriginalPrivileges;
     NewEvent->NewPrivileges = CurrentPrivileges;
+    NewEvent->OldSessionId = Baseline->OriginalSessionId;
+    NewEvent->NewSessionId = CurrentSessionId;
+    NewEvent->OldAuthenticationId = Baseline->AuthenticationId;
+    NewEvent->NewAuthenticationId = CurrentAuthenticationId;
+
+    //
+    // Timestamps
+    //
+    KeQuerySystemTime(&NewEvent->Timestamp);
+    NewEvent->BaselineTime = Baseline->BaselineTime;
 
     //
     // Determine escalation type
     //
-    NewEvent->Type = PmpDetermineEscalationType(
+    EscalationType = PmpDetermineEscalationType(
         Baseline,
         Baseline->OriginalIntegrityLevel,
         CurrentIntegrity,
         Baseline->OriginalPrivileges,
-        CurrentPrivileges
+        CurrentPrivileges,
+        Baseline->OriginalSessionId,
+        CurrentSessionId,
+        &Baseline->AuthenticationId,
+        &CurrentAuthenticationId
         );
 
     //
     // Check for UAC bypass
     //
-    if (Internal->Config.EnableUACBypassDetection) {
+    if (ConfigSnapshot.EnableUACBypassDetection) {
         if (PmpDetectUACBypass(
                 Internal,
-                ProcessId,
-                Baseline->ProcessName,
-                NewEvent->Technique,
-                sizeof(NewEvent->Technique))) {
-            NewEvent->Type = PmEscalation_UACBypass;
+                Baseline,
+                TechniqueBuffer,
+                sizeof(TechniqueBuffer),
+                &PatternScore)) {
+            EscalationType = PmEscalation_UACBypass;
+            RtlCopyMemory(NewEvent->Technique, TechniqueBuffer, sizeof(NewEvent->Technique));
         }
     }
+
+    NewEvent->Type = EscalationType;
 
     //
     // Calculate suspicion score
     //
     NewEvent->SuspicionScore = PmpCalculateSuspicionScore(NewEvent, Baseline);
+    if (PatternScore > 0 && PatternScore > NewEvent->SuspicionScore) {
+        NewEvent->SuspicionScore = PatternScore;
+    }
 
     //
     // Determine if legitimate
     //
-    NewEvent->IsLegitimate = PmpIsLegitimateEscalation(NewEvent, Baseline);
+    if (PmpIsLegitimateEscalation(NewEvent, Baseline)) {
+        NewEvent->Flags |= PM_EVENT_FLAG_LEGITIMATE;
+        InterlockedIncrement64(&Internal->Stats.LegitimateEscalations);
+    }
 
     //
-    // Timestamp
+    // Check if alertable
     //
-    KeQuerySystemTime(&NewEvent->Timestamp);
+    if (NewEvent->SuspicionScore >= ConfigSnapshot.MinAlertScore) {
+        NewEvent->Flags |= PM_EVENT_FLAG_ALERTABLE;
+    }
+
+    //
+    // Check if should be blocked
+    //
+    if (ConfigSnapshot.BlockHighRiskEscalation &&
+        NewEvent->SuspicionScore >= ConfigSnapshot.BlockThresholdScore &&
+        !(NewEvent->Flags & PM_EVENT_FLAG_LEGITIMATE)) {
+        NewEvent->Flags |= PM_EVENT_FLAG_BLOCKED;
+        InterlockedIncrement64(&Internal->Stats.BlockedEscalations);
+    }
 
     //
     // Update baseline state
@@ -1103,6 +1576,8 @@ Return Value:
     Baseline->CurrentIntegrityLevel = CurrentIntegrity;
     Baseline->CurrentPrivileges = CurrentPrivileges;
     Baseline->CurrentIsElevated = CurrentIsElevated;
+    Baseline->CurrentSessionId = CurrentSessionId;
+    Baseline->CurrentAuthenticationId = CurrentAuthenticationId;
     Baseline->EscalationCount++;
     Baseline->HasEscalated = TRUE;
     Baseline->Flags |= PM_BASELINE_FLAG_SUSPICIOUS;
@@ -1110,34 +1585,74 @@ Return Value:
     //
     // Update statistics
     //
-    InterlockedIncrement64(&Internal->Public.Stats.EscalationsDetected);
-    if (NewEvent->IsLegitimate) {
-        InterlockedIncrement64(&Internal->Public.Stats.LegitimateEscalations);
-    }
+    InterlockedIncrement64(&Internal->Stats.EscalationsDetected);
 
     //
-    // Insert event
+    // Insert event into list
     //
     PmpInsertEvent(Internal, NewEvent);
 
-    PmpDereferenceBaseline(Internal, Baseline);
+    //
+    // Return event to caller with reference (caller must dereference)
+    //
+    if (Event != NULL) {
+        PmReferenceEvent(NewEvent);
+        *Event = NewEvent;
+    }
 
-    *Event = NewEvent;
+    PmpDereferenceBaseline(Internal, Baseline);
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_WARNING_LEVEL,
         "[ShadowStrike/PrivilegeMonitor] ESCALATION DETECTED: PID=%lu, Type=%d, "
-        "Integrity=%lu->%lu, Score=%lu, Legitimate=%d\n",
+        "Integrity=%lu->%lu, Privs=0x%08X->0x%08X, Score=%lu, Flags=0x%X\n",
         HandleToULong(ProcessId),
         NewEvent->Type,
         NewEvent->OldIntegrityLevel,
         NewEvent->NewIntegrityLevel,
+        NewEvent->OldPrivileges,
+        NewEvent->NewPrivileges,
         NewEvent->SuspicionScore,
-        NewEvent->IsLegitimate
+        NewEvent->Flags
         );
 
     return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// EVENT MANAGEMENT
+// ============================================================================
+
+_Use_decl_annotations_
+VOID
+PmReferenceEvent(
+    _In_ PPM_ESCALATION_EVENT Event
+    )
+{
+    if (Event != NULL) {
+        InterlockedIncrement(&Event->RefCount);
+    }
+}
+
+
+_Use_decl_annotations_
+VOID
+PmDereferenceEvent(
+    _In_ PPM_ESCALATION_EVENT Event
+    )
+{
+    if (Event != NULL) {
+        LONG NewCount = InterlockedDecrement(&Event->RefCount);
+        if (NewCount == 0) {
+            //
+            // Event is no longer referenced, free it
+            // Note: We can't use the monitor's lookaside list here since
+            // the event may outlive the monitor. Use pool directly.
+            //
+            ShadowStrikeFreePoolWithTag(Event, PM_EVENT_POOL_TAG);
+        }
+    }
 }
 
 
@@ -1145,19 +1660,20 @@ _Use_decl_annotations_
 NTSTATUS
 PmGetEvents(
     _In_ PPM_MONITOR Monitor,
-    _Out_writes_to_(Max, *Count) PPM_ESCALATION_EVENT* Events,
-    _In_ ULONG Max,
-    _Out_ PULONG Count
+    _Out_writes_to_(MaxEvents, *EventCount) PPM_ESCALATION_EVENT* Events,
+    _In_ ULONG MaxEvents,
+    _Out_ PULONG EventCount
     )
 /*++
 Routine Description:
-    Gets escalation events.
+    Gets escalation events with references.
+    Caller MUST call PmDereferenceEvent on each returned event.
 
 Arguments:
     Monitor - Monitor instance.
     Events - Array to receive event pointers.
-    Max - Maximum events to return.
-    Count - Receives number of events returned.
+    MaxEvents - Maximum events to return.
+    EventCount - Receives number of events returned.
 
 Return Value:
     STATUS_SUCCESS on success.
@@ -1169,63 +1685,169 @@ Return Value:
     KIRQL OldIrql;
     ULONG Found = 0;
 
-    if (Internal == NULL || !Internal->Public.Initialized ||
-        Events == NULL || Count == NULL || Max == 0) {
+    if (!PmpIsValidMonitorInternal(Internal) ||
+        Events == NULL || EventCount == NULL || MaxEvents == 0) {
+        if (EventCount != NULL) *EventCount = 0;
         return STATUS_INVALID_PARAMETER;
     }
 
-    *Count = 0;
-    RtlZeroMemory(Events, Max * sizeof(PPM_ESCALATION_EVENT));
+    *EventCount = 0;
+    RtlZeroMemory(Events, MaxEvents * sizeof(PPM_ESCALATION_EVENT));
 
-    KeAcquireSpinLock(&Internal->Public.EventLock, &OldIrql);
+    KeAcquireSpinLock(&Internal->EventLock, &OldIrql);
 
-    for (Entry = Internal->Public.EventList.Flink;
-         Entry != &Internal->Public.EventList && Found < Max;
+    for (Entry = Internal->EventList.Flink;
+         Entry != &Internal->EventList && Found < MaxEvents;
          Entry = Entry->Flink) {
 
         Event = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+
+        //
+        // Add reference for caller
+        //
+        InterlockedIncrement(&Event->RefCount);
         Events[Found] = Event;
         Found++;
     }
 
-    KeReleaseSpinLock(&Internal->Public.EventLock, OldIrql);
+    KeReleaseSpinLock(&Internal->EventLock, OldIrql);
 
-    *Count = Found;
+    *EventCount = Found;
 
     return STATUS_SUCCESS;
 }
 
 
 _Use_decl_annotations_
-VOID
-PmFreeEvent(
-    _In_ PPM_ESCALATION_EVENT Event
+NTSTATUS
+PmClearEvents(
+    _In_ PPM_MONITOR Monitor
     )
-/*++
-Routine Description:
-    Frees an escalation event.
-
-Arguments:
-    Event - Event to free.
---*/
 {
-    if (Event == NULL) {
-        return;
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+    LIST_ENTRY EventsToFree;
+    PLIST_ENTRY Entry;
+    PPM_ESCALATION_EVENT Event;
+    KIRQL OldIrql;
+
+    if (!PmpIsValidMonitorInternal(Internal)) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Free process name if allocated
-    //
-    if (Event->ProcessName.Buffer != NULL) {
-        ShadowStrikeFreePoolWithTag(Event->ProcessName.Buffer, PM_EVENT_POOL_TAG);
-        Event->ProcessName.Buffer = NULL;
-    }
+    InitializeListHead(&EventsToFree);
+
+    KeAcquireSpinLock(&Internal->EventLock, &OldIrql);
 
     //
-    // Note: Actual event structure freed by monitor when removed from list
+    // Move all events to local list
     //
+    while (!IsListEmpty(&Internal->EventList)) {
+        Entry = RemoveHeadList(&Internal->EventList);
+        Event = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+        InitializeListHead(&Event->ListEntry);
+        InsertTailList(&EventsToFree, &Event->ListEntry);
+    }
+    Internal->EventCount = 0;
+
+    KeReleaseSpinLock(&Internal->EventLock, OldIrql);
+
+    //
+    // Dereference events outside lock
+    //
+    while (!IsListEmpty(&EventsToFree)) {
+        Entry = RemoveHeadList(&EventsToFree);
+        Event = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+        PmDereferenceEvent(Event);
+    }
+
+    return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// QUERY APIs
+// ============================================================================
+
+_Use_decl_annotations_
+NTSTATUS
+PmQueryProcessEscalation(
+    _In_ PPM_MONITOR Monitor,
+    _In_ HANDLE ProcessId,
+    _Out_ PBOOLEAN HasEscalated,
+    _Out_ PULONG EscalationCount,
+    _Out_ PULONG CurrentIntegrityLevel
+    )
+{
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+    PPM_PROCESS_BASELINE Baseline;
+
+    PAGED_CODE();
+
+    if (!PmpIsValidMonitorInternal(Internal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (HasEscalated != NULL) *HasEscalated = FALSE;
+    if (EscalationCount != NULL) *EscalationCount = 0;
+    if (CurrentIntegrityLevel != NULL) *CurrentIntegrityLevel = 0;
+
+    Baseline = PmpLookupBaseline(Internal, ProcessId);
+    if (Baseline == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (HasEscalated != NULL) {
+        *HasEscalated = Baseline->HasEscalated;
+    }
+
+    if (EscalationCount != NULL) {
+        *EscalationCount = Baseline->EscalationCount;
+    }
+
+    if (CurrentIntegrityLevel != NULL) {
+        *CurrentIntegrityLevel = Baseline->CurrentIntegrityLevel;
+    }
+
+    PmpDereferenceBaseline(Internal, Baseline);
+
+    return STATUS_SUCCESS;
+}
+
+
+_Use_decl_annotations_
+NTSTATUS
+PmGetStatistics(
+    _In_ PPM_MONITOR Monitor,
+    _Out_ PPM_STATISTICS Statistics
+    )
+{
+    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
+
+    if (!PmpIsValidMonitorInternal(Internal) || Statistics == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Atomic reads of statistics
+    //
+    Statistics->EscalationsDetected = InterlockedCompareExchange64(
+        &Internal->Stats.EscalationsDetected, 0, 0);
+    Statistics->LegitimateEscalations = InterlockedCompareExchange64(
+        &Internal->Stats.LegitimateEscalations, 0, 0);
+    Statistics->BlockedEscalations = InterlockedCompareExchange64(
+        &Internal->Stats.BlockedEscalations, 0, 0);
+    Statistics->BaselinesCaptured = InterlockedCompareExchange64(
+        &Internal->Stats.BaselinesCaptured, 0, 0);
+    Statistics->BaselinesRemoved = InterlockedCompareExchange64(
+        &Internal->Stats.BaselinesRemoved, 0, 0);
+    Statistics->CurrentBaselineCount = InterlockedCompareExchange(
+        &Internal->BaselineCount, 0, 0);
+    Statistics->CurrentEventCount = InterlockedCompareExchange(
+        &Internal->EventCount, 0, 0);
+    Statistics->StartTime = Internal->Stats.StartTime;
+    Statistics->LastCleanupTime = Internal->Stats.LastCleanupTime;
+
+    return STATUS_SUCCESS;
+}
 
 // ============================================================================
 // BASELINE MANAGEMENT HELPERS
@@ -1263,14 +1885,6 @@ PmpFreeBaseline(
         return;
     }
 
-    //
-    // Dereference process object
-    //
-    if (Baseline->ProcessObject != NULL) {
-        ObDereferenceObject(Baseline->ProcessObject);
-        Baseline->ProcessObject = NULL;
-    }
-
     ExFreeToNPagedLookasideList(&Monitor->BaselineLookaside, Baseline);
 }
 
@@ -1282,6 +1896,9 @@ PmpHashProcessId(
 {
     ULONG_PTR Value = (ULONG_PTR)ProcessId;
 
+    //
+    // FNV-1a inspired hash
+    //
     Value = Value ^ (Value >> 16);
     Value = Value * 0x85EBCA6B;
     Value = Value ^ (Value >> 13);
@@ -1300,6 +1917,7 @@ PmpLookupBaseline(
     PPM_HASH_BUCKET Bucket;
     PLIST_ENTRY Entry;
     PPM_PROCESS_BASELINE Baseline = NULL;
+    PPM_PROCESS_BASELINE Found = NULL;
 
     BucketIndex = PmpHashProcessId(ProcessId);
     Bucket = &Monitor->HashTable[BucketIndex];
@@ -1315,16 +1933,15 @@ PmpLookupBaseline(
 
         if (Baseline->ProcessId == ProcessId && !Baseline->IsTerminated) {
             PmpReferenceBaseline(Baseline);
-            ExReleasePushLockShared(&Bucket->Lock);
-            KeLeaveCriticalRegion();
-            return Baseline;
+            Found = Baseline;
+            break;
         }
     }
 
     ExReleasePushLockShared(&Bucket->Lock);
     KeLeaveCriticalRegion();
 
-    return NULL;
+    return Found;
 }
 
 
@@ -1343,15 +1960,13 @@ PmpInsertBaseline(
     PmpReferenceBaseline(Baseline);
 
     //
-    // Insert into main list
+    // LOCK ORDERING: Baseline lock first, then hash bucket lock
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Monitor->Public.BaselineLock);
+    ExAcquirePushLockExclusive(&Monitor->BaselineLock);
 
-    InsertTailList(&Monitor->Public.ProcessBaselines, &Baseline->ListEntry);
-
-    ExReleasePushLockExclusive(&Monitor->Public.BaselineLock);
-    KeLeaveCriticalRegion();
+    InsertTailList(&Monitor->ProcessBaselines, &Baseline->ListEntry);
+    InterlockedIncrement(&Monitor->BaselineCount);
 
     //
     // Insert into hash table
@@ -1359,18 +1974,17 @@ PmpInsertBaseline(
     BucketIndex = PmpHashProcessId(Baseline->ProcessId);
     Bucket = &Monitor->HashTable[BucketIndex];
 
-    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Bucket->Lock);
-
     InsertTailList(&Bucket->List, &Baseline->HashEntry);
-
     ExReleasePushLockExclusive(&Bucket->Lock);
+
+    ExReleasePushLockExclusive(&Monitor->BaselineLock);
     KeLeaveCriticalRegion();
 }
 
 
 static VOID
-PmpRemoveBaseline(
+PmpRemoveBaselineInternal(
     _In_ PPM_MONITOR_INTERNAL Monitor,
     _In_ PPM_PROCESS_BASELINE Baseline
     )
@@ -1380,35 +1994,35 @@ PmpRemoveBaseline(
     BOOLEAN WasInList = FALSE;
 
     //
+    // LOCK ORDERING: Baseline lock first, then hash bucket lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Monitor->BaselineLock);
+
+    //
+    // Remove from main list
+    //
+    if (!IsListEmpty(&Baseline->ListEntry)) {
+        RemoveEntryList(&Baseline->ListEntry);
+        InitializeListHead(&Baseline->ListEntry);
+        InterlockedDecrement(&Monitor->BaselineCount);
+        WasInList = TRUE;
+    }
+
+    //
     // Remove from hash table
     //
     BucketIndex = PmpHashProcessId(Baseline->ProcessId);
     Bucket = &Monitor->HashTable[BucketIndex];
 
-    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Bucket->Lock);
-
     if (!IsListEmpty(&Baseline->HashEntry)) {
         RemoveEntryList(&Baseline->HashEntry);
         InitializeListHead(&Baseline->HashEntry);
     }
-
     ExReleasePushLockExclusive(&Bucket->Lock);
-    KeLeaveCriticalRegion();
 
-    //
-    // Remove from main list
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Monitor->Public.BaselineLock);
-
-    if (!IsListEmpty(&Baseline->ListEntry)) {
-        RemoveEntryList(&Baseline->ListEntry);
-        InitializeListHead(&Baseline->ListEntry);
-        WasInList = TRUE;
-    }
-
-    ExReleasePushLockExclusive(&Monitor->Public.BaselineLock);
+    ExReleasePushLockExclusive(&Monitor->BaselineLock);
     KeLeaveCriticalRegion();
 
     //
@@ -1440,9 +2054,8 @@ PmpDereferenceBaseline(
     }
 }
 
-
 // ============================================================================
-// EVENT MANAGEMENT
+// EVENT MANAGEMENT HELPERS
 // ============================================================================
 
 static PPM_ESCALATION_EVENT
@@ -1452,37 +2065,37 @@ PmpAllocateEvent(
 {
     PPM_ESCALATION_EVENT Event;
 
-    Event = (PPM_ESCALATION_EVENT)ExAllocateFromNPagedLookasideList(
-        &Monitor->EventLookaside
+    //
+    // Allocate from pool directly (not lookaside) so events can outlive monitor
+    //
+    Event = (PPM_ESCALATION_EVENT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(PM_ESCALATION_EVENT),
+        PM_EVENT_POOL_TAG
         );
 
     if (Event != NULL) {
         RtlZeroMemory(Event, sizeof(PM_ESCALATION_EVENT));
+        Event->RefCount = 1;  // Initial reference for list
         InitializeListHead(&Event->ListEntry);
     }
 
+    UNREFERENCED_PARAMETER(Monitor);
     return Event;
 }
 
 
 static VOID
-PmpFreeEvent(
+PmpFreeEventInternal(
     _In_ PPM_MONITOR_INTERNAL Monitor,
     _In_ PPM_ESCALATION_EVENT Event
     )
 {
-    if (Event == NULL) {
-        return;
-    }
+    UNREFERENCED_PARAMETER(Monitor);
 
-    //
-    // Free process name
-    //
-    if (Event->ProcessName.Buffer != NULL) {
-        ShadowStrikeFreePoolWithTag(Event->ProcessName.Buffer, PM_EVENT_POOL_TAG);
+    if (Event != NULL) {
+        ShadowStrikeFreePoolWithTag(Event, PM_EVENT_POOL_TAG);
     }
-
-    ExFreeToNPagedLookasideList(&Monitor->EventLookaside, Event);
 }
 
 
@@ -1493,34 +2106,46 @@ PmpInsertEvent(
     )
 {
     KIRQL OldIrql;
+    LIST_ENTRY EventsToFree;
+    PLIST_ENTRY Entry;
+    PPM_ESCALATION_EVENT OldEvent;
 
-    KeAcquireSpinLock(&Monitor->Public.EventLock, &OldIrql);
+    InitializeListHead(&EventsToFree);
+
+    KeAcquireSpinLock(&Monitor->EventLock, &OldIrql);
 
     //
-    // Check limit
+    // Enforce limit by removing oldest events
+    // Keep lock held during entire operation to prevent races
     //
-    if ((ULONG)Monitor->Public.EventCount >= PM_MAX_EVENTS) {
-        //
-        // Remove oldest event
-        //
-        if (!IsListEmpty(&Monitor->Public.EventList)) {
-            PLIST_ENTRY Entry = RemoveHeadList(&Monitor->Public.EventList);
-            PPM_ESCALATION_EVENT OldEvent = CONTAINING_RECORD(
-                Entry, PM_ESCALATION_EVENT, ListEntry);
-            InterlockedDecrement(&Monitor->Public.EventCount);
+    while ((ULONG)Monitor->EventCount >= PM_MAX_EVENTS &&
+           !IsListEmpty(&Monitor->EventList)) {
 
-            KeReleaseSpinLock(&Monitor->Public.EventLock, OldIrql);
-            PmpFreeEvent(Monitor, OldEvent);
-            KeAcquireSpinLock(&Monitor->Public.EventLock, &OldIrql);
-        }
+        Entry = RemoveHeadList(&Monitor->EventList);
+        OldEvent = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+        InitializeListHead(&OldEvent->ListEntry);
+        InsertTailList(&EventsToFree, &OldEvent->ListEntry);
+        InterlockedDecrement(&Monitor->EventCount);
     }
 
-    InsertTailList(&Monitor->Public.EventList, &Event->ListEntry);
-    InterlockedIncrement(&Monitor->Public.EventCount);
+    //
+    // Insert new event
+    //
+    InsertTailList(&Monitor->EventList, &Event->ListEntry);
+    InterlockedIncrement(&Monitor->EventCount);
+    InterlockedIncrement(&Monitor->Stats.CurrentEventCount);
 
-    KeReleaseSpinLock(&Monitor->Public.EventLock, OldIrql);
+    KeReleaseSpinLock(&Monitor->EventLock, OldIrql);
+
+    //
+    // Dereference old events outside lock
+    //
+    while (!IsListEmpty(&EventsToFree)) {
+        Entry = RemoveHeadList(&EventsToFree);
+        OldEvent = CONTAINING_RECORD(Entry, PM_ESCALATION_EVENT, ListEntry);
+        PmDereferenceEvent(OldEvent);
+    }
 }
-
 
 // ============================================================================
 // TOKEN STATE CAPTURE
@@ -1542,8 +2167,11 @@ PmpCaptureTokenState(
     PEPROCESS Process = NULL;
     PACCESS_TOKEN Token = NULL;
 
+    //
+    // Initialize outputs
+    //
     *IntegrityLevel = PM_INTEGRITY_MEDIUM;
-    *Privileges = 0;
+    *Privileges = PM_PRIV_NONE;
     *IsElevated = FALSE;
     *IsSystem = FALSE;
     *IsService = FALSE;
@@ -1571,6 +2199,16 @@ PmpCaptureTokenState(
         Status = SeQuerySessionIdToken(Token, SessionId);
         if (!NT_SUCCESS(Status)) {
             *SessionId = 0;
+            Status = STATUS_SUCCESS;  // Non-fatal
+        }
+
+        //
+        // Get authentication ID
+        //
+        Status = SeQueryAuthenticationIdToken(Token, AuthenticationId);
+        if (!NT_SUCCESS(Status)) {
+            RtlZeroMemory(AuthenticationId, sizeof(LUID));
+            Status = STATUS_SUCCESS;  // Non-fatal
         }
 
         //
@@ -1581,42 +2219,27 @@ PmpCaptureTokenState(
         }
 
         //
-        // Get privilege flags
+        // Get actual integrity level from token
+        //
+        *IntegrityLevel = PmpGetTokenIntegrityLevel(Token);
+
+        //
+        // Get privilege flags (actually enumerate privileges)
         //
         *Privileges = PmpConvertPrivilegesToFlags(Token);
 
         //
-        // Determine integrity level
-        // This is simplified - real implementation would query token
+        // Check for SYSTEM token
         //
-        if (*IsElevated) {
-            *IntegrityLevel = PM_INTEGRITY_HIGH;
+        if (*SessionId == 0 && *IntegrityLevel >= PM_INTEGRITY_SYSTEM) {
+            *IsSystem = TRUE;
         }
 
         //
-        // Check for SYSTEM
+        // Check for service (session 0, elevated, not SYSTEM)
         //
-        if (*SessionId == 0 && *IsElevated) {
-            //
-            // Simplified check - session 0 + elevated often means system/service
-            //
+        if (*SessionId == 0 && *IsElevated && !*IsSystem) {
             *IsService = TRUE;
-        }
-
-        //
-        // Check for actual SYSTEM token
-        //
-        {
-            SECURITY_SUBJECT_CONTEXT SubjectContext;
-            SeCaptureSubjectContext(&SubjectContext);
-
-            if (SubjectContext.PrimaryToken == Token) {
-                //
-                // Additional checks could be done here
-                //
-            }
-
-            SeReleaseSubjectContext(&SubjectContext);
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1634,27 +2257,210 @@ PmpCaptureTokenState(
 
 
 static ULONG
+PmpGetTokenIntegrityLevel(
+    _In_ PACCESS_TOKEN Token
+    )
+/*++
+Routine Description:
+    Gets the actual integrity level from a token.
+
+Arguments:
+    Token - Token to query.
+
+Return Value:
+    Integrity level value.
+--*/
+{
+    NTSTATUS Status;
+    ULONG IntegrityLevel = PM_INTEGRITY_MEDIUM;
+    PSID IntegritySid = NULL;
+
+    //
+    // Get the token integrity level SID
+    //
+    Status = SeQueryInformationToken(
+        Token,
+        TokenIntegrityLevel,
+        &IntegritySid
+        );
+
+    if (NT_SUCCESS(Status) && IntegritySid != NULL) {
+        //
+        // The integrity level is in the last subauthority
+        //
+        PISID Sid = (PISID)IntegritySid;
+        if (Sid->SubAuthorityCount > 0) {
+            ULONG IntegrityRid = Sid->SubAuthority[Sid->SubAuthorityCount - 1];
+
+            //
+            // Map RID to our integrity level values
+            //
+            if (IntegrityRid >= SECURITY_MANDATORY_PROTECTED_PROCESS_RID) {
+                IntegrityLevel = PM_INTEGRITY_PROTECTED;
+            } else if (IntegrityRid >= SECURITY_MANDATORY_SYSTEM_RID) {
+                IntegrityLevel = PM_INTEGRITY_SYSTEM;
+            } else if (IntegrityRid >= SECURITY_MANDATORY_HIGH_RID) {
+                IntegrityLevel = PM_INTEGRITY_HIGH;
+            } else if (IntegrityRid >= SECURITY_MANDATORY_MEDIUM_PLUS_RID) {
+                IntegrityLevel = PM_INTEGRITY_MEDIUM_PLUS;
+            } else if (IntegrityRid >= SECURITY_MANDATORY_MEDIUM_RID) {
+                IntegrityLevel = PM_INTEGRITY_MEDIUM;
+            } else if (IntegrityRid >= SECURITY_MANDATORY_LOW_RID) {
+                IntegrityLevel = PM_INTEGRITY_LOW;
+            } else {
+                IntegrityLevel = PM_INTEGRITY_UNTRUSTED;
+            }
+        }
+
+        ExFreePool(IntegritySid);
+    }
+
+    return IntegrityLevel;
+}
+
+
+static ULONG
 PmpConvertPrivilegesToFlags(
     _In_ PACCESS_TOKEN Token
     )
+/*++
+Routine Description:
+    Converts token privileges to our internal bit flags.
+    Actually enumerates the token privileges.
+
+Arguments:
+    Token - Token to query.
+
+Return Value:
+    Privilege bit flags.
+--*/
 {
-    ULONG Flags = 0;
-
-    UNREFERENCED_PARAMETER(Token);
-
-    //
-    // In a full implementation, we would enumerate token privileges
-    // using SePrivilegeCheck or similar. For now, we check common ones.
-    //
+    ULONG Flags = PM_PRIV_NONE;
+    LUID PrivilegeLuid;
+    BOOLEAN HasPrivilege;
 
     //
-    // The token analysis would be more comprehensive in production,
-    // iterating through TOKEN_PRIVILEGES structure
+    // Check each sensitive privilege
     //
+
+    // SE_DEBUG_PRIVILEGE
+    PrivilegeLuid = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
+    if (SePrivilegeCheck(&(PRIVILEGE_SET){1, PRIVILEGE_SET_ALL_NECESSARY,
+        {{PrivilegeLuid, SE_PRIVILEGE_ENABLED}}},
+        &((SECURITY_SUBJECT_CONTEXT){0, Token, Token, 0}),
+        UserMode)) {
+        Flags |= PM_PRIV_DEBUG;
+    }
+
+    //
+    // Alternative method: Use SeCheckTokenPrivilege for common privileges
+    //
+
+    // SE_TCB_PRIVILEGE
+    PrivilegeLuid = RtlConvertLongToLuid(SE_TCB_PRIVILEGE);
+    HasPrivilege = FALSE;
+    if (SeSinglePrivilegeCheck(PrivilegeLuid, KernelMode)) {
+        // Note: This checks current token, not the passed token
+        // For accurate checking, we'd need to use SePrivilegeCheck
+    }
+
+    //
+    // Check commonly abused privileges by examining token directly
+    // This is a simplified check - full implementation would iterate TOKEN_PRIVILEGES
+    //
+    __try {
+        PTOKEN_PRIVILEGES TokenPrivileges = NULL;
+        ULONG ReturnLength = 0;
+        NTSTATUS Status;
+
+        Status = SeQueryInformationToken(
+            Token,
+            TokenPrivileges,
+            &TokenPrivileges
+            );
+
+        if (NT_SUCCESS(Status) && TokenPrivileges != NULL) {
+            for (ULONG i = 0; i < TokenPrivileges->PrivilegeCount; i++) {
+                PLUID_AND_ATTRIBUTES Priv = &TokenPrivileges->Privileges[i];
+
+                //
+                // Only count enabled or default-enabled privileges
+                //
+                if (!(Priv->Attributes & (SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT))) {
+                    continue;
+                }
+
+                LONG PrivValue = Priv->Luid.LowPart;
+
+                switch (PrivValue) {
+                    case SE_DEBUG_PRIVILEGE:
+                        Flags |= PM_PRIV_DEBUG;
+                        break;
+                    case SE_TCB_PRIVILEGE:
+                        Flags |= PM_PRIV_TCB;
+                        break;
+                    case SE_LOAD_DRIVER_PRIVILEGE:
+                        Flags |= PM_PRIV_LOAD_DRIVER;
+                        break;
+                    case SE_IMPERSONATE_PRIVILEGE:
+                        Flags |= PM_PRIV_IMPERSONATE;
+                        break;
+                    case SE_ASSIGNPRIMARYTOKEN_PRIVILEGE:
+                        Flags |= PM_PRIV_ASSIGN_PRIMARY;
+                        break;
+                    case SE_CREATE_TOKEN_PRIVILEGE:
+                        Flags |= PM_PRIV_CREATE_TOKEN;
+                        break;
+                    case SE_BACKUP_PRIVILEGE:
+                        Flags |= PM_PRIV_BACKUP;
+                        break;
+                    case SE_RESTORE_PRIVILEGE:
+                        Flags |= PM_PRIV_RESTORE;
+                        break;
+                    case SE_TAKE_OWNERSHIP_PRIVILEGE:
+                        Flags |= PM_PRIV_TAKE_OWNERSHIP;
+                        break;
+                    case SE_SECURITY_PRIVILEGE:
+                        Flags |= PM_PRIV_SECURITY;
+                        break;
+                    case SE_SYSTEM_ENVIRONMENT_PRIVILEGE:
+                        Flags |= PM_PRIV_SYSTEM_ENVIRONMENT;
+                        break;
+                    case SE_INCREASE_QUOTA_PRIVILEGE:
+                        Flags |= PM_PRIV_INCREASE_QUOTA;
+                        break;
+                    case SE_INCREASE_BASE_PRIORITY_PRIVILEGE:
+                        Flags |= PM_PRIV_INCREASE_PRIORITY;
+                        break;
+                    case SE_CREATE_PAGEFILE_PRIVILEGE:
+                        Flags |= PM_PRIV_CREATE_PAGEFILE;
+                        break;
+                    case SE_SHUTDOWN_PRIVILEGE:
+                        Flags |= PM_PRIV_SHUTDOWN;
+                        break;
+                    case SE_AUDIT_PRIVILEGE:
+                        Flags |= PM_PRIV_AUDIT;
+                        break;
+                    case SE_SYSTEM_PROFILE_PRIVILEGE:
+                        Flags |= PM_PRIV_SYSTEM_PROFILE;
+                        break;
+                    case SE_SYSTEMTIME_PRIVILEGE:
+                        Flags |= PM_PRIV_SYSTEMTIME;
+                        break;
+                    case SE_MANAGE_VOLUME_PRIVILEGE:
+                        Flags |= PM_PRIV_MANAGE_VOLUME;
+                        break;
+                }
+            }
+
+            ExFreePool(TokenPrivileges);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Ignore exceptions during privilege enumeration
+    }
 
     return Flags;
 }
-
 
 // ============================================================================
 // ESCALATION ANALYSIS
@@ -1666,7 +2472,11 @@ PmpDetermineEscalationType(
     _In_ ULONG OldIntegrity,
     _In_ ULONG NewIntegrity,
     _In_ ULONG OldPrivileges,
-    _In_ ULONG NewPrivileges
+    _In_ ULONG NewPrivileges,
+    _In_ ULONG OldSessionId,
+    _In_ ULONG NewSessionId,
+    _In_ PLUID OldAuthId,
+    _In_ PLUID NewAuthId
     )
 {
     ULONG AddedPrivileges = NewPrivileges & ~OldPrivileges;
@@ -1674,11 +2484,29 @@ PmpDetermineEscalationType(
     UNREFERENCED_PARAMETER(Baseline);
 
     //
+    // Check for token manipulation first (most severe)
+    //
+    if (OldAuthId->LowPart != NewAuthId->LowPart ||
+        OldAuthId->HighPart != NewAuthId->HighPart) {
+        return PmEscalation_TokenManipulation;
+    }
+
+    //
+    // Check for cross-session escalation
+    //
+    if (OldSessionId != NewSessionId && NewSessionId == 0 && OldSessionId != 0) {
+        return PmEscalation_CrossSession;
+    }
+
+    //
     // Check for integrity increase
     //
     if (NewIntegrity > OldIntegrity) {
         if (OldIntegrity <= PM_INTEGRITY_MEDIUM && NewIntegrity >= PM_INTEGRITY_HIGH) {
             return PmEscalation_TokenElevation;
+        }
+        if (NewIntegrity >= PM_INTEGRITY_SYSTEM) {
+            return PmEscalation_ExploitKernel;
         }
         return PmEscalation_IntegrityIncrease;
     }
@@ -1690,10 +2518,7 @@ PmpDetermineEscalationType(
         if (AddedPrivileges & PM_PRIV_LOAD_DRIVER) {
             return PmEscalation_DriverLoad;
         }
-        if (AddedPrivileges & PM_PRIV_TCB) {
-            return PmEscalation_ExploitKernel;
-        }
-        if (AddedPrivileges & PM_PRIV_CREATE_TOKEN) {
+        if (AddedPrivileges & (PM_PRIV_TCB | PM_PRIV_CREATE_TOKEN)) {
             return PmEscalation_ExploitKernel;
         }
         return PmEscalation_PrivilegeEnable;
@@ -1716,31 +2541,39 @@ PmpCalculateSuspicionScore(
     //
     switch (Event->Type) {
         case PmEscalation_ExploitKernel:
+            Score += 95;
+            break;
+
+        case PmEscalation_TokenManipulation:
             Score += 90;
             break;
 
         case PmEscalation_UACBypass:
+            Score += 85;
+            break;
+
+        case PmEscalation_CrossSession:
             Score += 80;
             break;
 
         case PmEscalation_TokenElevation:
-            Score += 60;
+            Score += 65;
             break;
 
         case PmEscalation_DriverLoad:
-            Score += 70;
+            Score += 75;
             break;
 
         case PmEscalation_ServiceCreation:
-            Score += 50;
+            Score += 55;
             break;
 
         case PmEscalation_IntegrityIncrease:
-            Score += 40;
+            Score += 45;
             break;
 
         case PmEscalation_PrivilegeEnable:
-            Score += 30;
+            Score += 35;
             break;
 
         default:
@@ -1752,10 +2585,12 @@ PmpCalculateSuspicionScore(
     //
     if (Event->NewIntegrityLevel > Event->OldIntegrityLevel) {
         ULONG Jump = Event->NewIntegrityLevel - Event->OldIntegrityLevel;
-        if (Jump >= 0x2000) {
-            Score += 20;  // Large jump
-        } else if (Jump >= 0x1000) {
-            Score += 10;
+        if (Jump >= 0x3000) {        // Multiple levels (e.g., Low to High)
+            Score += 25;
+        } else if (Jump >= 0x2000) { // Two levels
+            Score += 15;
+        } else if (Jump >= 0x1000) { // One level
+            Score += 5;
         }
     }
 
@@ -1764,10 +2599,14 @@ PmpCalculateSuspicionScore(
     //
     ULONG NewPrivs = Event->NewPrivileges & ~Event->OldPrivileges;
     if (NewPrivs & PM_PRIV_DEBUG) Score += 15;
-    if (NewPrivs & PM_PRIV_TCB) Score += 25;
-    if (NewPrivs & PM_PRIV_LOAD_DRIVER) Score += 20;
-    if (NewPrivs & PM_PRIV_CREATE_TOKEN) Score += 25;
-    if (NewPrivs & PM_PRIV_ASSIGN_PRIMARY) Score += 15;
+    if (NewPrivs & PM_PRIV_TCB) Score += 30;
+    if (NewPrivs & PM_PRIV_LOAD_DRIVER) Score += 25;
+    if (NewPrivs & PM_PRIV_CREATE_TOKEN) Score += 30;
+    if (NewPrivs & PM_PRIV_ASSIGN_PRIMARY) Score += 20;
+    if (NewPrivs & PM_PRIV_SECURITY) Score += 15;
+    if (NewPrivs & PM_PRIV_TAKE_OWNERSHIP) Score += 10;
+    if (NewPrivs & PM_PRIV_BACKUP) Score += 10;
+    if (NewPrivs & PM_PRIV_RESTORE) Score += 10;
 
     //
     // Non-elevated process gaining elevation
@@ -1777,10 +2616,16 @@ PmpCalculateSuspicionScore(
     }
 
     //
-    // Non-system process in session 0
+    // Non-system process gaining system integrity
     //
-    if (!Baseline->OriginalIsSystem && Baseline->OriginalSessionId != 0 &&
-        Event->NewIntegrityLevel >= PM_INTEGRITY_SYSTEM) {
+    if (!Baseline->OriginalIsSystem && Event->NewIntegrityLevel >= PM_INTEGRITY_SYSTEM) {
+        Score += 25;
+    }
+
+    //
+    // Session 0 escalation from user session
+    //
+    if (Baseline->OriginalSessionId != 0 && Event->NewSessionId == 0) {
         Score += 20;
     }
 
@@ -1801,6 +2646,8 @@ PmpIsLegitimateEscalation(
     _In_ PPM_PROCESS_BASELINE Baseline
     )
 {
+    ULONG i;
+
     //
     // System processes elevating is often legitimate
     //
@@ -1816,22 +2663,20 @@ PmpIsLegitimateEscalation(
     }
 
     //
-    // Known Windows elevation processes
+    // Check against known legitimate elevation processes
     //
-    if (Baseline->ProcessName[0] != L'\0') {
-        if (_wcsicmp(Baseline->ProcessName, L"consent.exe") == 0 ||
-            _wcsicmp(Baseline->ProcessName, L"svchost.exe") == 0 ||
-            _wcsicmp(Baseline->ProcessName, L"services.exe") == 0 ||
-            _wcsicmp(Baseline->ProcessName, L"lsass.exe") == 0 ||
-            _wcsicmp(Baseline->ProcessName, L"csrss.exe") == 0 ||
-            _wcsicmp(Baseline->ProcessName, L"wininit.exe") == 0 ||
-            _wcsicmp(Baseline->ProcessName, L"winlogon.exe") == 0) {
-            return TRUE;
+    if (Event->ProcessName[0] != L'\0') {
+        for (i = 0; i < PM_LEGITIMATE_PROCESS_COUNT; i++) {
+            if (PmpCompareUnicodeStringInsensitive(
+                    Event->ProcessName,
+                    g_LegitimateElevationProcesses[i])) {
+                return TRUE;
+            }
         }
     }
 
     //
-    // Low suspicion score is likely legitimate
+    // Low suspicion score suggests legitimate
     //
     if (Event->SuspicionScore < PM_SUSPICION_LOW) {
         return TRUE;
@@ -1844,39 +2689,78 @@ PmpIsLegitimateEscalation(
 static BOOLEAN
 PmpDetectUACBypass(
     _In_ PPM_MONITOR_INTERNAL Monitor,
-    _In_ HANDLE ProcessId,
-    _In_ PCWSTR ProcessName,
-    _Out_ PCHAR TechniqueBuffer,
-    _In_ ULONG TechniqueBufferSize
+    _In_ PPM_PROCESS_BASELINE Baseline,
+    _Out_writes_bytes_(TechniqueBufferSize) PCHAR TechniqueBuffer,
+    _In_ ULONG TechniqueBufferSize,
+    _Out_ PULONG PatternScore
     )
 {
     ULONG i;
 
     UNREFERENCED_PARAMETER(Monitor);
-    UNREFERENCED_PARAMETER(ProcessId);
 
     TechniqueBuffer[0] = '\0';
+    *PatternScore = 0;
 
-    if (ProcessName == NULL || ProcessName[0] == L'\0') {
+    if (Baseline->ProcessName[0] == L'\0') {
         return FALSE;
     }
 
     for (i = 0; i < PM_UAC_BYPASS_PATTERN_COUNT; i++) {
         const PM_UAC_BYPASS_PATTERN* Pattern = &g_UACBypassPatterns[i];
+        BOOLEAN ProcessMatch = FALSE;
+        BOOLEAN ParentMatch = TRUE;  // Default to true if no parent specified
 
-        if (_wcsicmp(ProcessName, Pattern->ProcessName) == 0) {
-            RtlStringCchCopyA(
-                TechniqueBuffer,
-                TechniqueBufferSize,
-                Pattern->TechniqueName
-                );
-            return TRUE;
+        //
+        // Check process name match
+        //
+        if (PmpCompareUnicodeStringInsensitive(Baseline->ProcessName, Pattern->ProcessName)) {
+            ProcessMatch = TRUE;
         }
+
+        if (!ProcessMatch) {
+            continue;
+        }
+
+        //
+        // Check parent process if specified
+        //
+        if (Pattern->ParentProcessName != NULL) {
+            ParentMatch = FALSE;
+            if (Baseline->ParentProcessName[0] != L'\0') {
+                if (PmpCompareUnicodeStringInsensitive(
+                        Baseline->ParentProcessName,
+                        Pattern->ParentProcessName)) {
+                    ParentMatch = TRUE;
+                }
+            }
+        }
+
+        if (!ParentMatch) {
+            //
+            // Process matches but parent doesn't - still suspicious but lower score
+            //
+            if (*PatternScore < Pattern->SuspicionScore / 2) {
+                *PatternScore = Pattern->SuspicionScore / 2;
+            }
+            continue;
+        }
+
+        //
+        // Full match found
+        //
+        RtlStringCchCopyA(
+            TechniqueBuffer,
+            TechniqueBufferSize,
+            Pattern->TechniqueName
+            );
+        *PatternScore = Pattern->SuspicionScore;
+
+        return TRUE;
     }
 
     return FALSE;
 }
-
 
 // ============================================================================
 // CLEANUP
@@ -1889,6 +2773,15 @@ PmpCleanupTimerDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     )
+/*++
+Routine Description:
+    DPC callback for cleanup timer.
+    Runs at DISPATCH_LEVEL so cannot perform cleanup directly.
+    Queues a work item to run at PASSIVE_LEVEL.
+
+Arguments:
+    Standard DPC arguments.
+--*/
 {
     PPM_MONITOR_INTERNAL Monitor = (PPM_MONITOR_INTERNAL)DeferredContext;
 
@@ -1900,7 +2793,71 @@ PmpCleanupTimerDpc(
         return;
     }
 
+    if (Monitor->CleanupWorkItem == NULL) {
+        return;
+    }
+
+    //
+    // Try to set cleanup in progress flag
+    //
+    if (InterlockedCompareExchange(&Monitor->CleanupInProgress, 1, 0) != 0) {
+        //
+        // Cleanup already in progress
+        //
+        return;
+    }
+
+    //
+    // Queue work item to run at PASSIVE_LEVEL
+    //
+    IoQueueWorkItem(
+        Monitor->CleanupWorkItem,
+        PmpCleanupWorkRoutine,
+        DelayedWorkQueue,
+        Monitor
+        );
+}
+
+
+VOID
+PmpCleanupWorkRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+/*++
+Routine Description:
+    Work routine for cleanup. Runs at PASSIVE_LEVEL.
+
+Arguments:
+    DeviceObject - Device object (unused).
+    Context - Monitor pointer.
+--*/
+{
+    PPM_MONITOR_INTERNAL Monitor = (PPM_MONITOR_INTERNAL)Context;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (Monitor == NULL || Monitor->ShutdownRequested) {
+        if (Monitor != NULL) {
+            InterlockedExchange(&Monitor->CleanupInProgress, 0);
+        }
+        return;
+    }
+
+    //
+    // Perform cleanup at PASSIVE_LEVEL
+    //
     PmpCleanupStaleBaselines(Monitor);
+
+    //
+    // Update last cleanup time
+    //
+    KeQuerySystemTime(&Monitor->Stats.LastCleanupTime);
+
+    //
+    // Clear in-progress flag
+    //
+    InterlockedExchange(&Monitor->CleanupInProgress, 0);
 }
 
 
@@ -1908,51 +2865,103 @@ static VOID
 PmpCleanupStaleBaselines(
     _In_ PPM_MONITOR_INTERNAL Monitor
     )
+/*++
+Routine Description:
+    Cleans up baselines for terminated processes.
+    MUST be called at PASSIVE_LEVEL or APC_LEVEL.
+--*/
 {
     LARGE_INTEGER CurrentTime;
     LARGE_INTEGER TimeoutInterval;
     PLIST_ENTRY Entry, Next;
     PPM_PROCESS_BASELINE Baseline;
     LIST_ENTRY StaleList;
+    ULONG BucketIndex;
+    PPM_HASH_BUCKET Bucket;
+    PEPROCESS Process;
+    NTSTATUS Status;
+
+    PAGED_CODE();
 
     InitializeListHead(&StaleList);
 
     KeQuerySystemTime(&CurrentTime);
     TimeoutInterval.QuadPart = (LONGLONG)PM_BASELINE_TIMEOUT_MS * 10000;
 
+    //
+    // First pass: identify stale baselines under lock
+    //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Monitor->Public.BaselineLock);
+    ExAcquirePushLockExclusive(&Monitor->BaselineLock);
 
-    for (Entry = Monitor->Public.ProcessBaselines.Flink;
-         Entry != &Monitor->Public.ProcessBaselines;
+    for (Entry = Monitor->ProcessBaselines.Flink;
+         Entry != &Monitor->ProcessBaselines;
          Entry = Next) {
 
         Next = Entry->Flink;
         Baseline = CONTAINING_RECORD(Entry, PM_PROCESS_BASELINE, ListEntry);
 
-        //
-        // Check if process has terminated and enough time has passed
-        //
+        BOOLEAN ShouldRemove = FALSE;
+
         if (Baseline->IsTerminated) {
+            //
+            // Check timeout
+            //
             if ((CurrentTime.QuadPart - Baseline->LastCheckTime.QuadPart) > TimeoutInterval.QuadPart) {
-                RemoveEntryList(&Baseline->ListEntry);
-                InitializeListHead(&Baseline->ListEntry);
-                InsertTailList(&StaleList, &Baseline->ListEntry);
+                ShouldRemove = TRUE;
             }
         } else {
             //
             // Check if process still exists
             //
-            if (Baseline->ProcessObject != NULL) {
-                if (ShadowStrikeIsProcessTerminating(Baseline->ProcessObject)) {
+            Status = PsLookupProcessByProcessId(Baseline->ProcessId, &Process);
+            if (!NT_SUCCESS(Status)) {
+                //
+                // Process no longer exists, mark for cleanup
+                //
+                Baseline->IsTerminated = TRUE;
+                KeQuerySystemTime(&Baseline->LastCheckTime);
+            } else {
+                //
+                // Check if terminating
+                //
+                if (PsGetProcessExitStatus(Process) != STATUS_PENDING) {
                     Baseline->IsTerminated = TRUE;
                     KeQuerySystemTime(&Baseline->LastCheckTime);
                 }
+                ObDereferenceObject(Process);
             }
+        }
+
+        if (ShouldRemove) {
+            //
+            // Remove from main list
+            //
+            RemoveEntryList(&Baseline->ListEntry);
+            InitializeListHead(&Baseline->ListEntry);
+            InterlockedDecrement(&Monitor->BaselineCount);
+
+            //
+            // Remove from hash table while holding baseline lock
+            //
+            BucketIndex = PmpHashProcessId(Baseline->ProcessId);
+            Bucket = &Monitor->HashTable[BucketIndex];
+
+            ExAcquirePushLockExclusive(&Bucket->Lock);
+            if (!IsListEmpty(&Baseline->HashEntry)) {
+                RemoveEntryList(&Baseline->HashEntry);
+                InitializeListHead(&Baseline->HashEntry);
+            }
+            ExReleasePushLockExclusive(&Bucket->Lock);
+
+            //
+            // Add to stale list for freeing outside lock
+            //
+            InsertTailList(&StaleList, &Baseline->ListEntry);
         }
     }
 
-    ExReleasePushLockExclusive(&Monitor->Public.BaselineLock);
+    ExReleasePushLockExclusive(&Monitor->BaselineLock);
     KeLeaveCriticalRegion();
 
     //
@@ -1963,217 +2972,10 @@ PmpCleanupStaleBaselines(
         Baseline = CONTAINING_RECORD(Entry, PM_PROCESS_BASELINE, ListEntry);
 
         //
-        // Remove from hash table
-        //
-        ULONG BucketIndex = PmpHashProcessId(Baseline->ProcessId);
-        PPM_HASH_BUCKET Bucket = &Monitor->HashTable[BucketIndex];
-
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Bucket->Lock);
-
-        if (!IsListEmpty(&Baseline->HashEntry)) {
-            RemoveEntryList(&Baseline->HashEntry);
-            InitializeListHead(&Baseline->HashEntry);
-        }
-
-        ExReleasePushLockExclusive(&Bucket->Lock);
-        KeLeaveCriticalRegion();
-
-        //
-        // Release list reference
+        // Release list reference (may free baseline)
         //
         PmpDereferenceBaseline(Monitor, Baseline);
+
+        InterlockedIncrement64(&Monitor->Stats.BaselinesRemoved);
     }
 }
-
-
-static VOID
-PmpGetPrivilegeString(
-    _In_ ULONG PrivilegeFlags,
-    _Out_writes_(BufferSize) PCHAR Buffer,
-    _In_ ULONG BufferSize
-    )
-{
-    Buffer[0] = '\0';
-
-    if (PrivilegeFlags == 0) {
-        RtlStringCchCopyA(Buffer, BufferSize, "None");
-        return;
-    }
-
-    if (PrivilegeFlags & PM_PRIV_DEBUG) {
-        RtlStringCchCatA(Buffer, BufferSize, "Debug ");
-    }
-    if (PrivilegeFlags & PM_PRIV_TCB) {
-        RtlStringCchCatA(Buffer, BufferSize, "TCB ");
-    }
-    if (PrivilegeFlags & PM_PRIV_LOAD_DRIVER) {
-        RtlStringCchCatA(Buffer, BufferSize, "LoadDriver ");
-    }
-    if (PrivilegeFlags & PM_PRIV_IMPERSONATE) {
-        RtlStringCchCatA(Buffer, BufferSize, "Impersonate ");
-    }
-    if (PrivilegeFlags & PM_PRIV_CREATE_TOKEN) {
-        RtlStringCchCatA(Buffer, BufferSize, "CreateToken ");
-    }
-}
-
-
-// ============================================================================
-// ADDITIONAL PUBLIC APIs
-// ============================================================================
-
-NTSTATUS
-PmRemoveBaseline(
-    _In_ PPM_MONITOR Monitor,
-    _In_ HANDLE ProcessId
-    )
-/*++
-Routine Description:
-    Removes baseline for a terminated process.
-
-Arguments:
-    Monitor - Monitor instance.
-    ProcessId - Process ID.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
-{
-    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
-    PPM_PROCESS_BASELINE Baseline;
-
-    if (Internal == NULL || !Internal->Public.Initialized) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    Baseline = PmpLookupBaseline(Internal, ProcessId);
-    if (Baseline == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    //
-    // Mark as terminated for later cleanup
-    //
-    Baseline->IsTerminated = TRUE;
-    KeQuerySystemTime(&Baseline->LastCheckTime);
-
-    PmpDereferenceBaseline(Internal, Baseline);
-
-    return STATUS_SUCCESS;
-}
-
-
-NTSTATUS
-PmGetStatistics(
-    _In_ PPM_MONITOR Monitor,
-    _Out_ PULONG64 EscalationsDetected,
-    _Out_ PULONG64 LegitimateEscalations,
-    _Out_ PULONG BaselineCount
-    )
-/*++
-Routine Description:
-    Gets monitor statistics.
-
-Arguments:
-    Monitor - Monitor instance.
-    EscalationsDetected - Receives total escalation count.
-    LegitimateEscalations - Receives legitimate escalation count.
-    BaselineCount - Receives current baseline count.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
-{
-    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
-    PLIST_ENTRY Entry;
-    ULONG Count = 0;
-
-    if (Internal == NULL || !Internal->Public.Initialized) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (EscalationsDetected != NULL) {
-        *EscalationsDetected = (ULONG64)Internal->Public.Stats.EscalationsDetected;
-    }
-
-    if (LegitimateEscalations != NULL) {
-        *LegitimateEscalations = (ULONG64)Internal->Public.Stats.LegitimateEscalations;
-    }
-
-    if (BaselineCount != NULL) {
-        KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&Internal->Public.BaselineLock);
-
-        for (Entry = Internal->Public.ProcessBaselines.Flink;
-             Entry != &Internal->Public.ProcessBaselines;
-             Entry = Entry->Flink) {
-            Count++;
-        }
-
-        ExReleasePushLockShared(&Internal->Public.BaselineLock);
-        KeLeaveCriticalRegion();
-
-        *BaselineCount = Count;
-    }
-
-    return STATUS_SUCCESS;
-}
-
-
-NTSTATUS
-PmQueryProcessEscalation(
-    _In_ PPM_MONITOR Monitor,
-    _In_ HANDLE ProcessId,
-    _Out_ PBOOLEAN HasEscalated,
-    _Out_ PULONG EscalationCount,
-    _Out_ PULONG CurrentIntegrityLevel
-    )
-/*++
-Routine Description:
-    Queries escalation status for a specific process.
-
-Arguments:
-    Monitor - Monitor instance.
-    ProcessId - Process ID to query.
-    HasEscalated - Receives whether process has escalated.
-    EscalationCount - Receives number of escalations.
-    CurrentIntegrityLevel - Receives current integrity level.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
-{
-    PPM_MONITOR_INTERNAL Internal = (PPM_MONITOR_INTERNAL)Monitor;
-    PPM_PROCESS_BASELINE Baseline;
-
-    if (Internal == NULL || !Internal->Public.Initialized) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (HasEscalated != NULL) *HasEscalated = FALSE;
-    if (EscalationCount != NULL) *EscalationCount = 0;
-    if (CurrentIntegrityLevel != NULL) *CurrentIntegrityLevel = 0;
-
-    Baseline = PmpLookupBaseline(Internal, ProcessId);
-    if (Baseline == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    if (HasEscalated != NULL) {
-        *HasEscalated = Baseline->HasEscalated;
-    }
-
-    if (EscalationCount != NULL) {
-        *EscalationCount = Baseline->EscalationCount;
-    }
-
-    if (CurrentIntegrityLevel != NULL) {
-        *CurrentIntegrityLevel = Baseline->CurrentIntegrityLevel;
-    }
-
-    PmpDereferenceBaseline(Internal, Baseline);
-
-    return STATUS_SUCCESS;
-}
-

@@ -7,13 +7,15 @@
              malicious module identification.
 
     Architecture:
-    - PsSetLoadImageNotifyRoutineEx integration
+    - PsSetLoadImageNotifyRoutineEx integration with driver blocking
     - PE header validation and anomaly detection
     - Unsigned/untrusted module flagging
     - DLL side-loading detection
     - Reflective DLL injection detection
     - Module stomping detection
-    - Known vulnerable driver detection
+    - Known vulnerable driver detection (BYOVD)
+    - Per-process module tracking
+    - Image hash caching
     - Telemetry generation for SIEM integration
 
     MITRE ATT&CK Coverage:
@@ -23,6 +25,12 @@
     - T1574.002: Hijack Execution Flow - DLL Side-Loading
     - T1014: Rootkit (driver load monitoring)
     - T1068: Exploitation for Privilege Escalation (vulnerable drivers)
+
+    Thread Safety:
+    - All public APIs are thread-safe
+    - Rundown protection for callback lifetime management
+    - Lock-free statistics where possible
+    - Push locks for configuration and callback lists
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -37,6 +45,14 @@ extern "C" {
 #include <ntimage.h>
 
 //=============================================================================
+// Version Information
+//=============================================================================
+
+#define IMG_NOTIFY_VERSION_MAJOR        1
+#define IMG_NOTIFY_VERSION_MINOR        1
+#define IMG_NOTIFY_VERSION              ((IMG_NOTIFY_VERSION_MAJOR << 16) | IMG_NOTIFY_VERSION_MINOR)
+
+//=============================================================================
 // Pool Tags
 //=============================================================================
 
@@ -44,6 +60,8 @@ extern "C" {
 #define IMG_POOL_TAG_EVENT          'eImS'  // Image Notify - Event
 #define IMG_POOL_TAG_CACHE          'cImS'  // Image Notify - Cache
 #define IMG_POOL_TAG_HASH           'hImS'  // Image Notify - Hash
+#define IMG_POOL_TAG_MODULE         'mImS'  // Image Notify - Module tracking
+#define IMG_POOL_TAG_STRING         'sImS'  // Image Notify - String data
 
 //=============================================================================
 // Configuration Constants
@@ -56,6 +74,14 @@ extern "C" {
 #define IMG_CACHE_TTL_SECONDS           300
 #define IMG_MAX_PE_HEADER_SIZE          4096
 #define IMG_LOOKASIDE_DEPTH             128
+#define IMG_MAX_CALLBACKS               16
+#define IMG_VULNERABLE_DRIVER_BUCKETS   64
+#define IMG_MAX_VULNERABLE_DRIVERS      512
+#define IMG_MAX_CACHED_HASHES           4096
+#define IMG_MODULE_HASH_BUCKETS         128
+#define IMG_RATE_LIMIT_WINDOW_MS        1000
+#define IMG_DEFAULT_MAX_EVENTS_PER_SEC  10000
+#define IMG_HIGH_ENTROPY_THRESHOLD      700     // 7.0 * 100
 
 //=============================================================================
 // Image Load Flags
@@ -241,6 +267,11 @@ typedef struct _IMG_LOAD_EVENT {
     ULONG64 EventId;
 
     //
+    // Allocation tracking (for proper free)
+    //
+    BOOLEAN AllocatedFromLookaside;
+
+    //
     // Process context
     //
     HANDLE ProcessId;
@@ -314,6 +345,12 @@ typedef struct _IMG_LOAD_EVENT {
 
 typedef struct _IMG_NOTIFY_CONFIG {
     //
+    // Structure versioning for ABI compatibility
+    //
+    ULONG Size;
+    ULONG Version;
+
+    //
     // Feature toggles
     //
     BOOLEAN EnablePeAnalysis;
@@ -322,6 +359,8 @@ typedef struct _IMG_NOTIFY_CONFIG {
     BOOLEAN EnableSuspiciousDetection;
     BOOLEAN EnableDriverMonitoring;
     BOOLEAN EnableVulnerableDriverCheck;
+    BOOLEAN EnableDriverBlocking;
+    BOOLEAN EnableModuleTracking;
     BOOLEAN MonitorSystemProcesses;
     BOOLEAN MonitorKernelImages;
 
@@ -343,6 +382,12 @@ typedef struct _IMG_NOTIFY_CONFIG {
     //
     ULONG MaxEventsPerSecond;
 
+    //
+    // Hash computation limits
+    //
+    ULONG64 MaxFileSizeForHash;     // Maximum file size to hash (bytes)
+    ULONG HashTimeoutMs;            // Timeout for hash computation
+
 } IMG_NOTIFY_CONFIG, *PIMG_NOTIFY_CONFIG;
 
 //=============================================================================
@@ -362,8 +407,44 @@ typedef struct _IMG_NOTIFY_STATISTICS {
     volatile LONG64 CacheHits;
     volatile LONG64 CacheMisses;
     volatile LONG64 EventsDropped;
+    volatile LONG64 CallbackErrors;
+    volatile LONG64 ModulesTracked;
     LARGE_INTEGER StartTime;
 } IMG_NOTIFY_STATISTICS, *PIMG_NOTIFY_STATISTICS;
+
+//=============================================================================
+// Hash Cache Entry
+//=============================================================================
+
+typedef struct _IMG_HASH_CACHE_ENTRY {
+    LIST_ENTRY HashListEntry;
+    ULONG64 FileId;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER CacheTime;
+    UCHAR Sha256Hash[32];
+    UCHAR Sha1Hash[20];
+    UCHAR Md5Hash[16];
+    BOOLEAN IsValid;
+    volatile LONG RefCount;
+} IMG_HASH_CACHE_ENTRY, *PIMG_HASH_CACHE_ENTRY;
+
+//=============================================================================
+// Per-Process Module Entry
+//=============================================================================
+
+typedef struct _IMG_MODULE_ENTRY {
+    LIST_ENTRY ListEntry;
+    LIST_ENTRY HashEntry;
+    PVOID ImageBase;
+    SIZE_T ImageSize;
+    HANDLE ProcessId;
+    LARGE_INTEGER LoadTime;
+    WCHAR ModulePath[IMG_MAX_PATH_LENGTH];
+    WCHAR ModuleName[64];
+    UCHAR Sha256Hash[32];
+    BOOLEAN HashComputed;
+    volatile LONG RefCount;
+} IMG_MODULE_ENTRY, *PIMG_MODULE_ENTRY;
 
 //=============================================================================
 // Callback Types
@@ -371,10 +452,11 @@ typedef struct _IMG_NOTIFY_STATISTICS {
 
 //
 // Pre-load callback - can block driver loads
+// Note: Must complete quickly - executes in image load context
 //
 typedef NTSTATUS (*IMG_PRE_LOAD_CALLBACK)(
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING FullImageName,
+    _In_opt_ PUNICODE_STRING FullImageName,
     _In_ PIMAGE_INFO ImageInfo,
     _Out_ PBOOLEAN BlockLoad,
     _In_opt_ PVOID Context
@@ -403,7 +485,11 @@ typedef VOID (*IMG_POST_LOAD_CALLBACK)(
 // Return Value:
 //    STATUS_SUCCESS if successful
 //
+// IRQL:
+//    PASSIVE_LEVEL
+//
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyInitialize(
     _In_opt_ PIMG_NOTIFY_CONFIG Config
@@ -412,6 +498,7 @@ ImageNotifyInitialize(
 //
 // Routine Description:
 //    Registers the image load notification callback with the kernel.
+//    Uses PsSetLoadImageNotifyRoutineEx if driver blocking is enabled.
 //
 // Arguments:
 //    None
@@ -419,7 +506,11 @@ ImageNotifyInitialize(
 // Return Value:
 //    STATUS_SUCCESS if successful
 //
+// IRQL:
+//    PASSIVE_LEVEL
+//
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 RegisterImageNotify(
     VOID
@@ -428,12 +519,16 @@ RegisterImageNotify(
 //
 // Routine Description:
 //    Unregisters the image load notification callback.
+//    Waits for all in-flight callbacks to complete.
 //
 // Arguments:
 //    None
 //
 // Return Value:
 //    STATUS_SUCCESS if successful
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -444,9 +539,13 @@ UnregisterImageNotify(
 //
 // Routine Description:
 //    Shuts down the image notification subsystem and releases resources.
+//    Must be called at driver unload.
 //
 // Arguments:
 //    None
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -461,14 +560,20 @@ ImageNotifyShutdown(
 //
 // Routine Description:
 //    Updates the image notification configuration.
+//    Validates version and size before applying.
 //
 // Arguments:
-//    Config - New configuration
+//    Config - New configuration (must have valid Size and Version)
 //
 // Return Value:
 //    STATUS_SUCCESS if successful
+//    STATUS_INVALID_PARAMETER if Config is NULL or version mismatch
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifySetConfig(
     _In_ PIMG_NOTIFY_CONFIG Config
@@ -484,9 +589,29 @@ ImageNotifySetConfig(
 // Return Value:
 //    STATUS_SUCCESS if successful
 //
-_IRQL_requires_max_(DISPATCH_LEVEL)
+// IRQL:
+//    <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyGetConfig(
+    _Out_ PIMG_NOTIFY_CONFIG Config
+    );
+
+//
+// Routine Description:
+//    Initializes a configuration structure with default values.
+//
+// Arguments:
+//    Config - Configuration structure to initialize
+//
+// IRQL:
+//    Any
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ImageNotifyInitDefaultConfig(
     _Out_ PIMG_NOTIFY_CONFIG Config
     );
 
@@ -504,8 +629,13 @@ ImageNotifyGetConfig(
 //
 // Return Value:
 //    STATUS_SUCCESS if successful
+//    STATUS_QUOTA_EXCEEDED if maximum callbacks reached
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyRegisterPreLoadCallback(
     _In_ IMG_PRE_LOAD_CALLBACK Callback,
@@ -523,7 +653,11 @@ ImageNotifyRegisterPreLoadCallback(
 // Return Value:
 //    STATUS_SUCCESS if successful
 //
+// IRQL:
+//    PASSIVE_LEVEL
+//
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyRegisterPostLoadCallback(
     _In_ IMG_POST_LOAD_CALLBACK Callback,
@@ -533,9 +667,13 @@ ImageNotifyRegisterPostLoadCallback(
 //
 // Routine Description:
 //    Unregisters a previously registered callback.
+//    Waits for any in-progress invocations to complete.
 //
 // Arguments:
 //    Callback - Callback to unregister (either pre or post)
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -552,14 +690,18 @@ ImageNotifyUnregisterCallback(
 //    Adds a hash to the vulnerable driver database.
 //
 // Arguments:
-//    Sha256Hash - SHA-256 hash of vulnerable driver
+//    Sha256Hash - SHA-256 hash of vulnerable driver (32 bytes)
 //    DriverName - Name of the driver
 //    CveId - CVE identifier (optional)
 //
 // Return Value:
 //    STATUS_SUCCESS if successful
 //
+// IRQL:
+//    PASSIVE_LEVEL
+//
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyAddVulnerableDriver(
     _In_reads_bytes_(32) PUCHAR Sha256Hash,
@@ -569,15 +711,38 @@ ImageNotifyAddVulnerableDriver(
 
 //
 // Routine Description:
+//    Removes a hash from the vulnerable driver database.
+//
+// Arguments:
+//    Sha256Hash - Hash to remove
+//
+// Return Value:
+//    STATUS_SUCCESS if removed
+//    STATUS_NOT_FOUND if hash not in database
+//
+// IRQL:
+//    PASSIVE_LEVEL
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ImageNotifyRemoveVulnerableDriver(
+    _In_reads_bytes_(32) PUCHAR Sha256Hash
+    );
+
+//
+// Routine Description:
 //    Checks if a hash matches a known vulnerable driver.
 //
 // Arguments:
-//    Sha256Hash - Hash to check
+//    Sha256Hash - Hash to check (32 bytes)
 //
 // Return Value:
 //    TRUE if hash matches a known vulnerable driver
 //
-_IRQL_requires_max_(DISPATCH_LEVEL)
+// IRQL:
+//    <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ImageNotifyIsVulnerableDriver(
     _In_reads_bytes_(32) PUCHAR Sha256Hash
@@ -590,6 +755,7 @@ ImageNotifyIsVulnerableDriver(
 //
 // Routine Description:
 //    Retrieves image notification statistics.
+//    Uses atomic reads to prevent torn data.
 //
 // Arguments:
 //    Stats - Receives statistics snapshot
@@ -597,7 +763,11 @@ ImageNotifyIsVulnerableDriver(
 // Return Value:
 //    STATUS_SUCCESS if successful
 //
+// IRQL:
+//    <= DISPATCH_LEVEL
+//
 _IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyGetStatistics(
     _Out_ PIMG_NOTIFY_STATISTICS Stats
@@ -605,7 +775,10 @@ ImageNotifyGetStatistics(
 
 //
 // Routine Description:
-//    Resets all statistics counters.
+//    Resets all statistics counters atomically.
+//
+// IRQL:
+//    <= DISPATCH_LEVEL
 //
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -614,7 +787,7 @@ ImageNotifyResetStatistics(
     );
 
 //=============================================================================
-// Public API - Query Functions
+// Public API - Module Tracking
 //=============================================================================
 
 //
@@ -629,12 +802,17 @@ ImageNotifyResetStatistics(
 //
 // Return Value:
 //    STATUS_SUCCESS if successful
+//    STATUS_BUFFER_TOO_SMALL if array too small (ModuleCount set to required)
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ImageNotifyQueryProcessModules(
     _In_ HANDLE ProcessId,
-    _Out_writes_to_(MaxModules, *ModuleCount) PIMG_LOAD_EVENT Modules,
+    _Out_writes_to_opt_(MaxModules, *ModuleCount) PIMG_LOAD_EVENT Modules,
     _In_ ULONG MaxModules,
     _Out_ PULONG ModuleCount
     );
@@ -646,10 +824,13 @@ ImageNotifyQueryProcessModules(
 // Arguments:
 //    ProcessId - Target process ID
 //    ModuleName - Module name to check
-//    ImageBase - Receives base address if found
+//    ImageBase - Receives base address if found (optional)
 //
 // Return Value:
 //    TRUE if module is loaded
+//
+// IRQL:
+//    PASSIVE_LEVEL
 //
 _IRQL_requires_(PASSIVE_LEVEL)
 BOOLEAN
@@ -657,6 +838,90 @@ ImageNotifyIsModuleLoaded(
     _In_ HANDLE ProcessId,
     _In_ PUNICODE_STRING ModuleName,
     _Out_opt_ PPVOID ImageBase
+    );
+
+//
+// Routine Description:
+//    Removes tracking for a terminated process.
+//    Should be called from process termination callback.
+//
+// Arguments:
+//    ProcessId - Process that terminated
+//
+// IRQL:
+//    <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ImageNotifyProcessTerminated(
+    _In_ HANDLE ProcessId
+    );
+
+//=============================================================================
+// Public API - Hash Cache
+//=============================================================================
+
+//
+// Routine Description:
+//    Looks up a hash in the cache.
+//
+// Arguments:
+//    FileId - Unique file ID
+//    LastWriteTime - File's last write time
+//    Sha256Hash - Receives SHA-256 hash if found (32 bytes)
+//
+// Return Value:
+//    TRUE if hash found and valid
+//
+// IRQL:
+//    <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN
+ImageNotifyLookupCachedHash(
+    _In_ ULONG64 FileId,
+    _In_ PLARGE_INTEGER LastWriteTime,
+    _Out_writes_bytes_(32) PUCHAR Sha256Hash
+    );
+
+//
+// Routine Description:
+//    Adds a hash to the cache.
+//
+// Arguments:
+//    FileId - Unique file ID
+//    LastWriteTime - File's last write time
+//    Sha256Hash - SHA-256 hash (32 bytes)
+//    Sha1Hash - SHA-1 hash (20 bytes, optional)
+//    Md5Hash - MD5 hash (16 bytes, optional)
+//
+// Return Value:
+//    STATUS_SUCCESS if added
+//
+// IRQL:
+//    <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+ImageNotifyAddCachedHash(
+    _In_ ULONG64 FileId,
+    _In_ PLARGE_INTEGER LastWriteTime,
+    _In_reads_bytes_(32) PUCHAR Sha256Hash,
+    _In_reads_bytes_opt_(20) PUCHAR Sha1Hash,
+    _In_reads_bytes_opt_(16) PUCHAR Md5Hash
+    );
+
+//
+// Routine Description:
+//    Purges expired entries from the hash cache.
+//
+// IRQL:
+//    PASSIVE_LEVEL
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+ImageNotifyPurgeHashCache(
+    VOID
     );
 
 #ifdef __cplusplus

@@ -194,6 +194,9 @@ typedef struct _BE_ATTACK_CHAIN {
 #define BE_CHAIN_FLAG_LATERAL_MOVEMENT    0x00000020
 #define BE_CHAIN_FLAG_USER_NOTIFIED       0x00000040
 #define BE_CHAIN_FLAG_AUTO_REMEDIATE      0x00000080
+#define BE_CHAIN_FLAG_FALSE_POSITIVE      0x00000100
+#define BE_CHAIN_FLAG_PENDING_REVIEW      0x00000200
+#define BE_CHAIN_FLAG_ESCALATED           0x00000400
 
 // ============================================================================
 // PROCESS BEHAVIORAL CONTEXT
@@ -361,6 +364,56 @@ typedef struct _BEHAVIOR_ENGINE_GLOBALS {
     UINT64 LastChainCleanupTime;
     UINT64 LastStatisticsReportTime;
 } BEHAVIOR_ENGINE_GLOBALS, *PBEHAVIOR_ENGINE_GLOBALS;
+
+// ============================================================================
+// SAFE STATISTICS STRUCTURE (FOR EXTERNAL EXPOSURE)
+// ============================================================================
+
+/**
+ * @brief Safe behavioral engine statistics for external reporting.
+ *
+ * This structure contains ONLY safe-to-expose statistics fields.
+ * It explicitly excludes:
+ * - Internal pointers (thread objects, list heads)
+ * - Lock states and synchronization primitives
+ * - Memory allocator structures
+ * - Any data that could aid kernel exploitation
+ */
+typedef struct _BEHAVIOR_ENGINE_STATISTICS {
+    // Configuration (read-only)
+    BOOLEAN Initialized;
+    BOOLEAN Enabled;
+    UINT16 Reserved1;
+
+    UINT32 ChainTimeoutMs;
+    UINT32 MaxActiveChains;
+    UINT32 MaxEventsPerChain;
+    UINT32 CorrelationWindowMs;
+    UINT32 HighThreatThreshold;
+    UINT32 CriticalThreshold;
+
+    // Current state counts
+    UINT32 ActiveChainCount;
+    UINT32 ProcessContextCount;
+    UINT32 LoadedRuleCount;
+    UINT32 EnabledRuleCount;
+    UINT32 PendingEventCount;
+    UINT32 MaxPendingEvents;
+
+    // Lifetime statistics (monotonically increasing)
+    LONG64 TotalEventsProcessed;
+    LONG64 TotalEventsCorrelated;
+    LONG64 TotalChainsCreated;
+    LONG64 TotalRuleMatches;
+    LONG64 TotalThreatsDetected;
+    LONG64 TotalThreatsBlocked;
+    LONG64 EventsDropped;
+
+    // Timing information
+    UINT64 LastChainCleanupTime;
+    UINT64 LastStatisticsReportTime;
+    UINT64 EngineUptimeMs;
+} BEHAVIOR_ENGINE_STATISTICS, *PBEHAVIOR_ENGINE_STATISTICS;
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -633,7 +686,25 @@ BeEngineGetProcessTechniques(
 // ============================================================================
 
 /**
- * @brief Get behavioral engine statistics.
+ * @brief Get behavioral engine statistics (SAFE VERSION).
+ *
+ * Returns only safe-to-expose statistics. Use this for user-mode
+ * IOCTL responses to avoid kernel information disclosure.
+ *
+ * @param Stats Output statistics structure.
+ * @return STATUS_SUCCESS on success.
+ */
+NTSTATUS
+BeEngineGetStatisticsSafe(
+    _Out_ PBEHAVIOR_ENGINE_STATISTICS Stats
+    );
+
+/**
+ * @brief Get behavioral engine statistics (INTERNAL ONLY).
+ *
+ * WARNING: This function returns internal state including pointers.
+ * DO NOT expose this to user-mode. Use BeEngineGetStatisticsSafe instead.
+ *
  * @param Stats Output statistics.
  * @return STATUS_SUCCESS on success.
  */

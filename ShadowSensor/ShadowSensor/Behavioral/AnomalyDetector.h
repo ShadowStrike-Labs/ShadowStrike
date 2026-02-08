@@ -2,6 +2,19 @@
     ShadowStrike Next-Generation Antivirus
     Module: AnomalyDetector.h - Behavioral anomaly detection
     Copyright (c) ShadowStrike Team
+
+    ENTERPRISE-GRADE IMPLEMENTATION
+
+    This header defines the public API for statistical anomaly detection.
+    All structures use opaque handles to maintain ABI stability.
+
+    IRQL REQUIREMENTS:
+    - All public APIs require IRQL <= APC_LEVEL unless otherwise noted
+    - Callback functions are invoked at PASSIVE_LEVEL
+
+    THREAD SAFETY:
+    - All public APIs are thread-safe
+    - Callbacks may be invoked concurrently
 --*/
 
 #pragma once
@@ -12,9 +25,27 @@ extern "C" {
 
 #include <ntddk.h>
 
+//
+// Pool tag for all allocations
+//
 #define AD_POOL_TAG 'DADA'
-#define AD_BASELINE_SAMPLES 1000
 
+//
+// Version for compatibility checking
+//
+#define AD_VERSION_MAJOR    2
+#define AD_VERSION_MINOR    1
+#define AD_VERSION          ((AD_VERSION_MAJOR << 16) | AD_VERSION_MINOR)
+
+//
+// Configuration limits
+//
+#define AD_BASELINE_SAMPLES         1000
+#define AD_MAX_PROCESS_NAME_CCH     260
+
+//
+// Metric types for anomaly detection
+//
 typedef enum _AD_METRIC_TYPE {
     AdMetric_CPUUsage = 0,
     AdMetric_MemoryUsage,
@@ -27,89 +58,211 @@ typedef enum _AD_METRIC_TYPE {
     AdMetric_HandleCount,
     AdMetric_PrivilegeUse,
     AdMetric_Custom,
+    AdMetric_MaxValue = AdMetric_Custom
 } AD_METRIC_TYPE;
 
-typedef struct _AD_BASELINE {
+//
+// Compile-time validation of metric array bounds
+//
+C_ASSERT(AdMetric_MaxValue == AdMetric_Custom);
+#define AD_METRIC_COUNT (AdMetric_MaxValue + 1)
+
+//
+// Baseline statistics (read-only snapshot for callers)
+//
+typedef struct _AD_BASELINE_INFO {
     AD_METRIC_TYPE Type;
-    
-    // Statistical baseline
     DOUBLE Mean;
     DOUBLE StandardDeviation;
     DOUBLE Min;
     DOUBLE Max;
     ULONG SampleCount;
-    
-    // Recent samples for sliding window
-    DOUBLE Samples[AD_BASELINE_SAMPLES];
-    ULONG CurrentIndex;
     BOOLEAN IsFull;
-    
     LARGE_INTEGER LastUpdated;
-    LIST_ENTRY ListEntry;
-} AD_BASELINE, *PAD_BASELINE;
+} AD_BASELINE_INFO, *PAD_BASELINE_INFO;
 
-typedef struct _AD_ANOMALY {
+//
+// Anomaly record (caller-owned copy)
+//
+typedef struct _AD_ANOMALY_INFO {
     HANDLE ProcessId;
-    UNICODE_STRING ProcessName;
+    WCHAR ProcessName[AD_MAX_PROCESS_NAME_CCH];
     AD_METRIC_TYPE MetricType;
-    
-    // Detected anomaly
+
     DOUBLE ObservedValue;
     DOUBLE ExpectedValue;
-    DOUBLE DeviationSigmas;             // Number of standard deviations
-    
-    ULONG SeverityScore;                // 0-100
+    DOUBLE DeviationSigmas;
+
+    ULONG SeverityScore;        // 0-100
     BOOLEAN IsHighConfidence;
-    
+
     LARGE_INTEGER DetectionTime;
-    LIST_ENTRY ListEntry;
-} AD_ANOMALY, *PAD_ANOMALY;
+} AD_ANOMALY_INFO, *PAD_ANOMALY_INFO;
 
-typedef VOID (*AD_ANOMALY_CALLBACK)(
-    _In_ PAD_ANOMALY Anomaly,
+//
+// Opaque detector handle
+//
+typedef struct _AD_DETECTOR *PAD_DETECTOR;
+
+//
+// Callback function type
+// IRQL: Called at PASSIVE_LEVEL
+// Thread safety: May be called concurrently from multiple threads
+//
+typedef VOID
+(NTAPI *AD_ANOMALY_CALLBACK)(
+    _In_ CONST AD_ANOMALY_INFO* AnomalyInfo,
     _In_opt_ PVOID Context
-);
+    );
 
-typedef struct _AD_DETECTOR {
-    BOOLEAN Initialized;
-    
-    // Global baselines
-    LIST_ENTRY GlobalBaselines;
-    EX_PUSH_LOCK GlobalBaselineLock;
-    
-    // Per-process baselines
-    LIST_ENTRY ProcessBaselines;
-    EX_PUSH_LOCK ProcessBaselineLock;
-    
-    // Configuration
-    DOUBLE SigmaThreshold;              // Default 3.0 (3 sigma rule)
-    ULONG MinimumSamples;               // Minimum samples before detection
-    
-    // Anomalies
-    LIST_ENTRY AnomalyList;
-    KSPIN_LOCK AnomalyLock;
-    volatile LONG AnomalyCount;
-    
-    // Callback
-    AD_ANOMALY_CALLBACK Callback;
-    PVOID CallbackContext;
-    
-    struct {
-        volatile LONG64 SamplesProcessed;
-        volatile LONG64 AnomaliesDetected;
-        LARGE_INTEGER StartTime;
-    } Stats;
-} AD_DETECTOR, *PAD_DETECTOR;
+//
+// Callback handle for unregistration
+//
+typedef PVOID AD_CALLBACK_HANDLE;
 
-NTSTATUS AdInitialize(_Out_ PAD_DETECTOR* Detector);
-VOID AdShutdown(_Inout_ PAD_DETECTOR Detector);
-NTSTATUS AdSetThreshold(_In_ PAD_DETECTOR Detector, _In_ DOUBLE SigmaThreshold);
-NTSTATUS AdRegisterCallback(_In_ PAD_DETECTOR Detector, _In_ AD_ANOMALY_CALLBACK Callback, _In_opt_ PVOID Context);
-NTSTATUS AdRecordSample(_In_ PAD_DETECTOR Detector, _In_opt_ HANDLE ProcessId, _In_ AD_METRIC_TYPE Metric, _In_ DOUBLE Value);
-NTSTATUS AdCheckForAnomaly(_In_ PAD_DETECTOR Detector, _In_opt_ HANDLE ProcessId, _In_ AD_METRIC_TYPE Metric, _In_ DOUBLE Value, _Out_ PBOOLEAN IsAnomaly, _Out_opt_ PAD_ANOMALY* Anomaly);
-NTSTATUS AdGetBaseline(_In_ PAD_DETECTOR Detector, _In_opt_ HANDLE ProcessId, _In_ AD_METRIC_TYPE Metric, _Out_ PAD_BASELINE* Baseline);
-NTSTATUS AdGetRecentAnomalies(_In_ PAD_DETECTOR Detector, _In_ ULONG MaxAgeSeconds, _Out_writes_to_(Max, *Count) PAD_ANOMALY* Anomalies, _In_ ULONG Max, _Out_ PULONG Count);
-VOID AdFreeAnomaly(_In_ PAD_ANOMALY Anomaly);
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+//
+// Initialize the anomaly detector
+// IRQL: PASSIVE_LEVEL
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdInitialize(
+    _Out_ PAD_DETECTOR* Detector
+    );
+
+//
+// Shutdown and free the anomaly detector
+// IRQL: PASSIVE_LEVEL
+// Note: Blocks until all operations complete
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+AdShutdown(
+    _Inout_ PAD_DETECTOR Detector
+    );
+
+//
+// Set the detection threshold (sigma value)
+// IRQL: <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdSetThreshold(
+    _In_ PAD_DETECTOR Detector,
+    _In_ DOUBLE SigmaThreshold
+    );
+
+//
+// Register a callback for anomaly notifications
+// IRQL: <= APC_LEVEL
+// Returns: Callback handle for use with AdUnregisterCallback
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdRegisterCallback(
+    _In_ PAD_DETECTOR Detector,
+    _In_ AD_ANOMALY_CALLBACK Callback,
+    _In_opt_ PVOID Context,
+    _Out_ AD_CALLBACK_HANDLE* Handle
+    );
+
+//
+// Unregister a previously registered callback
+// IRQL: <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+AdUnregisterCallback(
+    _In_ PAD_DETECTOR Detector,
+    _In_ AD_CALLBACK_HANDLE Handle
+    );
+
+//
+// Record a sample for baseline building
+// IRQL: <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdRecordSample(
+    _In_ PAD_DETECTOR Detector,
+    _In_opt_ HANDLE ProcessId,
+    _In_ AD_METRIC_TYPE Metric,
+    _In_ DOUBLE Value
+    );
+
+//
+// Check if a value is anomalous
+// IRQL: <= APC_LEVEL
+// Note: Also records the sample if not anomalous
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdCheckForAnomaly(
+    _In_ PAD_DETECTOR Detector,
+    _In_opt_ HANDLE ProcessId,
+    _In_ AD_METRIC_TYPE Metric,
+    _In_ DOUBLE Value,
+    _Out_ PBOOLEAN IsAnomaly,
+    _Out_opt_ PAD_ANOMALY_INFO AnomalyInfo
+    );
+
+//
+// Get baseline information for a metric
+// IRQL: <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdGetBaseline(
+    _In_ PAD_DETECTOR Detector,
+    _In_opt_ HANDLE ProcessId,
+    _In_ AD_METRIC_TYPE Metric,
+    _Out_ PAD_BASELINE_INFO BaselineInfo
+    );
+
+//
+// Get recent anomalies
+// IRQL: <= APC_LEVEL
+//
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdGetRecentAnomalies(
+    _In_ PAD_DETECTOR Detector,
+    _In_ ULONG MaxAgeSeconds,
+    _Out_writes_to_(MaxCount, *ActualCount) PAD_ANOMALY_INFO AnomalyArray,
+    _In_ ULONG MaxCount,
+    _Out_ PULONG ActualCount
+    );
+
+//
+// Get detector statistics
+//
+typedef struct _AD_STATISTICS {
+    LONG64 SamplesProcessed;
+    LONG64 AnomaliesDetected;
+    LONG ProcessBaselineCount;
+    LONG AnomalyCount;
+    LARGE_INTEGER StartTime;
+    LARGE_INTEGER Uptime;
+} AD_STATISTICS, *PAD_STATISTICS;
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+AdGetStatistics(
+    _In_ PAD_DETECTOR Detector,
+    _Out_ PAD_STATISTICS Statistics
+    );
 
 #ifdef __cplusplus
 }

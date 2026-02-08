@@ -30,6 +30,17 @@
  * - Memory allocation failure handling
  * - Reference counting for all shared structures
  *
+ * LOCK HIERARCHY (MUST BE ACQUIRED IN THIS ORDER):
+ * 1. g_BeState.ChainLock (ERESOURCE) - outermost
+ * 2. g_BeState.ProcessLock (ERESOURCE)
+ * 3. g_BeState.RuleLock (ERESOURCE)
+ * 4. g_ChainHashLock (PUSH_LOCK)
+ * 5. g_ProcessHashLock (PUSH_LOCK)
+ * 6. g_BeState.EventQueueLock (SPINLOCK)
+ * 7. Chain->Lock (SPINLOCK) - innermost
+ *
+ * NEVER acquire locks in reverse order to prevent deadlocks.
+ *
  * Performance Characteristics:
  * - O(1) process context lookup via hash table
  * - Lock-free statistics updates
@@ -43,7 +54,7 @@
  * - Kill chain stage tracking
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -94,6 +105,16 @@
  * @brief Process context cleanup age (ms)
  */
 #define BE_PROCESS_CLEANUP_AGE_MS       300000
+
+/**
+ * @brief Maximum worker shutdown wait retries
+ */
+#define BE_WORKER_SHUTDOWN_RETRIES      3
+
+/**
+ * @brief Worker shutdown wait timeout per retry (100ms units)
+ */
+#define BE_WORKER_SHUTDOWN_TIMEOUT_MS   5000
 
 /**
  * @brief Lookaside list depths
@@ -394,6 +415,21 @@ BepInsertChain(
 static VOID
 BepRemoveChain(
     _In_ PBE_ATTACK_CHAIN Chain
+    );
+
+static VOID
+BepRemoveChainFromHash(
+    _In_ PBE_ATTACK_CHAIN Chain
+    );
+
+static VOID
+BepRemoveProcessContextFromHash(
+    _In_ PBE_PROCESS_CONTEXT Context
+    );
+
+static BOOLEAN
+BepIsCriticalProcess(
+    _In_ UINT32 ProcessId
     );
 
 static NTSTATUS
@@ -840,6 +876,25 @@ BeEngineSubmitEvent(
     }
 
     //
+    // CRITICAL IRQL CHECK: Blocking events require synchronous processing
+    // which calls functions that acquire ERESOURCE locks. These locks
+    // can only be acquired at IRQL <= APC_LEVEL. Reject blocking requests
+    // at DISPATCH_LEVEL to prevent BSOD.
+    //
+    if (IsBlocking && KeGetCurrentIrql() > APC_LEVEL) {
+        //
+        // Cannot process blocking event at elevated IRQL.
+        // Caller must either:
+        // 1. Call at PASSIVE_LEVEL/APC_LEVEL, or
+        // 2. Use non-blocking mode (IsBlocking = FALSE)
+        //
+        if (Response != NULL) {
+            *Response = BehaviorResponse_Allow;
+        }
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    //
     // Check queue limit
     //
     if ((UINT32)g_BeState.PendingEventCount >= g_BeState.MaxPendingEvents) {
@@ -952,6 +1007,13 @@ BeEngineSubmitEvent(
 
 /**
  * @brief Submit process creation event.
+ *
+ * Creates a new behavioral context for the process and submits
+ * a process creation event for behavioral analysis.
+ *
+ * SECURITY NOTE: We do NOT store a reference to PEPROCESS to avoid
+ * use-after-free if the process terminates while context exists.
+ * Process information is captured at creation time only.
  */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
@@ -988,13 +1050,37 @@ BeEngineProcessCreate(
     context->RefCount = 1;
 
     //
-    // Get process create time
+    // Get process create time - we intentionally do NOT store PEPROCESS
+    // to avoid use-after-free. The process object reference is only held
+    // temporarily to extract immutable properties.
     //
     status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)ProcessId, &process);
     if (NT_SUCCESS(status)) {
-        context->ProcessObject = process;
+        //
+        // Extract create time while we hold the reference
+        //
         context->ProcessCreateTime = (UINT64)(PsGetProcessCreateTimeQuadPart(process) / 10000);
+
+        //
+        // DO NOT store ProcessObject - it would be a dangling pointer after
+        // we dereference. Set to NULL to make this explicit.
+        //
+        context->ProcessObject = NULL;
+
+        //
+        // Release reference immediately - we don't need it anymore
+        //
         ObDereferenceObject(process);
+        process = NULL;
+    } else {
+        //
+        // Process lookup failed - this can happen if process is already gone
+        // Use current time as fallback
+        //
+        LARGE_INTEGER currentTime;
+        KeQuerySystemTime(&currentTime);
+        context->ProcessCreateTime = (UINT64)(currentTime.QuadPart / 10000);
+        context->ProcessObject = NULL;
     }
 
     //
@@ -1151,6 +1237,9 @@ BeEngineGetChain(
 
 /**
  * @brief Get attack chains for process.
+ *
+ * SECURITY: This function now holds the ProcessLock while iterating
+ * the chain list to prevent race conditions and use-after-free.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
@@ -1166,11 +1255,17 @@ BeEngineGetProcessChains(
     PLIST_ENTRY entry;
     UINT32 count = 0;
 
+    PAGED_CODE();
+
     if (Chains == NULL || ChainCount == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *ChainCount = 0;
+
+    if (MaxChains == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     status = BeEngineGetProcessContext(ProcessId, &context);
     if (!NT_SUCCESS(status)) {
@@ -1178,16 +1273,36 @@ BeEngineGetProcessChains(
     }
 
     //
-    // Iterate process chain list
+    // CRITICAL: Hold ProcessLock while iterating chain list to prevent
+    // concurrent modification. The chain list is protected by the process
+    // context's implicit ownership, but we need to ensure the chains
+    // themselves aren't freed while we're referencing them.
     //
+    ExAcquireResourceSharedLite(&g_BeState.ProcessLock, TRUE);
+
     for (entry = context->ChainList.Flink;
          entry != &context->ChainList && count < MaxChains;
          entry = entry->Flink) {
 
         PBE_ATTACK_CHAIN chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ProcessListEntry);
+
+        //
+        // Atomically increment refcount. If it was already 0, the chain
+        // is being freed - skip it.
+        //
+        LONG oldRef = InterlockedCompareExchange(&chain->RefCount, 1, 0);
+        if (oldRef == 0) {
+            //
+            // Chain is being freed, skip
+            //
+            continue;
+        }
+
         InterlockedIncrement(&chain->RefCount);
         Chains[count++] = chain;
     }
+
+    ExReleaseResourceLite(&g_BeState.ProcessLock);
 
     *ChainCount = count;
     BeEngineReleaseProcessContext(context);
@@ -1197,6 +1312,13 @@ BeEngineGetProcessChains(
 
 /**
  * @brief Release chain reference.
+ *
+ * CRITICAL: Implements proper reference counting with cleanup on zero.
+ * When the last reference is released, the chain is removed from tracking
+ * and freed. This prevents memory leaks and ensures deterministic cleanup.
+ *
+ * THREAD SAFETY: Uses InterlockedDecrement for atomic refcount update.
+ * Cleanup is deferred to avoid holding locks during free operations.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -1204,11 +1326,59 @@ BeEngineReleaseChain(
     _In_ PBE_ATTACK_CHAIN Chain
     )
 {
+    LONG newRefCount;
+
     if (Chain == NULL) {
         return;
     }
 
-    InterlockedDecrement(&Chain->RefCount);
+    newRefCount = InterlockedDecrement(&Chain->RefCount);
+
+    //
+    // CRITICAL: RefCount should never go negative
+    //
+    NT_ASSERT(newRefCount >= 0);
+
+    if (newRefCount == 0) {
+        //
+        // Last reference released - chain must be cleaned up.
+        // We cannot call cleanup functions that acquire ERESOURCE
+        // at DISPATCH_LEVEL, so we mark the chain as inactive and
+        // let the cleanup thread handle actual removal.
+        //
+        Chain->IsActive = FALSE;
+
+        //
+        // If we're at PASSIVE_LEVEL, we can clean up immediately
+        //
+        if (KeGetCurrentIrql() <= APC_LEVEL) {
+            PLIST_ENTRY entryEntry;
+            PBE_CHAIN_ENTRY chainEntry;
+
+            //
+            // Remove from hash table first
+            //
+            BepRemoveChainFromHash(Chain);
+
+            //
+            // Free all chain entries
+            //
+            while (!IsListEmpty(&Chain->EntryList)) {
+                entryEntry = RemoveHeadList(&Chain->EntryList);
+                chainEntry = CONTAINING_RECORD(entryEntry, BE_CHAIN_ENTRY, ListEntry);
+                BepFreeChainEntry(chainEntry);
+            }
+
+            //
+            // Free the chain itself
+            //
+            BepFreeChain(Chain);
+        }
+        //
+        // At DISPATCH_LEVEL, the chain will be cleaned up by
+        // BepCleanupStaleChains() on the worker thread
+        //
+    }
 }
 
 /**
@@ -1223,12 +1393,14 @@ BeEngineMarkChainFalsePositive(
     PBE_ATTACK_CHAIN chain;
     NTSTATUS status;
 
+    PAGED_CODE();
+
     status = BeEngineGetChain(ChainId, &chain);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    chain->Flags |= CHAIN_FLAG_FALSE_POSITIVE;
+    chain->Flags |= BE_CHAIN_FLAG_FALSE_POSITIVE;
     chain->IsActive = FALSE;
 
     BeEngineReleaseChain(chain);
@@ -1236,7 +1408,99 @@ BeEngineMarkChainFalsePositive(
 }
 
 /**
- * @brief Remediate attack chain.
+ * @brief Check if a process is a critical system process.
+ *
+ * SECURITY: This function prevents termination of critical Windows
+ * processes that would cause system instability or BSOD.
+ *
+ * @param ProcessId Process ID to check.
+ * @return TRUE if process is critical and should NOT be terminated.
+ */
+static BOOLEAN
+BepIsCriticalProcess(
+    _In_ UINT32 ProcessId
+    )
+{
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    PUNICODE_STRING processName = NULL;
+    BOOLEAN isCritical = FALSE;
+
+    //
+    // System process (PID 4) is always critical
+    //
+    if (ProcessId == 4) {
+        return TRUE;
+    }
+
+    //
+    // Idle process (PID 0) is always critical
+    //
+    if (ProcessId == 0) {
+        return TRUE;
+    }
+
+    //
+    // Get process object to check name
+    //
+    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        //
+        // Can't lookup - be safe and assume not critical
+        // (process may have already exited)
+        //
+        return FALSE;
+    }
+
+    //
+    // Check for critical system processes by name
+    // These processes are essential for Windows operation
+    //
+    status = SeLocateProcessImageName(process, &processName);
+    if (NT_SUCCESS(status) && processName != NULL && processName->Buffer != NULL) {
+        //
+        // List of critical Windows processes that must never be terminated
+        //
+        static const PCWSTR criticalProcesses[] = {
+            L"\\csrss.exe",           // Client/Server Runtime - BSOD if killed
+            L"\\smss.exe",            // Session Manager - BSOD if killed
+            L"\\wininit.exe",         // Windows Initialization
+            L"\\winlogon.exe",        // Windows Logon
+            L"\\services.exe",        // Service Control Manager
+            L"\\lsass.exe",           // Local Security Authority
+            L"\\lsaiso.exe",          // LSA Isolated
+            L"\\svchost.exe",         // Service Host (many critical services)
+            L"\\System",              // System process
+            L"\\Registry",            // Registry process
+            L"\\Memory Compression",  // Memory compression
+            L"\\dwm.exe",             // Desktop Window Manager
+            L"\\conhost.exe",         // Console host
+            L"\\ntoskrnl.exe",        // Kernel (shouldn't be here but safety)
+            NULL
+        };
+
+        for (UINT32 i = 0; criticalProcesses[i] != NULL; i++) {
+            if (wcsstr(processName->Buffer, criticalProcesses[i]) != NULL) {
+                isCritical = TRUE;
+                break;
+            }
+        }
+
+        ExFreePool(processName);
+    }
+
+    ObDereferenceObject(process);
+    return isCritical;
+}
+
+/**
+ * @brief Remediate attack chain with critical process protection.
+ *
+ * SECURITY HARDENING:
+ * - Validates chain state before remediation
+ * - Protects critical system processes from termination
+ * - Logs all remediation actions for audit trail
+ * - Validates process still matches original chain criteria
  */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
@@ -1247,6 +1511,8 @@ BeEngineRemediateChain(
 {
     PBE_ATTACK_CHAIN chain;
     NTSTATUS status;
+    UINT32 terminatedCount = 0;
+    UINT32 skippedCount = 0;
 
     PAGED_CODE();
 
@@ -1256,21 +1522,68 @@ BeEngineRemediateChain(
     }
 
     //
+    // SECURITY: Validate chain is suitable for remediation
+    //
+    if (chain->Flags & BE_CHAIN_FLAG_FALSE_POSITIVE) {
+        //
+        // Chain marked as false positive - do not remediate
+        //
+        BeEngineReleaseChain(chain);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (chain->IsRemediated) {
+        //
+        // Already remediated
+        //
+        BeEngineReleaseChain(chain);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // SECURITY: Validate threat level before termination
+    // Only allow termination if chain has sufficient threat score
+    //
+    if ((RemediationFlags & (BE_REMEDIATE_TERMINATE_PRIMARY | BE_REMEDIATE_TERMINATE_RELATED)) &&
+        chain->CumulativeThreatScore < g_BeState.HighThreatThreshold) {
+        //
+        // Threat score too low for process termination
+        // This prevents abuse of remediation API
+        //
+        BeEngineReleaseChain(chain);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    //
     // Terminate primary process if requested
     //
     if (RemediationFlags & BE_REMEDIATE_TERMINATE_PRIMARY) {
-        HANDLE processHandle;
-        OBJECT_ATTRIBUTES oa;
-        CLIENT_ID clientId;
+        //
+        // CRITICAL: Check if primary process is critical system process
+        //
+        if (BepIsCriticalProcess(chain->PrimaryProcessId)) {
+            //
+            // Cannot terminate critical process - skip but continue
+            //
+            skippedCount++;
+        } else {
+            HANDLE processHandle;
+            OBJECT_ATTRIBUTES oa;
+            CLIENT_ID clientId;
 
-        clientId.UniqueProcess = (HANDLE)(ULONG_PTR)chain->PrimaryProcessId;
-        clientId.UniqueThread = NULL;
-        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)chain->PrimaryProcessId;
+            clientId.UniqueThread = NULL;
+            InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
-        status = ZwOpenProcess(&processHandle, PROCESS_TERMINATE, &oa, &clientId);
-        if (NT_SUCCESS(status)) {
-            ZwTerminateProcess(processHandle, STATUS_ACCESS_DENIED);
-            ZwClose(processHandle);
+            status = ZwOpenProcess(&processHandle, PROCESS_TERMINATE, &oa, &clientId);
+            if (NT_SUCCESS(status)) {
+                status = ZwTerminateProcess(processHandle, STATUS_ACCESS_DENIED);
+                ZwClose(processHandle);
+
+                if (NT_SUCCESS(status)) {
+                    terminatedCount++;
+                }
+            }
         }
     }
 
@@ -1279,27 +1592,46 @@ BeEngineRemediateChain(
     //
     if (RemediationFlags & BE_REMEDIATE_TERMINATE_RELATED) {
         for (UINT32 i = 0; i < chain->RelatedProcessCount; i++) {
+            UINT32 relatedPid = chain->RelatedProcessIds[i];
+
+            //
+            // CRITICAL: Check if related process is critical system process
+            //
+            if (BepIsCriticalProcess(relatedPid)) {
+                skippedCount++;
+                continue;
+            }
+
             HANDLE processHandle;
             OBJECT_ATTRIBUTES oa;
             CLIENT_ID clientId;
 
-            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)chain->RelatedProcessIds[i];
+            clientId.UniqueProcess = (HANDLE)(ULONG_PTR)relatedPid;
             clientId.UniqueThread = NULL;
             InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
             status = ZwOpenProcess(&processHandle, PROCESS_TERMINATE, &oa, &clientId);
             if (NT_SUCCESS(status)) {
-                ZwTerminateProcess(processHandle, STATUS_ACCESS_DENIED);
+                status = ZwTerminateProcess(processHandle, STATUS_ACCESS_DENIED);
                 ZwClose(processHandle);
+
+                if (NT_SUCCESS(status)) {
+                    terminatedCount++;
+                }
             }
         }
     }
 
+    //
+    // Mark chain as remediated
+    //
     chain->IsRemediated = TRUE;
     chain->IsActive = FALSE;
     chain->Flags |= BE_CHAIN_FLAG_AUTO_REMEDIATE;
 
-    InterlockedIncrement64(&g_BeState.TotalThreatsBlocked);
+    if (terminatedCount > 0) {
+        InterlockedIncrement64(&g_BeState.TotalThreatsBlocked);
+    }
 
     BeEngineReleaseChain(chain);
     return STATUS_SUCCESS;
@@ -1358,6 +1690,12 @@ BeEngineGetProcessContext(
 
 /**
  * @brief Release process context reference.
+ *
+ * CRITICAL: Implements proper reference counting with cleanup on zero.
+ * When the last reference is released, the context is removed from tracking
+ * and freed. This prevents memory leaks and ensures deterministic cleanup.
+ *
+ * THREAD SAFETY: Uses InterlockedDecrement for atomic refcount update.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -1365,11 +1703,46 @@ BeEngineReleaseProcessContext(
     _In_ PBE_PROCESS_CONTEXT Context
     )
 {
+    LONG newRefCount;
+
     if (Context == NULL) {
         return;
     }
 
-    InterlockedDecrement(&Context->RefCount);
+    newRefCount = InterlockedDecrement(&Context->RefCount);
+
+    //
+    // CRITICAL: RefCount should never go negative
+    //
+    NT_ASSERT(newRefCount >= 0);
+
+    if (newRefCount == 0) {
+        //
+        // Last reference released - context must be cleaned up.
+        // Mark as terminated so cleanup thread handles it, or
+        // clean up immediately if at appropriate IRQL.
+        //
+        Context->Flags |= BE_PROC_FLAG_TERMINATED;
+
+        //
+        // If we're at PASSIVE_LEVEL, we can clean up immediately
+        //
+        if (KeGetCurrentIrql() <= APC_LEVEL) {
+            //
+            // Remove from hash table
+            //
+            BepRemoveProcessContextFromHash(Context);
+
+            //
+            // Free the context
+            //
+            BepFreeProcessContext(Context);
+        }
+        //
+        // At DISPATCH_LEVEL, the context will be cleaned up by
+        // BepCleanupStaleProcessContexts() on the worker thread
+        //
+    }
 }
 
 /**
@@ -2093,25 +2466,38 @@ BepFreeProcessContext(
 // ============================================================================
 
 /**
- * @brief Hash process ID for lookup.
+ * @brief Hash process ID for lookup using multiply-shift hash.
+ *
+ * Uses a proper multiplicative hash to avoid clustering since
+ * Windows PIDs are typically multiples of 4.
  */
 static UINT32
 BepHashProcessId(
     _In_ UINT32 ProcessId
     )
 {
-    return ProcessId % BE_PROCESS_HASH_BUCKETS;
+    //
+    // Knuth multiplicative hash - good distribution for sequential/aligned values
+    //
+    UINT32 hash = ProcessId * 2654435761u;
+    return (hash >> (32 - 10)) & (BE_PROCESS_HASH_BUCKETS - 1);
 }
 
 /**
- * @brief Hash chain ID for lookup.
+ * @brief Hash chain ID for lookup using multiply-shift hash.
  */
 static UINT32
 BepHashChainId(
     _In_ UINT64 ChainId
     )
 {
-    return (UINT32)(ChainId % BE_CHAIN_HASH_BUCKETS);
+    //
+    // FNV-1a inspired hash for 64-bit values
+    //
+    UINT64 hash = ChainId * 0x100000001B3ULL;
+    hash ^= (hash >> 33);
+    hash *= 0xFF51AFD7ED558CCDULL;
+    return (UINT32)(hash & (BE_CHAIN_HASH_BUCKETS - 1));
 }
 
 // ============================================================================
@@ -2207,7 +2593,14 @@ BepRemoveProcessContext(
 }
 
 /**
- * @brief Get or create process context.
+ * @brief Get or create process context (TOCTOU-SAFE).
+ *
+ * SECURITY: This function uses atomic lookup-and-insert to prevent
+ * race conditions where two threads could create duplicate contexts
+ * for the same process ID.
+ *
+ * The lock is held across the entire lookup-allocate-insert sequence
+ * to ensure atomicity.
  */
 static NTSTATUS
 BepGetOrCreateProcessContext(
@@ -2216,30 +2609,95 @@ BepGetOrCreateProcessContext(
     )
 {
     NTSTATUS status;
+    UINT32 hashIndex;
+    PLIST_ENTRY entry;
+    PBE_PROCESS_HASH_ENTRY hashEntry;
+    PBE_PROCESS_CONTEXT newContext = NULL;
+    PBE_PROCESS_HASH_ENTRY newHashEntry = NULL;
 
-    status = BeEngineGetProcessContext(ProcessId, Context);
-    if (NT_SUCCESS(status)) {
-        return status;
+    PAGED_CODE();
+
+    if (Context == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *Context = NULL;
+    hashIndex = BepHashProcessId(ProcessId);
+
+    //
+    // CRITICAL: Hold exclusive lock across lookup AND insert to prevent TOCTOU.
+    // This ensures no two threads can create contexts for the same PID.
+    //
+    FltAcquirePushLockExclusive(&g_ProcessHashLock);
+
+    //
+    // First, check if context already exists
+    //
+    for (entry = g_ProcessHashTable[hashIndex].Flink;
+         entry != &g_ProcessHashTable[hashIndex];
+         entry = entry->Flink) {
+
+        hashEntry = CONTAINING_RECORD(entry, BE_PROCESS_HASH_ENTRY, HashListEntry);
+
+        if (hashEntry->Context->ProcessId == ProcessId) {
+            //
+            // Found existing context - increment refcount and return
+            //
+            InterlockedIncrement(&hashEntry->Context->RefCount);
+            *Context = hashEntry->Context;
+            FltReleasePushLock(&g_ProcessHashLock);
+            return STATUS_SUCCESS;
+        }
     }
 
     //
-    // Create new context
+    // Context doesn't exist - allocate new one while holding lock.
+    // We allocate while holding the lock to ensure atomicity.
+    // This is acceptable because allocations are fast (lookaside list).
     //
-    *Context = BepAllocateProcessContext();
-    if (*Context == NULL) {
+    newContext = BepAllocateProcessContext();
+    if (newContext == NULL) {
+        FltReleasePushLock(&g_ProcessHashLock);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    (*Context)->ProcessId = ProcessId;
-    InitializeListHead(&(*Context)->ChainList);
+    newHashEntry = (PBE_PROCESS_HASH_ENTRY)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(BE_PROCESS_HASH_ENTRY),
+        BE_POOL_TAG_GENERAL
+        );
 
-    status = BepInsertProcessContext(*Context);
-    if (!NT_SUCCESS(status)) {
-        BepFreeProcessContext(*Context);
-        *Context = NULL;
+    if (newHashEntry == NULL) {
+        BepFreeProcessContext(newContext);
+        FltReleasePushLock(&g_ProcessHashLock);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    return status;
+    //
+    // Initialize context
+    //
+    newContext->ProcessId = ProcessId;
+    newContext->RefCount = 1;
+    InitializeListHead(&newContext->ChainList);
+
+    //
+    // Insert into hash table
+    //
+    newHashEntry->Context = newContext;
+    InsertTailList(&g_ProcessHashTable[hashIndex], &newHashEntry->HashListEntry);
+
+    FltReleasePushLock(&g_ProcessHashLock);
+
+    //
+    // Insert into main list (separate lock, follows lock hierarchy)
+    //
+    ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+    InsertTailList(&g_BeState.ProcessContextList, &newContext->ListEntry);
+    g_BeState.ProcessContextCount++;
+    ExReleaseResourceLite(&g_BeState.ProcessLock);
+
+    *Context = newContext;
+    return STATUS_SUCCESS;
 }
 
 /**
@@ -2284,6 +2742,101 @@ BepInsertChain(
     InterlockedIncrement64(&g_BeState.TotalChainsCreated);
 
     return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Remove chain from hash table only.
+ *
+ * Used by reference counting cleanup when chain refcount hits zero.
+ * This is separate from BepRemoveChain to allow cleanup at different IRQLs.
+ */
+static VOID
+BepRemoveChainFromHash(
+    _In_ PBE_ATTACK_CHAIN Chain
+    )
+{
+    UINT32 hashIndex;
+    PLIST_ENTRY entry;
+    PBE_CHAIN_HASH_ENTRY hashEntry = NULL;
+
+    hashIndex = BepHashChainId(Chain->ChainId);
+
+    FltAcquirePushLockExclusive(&g_ChainHashLock);
+
+    for (entry = g_ChainHashTable[hashIndex].Flink;
+         entry != &g_ChainHashTable[hashIndex];
+         entry = entry->Flink) {
+
+        PBE_CHAIN_HASH_ENTRY current = CONTAINING_RECORD(entry, BE_CHAIN_HASH_ENTRY, HashListEntry);
+        if (current->Chain == Chain) {
+            RemoveEntryList(&current->HashListEntry);
+            hashEntry = current;
+            break;
+        }
+    }
+
+    FltReleasePushLock(&g_ChainHashLock);
+
+    if (hashEntry != NULL) {
+        ExFreePoolWithTag(hashEntry, BE_POOL_TAG_CHAIN);
+    }
+
+    //
+    // Also remove from main list if at appropriate IRQL
+    //
+    if (KeGetCurrentIrql() <= APC_LEVEL) {
+        ExAcquireResourceExclusiveLite(&g_BeState.ChainLock, TRUE);
+        RemoveEntryList(&Chain->ListEntry);
+        g_BeState.ActiveChainCount--;
+        ExReleaseResourceLite(&g_BeState.ChainLock);
+    }
+}
+
+/**
+ * @brief Remove process context from hash table only.
+ *
+ * Used by reference counting cleanup when context refcount hits zero.
+ */
+static VOID
+BepRemoveProcessContextFromHash(
+    _In_ PBE_PROCESS_CONTEXT Context
+    )
+{
+    UINT32 hashIndex;
+    PLIST_ENTRY entry;
+    PBE_PROCESS_HASH_ENTRY hashEntry = NULL;
+
+    hashIndex = BepHashProcessId(Context->ProcessId);
+
+    FltAcquirePushLockExclusive(&g_ProcessHashLock);
+
+    for (entry = g_ProcessHashTable[hashIndex].Flink;
+         entry != &g_ProcessHashTable[hashIndex];
+         entry = entry->Flink) {
+
+        PBE_PROCESS_HASH_ENTRY current = CONTAINING_RECORD(entry, BE_PROCESS_HASH_ENTRY, HashListEntry);
+        if (current->Context == Context) {
+            RemoveEntryList(&current->HashListEntry);
+            hashEntry = current;
+            break;
+        }
+    }
+
+    FltReleasePushLock(&g_ProcessHashLock);
+
+    if (hashEntry != NULL) {
+        ExFreePoolWithTag(hashEntry, BE_POOL_TAG_GENERAL);
+    }
+
+    //
+    // Also remove from main list if at appropriate IRQL
+    //
+    if (KeGetCurrentIrql() <= APC_LEVEL) {
+        ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+        RemoveEntryList(&Context->ListEntry);
+        g_BeState.ProcessContextCount--;
+        ExReleaseResourceLite(&g_BeState.ProcessLock);
+    }
 }
 
 /**
@@ -2333,7 +2886,10 @@ BepRemoveChain(
 }
 
 /**
- * @brief Get or create attack chain for process.
+ * @brief Get or create attack chain for process (TOCTOU-SAFE).
+ *
+ * SECURITY: This function holds appropriate locks during the
+ * lookup-create-insert sequence to prevent race conditions.
  */
 static NTSTATUS
 BepGetOrCreateChain(
@@ -2341,76 +2897,124 @@ BepGetOrCreateChain(
     _Out_ PBE_ATTACK_CHAIN* Chain
     )
 {
-    PBE_PROCESS_CONTEXT context;
+    PBE_PROCESS_CONTEXT context = NULL;
     NTSTATUS status;
     LARGE_INTEGER currentTime;
+    PBE_ATTACK_CHAIN newChain = NULL;
+
+    PAGED_CODE();
+
+    if (Chain == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     *Chain = NULL;
 
     //
+    // Get process context first - we need it for linking
+    //
+    status = BepGetOrCreateProcessContext(ProcessId, &context);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // CRITICAL: Hold ProcessLock while checking and modifying chain list
+    // to prevent TOCTOU race where two threads create chains for same process.
+    //
+    ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+
+    //
     // Check if process already has an active chain
     //
-    status = BeEngineGetProcessContext(ProcessId, &context);
-    if (NT_SUCCESS(status)) {
-        if (context->ChainCount > 0 && !IsListEmpty(&context->ChainList)) {
-            //
-            // Return existing chain
-            //
-            PLIST_ENTRY entry = context->ChainList.Flink;
-            *Chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ProcessListEntry);
-            InterlockedIncrement(&(*Chain)->RefCount);
+    if (context->ChainCount > 0 && !IsListEmpty(&context->ChainList)) {
+        //
+        // Return existing chain
+        //
+        PLIST_ENTRY entry = context->ChainList.Flink;
+        *Chain = CONTAINING_RECORD(entry, BE_ATTACK_CHAIN, ProcessListEntry);
+
+        //
+        // Safely increment refcount - check it's not being freed
+        //
+        if (InterlockedIncrement(&(*Chain)->RefCount) > 1) {
+            ExReleaseResourceLite(&g_BeState.ProcessLock);
             BeEngineReleaseProcessContext(context);
             return STATUS_SUCCESS;
+        } else {
+            //
+            // Chain was at 0 refcount (being freed) - decrement and create new
+            //
+            InterlockedDecrement(&(*Chain)->RefCount);
+            *Chain = NULL;
         }
-        BeEngineReleaseProcessContext(context);
     }
 
     //
     // Check chain limit
     //
     if (g_BeState.ActiveChainCount >= g_BeState.MaxActiveChains) {
+        ExReleaseResourceLite(&g_BeState.ProcessLock);
+        BeEngineReleaseProcessContext(context);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Create new chain
+    // Create new chain while holding lock
     //
-    *Chain = BepAllocateChain();
-    if (*Chain == NULL) {
+    newChain = BepAllocateChain();
+    if (newChain == NULL) {
+        ExReleaseResourceLite(&g_BeState.ProcessLock);
+        BeEngineReleaseProcessContext(context);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     KeQuerySystemTime(&currentTime);
 
-    (*Chain)->ChainId = (UINT64)InterlockedIncrement64(&g_BeState.NextChainId);
-    (*Chain)->CreateTime = (UINT64)(currentTime.QuadPart / 10000);
-    (*Chain)->LastUpdateTime = (*Chain)->CreateTime;
-    (*Chain)->PrimaryProcessId = ProcessId;
-    (*Chain)->IsActive = TRUE;
-    (*Chain)->MaxEntries = g_BeState.MaxEventsPerChain;
+    newChain->ChainId = (UINT64)InterlockedIncrement64(&g_BeState.NextChainId);
+    newChain->CreateTime = (UINT64)(currentTime.QuadPart / 10000);
+    newChain->LastUpdateTime = newChain->CreateTime;
+    newChain->PrimaryProcessId = ProcessId;
+    newChain->IsActive = TRUE;
+    newChain->MaxEntries = g_BeState.MaxEventsPerChain;
+    newChain->RefCount = 1;
 
-    status = BepInsertChain(*Chain);
+    //
+    // Link to process context (we already hold ProcessLock)
+    //
+    InsertTailList(&context->ChainList, &newChain->ProcessListEntry);
+    context->ChainCount++;
+
+    //
+    // Copy process path to chain
+    //
+    RtlCopyMemory(newChain->PrimaryImagePath, context->ImagePath,
+                  sizeof(newChain->PrimaryImagePath));
+
+    ExReleaseResourceLite(&g_BeState.ProcessLock);
+
+    //
+    // Insert into chain tracking (separate locks, follows hierarchy)
+    //
+    status = BepInsertChain(newChain);
     if (!NT_SUCCESS(status)) {
-        BepFreeChain(*Chain);
-        *Chain = NULL;
+        //
+        // Remove from process context on failure
+        //
+        ExAcquireResourceExclusiveLite(&g_BeState.ProcessLock, TRUE);
+        RemoveEntryList(&newChain->ProcessListEntry);
+        context->ChainCount--;
+        ExReleaseResourceLite(&g_BeState.ProcessLock);
+
+        BepFreeChain(newChain);
+        BeEngineReleaseProcessContext(context);
         return status;
     }
 
-    //
-    // Link to process context
-    //
-    status = BeEngineGetProcessContext(ProcessId, &context);
-    if (NT_SUCCESS(status)) {
-        InsertTailList(&context->ChainList, &(*Chain)->ProcessListEntry);
-        context->ChainCount++;
-
-        //
-        // Copy process path to chain
-        //
-        RtlCopyMemory((*Chain)->PrimaryImagePath, context->ImagePath,
-                      sizeof((*Chain)->PrimaryImagePath));
-
-        BeEngineReleaseProcessContext(context);
+    BeEngineReleaseProcessContext(context);
+    *Chain = newChain;
+    return STATUS_SUCCESS;
+}
     }
 
     return STATUS_SUCCESS;

@@ -15,30 +15,16 @@
  * - Automatic attack chain creation and merging
  * - Alert callback for confirmed attacks
  * - Evidence collection and preservation
+ * - Reference-counted chain objects for thread-safe lifetime
+ * - Periodic cleanup of expired chains
  *
- * Kill Chain Phases (Lockheed Martin Cyber Kill Chain + MITRE):
- * 1. Reconnaissance
- * 2. Initial Access
- * 3. Execution
- * 4. Persistence
- * 5. Privilege Escalation
- * 6. Defense Evasion
- * 7. Credential Access
- * 8. Discovery
- * 9. Lateral Movement
- * 10. Collection
- * 11. Exfiltration
- * 12. Impact
- *
- * Detection Strategy:
- * - Single suspicious events create new chains
- * - Related events (same process tree) join existing chains
- * - Chains advance through phases as techniques are observed
- * - High-confidence attacks trigger alerts when multiple phases detected
- * - Chains expire after inactivity timeout
+ * Lock Ordering (must be acquired in this order to prevent deadlock):
+ * 1. Tracker->ChainLock (push lock)
+ * 2. Chain->EventLock (spinlock)
+ * 3. Tracker->CallbackLock (spinlock)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition - Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -49,7 +35,11 @@
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ActInitialize)
 #pragma alloc_text(PAGE, ActShutdown)
-#pragma alloc_text(PAGE, ActFreeChain)
+#pragma alloc_text(PAGE, ActRegisterCallback)
+#pragma alloc_text(PAGE, ActUnregisterCallback)
+#pragma alloc_text(PAGE, ActGetChain)
+#pragma alloc_text(PAGE, ActCorrelateEvents)
+#pragma alloc_text(PAGE, ActGetActiveChains)
 #endif
 
 // ============================================================================
@@ -59,12 +49,12 @@
 /**
  * @brief Chain expiration time (30 minutes in 100ns units)
  */
-#define ACT_CHAIN_EXPIRY_TIME           (30LL * 60 * 10000000)
+#define ACT_CHAIN_EXPIRY_TIME           (30LL * 60 * 10000000LL)
 
 /**
- * @brief Event correlation window (5 minutes in 100ns units)
+ * @brief Cleanup timer interval (5 minutes in 100ns units, negative = relative)
  */
-#define ACT_CORRELATION_WINDOW          (5LL * 60 * 10000000)
+#define ACT_CLEANUP_INTERVAL            (-5LL * 60 * 10000000LL)
 
 /**
  * @brief Minimum score to confirm attack
@@ -75,16 +65,6 @@
  * @brief Minimum phases for confirmed attack
  */
 #define ACT_MIN_PHASES_FOR_CONFIRM      3
-
-/**
- * @brief Pool tag for chain allocations
- */
-#define ACT_CHAIN_TAG                   'hCAA'
-
-/**
- * @brief Pool tag for event allocations
- */
-#define ACT_EVENT_TAG                   'eCAA'
 
 // ============================================================================
 // TECHNIQUE TO PHASE MAPPING
@@ -220,6 +200,7 @@ typedef struct _ACT_DANGEROUS_COMBO {
     ULONG Technique1;
     ULONG Technique2;
     ULONG BonusScore;           // Extra score when both techniques seen
+    ULONG ComboIndex;           // Index for bitmask tracking (0-31)
     PCSTR Description;
 } ACT_DANGEROUS_COMBO;
 
@@ -227,116 +208,213 @@ static const ACT_DANGEROUS_COMBO g_DangerousCombos[] = {
     //
     // Credential dumping + Lateral movement = Active breach
     //
-    { MITRE_T1003 & 0xFFFF, MITRE_T1021 & 0xFFFF, 100, "Credential theft with lateral movement" },
+    { MITRE_T1003 & 0xFFFF, MITRE_T1021 & 0xFFFF, 100, 0, "Credential theft with lateral movement" },
 
     //
     // Defense evasion + Process injection = Stealthy code execution
     //
-    { MITRE_T1562 & 0xFFFF, MITRE_T1055 & 0xFFFF, 80, "Defense evasion with process injection" },
+    { MITRE_T1562 & 0xFFFF, MITRE_T1055 & 0xFFFF, 80, 1, "Defense evasion with process injection" },
 
     //
     // Persistence + Privilege escalation = Entrenched attacker
     //
-    { MITRE_T1547 & 0xFFFF, MITRE_T1548 & 0xFFFF, 70, "Persistence with privilege escalation" },
+    { MITRE_T1547 & 0xFFFF, MITRE_T1548 & 0xFFFF, 70, 2, "Persistence with privilege escalation" },
 
     //
     // Collection + Exfiltration = Data theft in progress
     //
-    { MITRE_T1560 & 0xFFFF, MITRE_T1041 & 0xFFFF, 90, "Data archiving with exfiltration" },
+    { MITRE_T1560 & 0xFFFF, MITRE_T1041 & 0xFFFF, 90, 3, "Data archiving with exfiltration" },
 
     //
     // Ransomware indicators
     //
-    { MITRE_T1486 & 0xFFFF, MITRE_T1490 & 0xFFFF, 150, "Ransomware with recovery inhibition" },
+    { MITRE_T1486 & 0xFFFF, MITRE_T1490 & 0xFFFF, 150, 4, "Ransomware with recovery inhibition" },
 
     //
     // End marker
     //
-    { 0, 0, 0, NULL }
+    { 0, 0, 0, 0, NULL }
 };
 
 // ============================================================================
 // PRIVATE FUNCTION PROTOTYPES
 // ============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static ACT_CHAIN_STATE
 ActpGetPhaseForTechnique(
     _In_ ULONG TechniqueId,
     _Out_ PULONG BaseScore
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static PACT_ATTACK_CHAIN
-ActpFindChainForProcess(
+ActpFindChainForProcessLocked(
     _In_ PACT_TRACKER Tracker,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 static PACT_ATTACK_CHAIN
 ActpCreateChain(
-    _In_ PACT_TRACKER Tracker,
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING ProcessName
+    _In_opt_ PUNICODE_STRING ProcessName
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 static PACT_CHAIN_EVENT
 ActpCreateEvent(
     _In_ ULONG TechniqueId,
     _In_ ACT_CHAIN_STATE Phase,
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING ProcessName,
+    _In_opt_ PUNICODE_STRING ProcessName,
     _In_ ULONG Score,
-    _In_opt_ PVOID Evidence,
+    _In_reads_bytes_opt_(EvidenceSize) PVOID Evidence,
     _In_ SIZE_T EvidenceSize
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 ActpFreeEvent(
     _In_ PACT_CHAIN_EVENT Event
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpAddEventToChain(
+ActpFreeChainInternal(
+    _In_ PACT_ATTACK_CHAIN Chain
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+ActpAddEventToChainLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
-    _In_ PACT_CHAIN_EVENT Event
+    _In_ PACT_CHAIN_EVENT Event,
+    _Out_opt_ PACT_CHAIN_EVENT* EvictedEvent
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpUpdateChainScore(
+ActpUpdateChainScoreLocked(
     _In_ PACT_ATTACK_CHAIN Chain
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
-ActpIsChainExpired(
+ActpIsChainExpiredLocked(
     _In_ PACT_ATTACK_CHAIN Chain
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpAddRelatedProcess(
+ActpAddRelatedProcessLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
-ActpIsProcessRelated(
+ActpIsProcessRelatedLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static ULONG
-ActpCountPhases(
+ActpCountPhasesLocked(
     _In_ PACT_ATTACK_CHAIN Chain
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpCheckDangerousCombos(
+ActpCheckDangerousCombosLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
     _In_ ULONG NewTechnique
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 ActpGenerateChainId(
     _Out_ PGUID ChainId
     );
+
+KDEFERRED_ROUTINE ActpCleanupTimerDpc;
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static ULONG
+ActpSaturatingAdd(
+    _In_ ULONG Value,
+    _In_ ULONG Addend
+    );
+
+// ============================================================================
+// INLINE UTILITIES
+// ============================================================================
+
+/**
+ * @brief Saturating addition for ULONG - prevents overflow
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static ULONG
+ActpSaturatingAdd(
+    _In_ ULONG Value,
+    _In_ ULONG Addend
+    )
+{
+    if (Value > MAXULONG - Addend) {
+        return MAXULONG;
+    }
+    return Value + Addend;
+}
+
+// ============================================================================
+// PUBLIC API - REFERENCE COUNTING
+// ============================================================================
+
+/**
+ * @brief Add a reference to a chain.
+ *
+ * @param Chain   Chain to reference.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ActReferenceChain(
+    _In_ PACT_ATTACK_CHAIN Chain
+    )
+{
+    if (Chain != NULL) {
+        LONG newCount = InterlockedIncrement(&Chain->ReferenceCount);
+        NT_ASSERT(newCount > 1);
+        UNREFERENCED_PARAMETER(newCount);
+    }
+}
+
+/**
+ * @brief Release a reference to a chain. Frees when count reaches zero.
+ *
+ * @param Chain   Chain to release.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+ActReleaseChain(
+    _In_ PACT_ATTACK_CHAIN Chain
+    )
+{
+    if (Chain != NULL) {
+        LONG newCount = InterlockedDecrement(&Chain->ReferenceCount);
+        NT_ASSERT(newCount >= 0);
+
+        if (newCount == 0) {
+            ActpFreeChainInternal(Chain);
+        }
+    }
+}
 
 // ============================================================================
 // PUBLIC API - INITIALIZATION
@@ -358,6 +436,7 @@ ActInitialize(
     )
 {
     PACT_TRACKER tracker = NULL;
+    LARGE_INTEGER dueTime;
 
     PAGED_CODE();
 
@@ -368,7 +447,7 @@ ActInitialize(
     *Tracker = NULL;
 
     //
-    // Allocate tracker structure
+    // Allocate tracker structure from NonPagedPoolNx
     //
     tracker = (PACT_TRACKER)ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -388,16 +467,34 @@ ActInitialize(
     tracker->ChainCount = 0;
 
     //
-    // Initialize rule list
+    // Initialize callback registration
     //
-    InitializeListHead(&tracker->RuleList);
+    tracker->CallbackReg = NULL;
+    KeInitializeSpinLock(&tracker->CallbackLock);
+
+    //
+    // Initialize cleanup timer
+    //
+    KeInitializeTimer(&tracker->CleanupTimer);
+    KeInitializeDpc(&tracker->CleanupDpc, ActpCleanupTimerDpc, tracker);
+    tracker->CleanupRunning = 0;
 
     //
     // Initialize statistics
     //
     KeQuerySystemTime(&tracker->Stats.StartTime);
 
-    tracker->Initialized = TRUE;
+    //
+    // Mark as initialized (must be last before starting timer)
+    //
+    InterlockedExchange(&tracker->Initialized, TRUE);
+
+    //
+    // Start cleanup timer
+    //
+    dueTime.QuadPart = ACT_CLEANUP_INTERVAL;
+    KeSetTimerEx(&tracker->CleanupTimer, dueTime, 5 * 60 * 1000, &tracker->CleanupDpc);
+
     *Tracker = tracker;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -422,6 +519,8 @@ ActShutdown(
     PLIST_ENTRY listEntry;
     PACT_ATTACK_CHAIN chain;
     LIST_ENTRY tempList;
+    PACT_CALLBACK_REGISTRATION oldReg;
+    KIRQL oldIrql;
 
     PAGED_CODE();
 
@@ -429,22 +528,40 @@ ActShutdown(
         return;
     }
 
-    if (!Tracker->Initialized) {
+    if (InterlockedExchange(&Tracker->Initialized, FALSE) == FALSE) {
         return;
     }
 
-    Tracker->Initialized = FALSE;
+    //
+    // Cancel and wait for cleanup timer
+    //
+    KeCancelTimer(&Tracker->CleanupTimer);
+    KeFlushQueuedDpcs();
+
+    //
+    // Clear callback registration
+    //
+    KeAcquireSpinLock(&Tracker->CallbackLock, &oldIrql);
+    oldReg = Tracker->CallbackReg;
+    Tracker->CallbackReg = NULL;
+    KeReleaseSpinLock(&Tracker->CallbackLock, oldIrql);
+
+    if (oldReg != NULL) {
+        ExFreePoolWithTag(oldReg, ACT_CALLBACK_TAG);
+    }
 
     InitializeListHead(&tempList);
 
     //
-    // Move all chains to temp list
+    // Move all chains to temp list under exclusive lock
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Tracker->ChainLock);
 
     while (!IsListEmpty(&Tracker->ChainList)) {
         listEntry = RemoveHeadList(&Tracker->ChainList);
+        chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
+        InitializeListHead(&chain->ListEntry);
         InsertTailList(&tempList, listEntry);
     }
 
@@ -454,26 +571,43 @@ ActShutdown(
     KeLeaveCriticalRegion();
 
     //
-    // Free chains outside lock
+    // Release references on all chains (will free when refcount hits zero)
     //
     while (!IsListEmpty(&tempList)) {
         listEntry = RemoveHeadList(&tempList);
         chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
-        ActFreeChain(chain);
+        InitializeListHead(&chain->ListEntry);
+        ActReleaseChain(chain);
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Attack chain tracker shutdown (events=%lld, chains=%lld, attacks=%lld)\n",
+               "[ShadowStrike] Attack chain tracker shutdown (events=%lld, chains=%lld, expired=%lld, attacks=%lld)\n",
                Tracker->Stats.EventsProcessed,
                Tracker->Stats.ChainsCreated,
+               Tracker->Stats.ChainsExpired,
                Tracker->Stats.AttacksConfirmed);
 
     ExFreePoolWithTag(Tracker, ACT_POOL_TAG);
 }
 
+// ============================================================================
+// PUBLIC API - CALLBACK REGISTRATION
+// ============================================================================
+
 /**
  * @brief Register callback for attack alerts.
+ *
+ * Thread-safe atomic registration. Previous callback (if any) is replaced.
+ *
+ * @param Tracker   Tracker handle.
+ * @param Callback  Callback function.
+ * @param Context   User context passed to callback.
+ * @return STATUS_SUCCESS on success.
+ *
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ActRegisterCallback(
     _In_ PACT_TRACKER Tracker,
@@ -481,6 +615,12 @@ ActRegisterCallback(
     _In_opt_ PVOID Context
     )
 {
+    PACT_CALLBACK_REGISTRATION newReg;
+    PACT_CALLBACK_REGISTRATION oldReg;
+    KIRQL oldIrql;
+
+    PAGED_CODE();
+
     if (Tracker == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -489,10 +629,70 @@ ActRegisterCallback(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    Tracker->AlertCallback = Callback;
-    Tracker->CallbackContext = Context;
+    //
+    // Allocate new registration structure
+    //
+    newReg = (PACT_CALLBACK_REGISTRATION)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        sizeof(ACT_CALLBACK_REGISTRATION),
+        ACT_CALLBACK_TAG
+    );
+
+    if (newReg == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    newReg->Callback = (PVOID)Callback;
+    newReg->Context = Context;
+
+    //
+    // Atomically swap in new registration
+    //
+    KeAcquireSpinLock(&Tracker->CallbackLock, &oldIrql);
+    oldReg = Tracker->CallbackReg;
+    Tracker->CallbackReg = newReg;
+    KeReleaseSpinLock(&Tracker->CallbackLock, oldIrql);
+
+    //
+    // Free old registration if any
+    //
+    if (oldReg != NULL) {
+        ExFreePoolWithTag(oldReg, ACT_CALLBACK_TAG);
+    }
 
     return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Unregister the current callback.
+ *
+ * @param Tracker   Tracker handle.
+ *
+ * @irql <= APC_LEVEL
+ */
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ActUnregisterCallback(
+    _In_ PACT_TRACKER Tracker
+    )
+{
+    PACT_CALLBACK_REGISTRATION oldReg;
+    KIRQL oldIrql;
+
+    PAGED_CODE();
+
+    if (Tracker == NULL) {
+        return;
+    }
+
+    KeAcquireSpinLock(&Tracker->CallbackLock, &oldIrql);
+    oldReg = Tracker->CallbackReg;
+    Tracker->CallbackReg = NULL;
+    KeReleaseSpinLock(&Tracker->CallbackLock, oldIrql);
+
+    if (oldReg != NULL) {
+        ExFreePoolWithTag(oldReg, ACT_CALLBACK_TAG);
+    }
 }
 
 // ============================================================================
@@ -505,30 +705,37 @@ ActRegisterCallback(
  * @param Tracker       Tracker handle.
  * @param Technique     MITRE technique ID.
  * @param ProcessId     Process that triggered the event.
- * @param ProcessName   Process name.
- * @param Evidence      Optional evidence data.
+ * @param ProcessName   Process name (optional, kernel buffer only).
+ * @param Evidence      Optional evidence data (kernel buffer only).
  * @param EvidenceSize  Size of evidence.
  * @return STATUS_SUCCESS on success.
  *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ActSubmitEvent(
     _In_ PACT_TRACKER Tracker,
     _In_ ULONG Technique,
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING ProcessName,
-    _In_opt_ PVOID Evidence,
+    _In_opt_ PUNICODE_STRING ProcessName,
+    _In_reads_bytes_opt_(EvidenceSize) PVOID Evidence,
     _In_ SIZE_T EvidenceSize
     )
 {
     PACT_ATTACK_CHAIN chain = NULL;
     PACT_CHAIN_EVENT event = NULL;
+    PACT_CHAIN_EVENT evictedEvent = NULL;
     ACT_CHAIN_STATE phase;
     ULONG baseScore = 0;
     BOOLEAN newChain = FALSE;
     BOOLEAN confirmedAttack = FALSE;
+    KIRQL eventIrql;
+    ACT_CHAIN_CALLBACK callback = NULL;
+    PVOID callbackContext = NULL;
+    PACT_CALLBACK_REGISTRATION callbackReg;
+    KIRQL callbackIrql;
 
     if (Tracker == NULL || ProcessId == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -536,6 +743,31 @@ ActSubmitEvent(
 
     if (!Tracker->Initialized) {
         return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Validate ProcessName if provided
+    //
+    if (ProcessName != NULL) {
+        if (ProcessName->Buffer == NULL && ProcessName->Length > 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (ProcessName->Length > ACT_MAX_PROCESS_NAME_LEN) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    //
+    // Validate Evidence
+    //
+    if (Evidence != NULL && EvidenceSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Evidence == NULL && EvidenceSize > 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (EvidenceSize > ACT_MAX_EVIDENCE_SIZE) {
+        return STATUS_INVALID_PARAMETER;
     }
 
     InterlockedIncrement64(&Tracker->Stats.EventsProcessed);
@@ -559,20 +791,18 @@ ActSubmitEvent(
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Tracker->ChainLock);
 
-    chain = ActpFindChainForProcess(Tracker, ProcessId);
+    chain = ActpFindChainForProcessLocked(Tracker, ProcessId);
 
     if (chain == NULL) {
         //
-        // Check if we can find a chain for a related process
-        // (This would require process tree tracking - simplified here)
-        //
-
-        //
-        // Create new chain
+        // Create new chain if under limit
         //
         if ((ULONG)Tracker->ChainCount < ACT_MAX_ACTIVE_CHAINS) {
-            chain = ActpCreateChain(Tracker, ProcessId, ProcessName);
+            chain = ActpCreateChain(ProcessId, ProcessName);
             if (chain != NULL) {
+                //
+                // Chain starts with refcount = 1 (for tracker list)
+                //
                 InsertHeadList(&Tracker->ChainList, &chain->ListEntry);
                 InterlockedIncrement(&Tracker->ChainCount);
                 InterlockedIncrement64(&Tracker->Stats.ChainsCreated);
@@ -586,6 +816,14 @@ ActSubmitEvent(
         KeLeaveCriticalRegion();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    //
+    // Take reference for our use (separate from tracker list reference)
+    //
+    ActReferenceChain(chain);
+
+    ExReleasePushLockExclusive(&Tracker->ChainLock);
+    KeLeaveCriticalRegion();
 
     //
     // Create event
@@ -602,24 +840,33 @@ ActSubmitEvent(
 
     if (event == NULL) {
         if (newChain) {
+            //
+            // Remove the chain we just added
+            //
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(&Tracker->ChainLock);
             RemoveEntryList(&chain->ListEntry);
+            InitializeListHead(&chain->ListEntry);
             InterlockedDecrement(&Tracker->ChainCount);
-            ActFreeChain(chain);
+            ExReleasePushLockExclusive(&Tracker->ChainLock);
+            KeLeaveCriticalRegion();
+
+            //
+            // Release tracker's reference (will free since refcount becomes 1->0 after our release)
+            //
+            ActReleaseChain(chain);
         }
-        ExReleasePushLockExclusive(&Tracker->ChainLock);
-        KeLeaveCriticalRegion();
+        ActReleaseChain(chain);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Add event to chain
+    // Add event to chain under EventLock
     //
-    ActpAddEventToChain(chain, event);
+    KeAcquireSpinLock(&chain->EventLock, &eventIrql);
 
-    //
-    // Add process to related list
-    //
-    ActpAddRelatedProcess(chain, ProcessId);
+    ActpAddEventToChainLocked(chain, event, &evictedEvent);
+    ActpAddRelatedProcessLocked(chain, ProcessId);
 
     //
     // Update chain state
@@ -629,20 +876,25 @@ ActSubmitEvent(
     }
 
     //
+    // Update last activity time
+    //
+    KeQuerySystemTime(&chain->LastActivityTime);
+
+    //
     // Check for dangerous technique combinations
     //
-    ActpCheckDangerousCombos(chain, Technique);
+    ActpCheckDangerousCombosLocked(chain, Technique);
 
     //
     // Update chain score
     //
-    ActpUpdateChainScore(chain);
+    ActpUpdateChainScoreLocked(chain);
 
     //
     // Check if attack is now confirmed
     //
     if (!chain->IsConfirmedAttack) {
-        ULONG phaseCount = ActpCountPhases(chain);
+        ULONG phaseCount = ActpCountPhasesLocked(chain);
 
         if (chain->ThreatScore >= ACT_CONFIRM_THRESHOLD &&
             phaseCount >= ACT_MIN_PHASES_FOR_CONFIRM) {
@@ -660,15 +912,39 @@ ActSubmitEvent(
         }
     }
 
-    ExReleasePushLockExclusive(&Tracker->ChainLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&chain->EventLock, eventIrql);
 
     //
-    // Fire callback if attack confirmed or chain updated significantly
+    // Free evicted event outside lock
     //
-    if (confirmedAttack && Tracker->AlertCallback != NULL) {
-        Tracker->AlertCallback(chain, event, Tracker->CallbackContext);
+    if (evictedEvent != NULL) {
+        ActpFreeEvent(evictedEvent);
     }
+
+    //
+    // Get callback atomically
+    //
+    if (confirmedAttack) {
+        KeAcquireSpinLock(&Tracker->CallbackLock, &callbackIrql);
+        callbackReg = Tracker->CallbackReg;
+        if (callbackReg != NULL) {
+            callback = (ACT_CHAIN_CALLBACK)callbackReg->Callback;
+            callbackContext = callbackReg->Context;
+        }
+        KeReleaseSpinLock(&Tracker->CallbackLock, callbackIrql);
+
+        //
+        // Fire callback with chain reference held
+        //
+        if (callback != NULL) {
+            callback(chain, event, callbackContext);
+        }
+    }
+
+    //
+    // Release our reference
+    //
+    ActReleaseChain(chain);
 
     return STATUS_SUCCESS;
 }
@@ -679,17 +955,25 @@ ActSubmitEvent(
 
 /**
  * @brief Get attack chain by ID.
+ *
+ * Returns chain with reference added. Caller must call ActReleaseChain.
+ *
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ActGetChain(
     _In_ PACT_TRACKER Tracker,
     _In_ PGUID ChainId,
-    _Out_ PACT_ATTACK_CHAIN* Chain
+    _Outptr_ PACT_ATTACK_CHAIN* Chain
     )
 {
     PLIST_ENTRY listEntry;
     PACT_ATTACK_CHAIN chain;
     PACT_ATTACK_CHAIN found = NULL;
+
+    PAGED_CODE();
 
     if (Tracker == NULL || ChainId == NULL || Chain == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -711,6 +995,10 @@ ActGetChain(
         chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
 
         if (RtlCompareMemory(&chain->ChainId, ChainId, sizeof(GUID)) == sizeof(GUID)) {
+            //
+            // Take reference before returning
+            //
+            ActReferenceChain(chain);
             found = chain;
             break;
         }
@@ -729,15 +1017,23 @@ ActGetChain(
 
 /**
  * @brief Find attack chain correlated with a process.
+ *
+ * Returns chain with reference added. Caller must call ActReleaseChain.
+ *
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ActCorrelateEvents(
     _In_ PACT_TRACKER Tracker,
     _In_ HANDLE ProcessId,
-    _Out_ PACT_ATTACK_CHAIN* Chain
+    _Outptr_ PACT_ATTACK_CHAIN* Chain
     )
 {
     PACT_ATTACK_CHAIN found = NULL;
+
+    PAGED_CODE();
 
     if (Tracker == NULL || ProcessId == NULL || Chain == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -752,7 +1048,10 @@ ActCorrelateEvents(
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Tracker->ChainLock);
 
-    found = ActpFindChainForProcess(Tracker, ProcessId);
+    found = ActpFindChainForProcessLocked(Tracker, ProcessId);
+    if (found != NULL) {
+        ActReferenceChain(found);
+    }
 
     ExReleasePushLockShared(&Tracker->ChainLock);
     KeLeaveCriticalRegion();
@@ -766,25 +1065,35 @@ ActCorrelateEvents(
 }
 
 /**
- * @brief Get all active attack chains.
+ * @brief Get all active (non-expired) attack chains.
+ *
+ * Returns chains with references added. Caller must call ActReleaseChain on each.
+ *
+ * @irql <= APC_LEVEL
  */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 ActGetActiveChains(
     _In_ PACT_TRACKER Tracker,
-    _Out_writes_to_(Max, *Count) PACT_ATTACK_CHAIN* Chains,
-    _In_ ULONG Max,
-    _Out_ PULONG Count
+    _Out_writes_to_(MaxChains, *ChainCount) PACT_ATTACK_CHAIN* Chains,
+    _In_ ULONG MaxChains,
+    _Out_ PULONG ChainCount
     )
 {
     PLIST_ENTRY listEntry;
     PACT_ATTACK_CHAIN chain;
     ULONG count = 0;
+    KIRQL oldIrql;
+    BOOLEAN expired;
 
-    if (Tracker == NULL || Chains == NULL || Count == NULL) {
+    PAGED_CODE();
+
+    if (Tracker == NULL || Chains == NULL || ChainCount == NULL || MaxChains == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    *Count = 0;
+    *ChainCount = 0;
 
     if (!Tracker->Initialized) {
         return STATUS_DEVICE_NOT_READY;
@@ -794,15 +1103,20 @@ ActGetActiveChains(
     ExAcquirePushLockShared(&Tracker->ChainLock);
 
     for (listEntry = Tracker->ChainList.Flink;
-         listEntry != &Tracker->ChainList && count < Max;
+         listEntry != &Tracker->ChainList && count < MaxChains;
          listEntry = listEntry->Flink) {
 
         chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
 
         //
-        // Skip expired chains
+        // Check expiration under EventLock
         //
-        if (!ActpIsChainExpired(chain)) {
+        KeAcquireSpinLock(&chain->EventLock, &oldIrql);
+        expired = ActpIsChainExpiredLocked(chain);
+        KeReleaseSpinLock(&chain->EventLock, oldIrql);
+
+        if (!expired) {
+            ActReferenceChain(chain);
             Chains[count++] = chain;
         }
     }
@@ -810,62 +1124,119 @@ ActGetActiveChains(
     ExReleasePushLockShared(&Tracker->ChainLock);
     KeLeaveCriticalRegion();
 
-    *Count = count;
+    *ChainCount = count;
     return STATUS_SUCCESS;
 }
 
+// ============================================================================
+// CLEANUP TIMER DPC
+// ============================================================================
+
 /**
- * @brief Free an attack chain and all its events.
+ * @brief DPC routine for periodic chain cleanup.
+ *
+ * Removes expired chains from the tracker.
+ *
+ * @irql DISPATCH_LEVEL
  */
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_requires_same_
 VOID
-ActFreeChain(
-    _In_ PACT_ATTACK_CHAIN Chain
+ActpCleanupTimerDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
     )
 {
+    PACT_TRACKER tracker = (PACT_TRACKER)DeferredContext;
     PLIST_ENTRY listEntry;
-    PACT_CHAIN_EVENT event;
-    KIRQL oldIrql;
+    PLIST_ENTRY nextEntry;
+    PACT_ATTACK_CHAIN chain;
+    LIST_ENTRY expiredList;
+    KIRQL chainIrql;
+    BOOLEAN expired;
+    LARGE_INTEGER dueTime;
 
-    PAGED_CODE();
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (Chain == NULL) {
+    if (tracker == NULL || !tracker->Initialized) {
         return;
     }
 
     //
-    // Free all events
+    // Prevent concurrent cleanup runs
     //
-    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
-
-    while (!IsListEmpty(&Chain->EventList)) {
-        listEntry = RemoveHeadList(&Chain->EventList);
-        event = CONTAINING_RECORD(listEntry, ACT_CHAIN_EVENT, ListEntry);
-
-        KeReleaseSpinLock(&Chain->EventLock, oldIrql);
-        ActpFreeEvent(event);
-        KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
+    if (InterlockedCompareExchange(&tracker->CleanupRunning, 1, 0) != 0) {
+        return;
     }
 
-    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
+    InitializeListHead(&expiredList);
 
     //
-    // Free process name buffer if allocated
+    // Scan for expired chains under exclusive lock
+    // Note: Push locks cannot be acquired at DISPATCH_LEVEL in shared mode
+    // We're at DISPATCH from DPC, so we need to be careful here
+    // Using try-acquire pattern or queuing work item would be better,
+    // but for simplicity we'll use exclusive which is allowed
     //
-    if (Chain->RootProcessName.Buffer != NULL) {
-        ExFreePoolWithTag(Chain->RootProcessName.Buffer, ACT_CHAIN_TAG);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&tracker->ChainLock);
+
+    for (listEntry = tracker->ChainList.Flink;
+         listEntry != &tracker->ChainList;
+         listEntry = nextEntry) {
+
+        nextEntry = listEntry->Flink;
+        chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
+
+        KeAcquireSpinLockAtDpcLevel(&chain->EventLock);
+        expired = ActpIsChainExpiredLocked(chain);
+        KeReleaseSpinLockFromDpcLevel(&chain->EventLock);
+
+        if (expired) {
+            RemoveEntryList(&chain->ListEntry);
+            InitializeListHead(&chain->ListEntry);
+            InsertTailList(&expiredList, &chain->ListEntry);
+            InterlockedDecrement(&tracker->ChainCount);
+            InterlockedIncrement64(&tracker->Stats.ChainsExpired);
+        }
     }
 
+    ExReleasePushLockExclusive(&tracker->ChainLock);
+    KeLeaveCriticalRegion();
+
     //
-    // Free chain
+    // Release references on expired chains outside lock
     //
-    ExFreePoolWithTag(Chain, ACT_CHAIN_TAG);
+    while (!IsListEmpty(&expiredList)) {
+        listEntry = RemoveHeadList(&expiredList);
+        chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
+        InitializeListHead(&chain->ListEntry);
+        ActReleaseChain(chain);
+    }
+
+    InterlockedExchange(&tracker->CleanupRunning, 0);
+
+    //
+    // Reschedule timer if still initialized
+    //
+    if (tracker->Initialized) {
+        dueTime.QuadPart = ACT_CLEANUP_INTERVAL;
+        KeSetTimer(&tracker->CleanupTimer, dueTime, &tracker->CleanupDpc);
+    }
 }
 
 // ============================================================================
 // PRIVATE IMPLEMENTATION
 // ============================================================================
 
+/**
+ * @brief Get kill chain phase for a technique.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static ACT_CHAIN_STATE
 ActpGetPhaseForTechnique(
     _In_ ULONG TechniqueId,
@@ -887,17 +1258,21 @@ ActpGetPhaseForTechnique(
     return ActState_Initial;
 }
 
+/**
+ * @brief Find chain for process. Caller must hold ChainLock.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static PACT_ATTACK_CHAIN
-ActpFindChainForProcess(
+ActpFindChainForProcessLocked(
     _In_ PACT_TRACKER Tracker,
     _In_ HANDLE ProcessId
     )
 {
     PLIST_ENTRY listEntry;
     PACT_ATTACK_CHAIN chain;
-    LARGE_INTEGER currentTime;
-
-    KeQuerySystemTime(&currentTime);
+    KIRQL oldIrql;
+    BOOLEAN expired;
+    BOOLEAN related;
 
     for (listEntry = Tracker->ChainList.Flink;
          listEntry != &Tracker->ChainList;
@@ -906,37 +1281,48 @@ ActpFindChainForProcess(
         chain = CONTAINING_RECORD(listEntry, ACT_ATTACK_CHAIN, ListEntry);
 
         //
-        // Check if this is the root process
+        // Check under EventLock for thread safety
         //
-        if (chain->RootProcessId == ProcessId) {
-            if (!ActpIsChainExpired(chain)) {
+        KeAcquireSpinLock(&chain->EventLock, &oldIrql);
+
+        expired = ActpIsChainExpiredLocked(chain);
+        if (!expired) {
+            //
+            // Check if this is the root process or a related process
+            //
+            if (chain->RootProcessId == ProcessId) {
+                KeReleaseSpinLock(&chain->EventLock, oldIrql);
+                return chain;
+            }
+
+            related = ActpIsProcessRelatedLocked(chain, ProcessId);
+            if (related) {
+                KeReleaseSpinLock(&chain->EventLock, oldIrql);
                 return chain;
             }
         }
 
-        //
-        // Check if process is in related list
-        //
-        if (ActpIsProcessRelated(chain, ProcessId)) {
-            if (!ActpIsChainExpired(chain)) {
-                return chain;
-            }
-        }
+        KeReleaseSpinLock(&chain->EventLock, oldIrql);
     }
 
     return NULL;
 }
 
+/**
+ * @brief Create a new attack chain.
+ *
+ * Returns chain with ReferenceCount = 1.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 static PACT_ATTACK_CHAIN
 ActpCreateChain(
-    _In_ PACT_TRACKER Tracker,
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING ProcessName
+    _In_opt_ PUNICODE_STRING ProcessName
     )
 {
     PACT_ATTACK_CHAIN chain;
-
-    UNREFERENCED_PARAMETER(Tracker);
+    USHORT copyLength;
 
     chain = (PACT_ATTACK_CHAIN)ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -949,7 +1335,12 @@ ActpCreateChain(
     }
 
     //
-    // Generate unique chain ID
+    // Initialize reference count to 1 (for the caller/tracker list)
+    //
+    chain->ReferenceCount = 1;
+
+    //
+    // Generate unique chain ID using ExUuidCreate
     //
     ActpGenerateChainId(&chain->ChainId);
 
@@ -957,11 +1348,15 @@ ActpCreateChain(
     chain->RootProcessId = ProcessId;
 
     //
-    // Copy process name
+    // Copy process name with validation
     //
-    if (ProcessName != NULL && ProcessName->Length > 0) {
-        chain->RootProcessName.Length = ProcessName->Length;
-        chain->RootProcessName.MaximumLength = ProcessName->Length + sizeof(WCHAR);
+    if (ProcessName != NULL &&
+        ProcessName->Buffer != NULL &&
+        ProcessName->Length > 0) {
+
+        copyLength = min(ProcessName->Length, ACT_MAX_PROCESS_NAME_LEN);
+
+        chain->RootProcessName.MaximumLength = copyLength + sizeof(WCHAR);
         chain->RootProcessName.Buffer = (PWCH)ExAllocatePoolZero(
             NonPagedPoolNx,
             chain->RootProcessName.MaximumLength,
@@ -971,11 +1366,19 @@ ActpCreateChain(
         if (chain->RootProcessName.Buffer != NULL) {
             RtlCopyMemory(chain->RootProcessName.Buffer,
                           ProcessName->Buffer,
-                          ProcessName->Length);
+                          copyLength);
+            chain->RootProcessName.Length = copyLength;
+        } else {
+            //
+            // Allocation failed - continue with empty name
+            //
+            chain->RootProcessName.Length = 0;
+            chain->RootProcessName.MaximumLength = 0;
         }
     }
 
     KeQuerySystemTime(&chain->StartTime);
+    chain->LastActivityTime = chain->StartTime;
 
     InitializeListHead(&chain->EventList);
     KeInitializeSpinLock(&chain->EventLock);
@@ -984,6 +1387,7 @@ ActpCreateChain(
     chain->ThreatScore = 0;
     chain->ConfidenceScore = 0;
     chain->IsConfirmedAttack = FALSE;
+    chain->AppliedComboMask = 0;
 
     //
     // Add root process to related list
@@ -996,18 +1400,24 @@ ActpCreateChain(
     return chain;
 }
 
+/**
+ * @brief Create a new chain event.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 static PACT_CHAIN_EVENT
 ActpCreateEvent(
     _In_ ULONG TechniqueId,
     _In_ ACT_CHAIN_STATE Phase,
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING ProcessName,
+    _In_opt_ PUNICODE_STRING ProcessName,
     _In_ ULONG Score,
-    _In_opt_ PVOID Evidence,
+    _In_reads_bytes_opt_(EvidenceSize) PVOID Evidence,
     _In_ SIZE_T EvidenceSize
     )
 {
     PACT_CHAIN_EVENT event;
+    USHORT copyLength;
 
     event = (PACT_CHAIN_EVENT)ExAllocatePoolZero(
         NonPagedPoolNx,
@@ -1027,11 +1437,15 @@ ActpCreateEvent(
     KeQuerySystemTime(&event->Timestamp);
 
     //
-    // Copy process name
+    // Copy process name with validation
     //
-    if (ProcessName != NULL && ProcessName->Length > 0) {
-        event->ProcessName.Length = ProcessName->Length;
-        event->ProcessName.MaximumLength = ProcessName->Length + sizeof(WCHAR);
+    if (ProcessName != NULL &&
+        ProcessName->Buffer != NULL &&
+        ProcessName->Length > 0) {
+
+        copyLength = min(ProcessName->Length, ACT_MAX_PROCESS_NAME_LEN);
+
+        event->ProcessName.MaximumLength = copyLength + sizeof(WCHAR);
         event->ProcessName.Buffer = (PWCH)ExAllocatePoolZero(
             NonPagedPoolNx,
             event->ProcessName.MaximumLength,
@@ -1041,14 +1455,15 @@ ActpCreateEvent(
         if (event->ProcessName.Buffer != NULL) {
             RtlCopyMemory(event->ProcessName.Buffer,
                           ProcessName->Buffer,
-                          ProcessName->Length);
+                          copyLength);
+            event->ProcessName.Length = copyLength;
         }
     }
 
     //
-    // Copy evidence if provided
+    // Copy evidence if provided (already validated by caller)
     //
-    if (Evidence != NULL && EvidenceSize > 0 && EvidenceSize <= 4096) {
+    if (Evidence != NULL && EvidenceSize > 0) {
         event->EvidenceData = ExAllocatePoolZero(
             NonPagedPoolNx,
             EvidenceSize,
@@ -1067,9 +1482,8 @@ ActpCreateEvent(
     RtlStringCchPrintfA(
         event->EvidenceDescription,
         sizeof(event->EvidenceDescription),
-        "Technique T%04X detected in process %wZ (PID %p)",
+        "Technique T%04X detected in PID %p",
         TechniqueId & 0xFFFF,
-        ProcessName,
         ProcessId
     );
 
@@ -1078,6 +1492,10 @@ ActpCreateEvent(
     return event;
 }
 
+/**
+ * @brief Free an event and its resources.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 ActpFreeEvent(
     _In_ PACT_CHAIN_EVENT Event
@@ -1098,19 +1516,84 @@ ActpFreeEvent(
     ExFreePoolWithTag(Event, ACT_EVENT_TAG);
 }
 
+/**
+ * @brief Free a chain and all its resources.
+ *
+ * Called when reference count reaches zero.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpAddEventToChain(
-    _In_ PACT_ATTACK_CHAIN Chain,
-    _In_ PACT_CHAIN_EVENT Event
+ActpFreeChainInternal(
+    _In_ PACT_ATTACK_CHAIN Chain
     )
 {
+    LIST_ENTRY tempList;
+    PLIST_ENTRY listEntry;
+    PACT_CHAIN_EVENT event;
     KIRQL oldIrql;
 
-    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
+    if (Chain == NULL) {
+        return;
+    }
+
+    InitializeListHead(&tempList);
 
     //
-    // Check max events
+    // Move all events to temp list under spinlock
     //
+    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
+
+    while (!IsListEmpty(&Chain->EventList)) {
+        listEntry = RemoveHeadList(&Chain->EventList);
+        InsertTailList(&tempList, listEntry);
+    }
+    Chain->EventCount = 0;
+
+    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
+
+    //
+    // Free events outside spinlock
+    //
+    while (!IsListEmpty(&tempList)) {
+        listEntry = RemoveHeadList(&tempList);
+        event = CONTAINING_RECORD(listEntry, ACT_CHAIN_EVENT, ListEntry);
+        ActpFreeEvent(event);
+    }
+
+    //
+    // Free process name buffer
+    //
+    if (Chain->RootProcessName.Buffer != NULL) {
+        ExFreePoolWithTag(Chain->RootProcessName.Buffer, ACT_CHAIN_TAG);
+    }
+
+    //
+    // Free chain structure
+    //
+    ExFreePoolWithTag(Chain, ACT_CHAIN_TAG);
+}
+
+/**
+ * @brief Add event to chain. Caller must hold EventLock.
+ *
+ * @param Chain         Chain to add event to.
+ * @param Event         Event to add.
+ * @param EvictedEvent  Receives evicted event if max reached (caller must free).
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+ActpAddEventToChainLocked(
+    _In_ PACT_ATTACK_CHAIN Chain,
+    _In_ PACT_CHAIN_EVENT Event,
+    _Out_opt_ PACT_CHAIN_EVENT* EvictedEvent
+    )
+{
+    PLIST_ENTRY oldEntry;
+
+    if (EvictedEvent != NULL) {
+        *EvictedEvent = NULL;
+    }
+
     if (Chain->EventCount < ACT_MAX_CHAIN_EVENTS) {
         InsertTailList(&Chain->EventList, &Event->ListEntry);
         InterlockedIncrement(&Chain->EventCount);
@@ -1118,21 +1601,27 @@ ActpAddEventToChain(
         //
         // Evict oldest event
         //
-        PLIST_ENTRY oldEntry = RemoveHeadList(&Chain->EventList);
+        oldEntry = RemoveHeadList(&Chain->EventList);
         InsertTailList(&Chain->EventList, &Event->ListEntry);
 
-        KeReleaseSpinLock(&Chain->EventLock, oldIrql);
-
-        PACT_CHAIN_EVENT oldEvent = CONTAINING_RECORD(oldEntry, ACT_CHAIN_EVENT, ListEntry);
-        ActpFreeEvent(oldEvent);
-        return;
+        if (EvictedEvent != NULL) {
+            *EvictedEvent = CONTAINING_RECORD(oldEntry, ACT_CHAIN_EVENT, ListEntry);
+        } else {
+            //
+            // Caller didn't want it - can't free here as we hold spinlock
+            // This shouldn't happen with proper usage
+            //
+            NT_ASSERT(FALSE);
+        }
     }
-
-    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
 }
 
+/**
+ * @brief Update chain scores. Caller must hold EventLock.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpUpdateChainScore(
+ActpUpdateChainScoreLocked(
     _In_ PACT_ATTACK_CHAIN Chain
     )
 {
@@ -1140,20 +1629,16 @@ ActpUpdateChainScore(
     PACT_CHAIN_EVENT event;
     ULONG totalScore = 0;
     ULONG eventCount = 0;
-    KIRQL oldIrql;
-
-    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
+    ULONG phaseCount;
 
     for (listEntry = Chain->EventList.Flink;
          listEntry != &Chain->EventList;
          listEntry = listEntry->Flink) {
 
         event = CONTAINING_RECORD(listEntry, ACT_CHAIN_EVENT, ListEntry);
-        totalScore += event->ConfidenceScore;
+        totalScore = ActpSaturatingAdd(totalScore, event->ConfidenceScore);
         eventCount++;
     }
-
-    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
 
     Chain->ThreatScore = totalScore;
 
@@ -1161,20 +1646,22 @@ ActpUpdateChainScore(
     // Confidence based on event count and phase progression
     //
     if (eventCount > 0) {
-        ULONG phaseCount = ActpCountPhases(Chain);
-        Chain->ConfidenceScore = min(100, (eventCount * 10) + (phaseCount * 15));
+        phaseCount = ActpCountPhasesLocked(Chain);
+        ULONG confidence = ActpSaturatingAdd(eventCount * 10, phaseCount * 15);
+        Chain->ConfidenceScore = min(100, confidence);
     }
 }
 
+/**
+ * @brief Check if chain is expired. Caller must hold EventLock.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
-ActpIsChainExpired(
+ActpIsChainExpiredLocked(
     _In_ PACT_ATTACK_CHAIN Chain
     )
 {
     LARGE_INTEGER currentTime;
-    PLIST_ENTRY lastEntry;
-    PACT_CHAIN_EVENT lastEvent;
-    KIRQL oldIrql;
 
     //
     // Confirmed attacks don't expire
@@ -1186,31 +1673,17 @@ ActpIsChainExpired(
     KeQuerySystemTime(&currentTime);
 
     //
-    // Check last event time
+    // Check against last activity time
     //
-    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
-
-    if (IsListEmpty(&Chain->EventList)) {
-        KeReleaseSpinLock(&Chain->EventLock, oldIrql);
-
-        //
-        // Check start time
-        //
-        return (currentTime.QuadPart - Chain->StartTime.QuadPart) > ACT_CHAIN_EXPIRY_TIME;
-    }
-
-    lastEntry = Chain->EventList.Blink;
-    lastEvent = CONTAINING_RECORD(lastEntry, ACT_CHAIN_EVENT, ListEntry);
-
-    LARGE_INTEGER lastEventTime = lastEvent->Timestamp;
-
-    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
-
-    return (currentTime.QuadPart - lastEventTime.QuadPart) > ACT_CHAIN_EXPIRY_TIME;
+    return (currentTime.QuadPart - Chain->LastActivityTime.QuadPart) > ACT_CHAIN_EXPIRY_TIME;
 }
 
+/**
+ * @brief Add process to related list. Caller must hold EventLock.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpAddRelatedProcess(
+ActpAddRelatedProcessLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
     _In_ HANDLE ProcessId
     )
@@ -1229,13 +1702,17 @@ ActpAddRelatedProcess(
     //
     // Add if space available
     //
-    if (Chain->RelatedProcessCount < ARRAYSIZE(Chain->RelatedProcessIds)) {
+    if (Chain->RelatedProcessCount < ACT_MAX_RELATED_PROCESSES) {
         Chain->RelatedProcessIds[Chain->RelatedProcessCount++] = ProcessId;
     }
 }
 
+/**
+ * @brief Check if process is in related list. Caller must hold EventLock.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
-ActpIsProcessRelated(
+ActpIsProcessRelatedLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
     _In_ HANDLE ProcessId
     )
@@ -1251,8 +1728,12 @@ ActpIsProcessRelated(
     return FALSE;
 }
 
+/**
+ * @brief Count unique phases in chain. Caller must hold EventLock.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static ULONG
-ActpCountPhases(
+ActpCountPhasesLocked(
     _In_ PACT_ATTACK_CHAIN Chain
     )
 {
@@ -1261,19 +1742,16 @@ ActpCountPhases(
     ULONG phaseMask = 0;
     ULONG count = 0;
     ULONG i;
-    KIRQL oldIrql;
-
-    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
 
     for (listEntry = Chain->EventList.Flink;
          listEntry != &Chain->EventList;
          listEntry = listEntry->Flink) {
 
         event = CONTAINING_RECORD(listEntry, ACT_CHAIN_EVENT, ListEntry);
-        phaseMask |= (1 << event->Phase);
+        if (event->Phase < 32) {
+            phaseMask |= (1 << event->Phase);
+        }
     }
-
-    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
 
     //
     // Count bits set
@@ -1287,8 +1765,15 @@ ActpCountPhases(
     return count;
 }
 
+/**
+ * @brief Check for dangerous technique combinations. Caller must hold EventLock.
+ *
+ * Uses bitmask to track which combos have already been applied to avoid
+ * duplicate scoring.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
-ActpCheckDangerousCombos(
+ActpCheckDangerousCombosLocked(
     _In_ PACT_ATTACK_CHAIN Chain,
     _In_ ULONG NewTechnique
     )
@@ -1297,9 +1782,7 @@ ActpCheckDangerousCombos(
     PACT_CHAIN_EVENT event;
     ULONG newBase = NewTechnique & 0xFFFF;
     ULONG i;
-    KIRQL oldIrql;
-
-    KeAcquireSpinLock(&Chain->EventLock, &oldIrql);
+    ULONG comboBit;
 
     for (listEntry = Chain->EventList.Flink;
          listEntry != &Chain->EventList;
@@ -1312,15 +1795,32 @@ ActpCheckDangerousCombos(
         // Check against dangerous combos
         //
         for (i = 0; g_DangerousCombos[i].Technique1 != 0; i++) {
+            comboBit = 1 << g_DangerousCombos[i].ComboIndex;
+
+            //
+            // Skip if this combo was already applied
+            //
+            if (Chain->AppliedComboMask & comboBit) {
+                continue;
+            }
+
             if ((g_DangerousCombos[i].Technique1 == newBase &&
                  g_DangerousCombos[i].Technique2 == existingBase) ||
                 (g_DangerousCombos[i].Technique2 == newBase &&
                  g_DangerousCombos[i].Technique1 == existingBase)) {
 
                 //
-                // Dangerous combo detected - add bonus score
+                // Mark combo as applied
                 //
-                Chain->ThreatScore += g_DangerousCombos[i].BonusScore;
+                Chain->AppliedComboMask |= comboBit;
+
+                //
+                // Add bonus score with saturation
+                //
+                Chain->ThreatScore = ActpSaturatingAdd(
+                    Chain->ThreatScore,
+                    g_DangerousCombos[i].BonusScore
+                );
 
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                            "[ShadowStrike] Dangerous combo detected: %s (+%u)\n",
@@ -1329,35 +1829,42 @@ ActpCheckDangerousCombos(
             }
         }
     }
-
-    KeReleaseSpinLock(&Chain->EventLock, oldIrql);
 }
 
+/**
+ * @brief Generate a unique chain ID using ExUuidCreate.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 ActpGenerateChainId(
     _Out_ PGUID ChainId
     )
 {
-    LARGE_INTEGER timestamp;
-    LARGE_INTEGER perfCounter;
+    NTSTATUS status;
 
-    KeQuerySystemTime(&timestamp);
-    perfCounter = KeQueryPerformanceCounter(NULL);
+    status = ExUuidCreate(ChainId);
 
-    //
-    // Generate pseudo-random GUID
-    // (In production, use ExUuidCreate if available)
-    //
-    ChainId->Data1 = (ULONG)timestamp.LowPart;
-    ChainId->Data2 = (USHORT)(perfCounter.LowPart & 0xFFFF);
-    ChainId->Data3 = (USHORT)((perfCounter.LowPart >> 16) & 0xFFFF);
-    ChainId->Data4[0] = (UCHAR)(timestamp.HighPart & 0xFF);
-    ChainId->Data4[1] = (UCHAR)((timestamp.HighPart >> 8) & 0xFF);
-    ChainId->Data4[2] = (UCHAR)((perfCounter.HighPart) & 0xFF);
-    ChainId->Data4[3] = (UCHAR)((perfCounter.HighPart >> 8) & 0xFF);
-    ChainId->Data4[4] = (UCHAR)((perfCounter.HighPart >> 16) & 0xFF);
-    ChainId->Data4[5] = (UCHAR)((perfCounter.HighPart >> 24) & 0xFF);
-    ChainId->Data4[6] = 0x4A;  // Version marker
-    ChainId->Data4[7] = 0xCT;  // "ACT" marker (invalid hex, use 0xAC)
-    ChainId->Data4[7] = 0xAC;
+    if (!NT_SUCCESS(status)) {
+        //
+        // Fallback to pseudo-random generation if ExUuidCreate fails
+        // (Should only happen if system UUID generator is exhausted)
+        //
+        LARGE_INTEGER timestamp;
+        LARGE_INTEGER perfCounter;
+
+        KeQuerySystemTime(&timestamp);
+        perfCounter = KeQueryPerformanceCounter(NULL);
+
+        ChainId->Data1 = (ULONG)(timestamp.LowPart ^ perfCounter.LowPart);
+        ChainId->Data2 = (USHORT)(perfCounter.LowPart & 0xFFFF);
+        ChainId->Data3 = (USHORT)((perfCounter.LowPart >> 16) & 0xFFFF);
+        ChainId->Data4[0] = (UCHAR)(timestamp.HighPart & 0xFF);
+        ChainId->Data4[1] = (UCHAR)((timestamp.HighPart >> 8) & 0xFF);
+        ChainId->Data4[2] = (UCHAR)((perfCounter.HighPart) & 0xFF);
+        ChainId->Data4[3] = (UCHAR)((perfCounter.HighPart >> 8) & 0xFF);
+        ChainId->Data4[4] = (UCHAR)((perfCounter.HighPart >> 16) & 0xFF);
+        ChainId->Data4[5] = (UCHAR)((perfCounter.HighPart >> 24) & 0xFF);
+        ChainId->Data4[6] = 0x4A;   // Version marker
+        ChainId->Data4[7] = 0xAC;   // "ACT" marker
+    }
 }

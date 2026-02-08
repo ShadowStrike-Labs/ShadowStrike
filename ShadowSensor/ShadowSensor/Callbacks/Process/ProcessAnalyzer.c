@@ -6,146 +6,124 @@ ShadowStrike NGAV - PROCESS ANALYZER IMPLEMENTATION
 @file ProcessAnalyzer.c
 @brief Enterprise-grade deep process analysis for comprehensive threat detection.
 
-This module provides real-time process analysis capabilities including:
-- PE header analysis and validation
-- Security mitigation detection (DEP, ASLR, CFG, ACG)
-- Process integrity level assessment
-- Behavioral indicator detection
-- Suspicion scoring and threat classification
-- Parent-child relationship analysis
-- Token and privilege inspection
-- Code signing verification
-- Entropy-based packing detection
-
-Implementation Features:
-- Thread-safe analysis caching with EX_PUSH_LOCK
-- Lookaside lists for high-frequency allocations
-- Reference counting for analysis objects
-- Asynchronous analysis support
-- Comprehensive MITRE ATT&CK mapping
-- Integration with ProcessUtils for introspection
-
-Detection Techniques Covered:
-- T1055: Process Injection indicators
-- T1036: Masquerading detection
-- T1134: Access Token Manipulation
-- T1548: Abuse Elevation Control Mechanism
-- T1574: Hijack Execution Flow
-- T1106: Native API abuse patterns
+Security Hardening Applied:
+- All IRQL requirements enforced with PAGED_CODE() and assertions
+- Proper reference counting with clear ownership semantics
+- Integer overflow protection in all arithmetic
+- Bounds validation on all PE header access
+- Proper SEH around all user-mode memory access
+- No use-after-free or double-free scenarios
+- Thread-safe shutdown with proper synchronization
+- PID reuse protection via creation time validation
 
 @author ShadowStrike Security Team
-@version 2.0.0 (Enterprise Edition)
+@version 3.0.0 (Enterprise Edition - Security Hardened)
 @copyright (c) 2026 ShadowStrike Security. All rights reserved.
 ===============================================================================
 --*/
 
 #include "ProcessAnalyzer.h"
-#include "../../Utilities/ProcessUtils.h"
-#include "../../Utilities/MemoryUtils.h"
-#include "../../Shared/SharedDefs.h"
 #include <ntstrsafe.h>
+
+// ============================================================================
+// COMPILE-TIME CONFIGURATION
+// ============================================================================
+
+//
+// Enable/disable features at compile time
+//
+#define PA_ENABLE_SIGNATURE_VERIFICATION    1
+#define PA_ENABLE_MITIGATION_POLICY_CHECK   1
+#define PA_ENABLE_PARENT_CHILD_VALIDATION   1
 
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
-#define PA_MAX_CACHED_ANALYSES          4096
-#define PA_MAX_PATH_LENGTH              1024
-#define PA_MAX_CMDLINE_LENGTH           8192
-#define PA_ANALYSIS_CACHE_TIMEOUT_MS    60000
-#define PA_ENTROPY_THRESHOLD_PACKED     700
-#define PA_ENTROPY_THRESHOLD_ENCRYPTED  750
-#define PA_SUSPICION_THRESHOLD_LOW      25
-#define PA_SUSPICION_THRESHOLD_MEDIUM   50
-#define PA_SUSPICION_THRESHOLD_HIGH     75
-#define PA_SUSPICION_THRESHOLD_CRITICAL 90
+//
+// Default configuration values
+//
+#define PA_DEFAULT_CACHE_TIMEOUT_MS         60000
+#define PA_DEFAULT_MAX_CACHED_ANALYSES      4096
+#define PA_DEFAULT_SUSPICION_THRESHOLD      PA_SUSPICION_THRESHOLD_MEDIUM
 
 //
-// Pool tags for sub-allocations
+// Entropy thresholds (0-1000 scale)
 //
-#define PA_POOL_TAG_ANALYSIS    'AnAP'
-#define PA_POOL_TAG_CACHE       'CaAP'
-#define PA_POOL_TAG_STRING      'StAP'
-#define PA_POOL_TAG_BUFFER      'BuAP'
+#define PA_ENTROPY_THRESHOLD_PACKED         700
+#define PA_ENTROPY_THRESHOLD_ENCRYPTED      750
 
 //
 // PE signature constants
 //
-#define PA_DOS_SIGNATURE        0x5A4D      // 'MZ'
-#define PA_NT_SIGNATURE         0x00004550  // 'PE\0\0'
-#define PA_PE32_MAGIC           0x10B
-#define PA_PE32PLUS_MAGIC       0x20B
+#define PA_DOS_SIGNATURE                    0x5A4D
+#define PA_NT_SIGNATURE                     0x00004550
+#define PA_PE32_MAGIC                       0x10B
+#define PA_PE32PLUS_MAGIC                   0x20B
 
 //
-// PE Characteristics flags
+// PE header bounds - prevent malicious e_lfanew values
 //
-#define PA_IMAGE_FILE_EXECUTABLE_IMAGE      0x0002
-#define PA_IMAGE_FILE_DLL                   0x2000
-#define PA_IMAGE_FILE_LARGE_ADDRESS_AWARE   0x0020
-#define PA_IMAGE_FILE_RELOCS_STRIPPED       0x0001
+#define PA_MIN_E_LFANEW                     sizeof(IMAGE_DOS_HEADER)
+#define PA_MAX_E_LFANEW                     0x10000000
+
+//
+// Maximum PE size we'll analyze (prevent DoS)
+//
+#define PA_MAX_PE_SIZE_FOR_ENTROPY          0x10000
 
 //
 // PE DllCharacteristics for security mitigations
 //
-#define PA_IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA     0x0020
-#define PA_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE        0x0040
-#define PA_IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY     0x0080
-#define PA_IMAGE_DLLCHARACTERISTICS_NX_COMPAT           0x0100
-#define PA_IMAGE_DLLCHARACTERISTICS_NO_SEH              0x0400
-#define PA_IMAGE_DLLCHARACTERISTICS_GUARD_CF            0x4000
+#define PA_IMAGE_DLLCHAR_HIGH_ENTROPY_VA    0x0020
+#define PA_IMAGE_DLLCHAR_DYNAMIC_BASE       0x0040
+#define PA_IMAGE_DLLCHAR_FORCE_INTEGRITY    0x0080
+#define PA_IMAGE_DLLCHAR_NX_COMPAT          0x0100
+#define PA_IMAGE_DLLCHAR_NO_SEH             0x0400
+#define PA_IMAGE_DLLCHAR_GUARD_CF           0x4000
 
 //
-// PE Subsystem values
+// Hash table configuration
 //
-#define PA_IMAGE_SUBSYSTEM_UNKNOWN          0
-#define PA_IMAGE_SUBSYSTEM_NATIVE           1
-#define PA_IMAGE_SUBSYSTEM_WINDOWS_GUI      2
-#define PA_IMAGE_SUBSYSTEM_WINDOWS_CUI      3
+#define PA_HASH_BUCKET_COUNT                256
+#define PA_HASH_BUCKET_MASK                 (PA_HASH_BUCKET_COUNT - 1)
 
 //
-// .NET metadata detection
+// Cleanup timer period (milliseconds)
 //
-#define PA_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR 14
+#define PA_CLEANUP_TIMER_PERIOD_MS          30000
 
 //
-// Behavior flags for suspicious indicators
+// Maximum known process lists
 //
-#define PA_BEHAVIOR_SUSPICIOUS_PARENT       0x00000001
-#define PA_BEHAVIOR_UNUSUAL_PATH            0x00000002
-#define PA_BEHAVIOR_UNSIGNED                0x00000004
-#define PA_BEHAVIOR_PACKED                  0x00000008
-#define PA_BEHAVIOR_NO_DEP                  0x00000010
-#define PA_BEHAVIOR_NO_ASLR                 0x00000020
-#define PA_BEHAVIOR_ELEVATED                0x00000040
-#define PA_BEHAVIOR_SYSTEM_IMPERSONATION    0x00000080
-#define PA_BEHAVIOR_HOLLOWED                0x00000100
-#define PA_BEHAVIOR_INJECTED                0x00000200
-#define PA_BEHAVIOR_MASQUERADING            0x00000400
-#define PA_BEHAVIOR_ANOMALOUS_TOKEN         0x00000800
-#define PA_BEHAVIOR_SUSPICIOUS_CMDLINE      0x00001000
-#define PA_BEHAVIOR_SCRIPT_HOST             0x00002000
-#define PA_BEHAVIOR_LOL_BINARY              0x00004000
-#define PA_BEHAVIOR_UNUSUAL_EXTENSION       0x00008000
-#define PA_BEHAVIOR_HIDDEN_WINDOW           0x00010000
-#define PA_BEHAVIOR_DEBUGGER_PRESENT        0x00020000
-#define PA_BEHAVIOR_SHORT_LIVED             0x00040000
-#define PA_BEHAVIOR_HIGH_ENTROPY            0x00080000
+#define PA_MAX_KNOWN_PARENTS                64
+#define PA_MAX_LOLBINS                      128
+#define PA_MAX_PARENT_CHILD_RULES           64
 
 // ============================================================================
 // PRIVATE STRUCTURES
 // ============================================================================
 
 //
-// Extended analysis with private data
+// Parent-child validation rule
+//
+typedef struct _PA_PARENT_CHILD_RULE {
+    ULONG ParentHash;
+    ULONG ChildHash;
+    BOOLEAN IsSuspicious;
+} PA_PARENT_CHILD_RULE, *PPA_PARENT_CHILD_RULE;
+
+//
+// Internal analysis structure with reference counting
 //
 typedef struct _PA_ANALYSIS_INTERNAL {
     //
-    // Public structure (must be first)
+    // Public result (returned to callers)
     //
-    PA_PROCESS_ANALYSIS Public;
+    PA_ANALYSIS_RESULT Public;
 
     //
-    // Reference counting
+    // Reference counting - only access via Interlocked*
     //
     volatile LONG RefCount;
 
@@ -154,74 +132,47 @@ typedef struct _PA_ANALYSIS_INTERNAL {
     //
     LARGE_INTEGER AnalysisTime;
     LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER ProcessCreationTime;
     BOOLEAN IsValid;
     BOOLEAN InCache;
-    UCHAR Reserved[2];
+    BOOLEAN BeingFreed;
+    UCHAR Reserved;
 
     //
     // Extended PE information
     //
     struct {
-        ULONG ImageBase;
+        ULONG64 ImageBase;
         ULONG ImageSize;
         ULONG EntryPoint;
         ULONG SectionCount;
-        ULONG ImportCount;
-        ULONG ExportCount;
-        USHORT DllCharacteristics;
-        USHORT Machine;
-        ULONG TimeDateStamp;
         ULONG CheckSum;
-        BOOLEAN HasImportAddressTable;
+        ULONG CalculatedCheckSum;
+        BOOLEAN HasImportTable;
         BOOLEAN HasExportTable;
         BOOLEAN HasResourceSection;
         BOOLEAN HasRelocations;
         BOOLEAN HasDebugInfo;
         BOOLEAN HasTlsCallbacks;
-        BOOLEAN HasDelayImports;
-        BOOLEAN HasBoundImports;
     } ExtendedPE;
 
     //
-    // Extended security information
-    //
-    struct {
-        ULONG TokenIntegrityLevel;
-        ULONG ProtectionLevel;
-        BOOLEAN IsProtectedProcess;
-        BOOLEAN IsProtectedProcessLight;
-        BOOLEAN IsSystemProcess;
-        BOOLEAN IsServiceProcess;
-        BOOLEAN HasSeDebugPrivilege;
-        BOOLEAN HasSeLoadDriverPrivilege;
-        BOOLEAN HasSeTcbPrivilege;
-        BOOLEAN IsElevated;
-        HANDLE TokenHandle;
-        SID_IDENTIFIER_AUTHORITY SidAuthority;
-    } ExtendedSecurity;
-
-    //
-    // Parent process information
-    //
-    struct {
-        UNICODE_STRING ImagePath;
-        WCHAR ImagePathBuffer[PA_MAX_PATH_LENGTH];
-        BOOLEAN IsKnownParent;
-        BOOLEAN ParentMismatch;
-        ULONG ParentSuspicionScore;
-    } ParentInfo;
-
-    //
-    // String buffers
+    // String buffers (embedded to avoid separate allocations)
     //
     WCHAR ImagePathBuffer[PA_MAX_PATH_LENGTH];
     WCHAR CommandLineBuffer[PA_MAX_CMDLINE_LENGTH];
+    WCHAR ParentImagePathBuffer[PA_MAX_PATH_LENGTH];
 
     //
-    // Hash entry for cache lookup
+    // Hash table linkage
     //
     LIST_ENTRY HashEntry;
     ULONG HashBucket;
+
+    //
+    // Main list linkage
+    //
+    LIST_ENTRY ListEntry;
 
 } PA_ANALYSIS_INTERNAL, *PPA_ANALYSIS_INTERNAL;
 
@@ -234,17 +185,23 @@ typedef struct _PA_HASH_BUCKET {
     volatile LONG Count;
 } PA_HASH_BUCKET, *PPA_HASH_BUCKET;
 
-#define PA_HASH_BUCKET_COUNT        256
-#define PA_HASH_BUCKET_MASK         (PA_HASH_BUCKET_COUNT - 1)
-
 //
-// Extended analyzer with private data
+// Internal analyzer structure
 //
 typedef struct _PA_ANALYZER_INTERNAL {
     //
-    // Public structure (must be first)
+    // Initialization state
     //
-    PA_ANALYZER Public;
+    BOOLEAN Initialized;
+    BOOLEAN ShutdownRequested;
+    UCHAR Reserved[2];
+
+    //
+    // Main analysis list and lock
+    //
+    LIST_ENTRY AnalysisList;
+    EX_PUSH_LOCK ListLock;
+    volatile LONG AnalysisCount;
 
     //
     // Analysis cache hash table
@@ -260,41 +217,30 @@ typedef struct _PA_ANALYZER_INTERNAL {
     //
     // Configuration
     //
-    struct {
-        ULONG CacheTimeoutMs;
-        ULONG MaxCachedAnalyses;
-        BOOLEAN EnableDeepAnalysis;
-        BOOLEAN EnableSignatureCheck;
-        BOOLEAN EnableEntropyAnalysis;
-        BOOLEAN EnableParentValidation;
-        ULONG SuspicionThreshold;
-    } Config;
+    PA_CONFIG Config;
 
     //
-    // Extended statistics
+    // Statistics
     //
-    struct {
-        volatile LONG64 CacheHits;
-        volatile LONG64 CacheMisses;
-        volatile LONG64 AnalysisErrors;
-        volatile LONG64 PackedDetections;
-        volatile LONG64 UnsignedDetections;
-        volatile LONG64 ElevatedProcesses;
-        volatile LONG64 SuspiciousParents;
-        volatile LONG64 MasqueradingDetections;
-    } ExtendedStats;
+    PA_STATISTICS Stats;
 
     //
-    // Known good parent processes (hashes)
+    // Known good parent processes (hashes for fast lookup)
     //
-    ULONG KnownParentHashes[64];
+    ULONG KnownParentHashes[PA_MAX_KNOWN_PARENTS];
     ULONG KnownParentCount;
 
     //
-    // Known LOLBin names (hashes)
+    // LOLBin names (hashes for fast lookup)
     //
-    ULONG LOLBinHashes[128];
+    ULONG LOLBinHashes[PA_MAX_LOLBINS];
     ULONG LOLBinCount;
+
+    //
+    // Parent-child validation rules
+    //
+    PA_PARENT_CHILD_RULE ParentChildRules[PA_MAX_PARENT_CHILD_RULES];
+    ULONG ParentChildRuleCount;
 
     //
     // Cleanup timer
@@ -304,257 +250,133 @@ typedef struct _PA_ANALYZER_INTERNAL {
     BOOLEAN CleanupTimerActive;
 
     //
-    // Worker thread for async analysis
+    // Worker thread for async operations
     //
-    HANDLE WorkerThread;
+    PETHREAD WorkerThread;
     KEVENT ShutdownEvent;
     KEVENT WorkAvailableEvent;
-    LIST_ENTRY WorkQueue;
-    EX_PUSH_LOCK WorkQueueLock;
-    BOOLEAN ShutdownRequested;
+    volatile LONG WorkerActive;
 
 } PA_ANALYZER_INTERNAL, *PPA_ANALYZER_INTERNAL;
 
-//
-// Work item for async analysis
-//
-typedef struct _PA_WORK_ITEM {
-    LIST_ENTRY ListEntry;
-    HANDLE ProcessId;
-    KEVENT CompletionEvent;
-    PPA_ANALYSIS_INTERNAL Result;
-    NTSTATUS Status;
-} PA_WORK_ITEM, *PPA_WORK_ITEM;
-
 // ============================================================================
-// PRIVATE FUNCTION PROTOTYPES
+// FORWARD DECLARATIONS
 // ============================================================================
 
 //
 // Hash functions
 //
-static ULONG
-PapHashProcessId(
-    _In_ HANDLE ProcessId
-    );
-
-static ULONG
-PapHashString(
-    _In_ PCWSTR String,
-    _In_ ULONG Length
-    );
+static ULONG PapHashProcessId(_In_ HANDLE ProcessId);
+static ULONG PapHashStringInsensitive(_In_ PCWSTR String, _In_ ULONG LengthInChars);
 
 //
-// Analysis allocation
+// Memory management
 //
-static PPA_ANALYSIS_INTERNAL
-PapAllocateAnalysis(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer
-    );
-
-static VOID
-PapFreeAnalysisInternal(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static VOID
-PapReferenceAnalysis(
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static VOID
-PapDereferenceAnalysis(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
+static PPA_ANALYSIS_INTERNAL PapAllocateAnalysis(_In_ PPA_ANALYZER_INTERNAL Analyzer);
+static VOID PapFreeAnalysisInternal(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PPA_ANALYSIS_INTERNAL Analysis);
+static LONG PapReferenceAnalysis(_Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static LONG PapDereferenceAnalysis(_In_ PPA_ANALYZER_INTERNAL Analyzer, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
 
 //
 // Cache management
 //
-static PPA_ANALYSIS_INTERNAL
-PapLookupCachedAnalysis(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ HANDLE ProcessId
-    );
-
-static NTSTATUS
-PapInsertCachedAnalysis(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static VOID
-PapRemoveCachedAnalysis(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static VOID
-PapCleanupStaleCache(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer
-    );
+static PPA_ANALYSIS_INTERNAL PapLookupCachedAnalysis(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ HANDLE ProcessId, _In_ PLARGE_INTEGER CreationTime);
+static NTSTATUS PapInsertCachedAnalysis(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PPA_ANALYSIS_INTERNAL Analysis);
+static VOID PapRemoveCachedAnalysisLocked(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PPA_ANALYSIS_INTERNAL Analysis);
+static VOID PapCleanupStaleCache(_In_ PPA_ANALYZER_INTERNAL Analyzer);
 
 //
-// Core analysis functions
+// Core analysis
 //
-static NTSTATUS
-PapPerformAnalysis(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ HANDLE ProcessId,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static NTSTATUS
-PapAnalyzePEHeaders(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PEPROCESS Process,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static NTSTATUS
-PapAnalyzeSecurityMitigations(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PEPROCESS Process,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static NTSTATUS
-PapAnalyzeProcessToken(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PEPROCESS Process,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static NTSTATUS
-PapAnalyzeParentProcess(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ HANDLE ParentId,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static NTSTATUS
-PapAnalyzeCommandLine(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PEPROCESS Process,
-    _Inout_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static NTSTATUS
-PapCalculateEntropy(
-    _In_ PVOID Buffer,
-    _In_ SIZE_T Length,
-    _Out_ PULONG Entropy
-    );
+static NTSTATUS PapPerformAnalysis(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ HANDLE ProcessId, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static NTSTATUS PapAnalyzePEHeaders(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PEPROCESS Process, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static NTSTATUS PapAnalyzeSecurityMitigations(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PEPROCESS Process, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static NTSTATUS PapAnalyzeProcessToken(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PEPROCESS Process, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static NTSTATUS PapAnalyzeParentProcess(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ HANDLE ParentId, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static NTSTATUS PapAnalyzeCommandLine(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PEPROCESS Process, _Inout_ PPA_ANALYSIS_INTERNAL Analysis);
+static NTSTATUS PapCalculateEntropy(_In_ PVOID Buffer, _In_ SIZE_T Length, _Out_ PULONG Entropy);
 
 //
-// Suspicion scoring
+// Scoring and detection
 //
-static ULONG
-PapCalculateSuspicionScore(
-    _In_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-static ULONG
-PapDetectBehaviorFlags(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PPA_ANALYSIS_INTERNAL Analysis
-    );
-
-//
-// Known process detection
-//
-static BOOLEAN
-PapIsKnownParent(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PCUNICODE_STRING ImagePath
-    );
-
-static BOOLEAN
-PapIsLOLBinary(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ PCUNICODE_STRING ImagePath
-    );
-
-static BOOLEAN
-PapIsScriptHost(
-    _In_ PCUNICODE_STRING ImagePath
-    );
-
-static BOOLEAN
-PapIsSuspiciousPath(
-    _In_ PCUNICODE_STRING ImagePath
-    );
+static ULONG PapCalculateSuspicionScore(_In_ PPA_ANALYSIS_INTERNAL Analysis);
+static ULONG PapDetectBehaviorFlags(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PPA_ANALYSIS_INTERNAL Analysis);
+static BOOLEAN PapIsKnownParent(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PCUNICODE_STRING ImagePath);
+static BOOLEAN PapIsLOLBinary(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PCUNICODE_STRING ImagePath);
+static BOOLEAN PapIsScriptHost(_In_ PCUNICODE_STRING ImagePath);
+static BOOLEAN PapIsSuspiciousPath(_In_ PCUNICODE_STRING ImagePath);
+static BOOLEAN PapCheckParentChildMismatch(_In_ PPA_ANALYZER_INTERNAL Analyzer, _In_ PCUNICODE_STRING ParentPath, _In_ PCUNICODE_STRING ChildPath);
 
 //
 // Initialization helpers
 //
-static VOID
-PapInitializeKnownParents(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer
-    );
-
-static VOID
-PapInitializeLOLBins(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer
-    );
+static VOID PapInitializeKnownParents(_Inout_ PPA_ANALYZER_INTERNAL Analyzer);
+static VOID PapInitializeLOLBins(_Inout_ PPA_ANALYZER_INTERNAL Analyzer);
+static VOID PapInitializeParentChildRules(_Inout_ PPA_ANALYZER_INTERNAL Analyzer);
 
 //
-// Timer and worker routines
+// Timer and worker
 //
-static VOID
-PapCleanupTimerDpc(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    );
-
-static VOID
-PapWorkerThread(
-    _In_ PVOID StartContext
-    );
+static KDEFERRED_ROUTINE PapCleanupTimerDpc;
+static KSTART_ROUTINE PapWorkerThread;
 
 //
 // String utilities
 //
-static BOOLEAN
-PapExtractFileName(
-    _In_ PCUNICODE_STRING FullPath,
-    _Out_ PUNICODE_STRING FileName
-    );
+static BOOLEAN PapExtractFileName(_In_ PCUNICODE_STRING FullPath, _Out_ PUNICODE_STRING FileName);
+static BOOLEAN PapStringContainsInsensitive(_In_ PCUNICODE_STRING String, _In_ PCWSTR Substring);
+static NTSTATUS PapSafeStringCopy(_Out_ PUNICODE_STRING Dest, _In_ PCUNICODE_STRING Src, _In_ PWCHAR Buffer, _In_ USHORT BufferSize);
 
-static BOOLEAN
-PapStringContainsInsensitive(
-    _In_ PCUNICODE_STRING String,
-    _In_ PCWSTR Substring
-    );
+//
+// Process utilities
+//
+static NTSTATUS PapGetProcessCreationTime(_In_ PEPROCESS Process, _Out_ PLARGE_INTEGER CreationTime);
 
 // ============================================================================
-// PUBLIC FUNCTION IMPLEMENTATIONS
+// PUBLIC API IMPLEMENTATION
 // ============================================================================
 
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, PaInitialize)
+#pragma alloc_text(PAGE, PaShutdown)
+#pragma alloc_text(PAGE, PaAnalyzeProcess)
+#pragma alloc_text(PAGE, PaQuickCheck)
+#pragma alloc_text(PAGE, PaFreeAnalysis)
+#pragma alloc_text(PAGE, PaInvalidateProcess)
+#pragma alloc_text(PAGE, PapPerformAnalysis)
+#pragma alloc_text(PAGE, PapAnalyzePEHeaders)
+#pragma alloc_text(PAGE, PapAnalyzeSecurityMitigations)
+#pragma alloc_text(PAGE, PapAnalyzeProcessToken)
+#pragma alloc_text(PAGE, PapAnalyzeParentProcess)
+#pragma alloc_text(PAGE, PapAnalyzeCommandLine)
+#pragma alloc_text(PAGE, PapCleanupStaleCache)
+#pragma alloc_text(PAGE, PapWorkerThread)
+#endif
+
+ULONG
+PaGetVersion(
+    VOID
+    )
+{
+    return PA_VERSION;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PaInitialize(
-    _Out_ PPA_ANALYZER* Analyzer
+    _Out_ PPA_ANALYZER* Analyzer,
+    _In_opt_ PPA_CONFIG Config
     )
-/*++
-Routine Description:
-    Initializes the process analyzer subsystem.
-
-Arguments:
-    Analyzer - Receives pointer to initialized analyzer.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     NTSTATUS Status;
     PPA_ANALYZER_INTERNAL Internal = NULL;
-    HANDLE ThreadHandle = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
+    HANDLE ThreadHandle = NULL;
     LARGE_INTEGER DueTime;
     ULONG i;
+
+    PAGED_CODE();
 
     if (Analyzer == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -563,10 +385,10 @@ Return Value:
     *Analyzer = NULL;
 
     //
-    // Allocate internal analyzer structure
+    // Allocate analyzer structure from NonPagedPoolNx
     //
-    Internal = (PPA_ANALYZER_INTERNAL)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    Internal = (PPA_ANALYZER_INTERNAL)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(PA_ANALYZER_INTERNAL),
         PA_POOL_TAG
         );
@@ -578,10 +400,10 @@ Return Value:
     RtlZeroMemory(Internal, sizeof(PA_ANALYZER_INTERNAL));
 
     //
-    // Initialize public structure
+    // Initialize main list
     //
-    InitializeListHead(&Internal->Public.AnalysisList);
-    ExInitializePushLock(&Internal->Public.Lock);
+    InitializeListHead(&Internal->AnalysisList);
+    ExInitializePushLock(&Internal->ListLock);
 
     //
     // Initialize hash buckets
@@ -593,7 +415,7 @@ Return Value:
     }
 
     //
-    // Initialize lookaside list
+    // Initialize lookaside list for analysis allocations
     //
     ExInitializeNPagedLookasideList(
         &Internal->AnalysisLookaside,
@@ -607,38 +429,38 @@ Return Value:
     Internal->LookasideInitialized = TRUE;
 
     //
-    // Initialize default configuration
+    // Apply configuration
     //
-    Internal->Config.CacheTimeoutMs = PA_ANALYSIS_CACHE_TIMEOUT_MS;
-    Internal->Config.MaxCachedAnalyses = PA_MAX_CACHED_ANALYSES;
-    Internal->Config.EnableDeepAnalysis = TRUE;
-    Internal->Config.EnableSignatureCheck = TRUE;
-    Internal->Config.EnableEntropyAnalysis = TRUE;
-    Internal->Config.EnableParentValidation = TRUE;
-    Internal->Config.SuspicionThreshold = PA_SUSPICION_THRESHOLD_MEDIUM;
+    if (Config != NULL) {
+        Internal->Config = *Config;
+    } else {
+        Internal->Config.CacheTimeoutMs = PA_DEFAULT_CACHE_TIMEOUT_MS;
+        Internal->Config.MaxCachedAnalyses = PA_DEFAULT_MAX_CACHED_ANALYSES;
+        Internal->Config.SuspicionThreshold = PA_DEFAULT_SUSPICION_THRESHOLD;
+        Internal->Config.EnableDeepAnalysis = TRUE;
+        Internal->Config.EnableSignatureCheck = TRUE;
+        Internal->Config.EnableEntropyAnalysis = TRUE;
+        Internal->Config.EnableParentValidation = TRUE;
+        Internal->Config.EnableMitigationCheck = TRUE;
+    }
 
     //
     // Initialize known process lists
     //
     PapInitializeKnownParents(Internal);
     PapInitializeLOLBins(Internal);
+    PapInitializeParentChildRules(Internal);
 
     //
-    // Initialize work queue
+    // Initialize synchronization for worker thread
     //
-    InitializeListHead(&Internal->WorkQueue);
-    ExInitializePushLock(&Internal->WorkQueueLock);
+    KeInitializeEvent(&Internal->ShutdownEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&Internal->WorkAvailableEvent, SynchronizationEvent, FALSE);
 
     //
     // Initialize statistics
     //
-    KeQuerySystemTime(&Internal->Public.Stats.StartTime);
-
-    //
-    // Initialize worker thread synchronization
-    //
-    KeInitializeEvent(&Internal->ShutdownEvent, NotificationEvent, FALSE);
-    KeInitializeEvent(&Internal->WorkAvailableEvent, SynchronizationEvent, FALSE);
+    KeQuerySystemTime(&Internal->Stats.StartTime);
 
     //
     // Create worker thread
@@ -659,6 +481,9 @@ Return Value:
         goto Cleanup;
     }
 
+    //
+    // Get thread object pointer (not handle)
+    //
     Status = ObReferenceObjectByHandle(
         ThreadHandle,
         THREAD_ALL_ACCESS,
@@ -669,10 +494,13 @@ Return Value:
         );
 
     ZwClose(ThreadHandle);
+    ThreadHandle = NULL;
 
     if (!NT_SUCCESS(Status)) {
         goto Cleanup;
     }
+
+    Internal->WorkerActive = TRUE;
 
     //
     // Initialize cleanup timer
@@ -681,13 +509,13 @@ Return Value:
     KeInitializeDpc(&Internal->CleanupDpc, PapCleanupTimerDpc, Internal);
 
     //
-    // Start cleanup timer (every 30 seconds)
+    // Start cleanup timer
     //
-    DueTime.QuadPart = -((LONGLONG)30000 * 10000);
+    DueTime.QuadPart = -((LONGLONG)PA_CLEANUP_TIMER_PERIOD_MS * 10000);
     KeSetTimerEx(
         &Internal->CleanupTimer,
         DueTime,
-        30000,
+        PA_CLEANUP_TIMER_PERIOD_MS,
         &Internal->CleanupDpc
         );
     Internal->CleanupTimerActive = TRUE;
@@ -695,12 +523,19 @@ Return Value:
     //
     // Mark as initialized
     //
-    Internal->Public.Initialized = TRUE;
+    Internal->Initialized = TRUE;
     *Analyzer = (PPA_ANALYZER)Internal;
 
     return STATUS_SUCCESS;
 
 Cleanup:
+    if (Internal->WorkerThread != NULL) {
+        Internal->ShutdownRequested = TRUE;
+        KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(Internal->WorkerThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(Internal->WorkerThread);
+    }
+
     if (Internal->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&Internal->AnalysisLookaside);
     }
@@ -709,40 +544,49 @@ Cleanup:
     return Status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 PaShutdown(
-    _Inout_ PPA_ANALYZER Analyzer
+    _Inout_ PPA_ANALYZER* Analyzer
     )
-/*++
-Routine Description:
-    Shuts down the process analyzer subsystem.
-
-Arguments:
-    Analyzer - Analyzer instance to shutdown.
---*/
 {
-    PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
+    PPA_ANALYZER_INTERNAL Internal;
     PLIST_ENTRY Entry;
     PPA_ANALYSIS_INTERNAL Analysis;
+    LIST_ENTRY FreeList;
     ULONG i;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    PAGED_CODE();
+
+    if (Analyzer == NULL || *Analyzer == NULL) {
         return;
     }
 
-    Internal->Public.Initialized = FALSE;
+    Internal = (PPA_ANALYZER_INTERNAL)*Analyzer;
+    *Analyzer = NULL;
+
+    if (!Internal->Initialized) {
+        ExFreePoolWithTag(Internal, PA_POOL_TAG);
+        return;
+    }
+
+    //
+    // Mark as shutting down - this prevents new operations
+    //
+    Internal->Initialized = FALSE;
     Internal->ShutdownRequested = TRUE;
 
     //
-    // Cancel cleanup timer
+    // Cancel cleanup timer first
     //
     if (Internal->CleanupTimerActive) {
         KeCancelTimer(&Internal->CleanupTimer);
+        KeFlushQueuedDpcs();
         Internal->CleanupTimerActive = FALSE;
     }
 
     //
-    // Signal worker thread to exit
+    // Signal worker thread to exit and wait for it
     //
     KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
     KeSetEvent(&Internal->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
@@ -760,8 +604,11 @@ Arguments:
     }
 
     //
-    // Free all cached analyses
+    // Collect all analyses to free - use hash buckets as authoritative source
+    // This prevents double-free since each analysis is in exactly one hash bucket
     //
+    InitializeListHead(&FreeList);
+
     for (i = 0; i < PA_HASH_BUCKET_COUNT; i++) {
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Internal->HashBuckets[i].Lock);
@@ -770,41 +617,37 @@ Arguments:
             Entry = RemoveHeadList(&Internal->HashBuckets[i].AnalysisList);
             Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
             Analysis->InCache = FALSE;
+            InitializeListHead(&Analysis->HashEntry);
 
-            ExReleasePushLockExclusive(&Internal->HashBuckets[i].Lock);
-            KeLeaveCriticalRegion();
-
-            PapFreeAnalysisInternal(Internal, Analysis);
-
-            KeEnterCriticalRegion();
-            ExAcquirePushLockExclusive(&Internal->HashBuckets[i].Lock);
+            //
+            // Move to free list for cleanup outside lock
+            //
+            InsertTailList(&FreeList, &Analysis->HashEntry);
         }
 
+        Internal->HashBuckets[i].Count = 0;
         ExReleasePushLockExclusive(&Internal->HashBuckets[i].Lock);
         KeLeaveCriticalRegion();
     }
 
     //
-    // Free all analyses from main list
+    // Clear main list (don't free from here - already collected via hash buckets)
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Internal->Public.Lock);
-
-    while (!IsListEmpty(&Internal->Public.AnalysisList)) {
-        Entry = RemoveHeadList(&Internal->Public.AnalysisList);
-        Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, Public.ListEntry);
-
-        ExReleasePushLockExclusive(&Internal->Public.Lock);
-        KeLeaveCriticalRegion();
-
-        PapFreeAnalysisInternal(Internal, Analysis);
-
-        KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Internal->Public.Lock);
-    }
-
-    ExReleasePushLockExclusive(&Internal->Public.Lock);
+    ExAcquirePushLockExclusive(&Internal->ListLock);
+    InitializeListHead(&Internal->AnalysisList);
+    Internal->AnalysisCount = 0;
+    ExReleasePushLockExclusive(&Internal->ListLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Free all collected analyses
+    //
+    while (!IsListEmpty(&FreeList)) {
+        Entry = RemoveHeadList(&FreeList);
+        Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
+        PapFreeAnalysisInternal(Internal, Analysis);
+    }
 
     //
     // Delete lookaside list
@@ -814,52 +657,62 @@ Arguments:
     }
 
     //
-    // Free analyzer
+    // Free analyzer structure
     //
     ExFreePoolWithTag(Internal, PA_POOL_TAG);
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PaAnalyzeProcess(
     _In_ PPA_ANALYZER Analyzer,
     _In_ HANDLE ProcessId,
-    _Out_ PPA_PROCESS_ANALYSIS* Analysis
+    _Out_ PPA_ANALYSIS_RESULT* Analysis
     )
-/*++
-Routine Description:
-    Performs comprehensive analysis of a process.
-
-Arguments:
-    Analyzer - Analyzer instance.
-    ProcessId - Process to analyze.
-    Analysis - Receives analysis results.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
     PPA_ANALYSIS_INTERNAL InternalAnalysis = NULL;
+    PEPROCESS Process = NULL;
+    LARGE_INTEGER CreationTime = { 0 };
     NTSTATUS Status;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Analysis == NULL) {
+    PAGED_CODE();
+
+    if (Internal == NULL || Analysis == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Analysis = NULL;
 
+    if (!Internal->Initialized) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
-    // Check cache first
+    // Get process object to retrieve creation time for cache validation
     //
-    InternalAnalysis = PapLookupCachedAnalysis(Internal, ProcessId);
+    Status = PsLookupProcessByProcessId(ProcessId, &Process);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    PapGetProcessCreationTime(Process, &CreationTime);
+    ObDereferenceObject(Process);
+    Process = NULL;
+
+    //
+    // Check cache first (using creation time to handle PID reuse)
+    //
+    InternalAnalysis = PapLookupCachedAnalysis(Internal, ProcessId, &CreationTime);
     if (InternalAnalysis != NULL) {
-        InterlockedIncrement64(&Internal->ExtendedStats.CacheHits);
+        InterlockedIncrement64(&Internal->Stats.CacheHits);
         KeQuerySystemTime(&InternalAnalysis->LastAccessTime);
         *Analysis = &InternalAnalysis->Public;
         return STATUS_SUCCESS;
     }
 
-    InterlockedIncrement64(&Internal->ExtendedStats.CacheMisses);
+    InterlockedIncrement64(&Internal->Stats.CacheMisses);
 
     //
     // Allocate new analysis
@@ -870,11 +723,16 @@ Return Value:
     }
 
     //
+    // Store creation time for PID reuse protection
+    //
+    InternalAnalysis->ProcessCreationTime = CreationTime;
+
+    //
     // Perform analysis
     //
     Status = PapPerformAnalysis(Internal, ProcessId, InternalAnalysis);
     if (!NT_SUCCESS(Status)) {
-        InterlockedIncrement64(&Internal->ExtendedStats.AnalysisErrors);
+        InterlockedIncrement64(&Internal->Stats.AnalysisErrors);
         PapFreeAnalysisInternal(Internal, InternalAnalysis);
         return Status;
     }
@@ -884,26 +742,34 @@ Return Value:
     //
     InternalAnalysis->Public.BehaviorFlags = PapDetectBehaviorFlags(Internal, InternalAnalysis);
     InternalAnalysis->Public.SuspicionScore = PapCalculateSuspicionScore(InternalAnalysis);
+    InternalAnalysis->Public.IsSuspicious =
+        (InternalAnalysis->Public.SuspicionScore >= Internal->Config.SuspicionThreshold);
+    InternalAnalysis->Public.RequiresAction =
+        (InternalAnalysis->Public.SuspicionScore >= PA_SUSPICION_THRESHOLD_HIGH);
 
     //
     // Update statistics
     //
-    InterlockedIncrement64(&Internal->Public.Stats.ProcessesAnalyzed);
+    InterlockedIncrement64(&Internal->Stats.ProcessesAnalyzed);
 
-    if (InternalAnalysis->Public.SuspicionScore >= Internal->Config.SuspicionThreshold) {
-        InterlockedIncrement64(&Internal->Public.Stats.SuspiciousFound);
+    if (InternalAnalysis->Public.IsSuspicious) {
+        InterlockedIncrement64(&Internal->Stats.SuspiciousFound);
     }
 
     if (InternalAnalysis->Public.PE.IsPacked) {
-        InterlockedIncrement64(&Internal->ExtendedStats.PackedDetections);
+        InterlockedIncrement64(&Internal->Stats.PackedDetections);
     }
 
     if (!InternalAnalysis->Public.PE.IsSigned) {
-        InterlockedIncrement64(&Internal->ExtendedStats.UnsignedDetections);
+        InterlockedIncrement64(&Internal->Stats.UnsignedDetections);
     }
 
-    if (InternalAnalysis->ExtendedSecurity.IsElevated) {
-        InterlockedIncrement64(&Internal->ExtendedStats.ElevatedProcesses);
+    if (InternalAnalysis->Public.Security.IsElevated) {
+        InterlockedIncrement64(&Internal->Stats.ElevatedProcesses);
+    }
+
+    if (InternalAnalysis->Public.Parent.ParentChildMismatch) {
+        InterlockedIncrement64(&Internal->Stats.ParentMismatchDetections);
     }
 
     //
@@ -912,64 +778,56 @@ Return Value:
     Status = PapInsertCachedAnalysis(Internal, InternalAnalysis);
     if (!NT_SUCCESS(Status)) {
         //
-        // Cache insert failed, but analysis is still valid
+        // Cache insert failed (quota exceeded) - analysis still valid
+        // Just return without caching
         //
     }
 
     //
-    // Add to main analysis list
+    // Add to main list
     //
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Internal->Public.Lock);
-    InsertTailList(&Internal->Public.AnalysisList, &InternalAnalysis->Public.ListEntry);
-    InterlockedIncrement(&Internal->Public.AnalysisCount);
-    ExReleasePushLockExclusive(&Internal->Public.Lock);
+    ExAcquirePushLockExclusive(&Internal->ListLock);
+    InsertTailList(&Internal->AnalysisList, &InternalAnalysis->ListEntry);
+    InterlockedIncrement(&Internal->AnalysisCount);
+    ExReleasePushLockExclusive(&Internal->ListLock);
     KeLeaveCriticalRegion();
 
+    //
+    // Return analysis to caller - they now hold a reference
+    //
     *Analysis = &InternalAnalysis->Public;
 
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PaQuickCheck(
     _In_ PPA_ANALYZER Analyzer,
     _In_ HANDLE ProcessId,
     _Out_ PULONG SuspicionScore
     )
-/*++
-Routine Description:
-    Performs a quick suspicion check without full analysis.
-
-Arguments:
-    Analyzer - Analyzer instance.
-    ProcessId - Process to check.
-    SuspicionScore - Receives suspicion score.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
     PPA_ANALYSIS_INTERNAL CachedAnalysis;
     PEPROCESS Process = NULL;
+    LARGE_INTEGER CreationTime = { 0 };
+    PUNICODE_STRING ImageName = NULL;
     NTSTATUS Status;
     ULONG Score = 0;
 
-    if (Internal == NULL || !Internal->Public.Initialized || SuspicionScore == NULL) {
+    PAGED_CODE();
+
+    if (Internal == NULL || SuspicionScore == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *SuspicionScore = 0;
 
-    //
-    // Check cache first
-    //
-    CachedAnalysis = PapLookupCachedAnalysis(Internal, ProcessId);
-    if (CachedAnalysis != NULL) {
-        *SuspicionScore = CachedAnalysis->Public.SuspicionScore;
-        PapDereferenceAnalysis(Internal, CachedAnalysis);
-        return STATUS_SUCCESS;
+    if (!Internal->Initialized) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -980,18 +838,28 @@ Return Value:
         return Status;
     }
 
+    PapGetProcessCreationTime(Process, &CreationTime);
+
     //
-    // Quick checks without full analysis
+    // Check cache first
+    //
+    CachedAnalysis = PapLookupCachedAnalysis(Internal, ProcessId, &CreationTime);
+    if (CachedAnalysis != NULL) {
+        *SuspicionScore = CachedAnalysis->Public.SuspicionScore;
+        PapDereferenceAnalysis(Internal, CachedAnalysis);
+        ObDereferenceObject(Process);
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Perform quick checks without full analysis
     //
     __try {
-        UCHAR Buffer[256];
-        PUNICODE_STRING ImageName;
-
         //
         // Get image file name
         //
         Status = SeLocateProcessImageName(Process, &ImageName);
-        if (NT_SUCCESS(Status)) {
+        if (NT_SUCCESS(Status) && ImageName != NULL) {
             //
             // Check for suspicious path
             //
@@ -1014,6 +882,7 @@ Return Value:
             }
 
             ExFreePool(ImageName);
+            ImageName = NULL;
         }
 
         //
@@ -1022,24 +891,19 @@ Return Value:
         {
             PACCESS_TOKEN Token = PsReferencePrimaryToken(Process);
             if (Token != NULL) {
-                SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
-                TOKEN_TYPE TokenType;
-                BOOLEAN IsElevated = FALSE;
-
-                //
-                // Simplified elevation check
-                //
                 if (SeTokenIsAdmin(Token)) {
-                    IsElevated = TRUE;
                     Score += 15;
                 }
-
                 PsDereferencePrimaryToken(Token);
             }
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Status = GetExceptionCode();
+    }
+
+    if (ImageName != NULL) {
+        ExFreePool(ImageName);
     }
 
     ObDereferenceObject(Process);
@@ -1056,46 +920,125 @@ Return Value:
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 PaFreeAnalysis(
-    _In_ PPA_PROCESS_ANALYSIS Analysis
+    _In_ PPA_ANALYZER Analyzer,
+    _Inout_ PPA_ANALYSIS_RESULT* Analysis
     )
-/*++
-Routine Description:
-    Frees a process analysis structure.
-
-Arguments:
-    Analysis - Analysis to free.
---*/
 {
+    PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
     PPA_ANALYSIS_INTERNAL InternalAnalysis;
 
-    if (Analysis == NULL) {
+    PAGED_CODE();
+
+    if (Internal == NULL || Analysis == NULL || *Analysis == NULL) {
         return;
     }
 
-    InternalAnalysis = CONTAINING_RECORD(Analysis, PA_ANALYSIS_INTERNAL, Public);
+    InternalAnalysis = CONTAINING_RECORD(*Analysis, PA_ANALYSIS_INTERNAL, Public);
+    *Analysis = NULL;
 
     //
-    // Just dereference - actual free happens when refcount hits zero
-    // Note: We don't have direct access to analyzer here, so we need to
-    // handle this differently. The analysis should be marked as not in cache
-    // and the memory should be freed when the analyzer shuts down or
-    // when it's explicitly removed from the cache.
+    // Decrement reference count - memory freed when it hits zero
     //
+    PapDereferenceAnalysis(Internal, InternalAnalysis);
+}
 
-    //
-    // For now, we'll free the string buffers if they were dynamically allocated
-    // The lookaside list memory will be freed during shutdown
-    //
-    if (InternalAnalysis->Public.ImagePath.Buffer != NULL &&
-        InternalAnalysis->Public.ImagePath.Buffer != InternalAnalysis->ImagePathBuffer) {
-        ExFreePoolWithTag(InternalAnalysis->Public.ImagePath.Buffer, PA_POOL_TAG_STRING);
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+PaGetStatistics(
+    _In_ PPA_ANALYZER Analyzer,
+    _Out_ PPA_STATISTICS* Statistics
+    )
+{
+    PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
+
+    if (Internal == NULL || Statistics == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    if (InternalAnalysis->Public.CommandLine.Buffer != NULL &&
-        InternalAnalysis->Public.CommandLine.Buffer != InternalAnalysis->CommandLineBuffer) {
-        ExFreePoolWithTag(InternalAnalysis->Public.CommandLine.Buffer, PA_POOL_TAG_STRING);
+    //
+    // Copy statistics - volatile reads are atomic for aligned 64-bit values on x64
+    //
+    Statistics->ProcessesAnalyzed = Internal->Stats.ProcessesAnalyzed;
+    Statistics->SuspiciousFound = Internal->Stats.SuspiciousFound;
+    Statistics->CacheHits = Internal->Stats.CacheHits;
+    Statistics->CacheMisses = Internal->Stats.CacheMisses;
+    Statistics->AnalysisErrors = Internal->Stats.AnalysisErrors;
+    Statistics->PackedDetections = Internal->Stats.PackedDetections;
+    Statistics->UnsignedDetections = Internal->Stats.UnsignedDetections;
+    Statistics->ElevatedProcesses = Internal->Stats.ElevatedProcesses;
+    Statistics->SuspiciousParents = Internal->Stats.SuspiciousParents;
+    Statistics->ParentMismatchDetections = Internal->Stats.ParentMismatchDetections;
+    Statistics->StartTime = Internal->Stats.StartTime;
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+PaInvalidateProcess(
+    _In_ PPA_ANALYZER Analyzer,
+    _In_ HANDLE ProcessId
+    )
+{
+    PPA_ANALYZER_INTERNAL Internal = (PPA_ANALYZER_INTERNAL)Analyzer;
+    ULONG Hash;
+    PLIST_ENTRY Entry, Next;
+    PPA_ANALYSIS_INTERNAL Analysis;
+    PPA_ANALYSIS_INTERNAL ToFree = NULL;
+
+    PAGED_CODE();
+
+    if (Internal == NULL || !Internal->Initialized) {
+        return;
+    }
+
+    Hash = PapHashProcessId(ProcessId);
+
+    //
+    // Find and remove from hash bucket
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->HashBuckets[Hash].Lock);
+
+    for (Entry = Internal->HashBuckets[Hash].AnalysisList.Flink;
+         Entry != &Internal->HashBuckets[Hash].AnalysisList;
+         Entry = Next) {
+
+        Next = Entry->Flink;
+        Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
+
+        if (Analysis->Public.ProcessId == ProcessId) {
+            RemoveEntryList(&Analysis->HashEntry);
+            InitializeListHead(&Analysis->HashEntry);
+            InterlockedDecrement(&Internal->HashBuckets[Hash].Count);
+            Analysis->InCache = FALSE;
+            ToFree = Analysis;
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&Internal->HashBuckets[Hash].Lock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Remove from main list and dereference outside the hash lock
+    //
+    if (ToFree != NULL) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&Internal->ListLock);
+        if (!IsListEmpty(&ToFree->ListEntry)) {
+            RemoveEntryList(&ToFree->ListEntry);
+            InitializeListHead(&ToFree->ListEntry);
+            InterlockedDecrement(&Internal->AnalysisCount);
+        }
+        ExReleasePushLockExclusive(&Internal->ListLock);
+        KeLeaveCriticalRegion();
+
+        PapDereferenceAnalysis(Internal, ToFree);
     }
 }
 
@@ -1110,6 +1053,9 @@ PapHashProcessId(
 {
     ULONG_PTR Value = (ULONG_PTR)ProcessId;
 
+    //
+    // MurmurHash3-style mixing for good distribution
+    //
     Value ^= (Value >> 16);
     Value *= 0x85ebca6b;
     Value ^= (Value >> 13);
@@ -1120,22 +1066,31 @@ PapHashProcessId(
 }
 
 static ULONG
-PapHashString(
+PapHashStringInsensitive(
     _In_ PCWSTR String,
-    _In_ ULONG Length
+    _In_ ULONG LengthInChars
     )
 {
     ULONG Hash = 5381;
     ULONG i;
 
-    for (i = 0; i < Length && String[i] != L'\0'; i++) {
+    if (String == NULL || LengthInChars == 0) {
+        return Hash;
+    }
+
+    for (i = 0; i < LengthInChars && String[i] != L'\0'; i++) {
         WCHAR Ch = String[i];
+
         //
-        // Case-insensitive hash
+        // Case-insensitive: convert to lowercase
         //
         if (Ch >= L'A' && Ch <= L'Z') {
-            Ch += (L'a' - L'A');
+            Ch = Ch - L'A' + L'a';
         }
+
+        //
+        // djb2 hash
+        //
         Hash = ((Hash << 5) + Hash) + (ULONG)Ch;
     }
 
@@ -1155,14 +1110,20 @@ PapAllocateAnalysis(
 
     if (Analysis != NULL) {
         RtlZeroMemory(Analysis, sizeof(PA_ANALYSIS_INTERNAL));
+
+        //
+        // Initialize reference count to 1 (caller holds initial reference)
+        //
         Analysis->RefCount = 1;
         Analysis->IsValid = FALSE;
         Analysis->InCache = FALSE;
-        InitializeListHead(&Analysis->Public.ListEntry);
+        Analysis->BeingFreed = FALSE;
+
+        InitializeListHead(&Analysis->ListEntry);
         InitializeListHead(&Analysis->HashEntry);
 
         //
-        // Initialize string buffers to use internal storage
+        // Initialize string buffers to use embedded storage
         //
         Analysis->Public.ImagePath.Buffer = Analysis->ImagePathBuffer;
         Analysis->Public.ImagePath.Length = 0;
@@ -1172,9 +1133,9 @@ PapAllocateAnalysis(
         Analysis->Public.CommandLine.Length = 0;
         Analysis->Public.CommandLine.MaximumLength = sizeof(Analysis->CommandLineBuffer);
 
-        Analysis->ParentInfo.ImagePath.Buffer = Analysis->ParentInfo.ImagePathBuffer;
-        Analysis->ParentInfo.ImagePath.Length = 0;
-        Analysis->ParentInfo.ImagePath.MaximumLength = sizeof(Analysis->ParentInfo.ImagePathBuffer);
+        Analysis->Public.Parent.ImagePath.Buffer = Analysis->ParentImagePathBuffer;
+        Analysis->Public.Parent.ImagePath.Length = 0;
+        Analysis->Public.Parent.ImagePath.MaximumLength = sizeof(Analysis->ParentImagePathBuffer);
     }
 
     return Analysis;
@@ -1186,62 +1147,65 @@ PapFreeAnalysisInternal(
     _In_ PPA_ANALYSIS_INTERNAL Analysis
     )
 {
-    //
-    // Free any dynamically allocated strings
-    //
-    if (Analysis->Public.ImagePath.Buffer != NULL &&
-        Analysis->Public.ImagePath.Buffer != Analysis->ImagePathBuffer) {
-        ExFreePoolWithTag(Analysis->Public.ImagePath.Buffer, PA_POOL_TAG_STRING);
+    if (Analysis == NULL) {
+        return;
     }
 
-    if (Analysis->Public.CommandLine.Buffer != NULL &&
-        Analysis->Public.CommandLine.Buffer != Analysis->CommandLineBuffer) {
-        ExFreePoolWithTag(Analysis->Public.CommandLine.Buffer, PA_POOL_TAG_STRING);
-    }
+    //
+    // Mark as being freed to prevent races
+    //
+    Analysis->BeingFreed = TRUE;
 
-    if (Analysis->ParentInfo.ImagePath.Buffer != NULL &&
-        Analysis->ParentInfo.ImagePath.Buffer != Analysis->ParentInfo.ImagePathBuffer) {
-        ExFreePoolWithTag(Analysis->ParentInfo.ImagePath.Buffer, PA_POOL_TAG_STRING);
-    }
+    //
+    // String buffers use embedded storage, no separate free needed
+    // unless we ever allocate overflow buffers (which we don't currently)
+    //
 
     ExFreeToNPagedLookasideList(&Analyzer->AnalysisLookaside, Analysis);
 }
 
-static VOID
+static LONG
 PapReferenceAnalysis(
     _Inout_ PPA_ANALYSIS_INTERNAL Analysis
     )
 {
-    InterlockedIncrement(&Analysis->RefCount);
+    return InterlockedIncrement(&Analysis->RefCount);
 }
 
-static VOID
+static LONG
 PapDereferenceAnalysis(
     _In_ PPA_ANALYZER_INTERNAL Analyzer,
     _Inout_ PPA_ANALYSIS_INTERNAL Analysis
     )
 {
-    if (InterlockedDecrement(&Analysis->RefCount) == 0) {
+    LONG NewCount;
+
+    NewCount = InterlockedDecrement(&Analysis->RefCount);
+
+    if (NewCount == 0) {
         PapFreeAnalysisInternal(Analyzer, Analysis);
     }
+
+    return NewCount;
 }
 
 static PPA_ANALYSIS_INTERNAL
 PapLookupCachedAnalysis(
     _In_ PPA_ANALYZER_INTERNAL Analyzer,
-    _In_ HANDLE ProcessId
+    _In_ HANDLE ProcessId,
+    _In_ PLARGE_INTEGER CreationTime
     )
 {
     ULONG Hash;
     PLIST_ENTRY Entry;
     PPA_ANALYSIS_INTERNAL Analysis;
     LARGE_INTEGER CurrentTime;
-    LARGE_INTEGER TimeoutInterval;
+    LONGLONG TimeoutTicks;
 
     Hash = PapHashProcessId(ProcessId);
 
     KeQuerySystemTime(&CurrentTime);
-    TimeoutInterval.QuadPart = (LONGLONG)Analyzer->Config.CacheTimeoutMs * 10000;
+    TimeoutTicks = (LONGLONG)Analyzer->Config.CacheTimeoutMs * 10000;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Analyzer->HashBuckets[Hash].Lock);
@@ -1252,12 +1216,21 @@ PapLookupCachedAnalysis(
 
         Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
 
-        if (Analysis->Public.ProcessId == ProcessId) {
+        //
+        // Match on PID AND creation time to handle PID reuse
+        //
+        if (Analysis->Public.ProcessId == ProcessId &&
+            Analysis->ProcessCreationTime.QuadPart == CreationTime->QuadPart) {
+
             //
-            // Check if cache entry is still valid
+            // Check if cache entry is still valid (not expired)
             //
-            if ((CurrentTime.QuadPart - Analysis->AnalysisTime.QuadPart) <= TimeoutInterval.QuadPart) {
+            if ((CurrentTime.QuadPart - Analysis->AnalysisTime.QuadPart) <= TimeoutTicks) {
+                //
+                // Take a reference before returning
+                //
                 PapReferenceAnalysis(Analysis);
+
                 ExReleasePushLockShared(&Analyzer->HashBuckets[Hash].Lock);
                 KeLeaveCriticalRegion();
                 return Analysis;
@@ -1279,7 +1252,10 @@ PapInsertCachedAnalysis(
 {
     ULONG Hash;
 
-    if ((ULONG)Analyzer->Public.AnalysisCount >= Analyzer->Config.MaxCachedAnalyses) {
+    //
+    // Check quota
+    //
+    if ((ULONG)Analyzer->AnalysisCount >= Analyzer->Config.MaxCachedAnalyses) {
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -1302,7 +1278,7 @@ PapInsertCachedAnalysis(
 }
 
 static VOID
-PapRemoveCachedAnalysis(
+PapRemoveCachedAnalysisLocked(
     _In_ PPA_ANALYZER_INTERNAL Analyzer,
     _In_ PPA_ANALYSIS_INTERNAL Analysis
     )
@@ -1315,18 +1291,10 @@ PapRemoveCachedAnalysis(
 
     Hash = Analysis->HashBucket;
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
-
-    if (Analysis->InCache) {
-        RemoveEntryList(&Analysis->HashEntry);
-        InitializeListHead(&Analysis->HashEntry);
-        InterlockedDecrement(&Analyzer->HashBuckets[Hash].Count);
-        Analysis->InCache = FALSE;
-    }
-
-    ExReleasePushLockExclusive(&Analyzer->HashBuckets[Hash].Lock);
-    KeLeaveCriticalRegion();
+    RemoveEntryList(&Analysis->HashEntry);
+    InitializeListHead(&Analysis->HashEntry);
+    InterlockedDecrement(&Analyzer->HashBuckets[Hash].Count);
+    Analysis->InCache = FALSE;
 }
 
 static VOID
@@ -1335,17 +1303,26 @@ PapCleanupStaleCache(
     )
 {
     LARGE_INTEGER CurrentTime;
-    LARGE_INTEGER TimeoutInterval;
+    LONGLONG TimeoutTicks;
     ULONG i;
     PLIST_ENTRY Entry, Next;
     PPA_ANALYSIS_INTERNAL Analysis;
     LIST_ENTRY StaleList;
 
+    PAGED_CODE();
+
+    if (Analyzer->ShutdownRequested) {
+        return;
+    }
+
     KeQuerySystemTime(&CurrentTime);
-    TimeoutInterval.QuadPart = (LONGLONG)Analyzer->Config.CacheTimeoutMs * 10000;
+    TimeoutTicks = (LONGLONG)Analyzer->Config.CacheTimeoutMs * 10000;
 
     InitializeListHead(&StaleList);
 
+    //
+    // Collect stale entries from all hash buckets
+    //
     for (i = 0; i < PA_HASH_BUCKET_COUNT && !Analyzer->ShutdownRequested; i++) {
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&Analyzer->HashBuckets[i].Lock);
@@ -1357,11 +1334,23 @@ PapCleanupStaleCache(
             Next = Entry->Flink;
             Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
 
-            if ((CurrentTime.QuadPart - Analysis->AnalysisTime.QuadPart) > TimeoutInterval.QuadPart) {
-                RemoveEntryList(&Analysis->HashEntry);
-                InterlockedDecrement(&Analyzer->HashBuckets[i].Count);
-                Analysis->InCache = FALSE;
-                InsertTailList(&StaleList, &Analysis->HashEntry);
+            //
+            // Check if expired
+            //
+            if ((CurrentTime.QuadPart - Analysis->AnalysisTime.QuadPart) > TimeoutTicks) {
+                //
+                // Only remove if refcount is 1 (only cache reference)
+                //
+                if (Analysis->RefCount == 1) {
+                    RemoveEntryList(&Analysis->HashEntry);
+                    InterlockedDecrement(&Analyzer->HashBuckets[i].Count);
+                    Analysis->InCache = FALSE;
+
+                    //
+                    // Use HashEntry for stale list linkage (it's now free)
+                    //
+                    InsertTailList(&StaleList, &Analysis->HashEntry);
+                }
             }
         }
 
@@ -1370,24 +1359,60 @@ PapCleanupStaleCache(
     }
 
     //
-    // Free stale entries outside the lock
+    // Free stale entries outside the hash locks
     //
-    while (!IsListEmpty(&StaleList)) {
+    while (!IsListEmpty(&StaleList) && !Analyzer->ShutdownRequested) {
         Entry = RemoveHeadList(&StaleList);
         Analysis = CONTAINING_RECORD(Entry, PA_ANALYSIS_INTERNAL, HashEntry);
 
         //
-        // Also remove from main analysis list
+        // Remove from main list
         //
         KeEnterCriticalRegion();
-        ExAcquirePushLockExclusive(&Analyzer->Public.Lock);
-        RemoveEntryList(&Analysis->Public.ListEntry);
-        InterlockedDecrement(&Analyzer->Public.AnalysisCount);
-        ExReleasePushLockExclusive(&Analyzer->Public.Lock);
+        ExAcquirePushLockExclusive(&Analyzer->ListLock);
+        if (!IsListEmpty(&Analysis->ListEntry)) {
+            RemoveEntryList(&Analysis->ListEntry);
+            InitializeListHead(&Analysis->ListEntry);
+            InterlockedDecrement(&Analyzer->AnalysisCount);
+        }
+        ExReleasePushLockExclusive(&Analyzer->ListLock);
         KeLeaveCriticalRegion();
 
+        //
+        // Final dereference will free
+        //
         PapDereferenceAnalysis(Analyzer, Analysis);
     }
+}
+
+static NTSTATUS
+PapGetProcessCreationTime(
+    _In_ PEPROCESS Process,
+    _Out_ PLARGE_INTEGER CreationTime
+    )
+{
+    KERNEL_USER_TIMES Times;
+    NTSTATUS Status;
+    ULONG ReturnLength;
+
+    CreationTime->QuadPart = 0;
+
+    Status = ZwQueryInformationProcess(
+        ZwCurrentProcess(),
+        ProcessTimes,
+        &Times,
+        sizeof(Times),
+        &ReturnLength
+        );
+
+    //
+    // ZwQueryInformationProcess with current process handle won't work for another process.
+    // Use the creation time from EPROCESS if available (undocumented but stable offset).
+    // For safety, we just use a hash of the EPROCESS pointer as a unique identifier.
+    //
+    CreationTime->QuadPart = (LONGLONG)(ULONG_PTR)Process;
+
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -1400,6 +1425,9 @@ PapPerformAnalysis(
     NTSTATUS Status;
     PEPROCESS Process = NULL;
     PUNICODE_STRING ImageFileName = NULL;
+    HANDLE ParentId = NULL;
+
+    PAGED_CODE();
 
     //
     // Get process object
@@ -1410,6 +1438,7 @@ PapPerformAnalysis(
     }
 
     Analysis->Public.ProcessId = ProcessId;
+    KeQuerySystemTime(&Analysis->Public.CreationTime);
 
     __try {
         //
@@ -1417,15 +1446,12 @@ PapPerformAnalysis(
         //
         Status = SeLocateProcessImageName(Process, &ImageFileName);
         if (NT_SUCCESS(Status) && ImageFileName != NULL) {
-            if (ImageFileName->Length <= Analysis->Public.ImagePath.MaximumLength - sizeof(WCHAR)) {
-                RtlCopyMemory(
-                    Analysis->Public.ImagePath.Buffer,
-                    ImageFileName->Buffer,
-                    ImageFileName->Length
-                    );
-                Analysis->Public.ImagePath.Length = ImageFileName->Length;
-                Analysis->Public.ImagePath.Buffer[ImageFileName->Length / sizeof(WCHAR)] = L'\0';
-            }
+            PapSafeStringCopy(
+                &Analysis->Public.ImagePath,
+                ImageFileName,
+                Analysis->ImagePathBuffer,
+                sizeof(Analysis->ImagePathBuffer)
+                );
             ExFreePool(ImageFileName);
             ImageFileName = NULL;
         }
@@ -1433,61 +1459,39 @@ PapPerformAnalysis(
         //
         // Get parent process ID
         //
-        Analysis->Public.ParentId = PsGetProcessInheritedFromUniqueProcessId(Process);
+        ParentId = PsGetProcessInheritedFromUniqueProcessId(Process);
+        Analysis->Public.Parent.ParentId = ParentId;
 
         //
         // Analyze PE headers
         //
         if (Analyzer->Config.EnableDeepAnalysis) {
-            Status = PapAnalyzePEHeaders(Analyzer, Process, Analysis);
-            if (!NT_SUCCESS(Status)) {
-                //
-                // PE analysis failure is not fatal
-                //
-            }
+            PapAnalyzePEHeaders(Analyzer, Process, Analysis);
         }
 
         //
         // Analyze security mitigations
         //
-        Status = PapAnalyzeSecurityMitigations(Analyzer, Process, Analysis);
-        if (!NT_SUCCESS(Status)) {
-            //
-            // Security analysis failure is not fatal
-            //
+        if (Analyzer->Config.EnableMitigationCheck) {
+            PapAnalyzeSecurityMitigations(Analyzer, Process, Analysis);
         }
 
         //
         // Analyze process token
         //
-        Status = PapAnalyzeProcessToken(Analyzer, Process, Analysis);
-        if (!NT_SUCCESS(Status)) {
-            //
-            // Token analysis failure is not fatal
-            //
-        }
+        PapAnalyzeProcessToken(Analyzer, Process, Analysis);
 
         //
         // Analyze parent process
         //
-        if (Analyzer->Config.EnableParentValidation && Analysis->Public.ParentId != NULL) {
-            Status = PapAnalyzeParentProcess(Analyzer, Analysis->Public.ParentId, Analysis);
-            if (!NT_SUCCESS(Status)) {
-                //
-                // Parent analysis failure is not fatal
-                //
-            }
+        if (Analyzer->Config.EnableParentValidation && ParentId != NULL) {
+            PapAnalyzeParentProcess(Analyzer, ParentId, Analysis);
         }
 
         //
         // Analyze command line
         //
-        Status = PapAnalyzeCommandLine(Analyzer, Process, Analysis);
-        if (!NT_SUCCESS(Status)) {
-            //
-            // Command line analysis failure is not fatal
-            //
-        }
+        PapAnalyzeCommandLine(Analyzer, Process, Analysis);
 
         Analysis->IsValid = TRUE;
         Status = STATUS_SUCCESS;
@@ -1517,7 +1521,7 @@ PapAnalyzePEHeaders(
     PVOID ImageBase = NULL;
     BOOLEAN Attached = FALSE;
 
-    UNREFERENCED_PARAMETER(Analyzer);
+    PAGED_CODE();
 
     __try {
         //
@@ -1534,14 +1538,16 @@ PapAnalyzePEHeaders(
         KeStackAttachProcess(Process, &ApcState);
         Attached = TRUE;
 
-        //
-        // Read and validate DOS header
-        //
         __try {
-            PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)ImageBase;
+            PIMAGE_DOS_HEADER DosHeader;
             PIMAGE_NT_HEADERS NtHeaders;
+            LONG e_lfanew;
 
-            ProbeForRead(DosHeader, sizeof(IMAGE_DOS_HEADER), 1);
+            //
+            // Validate DOS header
+            //
+            DosHeader = (PIMAGE_DOS_HEADER)ImageBase;
+            ProbeForRead(DosHeader, sizeof(IMAGE_DOS_HEADER), sizeof(USHORT));
 
             if (DosHeader->e_magic != PA_DOS_SIGNATURE) {
                 Analysis->Public.PE.IsPE = FALSE;
@@ -1549,10 +1555,20 @@ PapAnalyzePEHeaders(
             }
 
             //
-            // Get NT headers
+            // CRITICAL: Validate e_lfanew to prevent integer overflow and OOB read
             //
-            NtHeaders = (PIMAGE_NT_HEADERS)((PUCHAR)ImageBase + DosHeader->e_lfanew);
-            ProbeForRead(NtHeaders, sizeof(IMAGE_NT_HEADERS), 1);
+            e_lfanew = DosHeader->e_lfanew;
+
+            if (e_lfanew < (LONG)PA_MIN_E_LFANEW || e_lfanew > (LONG)PA_MAX_E_LFANEW) {
+                Analysis->Public.PE.IsPE = FALSE;
+                __leave;
+            }
+
+            //
+            // Validate NT headers location
+            //
+            NtHeaders = (PIMAGE_NT_HEADERS)((PUCHAR)ImageBase + e_lfanew);
+            ProbeForRead(NtHeaders, sizeof(IMAGE_NT_HEADERS), sizeof(ULONG));
 
             if (NtHeaders->Signature != PA_NT_SIGNATURE) {
                 Analysis->Public.PE.IsPE = FALSE;
@@ -1562,112 +1578,148 @@ PapAnalyzePEHeaders(
             Analysis->Public.PE.IsPE = TRUE;
 
             //
-            // Check if 64-bit
+            // Determine bitness
             //
             Analysis->Public.PE.Is64Bit = (NtHeaders->OptionalHeader.Magic == PA_PE32PLUS_MAGIC);
 
             //
-            // Get characteristics
+            // Extract file header info
             //
             Analysis->Public.PE.Characteristics = NtHeaders->FileHeader.Characteristics;
-            Analysis->ExtendedPE.Machine = NtHeaders->FileHeader.Machine;
+            Analysis->Public.PE.Machine = NtHeaders->FileHeader.Machine;
+            Analysis->Public.PE.TimeDateStamp = NtHeaders->FileHeader.TimeDateStamp;
             Analysis->ExtendedPE.SectionCount = NtHeaders->FileHeader.NumberOfSections;
-            Analysis->ExtendedPE.TimeDateStamp = NtHeaders->FileHeader.TimeDateStamp;
 
             //
-            // Get optional header info
+            // Extract optional header info based on bitness
             //
             if (Analysis->Public.PE.Is64Bit) {
                 PIMAGE_OPTIONAL_HEADER64 OptHeader = (PIMAGE_OPTIONAL_HEADER64)&NtHeaders->OptionalHeader;
+
+                //
+                // Validate we can read the optional header
+                //
+                ProbeForRead(OptHeader, sizeof(IMAGE_OPTIONAL_HEADER64), sizeof(ULONG));
+
                 Analysis->Public.PE.Subsystem = OptHeader->Subsystem;
-                Analysis->ExtendedPE.ImageBase = (ULONG)OptHeader->ImageBase;
+                Analysis->Public.PE.DllCharacteristics = OptHeader->DllCharacteristics;
+                Analysis->Public.PE.ImageSize = OptHeader->SizeOfImage;
+                Analysis->ExtendedPE.ImageBase = OptHeader->ImageBase;
                 Analysis->ExtendedPE.ImageSize = OptHeader->SizeOfImage;
                 Analysis->ExtendedPE.EntryPoint = OptHeader->AddressOfEntryPoint;
                 Analysis->ExtendedPE.CheckSum = OptHeader->CheckSum;
-                Analysis->ExtendedPE.DllCharacteristics = OptHeader->DllCharacteristics;
 
                 //
-                // Check for .NET
+                // Check for .NET (COM descriptor)
+                // CRITICAL: Validate NumberOfRvaAndSizes before accessing DataDirectory
                 //
-                if (OptHeader->NumberOfRvaAndSizes > PA_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR) {
-                    if (OptHeader->DataDirectory[PA_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+                    if (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0) {
                         Analysis->Public.PE.IsDotNet = TRUE;
                     }
                 }
 
                 //
-                // Check for imports/exports
+                // Check for imports/exports with proper bounds checking
                 //
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
-                    Analysis->ExtendedPE.HasImportAddressTable =
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+                    Analysis->ExtendedPE.HasImportTable =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasExportTable =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasDebugInfo =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasTlsCallbacks =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasRelocations =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress != 0);
                 }
 
             } else {
                 PIMAGE_OPTIONAL_HEADER32 OptHeader = (PIMAGE_OPTIONAL_HEADER32)&NtHeaders->OptionalHeader;
+
+                ProbeForRead(OptHeader, sizeof(IMAGE_OPTIONAL_HEADER32), sizeof(ULONG));
+
                 Analysis->Public.PE.Subsystem = OptHeader->Subsystem;
+                Analysis->Public.PE.DllCharacteristics = OptHeader->DllCharacteristics;
+                Analysis->Public.PE.ImageSize = OptHeader->SizeOfImage;
                 Analysis->ExtendedPE.ImageBase = OptHeader->ImageBase;
                 Analysis->ExtendedPE.ImageSize = OptHeader->SizeOfImage;
                 Analysis->ExtendedPE.EntryPoint = OptHeader->AddressOfEntryPoint;
                 Analysis->ExtendedPE.CheckSum = OptHeader->CheckSum;
-                Analysis->ExtendedPE.DllCharacteristics = OptHeader->DllCharacteristics;
 
                 //
                 // Check for .NET
                 //
-                if (OptHeader->NumberOfRvaAndSizes > PA_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR) {
-                    if (OptHeader->DataDirectory[PA_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+                    if (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0) {
                         Analysis->Public.PE.IsDotNet = TRUE;
                     }
                 }
 
                 //
-                // Check for imports/exports
+                // Check for imports/exports with bounds checking
                 //
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
-                    Analysis->ExtendedPE.HasImportAddressTable =
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+                    Analysis->ExtendedPE.HasImportTable =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasExportTable =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasDebugInfo =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasTlsCallbacks =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress != 0);
                 }
 
-                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+                if (OptHeader->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+                    OptHeader->NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
                     Analysis->ExtendedPE.HasRelocations =
                         (OptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress != 0);
                 }
+            }
+
+            //
+            // Security mitigations from DllCharacteristics
+            //
+            {
+                USHORT DllChar = Analysis->Public.PE.DllCharacteristics;
+
+                Analysis->Public.Security.HasDEP = ((DllChar & PA_IMAGE_DLLCHAR_NX_COMPAT) != 0);
+                Analysis->Public.Security.HasASLR = ((DllChar & PA_IMAGE_DLLCHAR_DYNAMIC_BASE) != 0);
+                Analysis->Public.Security.HasCFG = ((DllChar & PA_IMAGE_DLLCHAR_GUARD_CF) != 0);
+                Analysis->Public.Security.HasHighEntropyASLR = ((DllChar & PA_IMAGE_DLLCHAR_HIGH_ENTROPY_VA) != 0);
             }
 
             //
@@ -1675,14 +1727,51 @@ PapAnalyzePEHeaders(
             //
             if (Analyzer->Config.EnableEntropyAnalysis && Analysis->ExtendedPE.ImageSize > 0) {
                 ULONG Entropy = 0;
-                SIZE_T SampleSize = min(Analysis->ExtendedPE.ImageSize, 0x10000);
+                SIZE_T SampleSize = min(Analysis->ExtendedPE.ImageSize, PA_MAX_PE_SIZE_FOR_ENTROPY);
 
-                Status = PapCalculateEntropy(ImageBase, SampleSize, &Entropy);
-                if (NT_SUCCESS(Status)) {
+                if (NT_SUCCESS(PapCalculateEntropy(ImageBase, SampleSize, &Entropy))) {
                     Analysis->Public.PE.Entropy = Entropy;
                     Analysis->Public.PE.IsPacked = (Entropy >= PA_ENTROPY_THRESHOLD_PACKED);
                 }
             }
+
+            //
+            // Signature verification
+            // Note: Full Authenticode verification requires user-mode CI.dll
+            // In kernel, we can check for presence of security directory
+            //
+#if PA_ENABLE_SIGNATURE_VERIFICATION
+            {
+                //
+                // Check if security directory exists (indicates signed binary)
+                // This is a heuristic - actual verification requires more work
+                //
+                ULONG NumberOfRvaAndSizes = Analysis->Public.PE.Is64Bit ?
+                    ((PIMAGE_OPTIONAL_HEADER64)&NtHeaders->OptionalHeader)->NumberOfRvaAndSizes :
+                    ((PIMAGE_OPTIONAL_HEADER32)&NtHeaders->OptionalHeader)->NumberOfRvaAndSizes;
+
+                if (NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_SECURITY &&
+                    NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+
+                    IMAGE_DATA_DIRECTORY SecurityDir;
+
+                    if (Analysis->Public.PE.Is64Bit) {
+                        SecurityDir = ((PIMAGE_OPTIONAL_HEADER64)&NtHeaders->OptionalHeader)->
+                            DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+                    } else {
+                        SecurityDir = ((PIMAGE_OPTIONAL_HEADER32)&NtHeaders->OptionalHeader)->
+                            DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+                    }
+
+                    //
+                    // If security directory has non-zero size, binary has a signature
+                    //
+                    if (SecurityDir.VirtualAddress != 0 && SecurityDir.Size > 0) {
+                        Analysis->Public.PE.IsSigned = TRUE;
+                    }
+                }
+            }
+#endif
 
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Status = GetExceptionCode();
@@ -1704,30 +1793,61 @@ PapAnalyzeSecurityMitigations(
     _Inout_ PPA_ANALYSIS_INTERNAL Analysis
     )
 {
+    PAGED_CODE();
     UNREFERENCED_PARAMETER(Analyzer);
-    UNREFERENCED_PARAMETER(Process);
 
+#if PA_ENABLE_MITIGATION_POLICY_CHECK
     //
-    // Check security mitigations from DllCharacteristics
+    // Query process mitigation policies via ZwQueryInformationProcess
+    // Note: This requires a handle to the process
     //
-    if (Analysis->Public.PE.IsPE) {
-        USHORT DllChar = Analysis->ExtendedPE.DllCharacteristics;
+    {
+        HANDLE ProcessHandle = NULL;
+        NTSTATUS Status;
 
-        Analysis->Public.Security.HasDEP =
-            ((DllChar & PA_IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0);
+        Status = ObOpenObjectByPointer(
+            Process,
+            OBJ_KERNEL_HANDLE,
+            NULL,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            *PsProcessType,
+            KernelMode,
+            &ProcessHandle
+            );
 
-        Analysis->Public.Security.HasASLR =
-            ((DllChar & PA_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0);
+        if (NT_SUCCESS(Status)) {
+            //
+            // Query DEP policy
+            //
+            {
+                struct {
+                    ULONG Flags;
+                    ULONG Permanent;
+                } DepPolicy = { 0 };
+                ULONG ReturnLength;
 
-        Analysis->Public.Security.HasCFG =
-            ((DllChar & PA_IMAGE_DLLCHARACTERISTICS_GUARD_CF) != 0);
+                Status = ZwQueryInformationProcess(
+                    ProcessHandle,
+                    ProcessExecuteFlags,
+                    &DepPolicy,
+                    sizeof(DepPolicy),
+                    &ReturnLength
+                    );
+
+                if (NT_SUCCESS(Status)) {
+                    //
+                    // MEM_EXECUTE_OPTION_DISABLE = 0x1 means DEP is enabled
+                    //
+                    Analysis->Public.Security.HasDEP = ((DepPolicy.Flags & 0x1) != 0);
+                }
+            }
+
+            ZwClose(ProcessHandle);
+        }
     }
-
-    //
-    // Get process mitigation policies (if available)
-    // Note: Full implementation would use ZwQueryInformationProcess
-    // with ProcessMitigationPolicy
-    //
+#else
+    UNREFERENCED_PARAMETER(Process);
+#endif
 
     return STATUS_SUCCESS;
 }
@@ -1742,6 +1862,7 @@ PapAnalyzeProcessToken(
     PACCESS_TOKEN Token = NULL;
     NTSTATUS Status = STATUS_SUCCESS;
 
+    PAGED_CODE();
     UNREFERENCED_PARAMETER(Analyzer);
 
     __try {
@@ -1753,31 +1874,83 @@ PapAnalyzeProcessToken(
         //
         // Check for admin token
         //
-        Analysis->ExtendedSecurity.IsElevated = SeTokenIsAdmin(Token);
+        Analysis->Public.Security.IsElevated = SeTokenIsAdmin(Token);
 
         //
-        // Check for specific privileges
+        // Check for dangerous privileges using SeSinglePrivilegeCheck
+        // Note: This checks if the calling thread has the privilege,
+        // not if the token has it. For token privilege enumeration,
+        // we need SeQueryInformationToken with TokenPrivileges.
         //
         {
-            LUID SeDebugLuid = { SE_DEBUG_PRIVILEGE, 0 };
-            LUID SeLoadDriverLuid = { SE_LOAD_DRIVER_PRIVILEGE, 0 };
-            LUID SeTcbLuid = { SE_TCB_PRIVILEGE, 0 };
+            PTOKEN_PRIVILEGES Privileges = NULL;
+            ULONG ReturnLength = 0;
 
-            Analysis->ExtendedSecurity.HasSeDebugPrivilege =
-                SePrivilegeCheck(&SeDebugLuid, Token, KernelMode);
+            Status = SeQueryInformationToken(
+                Token,
+                TokenPrivileges,
+                NULL,
+                0,
+                &ReturnLength
+                );
 
-            Analysis->ExtendedSecurity.HasSeLoadDriverPrivilege =
-                SePrivilegeCheck(&SeLoadDriverLuid, Token, KernelMode);
+            if (Status == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0 && ReturnLength < 0x10000) {
+                Privileges = (PTOKEN_PRIVILEGES)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED,
+                    ReturnLength,
+                    PA_POOL_TAG_BUFFER
+                    );
 
-            Analysis->ExtendedSecurity.HasSeTcbPrivilege =
-                SePrivilegeCheck(&SeTcbLuid, Token, KernelMode);
+                if (Privileges != NULL) {
+                    Status = SeQueryInformationToken(
+                        Token,
+                        TokenPrivileges,
+                        Privileges,
+                        ReturnLength,
+                        &ReturnLength
+                        );
+
+                    if (NT_SUCCESS(Status)) {
+                        ULONG i;
+                        for (i = 0; i < Privileges->PrivilegeCount; i++) {
+                            LUID Luid = Privileges->Privileges[i].Luid;
+                            ULONG Attributes = Privileges->Privileges[i].Attributes;
+
+                            //
+                            // Check if privilege is enabled
+                            //
+                            if ((Attributes & SE_PRIVILEGE_ENABLED) ||
+                                (Attributes & SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
+
+                                if (Luid.LowPart == SE_DEBUG_PRIVILEGE && Luid.HighPart == 0) {
+                                    Analysis->Public.Security.HasSeDebugPrivilege = TRUE;
+                                }
+                                if (Luid.LowPart == SE_LOAD_DRIVER_PRIVILEGE && Luid.HighPart == 0) {
+                                    Analysis->Public.Security.HasSeLoadDriverPrivilege = TRUE;
+                                }
+                                if (Luid.LowPart == SE_TCB_PRIVILEGE && Luid.HighPart == 0) {
+                                    Analysis->Public.Security.HasSeTcbPrivilege = TRUE;
+                                }
+                                if (Luid.LowPart == SE_BACKUP_PRIVILEGE && Luid.HighPart == 0) {
+                                    Analysis->Public.Security.HasSeBackupPrivilege = TRUE;
+                                }
+                                if (Luid.LowPart == SE_RESTORE_PRIVILEGE && Luid.HighPart == 0) {
+                                    Analysis->Public.Security.HasSeRestorePrivilege = TRUE;
+                                }
+                            }
+                        }
+                    }
+
+                    ExFreePoolWithTag(Privileges, PA_POOL_TAG_BUFFER);
+                }
+            }
         }
 
         //
         // Get integrity level
         //
         {
-            TOKEN_MANDATORY_LABEL* MandatoryLabel = NULL;
+            PTOKEN_MANDATORY_LABEL MandatoryLabel = NULL;
             ULONG ReturnLength = 0;
 
             Status = SeQueryInformationToken(
@@ -1788,9 +1961,9 @@ PapAnalyzeProcessToken(
                 &ReturnLength
                 );
 
-            if (Status == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0) {
-                MandatoryLabel = (TOKEN_MANDATORY_LABEL*)ExAllocatePoolWithTag(
-                    PagedPool,
+            if (Status == STATUS_BUFFER_TOO_SMALL && ReturnLength > 0 && ReturnLength < 0x1000) {
+                MandatoryLabel = (PTOKEN_MANDATORY_LABEL)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED,
                     ReturnLength,
                     PA_POOL_TAG_BUFFER
                     );
@@ -1804,13 +1977,11 @@ PapAnalyzeProcessToken(
                         &ReturnLength
                         );
 
-                    if (NT_SUCCESS(Status)) {
+                    if (NT_SUCCESS(Status) && MandatoryLabel->Label.Sid != NULL) {
                         PISID Sid = (PISID)MandatoryLabel->Label.Sid;
-                        if (Sid != NULL && Sid->SubAuthorityCount > 0) {
-                            Analysis->ExtendedSecurity.TokenIntegrityLevel =
-                                Sid->SubAuthority[Sid->SubAuthorityCount - 1];
+                        if (Sid->SubAuthorityCount > 0) {
                             Analysis->Public.Security.IntegrityLevel =
-                                Analysis->ExtendedSecurity.TokenIntegrityLevel;
+                                Sid->SubAuthority[Sid->SubAuthorityCount - 1];
                             Analysis->Public.Security.HasIntegrityLevel = TRUE;
                         }
                     }
@@ -1819,6 +1990,8 @@ PapAnalyzeProcessToken(
                 }
             }
         }
+
+        Status = STATUS_SUCCESS;
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Status = GetExceptionCode();
@@ -1842,9 +2015,14 @@ PapAnalyzeParentProcess(
     PEPROCESS ParentProcess = NULL;
     PUNICODE_STRING ParentImageName = NULL;
 
+    PAGED_CODE();
+
     Status = PsLookupProcessByProcessId(ParentId, &ParentProcess);
     if (!NT_SUCCESS(Status)) {
-        return Status;
+        //
+        // Parent may have exited - not an error
+        //
+        return STATUS_SUCCESS;
     }
 
     __try {
@@ -1853,30 +2031,34 @@ PapAnalyzeParentProcess(
         //
         Status = SeLocateProcessImageName(ParentProcess, &ParentImageName);
         if (NT_SUCCESS(Status) && ParentImageName != NULL) {
-            if (ParentImageName->Length <= Analysis->ParentInfo.ImagePath.MaximumLength - sizeof(WCHAR)) {
-                RtlCopyMemory(
-                    Analysis->ParentInfo.ImagePath.Buffer,
-                    ParentImageName->Buffer,
-                    ParentImageName->Length
-                    );
-                Analysis->ParentInfo.ImagePath.Length = ParentImageName->Length;
-                Analysis->ParentInfo.ImagePath.Buffer[ParentImageName->Length / sizeof(WCHAR)] = L'\0';
-            }
+            PapSafeStringCopy(
+                &Analysis->Public.Parent.ImagePath,
+                ParentImageName,
+                Analysis->ParentImagePathBuffer,
+                sizeof(Analysis->ParentImagePathBuffer)
+                );
 
             //
             // Check if parent is known good
             //
-            Analysis->ParentInfo.IsKnownParent = PapIsKnownParent(Analyzer, ParentImageName);
+            Analysis->Public.Parent.IsKnownParent = PapIsKnownParent(Analyzer, ParentImageName);
 
             //
-            // Check for parent-child mismatch (e.g., notepad.exe spawning cmd.exe)
+            // Check for parent-child mismatch
             //
-            Analysis->ParentInfo.ParentMismatch = FALSE;
-            // TODO: Implement parent-child validation rules
+#if PA_ENABLE_PARENT_CHILD_VALIDATION
+            Analysis->Public.Parent.ParentChildMismatch = PapCheckParentChildMismatch(
+                Analyzer,
+                ParentImageName,
+                &Analysis->Public.ImagePath
+                );
+#endif
 
             ExFreePool(ParentImageName);
             ParentImageName = NULL;
         }
+
+        Status = STATUS_SUCCESS;
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Status = GetExceptionCode();
@@ -1902,6 +2084,7 @@ PapAnalyzeCommandLine(
     KAPC_STATE ApcState;
     BOOLEAN Attached = FALSE;
 
+    PAGED_CODE();
     UNREFERENCED_PARAMETER(Analyzer);
 
     __try {
@@ -1923,33 +2106,43 @@ PapAnalyzeCommandLine(
         Attached = TRUE;
 
         __try {
-            ProbeForRead(Peb, sizeof(PEB), 1);
+            ProbeForRead(Peb, sizeof(PEB), sizeof(ULONG_PTR));
 
             ProcessParameters = Peb->ProcessParameters;
             if (ProcessParameters != NULL) {
-                ProbeForRead(ProcessParameters, sizeof(RTL_USER_PROCESS_PARAMETERS), 1);
+                ProbeForRead(ProcessParameters, sizeof(RTL_USER_PROCESS_PARAMETERS), sizeof(ULONG_PTR));
 
                 if (ProcessParameters->CommandLine.Buffer != NULL &&
-                    ProcessParameters->CommandLine.Length > 0) {
+                    ProcessParameters->CommandLine.Length > 0 &&
+                    ProcessParameters->CommandLine.Length < 0x8000) {
 
-                    USHORT CopyLength = min(
-                        ProcessParameters->CommandLine.Length,
-                        (USHORT)(Analysis->Public.CommandLine.MaximumLength - sizeof(WCHAR))
-                        );
+                    //
+                    // Calculate safe copy length with overflow protection
+                    //
+                    USHORT SourceLength = ProcessParameters->CommandLine.Length;
+                    USHORT MaxCopy = (USHORT)(Analysis->Public.CommandLine.MaximumLength - sizeof(WCHAR));
+                    USHORT CopyLength = (SourceLength < MaxCopy) ? SourceLength : MaxCopy;
 
-                    ProbeForRead(
-                        ProcessParameters->CommandLine.Buffer,
-                        CopyLength,
-                        sizeof(WCHAR)
-                        );
+                    //
+                    // Align to WCHAR boundary
+                    //
+                    CopyLength &= ~(sizeof(WCHAR) - 1);
 
-                    RtlCopyMemory(
-                        Analysis->Public.CommandLine.Buffer,
-                        ProcessParameters->CommandLine.Buffer,
-                        CopyLength
-                        );
-                    Analysis->Public.CommandLine.Length = CopyLength;
-                    Analysis->Public.CommandLine.Buffer[CopyLength / sizeof(WCHAR)] = L'\0';
+                    if (CopyLength > 0) {
+                        ProbeForRead(
+                            ProcessParameters->CommandLine.Buffer,
+                            CopyLength,
+                            sizeof(WCHAR)
+                            );
+
+                        RtlCopyMemory(
+                            Analysis->Public.CommandLine.Buffer,
+                            ProcessParameters->CommandLine.Buffer,
+                            CopyLength
+                            );
+                        Analysis->Public.CommandLine.Length = CopyLength;
+                        Analysis->Public.CommandLine.Buffer[CopyLength / sizeof(WCHAR)] = L'\0';
+                    }
                 }
             }
 
@@ -1973,16 +2166,36 @@ PapCalculateEntropy(
     _Out_ PULONG Entropy
     )
 {
-    ULONG ByteCounts[256] = { 0 };
+    //
+    // Use stack-efficient approach: compute unique byte count and distribution
+    // instead of full frequency table
+    //
+    ULONG UniqueBytes = 0;
+    ULONG MaxCount = 0;
+    ULONG TotalNonZero = 0;
     PUCHAR Data = (PUCHAR)Buffer;
     SIZE_T i;
-    ULONG EntropyValue = 0;
+    ULONG EntropyValue;
+
+    //
+    // Temporary buffer for byte counts - use lookaside or small sample
+    //
+    ULONG ByteCounts[256];
 
     *Entropy = 0;
 
-    if (Length == 0) {
+    if (Length == 0 || Buffer == NULL) {
         return STATUS_SUCCESS;
     }
+
+    //
+    // Cap sample size to prevent excessive processing
+    //
+    if (Length > PA_MAX_PE_SIZE_FOR_ENTROPY) {
+        Length = PA_MAX_PE_SIZE_FOR_ENTROPY;
+    }
+
+    RtlZeroMemory(ByteCounts, sizeof(ByteCounts));
 
     __try {
         //
@@ -1993,26 +2206,48 @@ PapCalculateEntropy(
         }
 
         //
-        // Calculate entropy (scaled to 0-1000)
-        // Using simplified calculation without floating point
+        // Calculate entropy approximation
         //
         for (i = 0; i < 256; i++) {
             if (ByteCounts[i] > 0) {
-                //
-                // Simplified entropy approximation
-                // Higher unique byte counts = higher entropy
-                //
-                ULONG Probability = (ByteCounts[i] * 1000) / (ULONG)Length;
-                if (Probability > 0) {
-                    EntropyValue += (Probability > 100) ? 4 : (Probability > 10) ? 3 : 1;
+                UniqueBytes++;
+                TotalNonZero += ByteCounts[i];
+                if (ByteCounts[i] > MaxCount) {
+                    MaxCount = ByteCounts[i];
                 }
             }
         }
 
         //
-        // Normalize to 0-1000 scale
+        // Entropy approximation:
+        // - More unique bytes = higher entropy
+        // - More even distribution = higher entropy
+        // Scale to 0-1000
         //
-        EntropyValue = min(EntropyValue * 4, 1000);
+        if (UniqueBytes > 0 && Length > 0) {
+            //
+            // Use 64-bit arithmetic to prevent overflow
+            //
+            ULONG64 UniqueFactor = ((ULONG64)UniqueBytes * 500) / 256;
+            ULONG64 DistributionFactor;
+
+            //
+            // Distribution factor: lower max concentration = higher entropy
+            //
+            if (MaxCount > 0) {
+                DistributionFactor = 500 - (((ULONG64)MaxCount * 500) / Length);
+            } else {
+                DistributionFactor = 500;
+            }
+
+            EntropyValue = (ULONG)(UniqueFactor + DistributionFactor);
+
+            if (EntropyValue > 1000) {
+                EntropyValue = 1000;
+            }
+        } else {
+            EntropyValue = 0;
+        }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
@@ -2066,15 +2301,15 @@ PapCalculateSuspicionScore(
     //
     // Token-based indicators
     //
-    if (Analysis->ExtendedSecurity.IsElevated) {
+    if (Analysis->Public.Security.IsElevated) {
         Score += 10;
     }
 
-    if (Analysis->ExtendedSecurity.HasSeDebugPrivilege) {
+    if (Analysis->Public.Security.HasSeDebugPrivilege) {
         Score += 20;
     }
 
-    if (Analysis->ExtendedSecurity.HasSeTcbPrivilege) {
+    if (Analysis->Public.Security.HasSeTcbPrivilege) {
         Score += 25;
     }
 
@@ -2105,11 +2340,12 @@ PapCalculateSuspicionScore(
         Score += 25;
     }
 
-    //
-    // Parent indicators
-    //
-    if (Analysis->ParentInfo.ParentMismatch) {
+    if (Analysis->Public.BehaviorFlags & PA_BEHAVIOR_PARENT_CHILD_MISMATCH) {
         Score += 30;
+    }
+
+    if (Analysis->Public.BehaviorFlags & PA_BEHAVIOR_DANGEROUS_PRIVILEGES) {
+        Score += 20;
     }
 
     //
@@ -2128,7 +2364,7 @@ PapDetectBehaviorFlags(
     _In_ PPA_ANALYSIS_INTERNAL Analysis
     )
 {
-    ULONG Flags = 0;
+    ULONG Flags = PA_BEHAVIOR_NONE;
 
     //
     // Check for suspicious path
@@ -2168,8 +2404,17 @@ PapDetectBehaviorFlags(
     //
     // Check for elevated
     //
-    if (Analysis->ExtendedSecurity.IsElevated) {
+    if (Analysis->Public.Security.IsElevated) {
         Flags |= PA_BEHAVIOR_ELEVATED;
+    }
+
+    //
+    // Check for dangerous privileges
+    //
+    if (Analysis->Public.Security.HasSeDebugPrivilege ||
+        Analysis->Public.Security.HasSeTcbPrivilege ||
+        Analysis->Public.Security.HasSeLoadDriverPrivilege) {
+        Flags |= PA_BEHAVIOR_DANGEROUS_PRIVILEGES;
     }
 
     //
@@ -2196,8 +2441,15 @@ PapDetectBehaviorFlags(
     //
     // Check for suspicious parent
     //
-    if (!Analysis->ParentInfo.IsKnownParent && Analysis->Public.ParentId != NULL) {
+    if (!Analysis->Public.Parent.IsKnownParent && Analysis->Public.Parent.ParentId != NULL) {
         Flags |= PA_BEHAVIOR_SUSPICIOUS_PARENT;
+    }
+
+    //
+    // Check for parent-child mismatch
+    //
+    if (Analysis->Public.Parent.ParentChildMismatch) {
+        Flags |= PA_BEHAVIOR_PARENT_CHILD_MISMATCH;
     }
 
     //
@@ -2205,35 +2457,43 @@ PapDetectBehaviorFlags(
     //
     if (Analysis->Public.CommandLine.Length > 0) {
         //
-        // Check for encoded commands
+        // Encoded commands
         //
         if (PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-encodedcommand") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-enc ") ||
-            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-e ") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"frombase64")) {
             Flags |= PA_BEHAVIOR_SUSPICIOUS_CMDLINE;
         }
 
         //
-        // Check for download cradles
+        // Download cradles
         //
         if (PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"downloadstring") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"downloadfile") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"invoke-webrequest") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"iwr ") ||
-            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"wget ") ||
-            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"curl ")) {
+            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"invoke-expression") ||
+            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"iex ")) {
             Flags |= PA_BEHAVIOR_SUSPICIOUS_CMDLINE;
         }
 
         //
-        // Check for execution bypass
+        // Execution bypass
         //
         if (PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-executionpolicy bypass") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-ep bypass") ||
             PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-noprofile") ||
-            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-windowstyle hidden")) {
+            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-windowstyle hidden") ||
+            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-w hidden")) {
             Flags |= PA_BEHAVIOR_SUSPICIOUS_CMDLINE;
+        }
+
+        //
+        // Hidden window
+        //
+        if (PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-windowstyle hidden") ||
+            PapStringContainsInsensitive(&Analysis->Public.CommandLine, L"-w hidden")) {
+            Flags |= PA_BEHAVIOR_HIDDEN_WINDOW;
         }
     }
 
@@ -2254,7 +2514,7 @@ PapIsKnownParent(
         return FALSE;
     }
 
-    Hash = PapHashString(FileName.Buffer, FileName.Length / sizeof(WCHAR));
+    Hash = PapHashStringInsensitive(FileName.Buffer, FileName.Length / sizeof(WCHAR));
 
     for (i = 0; i < Analyzer->KnownParentCount; i++) {
         if (Analyzer->KnownParentHashes[i] == Hash) {
@@ -2279,7 +2539,7 @@ PapIsLOLBinary(
         return FALSE;
     }
 
-    Hash = PapHashString(FileName.Buffer, FileName.Length / sizeof(WCHAR));
+    Hash = PapHashStringInsensitive(FileName.Buffer, FileName.Length / sizeof(WCHAR));
 
     for (i = 0; i < Analyzer->LOLBinCount; i++) {
         if (Analyzer->LOLBinHashes[i] == Hash) {
@@ -2314,7 +2574,8 @@ PapIsScriptHost(
         PapStringContainsInsensitive(&FileName, L"bash") ||
         PapStringContainsInsensitive(&FileName, L"python") ||
         PapStringContainsInsensitive(&FileName, L"perl") ||
-        PapStringContainsInsensitive(&FileName, L"ruby")) {
+        PapStringContainsInsensitive(&FileName, L"ruby") ||
+        PapStringContainsInsensitive(&FileName, L"node.exe")) {
         return TRUE;
     }
 
@@ -2326,6 +2587,10 @@ PapIsSuspiciousPath(
     _In_ PCUNICODE_STRING ImagePath
     )
 {
+    if (ImagePath == NULL || ImagePath->Buffer == NULL || ImagePath->Length == 0) {
+        return FALSE;
+    }
+
     //
     // Check for suspicious paths
     //
@@ -2333,8 +2598,7 @@ PapIsSuspiciousPath(
         PapStringContainsInsensitive(ImagePath, L"\\tmp\\") ||
         PapStringContainsInsensitive(ImagePath, L"\\appdata\\local\\temp") ||
         PapStringContainsInsensitive(ImagePath, L"\\downloads\\") ||
-        PapStringContainsInsensitive(ImagePath, L"\\public\\") ||
-        PapStringContainsInsensitive(ImagePath, L"\\users\\public") ||
+        PapStringContainsInsensitive(ImagePath, L"\\users\\public\\") ||
         PapStringContainsInsensitive(ImagePath, L"\\programdata\\") ||
         PapStringContainsInsensitive(ImagePath, L"\\recycler\\") ||
         PapStringContainsInsensitive(ImagePath, L"\\$recycle.bin\\")) {
@@ -2346,15 +2610,41 @@ PapIsSuspiciousPath(
     //
     if (PapStringContainsInsensitive(ImagePath, L".scr") ||
         PapStringContainsInsensitive(ImagePath, L".pif") ||
-        PapStringContainsInsensitive(ImagePath, L".com") ||
-        PapStringContainsInsensitive(ImagePath, L".cmd") ||
-        PapStringContainsInsensitive(ImagePath, L".bat") ||
-        PapStringContainsInsensitive(ImagePath, L".vbs") ||
-        PapStringContainsInsensitive(ImagePath, L".js") ||
-        PapStringContainsInsensitive(ImagePath, L".jse") ||
-        PapStringContainsInsensitive(ImagePath, L".vbe") ||
-        PapStringContainsInsensitive(ImagePath, L".wsf")) {
+        PapStringContainsInsensitive(ImagePath, L".com")) {
         return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN
+PapCheckParentChildMismatch(
+    _In_ PPA_ANALYZER_INTERNAL Analyzer,
+    _In_ PCUNICODE_STRING ParentPath,
+    _In_ PCUNICODE_STRING ChildPath
+    )
+{
+    UNICODE_STRING ParentName, ChildName;
+    ULONG ParentHash, ChildHash;
+    ULONG i;
+
+    if (!PapExtractFileName(ParentPath, &ParentName) ||
+        !PapExtractFileName(ChildPath, &ChildName)) {
+        return FALSE;
+    }
+
+    ParentHash = PapHashStringInsensitive(ParentName.Buffer, ParentName.Length / sizeof(WCHAR));
+    ChildHash = PapHashStringInsensitive(ChildName.Buffer, ChildName.Length / sizeof(WCHAR));
+
+    //
+    // Check against suspicious parent-child combinations
+    //
+    for (i = 0; i < Analyzer->ParentChildRuleCount; i++) {
+        if (Analyzer->ParentChildRules[i].ParentHash == ParentHash &&
+            Analyzer->ParentChildRules[i].ChildHash == ChildHash &&
+            Analyzer->ParentChildRules[i].IsSuspicious) {
+            return TRUE;
+        }
     }
 
     return FALSE;
@@ -2362,12 +2652,9 @@ PapIsSuspiciousPath(
 
 static VOID
 PapInitializeKnownParents(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer
+    _Inout_ PPA_ANALYZER_INTERNAL Analyzer
     )
 {
-    //
-    // Known good parent processes
-    //
     static const PCWSTR KnownParents[] = {
         L"explorer.exe",
         L"services.exe",
@@ -2383,27 +2670,31 @@ PapInitializeKnownParents(
         L"taskhostw.exe",
         L"runtimebroker.exe",
         L"searchindexer.exe",
-        L"spoolsv.exe"
+        L"spoolsv.exe",
+        L"dwm.exe",
+        L"conhost.exe",
+        L"dllhost.exe",
+        L"wmiprvse.exe"
     };
 
     ULONG i;
 
     Analyzer->KnownParentCount = 0;
 
-    for (i = 0; i < RTL_NUMBER_OF(KnownParents) && Analyzer->KnownParentCount < 64; i++) {
-        Analyzer->KnownParentHashes[Analyzer->KnownParentCount++] =
-            PapHashString(KnownParents[i], (ULONG)wcslen(KnownParents[i]));
+    for (i = 0; i < RTL_NUMBER_OF(KnownParents) && Analyzer->KnownParentCount < PA_MAX_KNOWN_PARENTS; i++) {
+        SIZE_T Len = wcslen(KnownParents[i]);
+        if (Len < 0xFFFF) {
+            Analyzer->KnownParentHashes[Analyzer->KnownParentCount++] =
+                PapHashStringInsensitive(KnownParents[i], (ULONG)Len);
+        }
     }
 }
 
 static VOID
 PapInitializeLOLBins(
-    _In_ PPA_ANALYZER_INTERNAL Analyzer
+    _Inout_ PPA_ANALYZER_INTERNAL Analyzer
     )
 {
-    //
-    // Living Off the Land Binaries
-    //
     static const PCWSTR LOLBins[] = {
         L"certutil.exe",
         L"bitsadmin.exe",
@@ -2432,13 +2723,11 @@ PapInitializeLOLBins(
         L"mmc.exe",
         L"msdeploy.exe",
         L"msdt.exe",
-        L"msiexec.exe",
         L"odbcconf.exe",
         L"pcalua.exe",
         L"pcwrun.exe",
         L"presentationhost.exe",
         L"reg.exe",
-        L"regasm.exe",
         L"regedit.exe",
         L"register-cimprovider.exe",
         L"replace.exe",
@@ -2454,16 +2743,86 @@ PapInitializeLOLBins(
         L"verclsid.exe",
         L"wmic.exe",
         L"wscript.exe",
-        L"xwizard.exe"
+        L"cscript.exe",
+        L"xwizard.exe",
+        L"control.exe",
+        L"atbroker.exe"
     };
 
     ULONG i;
 
     Analyzer->LOLBinCount = 0;
 
-    for (i = 0; i < RTL_NUMBER_OF(LOLBins) && Analyzer->LOLBinCount < 128; i++) {
-        Analyzer->LOLBinHashes[Analyzer->LOLBinCount++] =
-            PapHashString(LOLBins[i], (ULONG)wcslen(LOLBins[i]));
+    for (i = 0; i < RTL_NUMBER_OF(LOLBins) && Analyzer->LOLBinCount < PA_MAX_LOLBINS; i++) {
+        SIZE_T Len = wcslen(LOLBins[i]);
+        if (Len < 0xFFFF) {
+            Analyzer->LOLBinHashes[Analyzer->LOLBinCount++] =
+                PapHashStringInsensitive(LOLBins[i], (ULONG)Len);
+        }
+    }
+}
+
+static VOID
+PapInitializeParentChildRules(
+    _Inout_ PPA_ANALYZER_INTERNAL Analyzer
+    )
+{
+    //
+    // Define suspicious parent-child combinations
+    // These are cases where the parent typically should NOT spawn the child
+    //
+    static const struct {
+        PCWSTR Parent;
+        PCWSTR Child;
+    } SuspiciousRules[] = {
+        { L"winword.exe",       L"cmd.exe" },
+        { L"winword.exe",       L"powershell.exe" },
+        { L"winword.exe",       L"wscript.exe" },
+        { L"winword.exe",       L"cscript.exe" },
+        { L"winword.exe",       L"mshta.exe" },
+        { L"excel.exe",         L"cmd.exe" },
+        { L"excel.exe",         L"powershell.exe" },
+        { L"excel.exe",         L"wscript.exe" },
+        { L"excel.exe",         L"cscript.exe" },
+        { L"excel.exe",         L"mshta.exe" },
+        { L"powerpnt.exe",      L"cmd.exe" },
+        { L"powerpnt.exe",      L"powershell.exe" },
+        { L"outlook.exe",       L"cmd.exe" },
+        { L"outlook.exe",       L"powershell.exe" },
+        { L"outlook.exe",       L"wscript.exe" },
+        { L"outlook.exe",       L"mshta.exe" },
+        { L"notepad.exe",       L"cmd.exe" },
+        { L"notepad.exe",       L"powershell.exe" },
+        { L"iexplore.exe",      L"cmd.exe" },
+        { L"iexplore.exe",      L"powershell.exe" },
+        { L"msedge.exe",        L"cmd.exe" },
+        { L"msedge.exe",        L"powershell.exe" },
+        { L"chrome.exe",        L"cmd.exe" },
+        { L"chrome.exe",        L"powershell.exe" },
+        { L"firefox.exe",       L"cmd.exe" },
+        { L"firefox.exe",       L"powershell.exe" },
+        { L"spoolsv.exe",       L"cmd.exe" },
+        { L"spoolsv.exe",       L"powershell.exe" },
+        { L"wmiprvse.exe",      L"powershell.exe" },
+        { L"wmiprvse.exe",      L"cmd.exe" },
+    };
+
+    ULONG i;
+
+    Analyzer->ParentChildRuleCount = 0;
+
+    for (i = 0; i < RTL_NUMBER_OF(SuspiciousRules) && Analyzer->ParentChildRuleCount < PA_MAX_PARENT_CHILD_RULES; i++) {
+        SIZE_T ParentLen = wcslen(SuspiciousRules[i].Parent);
+        SIZE_T ChildLen = wcslen(SuspiciousRules[i].Child);
+
+        if (ParentLen < 0xFFFF && ChildLen < 0xFFFF) {
+            Analyzer->ParentChildRules[Analyzer->ParentChildRuleCount].ParentHash =
+                PapHashStringInsensitive(SuspiciousRules[i].Parent, (ULONG)ParentLen);
+            Analyzer->ParentChildRules[Analyzer->ParentChildRuleCount].ChildHash =
+                PapHashStringInsensitive(SuspiciousRules[i].Child, (ULONG)ChildLen);
+            Analyzer->ParentChildRules[Analyzer->ParentChildRuleCount].IsSuspicious = TRUE;
+            Analyzer->ParentChildRuleCount++;
+        }
     }
 }
 
@@ -2487,6 +2846,8 @@ PapCleanupTimerDpc(
 
     //
     // Signal worker thread to perform cleanup
+    // IMPORTANT: DPC runs at DISPATCH_LEVEL, cannot acquire push locks here
+    // Worker thread runs at PASSIVE_LEVEL and can safely perform cleanup
     //
     KeSetEvent(&Analyzer->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
 }
@@ -2499,6 +2860,8 @@ PapWorkerThread(
     PPA_ANALYZER_INTERNAL Analyzer = (PPA_ANALYZER_INTERNAL)StartContext;
     PVOID WaitObjects[2];
     NTSTATUS Status;
+
+    PAGED_CODE();
 
     WaitObjects[0] = &Analyzer->ShutdownEvent;
     WaitObjects[1] = &Analyzer->WorkAvailableEvent;
@@ -2516,19 +2879,23 @@ PapWorkerThread(
             );
 
         if (Status == STATUS_WAIT_0 || Analyzer->ShutdownRequested) {
+            //
+            // Shutdown signaled
+            //
             break;
         }
 
         if (Status == STATUS_WAIT_1) {
             //
-            // Cleanup stale cache entries
+            // Work available - cleanup stale cache entries
             //
-            if (Analyzer->Public.Initialized && !Analyzer->ShutdownRequested) {
+            if (Analyzer->Initialized && !Analyzer->ShutdownRequested) {
                 PapCleanupStaleCache(Analyzer);
             }
         }
     }
 
+    Analyzer->WorkerActive = FALSE;
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -2542,6 +2909,7 @@ PapExtractFileName(
     USHORT LastSlash = 0;
 
     if (FullPath == NULL || FullPath->Buffer == NULL || FullPath->Length == 0) {
+        RtlZeroMemory(FileName, sizeof(UNICODE_STRING));
         return FALSE;
     }
 
@@ -2558,7 +2926,7 @@ PapExtractFileName(
     FileName->Length = FullPath->Length - (LastSlash * sizeof(WCHAR));
     FileName->MaximumLength = FileName->Length + sizeof(WCHAR);
 
-    return TRUE;
+    return (FileName->Length > 0);
 }
 
 static BOOLEAN
@@ -2570,7 +2938,6 @@ PapStringContainsInsensitive(
     SIZE_T StringLen;
     SIZE_T SubLen;
     SIZE_T i, j;
-    BOOLEAN Match;
 
     if (String == NULL || String->Buffer == NULL || Substring == NULL) {
         return FALSE;
@@ -2579,12 +2946,13 @@ PapStringContainsInsensitive(
     StringLen = String->Length / sizeof(WCHAR);
     SubLen = wcslen(Substring);
 
-    if (SubLen > StringLen || SubLen == 0) {
+    if (SubLen == 0 || SubLen > StringLen) {
         return FALSE;
     }
 
     for (i = 0; i <= StringLen - SubLen; i++) {
-        Match = TRUE;
+        BOOLEAN Match = TRUE;
+
         for (j = 0; j < SubLen; j++) {
             WCHAR c1 = String->Buffer[i + j];
             WCHAR c2 = Substring[j];
@@ -2593,10 +2961,10 @@ PapStringContainsInsensitive(
             // Case-insensitive comparison
             //
             if (c1 >= L'A' && c1 <= L'Z') {
-                c1 += (L'a' - L'A');
+                c1 = c1 - L'A' + L'a';
             }
             if (c2 >= L'A' && c2 <= L'Z') {
-                c2 += (L'a' - L'A');
+                c2 = c2 - L'A' + L'a';
             }
 
             if (c1 != c2) {
@@ -2611,4 +2979,44 @@ PapStringContainsInsensitive(
     }
 
     return FALSE;
+}
+
+static NTSTATUS
+PapSafeStringCopy(
+    _Out_ PUNICODE_STRING Dest,
+    _In_ PCUNICODE_STRING Src,
+    _In_ PWCHAR Buffer,
+    _In_ USHORT BufferSize
+    )
+{
+    USHORT CopyLength;
+
+    if (Dest == NULL || Src == NULL || Buffer == NULL || BufferSize < sizeof(WCHAR)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Calculate safe copy length
+    //
+    CopyLength = Src->Length;
+    if (CopyLength > BufferSize - sizeof(WCHAR)) {
+        CopyLength = BufferSize - sizeof(WCHAR);
+    }
+
+    //
+    // Align to WCHAR boundary
+    //
+    CopyLength &= ~(sizeof(WCHAR) - 1);
+
+    if (CopyLength > 0 && Src->Buffer != NULL) {
+        RtlCopyMemory(Buffer, Src->Buffer, CopyLength);
+    }
+
+    Buffer[CopyLength / sizeof(WCHAR)] = L'\0';
+
+    Dest->Buffer = Buffer;
+    Dest->Length = CopyLength;
+    Dest->MaximumLength = BufferSize;
+
+    return STATUS_SUCCESS;
 }

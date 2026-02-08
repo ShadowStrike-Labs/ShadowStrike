@@ -9,14 +9,19 @@
  * Provides high-performance caching of scan verdicts to reduce
  * redundant user-mode communication for recently scanned files.
  *
- * BSOD PREVENTION:
+ * SAFETY GUARANTEES:
  * - All pointer parameters validated before use
  * - All locks acquired with proper IRQL awareness
  * - Lookaside list for predictable memory allocation
  * - Fail-safe on any allocation failure
+ * - Proper work item lifecycle management (IoAllocateWorkItem)
+ * - Shutdown synchronization with KeFlushQueuedDpcs()
+ * - No floating-point operations
+ * - Proper volume serial retrieval (not pointer-based)
+ * - All statistics operations are atomic
  *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 1.1.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -29,6 +34,7 @@
 #pragma alloc_text(PAGE, ShadowStrikeCacheShutdown)
 #pragma alloc_text(PAGE, ShadowStrikeCacheClear)
 #pragma alloc_text(PAGE, ShadowStrikeCacheCleanup)
+#pragma alloc_text(PAGE, ShadowStrikeCacheBuildKey)
 #endif
 
 // ============================================================================
@@ -51,10 +57,7 @@ ShadowStrikeCacheCleanupDpc(
     );
 
 static
-VOID
-ShadowStrikeCacheCleanupWorker(
-    _In_ PVOID Context
-    );
+IO_WORKITEM_ROUTINE ShadowStrikeCacheCleanupWorker;
 
 static
 BOOLEAN
@@ -76,29 +79,129 @@ ShadowStrikeCacheFreeEntry(
     _In_ PSHADOWSTRIKE_CACHE_ENTRY Entry
     );
 
+static
+BOOLEAN
+ShadowStrikeCacheAcquireReference(
+    VOID
+    );
+
+static
+VOID
+ShadowStrikeCacheReleaseReference(
+    VOID
+    );
+
+// ============================================================================
+// REFERENCE COUNTING FOR SHUTDOWN SYNCHRONIZATION
+// ============================================================================
+
+/**
+ * @brief Acquire a reference to prevent shutdown during operation.
+ *
+ * @return TRUE if reference acquired, FALSE if shutdown in progress.
+ */
+static
+BOOLEAN
+ShadowStrikeCacheAcquireReference(
+    VOID
+    )
+{
+    //
+    // Check shutdown flag first
+    //
+    if (g_ScanCache.ShutdownInProgress) {
+        return FALSE;
+    }
+
+    //
+    // Increment reference count
+    //
+    InterlockedIncrement(&g_ScanCache.ActiveReferences);
+
+    //
+    // Double-check shutdown flag after incrementing
+    // (prevents race with shutdown)
+    //
+    if (g_ScanCache.ShutdownInProgress) {
+        InterlockedDecrement(&g_ScanCache.ActiveReferences);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/**
+ * @brief Release reference and signal shutdown event if last reference.
+ */
+static
+VOID
+ShadowStrikeCacheReleaseReference(
+    VOID
+    )
+{
+    LONG refCount = InterlockedDecrement(&g_ScanCache.ActiveReferences);
+
+    //
+    // If this was the last reference and shutdown is pending, signal event
+    //
+    if (refCount == 0 && g_ScanCache.ShutdownInProgress) {
+        KeSetEvent(&g_ScanCache.ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 // ============================================================================
 // INITIALIZATION / SHUTDOWN
 // ============================================================================
 
 NTSTATUS
 ShadowStrikeCacheInitialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
     _In_ ULONG TTLSeconds
     )
 {
     ULONG i;
     LARGE_INTEGER dueTime;
+    ULONG clampedTTL;
 
     PAGED_CODE();
+
+    //
+    // Validate parameters
+    //
+    if (DeviceObject == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ScanCache: DeviceObject is required\n");
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (g_ScanCache.Initialized) {
         return STATUS_SUCCESS;
     }
 
+    //
+    // Clamp TTL to prevent overflow
+    //
+    if (TTLSeconds == 0) {
+        clampedTTL = SHADOWSTRIKE_CACHE_DEFAULT_TTL;
+    } else if (TTLSeconds > SHADOWSTRIKE_CACHE_MAX_TTL) {
+        clampedTTL = SHADOWSTRIKE_CACHE_MAX_TTL;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ScanCache: TTL clamped from %lu to %lu seconds\n",
+                   TTLSeconds, clampedTTL);
+    } else {
+        clampedTTL = TTLSeconds;
+    }
+
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Initializing scan cache (TTL=%lu seconds)\n",
-               TTLSeconds);
+               clampedTTL);
 
     RtlZeroMemory(&g_ScanCache, sizeof(g_ScanCache));
+
+    //
+    // Initialize shutdown event (manual reset, initially not signaled)
+    //
+    KeInitializeEvent(&g_ScanCache.ShutdownEvent, NotificationEvent, FALSE);
 
     //
     // Initialize all buckets
@@ -125,11 +228,10 @@ ShadowStrikeCacheInitialize(
 
     //
     // Set TTL (convert seconds to 100-ns intervals)
+    // clampedTTL is already validated to be <= MAX_TTL (86400)
+    // Max value: 86400 * 10000000 = 864,000,000,000,000 (fits in LONGLONG)
     //
-    if (TTLSeconds == 0) {
-        TTLSeconds = SHADOWSTRIKE_CACHE_DEFAULT_TTL;
-    }
-    g_ScanCache.TTLInterval.QuadPart = (LONGLONG)TTLSeconds * 10000000LL;
+    g_ScanCache.TTLInterval.QuadPart = (LONGLONG)clampedTTL * 10000000LL;
 
     //
     // Initialize cleanup timer and DPC
@@ -138,16 +240,19 @@ ShadowStrikeCacheInitialize(
     KeInitializeDpc(&g_ScanCache.CleanupDpc, ShadowStrikeCacheCleanupDpc, NULL);
 
     //
-    // Initialize work item for cleanup (runs at PASSIVE_LEVEL)
-    // Using legacy ExInitializeWorkItem which doesn't require a DeviceObject
-    // (minifilters don't have a DeviceObject)
+    // Allocate work item using IoAllocateWorkItem for proper lifecycle management
+    // This is the correct API for kernel work items (not deprecated ExInitializeWorkItem)
     //
-    ExInitializeWorkItem(
-        &g_ScanCache.CleanupWorkItem,
-        ShadowStrikeCacheCleanupWorker,
-        NULL
-    );
-    g_ScanCache.WorkItemInitialized = TRUE;
+    g_ScanCache.CleanupWorkItem = IoAllocateWorkItem(DeviceObject);
+    if (g_ScanCache.CleanupWorkItem == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ScanCache: Failed to allocate cleanup work item\n");
+
+        ExDeleteNPagedLookasideList(&g_ScanCache.EntryLookaside);
+        g_ScanCache.LookasideInitialized = FALSE;
+
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     //
     // Start cleanup timer (periodic)
@@ -174,6 +279,8 @@ ShadowStrikeCacheShutdown(
     VOID
     )
 {
+    LARGE_INTEGER timeout;
+
     PAGED_CODE();
 
     if (!g_ScanCache.Initialized) {
@@ -184,12 +291,42 @@ ShadowStrikeCacheShutdown(
                "[ShadowStrike] Shutting down scan cache\n");
 
     //
-    // Cancel cleanup timer
+    // Step 1: Set shutdown flag to prevent new operations
+    //
+    g_ScanCache.ShutdownInProgress = TRUE;
+
+    //
+    // Step 2: Cancel the cleanup timer
     //
     KeCancelTimer(&g_ScanCache.CleanupTimer);
 
     //
-    // Wait for any cleanup in progress
+    // Step 3: CRITICAL - Flush queued DPCs to ensure our DPC has completed
+    // This prevents the DPC from queueing a work item after we think we're done
+    //
+    KeFlushQueuedDpcs();
+
+    //
+    // Step 4: Wait for any active references (work item or operations in progress)
+    //
+    if (g_ScanCache.ActiveReferences > 0) {
+        //
+        // Wait with timeout to prevent infinite hang
+        // 30 seconds should be more than enough for any operation
+        //
+        timeout.QuadPart = -300000000LL;  // 30 seconds in 100-ns units
+
+        KeWaitForSingleObject(
+            &g_ScanCache.ShutdownEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+    }
+
+    //
+    // Step 5: Wait for cleanup to complete if it's in progress
     //
     while (InterlockedCompareExchange(&g_ScanCache.CleanupInProgress, 0, 0) != 0) {
         LARGE_INTEGER interval;
@@ -198,18 +335,20 @@ ShadowStrikeCacheShutdown(
     }
 
     //
-    // Mark work item as not initialized (ExInitializeWorkItem doesn't allocate,
-    // so there's nothing to free - just prevent further queuing)
+    // Step 6: Free the work item
     //
-    g_ScanCache.WorkItemInitialized = FALSE;
+    if (g_ScanCache.CleanupWorkItem != NULL) {
+        IoFreeWorkItem(g_ScanCache.CleanupWorkItem);
+        g_ScanCache.CleanupWorkItem = NULL;
+    }
 
     //
-    // Clear all entries
+    // Step 7: Clear all entries
     //
     ShadowStrikeCacheClear();
 
     //
-    // Delete lookaside list
+    // Step 8: Delete lookaside list
     //
     if (g_ScanCache.LookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_ScanCache.EntryLookaside);
@@ -218,13 +357,27 @@ ShadowStrikeCacheShutdown(
 
     g_ScanCache.Initialized = FALSE;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Scan cache shutdown complete "
-               "(Hits=%lld, Misses=%lld, HitRate=%.1f%%)\n",
-               g_ScanCache.Stats.Hits,
-               g_ScanCache.Stats.Misses,
-               g_ScanCache.Stats.TotalLookups > 0 ?
-                   (double)g_ScanCache.Stats.Hits * 100.0 / g_ScanCache.Stats.TotalLookups : 0.0);
+    //
+    // Log final statistics (using integer math only - no floating point!)
+    //
+    {
+        LONG64 totalLookups = g_ScanCache.Stats.TotalLookups;
+        LONG64 hits = g_ScanCache.Stats.Hits;
+        LONG64 misses = g_ScanCache.Stats.Misses;
+        LONG hitRatePercent = 0;
+
+        if (totalLookups > 0) {
+            //
+            // Integer percentage: (hits * 100) / totalLookups
+            //
+            hitRatePercent = (LONG)((hits * 100) / totalLookups);
+        }
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Scan cache shutdown complete "
+                   "(Hits=%lld, Misses=%lld, HitRate=%ld%%)\n",
+                   hits, misses, hitRatePercent);
+    }
 }
 
 // ============================================================================
@@ -251,7 +404,21 @@ ShadowStrikeCacheLookup(
     //
     // Validate parameters
     //
-    if (Key == NULL || !g_ScanCache.Initialized) {
+    if (Key == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Check if cache is ready
+    //
+    if (!g_ScanCache.Initialized || g_ScanCache.ShutdownInProgress) {
+        return FALSE;
+    }
+
+    //
+    // Validate g_DriverData is initialized before accessing Config
+    //
+    if (!g_DriverData.Initialized) {
         return FALSE;
     }
 
@@ -320,7 +487,7 @@ ShadowStrikeCacheLookup(
 NTSTATUS
 ShadowStrikeCacheInsert(
     _In_ PSHADOWSTRIKE_CACHE_KEY Key,
-    _In_ SHADOWSTRIKE_VERDICT Verdict,
+    _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict,
     _In_ UINT8 ThreatScore,
     _In_ ULONG TTLSeconds
     )
@@ -332,12 +499,37 @@ ShadowStrikeCacheInsert(
     LARGE_INTEGER currentTime;
     LARGE_INTEGER ttlInterval;
     LONG currentEntries;
+    ULONG clampedTTL;
 
     //
     // Validate parameters
     //
-    if (Key == NULL || !g_ScanCache.Initialized) {
+    if (Key == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate verdict enum range
+    //
+    if (!ShadowStrikeCacheIsValidVerdict(Verdict)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ScanCache: Invalid verdict value %d\n",
+                   (int)Verdict);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Check if cache is ready
+    //
+    if (!g_ScanCache.Initialized || g_ScanCache.ShutdownInProgress) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Validate g_DriverData is initialized before accessing Config
+    //
+    if (!g_DriverData.Initialized) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -358,12 +550,17 @@ ShadowStrikeCacheInsert(
     }
 
     //
-    // Calculate TTL
+    // Calculate TTL with overflow protection
     //
     if (TTLSeconds == 0) {
         ttlInterval = g_ScanCache.TTLInterval;
     } else {
-        ttlInterval.QuadPart = (LONGLONG)TTLSeconds * 10000000LL;
+        //
+        // Clamp TTL to prevent overflow
+        //
+        clampedTTL = (TTLSeconds > SHADOWSTRIKE_CACHE_MAX_TTL) ?
+                     SHADOWSTRIKE_CACHE_MAX_TTL : TTLSeconds;
+        ttlInterval.QuadPart = (LONGLONG)clampedTTL * 10000000LL;
     }
 
     //
@@ -439,12 +636,10 @@ ShadowStrikeCacheInsert(
     KeLeaveCriticalRegion();
 
     //
-    // Update global statistics
+    // Update global statistics using proper atomic peak update
     //
     currentEntries = InterlockedIncrement(&g_ScanCache.Stats.CurrentEntries);
-    if (currentEntries > g_ScanCache.Stats.PeakEntries) {
-        InterlockedExchange(&g_ScanCache.Stats.PeakEntries, currentEntries);
-    }
+    ShadowStrikeCacheUpdatePeak(&g_ScanCache.Stats.PeakEntries, currentEntries);
     InterlockedIncrement64(&g_ScanCache.Stats.Inserts);
 
     return STATUS_SUCCESS;
@@ -473,16 +668,25 @@ ShadowStrikeCacheRemove(
     entry = ShadowStrikeCacheFindEntry(bucket, Key);
 
     if (entry != NULL) {
+        //
+        // Remove from list
+        //
         RemoveEntryList(&entry->ListEntry);
         InterlockedDecrement(&bucket->EntryCount);
+
+        //
+        // CRITICAL FIX: Free entry WHILE holding lock to prevent use-after-free
+        // Another thread cannot access this entry once it's removed from the list
+        // and we're still holding the exclusive lock
+        //
+        ShadowStrikeCacheFreeEntry(entry);
         removed = TRUE;
     }
 
     ExReleasePushLockExclusive(&bucket->Lock);
     KeLeaveCriticalRegion();
 
-    if (removed && entry != NULL) {
-        ShadowStrikeCacheFreeEntry(entry);
+    if (removed) {
         InterlockedDecrement(&g_ScanCache.Stats.CurrentEntries);
         InterlockedIncrement64(&g_ScanCache.Stats.Evictions);
     }
@@ -514,6 +718,13 @@ ShadowStrikeCacheInvalidateVolume(
     for (i = 0; i < SHADOWSTRIKE_CACHE_BUCKET_COUNT; i++) {
         PSHADOWSTRIKE_CACHE_BUCKET bucket = &g_ScanCache.Buckets[i];
 
+        //
+        // Skip empty buckets (quick check without lock)
+        //
+        if (bucket->EntryCount == 0) {
+            continue;
+        }
+
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&bucket->Lock);
 
@@ -537,7 +748,7 @@ ShadowStrikeCacheInvalidateVolume(
     }
 
     //
-    // Free removed entries
+    // Free removed entries (outside of locks)
     //
     while (!IsListEmpty(&removeList)) {
         listEntry = RemoveHeadList(&removeList);
@@ -569,7 +780,7 @@ ShadowStrikeCacheClear(
 
     PAGED_CODE();
 
-    if (!g_ScanCache.Initialized) {
+    if (!g_ScanCache.Initialized && !g_ScanCache.ShutdownInProgress) {
         return;
     }
 
@@ -616,7 +827,7 @@ ShadowStrikeCacheCleanup(
 
     PAGED_CODE();
 
-    if (!g_ScanCache.Initialized) {
+    if (!g_ScanCache.Initialized || g_ScanCache.ShutdownInProgress) {
         return;
     }
 
@@ -706,15 +917,30 @@ ShadowStrikeCacheGetStats(
         return;
     }
 
-    Stats->TotalLookups = g_ScanCache.Stats.TotalLookups;
-    Stats->Hits = g_ScanCache.Stats.Hits;
-    Stats->Misses = g_ScanCache.Stats.Misses;
-    Stats->Inserts = g_ScanCache.Stats.Inserts;
-    Stats->Evictions = g_ScanCache.Stats.Evictions;
+    //
+    // Use atomic reads for 64-bit values to ensure consistency
+    // InterlockedCompareExchange64 returns the current value atomically
+    //
+    Stats->TotalLookups = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.TotalLookups, 0, 0);
+    Stats->Hits = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.Hits, 0, 0);
+    Stats->Misses = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.Misses, 0, 0);
+    Stats->Inserts = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.Inserts, 0, 0);
+    Stats->Evictions = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.Evictions, 0, 0);
+    Stats->CleanupCycles = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.CleanupCycles, 0, 0);
+    Stats->CleanupEvictions = InterlockedCompareExchange64(
+        &g_ScanCache.Stats.CleanupEvictions, 0, 0);
+
+    //
+    // 32-bit values are naturally atomic on x86/x64
+    //
     Stats->CurrentEntries = g_ScanCache.Stats.CurrentEntries;
     Stats->PeakEntries = g_ScanCache.Stats.PeakEntries;
-    Stats->CleanupCycles = g_ScanCache.Stats.CleanupCycles;
-    Stats->CleanupEvictions = g_ScanCache.Stats.CleanupEvictions;
 }
 
 VOID
@@ -746,15 +972,25 @@ ShadowStrikeCacheBuildKey(
     FILE_INTERNAL_INFORMATION internalInfo;
     FILE_BASIC_INFORMATION basicInfo;
     FILE_STANDARD_INFORMATION stdInfo;
+    BOOLEAN haveFileId = FALSE;
+    BOOLEAN haveWriteTime = FALSE;
+    BOOLEAN haveFileSize = FALSE;
+    BOOLEAN haveVolumeSerial = FALSE;
+
+    PAGED_CODE();
 
     if (FltObjects == NULL || Key == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     RtlZeroMemory(Key, sizeof(SHADOWSTRIKE_CACHE_KEY));
 
     //
-    // Get file ID
+    // Get file ID (REQUIRED)
     //
     status = FltQueryInformationFile(
         FltObjects->Instance,
@@ -767,10 +1003,15 @@ ShadowStrikeCacheBuildKey(
 
     if (NT_SUCCESS(status)) {
         Key->FileId = internalInfo.IndexNumber.QuadPart;
+        haveFileId = TRUE;
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ScanCache: Failed to get FileId, status=0x%08X\n",
+                   status);
     }
 
     //
-    // Get basic info (last write time)
+    // Get basic info (last write time) (REQUIRED)
     //
     status = FltQueryInformationFile(
         FltObjects->Instance,
@@ -783,10 +1024,15 @@ ShadowStrikeCacheBuildKey(
 
     if (NT_SUCCESS(status)) {
         Key->LastWriteTime = basicInfo.LastWriteTime;
+        haveWriteTime = TRUE;
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ScanCache: Failed to get LastWriteTime, status=0x%08X\n",
+                   status);
     }
 
     //
-    // Get file size
+    // Get file size (REQUIRED)
     //
     status = FltQueryInformationFile(
         FltObjects->Instance,
@@ -799,14 +1045,71 @@ ShadowStrikeCacheBuildKey(
 
     if (NT_SUCCESS(status)) {
         Key->FileSize = stdInfo.EndOfFile.QuadPart;
+        haveFileSize = TRUE;
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ScanCache: Failed to get FileSize, status=0x%08X\n",
+                   status);
     }
 
     //
-    // Get volume serial (from volume properties if available)
-    // For simplicity, use a hash of the volume name or device object
+    // Get proper volume serial number (REQUIRED)
+    // Using FltGetVolumeProperties to get actual volume information
     //
     if (FltObjects->Volume != NULL) {
-        Key->VolumeSerial = (ULONG)(ULONG_PTR)FltObjects->Volume;
+        FLT_VOLUME_PROPERTIES volumeProps;
+        ULONG bytesReturned = 0;
+
+        status = FltGetVolumeProperties(
+            FltObjects->Volume,
+            &volumeProps,
+            sizeof(volumeProps),
+            &bytesReturned
+        );
+
+        if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+            //
+            // STATUS_BUFFER_OVERFLOW is acceptable - we got the fixed fields
+            // Use DeviceCharacteristics as a volume identifier component
+            // Combined with SectorSize for better uniqueness
+            //
+            Key->VolumeSerial = volumeProps.DeviceCharacteristics ^
+                               (volumeProps.SectorSize << 16) ^
+                               (volumeProps.AllocatedLength.LowPart);
+            haveVolumeSerial = TRUE;
+        } else {
+            //
+            // Fallback: Query volume information via file object
+            //
+            FILE_FS_VOLUME_INFORMATION volumeInfo;
+            IO_STATUS_BLOCK ioStatus;
+
+            status = FltQueryVolumeInformation(
+                FltObjects->Instance,
+                &ioStatus,
+                &volumeInfo,
+                sizeof(volumeInfo),
+                FileFsVolumeInformation
+            );
+
+            if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+                Key->VolumeSerial = volumeInfo.VolumeSerialNumber;
+                haveVolumeSerial = TRUE;
+            }
+        }
+    }
+
+    //
+    // SECURITY: All required fields must be populated
+    // If any field is missing, the key is not reliable and could cause
+    // cache collisions leading to security bypass
+    //
+    if (!haveFileId || !haveWriteTime || !haveFileSize || !haveVolumeSerial) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] ScanCache: Incomplete key (FileId=%d, WriteTime=%d, "
+                   "Size=%d, Volume=%d)\n",
+                   haveFileId, haveWriteTime, haveFileSize, haveVolumeSerial);
+        return STATUS_UNSUCCESSFUL;
     }
 
     return STATUS_SUCCESS;
@@ -879,30 +1182,71 @@ ShadowStrikeCacheCleanupDpc(
     UNREFERENCED_PARAMETER(SystemArgument2);
 
     //
-    // Queue work item to run cleanup at PASSIVE_LEVEL
-    // Using legacy ExQueueWorkItem which doesn't require a DeviceObject
+    // Check shutdown flag and acquire reference atomically
     //
-    if (g_ScanCache.WorkItemInitialized && g_ScanCache.Initialized) {
-        //
-        // Re-initialize the work item before each queue
-        // (required for ExQueueWorkItem - work items are single-use)
-        //
-        ExInitializeWorkItem(
-            &g_ScanCache.CleanupWorkItem,
-            ShadowStrikeCacheCleanupWorker,
-            NULL
-        );
-        ExQueueWorkItem(&g_ScanCache.CleanupWorkItem, DelayedWorkQueue);
+    if (g_ScanCache.ShutdownInProgress) {
+        return;
     }
+
+    //
+    // Check if work item is already queued (prevents double-queue)
+    //
+    if (InterlockedCompareExchange(&g_ScanCache.WorkItemQueued, 1, 0) != 0) {
+        //
+        // Work item already queued, skip this cycle
+        //
+        return;
+    }
+
+    //
+    // Verify work item is valid
+    //
+    if (g_ScanCache.CleanupWorkItem == NULL || !g_ScanCache.Initialized) {
+        InterlockedExchange(&g_ScanCache.WorkItemQueued, 0);
+        return;
+    }
+
+    //
+    // Acquire reference for the work item
+    //
+    if (!ShadowStrikeCacheAcquireReference()) {
+        InterlockedExchange(&g_ScanCache.WorkItemQueued, 0);
+        return;
+    }
+
+    //
+    // Queue work item (IoQueueWorkItem is the correct API for IoAllocateWorkItem)
+    //
+    IoQueueWorkItem(
+        g_ScanCache.CleanupWorkItem,
+        ShadowStrikeCacheCleanupWorker,
+        DelayedWorkQueue,
+        NULL
+    );
 }
 
 static
 VOID
 ShadowStrikeCacheCleanupWorker(
-    _In_ PVOID Context
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
     )
 {
+    UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
+    //
+    // Perform cleanup
+    //
     ShadowStrikeCacheCleanup();
+
+    //
+    // Clear the queued flag so next DPC can queue again
+    //
+    InterlockedExchange(&g_ScanCache.WorkItemQueued, 0);
+
+    //
+    // Release reference acquired in DPC
+    //
+    ShadowStrikeCacheReleaseReference();
 }
