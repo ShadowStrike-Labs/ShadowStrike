@@ -47,6 +47,17 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_RegistryNotify,     // Registry operation
 
     //
+    // ALPC Notifications (0x40 - 0x4F)
+    //
+    FilterMessageType_AlpcPortCreated,        // ALPC port created
+    FilterMessageType_AlpcPortConnected,      // ALPC connection established
+    FilterMessageType_AlpcPortDisconnected,   // ALPC connection terminated
+    FilterMessageType_AlpcSuspiciousAccess,   // Suspicious ALPC access detected
+    FilterMessageType_AlpcImpersonation,      // ALPC impersonation attempt
+    FilterMessageType_AlpcSandboxEscape,      // Potential sandbox escape via ALPC
+    FilterMessageType_AlpcRateLimitExceeded,  // ALPC rate limit exceeded
+
+    //
     // Policy Messages (0x30 - 0x3F)
     //
     FilterMessageType_QueryDriverStatus,  // Query driver status
@@ -83,6 +94,15 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 #define ShadowStrikeMessageThreadNotify             FilterMessageType_ThreadNotify
 #define ShadowStrikeMessageImageLoad                FilterMessageType_ImageLoad
 #define ShadowStrikeMessageRegistryNotify           FilterMessageType_RegistryNotify
+
+// ALPC message aliases
+#define ShadowStrikeMessageAlpcPortCreated          FilterMessageType_AlpcPortCreated
+#define ShadowStrikeMessageAlpcPortConnected        FilterMessageType_AlpcPortConnected
+#define ShadowStrikeMessageAlpcPortDisconnected     FilterMessageType_AlpcPortDisconnected
+#define ShadowStrikeMessageAlpcSuspiciousAccess     FilterMessageType_AlpcSuspiciousAccess
+#define ShadowStrikeMessageAlpcImpersonation        FilterMessageType_AlpcImpersonation
+#define ShadowStrikeMessageAlpcSandboxEscape        FilterMessageType_AlpcSandboxEscape
+#define ShadowStrikeMessageAlpcRateLimitExceeded    FilterMessageType_AlpcRateLimitExceeded
 
 #define ShadowStrikeMessageQueryDriverStatus        FilterMessageType_QueryDriverStatus
 #define ShadowStrikeMessageUpdatePolicy             FilterMessageType_UpdatePolicy
