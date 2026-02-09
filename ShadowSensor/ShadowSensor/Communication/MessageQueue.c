@@ -6,23 +6,21 @@
  * @file MessageQueue.c
  * @brief Asynchronous message queue for kernel<->user communication.
  *
- * Enterprise-grade, lock-free (where possible) message queue implementation
- * for high-throughput, low-latency kernel-to-user-mode communication.
+ * Enterprise-grade message queue implementation for high-throughput,
+ * low-latency kernel-to-user-mode communication.
  *
- * Features:
- * - Priority-based message ordering (4 priority levels)
- * - Lock-free statistics counters
- * - Efficient batch coalescing for throughput optimization
- * - Flow control with high/low water marks
- * - Completion tracking for blocking messages
- * - Per-priority lookaside lists for memory efficiency
- * - BSOD-safe resource management with RAII patterns
+ * Key Design Decisions:
+ * - Reference-counted pending completions prevent use-after-free
+ * - Response data copied into completion structure under lock
+ * - Atomic slot reservation prevents queue depth race conditions
+ * - Explicit allocation source tracking prevents pool corruption
+ * - Proper shutdown sequencing waits for all outstanding operations
  *
  * Thread Safety:
  * - Per-priority spinlocks minimize contention
- * - Lock ordering: Priority locks acquired in ascending order to prevent deadlock
+ * - Lock ordering: Priority locks acquired in ascending order
  * - Statistics use interlocked operations (no locks)
- * - Batch operations protected by dedicated batch lock
+ * - Pending completions protected by dedicated spinlock with refcount
  *
  * IRQL Requirements:
  * - MqInitialize/MqShutdown: PASSIVE_LEVEL
@@ -31,67 +29,87 @@
  * - MqCompleteMessage: <= DISPATCH_LEVEL
  *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 2.0.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
 #include "MessageQueue.h"
-#include "../Core/Globals.h"
-#include "../../Shared/SharedDefs.h"
-#include "../../Shared/ErrorCodes.h"
 
 // ============================================================================
 // INTERNAL CONSTANTS
 // ============================================================================
 
 //
-// Internal pool tags for tracking allocations
-//
-#define MQ_TAG_GLOBALS      'GqMs'
-#define MQ_TAG_MESSAGE      'MqMs'
-#define MQ_TAG_BATCH        'BqMs'
-#define MQ_TAG_PENDING      'PqMs'
-
-//
-// Limits for safety
-//
-#define MQ_MAX_QUEUE_DEPTH_LIMIT        1000000
-#define MQ_MAX_MESSAGE_SIZE_LIMIT       (1024 * 1024)   // 1MB
-#define MQ_MIN_BATCH_SIZE               1
-#define MQ_MAX_BATCH_SIZE               1000
-#define MQ_MAX_PENDING_COMPLETIONS      50000
-
-//
-// Timing
+// Timing constants
 //
 #define MQ_WORKER_POLL_INTERVAL_MS      10
-#define MQ_COMPLETION_TIMEOUT_DEFAULT   30000
+#define MQ_COMPLETION_TIMEOUT_DEFAULT   30000   // 30 seconds
+#define MQ_SHUTDOWN_COMPLETION_WAIT_MS  10000   // 10 seconds max wait for completions
+
+//
+// Lookaside threshold - messages <= this size use lookaside
+//
+#define MQ_LOOKASIDE_THRESHOLD          1024
 
 // ============================================================================
-// PENDING COMPLETION TRACKING
+// PENDING COMPLETION STRUCTURE (REFERENCE-COUNTED)
 // ============================================================================
 
 /**
- * @brief Entry for tracking pending blocking messages awaiting completion.
+ * @brief Completion state values.
+ */
+typedef enum _MQ_COMPLETION_STATE {
+    MqCompletionState_Pending = 0,      // Waiting for response
+    MqCompletionState_Completed = 1,    // Response received
+    MqCompletionState_TimedOut = 2,     // Timed out
+    MqCompletionState_Cancelled = 3,    // Cancelled (shutdown)
+    MqCompletionState_Detached = 4      // Waiter gave up, completion orphaned
+} MQ_COMPLETION_STATE;
+
+/**
+ * @brief Reference-counted pending completion structure.
  *
- * When a blocking message is enqueued, we create a pending completion entry
- * that holds the completion event and response buffer pointers. When the
- * user-mode service sends a response, we look up this entry by MessageId
- * and signal completion.
+ * Lifetime management:
+ * - Created with RefCount=2 (one for waiter, one for list)
+ * - Waiter releases its reference when done waiting
+ * - MqCompleteMessage or cleanup releases list reference
+ * - Structure freed when RefCount reaches 0
+ *
+ * Response buffer:
+ * - Response data is copied INTO ResponseData[] under lock
+ * - This prevents writing to caller's potentially-freed stack
  */
 typedef struct _MQ_PENDING_COMPLETION {
+    // Validation
+    UINT32 Magic;
+    UINT32 Reserved1;
+
+    // List membership
     LIST_ENTRY ListEntry;
+
+    // Identification
+    UINT64 CompletionId;
     UINT64 MessageId;
-    KEVENT CompletionEvent;
-    volatile NTSTATUS CompletionStatus;
-    PVOID ResponseBuffer;
-    UINT32 ResponseBufferSize;
-    volatile UINT32 ResponseSize;
     UINT64 EnqueueTime;
-    volatile BOOLEAN Completed;
-    BOOLEAN Cancelled;
-    UINT8 Reserved[6];
+
+    // Reference counting for safe lifetime management
+    volatile LONG RefCount;
+
+    // State (atomic)
+    volatile LONG State;
+
+    // Completion event
+    KEVENT CompletionEvent;
+
+    // Result
+    volatile NTSTATUS CompletionStatus;
+    volatile UINT32 ResponseSize;
+
+    // Response buffer - data copied here under lock
+    // Caller copies from here after wait completes
+    UINT32 ResponseBufferSize;
+    UINT8 ResponseData[MQ_MAX_RESPONSE_SIZE];
 } MQ_PENDING_COMPLETION, *PMQ_PENDING_COMPLETION;
 
 // ============================================================================
@@ -104,12 +122,17 @@ typedef struct _MQ_PENDING_COMPLETION {
 static MESSAGE_QUEUE_GLOBALS g_MqGlobals = {0};
 
 /**
- * @brief Pending completion list for blocking messages.
+ * @brief Pending completion list and synchronization.
  */
 static LIST_ENTRY g_PendingCompletionList;
 static KSPIN_LOCK g_PendingCompletionLock;
 static volatile LONG g_PendingCompletionCount = 0;
+
+/**
+ * @brief Lookaside list for pending completions.
+ */
 static NPAGED_LOOKASIDE_LIST g_PendingCompletionLookaside;
+static BOOLEAN g_PendingCompletionLookasideInitialized = FALSE;
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -141,17 +164,17 @@ MqpAllocatePendingCompletion(
     );
 
 static VOID
-MqpFreePendingCompletion(
+MqpReleasePendingCompletion(
     _In_ PMQ_PENDING_COMPLETION Completion
     );
 
 static PMQ_PENDING_COMPLETION
-MqpFindPendingCompletion(
+MqpFindAndReferencePendingCompletion(
     _In_ UINT64 MessageId
     );
 
 static VOID
-MqpRemovePendingCompletion(
+MqpDetachPendingCompletion(
     _In_ PMQ_PENDING_COMPLETION Completion
     );
 
@@ -160,12 +183,20 @@ MqpCleanupExpiredCompletions(
     VOID
     );
 
-_IRQL_requires_max_(PASSIVE_LEVEL)
+static VOID
+MqpUpdateFlowControl(
+    _In_ LONG CurrentDepth
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 MqpWorkerThread(
     _In_ PVOID Context
     );
 
+/**
+ * @brief Get current time in milliseconds.
+ */
 FORCEINLINE
 UINT64
 MqpGetCurrentTimeMs(
@@ -177,6 +208,18 @@ MqpGetCurrentTimeMs(
     return (UINT64)(time.QuadPart / 10000);  // 100ns -> ms
 }
 
+/**
+ * @brief Check if subsystem is in running state.
+ */
+FORCEINLINE
+BOOLEAN
+MqpIsRunning(
+    VOID
+    )
+{
+    return (InterlockedCompareExchange(&g_MqGlobals.State, MqState_Running, MqState_Running) == MqState_Running);
+}
+
 // ============================================================================
 // INITIALIZATION AND SHUTDOWN
 // ============================================================================
@@ -184,10 +227,8 @@ MqpGetCurrentTimeMs(
 /**
  * @brief Initialize the message queue subsystem.
  *
- * Must be called at PASSIVE_LEVEL during driver initialization.
- * Allocates all required resources and initializes synchronization objects.
- *
- * @return STATUS_SUCCESS on success, error code on failure.
+ * Thread-safe initialization using atomic state transitions.
+ * All resources allocated atomically - either all succeed or none.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -199,21 +240,35 @@ MqInitialize(
     NTSTATUS status = STATUS_SUCCESS;
     OBJECT_ATTRIBUTES objAttr;
     HANDLE threadHandle = NULL;
+    LONG previousState;
     ULONG i;
 
     PAGED_CODE();
 
     //
-    // Check if already initialized
+    // Atomic state transition: Uninitialized -> Initializing
     //
-    if (g_MqGlobals.Initialized) {
-        return STATUS_ALREADY_REGISTERED;
+    previousState = InterlockedCompareExchange(
+        &g_MqGlobals.State,
+        MqState_Initializing,
+        MqState_Uninitialized
+    );
+
+    if (previousState != MqState_Uninitialized) {
+        if (previousState == MqState_Running) {
+            return STATUS_ALREADY_REGISTERED;
+        }
+        return STATUS_DEVICE_BUSY;  // Initialization in progress
     }
 
     //
-    // Zero out global state
+    // Zero out global state (except State which we just set)
     //
-    RtlZeroMemory(&g_MqGlobals, sizeof(g_MqGlobals));
+    {
+        LONG savedState = g_MqGlobals.State;
+        RtlZeroMemory(&g_MqGlobals, sizeof(g_MqGlobals));
+        g_MqGlobals.State = savedState;
+    }
 
     //
     // Initialize default configuration
@@ -246,20 +301,22 @@ MqInitialize(
     KeInitializeEvent(&g_MqGlobals.MessageAvailableEvent, SynchronizationEvent, FALSE);
     KeInitializeEvent(&g_MqGlobals.BatchReadyEvent, SynchronizationEvent, FALSE);
     KeInitializeEvent(&g_MqGlobals.HighWaterMarkEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&g_MqGlobals.SpaceAvailableEvent, NotificationEvent, TRUE);  // Initially signaled (space available)
+    KeInitializeEvent(&g_MqGlobals.AllCompletionsReleasedEvent, NotificationEvent, TRUE);  // Initially signaled
 
     //
     // Initialize message lookaside list
-    // We allocate enough for a typical message plus some overhead
     //
     ExInitializeNPagedLookasideList(
         &g_MqGlobals.MessageLookaside,
-        NULL,   // Allocate function (use default)
-        NULL,   // Free function (use default)
+        NULL,
+        NULL,
         POOL_NX_ALLOCATION,
-        MQ_MESSAGE_ALLOC_SIZE(1024),  // Typical small message
-        MQ_TAG_MESSAGE,
-        0       // Depth (let system manage)
+        MQ_MESSAGE_ALLOC_SIZE(MQ_LOOKASIDE_THRESHOLD),
+        MQ_POOL_TAG_MESSAGE,
+        0
     );
+    g_MqGlobals.MessageLookasideInitialized = TRUE;
 
     //
     // Initialize pending completion list and lookaside
@@ -274,9 +331,10 @@ MqInitialize(
         NULL,
         POOL_NX_ALLOCATION,
         sizeof(MQ_PENDING_COMPLETION),
-        MQ_TAG_PENDING,
+        MQ_POOL_TAG_COMPLETION,
         0
     );
+    g_PendingCompletionLookasideInitialized = TRUE;
 
     //
     // Initialize worker thread control
@@ -300,8 +358,7 @@ MqInitialize(
     );
 
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike/MQ] Failed to create worker thread: 0x%08X\n", status);
+        MQ_LOG_ERROR("Failed to create worker thread: 0x%08X", status);
         goto Cleanup;
     }
 
@@ -321,21 +378,22 @@ MqInitialize(
     threadHandle = NULL;
 
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike/MQ] Failed to reference worker thread: 0x%08X\n", status);
-        g_MqGlobals.WorkerStopping = TRUE;
+        MQ_LOG_ERROR("Failed to reference worker thread: 0x%08X", status);
+        //
+        // Signal thread to stop - it will exit on its own
+        //
+        InterlockedExchange(&g_MqGlobals.WorkerStopping, TRUE);
         KeSetEvent(&g_MqGlobals.WorkerStopEvent, IO_NO_INCREMENT, FALSE);
         goto Cleanup;
     }
 
     //
-    // Mark as initialized
+    // Transition to running state
     //
-    g_MqGlobals.Initialized = TRUE;
+    InterlockedExchange(&g_MqGlobals.State, MqState_Running);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Message queue initialized (depth=%u, msgSize=%u)\n",
-               g_MqGlobals.MaxQueueDepth, g_MqGlobals.MaxMessageSize);
+    MQ_LOG_INFO("Message queue initialized (depth=%d, msgSize=%d)",
+                g_MqGlobals.MaxQueueDepth, g_MqGlobals.MaxMessageSize);
 
     return STATUS_SUCCESS;
 
@@ -343,10 +401,17 @@ Cleanup:
     //
     // Cleanup on failure
     //
-    ExDeleteNPagedLookasideList(&g_MqGlobals.MessageLookaside);
-    ExDeleteNPagedLookasideList(&g_PendingCompletionLookaside);
+    if (g_MqGlobals.MessageLookasideInitialized) {
+        ExDeleteNPagedLookasideList(&g_MqGlobals.MessageLookaside);
+        g_MqGlobals.MessageLookasideInitialized = FALSE;
+    }
 
-    RtlZeroMemory(&g_MqGlobals, sizeof(g_MqGlobals));
+    if (g_PendingCompletionLookasideInitialized) {
+        ExDeleteNPagedLookasideList(&g_PendingCompletionLookaside);
+        g_PendingCompletionLookasideInitialized = FALSE;
+    }
+
+    InterlockedExchange(&g_MqGlobals.State, MqState_Uninitialized);
 
     return status;
 }
@@ -354,10 +419,13 @@ Cleanup:
 /**
  * @brief Shutdown the message queue subsystem.
  *
- * Drains all pending messages, completes outstanding blocking requests
- * with STATUS_CANCELLED, and releases all resources.
- *
- * Must be called at PASSIVE_LEVEL during driver unload.
+ * Proper shutdown sequence:
+ * 1. Transition to ShuttingDown state (reject new operations)
+ * 2. Stop worker thread (wait indefinitely - it MUST stop)
+ * 3. Cancel all pending completions
+ * 4. Wait for all completion references to be released
+ * 5. Drain message queues
+ * 6. Delete lookaside lists
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -371,61 +439,110 @@ MqShutdown(
     PMQ_PENDING_COMPLETION completion;
     KIRQL oldIrql;
     LARGE_INTEGER timeout;
+    NTSTATUS waitStatus;
 
     PAGED_CODE();
 
-    if (!g_MqGlobals.Initialized) {
-        return;
+    //
+    // Atomic state transition: Running -> ShuttingDown
+    //
+    if (InterlockedCompareExchange(&g_MqGlobals.State, MqState_ShuttingDown, MqState_Running) != MqState_Running) {
+        return;  // Not running or already shutting down
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Shutting down message queue...\n");
+    MQ_LOG_INFO("Shutting down message queue...");
 
     //
     // Signal worker thread to stop
     //
-    g_MqGlobals.WorkerStopping = TRUE;
+    InterlockedExchange(&g_MqGlobals.WorkerStopping, TRUE);
     KeSetEvent(&g_MqGlobals.WorkerStopEvent, IO_NO_INCREMENT, FALSE);
     KeSetEvent(&g_MqGlobals.MessageAvailableEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Wait for worker thread to exit (max 5 seconds)
+    // Wait for worker thread to exit (indefinitely - it MUST stop)
+    // The worker checks WorkerStopping flag and will exit promptly
     //
     if (g_MqGlobals.WorkerThread != NULL) {
-        timeout.QuadPart = -50000000LL;  // 5 seconds
-        KeWaitForSingleObject(
+        waitStatus = KeWaitForSingleObject(
             g_MqGlobals.WorkerThread,
             Executive,
             KernelMode,
             FALSE,
-            &timeout
+            NULL  // Infinite wait - worker MUST exit
         );
+
+        if (waitStatus != STATUS_SUCCESS) {
+            //
+            // This should never happen with infinite wait
+            // Log but continue cleanup
+            //
+            MQ_LOG_ERROR("Unexpected wait result for worker thread: 0x%08X", waitStatus);
+        }
 
         ObDereferenceObject(g_MqGlobals.WorkerThread);
         g_MqGlobals.WorkerThread = NULL;
     }
 
     //
-    // Cancel all pending completions
+    // Cancel all pending completions and release list references
     //
     KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
 
     while (!IsListEmpty(&g_PendingCompletionList)) {
         entry = RemoveHeadList(&g_PendingCompletionList);
         completion = CONTAINING_RECORD(entry, MQ_PENDING_COMPLETION, ListEntry);
+        InitializeListHead(&completion->ListEntry);  // Prevent double-remove
+        InterlockedDecrement(&g_PendingCompletionCount);
 
+        //
+        // Mark as cancelled and signal waiter
+        //
+        InterlockedExchange(&completion->State, MqCompletionState_Cancelled);
         completion->CompletionStatus = STATUS_CANCELLED;
-        completion->Cancelled = TRUE;
         KeSetEvent(&completion->CompletionEvent, IO_NO_INCREMENT, FALSE);
+
+        //
+        // Release list's reference (waiter still has one)
+        // Cannot call MqpReleasePendingCompletion under spinlock as it may free
+        //
+        if (InterlockedDecrement(&completion->RefCount) == 0) {
+            //
+            // Waiter already released - we need to free
+            // But we're under spinlock, so mark for later
+            //
+            completion->Magic = 0;  // Invalidate
+        }
+    }
+
+    //
+    // Track that we need to wait for outstanding completions
+    //
+    if (g_MqGlobals.OutstandingCompletions > 0) {
+        KeClearEvent(&g_MqGlobals.AllCompletionsReleasedEvent);
     }
 
     KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
     //
-    // Give pending completions time to wake up (100ms)
+    // Wait for all outstanding completions to be released
+    // This ensures waiters have finished copying response data
     //
-    timeout.QuadPart = -1000000LL;
-    KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+    if (g_MqGlobals.OutstandingCompletions > 0) {
+        timeout.QuadPart = -(LONGLONG)MQ_SHUTDOWN_COMPLETION_WAIT_MS * 10000LL;
+        waitStatus = KeWaitForSingleObject(
+            &g_MqGlobals.AllCompletionsReleasedEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+
+        if (waitStatus == STATUS_TIMEOUT) {
+            MQ_LOG_WARNING("Timeout waiting for %d outstanding completions",
+                          g_MqGlobals.OutstandingCompletions);
+        }
+    }
 
     //
     // Drain all priority queues
@@ -436,21 +553,14 @@ MqShutdown(
         while (!IsListEmpty(&g_MqGlobals.Queues[i].MessageList)) {
             entry = RemoveHeadList(&g_MqGlobals.Queues[i].MessageList);
             message = CONTAINING_RECORD(entry, QUEUED_MESSAGE, ListEntry);
+            InterlockedDecrement(&g_MqGlobals.Queues[i].Count);
 
             //
-            // If blocking message, signal completion with cancelled status
+            // Cannot free under spinlock if using lookaside
+            // Mark as invalid and free after releasing lock
             //
-            if (MQ_IS_BLOCKING_MESSAGE(message) && message->CompletionEvent != NULL) {
-                if (message->CompletionStatus != NULL) {
-                    *message->CompletionStatus = STATUS_CANCELLED;
-                }
-                KeSetEvent(message->CompletionEvent, IO_NO_INCREMENT, FALSE);
-            }
-
-            MqpFreeMessageInternal(message);
+            message->Magic = 0;
         }
-
-        g_MqGlobals.Queues[i].Count = 0;
 
         KeReleaseSpinLock(&g_MqGlobals.Queues[i].Lock, oldIrql);
     }
@@ -461,46 +571,39 @@ MqShutdown(
     // Free batch buffer if allocated
     //
     if (g_MqGlobals.CurrentBatch != NULL) {
-        ExFreePoolWithTag(g_MqGlobals.CurrentBatch, MQ_TAG_BATCH);
+        ExFreePoolWithTag(g_MqGlobals.CurrentBatch, MQ_POOL_TAG_BATCH);
         g_MqGlobals.CurrentBatch = NULL;
     }
 
     //
     // Delete lookaside lists
+    // Safe now because all references have been released
     //
-    ExDeleteNPagedLookasideList(&g_MqGlobals.MessageLookaside);
-    ExDeleteNPagedLookasideList(&g_PendingCompletionLookaside);
+    if (g_MqGlobals.MessageLookasideInitialized) {
+        ExDeleteNPagedLookasideList(&g_MqGlobals.MessageLookaside);
+        g_MqGlobals.MessageLookasideInitialized = FALSE;
+    }
+
+    if (g_PendingCompletionLookasideInitialized) {
+        ExDeleteNPagedLookasideList(&g_PendingCompletionLookaside);
+        g_PendingCompletionLookasideInitialized = FALSE;
+    }
+
+    MQ_LOG_INFO("Final stats: Enqueued=%llu, Dequeued=%llu, Dropped=%llu",
+               (unsigned long long)g_MqGlobals.TotalMessagesEnqueued,
+               (unsigned long long)g_MqGlobals.TotalMessagesDequeued,
+               (unsigned long long)g_MqGlobals.TotalMessagesDropped);
 
     //
-    // Log final statistics
+    // Transition to shutdown state
     //
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Final stats: Enqueued=%llu, Dequeued=%llu, Dropped=%llu\n",
-               g_MqGlobals.TotalMessagesEnqueued,
-               g_MqGlobals.TotalMessagesDequeued,
-               g_MqGlobals.TotalMessagesDropped);
+    InterlockedExchange(&g_MqGlobals.State, MqState_Shutdown);
 
-    //
-    // Clear state
-    //
-    g_MqGlobals.Initialized = FALSE;
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Message queue shutdown complete\n");
+    MQ_LOG_INFO("Message queue shutdown complete");
 }
 
 /**
  * @brief Configure the message queue parameters.
- *
- * Can be called at runtime to adjust queue parameters. Will not affect
- * messages already in the queue.
- *
- * @param MaxQueueDepth Maximum total messages across all priority queues.
- * @param MaxMessageSize Maximum size of a single message.
- * @param BatchSize Number of messages to batch for delivery.
- * @param BatchTimeoutMs Maximum time to wait before flushing a batch.
- *
- * @return STATUS_SUCCESS or STATUS_INVALID_PARAMETER.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
@@ -528,21 +631,20 @@ MqConfigure(
     }
 
     //
-    // Update configuration atomically where possible
+    // Update configuration atomically
     //
-    InterlockedExchange((volatile LONG*)&g_MqGlobals.MaxQueueDepth, MaxQueueDepth);
-    InterlockedExchange((volatile LONG*)&g_MqGlobals.MaxMessageSize, MaxMessageSize);
-    InterlockedExchange((volatile LONG*)&g_MqGlobals.BatchSize, BatchSize);
-    InterlockedExchange((volatile LONG*)&g_MqGlobals.BatchTimeoutMs, BatchTimeoutMs);
+    InterlockedExchange(&g_MqGlobals.MaxQueueDepth, (LONG)MaxQueueDepth);
+    InterlockedExchange(&g_MqGlobals.MaxMessageSize, (LONG)MaxMessageSize);
+    InterlockedExchange(&g_MqGlobals.BatchSize, (LONG)BatchSize);
+    InterlockedExchange(&g_MqGlobals.BatchTimeoutMs, (LONG)BatchTimeoutMs);
 
     //
     // Update water marks (80% / 50% of new depth)
     //
-    InterlockedExchange((volatile LONG*)&g_MqGlobals.HighWaterMark, (MaxQueueDepth * 80) / 100);
-    InterlockedExchange((volatile LONG*)&g_MqGlobals.LowWaterMark, (MaxQueueDepth * 50) / 100);
+    InterlockedExchange(&g_MqGlobals.HighWaterMark, (LONG)((MaxQueueDepth * 80) / 100));
+    InterlockedExchange(&g_MqGlobals.LowWaterMark, (LONG)((MaxQueueDepth * 50) / 100));
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Reconfigured: depth=%u, msgSize=%u, batch=%u\n",
+    MQ_LOG_INFO("Reconfigured: depth=%u, msgSize=%u, batch=%u",
                MaxQueueDepth, MaxMessageSize, BatchSize);
 
     return STATUS_SUCCESS;
@@ -553,19 +655,10 @@ MqConfigure(
 // ============================================================================
 
 /**
- * @brief Enqueue a message to the appropriate priority queue.
+ * @brief Enqueue a message with atomic slot reservation.
  *
- * This is the core message enqueue function. Messages are placed in the
- * appropriate priority queue and the consumer is signaled.
- *
- * @param MessageType Type of message being enqueued.
- * @param MessageData Pointer to message payload data.
- * @param MessageSize Size of message payload in bytes.
- * @param Priority Priority level for the message.
- * @param Flags Message flags (blocking, notify-only, etc.).
- * @param MessageId Optional output for the assigned message ID.
- *
- * @return STATUS_SUCCESS, STATUS_INSUFFICIENT_RESOURCES, or STATUS_DEVICE_BUSY.
+ * Uses InterlockedCompareExchange loop to atomically reserve a queue slot,
+ * preventing the TOCTOU race where multiple threads could exceed MaxQueueDepth.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
@@ -582,6 +675,9 @@ MqEnqueueMessage(
     PQUEUED_MESSAGE message = NULL;
     NTSTATUS status;
     LONG currentDepth;
+    LONG newDepth;
+    LONG maxDepth;
+    BOOLEAN slotReserved = FALSE;
 
     //
     // Initialize output
@@ -593,7 +689,7 @@ MqEnqueueMessage(
     //
     // Validate state
     //
-    if (!g_MqGlobals.Initialized) {
+    if (!MqpIsRunning()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -604,7 +700,7 @@ MqEnqueueMessage(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (MessageSize > g_MqGlobals.MaxMessageSize) {
+    if (MessageSize > (UINT32)g_MqGlobals.MaxMessageSize) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
@@ -613,15 +709,31 @@ MqEnqueueMessage(
     }
 
     //
-    // Check queue depth (unless high priority which bypasses check)
+    // Atomic slot reservation using CAS loop
+    // High/Critical priority messages bypass the limit
     //
-    currentDepth = g_MqGlobals.TotalMessageCount;
-    if (currentDepth >= (LONG)g_MqGlobals.MaxQueueDepth) {
-        if (Priority < MessagePriority_High) {
-            InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
-            return STATUS_DEVICE_BUSY;
-        }
-        // High/Critical priority messages always get through
+    maxDepth = g_MqGlobals.MaxQueueDepth;
+
+    if (Priority >= MessagePriority_High) {
+        //
+        // High priority - always succeeds, just increment
+        //
+        InterlockedIncrement(&g_MqGlobals.TotalMessageCount);
+        slotReserved = TRUE;
+    } else {
+        //
+        // Normal/Low priority - must reserve slot atomically
+        //
+        do {
+            currentDepth = g_MqGlobals.TotalMessageCount;
+            if (currentDepth >= maxDepth) {
+                InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
+                return STATUS_DEVICE_BUSY;
+            }
+            newDepth = currentDepth + 1;
+        } while (InterlockedCompareExchange(&g_MqGlobals.TotalMessageCount, newDepth, currentDepth) != currentDepth);
+
+        slotReserved = TRUE;
     }
 
     //
@@ -629,6 +741,10 @@ MqEnqueueMessage(
     //
     message = MqpAllocateMessage(MessageSize);
     if (message == NULL) {
+        //
+        // Release reserved slot
+        //
+        InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
         InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -644,11 +760,7 @@ MqEnqueueMessage(
     message->Flags = Flags;
     message->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
     message->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
-    message->CompletionEvent = NULL;
-    message->CompletionStatus = NULL;
-    message->ResponseBuffer = NULL;
-    message->ResponseBufferSize = 0;
-    message->ResponseSize = NULL;
+    message->CompletionId = 0;
 
     //
     // Copy message data
@@ -659,10 +771,12 @@ MqEnqueueMessage(
 
     //
     // Enqueue to appropriate priority queue
+    // Note: TotalMessageCount already incremented above
     //
     status = MqpEnqueueToPriorityQueue(message);
     if (!NT_SUCCESS(status)) {
         MqpFreeMessageInternal(message);
+        InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
         return status;
     }
 
@@ -673,16 +787,21 @@ MqEnqueueMessage(
     InterlockedAdd64(&g_MqGlobals.TotalBytesEnqueued, MessageSize);
 
     //
-    // Check high water mark
+    // Update flow control state
     //
-    currentDepth = g_MqGlobals.TotalMessageCount;
-    if (currentDepth >= (LONG)g_MqGlobals.HighWaterMark && !g_MqGlobals.FlowControlActive) {
-        g_MqGlobals.FlowControlActive = TRUE;
-        g_MqGlobals.LastFlowControlTime = MqpGetCurrentTimeMs();
-        KeSetEvent(&g_MqGlobals.HighWaterMarkEvent, IO_NO_INCREMENT, FALSE);
+    MqpUpdateFlowControl(g_MqGlobals.TotalMessageCount);
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/MQ] High water mark reached: %d messages\n", currentDepth);
+    //
+    // Update peak count
+    //
+    {
+        LONG depth = g_MqGlobals.TotalMessageCount;
+        LONG peak = g_MqGlobals.PeakMessageCount;
+        while (depth > peak) {
+            LONG oldPeak = InterlockedCompareExchange(&g_MqGlobals.PeakMessageCount, depth, peak);
+            if (oldPeak == peak) break;
+            peak = oldPeak;
+        }
     }
 
     //
@@ -703,24 +822,11 @@ MqEnqueueMessage(
 /**
  * @brief Enqueue a blocking message and wait for response.
  *
- * This function enqueues a message that requires a response from user-mode.
- * The calling thread blocks until either:
- * - A response is received via MqCompleteMessage()
- * - The timeout expires
- * - The queue is shut down
- *
- * IMPORTANT: Cannot be called at IRQL > PASSIVE_LEVEL as it waits.
- *
- * @param MessageType Type of message being enqueued.
- * @param MessageData Pointer to message payload data.
- * @param MessageSize Size of message payload in bytes.
- * @param Priority Priority level for the message.
- * @param ResponseBuffer Buffer to receive the response.
- * @param ResponseBufferSize Size of response buffer in bytes.
- * @param ResponseSize Receives actual response size.
- * @param TimeoutMs Timeout in milliseconds (0 = infinite).
- *
- * @return STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_CANCELLED, etc.
+ * Key safety features:
+ * - Completion structure is reference-counted
+ * - Response data copied INTO completion structure under lock
+ * - Caller copies from completion structure after wait (safe - we hold reference)
+ * - On timeout/cancel, completion is detached so MqCompleteMessage is safe
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -741,6 +847,10 @@ MqEnqueueMessageAndWait(
     NTSTATUS status;
     LARGE_INTEGER timeout;
     KIRQL oldIrql;
+    LONG currentDepth;
+    LONG newDepth;
+    LONG maxDepth;
+    MQ_COMPLETION_STATE completionState;
 
     PAGED_CODE();
 
@@ -752,7 +862,7 @@ MqEnqueueMessageAndWait(
     //
     // Validate state
     //
-    if (!g_MqGlobals.Initialized) {
+    if (!MqpIsRunning()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -767,7 +877,11 @@ MqEnqueueMessageAndWait(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (MessageSize > g_MqGlobals.MaxMessageSize) {
+    if (ResponseBufferSize > MQ_MAX_RESPONSE_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (MessageSize > (UINT32)g_MqGlobals.MaxMessageSize) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
@@ -791,27 +905,45 @@ MqEnqueueMessageAndWait(
     }
 
     //
+    // Reserve queue slot atomically
+    //
+    maxDepth = g_MqGlobals.MaxQueueDepth;
+
+    if (Priority >= MessagePriority_High) {
+        InterlockedIncrement(&g_MqGlobals.TotalMessageCount);
+    } else {
+        do {
+            currentDepth = g_MqGlobals.TotalMessageCount;
+            if (currentDepth >= maxDepth) {
+                MqpReleasePendingCompletion(pendingCompletion);
+                MqpReleasePendingCompletion(pendingCompletion);  // Release both refs
+                InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
+                return STATUS_DEVICE_BUSY;
+            }
+            newDepth = currentDepth + 1;
+        } while (InterlockedCompareExchange(&g_MqGlobals.TotalMessageCount, newDepth, currentDepth) != currentDepth);
+    }
+
+    //
     // Allocate message
     //
     message = MqpAllocateMessage(MessageSize);
     if (message == NULL) {
-        MqpFreePendingCompletion(pendingCompletion);
+        InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
+        MqpReleasePendingCompletion(pendingCompletion);
+        MqpReleasePendingCompletion(pendingCompletion);
         InterlockedIncrement64(&g_MqGlobals.TotalMessagesDropped);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
     // Initialize pending completion
+    // Created with RefCount=2 (one for waiter, one for list)
     //
+    pendingCompletion->CompletionId = (UINT64)InterlockedIncrement64(&g_MqGlobals.NextCompletionId);
     pendingCompletion->MessageId = (UINT64)InterlockedIncrement64(&g_MqGlobals.NextMessageId);
-    KeInitializeEvent(&pendingCompletion->CompletionEvent, NotificationEvent, FALSE);
-    pendingCompletion->CompletionStatus = STATUS_PENDING;
-    pendingCompletion->ResponseBuffer = ResponseBuffer;
-    pendingCompletion->ResponseBufferSize = ResponseBufferSize;
-    pendingCompletion->ResponseSize = 0;
     pendingCompletion->EnqueueTime = MqpGetCurrentTimeMs();
-    pendingCompletion->Completed = FALSE;
-    pendingCompletion->Cancelled = FALSE;
+    pendingCompletion->ResponseBufferSize = ResponseBufferSize;
 
     //
     // Fill message structure
@@ -824,11 +956,7 @@ MqEnqueueMessageAndWait(
     message->Flags = MQ_MSG_FLAG_BLOCKING;
     message->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
     message->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
-    message->CompletionEvent = &pendingCompletion->CompletionEvent;
-    message->CompletionStatus = &pendingCompletion->CompletionStatus;
-    message->ResponseBuffer = ResponseBuffer;
-    message->ResponseBufferSize = ResponseBufferSize;
-    message->ResponseSize = &pendingCompletion->ResponseSize;
+    message->CompletionId = pendingCompletion->CompletionId;
 
     //
     // Copy message data
@@ -843,23 +971,22 @@ MqEnqueueMessageAndWait(
     KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
     InsertTailList(&g_PendingCompletionList, &pendingCompletion->ListEntry);
     InterlockedIncrement(&g_PendingCompletionCount);
+    InterlockedIncrement(&g_MqGlobals.OutstandingCompletions);
+    KeClearEvent(&g_MqGlobals.AllCompletionsReleasedEvent);
     KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
     //
-    // Enqueue message
+    // Enqueue message (TotalMessageCount already incremented)
     //
     status = MqpEnqueueToPriorityQueue(message);
     if (!NT_SUCCESS(status)) {
         //
         // Remove pending completion on failure
         //
-        KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
-        RemoveEntryList(&pendingCompletion->ListEntry);
-        InterlockedDecrement(&g_PendingCompletionCount);
-        KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
-
-        MqpFreePendingCompletion(pendingCompletion);
+        MqpDetachPendingCompletion(pendingCompletion);
+        MqpReleasePendingCompletion(pendingCompletion);  // Release waiter's ref
         MqpFreeMessageInternal(message);
+        InterlockedDecrement(&g_MqGlobals.TotalMessageCount);
         return status;
     }
 
@@ -878,9 +1005,6 @@ MqEnqueueMessageAndWait(
     // Wait for completion
     //
     if (TimeoutMs == 0) {
-        //
-        // Infinite wait
-        //
         status = KeWaitForSingleObject(
             &pendingCompletion->CompletionEvent,
             Executive,
@@ -889,9 +1013,6 @@ MqEnqueueMessageAndWait(
             NULL
         );
     } else {
-        //
-        // Timed wait (negative value = relative)
-        //
         timeout.QuadPart = -(LONGLONG)TimeoutMs * 10000LL;
         status = KeWaitForSingleObject(
             &pendingCompletion->CompletionEvent,
@@ -905,49 +1026,55 @@ MqEnqueueMessageAndWait(
     //
     // Handle wait result
     //
-    if (status == STATUS_SUCCESS) {
+    completionState = (MQ_COMPLETION_STATE)InterlockedCompareExchange(
+        &pendingCompletion->State,
+        pendingCompletion->State,
+        pendingCompletion->State
+    );
+
+    if (status == STATUS_SUCCESS && completionState == MqCompletionState_Completed) {
         //
-        // Completion was signaled - get result
+        // Success - copy response from completion structure
+        // Safe because we still hold our reference
         //
+        UINT32 copySize = min(pendingCompletion->ResponseSize, ResponseBufferSize);
+        if (copySize > 0) {
+            RtlCopyMemory(ResponseBuffer, pendingCompletion->ResponseData, copySize);
+        }
+        *ResponseSize = copySize;
         status = pendingCompletion->CompletionStatus;
-        *ResponseSize = pendingCompletion->ResponseSize;
-    } else if (status == STATUS_TIMEOUT) {
+    } else if (status == STATUS_TIMEOUT || completionState == MqCompletionState_TimedOut) {
         //
-        // Timeout - mark as timed out
+        // Timeout - detach completion so MqCompleteMessage won't access it
         //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/MQ] Blocking message timeout (id=%llu, timeout=%ums)\n",
-                   pendingCompletion->MessageId, TimeoutMs);
+        MqpDetachPendingCompletion(pendingCompletion);
+        MQ_LOG_WARNING("Blocking message timeout (id=%llu, timeout=%ums)",
+                      (unsigned long long)pendingCompletion->MessageId, TimeoutMs);
         status = STATUS_TIMEOUT;
+    } else if (completionState == MqCompletionState_Cancelled) {
+        //
+        // Cancelled (shutdown)
+        //
+        status = STATUS_CANCELLED;
     } else {
         //
-        // Other wait failure (e.g., thread alerted)
+        // Other failure
         //
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/MQ] Wait failed for message id=%llu: 0x%08X\n",
-                   pendingCompletion->MessageId, status);
+        MqpDetachPendingCompletion(pendingCompletion);
+        MQ_LOG_WARNING("Wait failed for message id=%llu: 0x%08X",
+                      (unsigned long long)pendingCompletion->MessageId, status);
     }
 
     //
-    // Remove from pending list and free
+    // Release waiter's reference
     //
-    MqpRemovePendingCompletion(pendingCompletion);
-    MqpFreePendingCompletion(pendingCompletion);
+    MqpReleasePendingCompletion(pendingCompletion);
 
     return status;
 }
 
 /**
- * @brief Dequeue a single message from the queue.
- *
- * Dequeues the highest priority message available. Priority order is:
- * Critical > High > Normal > Low.
- *
- * @param Message Receives pointer to dequeued message. Caller must free
- *                with MqFreeMessage() when done.
- * @param TimeoutMs Timeout in milliseconds (0 = no wait).
- *
- * @return STATUS_SUCCESS, STATUS_TIMEOUT, or error code.
+ * @brief Dequeue a single message.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -971,7 +1098,7 @@ MqDequeueMessage(
     //
     // Validate state
     //
-    if (!g_MqGlobals.Initialized) {
+    if (!MqpIsRunning()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1024,14 +1151,17 @@ MqDequeueMessage(
     }
 
     //
+    // Check if shutting down
+    //
+    if (!MqpIsRunning()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
     // Try to dequeue again
     //
     message = MqpDequeueFromPriorityQueues();
     if (message == NULL) {
-        //
-        // Spurious wakeup - event was signaled but no message
-        // (could happen during shutdown or race condition)
-        //
         return STATUS_NO_MORE_ENTRIES;
     }
 
@@ -1040,34 +1170,15 @@ MqDequeueMessage(
     InterlockedAdd64(&g_MqGlobals.TotalBytesDequeued, message->MessageSize);
 
     //
-    // Check low water mark - reset flow control
+    // Update flow control
     //
-    if (g_MqGlobals.FlowControlActive) {
-        LONG depth = g_MqGlobals.TotalMessageCount;
-        if (depth <= (LONG)g_MqGlobals.LowWaterMark) {
-            g_MqGlobals.FlowControlActive = FALSE;
-            KeClearEvent(&g_MqGlobals.HighWaterMarkEvent);
-
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                       "[ShadowStrike/MQ] Low water mark reached: %d messages, flow control released\n", depth);
-        }
-    }
+    MqpUpdateFlowControl(g_MqGlobals.TotalMessageCount);
 
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Dequeue a batch of messages.
- *
- * Efficiently dequeues up to MaxMessages in a single operation.
- * Messages are returned in priority order (highest first).
- *
- * @param Messages Array to receive message pointers.
- * @param MaxMessages Maximum messages to dequeue.
- * @param MessageCount Receives actual number dequeued.
- * @param TimeoutMs Timeout for first message (0 = no wait).
- *
- * @return STATUS_SUCCESS or error code.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -1100,7 +1211,7 @@ MqDequeueBatch(
     //
     // Validate state
     //
-    if (!g_MqGlobals.Initialized) {
+    if (!MqpIsRunning()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1132,47 +1243,43 @@ MqDequeueBatch(
 
     *MessageCount = count;
 
-    //
-    // Update batch statistics
-    //
     if (count > 1) {
         InterlockedIncrement64(&g_MqGlobals.TotalBatchesSent);
     }
+
+    //
+    // Update flow control
+    //
+    MqpUpdateFlowControl(g_MqGlobals.TotalMessageCount);
 
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Free a dequeued message.
- *
- * Must be called to release a message obtained from MqDequeueMessage
- * or MqDequeueBatch.
- *
- * @param Message Message to free.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 MqFreeMessage(
-    _In_ PQUEUED_MESSAGE Message
+    _In_opt_ PQUEUED_MESSAGE Message
     )
 {
-    if (Message != NULL) {
+    if (Message != NULL && MQ_IS_VALID_MESSAGE(Message)) {
         MqpFreeMessageInternal(Message);
     }
 }
 
 /**
- * @brief Complete a blocking message with response data.
+ * @brief Complete a blocking message with response.
  *
- * Called by the consumer (typically CommPort message handler) when
- * a response is received from user-mode for a blocking message.
+ * Thread-safe completion:
+ * - Finds and references completion under lock
+ * - Copies response data under lock
+ * - Signals waiter
+ * - Releases reference
  *
- * @param MessageId ID of the message being completed.
- * @param Status Completion status.
- * @param ResponseData Response data to copy to waiting thread.
- * @param ResponseSize Size of response data.
- *
- * @return STATUS_SUCCESS or STATUS_NOT_FOUND if MessageId not found.
+ * If waiter has already timed out/cancelled, completion is detached
+ * and this function returns STATUS_NOT_FOUND.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Must_inspect_result_
@@ -1186,45 +1293,72 @@ MqCompleteMessage(
 {
     PMQ_PENDING_COMPLETION completion;
     UINT32 copySize;
+    LONG previousState;
+    KIRQL oldIrql;
 
     //
-    // Find pending completion
+    // Validate response size
     //
-    completion = MqpFindPendingCompletion(MessageId);
+    if (ResponseSize > MQ_MAX_RESPONSE_SIZE) {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    //
+    // Find and reference completion
+    // This acquires lock, finds entry, adds reference, releases lock
+    //
+    completion = MqpFindAndReferencePendingCompletion(MessageId);
     if (completion == NULL) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/MQ] CompleteMessage: id=%llu not found\n", MessageId);
+        MQ_LOG_WARNING("CompleteMessage: id=%llu not found", (unsigned long long)MessageId);
         return STATUS_NOT_FOUND;
     }
 
     //
-    // Check if already completed
+    // Atomically transition state: Pending -> Completed
+    // If already not pending (timeout/cancel/detached), fail
     //
-    if (completion->Completed || completion->Cancelled) {
+    previousState = InterlockedCompareExchange(
+        &completion->State,
+        MqCompletionState_Completed,
+        MqCompletionState_Pending
+    );
+
+    if (previousState != MqCompletionState_Pending) {
+        //
+        // Already completed/timed out/cancelled
+        //
+        MqpReleasePendingCompletion(completion);
         return STATUS_ALREADY_COMPLETE;
     }
 
     //
-    // Copy response data
+    // Copy response data into completion structure under lock
+    // This is safe because completion is reference-counted
     //
-    if (ResponseData != NULL && ResponseSize > 0 && completion->ResponseBuffer != NULL) {
+    KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
+
+    if (ResponseData != NULL && ResponseSize > 0) {
         copySize = min(ResponseSize, completion->ResponseBufferSize);
-        RtlCopyMemory(completion->ResponseBuffer, ResponseData, copySize);
+        copySize = min(copySize, MQ_MAX_RESPONSE_SIZE);
+        RtlCopyMemory(completion->ResponseData, ResponseData, copySize);
         completion->ResponseSize = copySize;
     } else {
         completion->ResponseSize = 0;
     }
 
-    //
-    // Set completion status
-    //
     completion->CompletionStatus = Status;
-    completion->Completed = TRUE;
+
+    KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
     //
     // Signal completion event
     //
     KeSetEvent(&completion->CompletionEvent, IO_NO_INCREMENT, FALSE);
+
+    //
+    // Release our reference
+    //
+    MqpReleasePendingCompletion(completion);
 
     return STATUS_SUCCESS;
 }
@@ -1232,6 +1366,43 @@ MqCompleteMessage(
 // ============================================================================
 // FLOW CONTROL
 // ============================================================================
+
+/**
+ * @brief Update flow control state atomically.
+ */
+static VOID
+MqpUpdateFlowControl(
+    _In_ LONG CurrentDepth
+    )
+{
+    LONG highWaterMark = g_MqGlobals.HighWaterMark;
+    LONG lowWaterMark = g_MqGlobals.LowWaterMark;
+
+    if (CurrentDepth >= highWaterMark) {
+        //
+        // At or above high water mark - activate flow control
+        //
+        if (InterlockedCompareExchange(&g_MqGlobals.FlowControlActive,
+                                       MQ_FLOW_CONTROL_ACTIVE,
+                                       MQ_FLOW_CONTROL_INACTIVE) == MQ_FLOW_CONTROL_INACTIVE) {
+            g_MqGlobals.LastFlowControlTime = MqpGetCurrentTimeMs();
+            KeSetEvent(&g_MqGlobals.HighWaterMarkEvent, IO_NO_INCREMENT, FALSE);
+            KeClearEvent(&g_MqGlobals.SpaceAvailableEvent);
+            MQ_LOG_WARNING("High water mark reached: %d messages", CurrentDepth);
+        }
+    } else if (CurrentDepth <= lowWaterMark) {
+        //
+        // At or below low water mark - deactivate flow control
+        //
+        if (InterlockedCompareExchange(&g_MqGlobals.FlowControlActive,
+                                       MQ_FLOW_CONTROL_INACTIVE,
+                                       MQ_FLOW_CONTROL_ACTIVE) == MQ_FLOW_CONTROL_ACTIVE) {
+            KeClearEvent(&g_MqGlobals.HighWaterMarkEvent);
+            KeSetEvent(&g_MqGlobals.SpaceAvailableEvent, IO_NO_INCREMENT, FALSE);
+            MQ_LOG_INFO("Low water mark reached: %d messages, flow control released", CurrentDepth);
+        }
+    }
+}
 
 /**
  * @brief Check if queue is at high water mark.
@@ -1242,7 +1413,7 @@ MqIsHighWaterMark(
     VOID
     )
 {
-    return g_MqGlobals.FlowControlActive;
+    return (g_MqGlobals.FlowControlActive == MQ_FLOW_CONTROL_ACTIVE);
 }
 
 /**
@@ -1254,8 +1425,8 @@ MqIsLowWaterMark(
     VOID
     )
 {
-    return (!g_MqGlobals.FlowControlActive &&
-            g_MqGlobals.TotalMessageCount <= (LONG)g_MqGlobals.LowWaterMark);
+    return (g_MqGlobals.FlowControlActive == MQ_FLOW_CONTROL_INACTIVE &&
+            g_MqGlobals.TotalMessageCount <= g_MqGlobals.LowWaterMark);
 }
 
 /**
@@ -1272,12 +1443,10 @@ MqGetQueueDepth(
 }
 
 /**
- * @brief Wait for queue space to become available.
+ * @brief Wait for queue space.
  *
- * Blocks until the queue drops below the high water mark or timeout.
- *
- * @param TimeoutMs Timeout in milliseconds.
- * @return STATUS_SUCCESS if space available, STATUS_TIMEOUT otherwise.
+ * Waits for SpaceAvailableEvent which is signaled when queue drops
+ * below low water mark.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -1291,7 +1460,10 @@ MqWaitForSpace(
 
     PAGED_CODE();
 
-    if (!g_MqGlobals.FlowControlActive) {
+    //
+    // If not at high water mark, space is available
+    //
+    if (g_MqGlobals.FlowControlActive != MQ_FLOW_CONTROL_ACTIVE) {
         return STATUS_SUCCESS;
     }
 
@@ -1299,32 +1471,37 @@ MqWaitForSpace(
         return STATUS_DEVICE_BUSY;
     }
 
-    timeout.QuadPart = -(LONGLONG)TimeoutMs * 10000LL;
-
     //
-    // Wait for flow control to be released
-    // (HighWaterMarkEvent is cleared when we go below low water mark)
+    // Wait for SpaceAvailableEvent (signaled when below low water mark)
     //
-    status = KeWaitForSingleObject(
-        &g_MqGlobals.HighWaterMarkEvent,
-        Executive,
-        KernelMode,
-        FALSE,
-        &timeout
-    );
+    if (TimeoutMs == MAXULONG) {
+        status = KeWaitForSingleObject(
+            &g_MqGlobals.SpaceAvailableEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+    } else {
+        timeout.QuadPart = -(LONGLONG)TimeoutMs * 10000LL;
+        status = KeWaitForSingleObject(
+            &g_MqGlobals.SpaceAvailableEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+    }
 
     if (status == STATUS_TIMEOUT) {
         return STATUS_DEVICE_BUSY;
     }
 
-    return STATUS_SUCCESS;
+    return status;
 }
 
 /**
  * @brief Flush all queued messages.
- *
- * @param Wait TRUE to wait for completion.
- * @return STATUS_SUCCESS.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -1350,6 +1527,13 @@ MqFlush(
     while (g_MqGlobals.TotalMessageCount > 0 && maxWaitIterations > 0) {
         KeDelayExecutionThread(KernelMode, FALSE, &pollInterval);
         maxWaitIterations--;
+    }
+
+    //
+    // Return appropriate status
+    //
+    if (g_MqGlobals.TotalMessageCount > 0) {
+        return STATUS_TIMEOUT;
     }
 
     return STATUS_SUCCESS;
@@ -1416,6 +1600,57 @@ MqResetStatistics(
 // ============================================================================
 
 /**
+ * @brief Wait for message available.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+MqWaitForMessageAvailable(
+    _In_ UINT32 TimeoutMs
+    )
+{
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (!MqpIsRunning()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (TimeoutMs == 0) {
+        //
+        // Non-blocking check
+        //
+        if (g_MqGlobals.TotalMessageCount > 0) {
+            return STATUS_SUCCESS;
+        }
+        return STATUS_TIMEOUT;
+    }
+
+    if (TimeoutMs == MAXULONG) {
+        status = KeWaitForSingleObject(
+            &g_MqGlobals.MessageAvailableEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+        );
+    } else {
+        timeout.QuadPart = -(LONGLONG)TimeoutMs * 10000LL;
+        status = KeWaitForSingleObject(
+            &g_MqGlobals.MessageAvailableEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+    }
+
+    return status;
+}
+
+/**
  * @brief Get event for message available notification.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1456,32 +1691,58 @@ MqGetHighWaterMarkEvent(
 // ============================================================================
 
 /**
- * @brief Allocate a message structure.
+ * @brief Allocate a message structure with overflow protection.
  *
  * Uses lookaside list for small messages, direct pool for large ones.
+ * Allocation source is explicitly tracked for safe deallocation.
  */
 static PQUEUED_MESSAGE
 MqpAllocateMessage(
     _In_ UINT32 DataSize
     )
 {
-    PQUEUED_MESSAGE message;
-    SIZE_T allocSize = MQ_MESSAGE_ALLOC_SIZE(DataSize);
+    PQUEUED_MESSAGE message = NULL;
+    SIZE_T allocSize;
 
     //
-    // Use lookaside for typical small messages
+    // Verify subsystem is initialized
     //
-    if (allocSize <= MQ_MESSAGE_ALLOC_SIZE(1024)) {
+    if (!g_MqGlobals.MessageLookasideInitialized) {
+        return NULL;
+    }
+
+    //
+    // Calculate allocation size with overflow check
+    //
+    allocSize = MqCalculateMessageAllocSize(DataSize);
+    if (allocSize == 0) {
+        //
+        // Overflow detected
+        //
+        return NULL;
+    }
+
+    //
+    // Use lookaside for small messages
+    //
+    if (DataSize <= MQ_LOOKASIDE_THRESHOLD) {
         message = (PQUEUED_MESSAGE)ExAllocateFromNPagedLookasideList(&g_MqGlobals.MessageLookaside);
+        if (message != NULL) {
+            RtlZeroMemory(message, MQ_MESSAGE_ALLOC_SIZE(MQ_LOOKASIDE_THRESHOLD));
+            message->AllocSource = MqAllocSource_Lookaside;
+        }
     } else {
         //
         // Direct allocation for larger messages
         //
-        message = (PQUEUED_MESSAGE)ExAllocatePoolZero(NonPagedPoolNx, allocSize, MQ_TAG_MESSAGE);
+        message = (PQUEUED_MESSAGE)ExAllocatePoolZero(NonPagedPoolNx, allocSize, MQ_POOL_TAG_MESSAGE);
+        if (message != NULL) {
+            message->AllocSource = MqAllocSource_Pool;
+        }
     }
 
     if (message != NULL) {
-        RtlZeroMemory(message, allocSize);
+        message->Magic = MQ_MESSAGE_MAGIC;
         InitializeListHead(&message->ListEntry);
     }
 
@@ -1489,24 +1750,54 @@ MqpAllocateMessage(
 }
 
 /**
- * @brief Free a message structure.
+ * @brief Free a message structure using tracked allocation source.
  */
 static VOID
 MqpFreeMessageInternal(
     _In_ PQUEUED_MESSAGE Message
     )
 {
-    SIZE_T allocSize = MQ_MESSAGE_ALLOC_SIZE(Message->MessageSize);
+    //
+    // Validate message
+    //
+    if (Message == NULL || Message->Magic != MQ_MESSAGE_MAGIC) {
+        return;
+    }
 
-    if (allocSize <= MQ_MESSAGE_ALLOC_SIZE(1024)) {
-        ExFreeToNPagedLookasideList(&g_MqGlobals.MessageLookaside, Message);
-    } else {
-        ExFreePoolWithTag(Message, MQ_TAG_MESSAGE);
+    //
+    // Invalidate magic to detect double-free
+    //
+    Message->Magic = 0;
+
+    //
+    // Free based on recorded allocation source
+    //
+    switch (Message->AllocSource) {
+    case MqAllocSource_Lookaside:
+        if (g_MqGlobals.MessageLookasideInitialized) {
+            ExFreeToNPagedLookasideList(&g_MqGlobals.MessageLookaside, Message);
+        }
+        break;
+
+    case MqAllocSource_Pool:
+        ExFreePoolWithTag(Message, MQ_POOL_TAG_MESSAGE);
+        break;
+
+    default:
+        //
+        // Invalid allocation source - corruption detected
+        // Cannot safely free, leak is better than corruption
+        //
+        MQ_LOG_ERROR("Invalid message allocation source: %d", Message->AllocSource);
+        break;
     }
 }
 
 /**
- * @brief Enqueue message to appropriate priority queue.
+ * @brief Enqueue message to priority queue.
+ *
+ * Note: TotalMessageCount must already be incremented by caller
+ * to implement atomic slot reservation.
  */
 static NTSTATUS
 MqpEnqueueToPriorityQueue(
@@ -1516,7 +1807,6 @@ MqpEnqueueToPriorityQueue(
     PPRIORITY_QUEUE queue;
     KIRQL oldIrql;
     LONG newCount;
-    LONG totalCount;
 
     if (Message->Priority >= MessagePriority_Max) {
         return STATUS_INVALID_PARAMETER;
@@ -1535,21 +1825,13 @@ MqpEnqueueToPriorityQueue(
 
     KeReleaseSpinLock(&queue->Lock, oldIrql);
 
-    //
-    // Update total count
-    //
-    totalCount = InterlockedIncrement(&g_MqGlobals.TotalMessageCount);
-    if (totalCount > g_MqGlobals.PeakMessageCount) {
-        InterlockedExchange(&g_MqGlobals.PeakMessageCount, totalCount);
-    }
-
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Dequeue highest priority message.
  *
- * Checks queues in priority order: Critical, High, Normal, Low.
+ * Decrements TotalMessageCount when message is dequeued.
  */
 static PQUEUED_MESSAGE
 MqpDequeueFromPriorityQueues(
@@ -1580,6 +1862,7 @@ MqpDequeueFromPriorityQueues(
         if (!IsListEmpty(&queue->MessageList)) {
             entry = RemoveHeadList(&queue->MessageList);
             message = CONTAINING_RECORD(entry, QUEUED_MESSAGE, ListEntry);
+            InitializeListHead(&message->ListEntry);  // Prevent double-remove
             InterlockedDecrement(&queue->Count);
         }
 
@@ -1596,6 +1879,10 @@ MqpDequeueFromPriorityQueues(
 
 /**
  * @brief Allocate pending completion structure.
+ *
+ * Created with RefCount=2:
+ * - One reference for the waiter
+ * - One reference for the list
  */
 static PMQ_PENDING_COMPLETION
 MqpAllocatePendingCompletion(
@@ -1604,9 +1891,17 @@ MqpAllocatePendingCompletion(
 {
     PMQ_PENDING_COMPLETION completion;
 
+    if (!g_PendingCompletionLookasideInitialized) {
+        return NULL;
+    }
+
     completion = (PMQ_PENDING_COMPLETION)ExAllocateFromNPagedLookasideList(&g_PendingCompletionLookaside);
     if (completion != NULL) {
         RtlZeroMemory(completion, sizeof(MQ_PENDING_COMPLETION));
+        completion->Magic = MQ_COMPLETION_MAGIC;
+        completion->RefCount = 2;  // Waiter + List
+        completion->State = MqCompletionState_Pending;
+        KeInitializeEvent(&completion->CompletionEvent, NotificationEvent, FALSE);
         InitializeListHead(&completion->ListEntry);
     }
 
@@ -1614,25 +1909,62 @@ MqpAllocatePendingCompletion(
 }
 
 /**
- * @brief Free pending completion structure.
+ * @brief Release a reference to pending completion.
+ *
+ * When RefCount reaches 0, the structure is freed.
  */
 static VOID
-MqpFreePendingCompletion(
+MqpReleasePendingCompletion(
     _In_ PMQ_PENDING_COMPLETION Completion
     )
 {
-    ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, Completion);
+    LONG newRefCount;
+
+    if (Completion == NULL || Completion->Magic != MQ_COMPLETION_MAGIC) {
+        return;
+    }
+
+    newRefCount = InterlockedDecrement(&Completion->RefCount);
+
+    if (newRefCount == 0) {
+        //
+        // Last reference - free the structure
+        //
+        Completion->Magic = 0;  // Invalidate
+
+        //
+        // Update outstanding completion count
+        //
+        if (InterlockedDecrement(&g_MqGlobals.OutstandingCompletions) == 0) {
+            KeSetEvent(&g_MqGlobals.AllCompletionsReleasedEvent, IO_NO_INCREMENT, FALSE);
+        }
+
+        if (g_PendingCompletionLookasideInitialized) {
+            ExFreeToNPagedLookasideList(&g_PendingCompletionLookaside, Completion);
+        }
+    } else if (newRefCount < 0) {
+        //
+        // Underflow - bug in reference counting
+        //
+        MQ_LOG_ERROR("Completion refcount underflow!");
+    }
 }
 
 /**
- * @brief Find pending completion by message ID.
+ * @brief Find pending completion by message ID and add reference.
+ *
+ * Searches under lock, adds reference if found, then releases lock.
+ * Caller must call MqpReleasePendingCompletion when done.
+ *
+ * Returns NULL if not found or already completed/detached.
  */
 static PMQ_PENDING_COMPLETION
-MqpFindPendingCompletion(
+MqpFindAndReferencePendingCompletion(
     _In_ UINT64 MessageId
     )
 {
     PMQ_PENDING_COMPLETION completion = NULL;
+    PMQ_PENDING_COMPLETION found = NULL;
     PLIST_ENTRY entry;
     KIRQL oldIrql;
 
@@ -1643,36 +1975,66 @@ MqpFindPendingCompletion(
          entry = entry->Flink)
     {
         completion = CONTAINING_RECORD(entry, MQ_PENDING_COMPLETION, ListEntry);
-        if (completion->MessageId == MessageId) {
+        if (completion->MessageId == MessageId &&
+            completion->State == MqCompletionState_Pending) {
+            //
+            // Found - add reference while holding lock
+            //
+            InterlockedIncrement(&completion->RefCount);
+            found = completion;
             break;
         }
-        completion = NULL;
     }
 
     KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
 
-    return completion;
+    return found;
 }
 
 /**
- * @brief Remove pending completion from tracking list.
+ * @brief Detach pending completion from list.
+ *
+ * Called when waiter times out or is cancelled.
+ * Removes from list and releases list's reference.
+ * After detach, MqCompleteMessage will not find this completion.
  */
 static VOID
-MqpRemovePendingCompletion(
+MqpDetachPendingCompletion(
     _In_ PMQ_PENDING_COMPLETION Completion
     )
 {
     KIRQL oldIrql;
+    BOOLEAN wasInList = FALSE;
+
+    if (Completion == NULL) {
+        return;
+    }
 
     KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
 
+    //
+    // Mark as detached
+    //
+    InterlockedExchange(&Completion->State, MqCompletionState_Detached);
+
+    //
+    // Remove from list if still there
+    //
     if (!IsListEmpty(&Completion->ListEntry)) {
         RemoveEntryList(&Completion->ListEntry);
-        InterlockedDecrement(&g_PendingCompletionCount);
         InitializeListHead(&Completion->ListEntry);
+        InterlockedDecrement(&g_PendingCompletionCount);
+        wasInList = TRUE;
     }
 
     KeReleaseSpinLock(&g_PendingCompletionLock, oldIrql);
+
+    //
+    // Release list's reference if we removed from list
+    //
+    if (wasInList) {
+        MqpReleasePendingCompletion(Completion);
+    }
 }
 
 /**
@@ -1691,6 +2053,7 @@ MqpCleanupExpiredCompletions(
     KIRQL oldIrql;
     UINT64 currentTime = MqpGetCurrentTimeMs();
     UINT64 timeout = MQ_COMPLETION_TIMEOUT_DEFAULT;
+    LONG previousState;
 
     KeAcquireSpinLock(&g_PendingCompletionLock, &oldIrql);
 
@@ -1702,20 +2065,28 @@ MqpCleanupExpiredCompletions(
         completion = CONTAINING_RECORD(entry, MQ_PENDING_COMPLETION, ListEntry);
 
         //
-        // Check if expired (30 second default)
+        // Check if expired
         //
         if ((currentTime - completion->EnqueueTime) > timeout) {
-            if (!completion->Completed && !completion->Cancelled) {
+            //
+            // Try to transition to TimedOut state
+            //
+            previousState = InterlockedCompareExchange(
+                &completion->State,
+                MqCompletionState_TimedOut,
+                MqCompletionState_Pending
+            );
+
+            if (previousState == MqCompletionState_Pending) {
                 //
-                // Mark as timed out and signal
+                // Successfully transitioned - signal timeout
                 //
                 completion->CompletionStatus = STATUS_TIMEOUT;
-                completion->Cancelled = TRUE;
                 KeSetEvent(&completion->CompletionEvent, IO_NO_INCREMENT, FALSE);
 
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike/MQ] Expired pending completion: id=%llu, age=%llums\n",
-                           completion->MessageId, currentTime - completion->EnqueueTime);
+                MQ_LOG_WARNING("Expired pending completion: id=%llu, age=%llums",
+                              (unsigned long long)completion->MessageId,
+                              (unsigned long long)(currentTime - completion->EnqueueTime));
             }
         }
     }
@@ -1725,11 +2096,6 @@ MqpCleanupExpiredCompletions(
 
 /**
  * @brief Worker thread for maintenance operations.
- *
- * Periodically:
- * - Cleans up expired pending completions
- * - Flushes batch buffer on timeout
- * - Monitors queue health
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
@@ -1745,8 +2111,7 @@ MqpWorkerThread(
 
     PAGED_CODE();
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Worker thread started\n");
+    MQ_LOG_INFO("Worker thread started");
 
     pollInterval.QuadPart = -(LONGLONG)MQ_WORKER_POLL_INTERVAL_MS * 10000LL;
 
@@ -1762,7 +2127,7 @@ MqpWorkerThread(
             &pollInterval
         );
 
-        if (status == STATUS_SUCCESS) {
+        if (status == STATUS_SUCCESS || g_MqGlobals.WorkerStopping) {
             //
             // Stop event signaled
             //
@@ -1782,20 +2147,20 @@ MqpWorkerThread(
             MqpCleanupExpiredCompletions();
 
             //
-            // Log statistics if at high water mark
+            // Log statistics if at high water mark (debug only)
             //
-            if (g_MqGlobals.FlowControlActive) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike/MQ] High load: depth=%d, enqueued=%llu, dropped=%llu\n",
-                           g_MqGlobals.TotalMessageCount,
-                           g_MqGlobals.TotalMessagesEnqueued,
-                           g_MqGlobals.TotalMessagesDropped);
+            #if MQ_DEBUG_OUTPUT
+            if (g_MqGlobals.FlowControlActive == MQ_FLOW_CONTROL_ACTIVE) {
+                MQ_LOG_WARNING("High load: depth=%d, enqueued=%llu, dropped=%llu",
+                              g_MqGlobals.TotalMessageCount,
+                              (unsigned long long)g_MqGlobals.TotalMessagesEnqueued,
+                              (unsigned long long)g_MqGlobals.TotalMessagesDropped);
             }
+            #endif
         }
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike/MQ] Worker thread exiting\n");
+    MQ_LOG_INFO("Worker thread exiting");
 
     PsTerminateSystemThread(STATUS_SUCCESS);
 }

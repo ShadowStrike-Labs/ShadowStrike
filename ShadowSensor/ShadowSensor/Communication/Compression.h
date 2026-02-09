@@ -113,6 +113,11 @@ C_ASSERT(sizeof(COMP_HEADER) == 40);
 // Compression Context
 //=============================================================================
 
+//
+// Forward declaration for dictionary
+//
+typedef struct _COMP_DICTIONARY *PCOMP_DICTIONARY_REF;
+
 typedef struct _COMP_CONTEXT {
     //
     // Algorithm settings
@@ -121,39 +126,45 @@ typedef struct _COMP_CONTEXT {
     COMP_FLAGS Flags;
     ULONG CompressionLevel;
     ULONG Acceleration;
-    
+
     //
-    // Dictionary support
+    // Dictionary support - stores actual PCOMP_DICTIONARY reference
     //
-    PVOID Dictionary;
+    PCOMP_DICTIONARY_REF DictionaryRef;
+    PVOID DictionaryData;
     ULONG DictionarySize;
     ULONG DictionaryId;
-    
+
     //
     // Internal state (for stream mode)
     //
     PVOID InternalState;
     ULONG InternalStateSize;
     BOOLEAN StreamInitialized;
-    
+
     //
     // Work buffers
     //
     PVOID WorkBuffer;
     ULONG WorkBufferSize;
-    
+
     //
-    // Statistics
+    // Statistics (must be accessed atomically)
     //
-    ULONG64 TotalBytesIn;
-    ULONG64 TotalBytesOut;
-    ULONG64 TotalOperations;
-    
+    volatile LONG64 TotalBytesIn;
+    volatile LONG64 TotalBytesOut;
+    volatile LONG64 TotalOperations;
+
     //
-    // Synchronization
+    // Synchronization - protects dictionary changes
     //
-    KSPIN_LOCK Lock;
-    
+    EX_SPIN_LOCK Lock;
+
+    //
+    // Indicates context is valid and initialized
+    //
+    volatile LONG Initialized;
+
 } COMP_CONTEXT, *PCOMP_CONTEXT;
 
 //=============================================================================
@@ -249,33 +260,39 @@ typedef struct _COMP_DICTIONARY {
 
 typedef struct _COMP_MANAGER {
     //
-    // Initialization state
+    // Initialization state - use interlocked access
     //
-    BOOLEAN Initialized;
-    
+    volatile LONG Initialized;
+
+    //
+    // Reference count for safe shutdown
+    //
+    volatile LONG RefCount;
+
     //
     // Default context for quick operations
     //
     COMP_CONTEXT DefaultContext;
-    
+
     //
     // Dictionary cache
     //
     LIST_ENTRY DictionaryList;
-    KSPIN_LOCK DictionaryLock;
-    ULONG DictionaryCount;
+    EX_SPIN_LOCK DictionaryLock;
+    volatile LONG DictionaryCount;
     ULONG MaxDictionaries;
-    
+
     //
-    // Statistics
+    // Statistics - all must be accessed atomically
     //
     struct {
-        ULONG64 TotalCompressed;
-        ULONG64 TotalDecompressed;
-        ULONG64 BytesSaved;
-        ULONG64 Errors;
+        volatile LONG64 TotalCompressed;
+        volatile LONG64 TotalDecompressed;
+        volatile LONG64 BytesSaved;
+        volatile LONG64 Errors;
+        volatile LONG PeakRatio;        // Peak compression ratio (percentage)
     } Stats;
-    
+
     //
     // Configuration
     //
@@ -285,7 +302,7 @@ typedef struct _COMP_MANAGER {
         ULONG MinSizeToCompress;
         BOOLEAN AlwaysVerify;
     } Config;
-    
+
 } COMP_MANAGER, *PCOMP_MANAGER;
 
 //=============================================================================
@@ -664,12 +681,13 @@ LZ4_decompress_safe(
     _In_ INT dstCapacity
     );
 
-INT
-LZ4_decompress_fast(
-    _In_ const CHAR* src,
-    _Out_writes_bytes_(originalSize) CHAR* dst,
-    _In_ INT originalSize
-    );
+//
+// LZ4_decompress_fast is DEPRECATED and REMOVED for security reasons.
+// This function cannot safely validate input bounds without knowing
+// the compressed size. Use LZ4_decompress_safe instead.
+//
+// INT LZ4_decompress_fast(...) - REMOVED - DO NOT USE
+//
 
 //
 // Dictionary variants

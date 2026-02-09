@@ -24,6 +24,7 @@
  * - Safe string handling with length limits
  * - Exception handling for user-mode data access
  * - Proper cleanup on all error paths
+ * - Proper buffer tracking for lookaside vs pool allocations
  *
  * Performance Optimizations:
  * - Lookaside list for frequent allocations
@@ -38,7 +39,7 @@
  * - T1036: Masquerading (file scan verdicts)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -109,6 +110,11 @@ extern "C" {
 #define SB_RETRY_DELAY_BASE_MS              100
 
 /**
+ * @brief Maximum retry delay (milliseconds) - cap for exponential backoff
+ */
+#define SB_MAX_RETRY_DELAY_MS               5000
+
+/**
  * @brief Maximum path length in scan requests
  */
 #define SB_MAX_PATH_LENGTH                  (32 * 1024)
@@ -121,7 +127,7 @@ extern "C" {
 /**
  * @brief Maximum registry data size to capture
  */
-#define MAX_REGISTRY_DATA_SIZE              4096
+#define SB_MAX_REGISTRY_DATA_SIZE           4096
 
 /**
  * @brief Circuit breaker threshold (failures before open)
@@ -142,6 +148,64 @@ extern "C" {
  * @brief Standard message buffer size for lookaside
  */
 #define SB_STANDARD_BUFFER_SIZE             4096
+
+/**
+ * @brief Large message buffer size for lookaside
+ */
+#define SB_LARGE_BUFFER_SIZE                SHADOWSTRIKE_MAX_MESSAGE_SIZE
+
+// ============================================================================
+// MESSAGE FLAGS
+// ============================================================================
+
+/**
+ * @brief Message header flag: High priority
+ */
+#define SB_MSG_FLAG_HIGH_PRIORITY           0x0001
+
+/**
+ * @brief Message header flag: Bypass cache
+ */
+#define SB_MSG_FLAG_BYPASS_CACHE            0x0002
+
+/**
+ * @brief Message header flag: Requires reply
+ */
+#define SB_MSG_FLAG_REQUIRES_REPLY          0x0004
+
+/**
+ * @brief Verdict flag: Threat detected
+ */
+#define SB_VERDICT_FLAG_THREAT_DETECTED     0x0001
+
+/**
+ * @brief Verdict flag: Result from cache
+ */
+#define SB_VERDICT_FLAG_FROM_CACHE          0x0002
+
+// ============================================================================
+// BUFFER ALLOCATION SOURCE TRACKING
+// ============================================================================
+
+/**
+ * @brief Buffer source: Direct pool allocation
+ */
+#define SB_BUFFER_SOURCE_POOL               0
+
+/**
+ * @brief Buffer source: Standard lookaside list
+ */
+#define SB_BUFFER_SOURCE_STANDARD_LOOKASIDE 1
+
+/**
+ * @brief Buffer source: Large lookaside list
+ */
+#define SB_BUFFER_SOURCE_LARGE_LOOKASIDE    2
+
+/**
+ * @brief Buffer header magic value for validation
+ */
+#define SB_BUFFER_HEADER_MAGIC              0x53424844  // 'SBHD'
 
 // ============================================================================
 // ERROR CODES
@@ -166,6 +230,11 @@ extern "C" {
  * @brief Message too large error
  */
 #define SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE    ((NTSTATUS)0xE0000004L)
+
+/**
+ * @brief Integer overflow error
+ */
+#define SHADOWSTRIKE_ERROR_INTEGER_OVERFLOW     ((NTSTATUS)0xE0000005L)
 
 // ============================================================================
 // ENUMERATIONS
@@ -230,6 +299,19 @@ typedef enum _SB_CIRCUIT_STATE {
 // ============================================================================
 
 /**
+ * @brief Buffer header for tracking allocation source
+ *
+ * Prepended to every buffer allocation to track where the buffer
+ * came from, enabling correct deallocation.
+ */
+typedef struct _SB_BUFFER_HEADER {
+    ULONG Magic;                // SB_BUFFER_HEADER_MAGIC
+    ULONG Source;               // SB_BUFFER_SOURCE_*
+    ULONG RequestedSize;        // Original requested size
+    ULONG AllocatedSize;        // Actual allocated size
+} SB_BUFFER_HEADER, *PSB_BUFFER_HEADER;
+
+/**
  * @brief Extended scan request options
  */
 typedef struct _SB_SCAN_OPTIONS {
@@ -281,7 +363,6 @@ typedef struct _SB_STATISTICS {
     volatile LONG64 TotalLatencyMs;
     volatile LONG64 MinLatencyMs;
     volatile LONG64 MaxLatencyMs;
-    volatile LONG64 AverageLatencyMs;
 
     //
     // Error tracking
@@ -484,7 +565,7 @@ ShadowStrikeSendProcessNotification(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ParentId,
     _In_ BOOLEAN Create,
-    _In_ PUNICODE_STRING ImageName,
+    _In_opt_ PUNICODE_STRING ImageName,
     _In_opt_ PUNICODE_STRING CommandLine
 );
 
@@ -517,7 +598,7 @@ ShadowStrikeSendThreadNotification(
  * Fire-and-forget notification for DLL/driver loads.
  *
  * @param ProcessId         Target process ID
- * @param FullImageName     Full path to loaded image
+ * @param FullImageName     Full path to loaded image (optional)
  * @param ImageInfo         Image information structure
  *
  * @return STATUS_SUCCESS if queued successfully
@@ -528,7 +609,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeSendImageNotification(
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING FullImageName,
+    _In_opt_ PUNICODE_STRING FullImageName,
     _In_ PIMAGE_INFO ImageInfo
 );
 
@@ -556,7 +637,7 @@ ShadowStrikeSendRegistryNotification(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId,
     _In_ UINT8 Operation,
-    _In_ PUNICODE_STRING KeyPath,
+    _In_opt_ PUNICODE_STRING KeyPath,
     _In_opt_ PUNICODE_STRING ValueName,
     _In_opt_ PVOID Data,
     _In_ ULONG DataSize,
@@ -628,6 +709,7 @@ ShadowStrikeSendMessageEx(
  *
  * Allocates from lookaside list for standard sizes,
  * falls back to pool for larger allocations.
+ * Buffer source is tracked for proper deallocation.
  *
  * @param Size  Minimum size required
  *
@@ -646,7 +728,8 @@ ShadowStrikeAllocateMessageBuffer(
 /**
  * @brief Free a message buffer.
  *
- * Returns buffer to lookaside list or frees to pool.
+ * Returns buffer to lookaside list or frees to pool based on
+ * tracked allocation source.
  *
  * @param Buffer    Buffer to free (NULL is safe)
  *
@@ -669,10 +752,12 @@ ShadowStrikeFreeMessageBuffer(
  * @param MessageType   Type of message
  * @param DataSize      Size of payload data (excluding header)
  *
+ * @return STATUS_SUCCESS on success, STATUS_INVALID_PARAMETER if Header is NULL
+ *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
+NTSTATUS
 ShadowStrikeInitMessageHeader(
     _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header,
     _In_ SHADOWSTRIKE_MESSAGE_TYPE MessageType,
@@ -746,10 +831,12 @@ ShadowStrikeGetCircuitState(
  *
  * @param Stats     Receives statistics snapshot
  *
+ * @return STATUS_SUCCESS on success, STATUS_INVALID_PARAMETER if Stats is NULL
+ *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
+NTSTATUS
 ShadowStrikeGetScanBridgeStatistics(
     _Out_ PSB_STATISTICS Stats
 );

@@ -11,28 +11,31 @@
  *
  * Key Features:
  * - Race-safe context creation using "Keep if Exists" pattern
- * - Thread-safe access via ERESOURCE locks with proper IRQL enforcement
- * - Proper cleanup to prevent BSOD (ExDeleteResourceLite)
- * - Memory leak prevention (FileName.Buffer cleanup)
- * - FileID caching for efficient lookups
- * - Defensive programming against corrupted/malicious data
+ * - Two-phase locking: LifetimeLock (spin) + Resource (ERESOURCE)
+ * - Proper cleanup with State machine to prevent use-after-free
+ * - Memory quota enforcement for DoS protection
+ * - Comprehensive telemetry for production debugging
+ * - FileID + VolumeSerial for globally unique file identification
  *
- * CRITICAL FIXES IN THIS VERSION (v2.0.0):
+ * CRITICAL FIXES IN THIS VERSION (v3.0.0):
  * -----------------------------------------
- * 1. Fixed FltGetFileNameInformation API misuse (was passing NULL for CallbackData)
- *    - Now uses FltGetFileNameInformationUnsafe which is correct for FileObject-only calls
- * 2. Fixed reference count leak in ShadowGetOrCreateStreamContext
- *    - Removed erroneous FltReferenceContext call after FltSetStreamContext
- * 3. Fixed mixed synchronization (atomics + locks on same fields)
- *    - Now uses consistent ERESOURCE locking for all state fields
- *    - WriteCount remains atomic as it's lock-free by design
- * 4. Added ResourceInitialized checks before all lock acquisitions
- * 5. Added proper IRQL assertions for PASSIVE_LEVEL requirements
- * 6. Added defensive size validation for file name allocations
- * 7. Uses ExAllocatePool2 for modern Windows compatibility
+ * 1. Added LifetimeLock (KSPIN_LOCK) to atomically verify State before Resource acquisition
+ * 2. Added State machine (UNINITIALIZED -> INITIALIZING -> ACTIVE -> TEARDOWN)
+ * 3. Cleanup waits for active lock holders before deleting ERESOURCE
+ * 4. All field access after lock release removed (use-after-free prevention)
+ * 5. WriteCount atomic increment moved inside critical section
+ * 6. File info initialization moved BEFORE FltSetStreamContext
+ * 7. VolumeSerial now properly populated via FltQueryVolumeInformation
+ * 8. ScanFileSize now captured during ShadowSetStreamVerdict
+ * 9. Global memory quota enforced (16MB) for DoS protection
+ * 10. Debug logging gated behind SHADOW_DEBUG_VERBOSE_LOGGING
+ * 11. PAGED_CODE() added to all PASSIVE_LEVEL functions
+ * 12. Comprehensive telemetry infrastructure added
+ * 13. g_DriverData.FilterHandle validated before use
+ * 14. SAL annotations fixed (_In_opt_ where NULL is handled)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0
+ * @version 3.0.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -40,6 +43,25 @@
 #include "StreamContext.h"
 #include "../Core/Globals.h"
 #include "../Shared/VerdictTypes.h"
+
+// ============================================================================
+// PAGED CODE PRAGMA
+// ============================================================================
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, ShadowAcquireStreamContextShared)
+#pragma alloc_text(PAGE, ShadowAcquireStreamContextExclusive)
+#pragma alloc_text(PAGE, ShadowReleaseStreamContext)
+#pragma alloc_text(PAGE, ShadowGetOrCreateStreamContext)
+#pragma alloc_text(PAGE, ShadowGetStreamContext)
+#pragma alloc_text(PAGE, ShadowCleanupStreamContext)
+#pragma alloc_text(PAGE, ShadowInvalidateStreamContext)
+#pragma alloc_text(PAGE, ShadowSetStreamVerdict)
+#pragma alloc_text(PAGE, ShadowMarkScanInProgress)
+#pragma alloc_text(PAGE, ShadowShouldRescan)
+#pragma alloc_text(PAGE, ShadowInitializeStreamContextFileInfo)
+#pragma alloc_text(PAGE, ShadowSetStreamContextHash)
+#endif
 
 // ============================================================================
 // COMPILER COMPATIBILITY - ExAllocatePool2 wrapper for older WDK
@@ -64,12 +86,20 @@
 #endif
 
 // ============================================================================
+// GLOBAL TELEMETRY INSTANCE
+// ============================================================================
+
+SHADOW_STREAM_CONTEXT_TELEMETRY g_StreamContextTelemetry = { 0 };
+
+// ============================================================================
 // PRIVATE HELPER PROTOTYPES
 // ============================================================================
 
 static
 NTSTATUS
 ShadowAllocateStreamContext(
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject,
     _Outptr_ PSHADOW_STREAM_CONTEXT* Context
     );
 
@@ -89,40 +119,104 @@ ShadowQueryFileId(
     _Inout_ PSHADOW_STREAM_CONTEXT Context
     );
 
+static
+VOID
+ShadowQueryVolumeSerial(
+    _In_ PFLT_INSTANCE Instance,
+    _Inout_ PSHADOW_STREAM_CONTEXT Context
+    );
+
+static
+BOOLEAN
+ShadowCheckAndReserveStringQuota(
+    _In_ USHORT AllocationSize
+    );
+
+static
+VOID
+ShadowReleaseStringQuota(
+    _In_ USHORT AllocationSize
+    );
+
+static
+NTSTATUS
+ShadowInitializeStreamContextFileInfo(
+    _In_ PSHADOW_STREAM_CONTEXT Context,
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject
+    );
+
 // ============================================================================
 // LOCK HELPER FUNCTIONS
 // ============================================================================
 
 /**
  * @brief Acquire stream context lock for shared (read-only) access.
+ *
+ * Uses two-phase locking to prevent race with cleanup:
+ * 1. Acquire LifetimeLock (spin lock, very brief)
+ * 2. Verify State == ACTIVE
+ * 3. Enter critical region and acquire Resource shared
+ * 4. Release LifetimeLock
+ *
+ * The LifetimeLock ensures that between checking State and acquiring
+ * the Resource, no other thread can transition State to TEARDOWN.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 ShadowAcquireStreamContextShared(
-    _In_ PSHADOW_STREAM_CONTEXT Context
+    _In_opt_ PSHADOW_STREAM_CONTEXT Context
     )
 {
-    //
-    // IRQL assertion - ERESOURCE can only be acquired at PASSIVE_LEVEL
-    //
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    KIRQL oldIrql;
+    LONG state;
+
+    PAGED_CODE();
 
     if (Context == NULL) {
         return FALSE;
     }
 
     //
-    // CRITICAL: Check ResourceInitialized before ANY resource operation
-    // Acquiring an uninitialized ERESOURCE causes BSOD
+    // Phase 1: Acquire lifetime lock and verify state
     //
-    if (!Context->ResourceInitialized) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] CRITICAL: Attempt to acquire uninitialized resource\n");
+    KeAcquireSpinLock(&Context->LifetimeLock, &oldIrql);
+
+    state = Context->State;
+
+    if (state != SHADOW_CONTEXT_STATE_ACTIVE) {
+        //
+        // Context is not active (uninitialized, initializing, or teardown)
+        //
+        KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
+        InterlockedIncrement(&g_StreamContextTelemetry.LockAcquisitionFailures);
         return FALSE;
     }
 
+    //
+    // Phase 2: Enter critical region and acquire Resource while still holding
+    // LifetimeLock. This ensures cleanup cannot proceed until we have the Resource.
+    //
+    // Note: We're at DISPATCH_LEVEL due to spin lock, but KeEnterCriticalRegion
+    // is safe at any IRQL. ExAcquireResourceSharedLite requires <= APC_LEVEL,
+    // so we must release spin lock first, but only after entering critical region.
+    //
+    // CRITICAL: The sequence is:
+    // 1. KeEnterCriticalRegion (safe at DISPATCH)
+    // 2. Release spin lock (drops to PASSIVE)
+    // 3. Acquire Resource (requires PASSIVE/APC)
+    //
     KeEnterCriticalRegion();
+    KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
+
+    //
+    // Now at PASSIVE_LEVEL, acquire the Resource
+    // State was ACTIVE when we checked, and cleanup cannot proceed because:
+    // - Cleanup acquires LifetimeLock to set State = TEARDOWN
+    // - Cleanup then waits for Resource to be free
+    // - We're about to acquire Resource, so cleanup will wait for us
+    //
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
 
     return TRUE;
@@ -135,28 +229,37 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 ShadowAcquireStreamContextExclusive(
-    _In_ PSHADOW_STREAM_CONTEXT Context
+    _In_opt_ PSHADOW_STREAM_CONTEXT Context
     )
 {
-    //
-    // IRQL assertion - ERESOURCE can only be acquired at PASSIVE_LEVEL
-    //
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    KIRQL oldIrql;
+    LONG state;
+
+    PAGED_CODE();
 
     if (Context == NULL) {
         return FALSE;
     }
 
     //
-    // CRITICAL: Check ResourceInitialized before ANY resource operation
+    // Phase 1: Acquire lifetime lock and verify state
     //
-    if (!Context->ResourceInitialized) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] CRITICAL: Attempt to acquire uninitialized resource\n");
+    KeAcquireSpinLock(&Context->LifetimeLock, &oldIrql);
+
+    state = Context->State;
+
+    if (state != SHADOW_CONTEXT_STATE_ACTIVE) {
+        KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
+        InterlockedIncrement(&g_StreamContextTelemetry.LockAcquisitionFailures);
         return FALSE;
     }
 
+    //
+    // Phase 2: Enter critical region, release spin lock, acquire Resource
+    //
     KeEnterCriticalRegion();
+    KeReleaseSpinLock(&Context->LifetimeLock, oldIrql);
+
     ExAcquireResourceExclusiveLite(&Context->Resource, TRUE);
 
     return TRUE;
@@ -171,9 +274,14 @@ ShadowReleaseStreamContext(
     _In_ PSHADOW_STREAM_CONTEXT Context
     )
 {
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    PAGED_CODE();
 
-    if (Context == NULL || !Context->ResourceInitialized) {
+    //
+    // Context must not be NULL if caller acquired the lock successfully
+    //
+    NT_ASSERT(Context != NULL);
+
+    if (Context == NULL) {
         return;
     }
 
@@ -187,6 +295,13 @@ ShadowReleaseStreamContext(
 
 /**
  * @brief Get or create stream context (race-safe implementation).
+ *
+ * Reference counting behavior:
+ * - FltAllocateContext: refcount = 1
+ * - FltSetStreamContext (success): Filter Manager adds its own reference (refcount = 2)
+ * - We return the context with our reference; caller must call FltReleaseContext
+ * - When file closes, Filter Manager releases its reference
+ * - When caller releases, refcount hits 0 and cleanup callback fires
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -201,7 +316,7 @@ ShadowGetOrCreateStreamContext(
     PSHADOW_STREAM_CONTEXT newContext = NULL;
     PSHADOW_STREAM_CONTEXT oldContext = NULL;
 
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    PAGED_CODE();
 
     //
     // Validate parameters
@@ -217,6 +332,15 @@ ShadowGetOrCreateStreamContext(
     }
 
     //
+    // Validate global state
+    //
+    if (g_DriverData.FilterHandle == NULL) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] ERROR: FilterHandle is NULL in ShadowGetOrCreateStreamContext\n");
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    //
     // STEP 1: Try to get existing context
     //
     status = FltGetStreamContext(
@@ -228,7 +352,7 @@ ShadowGetOrCreateStreamContext(
     if (NT_SUCCESS(status)) {
         //
         // Found existing context - return it
-        // Reference count is already incremented by FltGetStreamContext
+        // FltGetStreamContext increments reference count for caller
         //
         *Context = oldContext;
         return STATUS_SUCCESS;
@@ -236,15 +360,16 @@ ShadowGetOrCreateStreamContext(
 
     if (status != STATUS_NOT_FOUND) {
         //
-        // Unexpected error (e.g., stream contexts not supported)
+        // Unexpected error (e.g., stream contexts not supported on this volume)
         //
         return status;
     }
 
     //
     // STEP 2: No context exists - allocate and initialize new one
+    // This initializes file info BEFORE attaching to prevent reading uninitialized data
     //
-    status = ShadowAllocateStreamContext(&newContext);
+    status = ShadowAllocateStreamContext(Instance, FileObject, &newContext);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -255,7 +380,7 @@ ShadowGetOrCreateStreamContext(
     // FLT_SET_CONTEXT_KEEP_IF_EXISTS ensures atomicity:
     // - If no context exists, ours is set
     // - If another thread already set one, we get STATUS_FLT_CONTEXT_ALREADY_DEFINED
-    //   and oldContext receives the existing context
+    //   and oldContext receives the existing context (with added reference)
     //
     status = FltSetStreamContext(
         Instance,
@@ -267,37 +392,10 @@ ShadowGetOrCreateStreamContext(
 
     if (NT_SUCCESS(status)) {
         //
-        // SUCCESS: We won the race - our context was set
+        // SUCCESS: Our context was attached to the file stream
+        // We return newContext with the reference from FltAllocateContext
+        // Caller must call FltReleaseContext when done
         //
-        // FltSetStreamContext does NOT add a reference for the caller.
-        // The Filter Manager holds its own reference. We need to add
-        // a reference for the caller (who will call FltReleaseContext).
-        //
-        // CRITICAL FIX: The original code incorrectly called FltReferenceContext
-        // after FltSetStreamContext. When FltSetStreamContext succeeds, the
-        // context already has refcount=1 from FltAllocateContext. The Filter
-        // Manager's internal reference is separate. We return the context
-        // with the allocation reference, which the caller will release.
-        //
-        // Actually, per WDK docs: When FltSetStreamContext succeeds with
-        // KEEP_IF_EXISTS, the caller should NOT call FltReleaseContext on
-        // newContext. The Filter Manager now owns the only reference.
-        // We need to add a reference for the caller.
-        //
-        // Wait - let me re-read WDK docs carefully:
-        // FltAllocateContext: refcount = 1
-        // FltSetStreamContext (success): Filter Manager takes ownership,
-        //   but does NOT change refcount. Caller must release if no longer needed.
-        //
-        // So the context has refcount=1, caller needs it, so we keep that ref.
-        // No FltReferenceContext needed. The original bug was ADDING an extra ref.
-        //
-
-        //
-        // Initialize file info while we hold the context
-        //
-        ShadowInitializeStreamContextFileInfo(newContext, Instance, FileObject);
-
         *Context = newContext;
         return STATUS_SUCCESS;
     }
@@ -308,20 +406,22 @@ ShadowGetOrCreateStreamContext(
     if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
         //
         // We lost the race - another thread created the context first
-        // Release our unused context and return the winner's context
+        // FltSetStreamContext populated oldContext with the existing context
+        // (with an added reference for us)
         //
-        // FltSetStreamContext already populated oldContext with the existing
-        // context (with an added reference for us)
+        InterlockedIncrement(&g_StreamContextTelemetry.RaceConditionsDetected);
+
         //
-        FltReleaseContext(newContext);  // Release our unused context
+        // Release our unused context (triggers cleanup callback)
+        //
+        FltReleaseContext(newContext);
 
         if (oldContext != NULL) {
             *Context = oldContext;
             return STATUS_SUCCESS;
         } else {
             //
-            // This should never happen with STATUS_FLT_CONTEXT_ALREADY_DEFINED
-            // but handle defensively
+            // This should never happen per WDK documentation
             //
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "[ShadowStrike] BUG: Context race lost but oldContext is NULL\n");
@@ -348,7 +448,7 @@ ShadowGetStreamContext(
     _Outptr_ PSHADOW_STREAM_CONTEXT* Context
     )
 {
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    PAGED_CODE();
 
     if (Context == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -369,7 +469,13 @@ ShadowGetStreamContext(
 
 /**
  * @brief Cleanup callback - called by Filter Manager on context destruction.
+ *
+ * CRITICAL: This function implements safe teardown:
+ * 1. Transitions State to TEARDOWN under LifetimeLock
+ * 2. Waits for any active Resource holders to release
+ * 3. Only then deletes ERESOURCE and frees resources
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupStreamContext(
     _In_ PFLT_CONTEXT Context,
@@ -377,7 +483,12 @@ ShadowCleanupStreamContext(
     )
 {
     PSHADOW_STREAM_CONTEXT ctx = (PSHADOW_STREAM_CONTEXT)Context;
+    KIRQL oldIrql;
+    LONG previousState;
+    ULONG waitCount = 0;
+    USHORT fileNameLength = 0;
 
+    PAGED_CODE();
     UNREFERENCED_PARAMETER(ContextType);
 
     //
@@ -387,42 +498,104 @@ ShadowCleanupStreamContext(
         return;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Cleaning up stream context: %wZ\n",
-               &ctx->FileName);
+    //
+    // STEP 1: Transition State to TEARDOWN under LifetimeLock
+    // This prevents any new lock acquisitions from succeeding
+    //
+    KeAcquireSpinLock(&ctx->LifetimeLock, &oldIrql);
+    previousState = InterlockedExchange(&ctx->State, SHADOW_CONTEXT_STATE_TEARDOWN);
+    KeReleaseSpinLock(&ctx->LifetimeLock, oldIrql);
 
     //
-    // CRITICAL: Delete ERESOURCE only if it was successfully initialized
-    // Deleting an uninitialized ERESOURCE causes BSOD (pool corruption)
+    // If context was never fully initialized, skip resource cleanup
     //
-    if (ctx->ResourceInitialized) {
+    if (previousState == SHADOW_CONTEXT_STATE_UNINITIALIZED) {
+        goto CleanupComplete;
+    }
+
+    if (previousState == SHADOW_CONTEXT_STATE_INITIALIZING) {
         //
-        // Ensure no one is holding the resource
-        // In a properly designed system, this should never happen during cleanup
+        // Context was being initialized when cleanup triggered
+        // ERESOURCE may or may not be initialized - check via heuristic
+        // This is a rare race condition
         //
-        ExDeleteResourceLite(&ctx->Resource);
-        ctx->ResourceInitialized = FALSE;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] WARNING: Context cleanup during initialization\n");
+        goto CleanupComplete;
     }
 
     //
-    // Free FileName buffer if allocated
+    // STEP 2: Wait for any active Resource holders to release
+    // The State is now TEARDOWN, so no new acquisitions will succeed
+    // Existing holders will eventually release
+    //
+    // Use exponential backoff to avoid spinning too aggressively
+    //
+    while (ExIsResourceAcquiredExclusiveLite(&ctx->Resource) ||
+           ExIsResourceAcquiredSharedLite(&ctx->Resource) > 0) {
+
+        waitCount++;
+
+        if (waitCount > 1000) {
+            //
+            // Something is very wrong - a thread is holding the Resource
+            // for an extremely long time during cleanup
+            //
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "[ShadowStrike] CRITICAL: Resource still held after 1000 waits in cleanup\n");
+            NT_ASSERT(FALSE);
+            break;
+        }
+
+        //
+        // Brief sleep with increasing delay (1ms, 2ms, 4ms, ... up to 100ms)
+        //
+        LARGE_INTEGER delay;
+        ULONG delayMs = (waitCount < 7) ? (1 << waitCount) : 100;
+        delay.QuadPart = -((LONGLONG)delayMs * 10000);
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+    //
+    // STEP 3: Now safe to delete ERESOURCE
+    //
+    if (previousState == SHADOW_CONTEXT_STATE_ACTIVE) {
+        ExDeleteResourceLite(&ctx->Resource);
+    }
+
+    //
+    // STEP 4: Free FileName buffer if allocated
     //
     if (ctx->FileName.Buffer != NULL) {
+        fileNameLength = ctx->FileName.MaximumLength;
         ExFreePoolWithTag(ctx->FileName.Buffer, SHADOW_CONTEXT_STRING_TAG);
         ctx->FileName.Buffer = NULL;
         ctx->FileName.Length = 0;
         ctx->FileName.MaximumLength = 0;
+
+        //
+        // Release quota
+        //
+        ShadowReleaseStringQuota(fileNameLength);
     }
 
     //
-    // Clear sensitive data
+    // STEP 5: Clear sensitive data
     //
     RtlSecureZeroMemory(ctx->FileHash, sizeof(ctx->FileHash));
 
+CleanupComplete:
     //
-    // NOTE: The context structure itself is freed by Filter Manager
-    // Do NOT call ExFreePoolWithTag on ctx
+    // Update telemetry
     //
+    InterlockedIncrement64(&g_StreamContextTelemetry.TotalFrees);
+    InterlockedDecrement(&g_StreamContextTelemetry.ActiveContexts);
+
+#if SHADOW_DEBUG_VERBOSE_LOGGING
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] Cleaned up stream context %p (previousState=%d)\n",
+               ctx, previousState);
+#endif
 }
 
 // ============================================================================
@@ -432,9 +605,8 @@ ShadowCleanupStreamContext(
 /**
  * @brief Invalidate stream context after file modification.
  *
- * CRITICAL FIX: Uses consistent ERESOURCE locking instead of mixing
- * atomic operations with lock-protected access. The only exception is
- * WriteCount which is designed for lock-free atomic updates.
+ * All state modifications AND atomic WriteCount increment happen
+ * inside the exclusive lock to prevent race conditions.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -442,19 +614,13 @@ ShadowInvalidateStreamContext(
     _In_opt_ PSHADOW_STREAM_CONTEXT Context
     )
 {
+    PAGED_CODE();
+
     if (Context == NULL) {
         return;
     }
 
-    //
-    // Acquire exclusive lock for all modifications
-    // CRITICAL FIX: Original code used InterlockedExchange8 without lock,
-    // which caused undefined behavior when mixed with lock-protected reads
-    //
     if (!ShadowAcquireStreamContextExclusive(Context)) {
-        //
-        // Context not initialized - cannot modify safely
-        //
         return;
     }
 
@@ -466,15 +632,12 @@ ShadowInvalidateStreamContext(
     Context->HashValid = FALSE;
 
     //
-    // Release lock before atomic operation on WriteCount
-    //
-    ShadowReleaseStreamContext(Context);
-
-    //
-    // WriteCount is the ONLY field that uses atomic operations
-    // It's designed for lock-free counting and is never read under lock
+    // Increment WriteCount INSIDE the lock to prevent use-after-free
+    // The atomic is still used for lock-free reads by monitoring code
     //
     InterlockedIncrement(&Context->WriteCount);
+
+    ShadowReleaseStreamContext(Context);
 }
 
 /**
@@ -484,9 +647,12 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowSetStreamVerdict(
     _In_opt_ PSHADOW_STREAM_CONTEXT Context,
-    _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict
+    _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict,
+    _In_ LONGLONG FileSize
     )
 {
+    PAGED_CODE();
+
     if (Context == NULL) {
         return;
     }
@@ -499,12 +665,16 @@ ShadowSetStreamVerdict(
     Context->IsScanned = TRUE;
     Context->IsModified = FALSE;
     Context->ScanInProgress = FALSE;
+    Context->ScanFileSize.QuadPart = FileSize;
     KeQuerySystemTime(&Context->ScanTime);
 
     ShadowReleaseStreamContext(Context);
 
+#if SHADOW_DEBUG_VERBOSE_LOGGING
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Set verdict: %d for context %p\n", Verdict, Context);
+               "[ShadowStrike] Set verdict: %d for context %p, size=%lld\n",
+               Verdict, Context, FileSize);
+#endif
 }
 
 /**
@@ -518,6 +688,8 @@ ShadowMarkScanInProgress(
     )
 {
     BOOLEAN started = FALSE;
+
+    PAGED_CODE();
 
     if (Context == NULL) {
         return FALSE;
@@ -554,6 +726,8 @@ ShadowShouldRescan(
     LARGE_INTEGER currentTime;
     LARGE_INTEGER elapsedTime;
 
+    PAGED_CODE();
+
     //
     // NULL context = needs scan (defensive)
     //
@@ -563,9 +737,11 @@ ShadowShouldRescan(
 
     if (!ShadowAcquireStreamContextShared(Context)) {
         //
-        // Cannot acquire lock - assume rescan needed (safe default)
+        // Cannot acquire lock (context in teardown) - don't scan
+        // Returning FALSE is safer than TRUE here because the file
+        // is being closed anyway
         //
-        return TRUE;
+        return FALSE;
     }
 
     //
@@ -601,17 +777,17 @@ ShadowShouldRescan(
         elapsedTime.QuadPart = currentTime.QuadPart - Context->ScanTime.QuadPart;
 
         //
-        // Convert 100-nanosecond units to seconds
-        // 10,000,000 100-ns units = 1 second
+        // Handle time going backwards (system time change)
         //
         if (elapsedTime.QuadPart < 0) {
-            //
-            // Time went backwards (system time change) - force rescan
-            //
             shouldRescan = TRUE;
             goto Cleanup;
         }
 
+        //
+        // Convert 100-nanosecond units to seconds
+        // 10,000,000 100-ns units = 1 second
+        //
         ULONG elapsedSeconds = (ULONG)(elapsedTime.QuadPart / 10000000LL);
 
         if (elapsedSeconds > CacheTTL) {
@@ -631,43 +807,6 @@ Cleanup:
 }
 
 /**
- * @brief Initialize file name and FileID in context.
- *
- * CRITICAL FIX: Uses FltGetFileNameInformationUnsafe instead of
- * FltGetFileNameInformation(NULL, ...) which was incorrect API usage.
- */
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowInitializeStreamContextFileInfo(
-    _In_ PSHADOW_STREAM_CONTEXT Context,
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject
-    )
-{
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
-
-    if (Context == NULL || Instance == NULL || FileObject == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Query file name (uses unsafe API since we only have FileObject)
-    //
-    ShadowQueryFileNameUnsafe(Instance, FileObject, Context);
-
-    //
-    // Query File ID
-    //
-    ShadowQueryFileId(Instance, FileObject, Context);
-
-    //
-    // We return SUCCESS even if individual queries failed
-    // Caller can check FileName.Buffer and FileId.QuadPart to verify
-    //
-    return STATUS_SUCCESS;
-}
-
-/**
  * @brief Set cached file hash in context.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -677,6 +816,8 @@ ShadowSetStreamContextHash(
     _In_reads_(SHADOW_SHA256_HASH_SIZE) const UCHAR* Hash
     )
 {
+    PAGED_CODE();
+
     if (Context == NULL || Hash == NULL) {
         return;
     }
@@ -691,25 +832,110 @@ ShadowSetStreamContextHash(
     ShadowReleaseStreamContext(Context);
 }
 
+/**
+ * @brief Get current telemetry snapshot.
+ */
+VOID
+ShadowGetStreamContextTelemetry(
+    _Out_ PSHADOW_STREAM_CONTEXT_TELEMETRY Telemetry
+    )
+{
+    if (Telemetry == NULL) {
+        return;
+    }
+
+    //
+    // Copy current values - these are all atomically updated so we get
+    // a consistent-enough snapshot without needing a global lock
+    //
+    Telemetry->TotalAllocations = g_StreamContextTelemetry.TotalAllocations;
+    Telemetry->TotalFrees = g_StreamContextTelemetry.TotalFrees;
+    Telemetry->ActiveContexts = g_StreamContextTelemetry.ActiveContexts;
+    Telemetry->TotalStringBytes = g_StreamContextTelemetry.TotalStringBytes;
+    Telemetry->CurrentStringBytes = g_StreamContextTelemetry.CurrentStringBytes;
+    Telemetry->QuotaExceededCount = g_StreamContextTelemetry.QuotaExceededCount;
+    Telemetry->ResourceInitFailures = g_StreamContextTelemetry.ResourceInitFailures;
+    Telemetry->LockAcquisitionFailures = g_StreamContextTelemetry.LockAcquisitionFailures;
+    Telemetry->RaceConditionsDetected = g_StreamContextTelemetry.RaceConditionsDetected;
+}
+
 // ============================================================================
 // PRIVATE HELPER FUNCTIONS
 // ============================================================================
 
 /**
- * @brief Allocate and initialize a new stream context.
+ * @brief Check and reserve quota for string allocation.
+ *
+ * @return TRUE if quota available and reserved, FALSE if quota exceeded
+ */
+static
+BOOLEAN
+ShadowCheckAndReserveStringQuota(
+    _In_ USHORT AllocationSize
+    )
+{
+    LONG64 currentBytes;
+    LONG64 newBytes;
+
+    do {
+        currentBytes = g_StreamContextTelemetry.CurrentStringBytes;
+        newBytes = currentBytes + AllocationSize;
+
+        if (newBytes > SHADOW_MAX_CONTEXT_MEMORY) {
+            InterlockedIncrement(&g_StreamContextTelemetry.QuotaExceededCount);
+            return FALSE;
+        }
+
+    } while (InterlockedCompareExchange64(
+                 &g_StreamContextTelemetry.CurrentStringBytes,
+                 newBytes,
+                 currentBytes) != currentBytes);
+
+    InterlockedAdd64(&g_StreamContextTelemetry.TotalStringBytes, AllocationSize);
+    return TRUE;
+}
+
+/**
+ * @brief Release previously reserved string quota.
+ */
+static
+VOID
+ShadowReleaseStringQuota(
+    _In_ USHORT AllocationSize
+    )
+{
+    InterlockedAdd64(&g_StreamContextTelemetry.CurrentStringBytes, -(LONG64)AllocationSize);
+}
+
+/**
+ * @brief Allocate and fully initialize a new stream context.
+ *
+ * This function initializes ALL fields including file info BEFORE
+ * the context is attached to the file stream. This prevents other
+ * threads from reading uninitialized data.
  */
 static
 NTSTATUS
 ShadowAllocateStreamContext(
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject,
     _Outptr_ PSHADOW_STREAM_CONTEXT* Context
     )
 {
     NTSTATUS status;
     PSHADOW_STREAM_CONTEXT ctx = NULL;
+    KIRQL oldIrql;
 
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    PAGED_CODE();
 
     *Context = NULL;
+
+    //
+    // Validate FilterHandle
+    //
+    if (g_DriverData.FilterHandle == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
 
     //
     // Allocate context from Filter Manager
@@ -734,24 +960,26 @@ ShadowAllocateStreamContext(
     RtlZeroMemory(ctx, sizeof(SHADOW_STREAM_CONTEXT));
 
     //
+    // Initialize lifetime spin lock and set state to INITIALIZING
+    //
+    KeInitializeSpinLock(&ctx->LifetimeLock);
+    ctx->State = SHADOW_CONTEXT_STATE_INITIALIZING;
+
+    //
     // Initialize ERESOURCE lock
     //
     status = ExInitializeResourceLite(&ctx->Resource);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike] Failed to initialize resource: 0x%08X\n", status);
+        InterlockedIncrement(&g_StreamContextTelemetry.ResourceInitFailures);
+        ctx->State = SHADOW_CONTEXT_STATE_UNINITIALIZED;
         FltReleaseContext(ctx);
         return status;
     }
 
     //
-    // CRITICAL: Mark resource as initialized AFTER successful initialization
-    // This flag is checked before every lock operation to prevent BSOD
-    //
-    ctx->ResourceInitialized = TRUE;
-
-    //
-    // Initialize default state
+    // Initialize default state fields
     //
     ctx->Verdict = Verdict_Unknown;
     ctx->IsScanned = FALSE;
@@ -759,23 +987,83 @@ ShadowAllocateStreamContext(
     ctx->ScanInProgress = FALSE;
     ctx->HashValid = FALSE;
 
+    //
+    // Initialize file info BEFORE attaching to stream
+    // This prevents other threads from reading uninitialized FileName/FileId
+    //
+    status = ShadowInitializeStreamContextFileInfo(ctx, Instance, FileObject);
+    if (!NT_SUCCESS(status)) {
+        //
+        // Non-fatal - context is still usable without cached file info
+        // Individual queries may have partially succeeded
+        //
+    }
+
+    //
+    // Transition to ACTIVE state under LifetimeLock
+    //
+    KeAcquireSpinLock(&ctx->LifetimeLock, &oldIrql);
+    ctx->State = SHADOW_CONTEXT_STATE_ACTIVE;
+    KeReleaseSpinLock(&ctx->LifetimeLock, oldIrql);
+
+    //
+    // Update telemetry
+    //
+    InterlockedIncrement64(&g_StreamContextTelemetry.TotalAllocations);
+    InterlockedIncrement(&g_StreamContextTelemetry.ActiveContexts);
+
     *Context = ctx;
     return STATUS_SUCCESS;
 }
 
 /**
- * @brief Query file name using the "unsafe" API (for when we only have FileObject).
+ * @brief Initialize file name, FileID, and VolumeSerial in context.
  *
- * CRITICAL FIX: The original code incorrectly called:
- *   FltGetFileNameInformation(NULL, FileObject, ...)
+ * Called during context allocation BEFORE attaching to file stream.
+ * Does not acquire context lock because context is not yet visible
+ * to other threads.
+ */
+static
+NTSTATUS
+ShadowInitializeStreamContextFileInfo(
+    _In_ PSHADOW_STREAM_CONTEXT Context,
+    _In_ PFLT_INSTANCE Instance,
+    _In_ PFILE_OBJECT FileObject
+    )
+{
+    PAGED_CODE();
+
+    if (Context == NULL || Instance == NULL || FileObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Query file name (uses unsafe API since we only have FileObject)
+    //
+    ShadowQueryFileNameUnsafe(Instance, FileObject, Context);
+
+    //
+    // Query File ID
+    //
+    ShadowQueryFileId(Instance, FileObject, Context);
+
+    //
+    // Query Volume Serial Number
+    //
+    ShadowQueryVolumeSerial(Instance, Context);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Query file name using the "unsafe" API.
  *
- * The first parameter is PFLT_CALLBACK_DATA, not optional. When you only
- * have a PFILE_OBJECT (not in a callback context), you MUST use:
- *   FltGetFileNameInformationUnsafe(FileObject, Instance, ...)
+ * Uses FltGetFileNameInformationUnsafe because we only have FileObject,
+ * not a callback data structure. This is safe because caller holds a
+ * reference to the file object.
  *
- * This function is "unsafe" because it can't guarantee the file object
- * won't be freed during the query, but in our case the caller holds a
- * reference to the file object so it's safe.
+ * Does NOT acquire context lock - called during initialization before
+ * context is visible to other threads.
  */
 static
 VOID
@@ -790,10 +1078,10 @@ ShadowQueryFileNameUnsafe(
     PWCH nameBuffer = NULL;
     USHORT allocationSize;
 
+    PAGED_CODE();
+
     //
-    // CRITICAL FIX: Use FltGetFileNameInformationUnsafe when we only have FileObject
-    // The original code passed NULL as the first parameter to FltGetFileNameInformation
-    // which caused undefined behavior/BSOD
+    // Query file name information
     //
     status = FltGetFileNameInformationUnsafe(
         FileObject,
@@ -803,8 +1091,10 @@ ShadowQueryFileNameUnsafe(
     );
 
     if (!NT_SUCCESS(status)) {
+#if SHADOW_DEBUG_VERBOSE_LOGGING
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                    "[ShadowStrike] FltGetFileNameInformationUnsafe failed: 0x%08X\n", status);
+#endif
         return;
     }
 
@@ -813,25 +1103,44 @@ ShadowQueryFileNameUnsafe(
     //
     status = FltParseFileNameInformation(nameInfo);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] FltParseFileNameInformation failed: 0x%08X\n", status);
-        // Continue anyway - Name field is still valid
+        //
+        // Continue anyway - Name field is still valid for our purposes
+        //
     }
 
     //
-    // Validate length before allocation (defensive against corrupted data)
+    // Validate length (defensive against corrupted data and DoS)
     //
-    if (nameInfo->Name.Length == 0 || nameInfo->Name.Length > SHADOW_MAX_FILENAME_LENGTH) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Invalid file name length: %u\n", nameInfo->Name.Length);
+    if (nameInfo->Name.Length == 0) {
         FltReleaseFileNameInformation(nameInfo);
         return;
     }
 
+    if (nameInfo->Name.Length > SHADOW_MAX_FILENAME_LENGTH) {
+        //
+        // Path too long - truncate to our limit
+        // This is a defensive measure against malicious long paths
+        //
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] File name truncated from %u to %u bytes\n",
+                   nameInfo->Name.Length, SHADOW_MAX_FILENAME_LENGTH);
+        nameInfo->Name.Length = SHADOW_MAX_FILENAME_LENGTH;
+    }
+
     //
-    // Calculate allocation size (add space for null terminator for safety)
+    // Calculate allocation size (add space for null terminator)
     //
     allocationSize = nameInfo->Name.Length + sizeof(WCHAR);
+
+    //
+    // Check and reserve quota before allocating
+    //
+    if (!ShadowCheckAndReserveStringQuota(allocationSize)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike] String quota exceeded, cannot cache file name\n");
+        FltReleaseFileNameInformation(nameInfo);
+        return;
+    }
 
     //
     // Allocate buffer for file name
@@ -846,28 +1155,14 @@ ShadowQueryFileNameUnsafe(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "[ShadowStrike] Failed to allocate file name buffer (%u bytes)\n",
                    allocationSize);
+        ShadowReleaseStringQuota(allocationSize);
         FltReleaseFileNameInformation(nameInfo);
         return;
-    }
-
-    //
-    // Acquire exclusive lock for modification
-    //
-    if (!ShadowAcquireStreamContextExclusive(Context)) {
-        ExFreePoolWithTag(nameBuffer, SHADOW_CONTEXT_STRING_TAG);
-        FltReleaseFileNameInformation(nameInfo);
-        return;
-    }
-
-    //
-    // Free existing buffer if present (shouldn't happen, but defensive)
-    //
-    if (Context->FileName.Buffer != NULL) {
-        ExFreePoolWithTag(Context->FileName.Buffer, SHADOW_CONTEXT_STRING_TAG);
     }
 
     //
     // Copy file name to context
+    // No lock needed - context not yet visible to other threads
     //
     Context->FileName.Buffer = nameBuffer;
     Context->FileName.MaximumLength = allocationSize;
@@ -880,20 +1175,22 @@ ShadowQueryFileNameUnsafe(
     );
 
     //
-    // Null-terminate for safety (not required by UNICODE_STRING but helpful for debugging)
+    // Null-terminate for safety
     //
     Context->FileName.Buffer[Context->FileName.Length / sizeof(WCHAR)] = L'\0';
 
-    ShadowReleaseStreamContext(Context);
-
+#if SHADOW_DEBUG_VERBOSE_LOGGING
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] Cached file name: %wZ\n", &Context->FileName);
+#endif
 
     FltReleaseFileNameInformation(nameInfo);
 }
 
 /**
  * @brief Query NTFS File ID for the file.
+ *
+ * Does NOT acquire context lock - called during initialization.
  */
 static
 VOID
@@ -906,6 +1203,8 @@ ShadowQueryFileId(
     NTSTATUS status;
     FILE_INTERNAL_INFORMATION fileIdInfo;
     ULONG bytesReturned;
+
+    PAGED_CODE();
 
     RtlZeroMemory(&fileIdInfo, sizeof(fileIdInfo));
 
@@ -922,28 +1221,80 @@ ShadowQueryFileId(
     );
 
     if (!NT_SUCCESS(status)) {
+#if SHADOW_DEBUG_VERBOSE_LOGGING
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                    "[ShadowStrike] FltQueryInformationFile (FileId) failed: 0x%08X\n", status);
+#endif
         return;
     }
 
     if (bytesReturned < sizeof(fileIdInfo)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Incomplete FILE_INTERNAL_INFORMATION returned\n");
         return;
     }
 
     //
-    // Acquire exclusive lock for modification
+    // Store FileId - no lock needed during initialization
     //
-    if (!ShadowAcquireStreamContextExclusive(Context)) {
-        return;
-    }
-
     Context->FileId = fileIdInfo.IndexNumber;
 
-    ShadowReleaseStreamContext(Context);
-
+#if SHADOW_DEBUG_VERBOSE_LOGGING
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
                "[ShadowStrike] Cached FileId: 0x%016llX\n", Context->FileId.QuadPart);
+#endif
+}
+
+/**
+ * @brief Query volume serial number.
+ *
+ * This creates a globally unique file identifier when combined with FileId.
+ * Does NOT acquire context lock - called during initialization.
+ */
+static
+VOID
+ShadowQueryVolumeSerial(
+    _In_ PFLT_INSTANCE Instance,
+    _Inout_ PSHADOW_STREAM_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    UCHAR buffer[sizeof(FILE_FS_VOLUME_INFORMATION) + 256 * sizeof(WCHAR)];
+    PFILE_FS_VOLUME_INFORMATION volumeInfo = (PFILE_FS_VOLUME_INFORMATION)buffer;
+    ULONG bytesReturned;
+
+    PAGED_CODE();
+
+    RtlZeroMemory(buffer, sizeof(buffer));
+
+    //
+    // Query volume information to get serial number
+    //
+    status = FltQueryVolumeInformation(
+        Instance,
+        volumeInfo,
+        sizeof(buffer),
+        FileFsVolumeInformation,
+        &bytesReturned
+    );
+
+    if (!NT_SUCCESS(status)) {
+#if SHADOW_DEBUG_VERBOSE_LOGGING
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                   "[ShadowStrike] FltQueryVolumeInformation failed: 0x%08X\n", status);
+#endif
+        return;
+    }
+
+    if (bytesReturned < FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel)) {
+        return;
+    }
+
+    //
+    // Store volume serial - no lock needed during initialization
+    //
+    Context->VolumeSerial = volumeInfo->VolumeSerialNumber;
+
+#if SHADOW_DEBUG_VERBOSE_LOGGING
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+               "[ShadowStrike] Cached VolumeSerial: 0x%08X\n", Context->VolumeSerial);
+#endif
 }

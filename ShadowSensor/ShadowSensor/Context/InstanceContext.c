@@ -18,9 +18,11 @@
  * - Volume type detection (network, removable, fixed)
  * - Filesystem capability detection via FileFsAttributeInformation
  * - Race-free average scan time calculation
+ * - Context signature validation for corruption detection
+ * - Lock-free reads for immutable data after initialization
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0
+ * @version 2.1.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -44,6 +46,7 @@
 #pragma alloc_text(PAGE, ShadowpQueryVolumeSerialNumber)
 #pragma alloc_text(PAGE, ShadowpDetermineVolumeType)
 #pragma alloc_text(PAGE, ShadowpAllocateAndCopyString)
+#pragma alloc_text(PAGE, ShadowpValidateInstanceContext)
 #endif
 
 // ============================================================================
@@ -61,6 +64,17 @@ ShadowpQueryVolumeProperties(
     _Out_ PFLT_FILESYSTEM_TYPE FilesystemType
     );
 
+/**
+ * @brief Query filesystem capabilities from volume.
+ *
+ * Uses FileFsAttributeInformation to determine actual filesystem features.
+ *
+ * @note FltQueryVolumeInformation with NULL IRP may fail on some filesystems
+ *       (particularly network redirectors or third-party FSDs). This is
+ *       acceptable for capability detection - we fall back to conservative
+ *       defaults (all capabilities disabled) which ensures safe operation
+ *       at the cost of potentially reduced optimization opportunities.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 static
@@ -70,6 +84,13 @@ ShadowpQueryFilesystemCapabilities(
     _Out_ PSHADOW_FS_CAPABILITIES Capabilities
     );
 
+/**
+ * @brief Query volume serial number.
+ *
+ * @note FltQueryVolumeInformation with NULL IRP may return STATUS_INVALID_PARAMETER
+ *       on some filesystems. Serial number of 0 is used as fallback, which is
+ *       acceptable since it's primarily used for cache key optimization.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 static
@@ -96,6 +117,25 @@ ShadowpAllocateAndCopyString(
     _In_ PCUNICODE_STRING Source,
     _Out_ PUNICODE_STRING Destination,
     _In_ ULONG MaxLength
+    );
+
+/**
+ * @brief Validate instance context pointer and signature.
+ *
+ * Performs comprehensive validation of a context pointer to detect
+ * corruption, invalid pointers, or uninitialized contexts.
+ *
+ * @param Context           The context to validate
+ * @param RequireInitialized TRUE if context must be fully initialized
+ *
+ * @return TRUE if context is valid, FALSE otherwise
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static
+BOOLEAN
+ShadowpValidateInstanceContext(
+    _In_opt_ PSHADOW_INSTANCE_CONTEXT Context,
+    _In_ BOOLEAN RequireInitialized
     );
 
 // ============================================================================
@@ -138,8 +178,7 @@ ShadowCreateInstanceContext(
     );
 
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to allocate instance context: 0x%08X\n", status);
+        SHADOW_LOG_ERROR("Failed to allocate instance context: 0x%08X", status);
         return status;
     }
 
@@ -149,12 +188,17 @@ ShadowCreateInstanceContext(
     RtlZeroMemory(ctx, sizeof(SHADOW_INSTANCE_CONTEXT));
 
     //
+    // Set signature FIRST - enables validation even during partial init
+    //
+    ctx->Signature = SHADOW_INSTANCE_CONTEXT_SIGNATURE;
+
+    //
     // Initialize ERESOURCE for synchronization
     //
     status = ExInitializeResourceLite(&ctx->Resource);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Failed to initialize instance resource: 0x%08X\n", status);
+        SHADOW_LOG_ERROR("Failed to initialize instance resource: 0x%08X", status);
+        ctx->Signature = 0;  // Invalidate signature before release
         FltReleaseContext(ctx);
         return status;
     }
@@ -186,8 +230,7 @@ ShadowCreateInstanceContext(
 
     *Context = ctx;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Instance context created successfully\n");
+    SHADOW_LOG_TRACE("Instance context created successfully");
 
     return STATUS_SUCCESS;
 }
@@ -203,6 +246,7 @@ ShadowGetInstanceContext(
     )
 {
     NTSTATUS status;
+    PSHADOW_INSTANCE_CONTEXT ctx;
 
     PAGED_CODE();
 
@@ -214,17 +258,26 @@ ShadowGetInstanceContext(
 
     status = FltGetInstanceContext(
         Instance,
-        (PFLT_CONTEXT*)Context
+        (PFLT_CONTEXT*)&ctx
     );
 
     if (!NT_SUCCESS(status)) {
         if (status != STATUS_NOT_FOUND) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] FltGetInstanceContext failed: 0x%08X\n", status);
+            SHADOW_LOG_ERROR("FltGetInstanceContext failed: 0x%08X", status);
         }
         return status;
     }
 
+    //
+    // Validate retrieved context - detect corruption early
+    //
+    if (!ShadowpValidateInstanceContext(ctx, FALSE)) {
+        SHADOW_LOG_ERROR("Retrieved context failed validation - possible corruption");
+        FltReleaseContext(ctx);
+        return STATUS_DATA_ERROR;
+    }
+
+    *Context = ctx;
     return STATUS_SUCCESS;
 }
 
@@ -257,8 +310,24 @@ ShadowCleanupInstanceContext(
 
     NT_ASSERT(ContextType == FLT_INSTANCE_CONTEXT);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
-               "[ShadowStrike] Cleaning up instance context\n");
+    //
+    // Validate signature before cleanup - detect corruption
+    //
+    if (ctx->Signature != SHADOW_INSTANCE_CONTEXT_SIGNATURE) {
+        SHADOW_LOG_ERROR("Cleanup called on context with invalid signature: 0x%08X",
+                         ctx->Signature);
+        NT_ASSERT(FALSE);
+        //
+        // Continue cleanup attempt - better to try than to leak
+        //
+    }
+
+    SHADOW_LOG_TRACE("Cleaning up instance context");
+
+    //
+    // Invalidate signature immediately to prevent use-after-free detection
+    //
+    ctx->Signature = 0;
 
     //
     // CRITICAL: Delete ERESOURCE only if it was successfully initialized
@@ -329,8 +398,23 @@ ShadowInitializeInstanceVolumeInfo(
 
     PAGED_CODE();
 
-    if (Context == NULL || Instance == NULL) {
+    //
+    // Validate context pointer and signature
+    //
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Instance == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Verify resource is initialized before we can acquire it
+    //
+    if (!Context->ResourceInitialized) {
+        SHADOW_LOG_ERROR("Cannot initialize volume info - resource not initialized");
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
@@ -341,8 +425,7 @@ ShadowInitializeInstanceVolumeInfo(
     } else {
         status = FltGetVolumeFromInstance(Instance, &localVolume);
         if (!NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "[ShadowStrike] FltGetVolumeFromInstance failed: 0x%08X\n", status);
+            SHADOW_LOG_ERROR("FltGetVolumeFromInstance failed: 0x%08X", status);
             return status;
         }
         volumeReferenced = TRUE;
@@ -359,8 +442,7 @@ ShadowInitializeInstanceVolumeInfo(
     );
 
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to query volume properties: 0x%08X\n", status);
+        SHADOW_LOG_WARNING("Failed to query volume properties: 0x%08X", status);
         //
         // Continue with defaults - non-fatal for basic operation
         //
@@ -371,8 +453,7 @@ ShadowInitializeInstanceVolumeInfo(
     //
     status = ShadowpQueryFilesystemCapabilities(Instance, &capabilities);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to query filesystem capabilities: 0x%08X\n", status);
+        SHADOW_LOG_WARNING("Failed to query filesystem capabilities: 0x%08X", status);
         //
         // Default to conservative assumptions (no advanced features)
         //
@@ -384,8 +465,7 @@ ShadowInitializeInstanceVolumeInfo(
     //
     status = ShadowpQueryVolumeSerialNumber(Instance, &serialNumber);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike] Failed to query volume serial: 0x%08X\n", status);
+        SHADOW_LOG_WARNING("Failed to query volume serial: 0x%08X", status);
         serialNumber = 0;
     }
 
@@ -425,9 +505,25 @@ ShadowInitializeInstanceVolumeInfo(
 
     //
     // Now acquire exclusive lock and update context
+    // Use double-check pattern to prevent concurrent initialization
     //
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&Context->Resource, TRUE);
+
+    //
+    // Check if already initialized (race condition prevention)
+    //
+    if (Context->Initialized) {
+        ExReleaseResourceLite(&Context->Resource);
+        KeLeaveCriticalRegion();
+
+        SHADOW_LOG_TRACE("Context already initialized - skipping duplicate init");
+
+        if (volumeReferenced && localVolume != NULL) {
+            FltObjectDereference(localVolume);
+        }
+        return STATUS_SUCCESS;
+    }
 
     //
     // Store queried information
@@ -454,14 +550,16 @@ ShadowInitializeInstanceVolumeInfo(
         );
 
         if (!NT_SUCCESS(copyStatus)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike] Failed to copy volume name: 0x%08X\n", copyStatus);
+            SHADOW_LOG_WARNING("Failed to copy volume name: 0x%08X", copyStatus);
         }
     }
 
     //
     // Mark context as fully initialized
+    // This MUST be done last, after all data is written
+    // Uses a memory barrier to ensure visibility to other CPUs
     //
+    MemoryBarrier();
     Context->Initialized = TRUE;
 
     ExReleaseResourceLite(&Context->Resource);
@@ -474,9 +572,8 @@ ShadowInitializeInstanceVolumeInfo(
         FltObjectDereference(localVolume);
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Instance initialized: Type=0x%X, FS=%d, Serial=0x%08X\n",
-               volumeType, fsType, serialNumber);
+    SHADOW_LOG_INFO("Instance initialized: Type=0x%X, FS=%d, Serial=0x%08X",
+                    volumeType, fsType, serialNumber);
 
     return STATUS_SUCCESS;
 }
@@ -490,7 +587,7 @@ ShadowInstanceIncrementCreateCount(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -507,7 +604,7 @@ ShadowInstanceIncrementScanCount(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -524,7 +621,7 @@ ShadowInstanceIncrementBlockCount(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -541,7 +638,7 @@ ShadowInstanceIncrementWriteCount(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -563,7 +660,7 @@ ShadowInstanceRecordScanVerdict(
     LARGE_INTEGER ScanTime
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -596,7 +693,7 @@ ShadowInstanceRecordScanError(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -613,7 +710,7 @@ ShadowInstanceRecordCacheHit(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -622,6 +719,9 @@ ShadowInstanceRecordCacheHit(
 
 /**
  * @brief Check if volume is a network volume.
+ *
+ * Optimized: After context is initialized, VolumeType is immutable and
+ * can be read without acquiring the lock.
  */
 _Use_decl_annotations_
 BOOLEAN
@@ -629,13 +729,29 @@ ShadowInstanceIsNetworkVolume(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    BOOLEAN isNetwork = FALSE;
-
     PAGED_CODE();
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return FALSE;
     }
+
+    //
+    // If initialized, VolumeType is immutable - no lock needed
+    // Use acquire semantics to ensure we see the latest Initialized value
+    //
+    MemoryBarrier();
+    if (Context->Initialized) {
+        return BooleanFlagOn(Context->VolumeType, VolumeTypeNetwork);
+    }
+
+    //
+    // Not yet initialized - must use lock for safe access
+    //
+    if (!Context->ResourceInitialized) {
+        return FALSE;
+    }
+
+    BOOLEAN isNetwork = FALSE;
 
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
@@ -650,6 +766,8 @@ ShadowInstanceIsNetworkVolume(
 
 /**
  * @brief Check if volume is removable media.
+ *
+ * Optimized: After context is initialized, VolumeType is immutable.
  */
 _Use_decl_annotations_
 BOOLEAN
@@ -657,13 +775,28 @@ ShadowInstanceIsRemovableMedia(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    BOOLEAN isRemovable = FALSE;
-
     PAGED_CODE();
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return FALSE;
     }
+
+    //
+    // If initialized, VolumeType is immutable - no lock needed
+    //
+    MemoryBarrier();
+    if (Context->Initialized) {
+        return BooleanFlagOn(Context->VolumeType, VolumeTypeRemovable);
+    }
+
+    //
+    // Not yet initialized - must use lock
+    //
+    if (!Context->ResourceInitialized) {
+        return FALSE;
+    }
+
+    BOOLEAN isRemovable = FALSE;
 
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
@@ -678,6 +811,8 @@ ShadowInstanceIsRemovableMedia(
 
 /**
  * @brief Check if volume supports file IDs.
+ *
+ * Optimized: After context is initialized, Capabilities is immutable.
  */
 _Use_decl_annotations_
 BOOLEAN
@@ -685,13 +820,28 @@ ShadowInstanceSupportsFileIds(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    BOOLEAN supportsFileIds = FALSE;
-
     PAGED_CODE();
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return FALSE;
     }
+
+    //
+    // If initialized, Capabilities is immutable - no lock needed
+    //
+    MemoryBarrier();
+    if (Context->Initialized) {
+        return Context->Capabilities.SupportsFileIds;
+    }
+
+    //
+    // Not yet initialized - must use lock
+    //
+    if (!Context->ResourceInitialized) {
+        return FALSE;
+    }
+
+    BOOLEAN supportsFileIds = FALSE;
 
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
@@ -706,6 +856,8 @@ ShadowInstanceSupportsFileIds(
 
 /**
  * @brief Check if volume supports alternate data streams.
+ *
+ * Optimized: After context is initialized, Capabilities is immutable.
  */
 _Use_decl_annotations_
 BOOLEAN
@@ -713,13 +865,28 @@ ShadowInstanceSupportsStreams(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    BOOLEAN supportsStreams = FALSE;
-
     PAGED_CODE();
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return FALSE;
     }
+
+    //
+    // If initialized, Capabilities is immutable - no lock needed
+    //
+    MemoryBarrier();
+    if (Context->Initialized) {
+        return Context->Capabilities.SupportsStreams;
+    }
+
+    //
+    // Not yet initialized - must use lock
+    //
+    if (!Context->ResourceInitialized) {
+        return FALSE;
+    }
+
+    BOOLEAN supportsStreams = FALSE;
 
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
@@ -734,6 +901,8 @@ ShadowInstanceSupportsStreams(
 
 /**
  * @brief Get filesystem type for this volume.
+ *
+ * Optimized: After context is initialized, FilesystemType is immutable.
  */
 _Use_decl_annotations_
 FLT_FILESYSTEM_TYPE
@@ -741,13 +910,28 @@ ShadowInstanceGetFilesystemType(
     PSHADOW_INSTANCE_CONTEXT Context
     )
 {
-    FLT_FILESYSTEM_TYPE fsType = FLT_FSTYPE_UNKNOWN;
-
     PAGED_CODE();
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return FLT_FSTYPE_UNKNOWN;
     }
+
+    //
+    // If initialized, FilesystemType is immutable - no lock needed
+    //
+    MemoryBarrier();
+    if (Context->Initialized) {
+        return Context->FilesystemType;
+    }
+
+    //
+    // Not yet initialized - must use lock
+    //
+    if (!Context->ResourceInitialized) {
+        return FLT_FSTYPE_UNKNOWN;
+    }
+
+    FLT_FILESYSTEM_TYPE fsType = FLT_FSTYPE_UNKNOWN;
 
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
@@ -771,7 +955,7 @@ ShadowInstanceUpdateActivityTime(
 {
     LARGE_INTEGER currentTime;
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return;
     }
 
@@ -794,7 +978,7 @@ ShadowInstanceGetAverageScanTime(
     LONGLONG totalScans;
     LONGLONG cumulativeTime;
 
-    if (Context == NULL) {
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
         return 0;
     }
 
@@ -815,6 +999,9 @@ ShadowInstanceGetAverageScanTime(
 
 /**
  * @brief Copy volume name to caller buffer.
+ *
+ * Thread-safe - acquires shared lock. Copies the volume name to
+ * caller-provided buffer to avoid holding lock during use.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -827,30 +1014,62 @@ ShadowInstanceCopyVolumeName(
 {
     NTSTATUS status = STATUS_SUCCESS;
     USHORT nameLength;
+    ULONG requiredBytes;
 
     PAGED_CODE();
 
-    if (Context == NULL || RequiredSize == NULL) {
+    if (RequiredSize == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *RequiredSize = 0;
 
+    if (!ShadowpValidateInstanceContext(Context, FALSE)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!Context->ResourceInitialized) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&Context->Resource, TRUE);
 
     nameLength = Context->VolumeName.Length;
-    *RequiredSize = (ULONG)nameLength + sizeof(WCHAR); // Include null terminator
 
-    if (Buffer == NULL || BufferSize < *RequiredSize) {
+    //
+    // Calculate required size with overflow protection
+    //
+    requiredBytes = (ULONG)nameLength + sizeof(WCHAR);
+    if (requiredBytes < nameLength) {
+        //
+        // Integer overflow detected - should never happen with USHORT length
+        // but defend against it anyway
+        //
+        ExReleaseResourceLite(&Context->Resource);
+        KeLeaveCriticalRegion();
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    *RequiredSize = requiredBytes;
+
+    //
+    // Check buffer availability
+    //
+    if (Buffer == NULL) {
+        status = STATUS_BUFFER_TOO_SMALL;
+    } else if (BufferSize < requiredBytes) {
         status = STATUS_BUFFER_TOO_SMALL;
     } else if (nameLength > 0 && Context->VolumeName.Buffer != NULL) {
+        //
+        // Copy the volume name
+        //
         RtlCopyMemory(Buffer, Context->VolumeName.Buffer, nameLength);
         Buffer[nameLength / sizeof(WCHAR)] = L'\0';
         status = STATUS_SUCCESS;
     } else {
         //
-        // No volume name available
+        // No volume name available - return empty string
         //
         Buffer[0] = L'\0';
         status = STATUS_SUCCESS;
@@ -867,15 +1086,56 @@ ShadowInstanceCopyVolumeName(
 // ============================================================================
 
 /**
+ * @brief Validate instance context pointer and signature.
+ */
+_Use_decl_annotations_
+static
+BOOLEAN
+ShadowpValidateInstanceContext(
+    PSHADOW_INSTANCE_CONTEXT Context,
+    BOOLEAN RequireInitialized
+    )
+{
+    PAGED_CODE();
+
+    //
+    // NULL check
+    //
+    if (Context == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Signature validation - detect corruption or invalid pointers
+    //
+    if (Context->Signature != SHADOW_INSTANCE_CONTEXT_SIGNATURE) {
+        SHADOW_LOG_ERROR("Context validation failed: invalid signature 0x%08X (expected 0x%08X)",
+                         Context->Signature, SHADOW_INSTANCE_CONTEXT_SIGNATURE);
+        NT_ASSERT(FALSE);
+        return FALSE;
+    }
+
+    //
+    // Initialization check if required
+    //
+    if (RequireInitialized && !Context->Initialized) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/**
  * @brief Query volume properties from Filter Manager.
  */
+_Use_decl_annotations_
 static
 NTSTATUS
 ShadowpQueryVolumeProperties(
-    _In_ PFLT_VOLUME Volume,
-    _Out_ PDEVICE_TYPE DeviceType,
-    _Out_ PULONG DeviceCharacteristics,
-    _Out_ PFLT_FILESYSTEM_TYPE FilesystemType
+    PFLT_VOLUME Volume,
+    PDEVICE_TYPE DeviceType,
+    PULONG DeviceCharacteristics,
+    PFLT_FILESYSTEM_TYPE FilesystemType
     )
 {
     NTSTATUS status;
@@ -925,17 +1185,21 @@ ShadowpQueryVolumeProperties(
  * @brief Query filesystem capabilities from volume.
  *
  * Uses FileFsAttributeInformation to determine actual filesystem features.
+ *
+ * @note This function uses FltQueryVolumeInformation with NULL IRP, which
+ *       may fail on some filesystems (network redirectors, third-party FSDs).
+ *       Failure is non-fatal - we default to conservative settings.
  */
+_Use_decl_annotations_
 static
 NTSTATUS
 ShadowpQueryFilesystemCapabilities(
-    _In_ PFLT_INSTANCE Instance,
-    _Out_ PSHADOW_FS_CAPABILITIES Capabilities
+    PFLT_INSTANCE Instance,
+    PSHADOW_FS_CAPABILITIES Capabilities
     )
 {
     NTSTATUS status;
     FILE_FS_ATTRIBUTE_INFORMATION attrInfo;
-    ULONG bytesReturned;
     ULONG fsAttributes;
 
     PAGED_CODE();
@@ -945,7 +1209,7 @@ ShadowpQueryFilesystemCapabilities(
 
     status = FltQueryVolumeInformation(
         Instance,
-        NULL,                           // No IRP, use cached info
+        NULL,                           // No IRP - may fail on some FSDs
         &attrInfo,
         sizeof(attrInfo),
         FileFsAttributeInformation
@@ -993,12 +1257,16 @@ ShadowpQueryFilesystemCapabilities(
 
 /**
  * @brief Query volume serial number.
+ *
+ * @note Uses FltQueryVolumeInformation with NULL IRP which may fail
+ *       on some filesystems. Returns 0 on failure which is acceptable.
  */
+_Use_decl_annotations_
 static
 NTSTATUS
 ShadowpQueryVolumeSerialNumber(
-    _In_ PFLT_INSTANCE Instance,
-    _Out_ PULONG SerialNumber
+    PFLT_INSTANCE Instance,
+    PULONG SerialNumber
     )
 {
     NTSTATUS status;
@@ -1006,7 +1274,6 @@ ShadowpQueryVolumeSerialNumber(
         FILE_FS_VOLUME_INFORMATION VolumeInfo;
         UCHAR Buffer[sizeof(FILE_FS_VOLUME_INFORMATION) + 64 * sizeof(WCHAR)];
     } volumeBuffer;
-    ULONG bytesReturned;
 
     PAGED_CODE();
 
@@ -1034,12 +1301,13 @@ ShadowpQueryVolumeSerialNumber(
  *
  * Properly checks FILE_REMOVABLE_MEDIA and other device flags.
  */
+_Use_decl_annotations_
 static
 SHADOW_VOLUME_TYPE
 ShadowpDetermineVolumeType(
-    _In_ DEVICE_TYPE DeviceType,
-    _In_ ULONG DeviceCharacteristics,
-    _In_ FLT_FILESYSTEM_TYPE FilesystemType
+    DEVICE_TYPE DeviceType,
+    ULONG DeviceCharacteristics,
+    FLT_FILESYSTEM_TYPE FilesystemType
     )
 {
     SHADOW_VOLUME_TYPE volumeType = VolumeTypeUnknown;
@@ -1114,16 +1382,22 @@ ShadowpDetermineVolumeType(
  *
  * Allocates a new buffer for the destination and copies the source.
  * Caller is responsible for freeing Destination->Buffer.
+ *
+ * Uses ExAllocatePool2 which requires Windows 10 version 2004 or later.
+ * For broader compatibility, compile with appropriate NTDDI_VERSION or
+ * use the compatibility shim below.
  */
+_Use_decl_annotations_
 static
 NTSTATUS
 ShadowpAllocateAndCopyString(
-    _In_ PCUNICODE_STRING Source,
-    _Out_ PUNICODE_STRING Destination,
-    _In_ ULONG MaxLength
+    PCUNICODE_STRING Source,
+    PUNICODE_STRING Destination,
+    ULONG MaxLength
     )
 {
     USHORT allocationLength;
+    SIZE_T totalSize;
 
     PAGED_CODE();
 
@@ -1139,13 +1413,31 @@ ShadowpAllocateAndCopyString(
     allocationLength = (USHORT)min(Source->Length, MaxLength);
 
     //
-    // Allocate buffer with room for null terminator
+    // Calculate total size with null terminator
     //
+    totalSize = (SIZE_T)allocationLength + sizeof(WCHAR);
+
+    //
+    // Allocate buffer
+    // Note: ExAllocatePool2 requires Windows 10 2004+
+    // For older OS support, use ExAllocatePoolWithTag + RtlZeroMemory
+    //
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
     Destination->Buffer = (PWCH)ExAllocatePool2(
         POOL_FLAG_PAGED,
-        (SIZE_T)allocationLength + sizeof(WCHAR),
+        totalSize,
         SHADOW_INSTANCE_STRING_TAG
     );
+#else
+    Destination->Buffer = (PWCH)ExAllocatePoolWithTag(
+        PagedPool,
+        totalSize,
+        SHADOW_INSTANCE_STRING_TAG
+    );
+    if (Destination->Buffer != NULL) {
+        RtlZeroMemory(Destination->Buffer, totalSize);
+    }
+#endif
 
     if (Destination->Buffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1162,7 +1454,7 @@ ShadowpAllocateAndCopyString(
     Destination->Buffer[allocationLength / sizeof(WCHAR)] = L'\0';
 
     Destination->Length = allocationLength;
-    Destination->MaximumLength = allocationLength + sizeof(WCHAR);
+    Destination->MaximumLength = (USHORT)(allocationLength + sizeof(WCHAR));
 
     return STATUS_SUCCESS;
 }

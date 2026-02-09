@@ -18,10 +18,7 @@
     - Keys zeroed on destruction
     - Constant-time comparisons to prevent timing attacks
     - No key material in pageable memory
-
-    MITRE ATT&CK Coverage:
-    - T1573: Encrypted Channel (secure comms)
-    - T1027: Obfuscated Files or Information (key protection)
+    - All BCrypt operations at PASSIVE_LEVEL
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -32,11 +29,25 @@
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, EncInitialize)
 #pragma alloc_text(PAGE, EncShutdown)
+#pragma alloc_text(PAGE, EncSetMasterKey)
 #pragma alloc_text(PAGE, EncGenerateKey)
 #pragma alloc_text(PAGE, EncDeriveKey)
 #pragma alloc_text(PAGE, EncImportKey)
+#pragma alloc_text(PAGE, EncExportKey)
+#pragma alloc_text(PAGE, EncDestroyKey)
 #pragma alloc_text(PAGE, EncCreateContext)
 #pragma alloc_text(PAGE, EncDestroyContext)
+#pragma alloc_text(PAGE, EncSetAAD)
+#pragma alloc_text(PAGE, EncEncrypt)
+#pragma alloc_text(PAGE, EncDecrypt)
+#pragma alloc_text(PAGE, EncEncryptWithContext)
+#pragma alloc_text(PAGE, EncDecryptWithContext)
+#pragma alloc_text(PAGE, EncRotateKey)
+#pragma alloc_text(PAGE, EncRotateAllKeys)
+#pragma alloc_text(PAGE, EncSetAutoRotation)
+#pragma alloc_text(PAGE, EncRandomBytes)
+#pragma alloc_text(PAGE, EncHmacSha256)
+#pragma alloc_text(PAGE, EncHkdfDerive)
 #endif
 
 //=============================================================================
@@ -46,8 +57,8 @@
 #define ENC_SIGNATURE               'CNEZ'  // 'ZENC' reversed
 #define ENC_HMAC_SHA256_SIZE        32
 #define ENC_HKDF_HASH_SIZE          32      // SHA-256
-#define ENC_MAX_KEYS                64
 #define ENC_OBFUSCATION_ROUNDS      3
+#define ENC_CRC32_POLYNOMIAL        0xEDB88320UL
 
 //=============================================================================
 // Internal Structures
@@ -60,6 +71,11 @@ typedef struct _ENC_KEY_INTERNAL {
     volatile BOOLEAN Destroying;
 } ENC_KEY_INTERNAL, *PENC_KEY_INTERNAL;
 
+typedef struct _ENC_ROTATION_CONTEXT {
+    PENC_MANAGER Manager;
+    WORK_QUEUE_ITEM WorkItem;
+} ENC_ROTATION_CONTEXT, *PENC_ROTATION_CONTEXT;
+
 //=============================================================================
 // Forward Declarations
 //=============================================================================
@@ -71,16 +87,11 @@ EncpGenerateNonce(
     _Out_writes_bytes_(ENC_GCM_NONCE_SIZE) PUCHAR Nonce
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-EncpObfuscateKey(
-    _Inout_ PENC_KEY Key
-    );
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-static VOID
-EncpDeobfuscateKey(
-    _Inout_ PENC_KEY Key
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+EncpGetDeobfuscatedKeyMaterial(
+    _In_ PENC_KEY Key,
+    _Out_writes_bytes_(ENC_AES_KEY_SIZE_256) PUCHAR KeyBuffer
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -90,13 +101,76 @@ EncpInitializeBCryptKey(
     _Inout_ PENC_KEY Key
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 EncpCleanupBCryptKey(
     _Inout_ PENC_KEY Key
     );
 
-static KDEFERRED_ROUTINE EncpRotationDpcRoutine;
+_IRQL_requires_(PASSIVE_LEVEL)
+static BOOLEAN
+EncpIsKeyExpired(
+    _In_ PENC_KEY Key
+    );
+
+static ULONG
+EncpCalculateCrc32(
+    _In_reads_bytes_(Size) PVOID Data,
+    _In_ ULONG Size
+    );
+
+IO_WORKITEM_ROUTINE EncpRotationWorkItemRoutine;
+KDEFERRED_ROUTINE EncpRotationDpcRoutine;
+
+//=============================================================================
+// CRC32 Table (for header integrity)
+//=============================================================================
+
+static ULONG g_Crc32Table[256];
+static BOOLEAN g_Crc32TableInitialized = FALSE;
+
+static VOID
+EncpInitializeCrc32Table(
+    VOID
+    )
+{
+    ULONG i, j, crc;
+
+    if (g_Crc32TableInitialized) {
+        return;
+    }
+
+    for (i = 0; i < 256; i++) {
+        crc = i;
+        for (j = 0; j < 8; j++) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ ENC_CRC32_POLYNOMIAL;
+            } else {
+                crc >>= 1;
+            }
+        }
+        g_Crc32Table[i] = crc;
+    }
+
+    g_Crc32TableInitialized = TRUE;
+}
+
+static ULONG
+EncpCalculateCrc32(
+    _In_reads_bytes_(Size) PVOID Data,
+    _In_ ULONG Size
+    )
+{
+    PUCHAR bytes = (PUCHAR)Data;
+    ULONG crc = 0xFFFFFFFF;
+    ULONG i;
+
+    for (i = 0; i < Size; i++) {
+        crc = (crc >> 8) ^ g_Crc32Table[(crc ^ bytes[i]) & 0xFF];
+    }
+
+    return crc ^ 0xFFFFFFFF;
+}
 
 //=============================================================================
 // Initialization / Shutdown
@@ -105,7 +179,8 @@ static KDEFERRED_ROUTINE EncpRotationDpcRoutine;
 _Use_decl_annotations_
 NTSTATUS
 EncInitialize(
-    _Out_ PENC_MANAGER Manager
+    _Out_ PENC_MANAGER Manager,
+    _In_opt_ PDEVICE_OBJECT DeviceObject
     )
 /*++
 
@@ -117,6 +192,7 @@ Routine Description:
 Arguments:
 
     Manager - Encryption manager to initialize.
+    DeviceObject - Device object for work item allocation (optional).
 
 Return Value:
 
@@ -133,6 +209,11 @@ Return Value:
     }
 
     RtlZeroMemory(Manager, sizeof(ENC_MANAGER));
+
+    //
+    // Initialize CRC32 table
+    //
+    EncpInitializeCrc32Table();
 
     //
     // Open AES-GCM algorithm provider
@@ -156,32 +237,6 @@ Return Value:
         BCRYPT_CHAINING_MODE,
         (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
         sizeof(BCRYPT_CHAIN_MODE_GCM),
-        0
-        );
-
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-
-    //
-    // Open AES-CBC algorithm provider (for CBC+HMAC mode)
-    //
-    status = BCryptOpenAlgorithmProvider(
-        &Manager->AesCbcAlgHandle,
-        BCRYPT_AES_ALGORITHM,
-        NULL,
-        0
-        );
-
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-
-    status = BCryptSetProperty(
-        Manager->AesCbcAlgHandle,
-        BCRYPT_CHAINING_MODE,
-        (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
-        sizeof(BCRYPT_CHAIN_MODE_CBC),
         0
         );
 
@@ -218,16 +273,21 @@ Return Value:
     }
 
     //
-    // Initialize key list
+    // Initialize key list with ERESOURCE for reader/writer access
     //
     InitializeListHead(&Manager->KeyList);
-    KeInitializeSpinLock(&Manager->KeyListLock);
+    status = ExInitializeResourceLite(&Manager->KeyListLock);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+
     Manager->KeyCount = 0;
     Manager->NextKeyId = 1;
 
     //
-    // Initialize active keys
+    // Initialize active keys lock
     //
+    KeInitializeSpinLock(&Manager->ActiveKeysLock);
     RtlZeroMemory(Manager->ActiveKeys, sizeof(Manager->ActiveKeys));
 
     //
@@ -237,6 +297,26 @@ Return Value:
     KeInitializeDpc(&Manager->RotationDpc, EncpRotationDpcRoutine, Manager);
     Manager->RotationIntervalSeconds = ENC_KEY_ROTATION_INTERVAL;
     Manager->AutoRotationEnabled = FALSE;
+    Manager->RotationInProgress = FALSE;
+
+    //
+    // Store device object and allocate work item if provided
+    //
+    Manager->DeviceObject = DeviceObject;
+    if (DeviceObject != NULL) {
+        Manager->RotationWorkItem = IoAllocateWorkItem(DeviceObject);
+        if (Manager->RotationWorkItem == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Cleanup;
+        }
+    }
+
+    //
+    // Initialize master key mutex
+    //
+    ExInitializeFastMutex(&Manager->MasterKeyMutex);
+    Manager->MasterKeySet = FALSE;
+    Manager->MasterKeyObfuscation = NULL;
 
     //
     // Set default configuration
@@ -245,18 +325,27 @@ Return Value:
     Manager->Config.DefaultTagSize = ENC_GCM_TAG_SIZE;
     Manager->Config.RequireNonPagedKeys = TRUE;
     Manager->Config.EnableAutoRotation = FALSE;
+    Manager->Config.KeyExpirationSeconds = ENC_KEY_ROTATION_INTERVAL;
 
     //
     // Initialize statistics
     //
-    RtlZeroMemory(&Manager->Stats, sizeof(Manager->Stats));
+    Manager->TotalEncryptions = 0;
+    Manager->TotalDecryptions = 0;
+    Manager->BytesEncrypted = 0;
+    Manager->BytesDecrypted = 0;
+    Manager->AuthFailures = 0;
+    Manager->KeyRotations = 0;
 
-    Manager->MasterKeySet = FALSE;
     Manager->Initialized = TRUE;
 
     return STATUS_SUCCESS;
 
 Cleanup:
+    if (Manager->RotationWorkItem != NULL) {
+        IoFreeWorkItem(Manager->RotationWorkItem);
+        Manager->RotationWorkItem = NULL;
+    }
     if (Manager->RngAlgHandle != NULL) {
         BCryptCloseAlgorithmProvider(Manager->RngAlgHandle, 0);
         Manager->RngAlgHandle = NULL;
@@ -264,10 +353,6 @@ Cleanup:
     if (Manager->HmacAlgHandle != NULL) {
         BCryptCloseAlgorithmProvider(Manager->HmacAlgHandle, 0);
         Manager->HmacAlgHandle = NULL;
-    }
-    if (Manager->AesCbcAlgHandle != NULL) {
-        BCryptCloseAlgorithmProvider(Manager->AesCbcAlgHandle, 0);
-        Manager->AesCbcAlgHandle = NULL;
     }
     if (Manager->AesGcmAlgHandle != NULL) {
         BCryptCloseAlgorithmProvider(Manager->AesGcmAlgHandle, 0);
@@ -292,7 +377,6 @@ Routine Description:
 
 --*/
 {
-    KIRQL oldIrql;
     PLIST_ENTRY entry;
     PENC_KEY key;
     LIST_ENTRY keysToFree;
@@ -306,41 +390,79 @@ Routine Description:
     Manager->Initialized = FALSE;
 
     //
-    // Cancel rotation timer
+    // Cancel rotation timer and wait for DPC to complete
     //
     KeCancelTimer(&Manager->RotationTimer);
+    KeFlushQueuedDpcs();
 
     //
-    // Collect all keys
+    // Free work item
+    //
+    if (Manager->RotationWorkItem != NULL) {
+        IoFreeWorkItem(Manager->RotationWorkItem);
+        Manager->RotationWorkItem = NULL;
+    }
+
+    //
+    // Collect all keys under exclusive lock
     //
     InitializeListHead(&keysToFree);
 
-    KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+    ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
 
     while (!IsListEmpty(&Manager->KeyList)) {
         entry = RemoveHeadList(&Manager->KeyList);
+        key = CONTAINING_RECORD(entry, ENC_KEY, ListEntry);
+        key->RemovedFromList = TRUE;
         InsertTailList(&keysToFree, entry);
     }
 
     Manager->KeyCount = 0;
     RtlZeroMemory(Manager->ActiveKeys, sizeof(Manager->ActiveKeys));
 
-    KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+    ExReleaseResourceLite(&Manager->KeyListLock);
 
     //
-    // Destroy all keys
+    // Destroy all keys outside of lock
     //
     while (!IsListEmpty(&keysToFree)) {
         entry = RemoveHeadList(&keysToFree);
         key = CONTAINING_RECORD(entry, ENC_KEY, ListEntry);
-        EncDestroyKey(key);
+
+        //
+        // Direct cleanup since key is already removed from list
+        //
+        EncpCleanupBCryptKey(key);
+
+        EncSecureClear(key->KeyMaterial, sizeof(key->KeyMaterial));
+
+        if (key->ObfuscationKey != NULL) {
+            EncSecureClear(key->ObfuscationKey, ENC_AES_KEY_SIZE_256);
+            ShadowStrikeFreePoolWithTag(key->ObfuscationKey, ENC_POOL_TAG_OBFUSK);
+        }
+
+        PENC_KEY_INTERNAL keyInternal = CONTAINING_RECORD(key, ENC_KEY_INTERNAL, Key);
+        keyInternal->Signature = 0;
+        ShadowStrikeFreePoolWithTag(keyInternal, ENC_POOL_TAG_KEY);
     }
 
     //
     // Clear master key
     //
+    ExAcquireFastMutex(&Manager->MasterKeyMutex);
     EncSecureClear(Manager->MasterKey, sizeof(Manager->MasterKey));
+    if (Manager->MasterKeyObfuscation != NULL) {
+        EncSecureClear(Manager->MasterKeyObfuscation, ENC_AES_KEY_SIZE_256);
+        ShadowStrikeFreePoolWithTag(Manager->MasterKeyObfuscation, ENC_POOL_TAG_OBFUSK);
+        Manager->MasterKeyObfuscation = NULL;
+    }
     Manager->MasterKeySet = FALSE;
+    ExReleaseFastMutex(&Manager->MasterKeyMutex);
+
+    //
+    // Delete ERESOURCE
+    //
+    ExDeleteResourceLite(&Manager->KeyListLock);
 
     //
     // Close algorithm providers
@@ -353,11 +475,6 @@ Routine Description:
     if (Manager->HmacAlgHandle != NULL) {
         BCryptCloseAlgorithmProvider(Manager->HmacAlgHandle, 0);
         Manager->HmacAlgHandle = NULL;
-    }
-
-    if (Manager->AesCbcAlgHandle != NULL) {
-        BCryptCloseAlgorithmProvider(Manager->AesCbcAlgHandle, 0);
-        Manager->AesCbcAlgHandle = NULL;
     }
 
     if (Manager->AesGcmAlgHandle != NULL) {
@@ -378,10 +495,17 @@ EncSetMasterKey(
 
 Routine Description:
 
-    Sets the master key used for key derivation.
+    Sets the master key used for key derivation. The master key
+    is stored obfuscated in memory.
 
 --*/
 {
+    NTSTATUS status;
+    PUCHAR obfuscation = NULL;
+    ULONG i;
+
+    PAGED_CODE();
+
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -391,23 +515,63 @@ Routine Description:
     }
 
     //
+    // Allocate obfuscation key in separate allocation
+    //
+    obfuscation = (PUCHAR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        ENC_AES_KEY_SIZE_256,
+        ENC_POOL_TAG_OBFUSK
+        );
+
+    if (obfuscation == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Generate random obfuscation key
+    //
+    status = BCryptGenRandom(
+        Manager->RngAlgHandle,
+        obfuscation,
+        ENC_AES_KEY_SIZE_256,
+        0
+        );
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(obfuscation, ENC_POOL_TAG_OBFUSK);
+        return status;
+    }
+
+    ExAcquireFastMutex(&Manager->MasterKeyMutex);
+
+    //
     // Clear existing master key
     //
     EncSecureClear(Manager->MasterKey, sizeof(Manager->MasterKey));
+    if (Manager->MasterKeyObfuscation != NULL) {
+        EncSecureClear(Manager->MasterKeyObfuscation, ENC_AES_KEY_SIZE_256);
+        ShadowStrikeFreePoolWithTag(Manager->MasterKeyObfuscation, ENC_POOL_TAG_OBFUSK);
+    }
 
     //
-    // Copy new master key
+    // Copy and obfuscate new master key
     //
     RtlCopyMemory(Manager->MasterKey, Key, KeySize);
-
-    //
-    // Pad with zeros if smaller than max size
-    //
     if (KeySize < ENC_AES_KEY_SIZE_256) {
         RtlZeroMemory(Manager->MasterKey + KeySize, ENC_AES_KEY_SIZE_256 - KeySize);
     }
 
+    //
+    // XOR with obfuscation key
+    //
+    for (i = 0; i < ENC_AES_KEY_SIZE_256; i++) {
+        Manager->MasterKey[i] ^= obfuscation[i];
+    }
+
+    Manager->MasterKeyObfuscation = obfuscation;
     Manager->MasterKeySet = TRUE;
+
+    ExReleaseFastMutex(&Manager->MasterKeyMutex);
 
     return STATUS_SUCCESS;
 }
@@ -436,7 +600,6 @@ Routine Description:
     PENC_KEY_INTERNAL keyInternal = NULL;
     PENC_KEY key = NULL;
     NTSTATUS status;
-    KIRQL oldIrql;
     ULONG keySize;
 
     PAGED_CODE();
@@ -445,11 +608,11 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (KeyType <= EncKeyType_Invalid || KeyType >= EncKeyType_Max) {
+    if (!ENC_VALID_KEY_TYPE(KeyType)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Algorithm <= EncAlgorithm_None || Algorithm >= EncAlgorithm_Max) {
+    if (!ENC_VALID_ALGORITHM(Algorithm)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -467,13 +630,10 @@ Routine Description:
     //
     switch (Algorithm) {
         case EncAlgorithm_AES_128_GCM:
-        case EncAlgorithm_AES_128_CBC_HMAC:
             keySize = ENC_AES_KEY_SIZE_128;
             break;
 
         case EncAlgorithm_AES_256_GCM:
-        case EncAlgorithm_AES_256_CBC_HMAC:
-        case EncAlgorithm_ChaCha20_Poly1305:
             keySize = ENC_AES_KEY_SIZE_256;
             break;
 
@@ -503,9 +663,28 @@ Routine Description:
     key = &keyInternal->Key;
 
     //
-    // Generate key ID
+    // Initialize mutex for obfuscation
     //
-    key->KeyId = InterlockedIncrement((LONG*)&Manager->NextKeyId);
+    ExInitializeFastMutex(&key->ObfuscationMutex);
+
+    //
+    // Allocate obfuscation key in separate allocation
+    //
+    key->ObfuscationKey = (PUCHAR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        ENC_AES_KEY_SIZE_256,
+        ENC_POOL_TAG_OBFUSK
+        );
+
+    if (key->ObfuscationKey == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
+
+    //
+    // Generate key ID (64-bit, no overflow concern)
+    //
+    key->KeyId = (ULONG64)InterlockedIncrement64(&Manager->NextKeyId);
     key->KeyType = KeyType;
     key->Algorithm = Algorithm;
     key->KeySize = keySize;
@@ -553,7 +732,7 @@ Routine Description:
     }
 
     //
-    // Initialize nonce counter
+    // Initialize nonce counter and lock
     //
     key->NonceCounter = 0;
     KeInitializeSpinLock(&key->NonceLock);
@@ -571,27 +750,35 @@ Routine Description:
     //
     KeQuerySystemTimePrecise(&key->CreationTime);
     key->ExpirationTime.QuadPart = key->CreationTime.QuadPart +
-        ((LONGLONG)Manager->RotationIntervalSeconds * 10000000LL);
+        ((LONGLONG)Manager->Config.KeyExpirationSeconds * 10000000LL);
     key->UseCount = 0;
     key->IsActive = TRUE;
+    key->IsExpired = FALSE;
 
     //
-    // Initialize reference count
+    // Initialize reference count and state
     //
     key->RefCount = 1;
+    key->IsBeingDestroyed = FALSE;
+    key->RemovedFromList = FALSE;
 
     //
     // Obfuscate key material in memory
     //
-    EncpObfuscateKey(key);
+    ExAcquireFastMutex(&key->ObfuscationMutex);
+    for (ULONG i = 0; i < key->KeySize; i++) {
+        key->KeyMaterial[i] ^= key->ObfuscationKey[i];
+    }
+    key->IsObfuscated = TRUE;
+    ExReleaseFastMutex(&key->ObfuscationMutex);
 
     //
-    // Add to key list
+    // Add to key list under exclusive lock
     //
-    KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+    ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
-    KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+    ExReleaseResourceLite(&Manager->KeyListLock);
 
     *Key = key;
 
@@ -599,6 +786,10 @@ Routine Description:
 
 Cleanup:
     if (keyInternal != NULL) {
+        if (key->ObfuscationKey != NULL) {
+            EncSecureClear(key->ObfuscationKey, ENC_AES_KEY_SIZE_256);
+            ShadowStrikeFreePoolWithTag(key->ObfuscationKey, ENC_POOL_TAG_OBFUSK);
+        }
         EncSecureClear(keyInternal, sizeof(ENC_KEY_INTERNAL));
         ShadowStrikeFreePoolWithTag(keyInternal, ENC_POOL_TAG_KEY);
     }
@@ -628,9 +819,10 @@ Routine Description:
     PENC_KEY_INTERNAL keyInternal = NULL;
     PENC_KEY key = NULL;
     NTSTATUS status;
-    KIRQL oldIrql;
     ULONG keySize;
     UCHAR salt[ENC_HKDF_SALT_SIZE];
+    UCHAR deobfuscatedMasterKey[ENC_AES_KEY_SIZE_256];
+    ULONG i;
 
     PAGED_CODE();
 
@@ -646,6 +838,10 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!ENC_VALID_KEY_TYPE(KeyType) || !ENC_VALID_ALGORITHM(Algorithm)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     *Key = NULL;
 
     //
@@ -653,13 +849,10 @@ Routine Description:
     //
     switch (Algorithm) {
         case EncAlgorithm_AES_128_GCM:
-        case EncAlgorithm_AES_128_CBC_HMAC:
             keySize = ENC_AES_KEY_SIZE_128;
             break;
 
         case EncAlgorithm_AES_256_GCM:
-        case EncAlgorithm_AES_256_CBC_HMAC:
-        case EncAlgorithm_ChaCha20_Poly1305:
             keySize = ENC_AES_KEY_SIZE_256;
             break;
 
@@ -686,6 +879,21 @@ Routine Description:
     keyInternal->Manager = Manager;
 
     key = &keyInternal->Key;
+    ExInitializeFastMutex(&key->ObfuscationMutex);
+
+    //
+    // Allocate obfuscation key
+    //
+    key->ObfuscationKey = (PUCHAR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        ENC_AES_KEY_SIZE_256,
+        ENC_POOL_TAG_OBFUSK
+        );
+
+    if (key->ObfuscationKey == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
 
     //
     // Generate random salt
@@ -702,10 +910,22 @@ Routine Description:
     }
 
     //
+    // Get deobfuscated master key
+    //
+    ExAcquireFastMutex(&Manager->MasterKeyMutex);
+    RtlCopyMemory(deobfuscatedMasterKey, Manager->MasterKey, ENC_AES_KEY_SIZE_256);
+    if (Manager->MasterKeyObfuscation != NULL) {
+        for (i = 0; i < ENC_AES_KEY_SIZE_256; i++) {
+            deobfuscatedMasterKey[i] ^= Manager->MasterKeyObfuscation[i];
+        }
+    }
+    ExReleaseFastMutex(&Manager->MasterKeyMutex);
+
+    //
     // Derive key using HKDF
     //
     status = EncHkdfDerive(
-        Manager->MasterKey,
+        deobfuscatedMasterKey,
         ENC_AES_KEY_SIZE_256,
         salt,
         sizeof(salt),
@@ -715,11 +935,16 @@ Routine Description:
         keySize
         );
 
+    //
+    // Clear deobfuscated master key immediately
+    //
+    EncSecureClear(deobfuscatedMasterKey, sizeof(deobfuscatedMasterKey));
+
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
 
-    key->KeyId = InterlockedIncrement((LONG*)&Manager->NextKeyId);
+    key->KeyId = (ULONG64)InterlockedIncrement64(&Manager->NextKeyId);
     key->KeyType = KeyType;
     key->Algorithm = Algorithm;
     key->KeySize = keySize;
@@ -768,23 +993,31 @@ Routine Description:
     //
     KeQuerySystemTimePrecise(&key->CreationTime);
     key->ExpirationTime.QuadPart = key->CreationTime.QuadPart +
-        ((LONGLONG)Manager->RotationIntervalSeconds * 10000000LL);
+        ((LONGLONG)Manager->Config.KeyExpirationSeconds * 10000000LL);
     key->UseCount = 0;
     key->IsActive = TRUE;
+    key->IsExpired = FALSE;
     key->RefCount = 1;
+    key->IsBeingDestroyed = FALSE;
+    key->RemovedFromList = FALSE;
 
     //
     // Obfuscate key
     //
-    EncpObfuscateKey(key);
+    ExAcquireFastMutex(&key->ObfuscationMutex);
+    for (i = 0; i < key->KeySize; i++) {
+        key->KeyMaterial[i] ^= key->ObfuscationKey[i];
+    }
+    key->IsObfuscated = TRUE;
+    ExReleaseFastMutex(&key->ObfuscationMutex);
 
     //
     // Add to key list
     //
-    KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+    ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
-    KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+    ExReleaseResourceLite(&Manager->KeyListLock);
 
     //
     // Clear salt
@@ -797,8 +1030,13 @@ Routine Description:
 
 Cleanup:
     EncSecureClear(salt, sizeof(salt));
+    EncSecureClear(deobfuscatedMasterKey, sizeof(deobfuscatedMasterKey));
 
     if (keyInternal != NULL) {
+        if (key->ObfuscationKey != NULL) {
+            EncSecureClear(key->ObfuscationKey, ENC_AES_KEY_SIZE_256);
+            ShadowStrikeFreePoolWithTag(key->ObfuscationKey, ENC_POOL_TAG_OBFUSK);
+        }
         EncSecureClear(keyInternal, sizeof(ENC_KEY_INTERNAL));
         ShadowStrikeFreePoolWithTag(keyInternal, ENC_POOL_TAG_KEY);
     }
@@ -828,8 +1066,8 @@ Routine Description:
     PENC_KEY_INTERNAL keyInternal = NULL;
     PENC_KEY key = NULL;
     NTSTATUS status;
-    KIRQL oldIrql;
     ULONG expectedKeySize;
+    ULONG i;
 
     PAGED_CODE();
 
@@ -841,6 +1079,10 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!ENC_VALID_KEY_TYPE(KeyType) || !ENC_VALID_ALGORITHM(Algorithm)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     *Key = NULL;
 
     //
@@ -848,13 +1090,10 @@ Routine Description:
     //
     switch (Algorithm) {
         case EncAlgorithm_AES_128_GCM:
-        case EncAlgorithm_AES_128_CBC_HMAC:
             expectedKeySize = ENC_AES_KEY_SIZE_128;
             break;
 
         case EncAlgorithm_AES_256_GCM:
-        case EncAlgorithm_AES_256_CBC_HMAC:
-        case EncAlgorithm_ChaCha20_Poly1305:
             expectedKeySize = ENC_AES_KEY_SIZE_256;
             break;
 
@@ -885,13 +1124,28 @@ Routine Description:
     keyInternal->Manager = Manager;
 
     key = &keyInternal->Key;
+    ExInitializeFastMutex(&key->ObfuscationMutex);
+
+    //
+    // Allocate obfuscation key
+    //
+    key->ObfuscationKey = (PUCHAR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        ENC_AES_KEY_SIZE_256,
+        ENC_POOL_TAG_OBFUSK
+        );
+
+    if (key->ObfuscationKey == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
 
     //
     // Copy key material
     //
     RtlCopyMemory(key->KeyMaterial, KeyMaterial, KeySize);
 
-    key->KeyId = InterlockedIncrement((LONG*)&Manager->NextKeyId);
+    key->KeyId = (ULONG64)InterlockedIncrement64(&Manager->NextKeyId);
     key->KeyType = KeyType;
     key->Algorithm = Algorithm;
     key->KeySize = KeySize;
@@ -940,23 +1194,31 @@ Routine Description:
     //
     KeQuerySystemTimePrecise(&key->CreationTime);
     key->ExpirationTime.QuadPart = key->CreationTime.QuadPart +
-        ((LONGLONG)Manager->RotationIntervalSeconds * 10000000LL);
+        ((LONGLONG)Manager->Config.KeyExpirationSeconds * 10000000LL);
     key->UseCount = 0;
     key->IsActive = TRUE;
+    key->IsExpired = FALSE;
     key->RefCount = 1;
+    key->IsBeingDestroyed = FALSE;
+    key->RemovedFromList = FALSE;
 
     //
     // Obfuscate key
     //
-    EncpObfuscateKey(key);
+    ExAcquireFastMutex(&key->ObfuscationMutex);
+    for (i = 0; i < key->KeySize; i++) {
+        key->KeyMaterial[i] ^= key->ObfuscationKey[i];
+    }
+    key->IsObfuscated = TRUE;
+    ExReleaseFastMutex(&key->ObfuscationMutex);
 
     //
     // Add to key list
     //
-    KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+    ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
     InsertTailList(&Manager->KeyList, &key->ListEntry);
     Manager->KeyCount++;
-    KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+    ExReleaseResourceLite(&Manager->KeyListLock);
 
     *Key = key;
 
@@ -964,6 +1226,10 @@ Routine Description:
 
 Cleanup:
     if (keyInternal != NULL) {
+        if (key->ObfuscationKey != NULL) {
+            EncSecureClear(key->ObfuscationKey, ENC_AES_KEY_SIZE_256);
+            ShadowStrikeFreePoolWithTag(key->ObfuscationKey, ENC_POOL_TAG_OBFUSK);
+        }
         EncSecureClear(keyInternal, sizeof(ENC_KEY_INTERNAL));
         ShadowStrikeFreePoolWithTag(keyInternal, ENC_POOL_TAG_KEY);
     }
@@ -985,9 +1251,15 @@ EncExportKey(
 Routine Description:
 
     Exports key material for backup/transfer.
+    Uses mutex to safely access obfuscated key.
 
 --*/
 {
+    NTSTATUS status;
+    UCHAR deobfuscatedKey[ENC_AES_KEY_SIZE_256];
+
+    PAGED_CODE();
+
     if (Key == NULL || Buffer == NULL || ExportedSize == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -999,22 +1271,23 @@ Routine Description:
     }
 
     //
-    // Deobfuscate key temporarily
+    // Get deobfuscated key material safely
     //
-    if (Key->IsObfuscated) {
-        EncpDeobfuscateKey(Key);
+    status = EncpGetDeobfuscatedKeyMaterial(Key, deobfuscatedKey);
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
     //
-    // Copy key material
+    // Copy to output buffer
     //
-    RtlCopyMemory(Buffer, Key->KeyMaterial, Key->KeySize);
+    RtlCopyMemory(Buffer, deobfuscatedKey, Key->KeySize);
     *ExportedSize = Key->KeySize;
 
     //
-    // Re-obfuscate key
+    // Clear temporary buffer
     //
-    EncpObfuscateKey(Key);
+    EncSecureClear(deobfuscatedKey, sizeof(deobfuscatedKey));
 
     return STATUS_SUCCESS;
 }
@@ -1023,6 +1296,7 @@ Routine Description:
 _Use_decl_annotations_
 VOID
 EncDestroyKey(
+    _In_ PENC_MANAGER Manager,
     _Inout_ PENC_KEY Key
     )
 /*++
@@ -1030,12 +1304,16 @@ EncDestroyKey(
 Routine Description:
 
     Securely destroys a key, zeroing all sensitive material.
+    Removes from list before freeing to prevent use-after-free.
 
 --*/
 {
     PENC_KEY_INTERNAL keyInternal;
+    BOOLEAN wasInList = FALSE;
 
-    if (Key == NULL) {
+    PAGED_CODE();
+
+    if (Key == NULL || Manager == NULL) {
         return;
     }
 
@@ -1045,8 +1323,44 @@ Routine Description:
         return;
     }
 
-    keyInternal->Destroying = TRUE;
+    //
+    // Mark as being destroyed to prevent concurrent access
+    //
+    if (InterlockedCompareExchange((LONG*)&keyInternal->Destroying, TRUE, FALSE) == TRUE) {
+        // Already being destroyed by another thread
+        return;
+    }
+
     Key->IsActive = FALSE;
+    Key->IsBeingDestroyed = TRUE;
+
+    //
+    // Remove from list under exclusive lock BEFORE freeing
+    //
+    if (!Key->RemovedFromList) {
+        ExAcquireResourceExclusiveLite(&Manager->KeyListLock, TRUE);
+
+        if (!Key->RemovedFromList) {
+            RemoveEntryList(&Key->ListEntry);
+            Key->RemovedFromList = TRUE;
+            Manager->KeyCount--;
+            wasInList = TRUE;
+        }
+
+        ExReleaseResourceLite(&Manager->KeyListLock);
+    }
+
+    //
+    // Clear from active keys if present
+    //
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
+    for (ULONG i = 0; i < EncKeyType_Max; i++) {
+        if (Manager->ActiveKeys[i] == Key) {
+            Manager->ActiveKeys[i] = NULL;
+        }
+    }
+    KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
 
     //
     // Cleanup BCrypt handles
@@ -1056,8 +1370,19 @@ Routine Description:
     //
     // Securely clear key material
     //
+    ExAcquireFastMutex(&Key->ObfuscationMutex);
     EncSecureClear(Key->KeyMaterial, sizeof(Key->KeyMaterial));
-    EncSecureClear(Key->ObfuscationKey, sizeof(Key->ObfuscationKey));
+    ExReleaseFastMutex(&Key->ObfuscationMutex);
+
+    //
+    // Free obfuscation key
+    //
+    if (Key->ObfuscationKey != NULL) {
+        EncSecureClear(Key->ObfuscationKey, ENC_AES_KEY_SIZE_256);
+        ShadowStrikeFreePoolWithTag(Key->ObfuscationKey, ENC_POOL_TAG_OBFUSK);
+        Key->ObfuscationKey = NULL;
+    }
+
     EncSecureClear(Key->NoncePrefix, sizeof(Key->NoncePrefix));
 
     //
@@ -1083,16 +1408,18 @@ EncGetActiveKey(
         return NULL;
     }
 
-    if (KeyType <= EncKeyType_Invalid || KeyType >= EncKeyType_Max) {
+    if (!ENC_VALID_KEY_TYPE(KeyType)) {
         return NULL;
     }
 
-    KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+    KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
     key = Manager->ActiveKeys[KeyType];
-    if (key != NULL) {
+    if (key != NULL && !key->IsBeingDestroyed) {
         EncKeyAddRef(key);
+    } else {
+        key = NULL;
     }
-    KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+    KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
 
     return key;
 }
@@ -1113,20 +1440,20 @@ EncSetActiveKey(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (KeyType <= EncKeyType_Invalid || KeyType >= EncKeyType_Max) {
+    if (!ENC_VALID_KEY_TYPE(KeyType)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+    KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
 
     oldKey = Manager->ActiveKeys[KeyType];
     Manager->ActiveKeys[KeyType] = Key;
     EncKeyAddRef(Key);
 
-    KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+    KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
 
     //
-    // Release old key reference
+    // Release old key reference outside lock
     //
     if (oldKey != NULL) {
         EncKeyRelease(oldKey);
@@ -1142,14 +1469,14 @@ EncKeyAddRef(
     _In_ PENC_KEY Key
     )
 {
-    if (Key != NULL) {
+    if (Key != NULL && !Key->IsBeingDestroyed) {
         InterlockedIncrement(&Key->RefCount);
     }
 }
 
 
 _Use_decl_annotations_
-VOID
+LONG
 EncKeyRelease(
     _In_ PENC_KEY Key
     )
@@ -1157,14 +1484,18 @@ EncKeyRelease(
     LONG newCount;
 
     if (Key == NULL) {
-        return;
+        return 0;
     }
 
     newCount = InterlockedDecrement(&Key->RefCount);
 
-    if (newCount == 0) {
-        EncDestroyKey(Key);
-    }
+    //
+    // Note: Caller must explicitly call EncDestroyKey when ready
+    // to destroy the key. We don't auto-destroy here to avoid
+    // issues with circular references and shutdown ordering.
+    //
+
+    return newCount;
 }
 
 
@@ -1189,6 +1520,7 @@ EncEncrypt(
 Routine Description:
 
     Encrypts data using AES-256-GCM with automatic nonce generation.
+    All operations at PASSIVE_LEVEL as required by BCrypt.
 
 --*/
 {
@@ -1200,6 +1532,10 @@ Routine Description:
     UCHAR nonce[ENC_GCM_NONCE_SIZE];
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
     ULONG cbResult;
+    UCHAR localKeyMaterial[ENC_AES_KEY_SIZE_256];
+    BCRYPT_KEY_HANDLE tempKeyHandle = NULL;
+
+    PAGED_CODE();
 
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;
@@ -1216,9 +1552,13 @@ Routine Description:
     *CiphertextSize = 0;
 
     //
-    // Calculate required output size
+    // Calculate required output size with overflow check
     //
-    requiredSize = EncGetEncryptedSize(PlaintextSize, TRUE);
+    status = EncGetEncryptedSize(PlaintextSize, TRUE, &requiredSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
     if (OutputSize < requiredSize) {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -1237,6 +1577,14 @@ Routine Description:
     }
 
     //
+    // Check if key is expired
+    //
+    if (EncpIsKeyExpired(key)) {
+        EncKeyRelease(key);
+        return STATUS_ENCRYPTION_FAILED;
+    }
+
+    //
     // Generate unique nonce
     //
     status = EncpGenerateNonce(key, nonce);
@@ -1246,14 +1594,39 @@ Routine Description:
     }
 
     //
-    // Deobfuscate key for use
+    // Get deobfuscated key material into local buffer
     //
-    if (key->IsObfuscated) {
-        EncpDeobfuscateKey(key);
+    status = EncpGetDeobfuscatedKeyMaterial(key, localKeyMaterial);
+    if (!NT_SUCCESS(status)) {
+        EncKeyRelease(key);
+        return status;
     }
 
     //
-    // Setup header
+    // Create temporary key handle for this operation
+    //
+    status = BCryptGenerateSymmetricKey(
+        Manager->AesGcmAlgHandle,
+        &tempKeyHandle,
+        NULL,
+        0,
+        localKeyMaterial,
+        key->KeySize,
+        0
+        );
+
+    //
+    // Clear local key material immediately after creating handle
+    //
+    EncSecureClear(localKeyMaterial, sizeof(localKeyMaterial));
+
+    if (!NT_SUCCESS(status)) {
+        EncKeyRelease(key);
+        return status;
+    }
+
+    //
+    // Setup header - copy to local first to avoid TOCTOU
     //
     header = (PENC_HEADER)Output;
     RtlZeroMemory(header, sizeof(ENC_HEADER));
@@ -1280,6 +1653,11 @@ Routine Description:
     authInfo.cbTag = ENC_GCM_TAG_SIZE;
 
     if (Options != NULL && Options->AAD != NULL && Options->AADSize > 0) {
+        if (Options->AADSize > ENC_MAX_AAD_SIZE) {
+            BCryptDestroyKey(tempKeyHandle);
+            EncKeyRelease(key);
+            return STATUS_INVALID_PARAMETER;
+        }
         authInfo.pbAuthData = (PUCHAR)Options->AAD;
         authInfo.cbAuthData = Options->AADSize;
     }
@@ -1288,7 +1666,7 @@ Routine Description:
     // Perform encryption
     //
     status = BCryptEncrypt(
-        key->KeyHandle,
+        tempKeyHandle,
         (PUCHAR)Plaintext,
         PlaintextSize,
         &authInfo,
@@ -1301,9 +1679,9 @@ Routine Description:
         );
 
     //
-    // Re-obfuscate key
+    // Destroy temporary key handle
     //
-    EncpObfuscateKey(key);
+    BCryptDestroyKey(tempKeyHandle);
 
     if (!NT_SUCCESS(status)) {
         EncKeyRelease(key);
@@ -1312,10 +1690,15 @@ Routine Description:
     }
 
     //
+    // Calculate and store header CRC (excluding CRC field itself)
+    //
+    header->HeaderCrc32 = EncpCalculateCrc32(header, sizeof(ENC_HEADER) - sizeof(ULONG));
+
+    //
     // Update statistics
     //
-    InterlockedIncrement64((LONG64*)&Manager->Stats.TotalEncryptions);
-    InterlockedAdd64((LONG64*)&Manager->Stats.BytesEncrypted, PlaintextSize);
+    InterlockedIncrement64(&Manager->TotalEncryptions);
+    InterlockedAdd64(&Manager->BytesEncrypted, PlaintextSize);
     InterlockedIncrement(&key->UseCount);
 
     *CiphertextSize = requiredSize;
@@ -1342,17 +1725,22 @@ EncDecrypt(
 Routine Description:
 
     Decrypts data and verifies authentication tag.
+    Copies header to local variable to prevent TOCTOU attacks.
 
 --*/
 {
     NTSTATUS status;
-    PENC_HEADER header;
+    ENC_HEADER localHeader;  // Local copy to prevent TOCTOU
     PENC_KEY key = NULL;
     PUCHAR encryptedData;
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
     ULONG cbResult;
-    KIRQL oldIrql;
     PLIST_ENTRY entry;
+    UCHAR localKeyMaterial[ENC_AES_KEY_SIZE_256];
+    BCRYPT_KEY_HANDLE tempKeyHandle = NULL;
+    ULONG expectedCrc;
+
+    PAGED_CODE();
 
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;
@@ -1366,24 +1754,60 @@ Routine Description:
     *PlaintextSize = 0;
 
     //
-    // Validate header
+    // Copy header to local variable IMMEDIATELY to prevent TOCTOU
     //
-    header = (PENC_HEADER)Ciphertext;
+    RtlCopyMemory(&localHeader, Ciphertext, sizeof(ENC_HEADER));
 
-    if (header->Magic != ENC_MAGIC) {
+    //
+    // Validate header magic and version
+    //
+    if (localHeader.Magic != ENC_MAGIC) {
         return STATUS_DECRYPTION_FAILED;
     }
 
-    if (header->Version != ENC_VERSION) {
+    if (localHeader.Version != ENC_VERSION) {
         return STATUS_DECRYPTION_FAILED;
     }
 
-    if (CiphertextSize < sizeof(ENC_HEADER) + header->CiphertextSize) {
+    //
+    // Validate header CRC
+    //
+    expectedCrc = EncpCalculateCrc32(&localHeader, sizeof(ENC_HEADER) - sizeof(ULONG));
+    if (localHeader.HeaderCrc32 != expectedCrc) {
         return STATUS_DECRYPTION_FAILED;
     }
 
-    if (OutputSize < header->PlaintextSize) {
+    //
+    // Validate algorithm
+    //
+    if (!ENC_VALID_ALGORITHM((ENC_ALGORITHM)localHeader.Algorithm)) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    //
+    // For GCM, plaintext size MUST equal ciphertext size (no padding)
+    //
+    if (localHeader.PlaintextSize != localHeader.CiphertextSize) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    //
+    // Validate sizes
+    //
+    if (!ENC_VALID_SIZE(localHeader.PlaintextSize)) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    if (CiphertextSize < sizeof(ENC_HEADER) + localHeader.CiphertextSize) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    if (OutputSize < localHeader.PlaintextSize) {
         return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    if (localHeader.AADSize > ENC_MAX_AAD_SIZE) {
+        return STATUS_DECRYPTION_FAILED;
     }
 
     //
@@ -1393,21 +1817,21 @@ Routine Description:
         key = Options->Key;
         EncKeyAddRef(key);
     } else {
-        KeAcquireSpinLock(&Manager->KeyListLock, &oldIrql);
+        ExAcquireResourceSharedLite(&Manager->KeyListLock, TRUE);
 
         for (entry = Manager->KeyList.Flink;
              entry != &Manager->KeyList;
              entry = entry->Flink) {
 
             PENC_KEY candidate = CONTAINING_RECORD(entry, ENC_KEY, ListEntry);
-            if (candidate->KeyId == header->KeyId) {
+            if (candidate->KeyId == localHeader.KeyId && !candidate->IsBeingDestroyed) {
                 key = candidate;
                 EncKeyAddRef(key);
                 break;
             }
         }
 
-        KeReleaseSpinLock(&Manager->KeyListLock, oldIrql);
+        ExReleaseResourceLite(&Manager->KeyListLock);
 
         if (key == NULL) {
             return STATUS_DECRYPTION_FAILED;
@@ -1417,19 +1841,41 @@ Routine Description:
     encryptedData = (PUCHAR)Ciphertext + sizeof(ENC_HEADER);
 
     //
-    // Deobfuscate key
+    // Get deobfuscated key material
     //
-    if (key->IsObfuscated) {
-        EncpDeobfuscateKey(key);
+    status = EncpGetDeobfuscatedKeyMaterial(key, localKeyMaterial);
+    if (!NT_SUCCESS(status)) {
+        EncKeyRelease(key);
+        return status;
     }
 
     //
-    // Setup authenticated cipher mode info
+    // Create temporary key handle
+    //
+    status = BCryptGenerateSymmetricKey(
+        Manager->AesGcmAlgHandle,
+        &tempKeyHandle,
+        NULL,
+        0,
+        localKeyMaterial,
+        key->KeySize,
+        0
+        );
+
+    EncSecureClear(localKeyMaterial, sizeof(localKeyMaterial));
+
+    if (!NT_SUCCESS(status)) {
+        EncKeyRelease(key);
+        return status;
+    }
+
+    //
+    // Setup authenticated cipher mode info using LOCAL header copy
     //
     BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
-    authInfo.pbNonce = (PUCHAR)header->Nonce;
+    authInfo.pbNonce = (PUCHAR)localHeader.Nonce;
     authInfo.cbNonce = ENC_GCM_NONCE_SIZE;
-    authInfo.pbTag = (PUCHAR)header->Tag;
+    authInfo.pbTag = (PUCHAR)localHeader.Tag;
     authInfo.cbTag = ENC_GCM_TAG_SIZE;
 
     if (Options != NULL && Options->AAD != NULL && Options->AADSize > 0) {
@@ -1441,9 +1887,9 @@ Routine Description:
     // Perform decryption
     //
     status = BCryptDecrypt(
-        key->KeyHandle,
+        tempKeyHandle,
         encryptedData,
-        header->CiphertextSize,
+        localHeader.CiphertextSize,
         &authInfo,
         NULL,
         0,
@@ -1453,13 +1899,10 @@ Routine Description:
         0
         );
 
-    //
-    // Re-obfuscate key
-    //
-    EncpObfuscateKey(key);
+    BCryptDestroyKey(tempKeyHandle);
 
     if (!NT_SUCCESS(status)) {
-        InterlockedIncrement64((LONG64*)&Manager->Stats.AuthFailures);
+        InterlockedIncrement64(&Manager->AuthFailures);
         EncKeyRelease(key);
         EncSecureClear(Output, OutputSize);
         return STATUS_AUTH_TAG_MISMATCH;
@@ -1468,10 +1911,10 @@ Routine Description:
     //
     // Update statistics
     //
-    InterlockedIncrement64((LONG64*)&Manager->Stats.TotalDecryptions);
-    InterlockedAdd64((LONG64*)&Manager->Stats.BytesDecrypted, header->PlaintextSize);
+    InterlockedIncrement64(&Manager->TotalDecryptions);
+    InterlockedAdd64(&Manager->BytesDecrypted, localHeader.PlaintextSize);
 
-    *PlaintextSize = header->PlaintextSize;
+    *PlaintextSize = localHeader.PlaintextSize;
 
     EncKeyRelease(key);
 
@@ -1480,19 +1923,46 @@ Routine Description:
 
 
 _Use_decl_annotations_
-ULONG
+NTSTATUS
 EncGetEncryptedSize(
     _In_ ULONG PlaintextSize,
-    _In_ BOOLEAN IncludeHeader
+    _In_ BOOLEAN IncludeHeader,
+    _Out_ PULONG RequiredSize
     )
-{
-    ULONG size = PlaintextSize;  // GCM doesn't pad
+/*++
 
-    if (IncludeHeader) {
-        size += sizeof(ENC_HEADER);
+Routine Description:
+
+    Calculates required output buffer size with overflow protection.
+
+--*/
+{
+    NTSTATUS status;
+    ULONG size;
+
+    if (RequiredSize == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    return size;
+    *RequiredSize = 0;
+
+    //
+    // Start with plaintext size (GCM doesn't pad)
+    //
+    size = PlaintextSize;
+
+    if (IncludeHeader) {
+        //
+        // Safe add: size + sizeof(ENC_HEADER)
+        //
+        status = RtlULongAdd(size, sizeof(ENC_HEADER), &size);
+        if (!NT_SUCCESS(status)) {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+    }
+
+    *RequiredSize = size;
+    return STATUS_SUCCESS;
 }
 
 
@@ -1537,7 +2007,7 @@ EncCreateContext(
     ctx->Flags = Flags;
     ctx->TagSize = ENC_GCM_TAG_SIZE;
 
-    KeInitializeSpinLock(&ctx->Lock);
+    ExInitializeFastMutex(&ctx->ContextMutex);
 
     *Context = ctx;
 
@@ -1557,6 +2027,8 @@ EncDestroyContext(
         return;
     }
 
+    ExAcquireFastMutex(&Context->ContextMutex);
+
     //
     // Release key reference
     //
@@ -1574,14 +2046,7 @@ EncDestroyContext(
         Context->AADBuffer = NULL;
     }
 
-    //
-    // Free stream state
-    //
-    if (Context->StreamState != NULL) {
-        EncSecureClear(Context->StreamState, Context->StreamStateSize);
-        ShadowStrikeFreePoolWithTag(Context->StreamState, ENC_POOL_TAG_BUFFER);
-        Context->StreamState = NULL;
-    }
+    ExReleaseFastMutex(&Context->ContextMutex);
 
     ShadowStrikeFreePoolWithTag(Context, ENC_POOL_TAG_CONTEXT);
 }
@@ -1594,8 +2059,19 @@ EncSetAAD(
     _In_reads_bytes_(AADSize) PVOID AAD,
     _In_ ULONG AADSize
     )
+/*++
+
+Routine Description:
+
+    Sets AAD for context with proper synchronization.
+
+--*/
 {
     PVOID newBuffer;
+    PVOID oldBuffer = NULL;
+    ULONG oldSize = 0;
+
+    PAGED_CODE();
 
     if (Context == NULL || AAD == NULL || AADSize == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -1621,15 +2097,25 @@ EncSetAAD(
     RtlCopyMemory(newBuffer, AAD, AADSize);
 
     //
-    // Free old buffer
+    // Swap buffers under mutex
     //
-    if (Context->AADBuffer != NULL) {
-        EncSecureClear(Context->AADBuffer, Context->AADSize);
-        ShadowStrikeFreePoolWithTag(Context->AADBuffer, ENC_POOL_TAG_BUFFER);
-    }
+    ExAcquireFastMutex(&Context->ContextMutex);
+
+    oldBuffer = Context->AADBuffer;
+    oldSize = Context->AADSize;
 
     Context->AADBuffer = newBuffer;
     Context->AADSize = AADSize;
+
+    ExReleaseFastMutex(&Context->ContextMutex);
+
+    //
+    // Free old buffer outside lock
+    //
+    if (oldBuffer != NULL) {
+        EncSecureClear(oldBuffer, oldSize);
+        ShadowStrikeFreePoolWithTag(oldBuffer, ENC_POOL_TAG_BUFFER);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1639,6 +2125,7 @@ _Use_decl_annotations_
 NTSTATUS
 EncEncryptWithContext(
     _In_ PENC_CONTEXT Context,
+    _In_ PENC_MANAGER Manager,
     _In_reads_bytes_(PlaintextSize) PVOID Plaintext,
     _In_ ULONG PlaintextSize,
     _Out_writes_bytes_to_(OutputSize, *CiphertextSize) PVOID Output,
@@ -1647,16 +2134,14 @@ EncEncryptWithContext(
     )
 {
     ENC_OPTIONS options;
-    PENC_KEY_INTERNAL keyInternal;
 
-    if (Context == NULL || Context->CurrentKey == NULL) {
+    PAGED_CODE();
+
+    if (Context == NULL || Context->CurrentKey == NULL || Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    keyInternal = CONTAINING_RECORD(Context->CurrentKey, ENC_KEY_INTERNAL, Key);
-    if (keyInternal->Manager == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    ExAcquireFastMutex(&Context->ContextMutex);
 
     RtlZeroMemory(&options, sizeof(options));
     options.Flags = Context->Flags;
@@ -1665,8 +2150,10 @@ EncEncryptWithContext(
     options.AADSize = Context->AADSize;
     options.TagSize = Context->TagSize;
 
+    ExReleaseFastMutex(&Context->ContextMutex);
+
     return EncEncrypt(
-        keyInternal->Manager,
+        Manager,
         Context->CurrentKey->KeyType,
         Plaintext,
         PlaintextSize,
@@ -1682,6 +2169,7 @@ _Use_decl_annotations_
 NTSTATUS
 EncDecryptWithContext(
     _In_ PENC_CONTEXT Context,
+    _In_ PENC_MANAGER Manager,
     _In_reads_bytes_(CiphertextSize) PVOID Ciphertext,
     _In_ ULONG CiphertextSize,
     _Out_writes_bytes_to_(OutputSize, *PlaintextSize) PVOID Output,
@@ -1690,16 +2178,14 @@ EncDecryptWithContext(
     )
 {
     ENC_OPTIONS options;
-    PENC_KEY_INTERNAL keyInternal;
 
-    if (Context == NULL || Context->CurrentKey == NULL) {
+    PAGED_CODE();
+
+    if (Context == NULL || Context->CurrentKey == NULL || Manager == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    keyInternal = CONTAINING_RECORD(Context->CurrentKey, ENC_KEY_INTERNAL, Key);
-    if (keyInternal->Manager == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    ExAcquireFastMutex(&Context->ContextMutex);
 
     RtlZeroMemory(&options, sizeof(options));
     options.Flags = Context->Flags;
@@ -1708,8 +2194,10 @@ EncDecryptWithContext(
     options.AADSize = Context->AADSize;
     options.TagSize = Context->TagSize;
 
+    ExReleaseFastMutex(&Context->ContextMutex);
+
     return EncDecrypt(
-        keyInternal->Manager,
+        Manager,
         Ciphertext,
         CiphertextSize,
         Output,
@@ -1736,7 +2224,13 @@ EncRotateKey(
     PENC_KEY newKey = NULL;
     ENC_ALGORITHM algorithm;
 
+    PAGED_CODE();
+
     if (Manager == NULL || !Manager->Initialized) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!ENC_VALID_KEY_TYPE(KeyType)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1767,7 +2261,7 @@ EncRotateKey(
     }
 
     //
-    // Mark old key as inactive
+    // Mark old key as inactive (but keep it for decryption of existing data)
     //
     if (oldKey != NULL) {
         oldKey->IsActive = FALSE;
@@ -1777,7 +2271,7 @@ EncRotateKey(
     //
     // Update statistics
     //
-    InterlockedIncrement64((LONG64*)&Manager->Stats.KeyRotations);
+    InterlockedIncrement64(&Manager->KeyRotations);
 
     //
     // Release our reference to new key (active key holds reference)
@@ -1797,12 +2291,21 @@ EncRotateAllKeys(
     NTSTATUS status;
     ULONG i;
 
+    PAGED_CODE();
+
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
     for (i = EncKeyType_Invalid + 1; i < EncKeyType_Max; i++) {
-        if (Manager->ActiveKeys[i] != NULL) {
+        KIRQL oldIrql;
+        PENC_KEY activeKey;
+
+        KeAcquireSpinLock(&Manager->ActiveKeysLock, &oldIrql);
+        activeKey = Manager->ActiveKeys[i];
+        KeReleaseSpinLock(&Manager->ActiveKeysLock, oldIrql);
+
+        if (activeKey != NULL) {
             status = EncRotateKey(Manager, (ENC_KEY_TYPE)i);
             if (!NT_SUCCESS(status)) {
                 return status;
@@ -1824,11 +2327,21 @@ EncSetAutoRotation(
 {
     LARGE_INTEGER dueTime;
 
+    PAGED_CODE();
+
     if (Manager == NULL || !Manager->Initialized) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (Enable && Manager->RotationWorkItem == NULL) {
+        //
+        // Cannot enable auto rotation without work item
+        //
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     Manager->RotationIntervalSeconds = IntervalSeconds;
+    Manager->Config.KeyExpirationSeconds = IntervalSeconds;
 
     if (Enable && !Manager->AutoRotationEnabled) {
         //
@@ -1855,6 +2368,91 @@ EncSetAutoRotation(
 
 
 //=============================================================================
+// Rotation DPC and Work Item
+//=============================================================================
+
+VOID
+EncpRotationDpcRoutine(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+    )
+/*++
+
+Routine Description:
+
+    DPC routine for automatic key rotation timer.
+    Queues a work item to perform actual rotation at PASSIVE_LEVEL.
+
+--*/
+{
+    PENC_MANAGER manager;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    manager = (PENC_MANAGER)DeferredContext;
+
+    if (manager == NULL || !manager->Initialized) {
+        return;
+    }
+
+    //
+    // Only queue if not already rotating
+    //
+    if (InterlockedCompareExchange((LONG*)&manager->RotationInProgress, TRUE, FALSE) == FALSE) {
+        if (manager->RotationWorkItem != NULL && manager->DeviceObject != NULL) {
+            IoQueueWorkItem(
+                manager->RotationWorkItem,
+                EncpRotationWorkItemRoutine,
+                DelayedWorkQueue,
+                manager
+                );
+        } else {
+            manager->RotationInProgress = FALSE;
+        }
+    }
+}
+
+
+VOID
+EncpRotationWorkItemRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+/*++
+
+Routine Description:
+
+    Work item routine that performs actual key rotation at PASSIVE_LEVEL.
+
+--*/
+{
+    PENC_MANAGER manager = (PENC_MANAGER)Context;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    PAGED_CODE();
+
+    if (manager == NULL || !manager->Initialized) {
+        return;
+    }
+
+    //
+    // Perform rotation of all active keys
+    //
+    EncRotateAllKeys(manager);
+
+    //
+    // Clear rotation in progress flag
+    //
+    InterlockedExchange((LONG*)&manager->RotationInProgress, FALSE);
+}
+
+
+//=============================================================================
 // Utility Functions
 //=============================================================================
 
@@ -1866,6 +2464,8 @@ EncRandomBytes(
     _In_ ULONG Size
     )
 {
+    PAGED_CODE();
+
     if (Manager == NULL || !Manager->Initialized || Buffer == NULL || Size == 0) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1886,24 +2486,14 @@ EncSecureClear(
     _In_ ULONG Size
     )
 {
-    volatile UCHAR* ptr = (volatile UCHAR*)Buffer;
-    ULONG i;
-
     if (Buffer == NULL || Size == 0) {
         return;
     }
 
     //
-    // Use volatile to prevent compiler optimization
+    // Use RtlSecureZeroMemory which is guaranteed not to be optimized away
     //
-    for (i = 0; i < Size; i++) {
-        ptr[i] = 0;
-    }
-
-    //
-    // Memory barrier to ensure writes complete
-    //
-    KeMemoryBarrier();
+    RtlSecureZeroMemory(Buffer, Size);
 }
 
 
@@ -1950,6 +2540,8 @@ EncHmacSha256(
     BCRYPT_HASH_HANDLE hashHandle = NULL;
     ULONG hashLength;
     ULONG resultLength;
+
+    PAGED_CODE();
 
     if (Key == NULL || KeySize == 0 || Data == NULL || DataSize == 0 || Hmac == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2057,6 +2649,8 @@ Routine Description:
     ULONG hmacInputLen;
     UCHAR defaultSalt[ENC_HMAC_SHA256_SIZE] = {0};
 
+    PAGED_CODE();
+
     if (IKM == NULL || IKMSize == 0 || OKM == NULL || OKMSize == 0) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -2154,12 +2748,15 @@ EncGetStatistics(
 
     RtlZeroMemory(Stats, sizeof(ENC_STATISTICS));
 
-    Stats->TotalEncryptions = Manager->Stats.TotalEncryptions;
-    Stats->TotalDecryptions = Manager->Stats.TotalDecryptions;
-    Stats->BytesEncrypted = Manager->Stats.BytesEncrypted;
-    Stats->BytesDecrypted = Manager->Stats.BytesDecrypted;
-    Stats->AuthenticationFailures = Manager->Stats.AuthFailures;
-    Stats->KeyRotations = Manager->Stats.KeyRotations;
+    //
+    // Use interlocked reads for consistency
+    //
+    Stats->TotalEncryptions = InterlockedCompareExchange64(&Manager->TotalEncryptions, 0, 0);
+    Stats->TotalDecryptions = InterlockedCompareExchange64(&Manager->TotalDecryptions, 0, 0);
+    Stats->BytesEncrypted = InterlockedCompareExchange64(&Manager->BytesEncrypted, 0, 0);
+    Stats->BytesDecrypted = InterlockedCompareExchange64(&Manager->BytesDecrypted, 0, 0);
+    Stats->AuthenticationFailures = InterlockedCompareExchange64(&Manager->AuthFailures, 0, 0);
+    Stats->KeyRotations = InterlockedCompareExchange64(&Manager->KeyRotations, 0, 0);
     Stats->ActiveKeyCount = Manager->KeyCount;
 
     return STATUS_SUCCESS;
@@ -2176,11 +2773,11 @@ EncResetStatistics(
         return;
     }
 
-    InterlockedExchange64((LONG64*)&Manager->Stats.TotalEncryptions, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.TotalDecryptions, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.BytesEncrypted, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.BytesDecrypted, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.AuthFailures, 0);
+    InterlockedExchange64(&Manager->TotalEncryptions, 0);
+    InterlockedExchange64(&Manager->TotalDecryptions, 0);
+    InterlockedExchange64(&Manager->BytesEncrypted, 0);
+    InterlockedExchange64(&Manager->BytesDecrypted, 0);
+    InterlockedExchange64(&Manager->AuthFailures, 0);
 }
 
 
@@ -2191,32 +2788,60 @@ EncResetStatistics(
 _Use_decl_annotations_
 NTSTATUS
 EncValidateHeader(
-    _In_reads_bytes_(HeaderSize) PVOID Data,
-    _In_ ULONG HeaderSize,
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize,
     _Out_ PENC_HEADER Header
     )
 {
     PENC_HEADER srcHeader;
+    ULONG expectedCrc;
 
     if (Data == NULL || Header == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (HeaderSize < sizeof(ENC_HEADER)) {
+    if (DataSize < sizeof(ENC_HEADER)) {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
+    //
+    // Copy to output first
+    //
     srcHeader = (PENC_HEADER)Data;
-
-    if (srcHeader->Magic != ENC_MAGIC) {
-        return STATUS_DECRYPTION_FAILED;
-    }
-
-    if (srcHeader->Version != ENC_VERSION) {
-        return STATUS_DECRYPTION_FAILED;
-    }
-
     RtlCopyMemory(Header, srcHeader, sizeof(ENC_HEADER));
+
+    //
+    // Validate on the copy
+    //
+    if (Header->Magic != ENC_MAGIC) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    if (Header->Version != ENC_VERSION) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    //
+    // Validate CRC
+    //
+    expectedCrc = EncpCalculateCrc32(Header, sizeof(ENC_HEADER) - sizeof(ULONG));
+    if (Header->HeaderCrc32 != expectedCrc) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    //
+    // Validate algorithm
+    //
+    if (!ENC_VALID_ALGORITHM((ENC_ALGORITHM)Header->Algorithm)) {
+        return STATUS_DECRYPTION_FAILED;
+    }
+
+    //
+    // Validate GCM constraint
+    //
+    if (Header->PlaintextSize != Header->CiphertextSize) {
+        return STATUS_DECRYPTION_FAILED;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -2229,15 +2854,34 @@ EncIsEncrypted(
     _In_ ULONG Size
     )
 {
-    PENC_HEADER header;
+    ENC_HEADER localHeader;
 
     if (Data == NULL || Size < sizeof(ENC_HEADER)) {
         return FALSE;
     }
 
-    header = (PENC_HEADER)Data;
+    //
+    // Copy header to local variable for validation
+    //
+    RtlCopyMemory(&localHeader, Data, sizeof(ENC_HEADER));
 
-    return (header->Magic == ENC_MAGIC && header->Version == ENC_VERSION);
+    if (localHeader.Magic != ENC_MAGIC) {
+        return FALSE;
+    }
+
+    if (localHeader.Version != ENC_VERSION) {
+        return FALSE;
+    }
+
+    //
+    // Validate CRC for additional confidence
+    //
+    ULONG expectedCrc = EncpCalculateCrc32(&localHeader, sizeof(ENC_HEADER) - sizeof(ULONG));
+    if (localHeader.HeaderCrc32 != expectedCrc) {
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 
@@ -2271,6 +2915,10 @@ Routine Description:
 
     if (Key->NonceCounter >= ENC_NONCE_COUNTER_MAX) {
         KeReleaseSpinLock(&Key->NonceLock, oldIrql);
+        //
+        // Counter exhausted - key should be rotated
+        //
+        Key->IsExpired = TRUE;
         return STATUS_INTEGER_OVERFLOW;
     }
 
@@ -2289,58 +2937,58 @@ Routine Description:
 
 static
 _Use_decl_annotations_
-VOID
-EncpObfuscateKey(
-    _Inout_ PENC_KEY Key
+NTSTATUS
+EncpGetDeobfuscatedKeyMaterial(
+    _In_ PENC_KEY Key,
+    _Out_writes_bytes_(ENC_AES_KEY_SIZE_256) PUCHAR KeyBuffer
     )
 /*++
 
 Routine Description:
 
-    Obfuscates key material in memory by XORing with obfuscation key.
-    Prevents simple memory dumps from revealing key material.
+    Safely retrieves deobfuscated key material into a caller-provided buffer.
+    The caller is responsible for clearing the buffer after use.
 
 --*/
 {
     ULONG i;
 
+    PAGED_CODE();
+
+    if (Key == NULL || KeyBuffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Key->ObfuscationKey == NULL) {
+        return STATUS_INVALID_STATE;
+    }
+
+    ExAcquireFastMutex(&Key->ObfuscationMutex);
+
+    //
+    // Copy key material
+    //
+    RtlCopyMemory(KeyBuffer, Key->KeyMaterial, Key->KeySize);
+
+    //
+    // Deobfuscate if necessary
+    //
     if (Key->IsObfuscated) {
-        return;
+        for (i = 0; i < Key->KeySize; i++) {
+            KeyBuffer[i] ^= Key->ObfuscationKey[i];
+        }
     }
 
-    for (i = 0; i < Key->KeySize; i++) {
-        Key->KeyMaterial[i] ^= Key->ObfuscationKey[i];
+    //
+    // Zero out any remaining bytes
+    //
+    if (Key->KeySize < ENC_AES_KEY_SIZE_256) {
+        RtlZeroMemory(KeyBuffer + Key->KeySize, ENC_AES_KEY_SIZE_256 - Key->KeySize);
     }
 
-    Key->IsObfuscated = TRUE;
-}
+    ExReleaseFastMutex(&Key->ObfuscationMutex);
 
-
-static
-_Use_decl_annotations_
-VOID
-EncpDeobfuscateKey(
-    _Inout_ PENC_KEY Key
-    )
-/*++
-
-Routine Description:
-
-    Deobfuscates key material for use.
-
---*/
-{
-    ULONG i;
-
-    if (!Key->IsObfuscated) {
-        return;
-    }
-
-    for (i = 0; i < Key->KeySize; i++) {
-        Key->KeyMaterial[i] ^= Key->ObfuscationKey[i];
-    }
-
-    Key->IsObfuscated = FALSE;
+    return STATUS_SUCCESS;
 }
 
 
@@ -2360,35 +3008,16 @@ Routine Description:
 --*/
 {
     NTSTATUS status;
-    BCRYPT_ALG_HANDLE algHandle;
 
     PAGED_CODE();
 
-    //
-    // Select algorithm handle based on key algorithm
-    //
-    switch (Key->Algorithm) {
-        case EncAlgorithm_AES_128_GCM:
-        case EncAlgorithm_AES_256_GCM:
-            algHandle = Manager->AesGcmAlgHandle;
-            break;
-
-        case EncAlgorithm_AES_128_CBC_HMAC:
-        case EncAlgorithm_AES_256_CBC_HMAC:
-            algHandle = Manager->AesCbcAlgHandle;
-            break;
-
-        default:
-            return STATUS_INVALID_PARAMETER;
-    }
-
-    Key->AlgHandle = algHandle;
+    Key->AlgHandle = Manager->AesGcmAlgHandle;
 
     //
-    // Generate key object
+    // Generate key object using raw key material (not yet obfuscated at this point)
     //
     status = BCryptGenerateSymmetricKey(
-        algHandle,
+        Manager->AesGcmAlgHandle,
         &Key->KeyHandle,
         NULL,
         0,
@@ -2412,6 +3041,8 @@ EncpCleanupBCryptKey(
     _Inout_ PENC_KEY Key
     )
 {
+    PAGED_CODE();
+
     if (Key->HandlesInitialized && Key->KeyHandle != NULL) {
         BCryptDestroyKey(Key->KeyHandle);
         Key->KeyHandle = NULL;
@@ -2421,189 +3052,31 @@ EncpCleanupBCryptKey(
 
 
 static
-VOID
-EncpRotationDpcRoutine(
-    _In_ PKDPC Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
+_Use_decl_annotations_
+BOOLEAN
+EncpIsKeyExpired(
+    _In_ PENC_KEY Key
     )
 /*++
 
 Routine Description:
 
-    DPC routine for automatic key rotation timer.
+    Checks if a key has expired based on its expiration time.
 
 --*/
 {
-    PENC_MANAGER manager;
+    LARGE_INTEGER currentTime;
 
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-
-    manager = (PENC_MANAGER)DeferredContext;
-
-    if (manager == NULL || !manager->Initialized) {
-        return;
+    if (Key->IsExpired) {
+        return TRUE;
     }
 
-    //
-    // Key rotation must happen at PASSIVE_LEVEL
-    // Queue a work item for actual rotation
-    //
-    // Note: In production, use IoQueueWorkItem for PASSIVE_LEVEL rotation
-    // For now, we just update statistics - actual rotation would be done
-    // by a system thread or work item
-    //
+    KeQuerySystemTimePrecise(&currentTime);
 
-    InterlockedIncrement64((LONG64*)&manager->Stats.KeyRotations);
-}
-
-
-//=============================================================================
-// Streaming Encryption (Stub implementations for API completeness)
-//=============================================================================
-
-_Use_decl_annotations_
-NTSTATUS
-EncStreamBegin(
-    _Inout_ PENC_CONTEXT Context,
-    _Out_writes_bytes_(ENC_GCM_NONCE_SIZE) PUCHAR NonceOut
-    )
-{
-    NTSTATUS status;
-
-    if (Context == NULL || NonceOut == NULL || Context->CurrentKey == NULL) {
-        return STATUS_INVALID_PARAMETER;
+    if (currentTime.QuadPart >= Key->ExpirationTime.QuadPart) {
+        Key->IsExpired = TRUE;
+        return TRUE;
     }
 
-    status = EncpGenerateNonce(Context->CurrentKey, NonceOut);
-    if (NT_SUCCESS(status)) {
-        Context->StreamMode = TRUE;
-        Context->StreamInitialized = TRUE;
-        Context->StreamBytesProcessed = 0;
-    }
-
-    return status;
-}
-
-
-_Use_decl_annotations_
-NTSTATUS
-EncStreamProcess(
-    _Inout_ PENC_CONTEXT Context,
-    _In_reads_bytes_(InputSize) PVOID Input,
-    _In_ ULONG InputSize,
-    _Out_writes_bytes_(OutputSize) PVOID Output,
-    _In_ ULONG OutputSize,
-    _Out_ PULONG OutputWritten,
-    _In_ BOOLEAN IsFinal
-    )
-{
-    UNREFERENCED_PARAMETER(IsFinal);
-
-    if (Context == NULL || Input == NULL || Output == NULL || OutputWritten == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Context->StreamInitialized) {
-        return STATUS_INVALID_STATE_TRANSITION;
-    }
-
-    if (OutputSize < InputSize) {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-
-    //
-    // For GCM, streaming is complex - simplified implementation here
-    // Full implementation would use BCrypt's multi-call pattern
-    //
-    RtlCopyMemory(Output, Input, InputSize);
-    *OutputWritten = InputSize;
-    Context->StreamBytesProcessed += InputSize;
-
-    return STATUS_SUCCESS;
-}
-
-
-_Use_decl_annotations_
-NTSTATUS
-EncStreamFinalize(
-    _Inout_ PENC_CONTEXT Context,
-    _Out_writes_bytes_(TagSize) PUCHAR TagOut,
-    _In_ ULONG TagSize
-    )
-{
-    if (Context == NULL || TagOut == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (TagSize < ENC_GCM_TAG_SIZE) {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-
-    if (!Context->StreamInitialized) {
-        return STATUS_INVALID_STATE_TRANSITION;
-    }
-
-    //
-    // Generate placeholder tag - full implementation would
-    // use BCrypt to generate actual authentication tag
-    //
-    RtlZeroMemory(TagOut, TagSize);
-
-    Context->StreamMode = FALSE;
-    Context->StreamInitialized = FALSE;
-
-    return STATUS_SUCCESS;
-}
-
-
-_Use_decl_annotations_
-NTSTATUS
-EncStreamDecryptBegin(
-    _Inout_ PENC_CONTEXT Context,
-    _In_reads_bytes_(ENC_GCM_NONCE_SIZE) PUCHAR Nonce
-    )
-{
-    if (Context == NULL || Nonce == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    Context->StreamMode = TRUE;
-    Context->StreamInitialized = TRUE;
-    Context->StreamBytesProcessed = 0;
-
-    return STATUS_SUCCESS;
-}
-
-
-_Use_decl_annotations_
-NTSTATUS
-EncStreamDecryptFinalize(
-    _Inout_ PENC_CONTEXT Context,
-    _In_reads_bytes_(TagSize) PUCHAR Tag,
-    _In_ ULONG TagSize
-    )
-{
-    if (Context == NULL || Tag == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (TagSize < ENC_GCM_TAG_SIZE_MIN) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!Context->StreamInitialized) {
-        return STATUS_INVALID_STATE_TRANSITION;
-    }
-
-    //
-    // Verify tag - full implementation would use BCrypt
-    //
-    Context->StreamMode = FALSE;
-    Context->StreamInitialized = FALSE;
-
-    return STATUS_SUCCESS;
+    return FALSE;
 }

@@ -11,7 +11,7 @@
     - Stream compression for large data with block chaining
     - Dictionary support for improved compression of similar data
     - CRC32 integrity verification
-    - Lock-free statistics tracking
+    - Thread-safe statistics tracking with interlocked operations
 
     Performance Characteristics:
     - LZ4 Fast: ~400 MB/s compression, ~2 GB/s decompression
@@ -21,9 +21,10 @@
 
     Security Properties:
     - Bounds checking on all operations
-    - No buffer overflows possible
+    - Integer overflow protection
     - Safe decompression with size validation
     - Checksum verification for data integrity
+    - No stack-based large allocations
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -43,6 +44,7 @@
 #pragma alloc_text(PAGE, CompStreamEnd)
 #pragma alloc_text(PAGE, CompStreamDecompressBegin)
 #pragma alloc_text(PAGE, CompStreamDecompressEnd)
+#pragma alloc_text(PAGE, ComppDestroyDictionaryInternal)
 #endif
 
 //=============================================================================
@@ -144,6 +146,132 @@ static PCOMP_MANAGER g_CompressionManager = NULL;
 static volatile LONG g_NextStreamId = 0;
 static volatile LONG g_NextDictionaryId = 1000;
 
+//
+// Spinlock protecting g_CompressionManager pointer access
+//
+static EX_SPIN_LOCK g_ManagerLock = 0;
+
+//=============================================================================
+// Deferred Cleanup Work Item for Elevated IRQL Dictionary Release
+//=============================================================================
+
+typedef struct _COMP_DEFERRED_CLEANUP {
+    PIO_WORKITEM WorkItem;
+    PCOMP_DICTIONARY Dictionary;
+} COMP_DEFERRED_CLEANUP, *PCOMP_DEFERRED_CLEANUP;
+
+static PDEVICE_OBJECT g_CompressionDeviceObject = NULL;
+
+/**
+ * @brief Work item callback for deferred dictionary cleanup.
+ */
+static VOID
+ComppDeferredDictionaryCleanup(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+    )
+{
+    PCOMP_DEFERRED_CLEANUP Cleanup = (PCOMP_DEFERRED_CLEANUP)Context;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (Cleanup == NULL) {
+        return;
+    }
+
+    //
+    // Now at PASSIVE_LEVEL - safe to destroy dictionary
+    //
+    if (Cleanup->Dictionary != NULL) {
+        ComppDestroyDictionaryInternal(Cleanup->Dictionary);
+    }
+
+    //
+    // Free work item and cleanup structure
+    //
+    if (Cleanup->WorkItem != NULL) {
+        IoFreeWorkItem(Cleanup->WorkItem);
+    }
+
+    ExFreePoolWithTag(Cleanup, COMP_POOL_TAG_CONTEXT);
+}
+
+/**
+ * @brief Queue deferred dictionary cleanup for elevated IRQL.
+ */
+static BOOLEAN
+ComppQueueDeferredDictionaryCleanup(
+    _In_ PCOMP_DICTIONARY Dictionary
+    )
+{
+    PCOMP_DEFERRED_CLEANUP Cleanup;
+    PIO_WORKITEM WorkItem;
+
+    //
+    // Need a device object to queue work items
+    // If not available, we cannot defer - caller must handle
+    //
+    if (g_CompressionDeviceObject == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Allocate cleanup structure from NonPaged pool (we're at elevated IRQL)
+    //
+    Cleanup = (PCOMP_DEFERRED_CLEANUP)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(COMP_DEFERRED_CLEANUP),
+        COMP_POOL_TAG_CONTEXT
+    );
+
+    if (Cleanup == NULL) {
+        return FALSE;
+    }
+
+    //
+    // Allocate work item
+    //
+    WorkItem = IoAllocateWorkItem(g_CompressionDeviceObject);
+    if (WorkItem == NULL) {
+        ExFreePoolWithTag(Cleanup, COMP_POOL_TAG_CONTEXT);
+        return FALSE;
+    }
+
+    Cleanup->WorkItem = WorkItem;
+    Cleanup->Dictionary = Dictionary;
+
+    //
+    // Queue for deferred execution at PASSIVE_LEVEL
+    //
+    IoQueueWorkItem(
+        WorkItem,
+        ComppDeferredDictionaryCleanup,
+        DelayedWorkQueue,
+        Cleanup
+    );
+
+    return TRUE;
+}
+
+//=============================================================================
+// Forward Declarations - Internal Helpers
+//=============================================================================
+
+static VOID
+ComppDestroyDictionaryInternal(
+    _Inout_ PCOMP_DICTIONARY Dictionary
+    );
+
+static PCOMP_MANAGER
+ComppAcquireManager(
+    VOID
+    );
+
+static VOID
+ComppReleaseManager(
+    _In_ PCOMP_MANAGER Manager
+    );
+
 //=============================================================================
 // CRC32 Lookup Table
 //=============================================================================
@@ -195,6 +323,57 @@ static const ULONG g_Crc32LookupTable[256] = {
 };
 
 //=============================================================================
+// Manager Access Helpers (TOCTOU Protection)
+//=============================================================================
+
+/**
+ * @brief Acquire reference to global compression manager.
+ *
+ * This provides TOCTOU-safe access to the global manager by
+ * incrementing the reference count before returning.
+ *
+ * @return Pointer to manager if available, NULL otherwise.
+ *         Caller MUST call ComppReleaseManager when done.
+ */
+static PCOMP_MANAGER
+ComppAcquireManager(
+    VOID
+    )
+{
+    KIRQL OldIrql;
+    PCOMP_MANAGER Manager;
+
+    OldIrql = ExAcquireSpinLockShared(&g_ManagerLock);
+
+    Manager = g_CompressionManager;
+
+    if (Manager != NULL && InterlockedCompareExchange(&Manager->Initialized, TRUE, TRUE) == TRUE) {
+        InterlockedIncrement(&Manager->RefCount);
+    } else {
+        Manager = NULL;
+    }
+
+    ExReleaseSpinLockShared(&g_ManagerLock, OldIrql);
+
+    return Manager;
+}
+
+/**
+ * @brief Release reference to compression manager.
+ *
+ * @param Manager Manager to release (may be NULL).
+ */
+static VOID
+ComppReleaseManager(
+    _In_opt_ PCOMP_MANAGER Manager
+    )
+{
+    if (Manager != NULL) {
+        InterlockedDecrement(&Manager->RefCount);
+    }
+}
+
+//=============================================================================
 // Forward Declarations
 //=============================================================================
 
@@ -239,7 +418,8 @@ static FORCEINLINE ULONG
 ComppCount(
     _In_ const UCHAR* Ptr1,
     _In_ const UCHAR* Ptr2,
-    _In_ const UCHAR* Limit
+    _In_ const UCHAR* Limit1,
+    _In_ const UCHAR* Limit2
     );
 
 static FORCEINLINE ULONG
@@ -381,21 +561,38 @@ ComppRead64(
 }
 
 /**
- * @brief Count matching bytes forward.
+ * @brief Count matching bytes forward with bounds checking on both pointers.
+ *
+ * @param Ptr1 First pointer to compare
+ * @param Ptr2 Second pointer to compare (match candidate)
+ * @param Limit1 End boundary for Ptr1
+ * @param Limit2 End boundary for Ptr2
+ * @return Number of matching bytes
  */
 static FORCEINLINE ULONG
 ComppCount(
     _In_ const UCHAR* Ptr1,
     _In_ const UCHAR* Ptr2,
-    _In_ const UCHAR* Limit
+    _In_ const UCHAR* Limit1,
+    _In_ const UCHAR* Limit2
     )
 {
     const UCHAR* Start = Ptr1;
+    const UCHAR* EffectiveLimit;
 
     //
-    // Process 8 bytes at a time for speed
+    // Use the more restrictive limit based on both buffers
     //
-    while (Ptr1 < Limit - 7) {
+    ULONG MaxLen1 = (ULONG)(Limit1 - Ptr1);
+    ULONG MaxLen2 = (ULONG)(Limit2 - Ptr2);
+    ULONG MaxLen = (MaxLen1 < MaxLen2) ? MaxLen1 : MaxLen2;
+
+    EffectiveLimit = Ptr1 + MaxLen;
+
+    //
+    // Process 8 bytes at a time for speed, but check both limits
+    //
+    while (Ptr1 + 8 <= EffectiveLimit) {
         ULONG64 Diff = ComppRead64(Ptr1) ^ ComppRead64(Ptr2);
         if (Diff != 0) {
             //
@@ -415,7 +612,7 @@ ComppCount(
     //
     // Handle remaining bytes
     //
-    while (Ptr1 < Limit && *Ptr1 == *Ptr2) {
+    while (Ptr1 < EffectiveLimit && *Ptr1 == *Ptr2) {
         Ptr1++;
         Ptr2++;
     }
@@ -586,7 +783,7 @@ _NextMatch:
             const UCHAR* MatchStart = Ip + LZ4_MINMATCH;
             const UCHAR* MatchEnd = MatchStart;
 
-            MatchEnd += ComppCount(MatchStart, Match + LZ4_MINMATCH, MatchLimit);
+            MatchEnd += ComppCount(MatchStart, Match + LZ4_MINMATCH, MatchLimit, IEnd);
             MatchLength = (ULONG)(MatchEnd - MatchStart);
             Ip = MatchEnd;
 
@@ -672,6 +869,9 @@ _LastLiterals:
  *
  * Provides better compression ratios at the cost of speed.
  * Uses more sophisticated match finding with hash chains.
+ *
+ * FIXED: Added proper bounds checking in encoding loops.
+ * FIXED: Removed unused SearchMatchNb variable.
  */
 static INT
 ComppCompressHC(
@@ -694,7 +894,6 @@ ComppCompressHC(
     UCHAR* Token;
 
     ULONG MaxNbAttempts;
-    INT SearchMatchNb;
 
     //
     // Handle compression level
@@ -707,7 +906,6 @@ ComppCompressHC(
     }
 
     MaxNbAttempts = 1U << (CompressionLevel - 1);
-    SearchMatchNb = CompressionLevel >= LZ4HC_CLEVEL_OPT_MIN ? 2 : 1;
 
     //
     // Handle small inputs
@@ -762,7 +960,8 @@ ComppCompressHC(
                     ULONG CandidateLength = LZ4_MINMATCH + ComppCount(
                         Ip + LZ4_MINMATCH,
                         MatchCandidate + LZ4_MINMATCH,
-                        MatchLimit
+                        MatchLimit,
+                        IEnd
                     );
 
                     if (CandidateLength > MatchLength) {
@@ -792,23 +991,39 @@ ComppCompressHC(
         }
 
         //
-        // Encode literals
+        // Encode literals with proper bounds checking
         //
         {
             ULONG LiteralLength = (ULONG)(Ip - Anchor);
-            Token = Op++;
+            ULONG RequiredSpace;
 
-            if ((ULONG)(OLimit - Op) < LiteralLength + 2 + 1 + LZ4_LASTLITERALS) {
-                return 0;
+            //
+            // Calculate required output space
+            // Token + literal length bytes + literals + offset + match length bytes
+            //
+            RequiredSpace = 1;  // Token
+            if (LiteralLength >= RUN_MASK) {
+                RequiredSpace += 1 + ((LiteralLength - RUN_MASK) / 255);
             }
+            RequiredSpace += LiteralLength;  // Literals
+            RequiredSpace += 2;  // Offset
+            RequiredSpace += LZ4_LASTLITERALS;  // Safety margin
+
+            if ((ULONG)(OLimit - Op) < RequiredSpace) {
+                return 0;  // Output too small
+            }
+
+            Token = Op++;
 
             if (LiteralLength >= RUN_MASK) {
                 ULONG Len = LiteralLength - RUN_MASK;
                 *Token = (UCHAR)(RUN_MASK << ML_BITS);
                 while (Len >= 255) {
+                    if (Op >= OLimit) return 0;  // Bounds check
                     *Op++ = 255;
                     Len -= 255;
                 }
+                if (Op >= OLimit) return 0;  // Bounds check
                 *Op++ = (UCHAR)Len;
             } else {
                 *Token = (UCHAR)(LiteralLength << ML_BITS);
@@ -821,11 +1036,12 @@ ComppCompressHC(
         //
         // Encode offset
         //
+        if (Op + 2 > OLimit) return 0;  // Bounds check
         ComppWriteLE16(Op, (USHORT)BestOffset);
         Op += 2;
 
         //
-        // Encode match length
+        // Encode match length with bounds checking
         //
         {
             ULONG Len = MatchLength - LZ4_MINMATCH;
@@ -834,9 +1050,11 @@ ComppCompressHC(
                 *Token += (UCHAR)ML_MASK;
                 Len -= ML_MASK;
                 while (Len >= 255) {
+                    if (Op >= OLimit) return 0;  // Bounds check
                     *Op++ = 255;
                     Len -= 255;
                 }
+                if (Op >= OLimit) return 0;  // Bounds check
                 *Op++ = (UCHAR)Len;
             } else {
                 *Token += (UCHAR)Len;
@@ -863,13 +1081,18 @@ ComppCompressHC(
 
 _LastLiterals:
     //
-    // Encode last literals
+    // Encode last literals with proper bounds checking
     //
     {
         ULONG LastRunLength = (ULONG)(IEnd - Anchor);
+        ULONG RequiredSpace = 1 + LastRunLength;
 
-        if ((ULONG)(OLimit - Op) < LastRunLength + 1 + ((LastRunLength + 255 - RUN_MASK) / 255)) {
-            return 0;
+        if (LastRunLength >= RUN_MASK) {
+            RequiredSpace += 1 + ((LastRunLength - RUN_MASK) / 255);
+        }
+
+        if ((ULONG)(OLimit - Op) < RequiredSpace) {
+            return 0;  // Output too small
         }
 
         if (LastRunLength >= RUN_MASK) {
@@ -896,6 +1119,11 @@ _LastLiterals:
  *
  * Decompresses LZ4 data with full bounds checking to prevent
  * buffer overflows from malformed or malicious input.
+ *
+ * SECURITY FIXES:
+ * - Integer overflow protection in length decoding
+ * - Proper boundary underflow checks
+ * - Bounds validation before all memory access
  */
 static INT
 ComppDecompressSafe(
@@ -913,9 +1141,20 @@ ComppDecompressSafe(
 
     UCHAR* Op = (UCHAR*)Dest;
     UCHAR* OEnd = Op + MaxDecompressedSize;
-    UCHAR* CopyEnd = OEnd - (PartialDecode ? 0 : 8);
+    UCHAR* CopyEnd;
 
     const UCHAR* DictEnd = DictStart ? (const UCHAR*)DictStart + DictSize : NULL;
+
+    //
+    // Validate input parameters
+    //
+    if (Source == NULL || Dest == NULL) {
+        return -1;
+    }
+
+    if (CompressedSize <= 0 || MaxDecompressedSize <= 0) {
+        return -1;
+    }
 
     //
     // Handle zero-size inputs
@@ -925,22 +1164,40 @@ ComppDecompressSafe(
     }
 
     //
+    // Calculate copy end with underflow protection
+    // For partial decode, we can fill to the very end
+    // For full decode, we need 8 bytes safety margin
+    //
+    if (PartialDecode) {
+        CopyEnd = OEnd;
+    } else {
+        if (MaxDecompressedSize < 8) {
+            CopyEnd = Op;  // No room for fast copy
+        } else {
+            CopyEnd = OEnd - 8;
+        }
+    }
+
+    //
     // Main decompression loop
     //
-    while (TRUE) {
+    while (Ip < IEnd) {
         ULONG Token;
         ULONG Length;
         const UCHAR* Match;
         USHORT Offset;
 
         //
-        // Get token
+        // Get token - need at least 1 byte
         //
+        if (Ip >= IEnd) {
+            return -1;
+        }
         Token = *Ip++;
         Length = Token >> ML_BITS;
 
         //
-        // Decode literal length
+        // Decode literal length with overflow protection
         //
         if (Length == RUN_MASK) {
             ULONG Addl;
@@ -949,32 +1206,79 @@ ComppDecompressSafe(
                     return -1;  // Malformed input
                 }
                 Addl = *Ip++;
+
+                //
+                // SECURITY: Check for integer overflow before adding
+                //
+                if (Length > COMP_MAX_INPUT_SIZE - Addl) {
+                    return -1;  // Overflow attack detected
+                }
                 Length += Addl;
             } while (Addl == 255);
         }
 
         //
-        // Copy literals
+        // Validate we have enough input and output space for literals
         //
         if (Length > 0) {
-            if ((Ip + Length > IEnd - (2 + 1 + LZ4_LASTLITERALS)) ||
-                (Op + Length > OEnd)) {
-                //
-                // Boundary check for partial decode or last literals
-                //
-                if ((PartialDecode && Op + Length <= OEnd) ||
-                    (!PartialDecode && Ip + Length == IEnd && Op + Length <= OEnd)) {
-                    RtlCopyMemory(Op, Ip, Length);
-                    Op += Length;
-                    Ip += Length;
-                    break;  // End of block
-                }
-                return -1;  // Overflow
+            //
+            // Calculate minimum required input remaining
+            // Need: Length bytes of literals + 2 bytes offset (unless at end)
+            //
+            ULONG InputRemaining = (ULONG)(IEnd - Ip);
+            ULONG OutputRemaining = (ULONG)(OEnd - Op);
+
+            //
+            // Check if this is potentially the last block
+            //
+            if (InputRemaining < Length) {
+                return -1;  // Not enough input
             }
 
+            if (OutputRemaining < Length) {
+                if (PartialDecode && Op + Length <= OEnd) {
+                    // Partial decode allows filling to end
+                } else {
+                    return -1;  // Output overflow
+                }
+            }
+
+            //
+            // Check if we're at the end of input (last literals)
+            //
+            if (Ip + Length == IEnd) {
+                //
+                // This is the last block - just copy literals and exit
+                //
+                if (Op + Length > OEnd) {
+                    return -1;
+                }
+                RtlCopyMemory(Op, Ip, Length);
+                Op += Length;
+                break;  // End of decompression
+            }
+
+            //
+            // Not the last block - need offset and match length after
+            // Ensure we have at least 2 bytes for offset + potential match length
+            //
+            if (InputRemaining < Length + 2) {
+                return -1;  // Truncated input
+            }
+
+            //
+            // Copy literals
+            //
             RtlCopyMemory(Op, Ip, Length);
             Ip += Length;
             Op += Length;
+        }
+
+        //
+        // Ensure we have 2 bytes for offset
+        //
+        if (Ip + 2 > IEnd) {
+            return -1;  // Truncated input
         }
 
         //
@@ -982,6 +1286,11 @@ ComppDecompressSafe(
         //
         Offset = ComppReadLE16(Ip);
         Ip += 2;
+
+        if (Offset == 0) {
+            return -1;  // Invalid zero offset
+        }
+
         Match = Op - Offset;
 
         //
@@ -992,7 +1301,7 @@ ComppDecompressSafe(
             // Check dictionary
             //
             if (DictStart == NULL) {
-                return -1;  // Invalid offset
+                return -1;  // Invalid offset - no dictionary
             }
 
             if (Match < (const UCHAR*)Dest - DictSize) {
@@ -1006,7 +1315,7 @@ ComppDecompressSafe(
         }
 
         //
-        // Decode match length
+        // Decode match length with overflow protection
         //
         Length = Token & ML_MASK;
         if (Length == ML_MASK) {
@@ -1016,74 +1325,82 @@ ComppDecompressSafe(
                     return -1;
                 }
                 Addl = *Ip++;
+
+                //
+                // SECURITY: Check for integer overflow before adding
+                //
+                if (Length > COMP_MAX_INPUT_SIZE - Addl) {
+                    return -1;  // Overflow attack detected
+                }
                 Length += Addl;
             } while (Addl == 255);
+        }
+
+        //
+        // Add minimum match length
+        // Check for overflow first
+        //
+        if (Length > COMP_MAX_INPUT_SIZE - LZ4_MINMATCH) {
+            return -1;
         }
         Length += LZ4_MINMATCH;
 
         //
-        // Copy match
+        // Validate output space for match
         //
         if (Op + Length > OEnd) {
             return -1;  // Output overflow
         }
 
         //
-        // Handle overlapping match (offset < length)
+        // Copy match - handle overlapping carefully
         //
         if (Offset < 8) {
             //
-            // Byte-by-byte copy for small offsets
+            // Byte-by-byte copy for small offsets (run-length encoding pattern)
             //
             ULONG i;
             for (i = 0; i < Length; i++) {
                 Op[i] = Match[i];
             }
             Op += Length;
-        } else {
+        } else if (Match >= (const UCHAR*)Dest && Match + Length <= Op) {
             //
-            // Fast copy for larger offsets
+            // Standard case: match is entirely before output position
+            // No overlap, safe to use RtlCopyMemory
             //
-            const UCHAR* MatchEnd = Match + Length;
-
-            if (Match >= (const UCHAR*)Dest && MatchEnd <= Op) {
+            RtlCopyMemory(Op, Match, Length);
+            Op += Length;
+        } else if (Match < (const UCHAR*)Dest && DictStart != NULL) {
+            //
+            // Match spans dictionary and output buffer
+            //
+            ULONG DictPortion = (ULONG)((const UCHAR*)Dest - Match);
+            if (DictPortion > Length) {
+                DictPortion = Length;
+            }
+            RtlCopyMemory(Op, Match, DictPortion);
+            Op += DictPortion;
+            Length -= DictPortion;
+            if (Length > 0) {
                 //
-                // Standard case: match is entirely before output position
-                //
-                RtlCopyMemory(Op, Match, Length);
-                Op += Length;
-            } else if (Match < (const UCHAR*)Dest && DictStart != NULL) {
-                //
-                // Match spans dictionary and output buffer
-                //
-                ULONG DictPortion = (ULONG)((const UCHAR*)Dest - Match);
-                if (DictPortion > Length) {
-                    DictPortion = Length;
-                }
-                RtlCopyMemory(Op, Match, DictPortion);
-                Op += DictPortion;
-                Length -= DictPortion;
-                if (Length > 0) {
-                    RtlCopyMemory(Op, Dest, Length);
-                    Op += Length;
-                }
-            } else {
-                //
-                // Overlapping copy
+                // Copy remaining from start of output buffer
                 //
                 ULONG i;
                 for (i = 0; i < Length; i++) {
-                    Op[i] = Match[i];
+                    Op[i] = ((const UCHAR*)Dest)[i];
                 }
                 Op += Length;
             }
-        }
-
-        //
-        // Check for end of compressed data
-        //
-        if (Ip >= IEnd) {
-            break;
+        } else {
+            //
+            // Overlapping copy - must be byte-by-byte
+            //
+            ULONG i;
+            for (i = 0; i < Length; i++) {
+                Op[i] = Match[i];
+            }
+            Op += Length;
         }
     }
 
@@ -1110,6 +1427,9 @@ LZ4_compress_default(
 
 /**
  * @brief LZ4 fast compression with acceleration.
+ *
+ * FIXED: Allocates LZ4_STREAM_INTERNAL from pool instead of stack
+ * to prevent kernel stack overflow (structure is ~16KB).
  */
 INT
 LZ4_compress_fast(
@@ -1120,7 +1440,7 @@ LZ4_compress_fast(
     _In_ INT acceleration
     )
 {
-    LZ4_STREAM_INTERNAL State;
+    PLZ4_STREAM_INTERNAL State = NULL;
     INT Result;
 
     //
@@ -1139,15 +1459,34 @@ LZ4_compress_fast(
     }
 
     //
+    // Allocate state from pool - LZ4_STREAM_INTERNAL is ~16KB
+    // which would overflow the kernel stack
+    //
+    State = (PLZ4_STREAM_INTERNAL)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(LZ4_STREAM_INTERNAL),
+        COMP_POOL_TAG_CONTEXT
+    );
+
+    if (State == NULL) {
+        return 0;
+    }
+
+    //
     // Initialize state
     //
-    RtlZeroMemory(&State, sizeof(State));
-    State.CurrentOffset = 0;
+    RtlZeroMemory(State, sizeof(LZ4_STREAM_INTERNAL));
+    State->CurrentOffset = 0;
 
     //
     // Compress
     //
-    Result = ComppCompressGeneric(&State, src, dst, srcSize, dstCapacity, acceleration);
+    Result = ComppCompressGeneric(State, src, dst, srcSize, dstCapacity, acceleration);
+
+    //
+    // Free state
+    //
+    ShadowStrikeFreePoolWithTag(State, COMP_POOL_TAG_CONTEXT);
 
     return Result;
 }
@@ -1226,8 +1565,17 @@ LZ4_decompress_safe(
 }
 
 /**
- * @brief Fast LZ4 decompression (requires known original size).
+ * @brief LZ4_decompress_fast is REMOVED for security reasons.
+ *
+ * This function was fundamentally unsafe because it required knowing
+ * the original size but not the compressed size, allowing attackers
+ * to cause arbitrary kernel memory reads.
+ *
+ * Use LZ4_decompress_safe() instead which requires both sizes.
+ *
+ * This stub exists only to cause link errors if old code tries to use it.
  */
+#if 0
 INT
 LZ4_decompress_fast(
     _In_ const CHAR* src,
@@ -1235,12 +1583,18 @@ LZ4_decompress_fast(
     _In_ INT originalSize
     )
 {
+    UNREFERENCED_PARAMETER(src);
+    UNREFERENCED_PARAMETER(dst);
+    UNREFERENCED_PARAMETER(originalSize);
+
     //
-    // For safety, we use the safe decompressor internally
-    // The "fast" variant is deprecated due to security concerns
+    // SECURITY: This function is intentionally disabled.
+    // It cannot safely validate input without knowing compressed size.
     //
-    return ComppDecompressSafe(src, dst, LZ4_MAX_INPUT_SIZE, originalSize, NULL, 0, FALSE);
+    NT_ASSERT(FALSE && "LZ4_decompress_fast is deprecated - use LZ4_decompress_safe");
+    return -1;
 }
+#endif
 
 /**
  * @brief Dictionary-based compression.
@@ -1302,6 +1656,8 @@ CompInitialize(
     PCOMP_MANAGER Manager
     )
 {
+    KIRQL OldIrql;
+
     PAGED_CODE();
 
     if (Manager == NULL) {
@@ -1311,10 +1667,10 @@ CompInitialize(
     RtlZeroMemory(Manager, sizeof(COMP_MANAGER));
 
     //
-    // Initialize dictionary list
+    // Initialize dictionary list with EX_SPIN_LOCK
     //
     InitializeListHead(&Manager->DictionaryList);
-    KeInitializeSpinLock(&Manager->DictionaryLock);
+    Manager->DictionaryLock = 0;
     Manager->MaxDictionaries = 16;  // Default limit
 
     //
@@ -1324,7 +1680,8 @@ CompInitialize(
     Manager->DefaultContext.CompressionLevel = COMP_LEVEL_DEFAULT;
     Manager->DefaultContext.Acceleration = LZ4_ACCELERATION_DEFAULT;
     Manager->DefaultContext.Flags = CompFlag_Checksum;
-    KeInitializeSpinLock(&Manager->DefaultContext.Lock);
+    Manager->DefaultContext.Lock = 0;
+    Manager->DefaultContext.Initialized = TRUE;
 
     //
     // Set default configuration
@@ -1343,16 +1700,27 @@ CompInitialize(
     Manager->Stats.Errors = 0;
 
     //
-    // Mark as initialized
+    // Initialize reference count
     //
-    Manager->Initialized = TRUE;
+    Manager->RefCount = 0;
+
+    //
+    // Mark as initialized and set global pointer atomically
+    //
+    InterlockedExchange(&Manager->Initialized, TRUE);
+
+    OldIrql = ExAcquireSpinLockExclusive(&g_ManagerLock);
     g_CompressionManager = Manager;
+    ExReleaseSpinLockExclusive(&g_ManagerLock, OldIrql);
 
     return STATUS_SUCCESS;
 }
 
 /**
  * @brief Shutdown the compression manager.
+ *
+ * FIXED: Implements proper collect-then-free pattern to avoid
+ * IRQL violations and race conditions when freeing dictionaries.
  */
 _Use_decl_annotations_
 VOID
@@ -1361,27 +1729,61 @@ CompShutdown(
     )
 {
     KIRQL OldIrql;
+    LIST_ENTRY FreeList;
     PLIST_ENTRY Entry;
     PCOMP_DICTIONARY Dict;
 
     PAGED_CODE();
 
-    if (Manager == NULL || !Manager->Initialized) {
+    if (Manager == NULL) {
         return;
     }
 
-    Manager->Initialized = FALSE;
+    //
+    // Mark as not initialized atomically
+    //
+    if (InterlockedCompareExchange(&Manager->Initialized, FALSE, TRUE) == FALSE) {
+        return;  // Already shutdown or never initialized
+    }
 
     //
-    // Free all dictionaries
+    // Wait for all references to be released
+    // This is a simple spin-wait; in production consider using an event
     //
-    KeAcquireSpinLock(&Manager->DictionaryLock, &OldIrql);
+    while (InterlockedCompareExchange(&Manager->RefCount, 0, 0) > 0) {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -10000;  // 1ms
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+    }
+
+    //
+    // Collect all dictionaries to free list while holding lock
+    //
+    InitializeListHead(&FreeList);
+
+    OldIrql = ExAcquireSpinLockExclusive(&Manager->DictionaryLock);
 
     while (!IsListEmpty(&Manager->DictionaryList)) {
         Entry = RemoveHeadList(&Manager->DictionaryList);
+        InsertTailList(&FreeList, Entry);
+    }
+
+    Manager->DictionaryCount = 0;
+
+    ExReleaseSpinLockExclusive(&Manager->DictionaryLock, OldIrql);
+
+    //
+    // Now free all dictionaries without holding the lock
+    // This is safe because we've already removed them from the list
+    //
+    while (!IsListEmpty(&FreeList)) {
+        Entry = RemoveHeadList(&FreeList);
         Dict = CONTAINING_RECORD(Entry, COMP_DICTIONARY, ListEntry);
 
-        KeReleaseSpinLock(&Manager->DictionaryLock, OldIrql);
+        //
+        // Force refcount to 0 and destroy
+        //
+        InterlockedExchange(&Dict->RefCount, 0);
 
         if (Dict->Data != NULL) {
             ShadowStrikeFreePoolWithTag(Dict->Data, COMP_POOL_TAG_DICT);
@@ -1390,11 +1792,7 @@ CompShutdown(
             ShadowStrikeFreePoolWithTag(Dict->LZ4DictState, COMP_POOL_TAG_DICT);
         }
         ShadowStrikeFreePoolWithTag(Dict, COMP_POOL_TAG_DICT);
-
-        KeAcquireSpinLock(&Manager->DictionaryLock, &OldIrql);
     }
-
-    KeReleaseSpinLock(&Manager->DictionaryLock, OldIrql);
 
     //
     // Free default context resources
@@ -1409,7 +1807,14 @@ CompShutdown(
         Manager->DefaultContext.InternalState = NULL;
     }
 
-    g_CompressionManager = NULL;
+    //
+    // Clear global manager pointer
+    //
+    OldIrql = ExAcquireSpinLockExclusive(&g_ManagerLock);
+    if (g_CompressionManager == Manager) {
+        g_CompressionManager = NULL;
+    }
+    ExReleaseSpinLockExclusive(&g_ManagerLock, OldIrql);
 }
 
 //=============================================================================
@@ -1417,7 +1822,10 @@ CompShutdown(
 //=============================================================================
 
 /**
- * @brief Calculate worst-case compressed size.
+ * @brief Calculate worst-case compressed size with overflow protection.
+ *
+ * FIXED: Added integer overflow checks to prevent returning undersized
+ * buffer estimates that would cause buffer overflows.
  */
 _Use_decl_annotations_
 ULONG
@@ -1427,13 +1835,36 @@ CompGetBound(
     )
 {
     ULONG Bound;
+    ULONG LZ4Overhead;
 
     UNREFERENCED_PARAMETER(Algorithm);
 
     //
-    // LZ4 worst case: input + input/255 + 16
+    // Check for overflow before calculation
+    // LZ4 worst case: input + input/255 + 16 + header
     //
-    Bound = InputSize + (InputSize / 255) + 16;
+    // Maximum safe input size to prevent overflow:
+    // ULONG_MAX - 16 - sizeof(COMP_HEADER) - (ULONG_MAX/255) ≈ 4GB - overhead
+    //
+    // For safety, cap at COMP_MAX_INPUT_SIZE (64MB)
+    //
+    if (InputSize > COMP_MAX_INPUT_SIZE) {
+        return 0;  // Indicate error - input too large
+    }
+
+    //
+    // Calculate LZ4 overhead safely
+    //
+    LZ4Overhead = (InputSize / 255) + 16;
+
+    //
+    // Check for overflow in final calculation
+    //
+    if (InputSize > ULONG_MAX - LZ4Overhead - sizeof(COMP_HEADER)) {
+        return 0;  // Overflow would occur
+    }
+
+    Bound = InputSize + LZ4Overhead;
 
     //
     // Add header size
@@ -1635,12 +2066,16 @@ CompCompress(
     }
 
     //
-    // Update global statistics
+    // Update global statistics using safe manager access
     //
-    if (g_CompressionManager != NULL && g_CompressionManager->Initialized) {
-        InterlockedIncrement64((LONG64*)&g_CompressionManager->Stats.TotalCompressed);
-        InterlockedAdd64((LONG64*)&g_CompressionManager->Stats.BytesSaved,
-                         InputSize - *CompressedSize);
+    {
+        PCOMP_MANAGER Mgr = ComppAcquireManager();
+        if (Mgr != NULL) {
+            InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.TotalCompressed);
+            InterlockedAdd64((volatile LONG64*)&Mgr->Stats.BytesSaved,
+                             (LONG64)InputSize - (LONG64)*CompressedSize);
+            ComppReleaseManager(Mgr);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -1737,22 +2172,30 @@ CompDecompress(
             break;
 
         default:
-            if (g_CompressionManager != NULL) {
-                InterlockedIncrement64((LONG64*)&g_CompressionManager->Stats.Errors);
+            {
+                PCOMP_MANAGER Mgr = ComppAcquireManager();
+                if (Mgr != NULL) {
+                    InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.Errors);
+                    ComppReleaseManager(Mgr);
+                }
             }
             return STATUS_NOT_SUPPORTED;
     }
 
     if (Result < 0) {
-        if (g_CompressionManager != NULL) {
-            InterlockedIncrement64((LONG64*)&g_CompressionManager->Stats.Errors);
+        PCOMP_MANAGER Mgr = ComppAcquireManager();
+        if (Mgr != NULL) {
+            InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.Errors);
+            ComppReleaseManager(Mgr);
         }
         return STATUS_DATA_ERROR;
     }
 
     if ((ULONG)Result != Header->OriginalSize) {
-        if (g_CompressionManager != NULL) {
-            InterlockedIncrement64((LONG64*)&g_CompressionManager->Stats.Errors);
+        PCOMP_MANAGER Mgr = ComppAcquireManager();
+        if (Mgr != NULL) {
+            InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.Errors);
+            ComppReleaseManager(Mgr);
         }
         return STATUS_DATA_ERROR;
     }
@@ -1766,18 +2209,24 @@ VerifyChecksum:
     if (Header->Flags & CompFlag_Checksum) {
         Checksum = ComppCalculateCrc32(Output, *DecompressedSize);
         if (Checksum != Header->Checksum) {
-            if (g_CompressionManager != NULL) {
-                InterlockedIncrement64((LONG64*)&g_CompressionManager->Stats.Errors);
+            PCOMP_MANAGER Mgr = ComppAcquireManager();
+            if (Mgr != NULL) {
+                InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.Errors);
+                ComppReleaseManager(Mgr);
             }
             return STATUS_CRC_ERROR;
         }
     }
 
     //
-    // Update statistics
+    // Update statistics using safe manager access
     //
-    if (g_CompressionManager != NULL && g_CompressionManager->Initialized) {
-        InterlockedIncrement64((LONG64*)&g_CompressionManager->Stats.TotalDecompressed);
+    {
+        PCOMP_MANAGER Mgr = ComppAcquireManager();
+        if (Mgr != NULL) {
+            InterlockedIncrement64((volatile LONG64*)&Mgr->Stats.TotalDecompressed);
+            ComppReleaseManager(Mgr);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -2601,7 +3050,43 @@ CompLoadDictionary(
 }
 
 /**
- * @brief Destroy a dictionary.
+ * @brief Internal dictionary destruction (does NOT decrement refcount).
+ *
+ * This is the actual cleanup function - must only be called when
+ * refcount has already reached zero.
+ */
+static VOID
+ComppDestroyDictionaryInternal(
+    _Inout_ PCOMP_DICTIONARY Dictionary
+    )
+{
+    PAGED_CODE();
+
+    if (Dictionary == NULL) {
+        return;
+    }
+
+    //
+    // Free resources
+    //
+    if (Dictionary->Data != NULL) {
+        ShadowStrikeFreePoolWithTag(Dictionary->Data, COMP_POOL_TAG_DICT);
+        Dictionary->Data = NULL;
+    }
+
+    if (Dictionary->LZ4DictState != NULL) {
+        ShadowStrikeFreePoolWithTag(Dictionary->LZ4DictState, COMP_POOL_TAG_DICT);
+        Dictionary->LZ4DictState = NULL;
+    }
+
+    ShadowStrikeFreePoolWithTag(Dictionary, COMP_POOL_TAG_DICT);
+}
+
+/**
+ * @brief Destroy a dictionary (public API - decrements refcount).
+ *
+ * FIXED: This function now properly decrements refcount and only
+ * destroys when it reaches zero. Does NOT double-decrement.
  */
 _Use_decl_annotations_
 VOID
@@ -2616,24 +3101,11 @@ CompDestroyDictionary(
     }
 
     //
-    // Check reference count
+    // Decrement refcount and destroy if zero
     //
-    if (InterlockedDecrement(&Dictionary->RefCount) > 0) {
-        return;
+    if (InterlockedDecrement(&Dictionary->RefCount) == 0) {
+        ComppDestroyDictionaryInternal(Dictionary);
     }
-
-    //
-    // Free resources
-    //
-    if (Dictionary->Data != NULL) {
-        ShadowStrikeFreePoolWithTag(Dictionary->Data, COMP_POOL_TAG_DICT);
-    }
-
-    if (Dictionary->LZ4DictState != NULL) {
-        ShadowStrikeFreePoolWithTag(Dictionary->LZ4DictState, COMP_POOL_TAG_DICT);
-    }
-
-    ShadowStrikeFreePoolWithTag(Dictionary, COMP_POOL_TAG_DICT);
 }
 
 /**
@@ -2652,6 +3124,9 @@ CompDictionaryAddRef(
 
 /**
  * @brief Release dictionary reference.
+ *
+ * FIXED: Now properly handles refcount and uses deferred cleanup
+ * when called at elevated IRQL to avoid BSOD.
  */
 _Use_decl_annotations_
 VOID
@@ -2659,15 +3134,41 @@ CompDictionaryRelease(
     PCOMP_DICTIONARY Dictionary
     )
 {
-    if (Dictionary != NULL) {
-        if (InterlockedDecrement(&Dictionary->RefCount) == 0) {
-            CompDestroyDictionary(Dictionary);
+    if (Dictionary == NULL) {
+        return;
+    }
+
+    //
+    // Decrement and check if we should destroy
+    //
+    if (InterlockedDecrement(&Dictionary->RefCount) == 0) {
+        //
+        // SECURITY: Check IRQL - must be at PASSIVE_LEVEL to destroy
+        // because internal destroy uses paged pool operations
+        //
+        if (KeGetCurrentIrql() <= APC_LEVEL) {
+            ComppDestroyDictionaryInternal(Dictionary);
+        } else {
+            //
+            // At elevated IRQL - queue work item for deferred cleanup
+            //
+            if (!ComppQueueDeferredDictionaryCleanup(Dictionary)) {
+                //
+                // Failed to queue - this is a serious issue
+                // Log error but don't crash; dictionary will leak
+                // This should never happen in properly configured systems
+                //
+                NT_ASSERT(FALSE && "CompDictionaryRelease: Failed to queue deferred cleanup");
+            }
         }
     }
 }
 
 /**
  * @brief Set context dictionary.
+ *
+ * FIXED: Now properly stores the dictionary reference (not just data pointer)
+ * and uses proper synchronization to prevent races.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -2676,24 +3177,46 @@ CompSetDictionary(
     PCOMP_DICTIONARY Dictionary
     )
 {
+    KIRQL OldIrql;
+    PCOMP_DICTIONARY OldDict;
+
     if (Context == NULL || Dictionary == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Release old dictionary if any
-    //
-    if (Context->Dictionary != NULL) {
-        CompDictionaryRelease((PCOMP_DICTIONARY)Context->Dictionary);
-    }
-
-    //
-    // Set new dictionary
+    // Add reference to new dictionary first (before releasing old)
     //
     CompDictionaryAddRef(Dictionary);
-    Context->Dictionary = Dictionary->Data;
+
+    //
+    // Acquire context lock for thread-safe dictionary swap
+    //
+    OldIrql = ExAcquireSpinLockExclusive(&Context->Lock);
+
+    //
+    // Save old dictionary reference for release after unlock
+    //
+    OldDict = Context->DictionaryRef;
+
+    //
+    // Set new dictionary - store the actual dictionary pointer,
+    // not just the data pointer (which caused type confusion)
+    //
+    Context->DictionaryRef = Dictionary;
+    Context->DictionaryData = Dictionary->Data;
     Context->DictionarySize = Dictionary->Size;
     Context->DictionaryId = Dictionary->DictionaryId;
+
+    ExReleaseSpinLockExclusive(&Context->Lock, OldIrql);
+
+    //
+    // Release old dictionary reference after releasing lock
+    // to avoid holding lock during potential deallocation
+    //
+    if (OldDict != NULL) {
+        CompDictionaryRelease(OldDict);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -2939,7 +3462,9 @@ CompVerifyEx(
 //=============================================================================
 
 /**
- * @brief Get compression statistics.
+ * @brief Get compression statistics with atomic reads.
+ *
+ * FIXED: Uses interlocked operations to prevent torn reads on 32-bit systems.
  */
 _Use_decl_annotations_
 NTSTATUS
@@ -2948,45 +3473,52 @@ CompGetStatistics(
     PCOMP_STATISTICS Stats
     )
 {
-    ULONG64 BytesIn;
-    ULONG64 BytesOut;
+    if (Manager == NULL || Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    if (Manager == NULL || Stats == NULL || !Manager->Initialized) {
+    if (InterlockedCompareExchange(&Manager->Initialized, TRUE, TRUE) != TRUE) {
         return STATUS_INVALID_PARAMETER;
     }
 
     RtlZeroMemory(Stats, sizeof(COMP_STATISTICS));
 
-    Stats->TotalCompressed = Manager->Stats.TotalCompressed;
-    Stats->TotalDecompressed = Manager->Stats.TotalDecompressed;
-    Stats->BytesSaved = Manager->Stats.BytesSaved;
-    Stats->Errors = Manager->Stats.Errors;
+    //
+    // Use interlocked reads for 64-bit values to prevent torn reads
+    //
+    Stats->TotalCompressed = InterlockedCompareExchange64(
+        (volatile LONG64*)&Manager->Stats.TotalCompressed, 0, 0);
+    Stats->TotalDecompressed = InterlockedCompareExchange64(
+        (volatile LONG64*)&Manager->Stats.TotalDecompressed, 0, 0);
+    Stats->BytesSaved = InterlockedCompareExchange64(
+        (volatile LONG64*)&Manager->Stats.BytesSaved, 0, 0);
+    Stats->Errors = InterlockedCompareExchange64(
+        (volatile LONG64*)&Manager->Stats.Errors, 0, 0);
 
     //
-    // Calculate bytes in/out from context statistics
+    // Read context statistics atomically
     //
-    BytesIn = Manager->DefaultContext.TotalBytesIn;
-    BytesOut = Manager->DefaultContext.TotalBytesOut;
+    Stats->BytesIn = InterlockedCompareExchange64(
+        (volatile LONG64*)&Manager->DefaultContext.TotalBytesIn, 0, 0);
+    Stats->BytesOut = InterlockedCompareExchange64(
+        (volatile LONG64*)&Manager->DefaultContext.TotalBytesOut, 0, 0);
 
-    Stats->BytesIn = BytesIn;
-    Stats->BytesOut = BytesOut;
-
     //
-    // Calculate average ratio
+    // Calculate average ratio safely
     //
-    if (BytesIn > 0) {
-        Stats->AverageRatio = (ULONG)((BytesOut * 100) / BytesIn);
+    if (Stats->BytesIn > 0) {
+        Stats->AverageRatio = (ULONG)((Stats->BytesOut * 100) / Stats->BytesIn);
     } else {
         Stats->AverageRatio = 100;
     }
 
-    Stats->PeakRatio = 0;  // Would need tracking per operation
+    Stats->PeakRatio = 0;  // Would need per-operation tracking
 
     return STATUS_SUCCESS;
 }
 
 /**
- * @brief Reset compression statistics.
+ * @brief Reset compression statistics with atomic writes.
  */
 _Use_decl_annotations_
 VOID
@@ -2994,16 +3526,20 @@ CompResetStatistics(
     PCOMP_MANAGER Manager
     )
 {
-    if (Manager == NULL || !Manager->Initialized) {
+    if (Manager == NULL) {
         return;
     }
 
-    InterlockedExchange64((LONG64*)&Manager->Stats.TotalCompressed, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.TotalDecompressed, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.BytesSaved, 0);
-    InterlockedExchange64((LONG64*)&Manager->Stats.Errors, 0);
+    if (InterlockedCompareExchange(&Manager->Initialized, TRUE, TRUE) != TRUE) {
+        return;
+    }
 
-    InterlockedExchange64((LONG64*)&Manager->DefaultContext.TotalBytesIn, 0);
-    InterlockedExchange64((LONG64*)&Manager->DefaultContext.TotalBytesOut, 0);
-    InterlockedExchange64((LONG64*)&Manager->DefaultContext.TotalOperations, 0);
+    InterlockedExchange64((volatile LONG64*)&Manager->Stats.TotalCompressed, 0);
+    InterlockedExchange64((volatile LONG64*)&Manager->Stats.TotalDecompressed, 0);
+    InterlockedExchange64((volatile LONG64*)&Manager->Stats.BytesSaved, 0);
+    InterlockedExchange64((volatile LONG64*)&Manager->Stats.Errors, 0);
+
+    InterlockedExchange64((volatile LONG64*)&Manager->DefaultContext.TotalBytesIn, 0);
+    InterlockedExchange64((volatile LONG64*)&Manager->DefaultContext.TotalBytesOut, 0);
+    InterlockedExchange64((volatile LONG64*)&Manager->DefaultContext.TotalOperations, 0);
 }

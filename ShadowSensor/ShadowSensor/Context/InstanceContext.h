@@ -53,6 +53,51 @@ extern "C" {
  */
 #define SHADOW_INSTANCE_STRING_TAG 'sSSi'
 
+/**
+ * @brief Context signature for corruption detection: 'SSiC' = ShadowStrike Instance Context
+ *
+ * This magic value is validated in all public functions to detect memory corruption
+ * or invalid context pointers before dereferencing fields.
+ */
+#define SHADOW_INSTANCE_CONTEXT_SIGNATURE 'CiSS'
+
+// ============================================================================
+// LOGGING MACROS
+// ============================================================================
+
+/**
+ * @brief Centralized logging macros for consistent debug output.
+ *
+ * These macros wrap DbgPrintEx and can be fully disabled in production builds.
+ * Log levels follow standard kernel conventions:
+ * - ERROR: Critical failures that may cause functional problems
+ * - WARNING: Non-fatal issues that may indicate problems
+ * - INFO: Informational messages for normal operation
+ * - TRACE: Verbose debugging output
+ */
+#if DBG
+    #define SHADOW_LOG_ERROR(fmt, ...) \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+                   "[ShadowStrike:InstanceCtx] ERROR: " fmt "\n", ##__VA_ARGS__)
+
+    #define SHADOW_LOG_WARNING(fmt, ...) \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, \
+                   "[ShadowStrike:InstanceCtx] WARN: " fmt "\n", ##__VA_ARGS__)
+
+    #define SHADOW_LOG_INFO(fmt, ...) \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, \
+                   "[ShadowStrike:InstanceCtx] INFO: " fmt "\n", ##__VA_ARGS__)
+
+    #define SHADOW_LOG_TRACE(fmt, ...) \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL, \
+                   "[ShadowStrike:InstanceCtx] TRACE: " fmt "\n", ##__VA_ARGS__)
+#else
+    #define SHADOW_LOG_ERROR(fmt, ...)   ((void)0)
+    #define SHADOW_LOG_WARNING(fmt, ...) ((void)0)
+    #define SHADOW_LOG_INFO(fmt, ...)    ((void)0)
+    #define SHADOW_LOG_TRACE(fmt, ...)   ((void)0)
+#endif
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -130,8 +175,12 @@ typedef struct _SHADOW_FS_CAPABILITIES {
 typedef struct _SHADOW_INSTANCE_CONTEXT {
 
     //
-    // Synchronization
+    // Validation & Synchronization
     //
+
+    /// @brief Magic signature for corruption detection (SHADOW_INSTANCE_CONTEXT_SIGNATURE)
+    /// MUST be the first field for safe validation before accessing other fields.
+    ULONG Signature;
 
     /// @brief Synchronization lock for thread-safe access
     ERESOURCE Resource;

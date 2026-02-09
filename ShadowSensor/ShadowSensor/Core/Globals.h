@@ -287,8 +287,12 @@ typedef struct _SHADOWSTRIKE_DRIVER_DATA {
     /// @brief Driver unload event (signaled when safe to unload)
     KEVENT UnloadEvent;
 
-    /// @brief Outstanding operation count
-    volatile LONG OutstandingOperations;
+    /// @brief Rundown protection for safe callback unload synchronization
+    /// This REPLACES the old OutstandingOperations counter with proper kernel primitive
+    EX_RUNDOWN_REF RundownProtection;
+
+    /// @brief Legacy counter for statistics only (NOT for synchronization)
+    volatile LONG64 TotalOperationsProcessed;
 
     // =========================================================================
     // Configuration
@@ -370,23 +374,28 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 // HELPER MACROS
 // ============================================================================
 
-/// @brief Check if driver is ready to process requests
+/// @brief Check if driver is ready to process requests (uses volatile read with acquire semantics)
 #define SHADOWSTRIKE_IS_READY() \
-    (g_DriverData.Initialized && \
-     g_DriverData.FilteringStarted && \
-     !g_DriverData.ShuttingDown)
+    (ReadBooleanAcquire(&g_DriverData.Initialized) && \
+     ReadBooleanAcquire(&g_DriverData.FilteringStarted) && \
+     !ReadBooleanAcquire(&g_DriverData.ShuttingDown))
 
 /// @brief Check if user-mode is connected
 #define SHADOWSTRIKE_USER_MODE_CONNECTED() \
     (g_DriverData.ConnectedClients > 0)
 
-/// @brief Increment outstanding operation count
-#define SHADOWSTRIKE_ENTER_OPERATION() \
-    InterlockedIncrement(&g_DriverData.OutstandingOperations)
+/// @brief Acquire rundown protection before entering callback operation
+/// Returns TRUE if acquired (safe to proceed), FALSE if driver is unloading
+#define SHADOWSTRIKE_ACQUIRE_RUNDOWN() \
+    ExAcquireRundownProtection(&g_DriverData.RundownProtection)
 
-/// @brief Decrement outstanding operation count
-#define SHADOWSTRIKE_LEAVE_OPERATION() \
-    InterlockedDecrement(&g_DriverData.OutstandingOperations)
+/// @brief Release rundown protection after callback operation completes
+#define SHADOWSTRIKE_RELEASE_RUNDOWN() \
+    ExReleaseRundownProtection(&g_DriverData.RundownProtection)
+
+/// @brief Increment total operations counter (for statistics only)
+#define SHADOWSTRIKE_COUNT_OPERATION() \
+    InterlockedIncrement64(&g_DriverData.TotalOperationsProcessed)
 
 /// @brief Generate next message ID
 #define SHADOWSTRIKE_NEXT_MESSAGE_ID() \
@@ -399,6 +408,40 @@ extern SHADOWSTRIKE_DRIVER_DATA g_DriverData;
 /// @brief Add to statistic counter
 #define SHADOWSTRIKE_ADD_STAT(field, value) \
     InterlockedAdd64(&g_DriverData.Stats.field, (LONG64)(value))
+
+// ============================================================================
+// VOLATILE BOOLEAN ACCESS HELPERS
+// ============================================================================
+
+/**
+ * @brief Read a boolean with acquire semantics.
+ * Ensures proper memory ordering for checking shutdown/init flags.
+ */
+FORCEINLINE
+BOOLEAN
+ReadBooleanAcquire(
+    _In_ volatile BOOLEAN* Value
+    )
+{
+    BOOLEAN result = *Value;
+    MemoryBarrier();
+    return result;
+}
+
+/**
+ * @brief Write a boolean with release semantics.
+ * Ensures proper memory ordering when setting shutdown/init flags.
+ */
+FORCEINLINE
+VOID
+WriteBooleanRelease(
+    _Out_ volatile BOOLEAN* Target,
+    _In_ BOOLEAN Value
+    )
+{
+    MemoryBarrier();
+    *Target = Value;
+}
 
 // ============================================================================
 // DEFAULT CONFIGURATION

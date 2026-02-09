@@ -18,16 +18,19 @@
  * - Memory-efficient buffer pooling
  * - Safe message serialization
  *
- * Security Hardened v2.0.0:
+ * Security Hardened v2.1.0:
  * - All message buffers are validated before use
  * - Integer overflow protection on all size calculations
  * - Safe string handling with length limits
  * - Exception handling for user-mode data access
  * - Proper cleanup on all error paths
  * - Reference counting for thread safety
+ * - Proper buffer tracking for correct deallocation
+ * - Fixed initialization race conditions
+ * - Proper rundown protection
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0 (Enterprise Edition - Security Hardened)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -73,6 +76,16 @@
  * @brief Half-open test interval (ms)
  */
 #define SB_CIRCUIT_HALF_OPEN_TEST_MS    5000
+
+/**
+ * @brief Number of verdict names in the static array
+ */
+#define SB_VERDICT_NAME_COUNT           6
+
+/**
+ * @brief Number of access type names in the static array
+ */
+#define SB_ACCESS_TYPE_NAME_COUNT       8
 
 // ============================================================================
 // PRIVATE STRUCTURES
@@ -156,9 +169,9 @@ typedef struct _SB_CONTEXT {
     SB_STATISTICS Stats;
 
     //
-    // Reference counting for shutdown
+    // Rundown protection for shutdown
     //
-    volatile LONG ReferenceCount;
+    EX_RUNDOWN_REF RundownProtection;
     volatile LONG ActiveOperations;
     KEVENT ShutdownEvent;
 
@@ -208,11 +221,6 @@ SbpTransitionCircuitState(
     _In_ SB_CIRCUIT_STATE NewState
 );
 
-static ULONG
-SbpHashMessageId(
-    _In_ UINT64 MessageId
-);
-
 static PSB_PENDING_REQUEST
 SbpAllocatePendingRequest(
     VOID
@@ -220,21 +228,6 @@ SbpAllocatePendingRequest(
 
 static VOID
 SbpFreePendingRequest(
-    _In_ PSB_PENDING_REQUEST Request
-);
-
-static VOID
-SbpInsertPendingRequest(
-    _In_ PSB_PENDING_REQUEST Request
-);
-
-static PSB_PENDING_REQUEST
-SbpFindPendingRequest(
-    _In_ UINT64 MessageId
-);
-
-static VOID
-SbpRemovePendingRequest(
     _In_ PSB_PENDING_REQUEST Request
 );
 
@@ -253,24 +246,23 @@ SbpUpdateLatencyStats(
     _In_ LARGE_INTEGER StartTime
 );
 
-static VOID
-SbpAcquireReference(
-    VOID
-);
-
-static VOID
-SbpReleaseReference(
-    VOID
-);
-
+_Must_inspect_result_
 static BOOLEAN
-SbpAcquireOperationReference(
+SbpAcquireRundownProtection(
     VOID
 );
 
 static VOID
-SbpReleaseOperationReference(
+SbpReleaseRundownProtection(
     VOID
+);
+
+_Must_inspect_result_
+static NTSTATUS
+SbpSafeAddUlong(
+    _In_ ULONG Value1,
+    _In_ ULONG Value2,
+    _Out_ PULONG Result
 );
 
 // ============================================================================
@@ -296,7 +288,7 @@ SbpReleaseOperationReference(
 // STATIC STRING TABLES
 // ============================================================================
 
-static PCWSTR g_VerdictNames[] = {
+static PCWSTR g_VerdictNames[SB_VERDICT_NAME_COUNT] = {
     L"Unknown",
     L"Clean",
     L"Malicious",
@@ -305,7 +297,7 @@ static PCWSTR g_VerdictNames[] = {
     L"Timeout"
 };
 
-static PCWSTR g_AccessTypeNames[] = {
+static PCWSTR g_AccessTypeNames[SB_ACCESS_TYPE_NAME_COUNT] = {
     L"None",
     L"Read",
     L"Write",
@@ -315,6 +307,26 @@ static PCWSTR g_AccessTypeNames[] = {
     L"Delete",
     L"SetInfo"
 };
+
+// ============================================================================
+// SAFE INTEGER ARITHMETIC
+// ============================================================================
+
+_Must_inspect_result_
+static NTSTATUS
+SbpSafeAddUlong(
+    _In_ ULONG Value1,
+    _In_ ULONG Value2,
+    _Out_ PULONG Result
+)
+{
+    if (Value1 > MAXULONG - Value2) {
+        *Result = 0;
+        return SHADOWSTRIKE_ERROR_INTEGER_OVERFLOW;
+    }
+    *Result = Value1 + Value2;
+    return STATUS_SUCCESS;
+}
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP
@@ -332,16 +344,18 @@ ShadowStrikeScanBridgeInitialize(
     PAGED_CODE();
 
     //
-    // Check if already initialized
+    // Atomically check and set initialization flag to prevent races
     //
-    if (g_ScanBridge.Initialized) {
+    if (InterlockedCompareExchange(&g_ScanBridge.Initialized, 1, 0) != 0) {
         return STATUS_ALREADY_REGISTERED;
     }
 
     //
-    // Zero-initialize context
+    // Zero-initialize context (except Initialized which is already set)
     //
+    LONG savedInit = g_ScanBridge.Initialized;
     RtlZeroMemory(&g_ScanBridge, sizeof(SB_CONTEXT));
+    g_ScanBridge.Initialized = savedInit;
 
     //
     // Set magic value
@@ -355,6 +369,11 @@ ShadowStrikeScanBridgeInitialize(
     ExInitializePushLock(&g_ScanBridge.CircuitBreaker.Lock);
 
     //
+    // Initialize rundown protection
+    //
+    ExInitializeRundownProtection(&g_ScanBridge.RundownProtection);
+
+    //
     // Initialize pending request tracking
     //
     for (i = 0; i < SB_REQUEST_HASH_BUCKETS; i++) {
@@ -365,13 +384,14 @@ ShadowStrikeScanBridgeInitialize(
 
     //
     // Initialize lookaside lists for message buffers
+    // Note: Actual allocation size includes header for tracking
     //
     ExInitializeNPagedLookasideList(
         &g_ScanBridge.StandardBufferLookaside,
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        SB_STANDARD_BUFFER_SIZE,
+        sizeof(SB_BUFFER_HEADER) + SB_STANDARD_BUFFER_SIZE,
         SB_MESSAGE_TAG,
         SB_LOOKASIDE_DEPTH
     );
@@ -381,7 +401,7 @@ ShadowStrikeScanBridgeInitialize(
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        SHADOWSTRIKE_MAX_MESSAGE_SIZE,
+        sizeof(SB_BUFFER_HEADER) + SB_LARGE_BUFFER_SIZE,
         SB_MESSAGE_TAG,
         32  // Smaller depth for large buffers
     );
@@ -412,16 +432,7 @@ ShadowStrikeScanBridgeInitialize(
     // Initialize statistics
     //
     KeQuerySystemTime(&g_ScanBridge.Stats.StartTime);
-
-    //
-    // Set initial reference count
-    //
-    g_ScanBridge.ReferenceCount = 1;
-
-    //
-    // Mark as initialized
-    //
-    InterlockedExchange(&g_ScanBridge.Initialized, 1);
+    g_ScanBridge.Stats.MinLatencyMs = MAXLONG64;
 
     return STATUS_SUCCESS;
 }
@@ -435,6 +446,7 @@ ShadowStrikeScanBridgeShutdown(
     LARGE_INTEGER timeout;
     NTSTATUS waitStatus;
     KIRQL oldIrql;
+    LIST_ENTRY localList;
     PLIST_ENTRY entry;
     PSB_PENDING_REQUEST request;
     ULONG i;
@@ -451,43 +463,41 @@ ShadowStrikeScanBridgeShutdown(
     InterlockedExchange(&g_ScanBridge.ShuttingDown, 1);
 
     //
-    // Cancel all pending requests
+    // Wait for rundown protection - this blocks until all acquired refs are released
     //
+    ExWaitForRundownProtectionRelease(&g_ScanBridge.RundownProtection);
+
+    //
+    // Collect all pending requests to a local list to minimize spinlock hold time
+    //
+    InitializeListHead(&localList);
+
     KeAcquireSpinLock(&g_ScanBridge.Requests.Lock, &oldIrql);
 
     for (i = 0; i < SB_REQUEST_HASH_BUCKETS; i++) {
         while (!IsListEmpty(&g_ScanBridge.Requests.HashBuckets[i])) {
             entry = RemoveHeadList(&g_ScanBridge.Requests.HashBuckets[i]);
-            request = CONTAINING_RECORD(entry, SB_PENDING_REQUEST, ListEntry);
-
-            InterlockedExchange(&request->Cancelled, 1);
-            request->Status = STATUS_CANCELLED;
-            KeSetEvent(&request->CompletionEvent, IO_NO_INCREMENT, FALSE);
+            InsertTailList(&localList, entry);
         }
     }
 
     KeReleaseSpinLock(&g_ScanBridge.Requests.Lock, oldIrql);
 
     //
-    // Wait for active operations to complete
+    // Now signal and free all pending requests without holding the lock
     //
-    timeout.QuadPart = -((LONGLONG)SB_SHUTDOWN_DRAIN_TIMEOUT_MS * 10000);
+    while (!IsListEmpty(&localList)) {
+        entry = RemoveHeadList(&localList);
+        request = CONTAINING_RECORD(entry, SB_PENDING_REQUEST, ListEntry);
 
-    while (g_ScanBridge.ActiveOperations > 0) {
-        waitStatus = KeWaitForSingleObject(
-            &g_ScanBridge.ShutdownEvent,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-        );
+        InterlockedExchange(&request->Cancelled, 1);
+        request->Status = STATUS_CANCELLED;
+        KeSetEvent(&request->CompletionEvent, IO_NO_INCREMENT, FALSE);
 
-        if (waitStatus == STATUS_TIMEOUT) {
-            //
-            // Log warning but continue - don't hang unload
-            //
-            break;
-        }
+        //
+        // Free the request structure
+        //
+        SbpFreePendingRequest(request);
     }
 
     //
@@ -552,7 +562,8 @@ ShadowStrikeBuildFileScanRequestEx(
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     UNICODE_STRING processName = { 0 };
     HANDLE processId;
-    ULONG totalSize;
+    ULONG totalSize = 0;
+    ULONG tempSize = 0;
     ULONG filePathLen = 0;
     ULONG processNameLen = 0;
     PUCHAR dataPtr;
@@ -584,9 +595,9 @@ ShadowStrikeBuildFileScanRequestEx(
     }
 
     //
-    // Acquire operation reference
+    // Acquire rundown protection
     //
-    if (!SbpAcquireOperationReference()) {
+    if (!SbpAcquireRundownProtection()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -610,7 +621,7 @@ ShadowStrikeBuildFileScanRequestEx(
         );
 
         if (!NT_SUCCESS(status)) {
-            SbpReleaseOperationReference();
+            SbpReleaseRundownProtection();
             return status;
         }
     }
@@ -618,7 +629,7 @@ ShadowStrikeBuildFileScanRequestEx(
     status = FltParseFileNameInformation(nameInfo);
     if (!NT_SUCCESS(status)) {
         FltReleaseFileNameInformation(nameInfo);
-        SbpReleaseOperationReference();
+        SbpReleaseRundownProtection();
         return status;
     }
 
@@ -649,10 +660,30 @@ ShadowStrikeBuildFileScanRequestEx(
     //
     // Calculate total message size with overflow protection
     //
-    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                sizeof(FILE_SCAN_REQUEST) +
-                filePathLen + sizeof(WCHAR) +
-                processNameLen + sizeof(WCHAR);
+    status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(FILE_SCAN_REQUEST), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+
+    status = SbpSafeAddUlong(totalSize, filePathLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);  // Null terminator
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+
+    status = SbpSafeAddUlong(totalSize, processNameLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);  // Null terminator
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
         //
@@ -661,10 +692,14 @@ ShadowStrikeBuildFileScanRequestEx(
         ULONG excess = totalSize - SHADOWSTRIKE_MAX_MESSAGE_SIZE;
         if (excess < filePathLen) {
             filePathLen -= excess;
+            totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
         } else {
-            filePathLen = 0;
+            //
+            // Cannot fit even minimal message
+            //
+            status = SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE;
+            goto Cleanup;
         }
-        totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
     }
 
     //
@@ -679,21 +714,25 @@ ShadowStrikeBuildFileScanRequestEx(
     //
     // Initialize message header
     //
-    ShadowStrikeInitMessageHeader(
+    status = ShadowStrikeInitMessageHeader(
         header,
-        ShadowStrikeMessageFileScan,
+        ShadowStrikeMessageFileScanOnOpen,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
     );
+
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
 
     //
     // Set flags from options if provided
     //
     if (Options != NULL) {
         if (Options->Flags & SbScanFlagHighPriority) {
-            header->Flags |= 0x0001;  // High priority flag
+            header->Flags |= SB_MSG_FLAG_HIGH_PRIORITY;
         }
         if (Options->Flags & SbScanFlagBypassCache) {
-            header->Flags |= 0x0002;  // Bypass cache flag
+            header->Flags |= SB_MSG_FLAG_BYPASS_CACHE;
         }
     }
 
@@ -705,7 +744,7 @@ ShadowStrikeBuildFileScanRequestEx(
     scanRequest->ProcessId = HandleToULong(processId);
     scanRequest->ThreadId = HandleToULong(PsGetCurrentThreadId());
     scanRequest->AccessType = (UINT8)AccessType;
-    scanRequest->FilePathLength = (UINT16)filePathLen;
+    scanRequest->PathLength = (UINT16)filePathLen;
     scanRequest->ProcessNameLength = (UINT16)processNameLen;
 
     //
@@ -713,7 +752,7 @@ ShadowStrikeBuildFileScanRequestEx(
     //
     if (FltObjects->FileObject != NULL) {
         FILE_STANDARD_INFORMATION fileInfo;
-        status = FltQueryInformationFile(
+        NTSTATUS queryStatus = FltQueryInformationFile(
             FltObjects->Instance,
             FltObjects->FileObject,
             &fileInfo,
@@ -722,7 +761,7 @@ ShadowStrikeBuildFileScanRequestEx(
             NULL
         );
 
-        if (NT_SUCCESS(status)) {
+        if (NT_SUCCESS(queryStatus)) {
             scanRequest->FileSize = fileInfo.EndOfFile.QuadPart;
             scanRequest->IsDirectory = fileInfo.Directory;
         }
@@ -737,7 +776,8 @@ ShadowStrikeBuildFileScanRequestEx(
         __try {
             RtlCopyMemory(dataPtr, nameInfo->Name.Buffer, filePathLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            scanRequest->FilePathLength = 0;
+            scanRequest->PathLength = 0;
+            filePathLen = 0;
         }
         dataPtr += filePathLen;
     }
@@ -756,6 +796,7 @@ ShadowStrikeBuildFileScanRequestEx(
             RtlCopyMemory(dataPtr, processName.Buffer, processNameLen);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             scanRequest->ProcessNameLength = 0;
+            processNameLen = 0;
         }
         dataPtr += processNameLen;
     }
@@ -790,7 +831,7 @@ Cleanup:
         ShadowStrikeFreeMessageBuffer(header);
     }
 
-    SbpReleaseOperationReference();
+    SbpReleaseRundownProtection();
 
     return status;
 }
@@ -842,13 +883,10 @@ ShadowStrikeSendScanRequest(
         // Copy result to reply
         //
         Reply->Verdict = result.Verdict;
-        Reply->Flags = 0;
-        if (result.ThreatDetected) {
-            Reply->Flags |= 0x0001;
-        }
-        if (result.FromCache) {
-            Reply->Flags |= 0x0002;
-        }
+        Reply->ResultCode = result.Status;
+        Reply->ThreatDetected = result.ThreatDetected;
+        Reply->ThreatScore = (UINT8)result.ThreatScore;
+        Reply->CacheResult = result.FromCache;
         *ReplySize = sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY);
     }
 
@@ -872,7 +910,6 @@ ShadowStrikeSendScanRequestEx(
     LARGE_INTEGER endTime;
     ULONG timeoutMs;
     ULONG maxRetries;
-    SB_MESSAGE_PRIORITY priority;
 
     PAGED_CODE();
 
@@ -895,16 +932,16 @@ ShadowStrikeSendScanRequestEx(
     //
     if (!ShadowStrikeScanBridgeIsReady()) {
         Result->Status = SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
-        Result->Verdict = ShadowStrikeVerdictError;
+        Result->Verdict = Verdict_Error;
         return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
     }
 
     //
-    // Acquire operation reference
+    // Acquire rundown protection
     //
-    if (!SbpAcquireOperationReference()) {
+    if (!SbpAcquireRundownProtection()) {
         Result->Status = STATUS_DEVICE_NOT_READY;
-        Result->Verdict = ShadowStrikeVerdictError;
+        Result->Verdict = Verdict_Error;
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -913,9 +950,9 @@ ShadowStrikeSendScanRequestEx(
     //
     if (!SbpCheckCircuitBreaker(&g_ScanBridge.CircuitBreaker)) {
         InterlockedIncrement64(&g_ScanBridge.Stats.FailedScans);
-        SbpReleaseOperationReference();
+        SbpReleaseRundownProtection();
         Result->Status = SHADOWSTRIKE_ERROR_CIRCUIT_OPEN;
-        Result->Verdict = ShadowStrikeVerdictError;
+        Result->Verdict = Verdict_Error;
         return SHADOWSTRIKE_ERROR_CIRCUIT_OPEN;
     }
 
@@ -925,12 +962,10 @@ ShadowStrikeSendScanRequestEx(
     if (Options != NULL) {
         timeoutMs = Options->TimeoutMs > 0 ? Options->TimeoutMs : SB_DEFAULT_SCAN_TIMEOUT_MS;
         maxRetries = Options->MaxRetries > 0 ? Options->MaxRetries : SB_MAX_RETRY_COUNT;
-        priority = Options->Priority;
         Result->UserContext = Options->UserContext;
     } else {
         timeoutMs = SB_DEFAULT_SCAN_TIMEOUT_MS;
         maxRetries = SB_MAX_RETRY_COUNT;
-        priority = SbPriorityNormal;
     }
 
     //
@@ -980,9 +1015,10 @@ ShadowStrikeSendScanRequestEx(
         //
         Result->Status = STATUS_SUCCESS;
         Result->Verdict = (SHADOWSTRIKE_SCAN_VERDICT)reply.Verdict;
-        Result->ThreatDetected = (reply.Verdict == ShadowStrikeVerdictMalicious ||
-                                  reply.Verdict == ShadowStrikeVerdictSuspicious);
-        Result->FromCache = (reply.Flags & 0x0002) != 0;
+        Result->ThreatDetected = (reply.Verdict == Verdict_Malicious ||
+                                  reply.Verdict == Verdict_Suspicious);
+        Result->FromCache = reply.CacheResult != 0;
+        Result->ThreatScore = reply.ThreatScore;
 
         //
         // Record success with circuit breaker
@@ -995,7 +1031,7 @@ ShadowStrikeSendScanRequestEx(
         // Timeout
         //
         Result->Status = SHADOWSTRIKE_ERROR_SCAN_TIMEOUT;
-        Result->Verdict = ShadowStrikeVerdictTimeout;
+        Result->Verdict = Verdict_Timeout;
 
         //
         // Record failure with circuit breaker
@@ -1009,7 +1045,7 @@ ShadowStrikeSendScanRequestEx(
         // Other error
         //
         Result->Status = status;
-        Result->Verdict = ShadowStrikeVerdictError;
+        Result->Verdict = Verdict_Error;
 
         //
         // Record failure with circuit breaker
@@ -1018,7 +1054,7 @@ ShadowStrikeSendScanRequestEx(
         InterlockedIncrement64(&g_ScanBridge.Stats.FailedScans);
     }
 
-    SbpReleaseOperationReference();
+    SbpReleaseRundownProtection();
 
     return status;
 }
@@ -1033,7 +1069,7 @@ ShadowStrikeSendProcessNotification(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ParentId,
     _In_ BOOLEAN Create,
-    _In_ PUNICODE_STRING ImageName,
+    _In_opt_ PUNICODE_STRING ImageName,
     _In_opt_ PUNICODE_STRING CommandLine
 )
 {
@@ -1041,15 +1077,15 @@ ShadowStrikeSendProcessNotification(
     PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
     PSHADOWSTRIKE_PROCESS_NOTIFICATION notification = NULL;
     ULONG totalSize = 0;
-    ULONG imageNameLen = ImageName ? ImageName->Length : 0;
-    ULONG cmdLineLen = CommandLine ? CommandLine->Length : 0;
+    ULONG imageNameLen = (ImageName != NULL && ImageName->Buffer != NULL) ? ImageName->Length : 0;
+    ULONG cmdLineLen = (CommandLine != NULL && CommandLine->Buffer != NULL) ? CommandLine->Length : 0;
 
     PAGED_CODE();
 
     //
     // Check if notifications are enabled
     //
-    if (!g_DriverData.Config.NotificationsEnabled) {
+    if (!g_DriverData.Initialized || !g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
     }
 
@@ -1063,10 +1099,30 @@ ShadowStrikeSendProcessNotification(
     //
     // Calculate total message size with overflow protection
     //
-    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) +
-                imageNameLen + sizeof(WCHAR) +
-                cmdLineLen + sizeof(WCHAR);
+    status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, imageNameLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, cmdLineLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
         totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
@@ -1083,11 +1139,16 @@ ShadowStrikeSendProcessNotification(
     //
     // Initialize header
     //
-    ShadowStrikeInitMessageHeader(
+    status = ShadowStrikeInitMessageHeader(
         header,
         ShadowStrikeMessageProcessNotify,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
     );
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreeMessageBuffer(header);
+        return status;
+    }
 
     //
     // Fill notification payload
@@ -1107,14 +1168,23 @@ ShadowStrikeSendProcessNotification(
     PUCHAR stringPtr = (PUCHAR)(notification + 1);
     ULONG remaining = totalSize - (ULONG)((PUCHAR)stringPtr - (PUCHAR)header);
 
-    if (ImageName && imageNameLen > 0 && remaining >= imageNameLen) {
-        RtlCopyMemory(stringPtr, ImageName->Buffer, imageNameLen);
+    if (ImageName != NULL && ImageName->Buffer != NULL && imageNameLen > 0 && remaining >= imageNameLen) {
+        __try {
+            RtlCopyMemory(stringPtr, ImageName->Buffer, imageNameLen);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            notification->ImagePathLength = 0;
+            imageNameLen = 0;
+        }
         stringPtr += imageNameLen;
         remaining -= imageNameLen;
     }
 
-    if (CommandLine && cmdLineLen > 0 && remaining >= cmdLineLen) {
-        RtlCopyMemory(stringPtr, CommandLine->Buffer, cmdLineLen);
+    if (CommandLine != NULL && CommandLine->Buffer != NULL && cmdLineLen > 0 && remaining >= cmdLineLen) {
+        __try {
+            RtlCopyMemory(stringPtr, CommandLine->Buffer, cmdLineLen);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            notification->CommandLineLength = 0;
+        }
     }
 
     //
@@ -1163,7 +1233,7 @@ ShadowStrikeSendThreadNotification(
     //
     // Check if notifications are enabled
     //
-    if (!g_DriverData.Config.NotificationsEnabled) {
+    if (!g_DriverData.Initialized || !g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
     }
 
@@ -1185,11 +1255,16 @@ ShadowStrikeSendThreadNotification(
     //
     // Initialize header
     //
-    ShadowStrikeInitMessageHeader(
+    status = ShadowStrikeInitMessageHeader(
         header,
         ShadowStrikeMessageThreadNotify,
         sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)
     );
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreeMessageBuffer(header);
+        return status;
+    }
 
     //
     // Fill notification payload
@@ -1228,24 +1303,29 @@ _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 ShadowStrikeSendImageNotification(
     _In_ HANDLE ProcessId,
-    _In_ PUNICODE_STRING FullImageName,
+    _In_opt_ PUNICODE_STRING FullImageName,
     _In_ PIMAGE_INFO ImageInfo
 )
 {
     NTSTATUS status;
     PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
     PSHADOWSTRIKE_IMAGE_NOTIFICATION notification = NULL;
-    ULONG imageNameLen = FullImageName ? FullImageName->Length : 0;
-    ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                      sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION) +
-                      imageNameLen + sizeof(WCHAR);
+    ULONG imageNameLen = 0;
+    ULONG totalSize = 0;
 
     PAGED_CODE();
 
     //
+    // Validate ImageInfo - this is required
+    //
+    if (ImageInfo == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
     // Check if notifications are enabled
     //
-    if (!g_DriverData.Config.NotificationsEnabled) {
+    if (!g_DriverData.Initialized || !g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
     }
 
@@ -1254,6 +1334,31 @@ ShadowStrikeSendImageNotification(
     //
     if (!ShadowStrikeIsUserModeConnected()) {
         return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    //
+    // Get image name length
+    //
+    if (FullImageName != NULL && FullImageName->Buffer != NULL) {
+        imageNameLen = FullImageName->Length;
+    }
+
+    //
+    // Calculate size with overflow protection
+    //
+    status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(SHADOWSTRIKE_IMAGE_NOTIFICATION), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, imageNameLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
@@ -1271,11 +1376,16 @@ ShadowStrikeSendImageNotification(
     //
     // Initialize header
     //
-    ShadowStrikeInitMessageHeader(
+    status = ShadowStrikeInitMessageHeader(
         header,
         ShadowStrikeMessageImageLoad,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
     );
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreeMessageBuffer(header);
+        return status;
+    }
 
     //
     // Fill notification payload
@@ -1304,8 +1414,12 @@ ShadowStrikeSendImageNotification(
     // Copy image name
     //
     PUCHAR stringPtr = (PUCHAR)(notification + 1);
-    if (FullImageName && imageNameLen > 0) {
-        RtlCopyMemory(stringPtr, FullImageName->Buffer, imageNameLen);
+    if (FullImageName != NULL && FullImageName->Buffer != NULL && imageNameLen > 0) {
+        __try {
+            RtlCopyMemory(stringPtr, FullImageName->Buffer, imageNameLen);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            notification->ImageNameLength = 0;
+        }
     }
 
     //
@@ -1337,7 +1451,7 @@ ShadowStrikeSendRegistryNotification(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId,
     _In_ UINT8 Operation,
-    _In_ PUNICODE_STRING KeyPath,
+    _In_opt_ PUNICODE_STRING KeyPath,
     _In_opt_ PUNICODE_STRING ValueName,
     _In_opt_ PVOID Data,
     _In_ ULONG DataSize,
@@ -1347,15 +1461,16 @@ ShadowStrikeSendRegistryNotification(
     NTSTATUS status;
     PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
     PSHADOWSTRIKE_REGISTRY_NOTIFICATION notification = NULL;
-    ULONG keyPathLen = KeyPath ? KeyPath->Length : 0;
-    ULONG valueNameLen = ValueName ? ValueName->Length : 0;
+    ULONG keyPathLen = (KeyPath != NULL && KeyPath->Buffer != NULL) ? KeyPath->Length : 0;
+    ULONG valueNameLen = (ValueName != NULL && ValueName->Buffer != NULL) ? ValueName->Length : 0;
+    ULONG totalSize = 0;
 
     PAGED_CODE();
 
     //
     // Check if notifications are enabled
     //
-    if (!g_DriverData.Config.NotificationsEnabled) {
+    if (!g_DriverData.Initialized || !g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
     }
 
@@ -1369,16 +1484,43 @@ ShadowStrikeSendRegistryNotification(
     //
     // Limit captured data size to prevent huge messages
     //
-    ULONG safeDataSize = (Data && DataSize > 0) ? DataSize : 0;
-    if (safeDataSize > MAX_REGISTRY_DATA_SIZE) {
-        safeDataSize = MAX_REGISTRY_DATA_SIZE;
+    ULONG safeDataSize = (Data != NULL && DataSize > 0) ? DataSize : 0;
+    if (safeDataSize > SB_MAX_REGISTRY_DATA_SIZE) {
+        safeDataSize = SB_MAX_REGISTRY_DATA_SIZE;
     }
 
-    ULONG totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                      sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION) +
-                      keyPathLen + sizeof(WCHAR) +
-                      valueNameLen + sizeof(WCHAR) +
-                      safeDataSize;
+    //
+    // Calculate size with overflow protection
+    //
+    status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, keyPathLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, valueNameLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SbpSafeAddUlong(totalSize, safeDataSize, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
         totalSize = SHADOWSTRIKE_MAX_MESSAGE_SIZE;
@@ -1395,11 +1537,16 @@ ShadowStrikeSendRegistryNotification(
     //
     // Initialize header
     //
-    ShadowStrikeInitMessageHeader(
+    status = ShadowStrikeInitMessageHeader(
         header,
         ShadowStrikeMessageRegistryNotify,
         totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
     );
+
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreeMessageBuffer(header);
+        return status;
+    }
 
     //
     // Fill notification payload
@@ -1420,21 +1567,31 @@ ShadowStrikeSendRegistryNotification(
     ULONG remaining = totalSize - (ULONG)((PUCHAR)stringPtr - (PUCHAR)header);
 
     // Copy key path
-    if (KeyPath && keyPathLen > 0 && remaining >= keyPathLen) {
-        RtlCopyMemory(stringPtr, KeyPath->Buffer, keyPathLen);
+    if (KeyPath != NULL && KeyPath->Buffer != NULL && keyPathLen > 0 && remaining >= keyPathLen) {
+        __try {
+            RtlCopyMemory(stringPtr, KeyPath->Buffer, keyPathLen);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            notification->KeyPathLength = 0;
+            keyPathLen = 0;
+        }
         stringPtr += keyPathLen;
         remaining -= keyPathLen;
     }
 
     // Copy value name
-    if (ValueName && valueNameLen > 0 && remaining >= valueNameLen) {
-        RtlCopyMemory(stringPtr, ValueName->Buffer, valueNameLen);
+    if (ValueName != NULL && ValueName->Buffer != NULL && valueNameLen > 0 && remaining >= valueNameLen) {
+        __try {
+            RtlCopyMemory(stringPtr, ValueName->Buffer, valueNameLen);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            notification->ValueNameLength = 0;
+            valueNameLen = 0;
+        }
         stringPtr += valueNameLen;
         remaining -= valueNameLen;
     }
 
-    // Copy data (with exception handling for potentially invalid user pointers)
-    if (Data && safeDataSize > 0 && remaining >= safeDataSize) {
+    // Copy data (with exception handling for potentially invalid pointers)
+    if (Data != NULL && safeDataSize > 0 && remaining >= safeDataSize) {
         __try {
             RtlCopyMemory(stringPtr, Data, safeDataSize);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1522,8 +1679,6 @@ ShadowStrikeSendMessageEx(
 {
     NTSTATUS status;
     PFLT_PORT clientPort;
-    LARGE_INTEGER timeout;
-    ULONG actualReplySize = 0;
 
     PAGED_CODE();
 
@@ -1580,7 +1735,10 @@ ShadowStrikeAllocateMessageBuffer(
     _In_ ULONG Size
 )
 {
-    PVOID buffer = NULL;
+    PSB_BUFFER_HEADER bufferHeader = NULL;
+    PVOID userBuffer = NULL;
+    ULONG totalSize;
+    ULONG source;
 
     //
     // Validate size
@@ -1590,60 +1748,96 @@ ShadowStrikeAllocateMessageBuffer(
     }
 
     //
+    // Calculate total size including header (with overflow check)
+    //
+    if (Size > MAXULONG - sizeof(SB_BUFFER_HEADER)) {
+        return NULL;
+    }
+    totalSize = sizeof(SB_BUFFER_HEADER) + Size;
+
+    //
     // Check if initialized
     //
     if (!g_ScanBridge.LookasideInitialized) {
         //
         // Fallback to direct pool allocation
         //
-        buffer = ShadowStrikeAllocatePoolWithTag(
+        bufferHeader = (PSB_BUFFER_HEADER)ShadowStrikeAllocatePoolWithTag(
             NonPagedPoolNx,
-            Size,
+            totalSize,
             SB_MESSAGE_TAG
         );
-        goto Done;
-    }
-
-    //
-    // Choose appropriate lookaside based on size
-    //
-    if (Size <= SB_STANDARD_BUFFER_SIZE) {
-        buffer = ExAllocateFromNPagedLookasideList(&g_ScanBridge.StandardBufferLookaside);
+        source = SB_BUFFER_SOURCE_POOL;
     } else {
-        buffer = ExAllocateFromNPagedLookasideList(&g_ScanBridge.LargeBufferLookaside);
-    }
-
-    //
-    // Fallback to pool if lookaside is exhausted
-    //
-    if (buffer == NULL) {
-        buffer = ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            Size,
-            SB_MESSAGE_TAG
-        );
-    }
-
-Done:
-    if (buffer != NULL) {
-        RtlZeroMemory(buffer, Size);
-        InterlockedIncrement64(&g_ScanBridge.Stats.BuffersAllocated);
-        InterlockedIncrement(&g_ScanBridge.Stats.CurrentBuffersInUse);
+        //
+        // Choose appropriate lookaside based on size
+        //
+        if (Size <= SB_STANDARD_BUFFER_SIZE) {
+            bufferHeader = (PSB_BUFFER_HEADER)ExAllocateFromNPagedLookasideList(
+                &g_ScanBridge.StandardBufferLookaside
+            );
+            source = SB_BUFFER_SOURCE_STANDARD_LOOKASIDE;
+            totalSize = sizeof(SB_BUFFER_HEADER) + SB_STANDARD_BUFFER_SIZE;
+        } else {
+            bufferHeader = (PSB_BUFFER_HEADER)ExAllocateFromNPagedLookasideList(
+                &g_ScanBridge.LargeBufferLookaside
+            );
+            source = SB_BUFFER_SOURCE_LARGE_LOOKASIDE;
+            totalSize = sizeof(SB_BUFFER_HEADER) + SB_LARGE_BUFFER_SIZE;
+        }
 
         //
-        // Update peak
+        // Fallback to pool if lookaside is exhausted
         //
-        LONG current = g_ScanBridge.Stats.CurrentBuffersInUse;
-        LONG peak = g_ScanBridge.Stats.PeakBuffersInUse;
-        while (current > peak) {
-            if (InterlockedCompareExchange(&g_ScanBridge.Stats.PeakBuffersInUse, current, peak) == peak) {
-                break;
-            }
-            peak = g_ScanBridge.Stats.PeakBuffersInUse;
+        if (bufferHeader == NULL) {
+            totalSize = sizeof(SB_BUFFER_HEADER) + Size;
+            bufferHeader = (PSB_BUFFER_HEADER)ShadowStrikeAllocatePoolWithTag(
+                NonPagedPoolNx,
+                totalSize,
+                SB_MESSAGE_TAG
+            );
+            source = SB_BUFFER_SOURCE_POOL;
         }
     }
 
-    return buffer;
+    if (bufferHeader == NULL) {
+        return NULL;
+    }
+
+    //
+    // Zero the buffer
+    //
+    RtlZeroMemory(bufferHeader, totalSize);
+
+    //
+    // Initialize header for tracking
+    //
+    bufferHeader->Magic = SB_BUFFER_HEADER_MAGIC;
+    bufferHeader->Source = source;
+    bufferHeader->RequestedSize = Size;
+    bufferHeader->AllocatedSize = totalSize - sizeof(SB_BUFFER_HEADER);
+
+    //
+    // Update statistics
+    //
+    InterlockedIncrement64(&g_ScanBridge.Stats.BuffersAllocated);
+    LONG current = InterlockedIncrement(&g_ScanBridge.Stats.CurrentBuffersInUse);
+
+    //
+    // Update peak (lock-free)
+    //
+    LONG peak = g_ScanBridge.Stats.PeakBuffersInUse;
+    while (current > peak) {
+        if (InterlockedCompareExchange(&g_ScanBridge.Stats.PeakBuffersInUse, current, peak) == peak) {
+            break;
+        }
+        peak = g_ScanBridge.Stats.PeakBuffersInUse;
+    }
+
+    //
+    // Return pointer past header
+    //
+    return (PVOID)(bufferHeader + 1);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1652,9 +1846,32 @@ ShadowStrikeFreeMessageBuffer(
     _In_opt_ PVOID Buffer
 )
 {
+    PSB_BUFFER_HEADER bufferHeader;
+
     if (Buffer == NULL) {
         return;
     }
+
+    //
+    // Get header from buffer pointer
+    //
+    bufferHeader = ((PSB_BUFFER_HEADER)Buffer) - 1;
+
+    //
+    // Validate header
+    //
+    if (bufferHeader->Magic != SB_BUFFER_HEADER_MAGIC) {
+        //
+        // Invalid buffer - possible corruption or double-free
+        // Log error but don't crash
+        //
+        return;
+    }
+
+    //
+    // Clear magic to detect double-free
+    //
+    bufferHeader->Magic = 0;
 
     //
     // Update statistics
@@ -1663,11 +1880,29 @@ ShadowStrikeFreeMessageBuffer(
     InterlockedDecrement(&g_ScanBridge.Stats.CurrentBuffersInUse);
 
     //
-    // Note: We can't easily determine which lookaside the buffer came from
-    // without tracking it. For simplicity, use pool free with tag.
-    // In production, you might want to add a header with metadata.
+    // Free to appropriate source
     //
-    ShadowStrikeFreePoolWithTag(Buffer, SB_MESSAGE_TAG);
+    if (!g_ScanBridge.LookasideInitialized) {
+        //
+        // Lookaside not available, must be pool
+        //
+        ShadowStrikeFreePoolWithTag(bufferHeader, SB_MESSAGE_TAG);
+    } else {
+        switch (bufferHeader->Source) {
+            case SB_BUFFER_SOURCE_STANDARD_LOOKASIDE:
+                ExFreeToNPagedLookasideList(&g_ScanBridge.StandardBufferLookaside, bufferHeader);
+                break;
+
+            case SB_BUFFER_SOURCE_LARGE_LOOKASIDE:
+                ExFreeToNPagedLookasideList(&g_ScanBridge.LargeBufferLookaside, bufferHeader);
+                break;
+
+            case SB_BUFFER_SOURCE_POOL:
+            default:
+                ShadowStrikeFreePoolWithTag(bufferHeader, SB_MESSAGE_TAG);
+                break;
+        }
+    }
 }
 
 // ============================================================================
@@ -1675,7 +1910,7 @@ ShadowStrikeFreeMessageBuffer(
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
+NTSTATUS
 ShadowStrikeInitMessageHeader(
     _Out_ PSHADOWSTRIKE_MESSAGE_HEADER Header,
     _In_ SHADOWSTRIKE_MESSAGE_TYPE MessageType,
@@ -1685,20 +1920,23 @@ ShadowStrikeInitMessageHeader(
     LARGE_INTEGER timestamp;
 
     if (Header == NULL) {
-        return;
+        return STATUS_INVALID_PARAMETER;
     }
 
     RtlZeroMemory(Header, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
 
-    Header->Magic = SHADOWSTRIKE_PROTOCOL_MAGIC;
+    Header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
     Header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-    Header->MessageType = MessageType;
+    Header->MessageType = (UINT16)MessageType;
     Header->MessageId = ShadowStrikeGenerateMessageId();
     Header->DataSize = DataSize;
+    Header->TotalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + DataSize;
     Header->Flags = 0;
 
     KeQuerySystemTime(&timestamp);
     Header->Timestamp = timestamp.QuadPart;
+
+    return STATUS_SUCCESS;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1745,19 +1983,21 @@ ShadowStrikeGetCircuitState(
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID
+NTSTATUS
 ShadowStrikeGetScanBridgeStatistics(
     _Out_ PSB_STATISTICS Stats
 )
 {
     if (Stats == NULL) {
-        return;
+        return STATUS_INVALID_PARAMETER;
     }
 
     //
     // Copy statistics snapshot
     //
     RtlCopyMemory(Stats, &g_ScanBridge.Stats, sizeof(SB_STATISTICS));
+
+    return STATUS_SUCCESS;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1781,7 +2021,6 @@ ShadowStrikeResetScanBridgeStatistics(
     InterlockedExchange64(&g_ScanBridge.Stats.TotalLatencyMs, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.MinLatencyMs, MAXLONG64);
     InterlockedExchange64(&g_ScanBridge.Stats.MaxLatencyMs, 0);
-    InterlockedExchange64(&g_ScanBridge.Stats.AverageLatencyMs, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.ConnectionErrors, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.MessageErrors, 0);
     InterlockedExchange64(&g_ScanBridge.Stats.RetryCount, 0);
@@ -1801,7 +2040,7 @@ ShadowStrikeGetVerdictName(
     _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict
 )
 {
-    if (Verdict > ShadowStrikeVerdictTimeout) {
+    if ((ULONG)Verdict >= SB_VERDICT_NAME_COUNT) {
         return L"Unknown";
     }
 
@@ -1813,7 +2052,7 @@ ShadowStrikeGetAccessTypeName(
     _In_ SHADOWSTRIKE_ACCESS_TYPE AccessType
 )
 {
-    if (AccessType >= ShadowStrikeAccessMax) {
+    if ((ULONG)AccessType >= SB_ACCESS_TYPE_NAME_COUNT) {
         return L"Unknown";
     }
 
@@ -1844,7 +2083,11 @@ SbpCheckCircuitBreaker(
     LARGE_INTEGER currentTime;
     LONG64 timeSinceOpen;
 
-    state = (SB_CIRCUIT_STATE)CircuitBreaker->State;
+    state = (SB_CIRCUIT_STATE)InterlockedCompareExchange(
+        &CircuitBreaker->State,
+        CircuitBreaker->State,
+        CircuitBreaker->State
+    );
 
     if (state == SbCircuitClosed) {
         return TRUE;
@@ -1948,19 +2191,6 @@ SbpTransitionCircuitState(
 // ============================================================================
 // PRIVATE IMPLEMENTATION - REQUEST TRACKING
 // ============================================================================
-
-static ULONG
-SbpHashMessageId(
-    _In_ UINT64 MessageId
-)
-{
-    //
-    // Simple hash for message ID
-    //
-    ULONG hash = (ULONG)(MessageId ^ (MessageId >> 32));
-    hash = hash ^ (hash >> 16);
-    return hash % SB_REQUEST_HASH_BUCKETS;
-}
 
 static PSB_PENDING_REQUEST
 SbpAllocatePendingRequest(
@@ -2083,11 +2313,11 @@ SbpSendWithRetry(
                 KeDelayExecutionThread(KernelMode, FALSE, &delayInterval);
 
                 //
-                // Double delay for next attempt (capped)
+                // Double delay for next attempt (capped at SB_MAX_RETRY_DELAY_MS)
                 //
-                delayMs = (delayMs * 2);
-                if (delayMs > RT_MAX_DELAY_MS) {
-                    delayMs = RT_MAX_DELAY_MS;
+                delayMs = delayMs * 2;
+                if (delayMs > SB_MAX_RETRY_DELAY_MS) {
+                    delayMs = SB_MAX_RETRY_DELAY_MS;
                 }
 
                 //
@@ -2127,11 +2357,13 @@ SbpUpdateLatencyStats(
     LONG64 latencyMs;
     LONG64 currentMin;
     LONG64 currentMax;
-    LONG64 totalLatency;
-    LONG64 successfulScans;
 
     KeQuerySystemTime(&endTime);
     latencyMs = (endTime.QuadPart - StartTime.QuadPart) / 10000;
+
+    if (latencyMs < 0) {
+        latencyMs = 0;
+    }
 
     //
     // Update total
@@ -2143,7 +2375,7 @@ SbpUpdateLatencyStats(
     //
     do {
         currentMin = g_ScanBridge.Stats.MinLatencyMs;
-        if (latencyMs >= currentMin && currentMin != 0) {
+        if (latencyMs >= currentMin && currentMin != MAXLONG64) {
             break;
         }
     } while (InterlockedCompareExchange64(
@@ -2163,40 +2395,15 @@ SbpUpdateLatencyStats(
         &g_ScanBridge.Stats.MaxLatencyMs,
         latencyMs,
         currentMax) != currentMax);
-
-    //
-    // Calculate average
-    //
-    successfulScans = g_ScanBridge.Stats.SuccessfulScans;
-    totalLatency = g_ScanBridge.Stats.TotalLatencyMs;
-
-    if (successfulScans > 0) {
-        g_ScanBridge.Stats.AverageLatencyMs = totalLatency / successfulScans;
-    }
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - REFERENCE COUNTING
+// PRIVATE IMPLEMENTATION - RUNDOWN PROTECTION
 // ============================================================================
 
-static VOID
-SbpAcquireReference(
-    VOID
-)
-{
-    InterlockedIncrement(&g_ScanBridge.ReferenceCount);
-}
-
-static VOID
-SbpReleaseReference(
-    VOID
-)
-{
-    InterlockedDecrement(&g_ScanBridge.ReferenceCount);
-}
-
+_Must_inspect_result_
 static BOOLEAN
-SbpAcquireOperationReference(
+SbpAcquireRundownProtection(
     VOID
 )
 {
@@ -2204,35 +2411,13 @@ SbpAcquireOperationReference(
         return FALSE;
     }
 
-    InterlockedIncrement(&g_ScanBridge.ActiveOperations);
-    SbpAcquireReference();
-
-    //
-    // Double-check after acquiring
-    //
-    if (g_ScanBridge.ShuttingDown) {
-        InterlockedDecrement(&g_ScanBridge.ActiveOperations);
-        SbpReleaseReference();
-        return FALSE;
-    }
-
-    return TRUE;
+    return ExAcquireRundownProtection(&g_ScanBridge.RundownProtection);
 }
 
 static VOID
-SbpReleaseOperationReference(
+SbpReleaseRundownProtection(
     VOID
 )
 {
-    LONG remaining;
-
-    remaining = InterlockedDecrement(&g_ScanBridge.ActiveOperations);
-    SbpReleaseReference();
-
-    //
-    // Signal shutdown event if draining
-    //
-    if (remaining == 0 && g_ScanBridge.ShuttingDown) {
-        KeSetEvent(&g_ScanBridge.ShutdownEvent, IO_NO_INCREMENT, FALSE);
-    }
+    ExReleaseRundownProtection(&g_ScanBridge.RundownProtection);
 }

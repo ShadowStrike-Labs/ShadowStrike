@@ -12,17 +12,23 @@
  * cleanup to prevent BSOD and memory leaks.
  *
  * Thread Safety Model:
- * - All fields protected by ERESOURCE lock (acquired via Shadow*Lock functions)
- * - Atomic counters (WriteCount) use InterlockedIncrement for lock-free updates
+ * --------------------
+ * - Context lifecycle protected by KSPIN_LOCK (LifetimeLock) for atomicity
+ * - Field access protected by ERESOURCE (Resource) for reader/writer semantics
+ * - Atomic counters (WriteCount, AllocationCount) use Interlocked* for lock-free updates
+ * - Two-phase locking: LifetimeLock (brief) then Resource (extended hold)
  * - ERESOURCE must be acquired at PASSIVE_LEVEL only
+ * - LifetimeLock acquired at DISPATCH_LEVEL (spin lock)
  *
  * Memory Model:
+ * -------------
  * - Context structure managed by Filter Manager (FltAllocateContext/FltReleaseContext)
  * - FileName.Buffer separately allocated from PagedPool, freed in cleanup callback
  * - ERESOURCE must be deleted in cleanup callback before Filter Manager frees context
+ * - Global memory quota enforced to prevent DoS attacks
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0
+ * @version 3.0.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -63,15 +69,103 @@ typedef enum _SHADOWSTRIKE_SCAN_VERDICT SHADOWSTRIKE_SCAN_VERDICT;
 
 /**
  * @brief Maximum file name length we will cache (in bytes, including null terminator).
- *        Defensive limit to prevent excessive allocations from corrupted data.
- *        MAX_PATH * sizeof(WCHAR) * 2 = 520 * 2 = 1040, rounded up.
+ *        Reduced from 32KB to 2KB for DoS protection while still supporting long paths.
+ *        Windows MAX_PATH is 260, but extended paths can reach ~32K. 2KB handles 99%+ of cases.
  */
-#define SHADOW_MAX_FILENAME_LENGTH  (32768)
+#define SHADOW_MAX_FILENAME_LENGTH  (2048)
 
 /**
  * @brief SHA-256 hash size in bytes.
  */
 #define SHADOW_SHA256_HASH_SIZE     (32)
+
+/**
+ * @brief Maximum total memory for stream context string allocations (DoS protection).
+ *        16MB global quota prevents resource exhaustion attacks.
+ */
+#define SHADOW_MAX_CONTEXT_MEMORY   (16 * 1024 * 1024)
+
+/**
+ * @brief Context state flags for lifecycle management.
+ */
+#define SHADOW_CONTEXT_STATE_UNINITIALIZED  0x00000000
+#define SHADOW_CONTEXT_STATE_INITIALIZING   0x00000001
+#define SHADOW_CONTEXT_STATE_ACTIVE         0x00000002
+#define SHADOW_CONTEXT_STATE_TEARDOWN       0x00000003
+
+// ============================================================================
+// COMPILE-TIME CONFIGURATION
+// ============================================================================
+
+/**
+ * @brief Enable verbose debug logging (DISABLE IN PRODUCTION).
+ *        When disabled, file paths are not logged to prevent information disclosure.
+ */
+#ifndef SHADOW_DEBUG_VERBOSE_LOGGING
+#define SHADOW_DEBUG_VERBOSE_LOGGING 0
+#endif
+
+// ============================================================================
+// TELEMETRY STRUCTURE
+// ============================================================================
+
+/**
+ * @brief Global telemetry counters for stream context operations.
+ *        Used for production debugging and performance monitoring.
+ */
+typedef struct _SHADOW_STREAM_CONTEXT_TELEMETRY {
+
+    /**
+     * @brief Total contexts allocated since driver load.
+     */
+    volatile LONG64 TotalAllocations;
+
+    /**
+     * @brief Total contexts freed since driver load.
+     */
+    volatile LONG64 TotalFrees;
+
+    /**
+     * @brief Current active context count.
+     */
+    volatile LONG ActiveContexts;
+
+    /**
+     * @brief Total bytes allocated for file name strings.
+     */
+    volatile LONG64 TotalStringBytes;
+
+    /**
+     * @brief Current bytes allocated for file name strings.
+     */
+    volatile LONG64 CurrentStringBytes;
+
+    /**
+     * @brief Allocation failures due to memory quota.
+     */
+    volatile LONG QuotaExceededCount;
+
+    /**
+     * @brief Resource initialization failures.
+     */
+    volatile LONG ResourceInitFailures;
+
+    /**
+     * @brief Lock acquisition failures (context in teardown).
+     */
+    volatile LONG LockAcquisitionFailures;
+
+    /**
+     * @brief Race conditions detected (context already existed).
+     */
+    volatile LONG RaceConditionsDetected;
+
+} SHADOW_STREAM_CONTEXT_TELEMETRY, *PSHADOW_STREAM_CONTEXT_TELEMETRY;
+
+/**
+ * @brief Global telemetry instance (defined in StreamContext.c).
+ */
+extern SHADOW_STREAM_CONTEXT_TELEMETRY g_StreamContextTelemetry;
 
 // ============================================================================
 // STREAM CONTEXT STRUCTURE
@@ -86,12 +180,13 @@ typedef enum _SHADOWSTRIKE_SCAN_VERDICT SHADOWSTRIKE_SCAN_VERDICT;
  *
  * SYNCHRONIZATION RULES (CRITICAL):
  * ---------------------------------
- * 1. ALL field access MUST be protected by the Resource lock
- * 2. Use ShadowAcquireStreamContextShared() for read-only access
- * 3. Use ShadowAcquireStreamContextExclusive() for modifications
+ * 1. LifetimeLock protects State transitions (brief spin lock hold)
+ * 2. Resource protects ALL field access (reader/writer lock)
+ * 3. Acquisition order: LifetimeLock -> verify State -> Resource
  * 4. WriteCount uses InterlockedIncrement for lock-free atomic updates
  * 5. Resource lock MUST be acquired at IRQL == PASSIVE_LEVEL only
- * 6. NEVER mix atomic and non-atomic access to the same field
+ * 6. LifetimeLock raises to DISPATCH_LEVEL (very brief hold)
+ * 7. NEVER access fields without verifying State == ACTIVE first
  *
  * MEMORY MANAGEMENT:
  * ------------------
@@ -104,15 +199,42 @@ typedef enum _SHADOWSTRIKE_SCAN_VERDICT SHADOWSTRIKE_SCAN_VERDICT;
  * ---------------------
  * 1. FltAllocateContext (Filter Manager allocates structure)
  * 2. RtlZeroMemory (zero all fields)
- * 3. ExInitializeResourceLite (initialize lock)
- * 4. Set ResourceInitialized = TRUE
- * 5. FltSetStreamContext (attach to file)
- * 6. ShadowInitializeStreamContextFileInfo (populate file info)
+ * 3. KeInitializeSpinLock (initialize lifetime lock)
+ * 4. State = INITIALIZING
+ * 5. ExInitializeResourceLite (initialize ERESOURCE)
+ * 6. Initialize file info (FileName, FileId, VolumeSerial)
+ * 7. State = ACTIVE (under LifetimeLock)
+ * 8. FltSetStreamContext (attach to file)
  */
 typedef struct _SHADOW_STREAM_CONTEXT {
 
     // =========================================================================
-    // Synchronization (MUST BE FIRST for alignment)
+    // Lifecycle Management (MUST BE FIRST for cache line alignment)
+    // =========================================================================
+
+    /**
+     * @brief Spin lock protecting State transitions.
+     *
+     * CRITICAL: This lock is held very briefly only during State checks/transitions.
+     * It ensures atomicity between checking State and acquiring Resource.
+     */
+    KSPIN_LOCK LifetimeLock;
+
+    /**
+     * @brief Current state of the context lifecycle.
+     *
+     * Values: UNINITIALIZED, INITIALIZING, ACTIVE, TEARDOWN
+     * Transitions are protected by LifetimeLock.
+     */
+    volatile LONG State;
+
+    /**
+     * @brief Reserved padding for alignment to 8-byte boundary.
+     */
+    ULONG Reserved0;
+
+    // =========================================================================
+    // Synchronization
     // =========================================================================
 
     /**
@@ -121,23 +243,9 @@ typedef struct _SHADOW_STREAM_CONTEXT {
      * CRITICAL: Must be initialized with ExInitializeResourceLite before use.
      * CRITICAL: Must be deleted with ExDeleteResourceLite in cleanup callback.
      * CRITICAL: Can only be acquired at IRQL == PASSIVE_LEVEL.
+     * CRITICAL: Only acquire when State == ACTIVE (verified under LifetimeLock).
      */
     ERESOURCE Resource;
-
-    /**
-     * @brief TRUE if Resource was successfully initialized.
-     *
-     * CRITICAL: Must check this before ANY Resource operation to prevent
-     * BSOD from operating on uninitialized ERESOURCE. Set to TRUE only
-     * after ExInitializeResourceLite succeeds. Set to FALSE in cleanup
-     * after ExDeleteResourceLite.
-     */
-    BOOLEAN ResourceInitialized;
-
-    /**
-     * @brief Reserved padding for alignment.
-     */
-    BOOLEAN Reserved1[7];
 
     // =========================================================================
     // File Identity
@@ -229,7 +337,8 @@ typedef struct _SHADOW_STREAM_CONTEXT {
      * @brief Number of write operations since context creation.
      *
      * Updated atomically with InterlockedIncrement for lock-free counting.
-     * This is the ONLY field that uses atomic operations.
+     * This is the ONLY field that uses atomic operations outside the lock.
+     * MUST be read/written only via Interlocked* functions.
      */
     volatile LONG WriteCount;
 
@@ -240,6 +349,8 @@ typedef struct _SHADOW_STREAM_CONTEXT {
 
     /**
      * @brief File size at last scan (for change detection).
+     *
+     * Captured when scan completes. Used with IsModified for robust change detection.
      */
     LARGE_INTEGER ScanFileSize;
 
@@ -263,46 +374,58 @@ typedef struct _SHADOW_STREAM_CONTEXT {
 /**
  * @brief Acquire stream context lock for shared (read-only) access.
  *
+ * Uses two-phase locking:
+ * 1. Acquire LifetimeLock (spin lock, brief)
+ * 2. Verify State == ACTIVE
+ * 3. Acquire Resource shared
+ * 4. Release LifetimeLock
+ *
  * CRITICAL: Must be called at IRQL == PASSIVE_LEVEL.
  * CRITICAL: Must call ShadowReleaseStreamContext() to release.
  *
- * @param Context  The context to lock (must not be NULL, must be initialized)
+ * @param Context  The context to lock (NULL returns FALSE)
  *
  * @return TRUE if lock acquired successfully
- *         FALSE if context is NULL or not initialized (caller should abort)
+ *         FALSE if context is NULL, not initialized, or in teardown
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 ShadowAcquireStreamContextShared(
-    _In_ PSHADOW_STREAM_CONTEXT Context
+    _In_opt_ PSHADOW_STREAM_CONTEXT Context
     );
 
 /**
  * @brief Acquire stream context lock for exclusive (read-write) access.
  *
+ * Uses two-phase locking:
+ * 1. Acquire LifetimeLock (spin lock, brief)
+ * 2. Verify State == ACTIVE
+ * 3. Acquire Resource exclusive
+ * 4. Release LifetimeLock
+ *
  * CRITICAL: Must be called at IRQL == PASSIVE_LEVEL.
  * CRITICAL: Must call ShadowReleaseStreamContext() to release.
  *
- * @param Context  The context to lock (must not be NULL, must be initialized)
+ * @param Context  The context to lock (NULL returns FALSE)
  *
  * @return TRUE if lock acquired successfully
- *         FALSE if context is NULL or not initialized (caller should abort)
+ *         FALSE if context is NULL, not initialized, or in teardown
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 BOOLEAN
 ShadowAcquireStreamContextExclusive(
-    _In_ PSHADOW_STREAM_CONTEXT Context
+    _In_opt_ PSHADOW_STREAM_CONTEXT Context
     );
 
 /**
  * @brief Release stream context lock (shared or exclusive).
  *
- * CRITICAL: Must be called after ShadowAcquireStreamContext*().
+ * CRITICAL: Must be called after successful ShadowAcquireStreamContext*().
  * CRITICAL: Must be called at IRQL == PASSIVE_LEVEL.
  *
- * @param Context  The context to unlock
+ * @param Context  The context to unlock (must not be NULL if lock was acquired)
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
@@ -325,12 +448,15 @@ ShadowReleaseStreamContext(
  * Algorithm:
  * 1. Try FltGetStreamContext - return if exists
  * 2. Allocate new context via FltAllocateContext
- * 3. Initialize ERESOURCE lock
- * 4. FltSetStreamContext with FLT_SET_CONTEXT_KEEP_IF_EXISTS
- * 5. If race occurred (STATUS_FLT_CONTEXT_ALREADY_DEFINED):
+ * 3. Initialize LifetimeLock, State = INITIALIZING
+ * 4. Initialize ERESOURCE lock
+ * 5. Initialize file info (FileName, FileId, VolumeSerial) BEFORE attachment
+ * 6. State = ACTIVE
+ * 7. FltSetStreamContext with FLT_SET_CONTEXT_KEEP_IF_EXISTS
+ * 8. If race occurred (STATUS_FLT_CONTEXT_ALREADY_DEFINED):
  *    - Release our unused context
  *    - Return the winner's context
- * 6. Otherwise initialize file info and return our new context
+ * 9. Otherwise return our new context
  *
  * @param Instance    Filter instance (must not be NULL)
  * @param FileObject  File object (must not be NULL)
@@ -338,7 +464,7 @@ ShadowReleaseStreamContext(
  *
  * @return STATUS_SUCCESS on success
  *         STATUS_INVALID_PARAMETER if parameters are NULL
- *         STATUS_INSUFFICIENT_RESOURCES if allocation fails
+ *         STATUS_INSUFFICIENT_RESOURCES if allocation fails or quota exceeded
  *         Other NTSTATUS codes from Filter Manager
  *
  * @note CRITICAL: Caller MUST call FltReleaseContext when done with the context.
@@ -385,8 +511,11 @@ ShadowGetStreamContext(
  * This is the ONLY place to free resources allocated within the context.
  *
  * Cleanup actions:
- * 1. Delete ERESOURCE (if initialized)
- * 2. Free FileName.Buffer (if allocated)
+ * 1. Transition State to TEARDOWN (prevents new lock acquisitions)
+ * 2. Wait for any active lock holders to release (spin with backoff)
+ * 3. Delete ERESOURCE
+ * 4. Free FileName.Buffer
+ * 5. Update telemetry
  *
  * CRITICAL: Do NOT call ExFreePool on the context pointer - Filter Manager
  * owns and frees the context structure itself.
@@ -394,6 +523,7 @@ ShadowGetStreamContext(
  * @param Context      The context being freed (may be NULL - handle gracefully)
  * @param ContextType  Type of context (FLT_STREAM_CONTEXT)
  */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowCleanupStreamContext(
     _In_ PFLT_CONTEXT Context,
@@ -411,10 +541,12 @@ ShadowCleanupStreamContext(
  * next access. Thread-safe - acquires exclusive lock internally.
  *
  * Actions:
- * 1. Set IsModified = TRUE
- * 2. Set IsScanned = FALSE
- * 3. Set HashValid = FALSE
- * 4. Increment WriteCount (atomic)
+ * 1. Acquire exclusive lock
+ * 2. Set IsModified = TRUE
+ * 3. Set IsScanned = FALSE
+ * 4. Set HashValid = FALSE
+ * 5. Increment WriteCount (atomic, inside lock)
+ * 6. Release lock
  *
  * @param Context  The context to invalidate (NULL is handled gracefully)
  */
@@ -427,24 +559,29 @@ ShadowInvalidateStreamContext(
 /**
  * @brief Set the scan verdict for a stream context.
  *
- * Updates verdict, scan time, and clears modification flags.
+ * Updates verdict, scan time, file size, and clears modification flags.
  * Thread-safe - acquires exclusive lock internally.
  *
  * Actions:
- * 1. Set Verdict = provided verdict
- * 2. Set IsScanned = TRUE
- * 3. Set IsModified = FALSE
- * 4. Set ScanInProgress = FALSE
- * 5. Update ScanTime to current time
+ * 1. Acquire exclusive lock
+ * 2. Set Verdict = provided verdict
+ * 3. Set IsScanned = TRUE
+ * 4. Set IsModified = FALSE
+ * 5. Set ScanInProgress = FALSE
+ * 6. Update ScanTime to current time
+ * 7. Capture ScanFileSize
+ * 8. Release lock
  *
- * @param Context  The context to update (NULL is handled gracefully)
- * @param Verdict  The scan verdict to set
+ * @param Context   The context to update (NULL is handled gracefully)
+ * @param Verdict   The scan verdict to set
+ * @param FileSize  The current file size (captured for change detection)
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 ShadowSetStreamVerdict(
     _In_opt_ PSHADOW_STREAM_CONTEXT Context,
-    _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict
+    _In_ SHADOWSTRIKE_SCAN_VERDICT Verdict,
+    _In_ LONGLONG FileSize
     );
 
 /**
@@ -455,7 +592,7 @@ ShadowSetStreamVerdict(
  * @param Context  The context to update
  *
  * @return TRUE if scan was started (caller should proceed with scan)
- *         FALSE if scan was already in progress (caller should skip)
+ *         FALSE if scan was already in progress or context unavailable
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
@@ -471,12 +608,15 @@ ShadowMarkScanInProgress(
  * - Context is NULL (defensive - assume scan needed)
  * - File has never been scanned (IsScanned == FALSE)
  * - File was modified since last scan (IsModified == TRUE)
- * - Scan is already in progress (returns FALSE to prevent re-entry)
  * - Cached verdict has expired (based on CacheTTL)
+ *
+ * Returns FALSE if:
+ * - Scan is already in progress (prevents re-entry)
+ * - Context is in teardown
  *
  * Thread-safe - acquires shared lock internally.
  *
- * @param Context   The context to check (NULL handled gracefully)
+ * @param Context   The context to check (NULL returns TRUE)
  * @param CacheTTL  Cache time-to-live in seconds (0 = no expiry check)
  *
  * @return TRUE if rescan is needed, FALSE otherwise
@@ -486,32 +626,6 @@ BOOLEAN
 ShadowShouldRescan(
     _In_opt_ PSHADOW_STREAM_CONTEXT Context,
     _In_ ULONG CacheTTL
-    );
-
-/**
- * @brief Initialize file name and ID in context.
- *
- * Queries and caches file name (normalized path) and NTFS FileID for
- * efficient lookups. Should be called after context creation and attachment.
- *
- * Thread-safe - acquires exclusive lock internally.
- *
- * @param Context      The context to initialize (must not be NULL)
- * @param Instance     Filter instance for queries (must not be NULL)
- * @param FileObject   File object for queries (must not be NULL)
- *
- * @return STATUS_SUCCESS on success (partial success still returns SUCCESS)
- *         STATUS_INVALID_PARAMETER if any parameter is NULL
- *
- * @note This function continues even if individual queries fail.
- *       Check FileName.Buffer and FileId.QuadPart to verify what was populated.
- */
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowInitializeStreamContextFileInfo(
-    _In_ PSHADOW_STREAM_CONTEXT Context,
-    _In_ PFLT_INSTANCE Instance,
-    _In_ PFILE_OBJECT FileObject
     );
 
 /**
@@ -527,6 +641,18 @@ VOID
 ShadowSetStreamContextHash(
     _In_opt_ PSHADOW_STREAM_CONTEXT Context,
     _In_reads_(SHADOW_SHA256_HASH_SIZE) const UCHAR* Hash
+    );
+
+/**
+ * @brief Get current telemetry snapshot.
+ *
+ * Returns a copy of current telemetry counters. Thread-safe.
+ *
+ * @param Telemetry  [out] Receives telemetry data
+ */
+VOID
+ShadowGetStreamContextTelemetry(
+    _Out_ PSHADOW_STREAM_CONTEXT_TELEMETRY Telemetry
     );
 
 #ifdef __cplusplus

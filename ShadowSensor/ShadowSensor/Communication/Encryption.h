@@ -1,21 +1,22 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: Encryption.h
-    
+
     Purpose: AES-GCM encryption for sensitive telemetry data and
              secure kernel-to-user communication channels.
-             
+
     Architecture:
     - AES-256-GCM authenticated encryption
     - Key derivation using HKDF
     - Nonce management with counter mode
     - Secure key storage with obfuscation
-    
+
     Security Notes:
     - Keys never stored in pageable memory
     - Nonces never reused (monotonic counter)
     - Sensitive data cleared after use
-    
+    - All BCrypt operations require PASSIVE_LEVEL
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -27,6 +28,7 @@ extern "C" {
 
 #include <ntddk.h>
 #include <bcrypt.h>
+#include <ntstrsafe.h>
 
 //=============================================================================
 // Pool Tags
@@ -36,6 +38,8 @@ extern "C" {
 #define ENC_POOL_TAG_CONTEXT    'CXNE'  // Encryption - Context
 #define ENC_POOL_TAG_BUFFER     'FBNE'  // Encryption - Buffer
 #define ENC_POOL_TAG_NONCE      'NNNE'  // Encryption - Nonce
+#define ENC_POOL_TAG_OBFUSK     'OKNE'  // Encryption - Obfuscation Key
+#define ENC_POOL_TAG_WORKITEM   'WINE'  // Encryption - Work Item
 
 //=============================================================================
 // Configuration Constants
@@ -60,10 +64,11 @@ extern "C" {
 #define ENC_KEY_ROTATION_INTERVAL   (24 * 60 * 60)  // 24 hours in seconds
 
 // Limits
-#define ENC_MAX_PLAINTEXT_SIZE      (64 * 1024 * 1024)  // 64 MB
+#define ENC_MAX_PLAINTEXT_SIZE      (16 * 1024 * 1024)  // 16 MB (reduced for safety)
 #define ENC_MIN_PLAINTEXT_SIZE      1
 #define ENC_MAX_AAD_SIZE            (64 * 1024)
-#define ENC_NONCE_COUNTER_MAX       0xFFFFFFFFFFFFFFFFULL
+#define ENC_NONCE_COUNTER_MAX       0x7FFFFFFFFFFFFFFFLL  // Signed max for safe increment
+#define ENC_MAX_KEYS                64
 
 //=============================================================================
 // Algorithm Types
@@ -73,9 +78,6 @@ typedef enum _ENC_ALGORITHM {
     EncAlgorithm_None = 0,
     EncAlgorithm_AES_128_GCM,           // AES-128-GCM
     EncAlgorithm_AES_256_GCM,           // AES-256-GCM (default)
-    EncAlgorithm_AES_128_CBC_HMAC,      // AES-128-CBC + HMAC-SHA256
-    EncAlgorithm_AES_256_CBC_HMAC,      // AES-256-CBC + HMAC-SHA256
-    EncAlgorithm_ChaCha20_Poly1305,     // ChaCha20-Poly1305 (if available)
     EncAlgorithm_Max
 } ENC_ALGORITHM;
 
@@ -101,8 +103,6 @@ typedef enum _ENC_FLAGS {
     EncFlag_IncludeHeader       = 0x00000001,   // Prepend header to output
     EncFlag_UseAAD              = 0x00000002,   // Use additional auth data
     EncFlag_InPlace             = 0x00000004,   // Encrypt in-place
-    EncFlag_Streaming           = 0x00000008,   // Multi-call encryption
-    EncFlag_FinalBlock          = 0x00000010,   // Final block in stream
     EncFlag_ZeroOnFree          = 0x00000020,   // Zero memory on free
     EncFlag_NonPagedKey         = 0x00000040,   // Key in non-paged pool
 } ENC_FLAGS;
@@ -122,16 +122,16 @@ typedef struct _ENC_HEADER {
     ULONG CiphertextSize;               // Ciphertext size (without header/tag)
     UCHAR Nonce[ENC_GCM_NONCE_SIZE];    // Nonce/IV
     UCHAR Tag[ENC_GCM_TAG_SIZE];        // Authentication tag
-    ULONG KeyId;                        // Key identifier (for rotation)
+    ULONG64 KeyId;                      // Key identifier (64-bit for no overflow)
     ULONG AADSize;                      // Additional auth data size
     LARGE_INTEGER Timestamp;            // Encryption timestamp
-    ULONG Reserved;
+    ULONG HeaderCrc32;                  // CRC32 of header fields (excluding this)
 } ENC_HEADER, *PENC_HEADER;
 
 #define ENC_MAGIC           'RCNE'      // 'ENCR' reversed
-#define ENC_VERSION         1
+#define ENC_VERSION         2           // Version 2 with 64-bit KeyId
 
-C_ASSERT(sizeof(ENC_HEADER) == 64);
+C_ASSERT(sizeof(ENC_HEADER) == 72);
 
 #pragma pack(pop)
 
@@ -143,36 +143,38 @@ typedef struct _ENC_KEY {
     //
     // Key identification
     //
-    ULONG KeyId;
+    ULONG64 KeyId;
     ENC_KEY_TYPE KeyType;
     ENC_ALGORITHM Algorithm;
-    
+
     //
     // Key material (in non-paged memory)
+    // Stored obfuscated - use EncpGetKeyMaterial for access
     //
     UCHAR KeyMaterial[ENC_AES_KEY_SIZE_256];
     ULONG KeySize;
-    
+
     //
-    // Key obfuscation (XOR with random value)
+    // Key obfuscation (stored in separate allocation for security)
     //
-    UCHAR ObfuscationKey[ENC_AES_KEY_SIZE_256];
+    PUCHAR ObfuscationKey;              // Separate allocation
     BOOLEAN IsObfuscated;
-    
+    FAST_MUTEX ObfuscationMutex;        // Protects obfuscation state
+
     //
     // Nonce counter (monotonic, never reused)
     //
     volatile LONG64 NonceCounter;
     UCHAR NoncePrefix[4];               // First 4 bytes of nonce
     KSPIN_LOCK NonceLock;
-    
+
     //
     // BCrypt handles
     //
     BCRYPT_ALG_HANDLE AlgHandle;
     BCRYPT_KEY_HANDLE KeyHandle;
     BOOLEAN HandlesInitialized;
-    
+
     //
     // Key lifecycle
     //
@@ -180,17 +182,24 @@ typedef struct _ENC_KEY {
     LARGE_INTEGER ExpirationTime;
     volatile LONG UseCount;
     BOOLEAN IsActive;
-    
+    volatile BOOLEAN IsExpired;
+
     //
     // Reference counting
     //
     volatile LONG RefCount;
-    
+
+    //
+    // Flags for cleanup state
+    //
+    volatile BOOLEAN IsBeingDestroyed;
+    volatile BOOLEAN RemovedFromList;
+
     //
     // List linkage
     //
     LIST_ENTRY ListEntry;
-    
+
 } ENC_KEY, *PENC_KEY;
 
 //=============================================================================
@@ -202,41 +211,32 @@ typedef struct _ENC_CONTEXT {
     // Current key
     //
     PENC_KEY CurrentKey;
-    
+
     //
     // Algorithm settings
     //
     ENC_ALGORITHM Algorithm;
     ENC_FLAGS Flags;
     ULONG TagSize;                      // Authentication tag size
-    
+
     //
     // AAD for this operation
     //
     PVOID AADBuffer;
     ULONG AADSize;
-    
-    //
-    // Streaming state
-    //
-    BOOLEAN StreamMode;
-    BOOLEAN StreamInitialized;
-    PVOID StreamState;
-    ULONG StreamStateSize;
-    ULONG StreamBytesProcessed;
-    
+
     //
     // Statistics
     //
     ULONG64 TotalBytesEncrypted;
     ULONG64 TotalBytesDecrypted;
     ULONG64 OperationCount;
-    
+
     //
     // Synchronization
     //
-    KSPIN_LOCK Lock;
-    
+    FAST_MUTEX ContextMutex;
+
 } ENC_CONTEXT, *PENC_CONTEXT;
 
 //=============================================================================
@@ -248,54 +248,57 @@ typedef struct _ENC_MANAGER {
     // Initialization state
     //
     BOOLEAN Initialized;
-    
+
     //
     // BCrypt algorithm providers
     //
     BCRYPT_ALG_HANDLE AesGcmAlgHandle;
-    BCRYPT_ALG_HANDLE AesCbcAlgHandle;
     BCRYPT_ALG_HANDLE HmacAlgHandle;
     BCRYPT_ALG_HANDLE RngAlgHandle;
-    
+
     //
     // Key management
     //
     LIST_ENTRY KeyList;
-    KSPIN_LOCK KeyListLock;
+    ERESOURCE KeyListLock;              // Use ERESOURCE for reader/writer
     ULONG KeyCount;
-    ULONG NextKeyId;
-    
+    volatile LONG64 NextKeyId;
+
     //
     // Active keys by type
     //
     PENC_KEY ActiveKeys[EncKeyType_Max];
-    
+    KSPIN_LOCK ActiveKeysLock;
+
     //
     // Key rotation
     //
     KTIMER RotationTimer;
     KDPC RotationDpc;
+    PIO_WORKITEM RotationWorkItem;
+    PDEVICE_OBJECT DeviceObject;
     ULONG RotationIntervalSeconds;
     BOOLEAN AutoRotationEnabled;
-    
+    volatile BOOLEAN RotationInProgress;
+
     //
     // Master key (derived from boot key or TPM)
     //
     UCHAR MasterKey[ENC_AES_KEY_SIZE_256];
+    PUCHAR MasterKeyObfuscation;        // Separate allocation
     BOOLEAN MasterKeySet;
-    
+    FAST_MUTEX MasterKeyMutex;
+
     //
-    // Statistics
+    // Statistics (use interlocked access)
     //
-    struct {
-        ULONG64 TotalEncryptions;
-        ULONG64 TotalDecryptions;
-        ULONG64 BytesEncrypted;
-        ULONG64 BytesDecrypted;
-        ULONG64 AuthFailures;
-        ULONG64 KeyRotations;
-    } Stats;
-    
+    volatile LONG64 TotalEncryptions;
+    volatile LONG64 TotalDecryptions;
+    volatile LONG64 BytesEncrypted;
+    volatile LONG64 BytesDecrypted;
+    volatile LONG64 AuthFailures;
+    volatile LONG64 KeyRotations;
+
     //
     // Configuration
     //
@@ -304,8 +307,9 @@ typedef struct _ENC_MANAGER {
         ULONG DefaultTagSize;
         BOOLEAN RequireNonPagedKeys;
         BOOLEAN EnableAutoRotation;
+        ULONG KeyExpirationSeconds;
     } Config;
-    
+
 } ENC_MANAGER, *PENC_MANAGER;
 
 //=============================================================================
@@ -327,14 +331,18 @@ typedef struct _ENC_OPTIONS {
 //
 // Initialize the encryption manager
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncInitialize(
-    _Out_ PENC_MANAGER Manager
+    _Out_ PENC_MANAGER Manager,
+    _In_opt_ PDEVICE_OBJECT DeviceObject
     );
 
 //
 // Shutdown the encryption manager
 //
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EncShutdown(
     _Inout_ PENC_MANAGER Manager
@@ -343,6 +351,8 @@ EncShutdown(
 //
 // Set the master key (from TPM or secure storage)
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncSetMasterKey(
     _Inout_ PENC_MANAGER Manager,
@@ -357,6 +367,8 @@ EncSetMasterKey(
 //
 // Generate a new encryption key
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncGenerateKey(
     _In_ PENC_MANAGER Manager,
@@ -368,6 +380,8 @@ EncGenerateKey(
 //
 // Derive a key from master key and context
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncDeriveKey(
     _In_ PENC_MANAGER Manager,
@@ -381,6 +395,8 @@ EncDeriveKey(
 //
 // Import an existing key
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncImportKey(
     _In_ PENC_MANAGER Manager,
@@ -394,6 +410,8 @@ EncImportKey(
 //
 // Export a key (for backup/transfer)
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncExportKey(
     _In_ PENC_KEY Key,
@@ -405,14 +423,18 @@ EncExportKey(
 //
 // Destroy a key
 //
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EncDestroyKey(
+    _In_ PENC_MANAGER Manager,
     _Inout_ PENC_KEY Key
     );
 
 //
 // Get active key for a type
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 PENC_KEY
 EncGetActiveKey(
     _In_ PENC_MANAGER Manager,
@@ -422,6 +444,8 @@ EncGetActiveKey(
 //
 // Set active key for a type
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncSetActiveKey(
     _Inout_ PENC_MANAGER Manager,
@@ -432,12 +456,14 @@ EncSetActiveKey(
 //
 // Add/release key reference
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 EncKeyAddRef(
     _In_ PENC_KEY Key
     );
 
-VOID
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONG
 EncKeyRelease(
     _In_ PENC_KEY Key
     );
@@ -449,6 +475,8 @@ EncKeyRelease(
 //
 // Encrypt data with default key
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncEncrypt(
     _In_ PENC_MANAGER Manager,
@@ -464,6 +492,8 @@ EncEncrypt(
 //
 // Decrypt data
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncDecrypt(
     _In_ PENC_MANAGER Manager,
@@ -476,12 +506,15 @@ EncDecrypt(
     );
 
 //
-// Calculate required output buffer size
+// Calculate required output buffer size (with overflow protection)
 //
-ULONG
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
 EncGetEncryptedSize(
     _In_ ULONG PlaintextSize,
-    _In_ BOOLEAN IncludeHeader
+    _In_ BOOLEAN IncludeHeader,
+    _Out_ PULONG RequiredSize
     );
 
 //=============================================================================
@@ -491,6 +524,8 @@ EncGetEncryptedSize(
 //
 // Create encryption context
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncCreateContext(
     _Out_ PENC_CONTEXT* Context,
@@ -501,6 +536,7 @@ EncCreateContext(
 //
 // Destroy encryption context
 //
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EncDestroyContext(
     _Inout_ PENC_CONTEXT Context
@@ -509,9 +545,12 @@ EncDestroyContext(
 //
 // Encrypt with context
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncEncryptWithContext(
     _In_ PENC_CONTEXT Context,
+    _In_ PENC_MANAGER Manager,
     _In_reads_bytes_(PlaintextSize) PVOID Plaintext,
     _In_ ULONG PlaintextSize,
     _Out_writes_bytes_to_(OutputSize, *CiphertextSize) PVOID Output,
@@ -522,9 +561,12 @@ EncEncryptWithContext(
 //
 // Decrypt with context
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncDecryptWithContext(
     _In_ PENC_CONTEXT Context,
+    _In_ PENC_MANAGER Manager,
     _In_reads_bytes_(CiphertextSize) PVOID Ciphertext,
     _In_ ULONG CiphertextSize,
     _Out_writes_bytes_to_(OutputSize, *PlaintextSize) PVOID Output,
@@ -535,67 +577,13 @@ EncDecryptWithContext(
 //
 // Set AAD for context
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncSetAAD(
     _Inout_ PENC_CONTEXT Context,
     _In_reads_bytes_(AADSize) PVOID AAD,
     _In_ ULONG AADSize
-    );
-
-//=============================================================================
-// Public API - Streaming Encryption
-//=============================================================================
-
-//
-// Begin streaming encryption
-//
-NTSTATUS
-EncStreamBegin(
-    _Inout_ PENC_CONTEXT Context,
-    _Out_writes_bytes_(ENC_GCM_NONCE_SIZE) PUCHAR NonceOut
-    );
-
-//
-// Process streaming data
-//
-NTSTATUS
-EncStreamProcess(
-    _Inout_ PENC_CONTEXT Context,
-    _In_reads_bytes_(InputSize) PVOID Input,
-    _In_ ULONG InputSize,
-    _Out_writes_bytes_(OutputSize) PVOID Output,
-    _In_ ULONG OutputSize,
-    _Out_ PULONG OutputWritten,
-    _In_ BOOLEAN IsFinal
-    );
-
-//
-// Finalize streaming encryption
-//
-NTSTATUS
-EncStreamFinalize(
-    _Inout_ PENC_CONTEXT Context,
-    _Out_writes_bytes_(TagSize) PUCHAR TagOut,
-    _In_ ULONG TagSize
-    );
-
-//
-// Begin streaming decryption
-//
-NTSTATUS
-EncStreamDecryptBegin(
-    _Inout_ PENC_CONTEXT Context,
-    _In_reads_bytes_(ENC_GCM_NONCE_SIZE) PUCHAR Nonce
-    );
-
-//
-// Finalize streaming decryption (verify tag)
-//
-NTSTATUS
-EncStreamDecryptFinalize(
-    _Inout_ PENC_CONTEXT Context,
-    _In_reads_bytes_(TagSize) PUCHAR Tag,
-    _In_ ULONG TagSize
     );
 
 //=============================================================================
@@ -605,6 +593,8 @@ EncStreamDecryptFinalize(
 //
 // Rotate key for a specific type
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncRotateKey(
     _Inout_ PENC_MANAGER Manager,
@@ -614,6 +604,8 @@ EncRotateKey(
 //
 // Rotate all keys
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncRotateAllKeys(
     _Inout_ PENC_MANAGER Manager
@@ -622,6 +614,8 @@ EncRotateAllKeys(
 //
 // Enable/disable automatic key rotation
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncSetAutoRotation(
     _Inout_ PENC_MANAGER Manager,
@@ -636,6 +630,8 @@ EncSetAutoRotation(
 //
 // Generate cryptographically secure random bytes
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncRandomBytes(
     _In_ PENC_MANAGER Manager,
@@ -644,8 +640,9 @@ EncRandomBytes(
     );
 
 //
-// Secure memory clear
+// Secure memory clear (not optimized away)
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 EncSecureClear(
     _Out_writes_bytes_(Size) PVOID Buffer,
@@ -655,6 +652,8 @@ EncSecureClear(
 //
 // Constant-time comparison
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 BOOLEAN
 EncConstantTimeCompare(
     _In_reads_bytes_(Size) PVOID A,
@@ -665,6 +664,8 @@ EncConstantTimeCompare(
 //
 // Calculate HMAC-SHA256
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncHmacSha256(
     _In_reads_bytes_(KeySize) PVOID Key,
@@ -677,6 +678,8 @@ EncHmacSha256(
 //
 // HKDF key derivation
 //
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncHkdfDerive(
     _In_reads_bytes_(IKMSize) PVOID IKM,
@@ -694,22 +697,25 @@ EncHkdfDerive(
 //=============================================================================
 
 typedef struct _ENC_STATISTICS {
-    ULONG64 TotalEncryptions;
-    ULONG64 TotalDecryptions;
-    ULONG64 BytesEncrypted;
-    ULONG64 BytesDecrypted;
-    ULONG64 AuthenticationFailures;
-    ULONG64 KeyRotations;
+    LONG64 TotalEncryptions;
+    LONG64 TotalDecryptions;
+    LONG64 BytesEncrypted;
+    LONG64 BytesDecrypted;
+    LONG64 AuthenticationFailures;
+    LONG64 KeyRotations;
     ULONG ActiveKeyCount;
     LARGE_INTEGER LastKeyRotation;
 } ENC_STATISTICS, *PENC_STATISTICS;
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncGetStatistics(
     _In_ PENC_MANAGER Manager,
     _Out_ PENC_STATISTICS Stats
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 EncResetStatistics(
     _Inout_ PENC_MANAGER Manager
@@ -722,16 +728,20 @@ EncResetStatistics(
 //
 // Validate encrypted data header
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EncValidateHeader(
-    _In_reads_bytes_(HeaderSize) PVOID Data,
-    _In_ ULONG HeaderSize,
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize,
     _Out_ PENC_HEADER Header
     );
 
 //
 // Check if data appears encrypted
 //
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 BOOLEAN
 EncIsEncrypted(
     _In_reads_bytes_(Size) PVOID Data,
@@ -743,22 +753,22 @@ EncIsEncrypted(
 //=============================================================================
 
 //
-// Calculate encrypted output size (with header)
-//
-#define ENC_ENCRYPTED_SIZE(plaintextSize) \
-    (sizeof(ENC_HEADER) + (plaintextSize) + ENC_GCM_TAG_SIZE)
-
-//
-// Calculate plaintext size from encrypted size (with header)
-//
-#define ENC_PLAINTEXT_SIZE(encryptedSize) \
-    ((encryptedSize) - sizeof(ENC_HEADER) - ENC_GCM_TAG_SIZE)
-
-//
 // Check if size is valid for encryption
 //
 #define ENC_VALID_SIZE(size) \
     ((size) >= ENC_MIN_PLAINTEXT_SIZE && (size) <= ENC_MAX_PLAINTEXT_SIZE)
+
+//
+// Check if algorithm is valid
+//
+#define ENC_VALID_ALGORITHM(alg) \
+    ((alg) > EncAlgorithm_None && (alg) < EncAlgorithm_Max)
+
+//
+// Check if key type is valid
+//
+#define ENC_VALID_KEY_TYPE(type) \
+    ((type) > EncKeyType_Invalid && (type) < EncKeyType_Max)
 
 #ifdef __cplusplus
 }
