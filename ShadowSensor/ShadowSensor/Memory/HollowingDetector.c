@@ -41,14 +41,23 @@
 // ============================================================================
 
 #define PH_VERSION                      1
-#define PH_SIGNATURE                    0x48444554  // 'HDET'
 #define PH_MAX_CALLBACKS                8
-#define PH_MAX_ACTIVE_ANALYSES          64
-#define PH_MAX_SECTION_COMPARE          (256 * 1024)
+#define PH_MAX_SECTION_COMPARE          (64 * 1024)
 #define PH_MIN_IMAGE_SIZE               512
 #define PH_ENTRY_POINT_SCAN_SIZE        64
 #define PH_DOS_HEADER_SIZE              64
 #define PH_NT_HEADERS_OFFSET_MAX        1024
+#define PH_SHUTDOWN_TIMEOUT_100NS       (-(LONGLONG)10 * 1000 * 10000)  // 10 seconds
+
+C_ASSERT(PH_MAX_SECTION_COMPARE <= (SIZE_T)MAXULONG);  // L-2: ZwReadFile ULONG cast safety
+
+//
+// CAS-based lifecycle states (C-1, H-1, H-5 fix)
+//
+#define PH_STATE_UNINITIALIZED          0
+#define PH_STATE_INITIALIZING           1
+#define PH_STATE_READY                  2
+#define PH_STATE_SHUTTING_DOWN          3
 
 //
 // Confidence score weights
@@ -90,17 +99,11 @@ typedef struct _PH_CALLBACK_ENTRY {
 } PH_CALLBACK_ENTRY, *PPH_CALLBACK_ENTRY;
 
 /**
- * @brief Active analysis tracking entry.
- */
-typedef struct _PH_ACTIVE_ANALYSIS {
-    LIST_ENTRY ListEntry;
-    HANDLE ProcessId;
-    LARGE_INTEGER StartTime;
-    volatile LONG InProgress;
-} PH_ACTIVE_ANALYSIS, *PPH_ACTIVE_ANALYSIS;
-
-/**
  * @brief Extended internal detector structure.
+ *
+ * Uses CAS-based state machine for lifecycle management.
+ * Public PH_DETECTOR is embedded as first member for
+ * CONTAINING_RECORD access from callers.
  */
 typedef struct _PH_DETECTOR_INTERNAL {
     //
@@ -109,9 +112,9 @@ typedef struct _PH_DETECTOR_INTERNAL {
     PH_DETECTOR Public;
 
     //
-    // Signature for validation
+    // Lifecycle state (CAS-based: PH_STATE_*)
     //
-    ULONG Signature;
+    volatile LONG State;
 
     //
     // Callback management
@@ -120,17 +123,8 @@ typedef struct _PH_DETECTOR_INTERNAL {
     EX_PUSH_LOCK CallbackLock;
 
     //
-    // Lookaside lists for efficient allocation
-    //
-    NPAGED_LOOKASIDE_LIST ResultLookaside;
-    NPAGED_LOOKASIDE_LIST AnalysisLookaside;
-    NPAGED_LOOKASIDE_LIST BufferLookaside;
-    BOOLEAN LookasideInitialized;
-
-    //
     // Shutdown synchronization
     //
-    volatile LONG ShuttingDown;
     volatile LONG ActiveOperations;
     KEVENT ShutdownEvent;
 
@@ -157,14 +151,27 @@ typedef struct _PH_PE_CONTEXT {
 // FORWARD DECLARATIONS
 // ============================================================================
 
+//
+// C-5 fix: Declare ShadowStrikeGetProcessImageBase if not available
+// from ProcessUtils.h. This must be implemented elsewhere.
+//
+#ifndef SHADOWSTRIKE_GET_PROCESS_IMAGE_BASE_DECLARED
+NTSTATUS
+ShadowStrikeGetProcessImageBase(
+    _In_ PEPROCESS Process,
+    _Out_ PVOID* ImageBase,
+    _Out_ PSIZE_T ImageSize
+    );
+#define SHADOWSTRIKE_GET_PROCESS_IMAGE_BASE_DECLARED
+#endif
+
 static PPH_ANALYSIS_RESULT
 PhpAllocateResult(
-    _In_ PPH_DETECTOR_INTERNAL Detector
+    VOID
     );
 
 static VOID
 PhpFreeResultInternal(
-    _In_ PPH_DETECTOR_INTERNAL Detector,
     _In_ PPH_ANALYSIS_RESULT Result
     );
 
@@ -270,7 +277,11 @@ PhpInvokeCallbacks(
     _In_ PPH_ANALYSIS_RESULT Result
     );
 
-static VOID
+/**
+ * @brief Atomically acquire a reference. Returns FALSE if shutting down.
+ * (C-1, H-1 fix: increment-then-check pattern prevents use-after-free)
+ */
+static BOOLEAN
 PhpAcquireReference(
     _In_ PPH_DETECTOR_INTERNAL Detector
     );
@@ -300,6 +311,17 @@ PhpFreeUnicodeString(
     _In_ ULONG PoolTag
     );
 
+/**
+ * @brief Inline state check for ready state.
+ */
+static FORCEINLINE BOOLEAN
+PhpIsReady(
+    _In_ PPH_DETECTOR_INTERNAL Detector
+    )
+{
+    return (ReadAcquire(&Detector->State) == PH_STATE_READY);
+}
+
 // ============================================================================
 // INITIALIZATION AND SHUTDOWN
 // ============================================================================
@@ -310,8 +332,8 @@ PhInitialize(
     _Out_ PPH_DETECTOR* Detector
     )
 {
-    NTSTATUS status = STATUS_SUCCESS;
     PPH_DETECTOR_INTERNAL internal = NULL;
+    LONG previousState;
 
     if (Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -333,55 +355,31 @@ PhInitialize(
     }
 
     RtlZeroMemory(internal, sizeof(PH_DETECTOR_INTERNAL));
-    internal->Signature = PH_SIGNATURE;
+
+    //
+    // CAS state: UNINITIALIZED -> INITIALIZING (C-1 fix)
+    //
+    previousState = InterlockedCompareExchange(
+        &internal->State,
+        PH_STATE_INITIALIZING,
+        PH_STATE_UNINITIALIZED
+    );
+
+    if (previousState != PH_STATE_UNINITIALIZED) {
+        ShadowStrikeFreePoolWithTag(internal, PH_POOL_TAG_CONTEXT);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     //
     // Initialize synchronization primitives
     //
-    KeInitializeSpinLock(&internal->Public.AnalysisLock);
     ExInitializePushLock(&internal->CallbackLock);
-    InitializeListHead(&internal->Public.ActiveAnalyses);
 
     //
     // Initialize shutdown synchronization
     //
     KeInitializeEvent(&internal->ShutdownEvent, NotificationEvent, FALSE);
-    internal->ActiveOperations = 1;  // Initial reference
-
-    //
-    // Initialize lookaside lists
-    //
-    ExInitializeNPagedLookasideList(
-        &internal->ResultLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(PH_ANALYSIS_RESULT),
-        PH_POOL_TAG_RESULT,
-        0
-    );
-
-    ExInitializeNPagedLookasideList(
-        &internal->AnalysisLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(PH_ACTIVE_ANALYSIS),
-        PH_POOL_TAG_CONTEXT,
-        0
-    );
-
-    ExInitializeNPagedLookasideList(
-        &internal->BufferLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        PH_MAX_HEADER_SIZE,
-        PH_POOL_TAG_BUFFER,
-        0
-    );
-
-    internal->LookasideInitialized = TRUE;
+    internal->ActiveOperations = 1;  // Init reference — released by PhShutdown
 
     //
     // Set default configuration
@@ -399,9 +397,10 @@ PhInitialize(
     KeQuerySystemTime(&internal->Public.Stats.StartTime);
 
     //
-    // Mark as initialized
+    // Transition: INITIALIZING -> READY
     //
-    internal->Public.Initialized = TRUE;
+    MemoryBarrier();
+    InterlockedExchange(&internal->State, PH_STATE_READY);
 
     *Detector = &internal->Public;
 
@@ -415,31 +414,34 @@ PhShutdown(
     )
 {
     PPH_DETECTOR_INTERNAL internal;
-    PLIST_ENTRY listEntry;
-    PPH_ACTIVE_ANALYSIS analysis;
     LARGE_INTEGER timeout;
-    KIRQL oldIrql;
+    LONG previousState;
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
         return;
     }
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->Signature != PH_SIGNATURE) {
+    //
+    // CAS state: READY -> SHUTTING_DOWN (C-1 fix)
+    //
+    previousState = InterlockedCompareExchange(
+        &internal->State,
+        PH_STATE_SHUTTING_DOWN,
+        PH_STATE_READY
+    );
+
+    if (previousState != PH_STATE_READY) {
         return;
     }
 
     //
-    // Signal shutdown
-    //
-    InterlockedExchange(&internal->ShuttingDown, 1);
-
-    //
-    // Wait for active operations to complete
+    // Release init reference and wait for active operations to drain.
+    // Bounded timeout prevents infinite hang.
     //
     PhpReleaseReference(internal);
-    timeout.QuadPart = -((LONGLONG)5000 * 10000);  // 5 second timeout
+    timeout.QuadPart = PH_SHUTDOWN_TIMEOUT_100NS;
     KeWaitForSingleObject(
         &internal->ShutdownEvent,
         Executive,
@@ -449,36 +451,9 @@ PhShutdown(
     );
 
     //
-    // Free all active analyses
+    // Final state transition and free
     //
-    KeAcquireSpinLock(&Detector->AnalysisLock, &oldIrql);
-
-    while (!IsListEmpty(&Detector->ActiveAnalyses)) {
-        listEntry = RemoveHeadList(&Detector->ActiveAnalyses);
-        analysis = CONTAINING_RECORD(listEntry, PH_ACTIVE_ANALYSIS, ListEntry);
-
-        if (internal->LookasideInitialized) {
-            ExFreeToNPagedLookasideList(&internal->AnalysisLookaside, analysis);
-        }
-    }
-
-    KeReleaseSpinLock(&Detector->AnalysisLock, oldIrql);
-
-    //
-    // Delete lookaside lists
-    //
-    if (internal->LookasideInitialized) {
-        ExDeleteNPagedLookasideList(&internal->ResultLookaside);
-        ExDeleteNPagedLookasideList(&internal->AnalysisLookaside);
-        ExDeleteNPagedLookasideList(&internal->BufferLookaside);
-        internal->LookasideInitialized = FALSE;
-    }
-
-    //
-    // Clear signature and free
-    //
-    internal->Signature = 0;
-    Detector->Initialized = FALSE;
+    InterlockedExchange(&internal->State, PH_STATE_UNINITIALIZED);
 
     ShadowStrikeFreePoolWithTag(internal, PH_POOL_TAG_CONTEXT);
 }
@@ -503,7 +478,7 @@ PhAnalyzeProcess(
     LARGE_INTEGER startTime;
     LARGE_INTEGER endTime;
 
-    if (Detector == NULL || !Detector->Initialized || Result == NULL) {
+    if (Detector == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -511,11 +486,9 @@ PhAnalyzeProcess(
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->ShuttingDown) {
+    if (!PhpAcquireReference(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    PhpAcquireReference(internal);
 
     //
     // Record start time
@@ -531,9 +504,11 @@ PhAnalyzeProcess(
     }
 
     //
-    // Allocate result structure
+    // Allocate result structure (C-4 fix: always use pool alloc for
+    // results returned to callers via public API, never lookaside,
+    // so PhFreeResult can safely free with ShadowStrikeFreePoolWithTag)
     //
-    result = PhpAllocateResult(internal);
+    result = PhpAllocateResult();
     if (result == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
@@ -657,7 +632,7 @@ PhAnalyzeProcess(
 
 Cleanup:
     if (result != NULL) {
-        PhpFreeResultInternal(internal, result);
+        PhpFreeResultInternal(result);
     }
 
     if (processHandle != NULL) {
@@ -692,8 +667,7 @@ PhAnalyzeAtCreation(
 
     UNREFERENCED_PARAMETER(ParentId);
 
-    if (Detector == NULL || !Detector->Initialized ||
-        Process == NULL || Result == NULL) {
+    if (Detector == NULL || Process == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -701,18 +675,19 @@ PhAnalyzeAtCreation(
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->ShuttingDown) {
+    if (!PhpAcquireReference(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    PhpAcquireReference(internal);
 
     KeQuerySystemTime(&startTime);
 
     //
-    // Reference the process object (it's provided by caller)
+    // M-5 fix: Use ObReferenceObjectSafe to handle dying process objects
     //
-    ObReferenceObject(Process);
+    if (!ObReferenceObjectSafe(Process)) {
+        PhpReleaseReference(internal);
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
 
     //
     // Open process handle for memory access
@@ -732,9 +707,9 @@ PhAnalyzeAtCreation(
     }
 
     //
-    // Allocate result
+    // Allocate result (C-4 fix: pool alloc, not lookaside)
     //
-    result = PhpAllocateResult(internal);
+    result = PhpAllocateResult();
     if (result == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
@@ -745,9 +720,9 @@ PhAnalyzeAtCreation(
     result->AnalysisTime = startTime;
 
     //
-    // Get process creation time
+    // Get process creation time (C-3 fix: .QuadPart assignment)
     //
-    result->ProcessCreateTime = PsGetProcessCreateTimeQuadPart(Process);
+    result->ProcessCreateTime.QuadPart = PsGetProcessCreateTimeQuadPart(Process);
 
     //
     // Get image path
@@ -827,7 +802,7 @@ PhAnalyzeAtCreation(
 
 Cleanup:
     if (result != NULL) {
-        PhpFreeResultInternal(internal, result);
+        PhpFreeResultInternal(result);
     }
 
     if (processHandle != NULL) {
@@ -911,7 +886,7 @@ PhCompareImageWithFile(
     BOOLEAN match = FALSE;
     ULONG mismatchOffset = 0;
 
-    if (Detector == NULL || !Detector->Initialized || Match == NULL) {
+    if (Detector == NULL || Match == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -920,11 +895,9 @@ PhCompareImageWithFile(
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->ShuttingDown) {
+    if (!PhpAcquireReference(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    PhpAcquireReference(internal);
 
     //
     // Open process
@@ -973,7 +946,7 @@ PhCompareImageWithFile(
     }
 
 Cleanup:
-    PhpFreeUnicodeString(&imagePath, PH_POOL_TAG_BUFFER);
+    PhpFreeUnicodeString(&imagePath, PH_POOL_TAG_RESULT);
 
     if (processHandle != NULL) {
         ZwClose(processHandle);
@@ -1002,7 +975,7 @@ PhValidateEntryPoint(
     PEPROCESS process = NULL;
     PPH_ANALYSIS_RESULT result = NULL;
 
-    if (Detector == NULL || !Detector->Initialized || Valid == NULL) {
+    if (Detector == NULL || Valid == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1010,11 +983,9 @@ PhValidateEntryPoint(
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->ShuttingDown) {
+    if (!PhpAcquireReference(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    PhpAcquireReference(internal);
 
     //
     // Open process
@@ -1027,7 +998,7 @@ PhValidateEntryPoint(
     //
     // Allocate temporary result
     //
-    result = PhpAllocateResult(internal);
+    result = PhpAllocateResult();
     if (result == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
@@ -1047,7 +1018,7 @@ PhValidateEntryPoint(
 
 Cleanup:
     if (result != NULL) {
-        PhpFreeResultInternal(internal, result);
+        PhpFreeResultInternal(result);
     }
 
     if (processHandle != NULL) {
@@ -1078,7 +1049,7 @@ PhCheckForDoppelganging(
     UNICODE_STRING imagePath = { 0 };
     BOOLEAN isTransacted = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized || IsDoppelganging == NULL) {
+    if (Detector == NULL || IsDoppelganging == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1086,11 +1057,9 @@ PhCheckForDoppelganging(
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->ShuttingDown) {
+    if (!PhpAcquireReference(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    PhpAcquireReference(internal);
 
     //
     // Open process
@@ -1122,7 +1091,7 @@ PhCheckForDoppelganging(
     }
 
 Cleanup:
-    PhpFreeUnicodeString(&imagePath, PH_POOL_TAG_BUFFER);
+    PhpFreeUnicodeString(&imagePath, PH_POOL_TAG_RESULT);
 
     if (processHandle != NULL) {
         ZwClose(processHandle);
@@ -1152,7 +1121,7 @@ PhCheckForGhosting(
     UNICODE_STRING imagePath = { 0 };
     BOOLEAN isDeleted = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized || IsGhosting == NULL) {
+    if (Detector == NULL || IsGhosting == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1160,11 +1129,9 @@ PhCheckForGhosting(
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
 
-    if (internal->ShuttingDown) {
+    if (!PhpAcquireReference(internal)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    PhpAcquireReference(internal);
 
     //
     // Open process
@@ -1196,7 +1163,7 @@ PhCheckForGhosting(
     }
 
 Cleanup:
-    PhpFreeUnicodeString(&imagePath, PH_POOL_TAG_BUFFER);
+    PhpFreeUnicodeString(&imagePath, PH_POOL_TAG_RESULT);
 
     if (processHandle != NULL) {
         ZwClose(processHandle);
@@ -1227,11 +1194,15 @@ PhRegisterCallback(
     ULONG i;
     NTSTATUS status = STATUS_QUOTA_EXCEEDED;
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
+
+    if (!PhpIsReady(internal)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&internal->CallbackLock);
@@ -1262,11 +1233,15 @@ PhUnregisterCallback(
     PPH_DETECTOR_INTERNAL internal;
     ULONG i;
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || Callback == NULL) {
         return;
     }
 
     internal = CONTAINING_RECORD(Detector, PH_DETECTOR_INTERNAL, Public);
+
+    if (!PhpIsReady(internal)) {
+        return;
+    }
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&internal->CallbackLock);
@@ -1326,10 +1301,15 @@ PhGetStatistics(
 {
     LARGE_INTEGER currentTime;
 
-    if (Detector == NULL || !Detector->Initialized || Stats == NULL) {
+    if (Detector == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // L-3: Statistics reads are intentionally non-atomic (approximate).
+    // InterlockedIncrement64 is used for writes; plain reads may see
+    // slightly stale values, which is acceptable for diagnostic counters.
+    //
     RtlZeroMemory(Stats, sizeof(PH_STATISTICS));
 
     Stats->ProcessesAnalyzed = Detector->Stats.ProcessesAnalyzed;
@@ -1350,31 +1330,25 @@ PhGetStatistics(
 // PRIVATE HELPER FUNCTIONS - ALLOCATION
 // ============================================================================
 
+//
+// C-4 fix: Always use pool alloc (never lookaside) for results returned
+// to callers. This eliminates the free-mismatch between PhFreeResult
+// (pool free) and PhpFreeResultInternal (was conditionally lookaside).
+//
 static PPH_ANALYSIS_RESULT
 PhpAllocateResult(
-    _In_ PPH_DETECTOR_INTERNAL Detector
+    VOID
     )
 {
-    PPH_ANALYSIS_RESULT result;
-
-    if (!Detector->LookasideInitialized) {
-        result = (PPH_ANALYSIS_RESULT)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            sizeof(PH_ANALYSIS_RESULT),
-            PH_POOL_TAG_RESULT
-        );
-    } else {
-        result = (PPH_ANALYSIS_RESULT)ExAllocateFromNPagedLookasideList(
-            &Detector->ResultLookaside
-        );
-    }
-
-    return result;
+    return (PPH_ANALYSIS_RESULT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(PH_ANALYSIS_RESULT),
+        PH_POOL_TAG_RESULT
+    );
 }
 
 static VOID
 PhpFreeResultInternal(
-    _In_ PPH_DETECTOR_INTERNAL Detector,
     _In_ PPH_ANALYSIS_RESULT Result
     )
 {
@@ -1386,11 +1360,7 @@ PhpFreeResultInternal(
     PhpFreeUnicodeString(&Result->ProcessName, PH_POOL_TAG_RESULT);
     PhpFreeUnicodeString(&Result->Section.BackingFileName, PH_POOL_TAG_RESULT);
 
-    if (Detector->LookasideInitialized) {
-        ExFreeToNPagedLookasideList(&Detector->ResultLookaside, Result);
-    } else {
-        ShadowStrikeFreePoolWithTag(Result, PH_POOL_TAG_RESULT);
-    }
+    ShadowStrikeFreePoolWithTag(Result, PH_POOL_TAG_RESULT);
 }
 
 // ============================================================================
@@ -1456,9 +1426,10 @@ PhpGetProcessImagePath(
     }
 
     //
-    // Copy the string
+    // Copy the string (H-8 fix: use PH_POOL_TAG_RESULT since this string
+    // will be owned by the result and freed by PhFreeResult with that tag)
     //
-    PhpCopyUnicodeString(ImagePath, processImageName, PH_POOL_TAG_BUFFER);
+    PhpCopyUnicodeString(ImagePath, processImageName, PH_POOL_TAG_RESULT);
 
     ExFreePool(processImageName);
 
@@ -1626,18 +1597,38 @@ PhpAnalyzeEntryPoint(
     }
 
     //
-    // Calculate entry point address
+    // M-3 fix: Calculate entry point RVA with overflow protection.
+    // peContext.EntryPoint is stored as (ImageBase + AddressOfEntryPoint),
+    // so the RVA = peContext.EntryPoint - peContext.ImageBase.
+    // Validate the pointer arithmetic won't wrap.
     //
-    Result->EntryPoint.DeclaredEntryPoint = peContext.EntryPoint;
-    Result->EntryPoint.ActualEntryPoint = (PVOID)((ULONG_PTR)imageBase +
-        (ULONG_PTR)peContext.EntryPoint - (ULONG_PTR)peContext.ImageBase);
+    if ((ULONG_PTR)peContext.EntryPoint < (ULONG_PTR)peContext.ImageBase) {
+        //
+        // Malicious PE: EntryPoint < ImageBase means negative RVA (wrapped)
+        //
+        Result->EntryPoint.DeclaredEntryPoint = peContext.EntryPoint;
+        Result->EntryPoint.ActualEntryPoint = NULL;
+        Result->EntryPoint.EntryPointInImage = FALSE;
+        Result->EntryPoint.EntryPointExecutable = FALSE;
+        Result->EntryPoint.EntryPointValid = FALSE;
+        Result->Indicators |= PhIndicator_EntryPointModified;
+        ShadowStrikeFreePoolWithTag(headerBuffer, PH_POOL_TAG_BUFFER);
+        return STATUS_SUCCESS;
+    }
 
-    //
-    // Validate entry point is within image bounds
-    //
-    Result->EntryPoint.EntryPointInImage =
-        ((ULONG_PTR)Result->EntryPoint.ActualEntryPoint >= (ULONG_PTR)imageBase) &&
-        ((ULONG_PTR)Result->EntryPoint.ActualEntryPoint < (ULONG_PTR)imageBase + imageSize);
+    {
+        ULONG_PTR rva = (ULONG_PTR)peContext.EntryPoint - (ULONG_PTR)peContext.ImageBase;
+
+        Result->EntryPoint.DeclaredEntryPoint = peContext.EntryPoint;
+        Result->EntryPoint.ActualEntryPoint = (PVOID)((ULONG_PTR)imageBase + rva);
+
+        //
+        // Validate entry point is within image bounds
+        //
+        Result->EntryPoint.EntryPointInImage =
+            (rva < imageSize) &&
+            ((ULONG_PTR)Result->EntryPoint.ActualEntryPoint >= (ULONG_PTR)imageBase);
+    }
 
     if (!Result->EntryPoint.EntryPointInImage) {
         Result->Indicators |= PhIndicator_EntryPointModified;
@@ -1730,7 +1721,11 @@ PhpAnalyzePEB(
     //
     // Get image path from PEB and compare with actual
     //
-    if (peb.ProcessParameters != NULL) {
+    //
+    // H-6 fix: Validate peb.ProcessParameters is a user-mode address.
+    // A hostile process can point this into kernel space.
+    //
+    if (peb.ProcessParameters != NULL && ShadowStrikeIsUserAddress(peb.ProcessParameters)) {
         RTL_USER_PROCESS_PARAMETERS params = { 0 };
 
         status = PhpReadProcessMemory(
@@ -1744,9 +1739,12 @@ PhpAnalyzePEB(
         if (NT_SUCCESS(status) && bytesRead >= sizeof(RTL_USER_PROCESS_PARAMETERS)) {
             //
             // Read the image path name from process memory
+            // H-6 fix: Also validate params.ImagePathName.Buffer is user-mode
             //
             if (params.ImagePathName.Length > 0 &&
-                params.ImagePathName.Length < MAX_PATH * sizeof(WCHAR)) {
+                params.ImagePathName.Length < MAX_PATH * sizeof(WCHAR) &&
+                params.ImagePathName.Buffer != NULL &&
+                ShadowStrikeIsUserAddress(params.ImagePathName.Buffer)) {
 
                 pebImagePath.Length = params.ImagePathName.Length;
                 pebImagePath.MaximumLength = params.ImagePathName.Length + sizeof(WCHAR);
@@ -1857,9 +1855,10 @@ PhpAnalyzeMemoryRegions(
             }
 
             //
-            // Check for unbacked executable memory (potential shellcode)
+            // L-1 fix: use 'else if' to prevent double-counting.
+            // A region that is RWX+private was already counted above.
             //
-            if (isExecutable && memInfo.Type == MEM_PRIVATE) {
+            else if (isExecutable && memInfo.Type == MEM_PRIVATE) {
                 unbackedExecCount++;
                 suspiciousCount++;
                 suspiciousSize += memInfo.RegionSize;
@@ -1980,7 +1979,11 @@ PhpParsePEHeaders(
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
-    if (ntHeaderOffset + sizeof(IMAGE_NT_HEADERS) > BufferSize) {
+    //
+    // C-6 fix: Initial bounds check uses Signature + FileHeader only.
+    // The full architecture-specific check comes after we read the magic.
+    //
+    if (ntHeaderOffset + RTL_SIZEOF_THROUGH_FIELD(IMAGE_NT_HEADERS, FileHeader) > BufferSize) {
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -1994,10 +1997,24 @@ PhpParsePEHeaders(
     }
 
     //
-    // Determine architecture
+    // Need at least Magic field to determine architecture
+    //
+    if (ntHeaderOffset + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader.Magic) + sizeof(USHORT) > BufferSize) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    //
+    // Determine architecture — C-6 fix: re-validate bounds for the specific
+    // header size BEFORE accessing any optional header fields
     //
     if (ntHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
+        PIMAGE_NT_HEADERS64 ntHeaders64;
+
+        if (ntHeaderOffset + sizeof(IMAGE_NT_HEADERS64) > BufferSize) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
 
         PeContext->Is64Bit = TRUE;
         PeContext->ImageBase = (PVOID)ntHeaders64->OptionalHeader.ImageBase;
@@ -2010,7 +2027,13 @@ PhpParsePEHeaders(
         PeContext->Checksum = ntHeaders64->OptionalHeader.CheckSum;
 
     } else if (ntHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-        PIMAGE_NT_HEADERS32 ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
+        PIMAGE_NT_HEADERS32 ntHeaders32;
+
+        if (ntHeaderOffset + sizeof(IMAGE_NT_HEADERS32) > BufferSize) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
 
         PeContext->Is64Bit = FALSE;
         PeContext->ImageBase = (PVOID)(ULONG_PTR)ntHeaders32->OptionalHeader.ImageBase;
@@ -2116,16 +2139,19 @@ PhpCompareMemoryWithFile(
     }
 
     //
-    // Allocate buffers
+    // H-2 fix: Use PagedPool — this function runs at PASSIVE_LEVEL only,
+    // and allocations can be up to PH_MAX_SECTION_COMPARE (256KB).
+    // H-3 fix: Compare the FULL allocated range, not just 4KB. The old
+    // truncation to PH_MAX_HEADER_SIZE made detection trivially evadable.
     //
     memoryBuffer = ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         compareSize,
         PH_POOL_TAG_BUFFER
     );
 
     fileBuffer = ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         compareSize,
         PH_POOL_TAG_BUFFER
     );
@@ -2170,10 +2196,9 @@ PhpCompareMemoryWithFile(
     }
 
     //
-    // Compare the headers (first 4KB should match for legitimate processes)
+    // H-3 fix: Compare the full allocated range, not just first 4KB.
+    // An attacker modifying code beyond 4KB would otherwise evade detection.
     //
-    compareSize = min(compareSize, PH_MAX_HEADER_SIZE);
-
     *Match = (RtlCompareMemory(memoryBuffer, fileBuffer, compareSize) == compareSize);
 
     if (!*Match && MismatchOffset != NULL) {
@@ -2245,9 +2270,19 @@ PhpCheckFileTransacted(
     OBJECT_ATTRIBUTES objAttr;
     IO_STATUS_BLOCK ioStatus;
     HANDLE fileHandle = NULL;
-    FILE_IS_REMOTE_DEVICE_INFORMATION remoteInfo = { 0 };
 
     *IsTransacted = FALSE;
+
+    //
+    // M-1: LIMITATION — This is a heuristic stub. True TxF doppelganging
+    // detection requires IoGetTransactionParameterBlock() or FltGetTransactionContext()
+    // in a minifilter. The current approach only detects the case where the
+    // transacted file has been rolled back (file no longer exists). Active
+    // transactions with committed data will NOT be detected here.
+    //
+    // TODO: Implement full TxF detection via minifilter transaction awareness
+    // once the minifilter component is integrated.
+    //
 
     //
     // Try to open the file
@@ -2271,32 +2306,19 @@ PhpCheckFileTransacted(
 
     if (!NT_SUCCESS(status)) {
         //
-        // File doesn't exist or can't be opened - might be transacted
+        // L-4 fix: File doesn't exist — set IsTransacted heuristic but
+        // return STATUS_SUCCESS so the caller treats the indicator as valid
+        // rather than treating this as an error.
         //
         if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
             status == STATUS_OBJECT_PATH_NOT_FOUND) {
             *IsTransacted = TRUE;
+            return STATUS_SUCCESS;
         }
         return status;
     }
 
-    //
-    // Query if file is remote (transacted files show as remote)
-    //
-    status = ZwQueryInformationFile(
-        fileHandle,
-        &ioStatus,
-        &remoteInfo,
-        sizeof(remoteInfo),
-        FileIsRemoteDeviceInformation
-    );
-
     ZwClose(fileHandle);
-
-    //
-    // Note: In a full implementation, we would use IoGetTransactionParameterBlock
-    // or other kernel APIs to detect TxF transactions
-    //
 
     return STATUS_SUCCESS;
 }
@@ -2535,33 +2557,67 @@ PhpInvokeCallbacks(
     )
 {
     ULONG i;
+    ULONG count = 0;
+
+    //
+    // H-4 fix: Copy callbacks under lock, then invoke outside lock.
+    // This prevents deadlock if a callback calls PhUnregisterCallback
+    // (which takes exclusive lock on the same push lock).
+    //
+    struct {
+        PH_DETECTION_CALLBACK Callback;
+        PVOID Context;
+    } snapshot[PH_MAX_CALLBACKS];
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->CallbackLock);
 
     for (i = 0; i < PH_MAX_CALLBACKS; i++) {
         if (Detector->Callbacks[i].InUse && Detector->Callbacks[i].Callback != NULL) {
-            Detector->Callbacks[i].Callback(
-                Result,
-                Detector->Callbacks[i].Context
-            );
+            snapshot[count].Callback = Detector->Callbacks[i].Callback;
+            snapshot[count].Context = Detector->Callbacks[i].Context;
+            count++;
         }
     }
 
     ExReleasePushLockShared(&Detector->CallbackLock);
     KeLeaveCriticalRegion();
+
+    //
+    // Invoke outside the lock — safe from deadlock
+    //
+    for (i = 0; i < count; i++) {
+        snapshot[i].Callback(Result, snapshot[i].Context);
+    }
 }
 
 // ============================================================================
 // PRIVATE HELPER FUNCTIONS - REFERENCE COUNTING
 // ============================================================================
 
-static VOID
+//
+// H-1 fix: PhpAcquireReference returns BOOLEAN. Increment first,
+// then check if state is READY. If not, decrement and signal event.
+// This eliminates the TOCTOU between the state check and increment.
+//
+static BOOLEAN
 PhpAcquireReference(
     _In_ PPH_DETECTOR_INTERNAL Detector
     )
 {
     InterlockedIncrement(&Detector->ActiveOperations);
+
+    if (ReadAcquire(&Detector->State) == PH_STATE_READY) {
+        return TRUE;
+    }
+
+    //
+    // Not ready (shutting down or not initialized) — roll back
+    //
+    if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
+        KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    }
+    return FALSE;
 }
 
 static VOID
@@ -2570,7 +2626,12 @@ PhpReleaseReference(
     )
 {
     if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
-        KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        //
+        // Only signal if we're shutting down — avoid spurious wakeups
+        //
+        if (ReadAcquire(&Detector->State) == PH_STATE_SHUTTING_DOWN) {
+            KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        }
     }
 }
 
@@ -2592,8 +2653,12 @@ PhpCopyUnicodeString(
     }
 
     Dest->MaximumLength = Src->Length + sizeof(WCHAR);
+    //
+    // M-2 fix: Use PagedPool — all callers run at PASSIVE_LEVEL and
+    // these are file path strings. Saves NonPagedPool pressure.
+    //
     Dest->Buffer = (PWCH)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         Dest->MaximumLength,
         PoolTag
     );

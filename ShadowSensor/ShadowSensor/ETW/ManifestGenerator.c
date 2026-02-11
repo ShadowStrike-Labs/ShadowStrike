@@ -39,6 +39,7 @@ Implementation Features:
 #define MG_MAX_INDENT_LEVEL                 16
 #define MG_TEMPLATE_NAME_PREFIX             "Template_"
 #define MG_DEFAULT_PROVIDER_SYMBOL          "SHADOWSTRIKE"
+#define MG_FORMAT_TEMP_BUFFER_SIZE          2048
 
 //
 // XML generation templates
@@ -110,6 +111,66 @@ static const CHAR* MgpFieldTypeToInType[] = {
 #define MG_FIELD_TYPE_COUNT (sizeof(MgpFieldTypeToInType) / sizeof(MgpFieldTypeToInType[0]))
 
 // ============================================================================
+// REFERENCE COUNTING HELPERS
+// ============================================================================
+
+//
+// Acquire a reference on the generator for the duration of a public API call.
+// Returns STATUS_DEVICE_NOT_READY if the generator is shutting down.
+//
+static
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+MgpAcquireReference(
+    _In_ PMG_GENERATOR Generator
+    )
+{
+    LONG OldCount;
+
+    if (Generator == NULL || !Generator->Initialized) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Generator->ShuttingDown) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    OldCount = InterlockedIncrement(&Generator->ReferenceCount);
+
+    //
+    // Re-check after increment to handle race with shutdown
+    //
+    if (Generator->ShuttingDown) {
+        if (InterlockedDecrement(&Generator->ReferenceCount) == 0) {
+            KeSetEvent(&Generator->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+//
+// Release a reference on the generator. Signals shutdown event when count
+// reaches zero.
+//
+static
+VOID
+MgpReleaseReference(
+    _In_ PMG_GENERATOR Generator
+    )
+{
+    LONG NewCount = InterlockedDecrement(&Generator->ReferenceCount);
+
+    NT_ASSERT(NewCount >= 0);
+
+    if (NewCount == 0) {
+        KeSetEvent(&Generator->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+// ============================================================================
 // PRIVATE FUNCTION PROTOTYPES
 // ============================================================================
 
@@ -120,6 +181,7 @@ static NTSTATUS
 MgpStringBuilderInit(
     _Out_ PMG_STRING_BUILDER Builder,
     _In_ SIZE_T InitialCapacity,
+    _In_ SIZE_T MaxCapacity,
     _In_ ULONG PoolTag
     );
 
@@ -352,19 +414,23 @@ Return Value:
     *Generator = NULL;
 
     //
-    // Allocate generator structure
+    // Acquire reference on schema to ensure it outlives the generator
     //
-    NewGenerator = (PMG_GENERATOR)ExAllocatePoolWithTag(
-        PagedPool,
+    EsAcquireReference(Schema);
+
+    //
+    // Allocate generator structure (ExAllocatePool2 zero-initializes)
+    //
+    NewGenerator = (PMG_GENERATOR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         sizeof(MG_GENERATOR),
         MG_POOL_TAG
         );
 
     if (NewGenerator == NULL) {
+        EsReleaseReference(Schema);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    RtlZeroMemory(NewGenerator, sizeof(MG_GENERATOR));
 
     //
     // Initialize basic fields
@@ -372,6 +438,12 @@ Return Value:
     NewGenerator->Schema = Schema;
     NewGenerator->Flags = MgFlagIncludeComments;
     NewGenerator->NextMessageId = MG_DEFAULT_MESSAGE_ID_BASE;
+    NewGenerator->ReferenceCount = 1;
+
+    //
+    // Initialize shutdown event (manual reset, initially non-signaled)
+    //
+    KeInitializeEvent(&NewGenerator->ShutdownEvent, NotificationEvent, FALSE);
 
     //
     // Initialize lists
@@ -402,8 +474,7 @@ Return Value:
         );
 
     if (!NT_SUCCESS(Status)) {
-        ExFreePoolWithTag(NewGenerator, MG_POOL_TAG);
-        return Status;
+        goto InitFailed;
     }
 
     //
@@ -416,8 +487,7 @@ Return Value:
         );
 
     if (!NT_SUCCESS(Status)) {
-        ExFreePoolWithTag(NewGenerator, MG_POOL_TAG);
-        return Status;
+        goto InitFailed;
     }
 
     Status = RtlStringCchCopyA(
@@ -427,26 +497,33 @@ Return Value:
         );
 
     if (!NT_SUCCESS(Status)) {
-        ExFreePoolWithTag(NewGenerator, MG_POOL_TAG);
-        return Status;
+        goto InitFailed;
     }
 
     //
-    // Register default levels
+    // Register default levels (no lock needed — not yet published)
     //
     Status = MgpRegisterDefaultLevels(NewGenerator);
     if (!NT_SUCCESS(Status)) {
-        ExFreePoolWithTag(NewGenerator, MG_POOL_TAG);
-        return Status;
+        goto InitFailed;
     }
 
     //
-    // Mark as initialized
+    // Mark as initialized and publish
     //
     NewGenerator->Initialized = TRUE;
     *Generator = NewGenerator;
 
     return STATUS_SUCCESS;
+
+InitFailed:
+    //
+    // Clean up any levels that were partially registered
+    //
+    MgpFreeLevelList(&NewGenerator->LevelList);
+    EsReleaseReference(Schema);
+    ExFreePoolWithTag(NewGenerator, MG_POOL_TAG);
+    return Status;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -462,6 +539,8 @@ Arguments:
     Generator - Generator instance to shutdown.
 --*/
 {
+    LARGE_INTEGER Timeout;
+
     PAGED_CODE();
 
     if (Generator == NULL) {
@@ -473,7 +552,27 @@ Arguments:
         return;
     }
 
+    //
+    // Signal shutdown to prevent new operations
+    //
+    Generator->ShuttingDown = TRUE;
+    MemoryBarrier();
     Generator->Initialized = FALSE;
+
+    //
+    // Release our init reference and wait for all in-flight operations to complete.
+    // Timeout after 10 seconds to prevent hang — log and proceed if hit.
+    //
+    if (InterlockedDecrement(&Generator->ReferenceCount) > 0) {
+        Timeout.QuadPart = -10LL * 10 * 1000 * 1000;   // 10 seconds relative
+        KeWaitForSingleObject(
+            &Generator->ShutdownEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &Timeout
+            );
+    }
 
     //
     // Free all list entries
@@ -495,6 +594,14 @@ Arguments:
     if (Generator->CachedHeader != NULL) {
         ExFreePoolWithTag(Generator->CachedHeader, MG_HDR_POOL_TAG);
         Generator->CachedHeader = NULL;
+    }
+
+    //
+    // Release schema reference
+    //
+    if (Generator->Schema != NULL) {
+        EsReleaseReference(Generator->Schema);
+        Generator->Schema = NULL;
     }
 
     //
@@ -523,12 +630,13 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS Status;
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized) {
-        return STATUS_INVALID_PARAMETER;
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
     //
@@ -544,6 +652,7 @@ Return Value:
             );
 
         if (!NT_SUCCESS(Status)) {
+            MgpReleaseReference(Generator);
             return Status;
         }
     }
@@ -556,10 +665,12 @@ Return Value:
             );
 
         if (!NT_SUCCESS(Status)) {
+            MgpReleaseReference(Generator);
             return Status;
         }
     }
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
@@ -581,19 +692,29 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    NTSTATUS Status;
+
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized || ProviderSymbol == NULL) {
+    if (ProviderSymbol == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
     MgInvalidateCache(Generator);
 
-    return RtlStringCchCopyA(
+    Status = RtlStringCchCopyA(
         Generator->ProviderSymbol,
         MG_MAX_PROVIDER_SYMBOL,
         ProviderSymbol
         );
+
+    MgpReleaseReference(Generator);
+    return Status;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -614,10 +735,13 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    NTSTATUS Status;
+
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized) {
-        return STATUS_INVALID_PARAMETER;
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
     MgInvalidateCache(Generator);
@@ -630,6 +754,7 @@ Return Value:
         Generator->UseGuidOverride = FALSE;
     }
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
@@ -651,15 +776,19 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    NTSTATUS Status;
+
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized) {
-        return STATUS_INVALID_PARAMETER;
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
     MgInvalidateCache(Generator);
     Generator->Flags = Flags;
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
@@ -689,20 +818,37 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized || Channel == NULL) {
+    if (Channel == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Validate enum bounds to prevent OOB array access during generation
+    //
+    if (Channel->Type > MG_MAX_CHANNEL_TYPE_VALUE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Channel->Isolation > MG_MAX_ISOLATION_TYPE_VALUE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
     //
     // Allocate new channel entry
     //
-    NewChannel = (PMG_CHANNEL_DEFINITION)ExAllocatePoolWithTag(
-        PagedPool,
+    NewChannel = (PMG_CHANNEL_DEFINITION)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         sizeof(MG_CHANNEL_DEFINITION),
-        MG_POOL_TAG
+        MG_CHN_POOL_TAG
         );
 
     if (NewChannel == NULL) {
+        MgpReleaseReference(Generator);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -728,7 +874,7 @@ Return Value:
 
         ExistingChannel = CONTAINING_RECORD(Entry, MG_CHANNEL_DEFINITION, ListEntry);
 
-        if (_stricmp(ExistingChannel->Name, NewChannel->Name) == 0) {
+        if (_strnicmp(ExistingChannel->Name, NewChannel->Name, MG_MAX_CHANNEL_NAME) == 0) {
             Status = STATUS_DUPLICATE_NAME;
             break;
         }
@@ -737,16 +883,21 @@ Return Value:
     if (NT_SUCCESS(Status)) {
         InsertTailList(&Generator->ChannelList, &NewChannel->ListEntry);
         Generator->ChannelCount++;
-        MgInvalidateCache(Generator);
     }
 
     ExReleasePushLockExclusive(&Generator->ChannelLock);
     KeLeaveCriticalRegion();
 
     if (!NT_SUCCESS(Status)) {
-        ExFreePoolWithTag(NewChannel, MG_POOL_TAG);
+        ExFreePoolWithTag(NewChannel, MG_CHN_POOL_TAG);
+    } else {
+        //
+        // Invalidate cache AFTER releasing ChannelLock to prevent lock ordering violation
+        //
+        MgInvalidateCache(Generator);
     }
 
+    MgpReleaseReference(Generator);
     return Status;
 }
 
@@ -768,21 +919,28 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    NTSTATUS Status;
     PMG_TASK_DEFINITION NewTask = NULL;
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized || Task == NULL) {
+    if (Task == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    NewTask = (PMG_TASK_DEFINITION)ExAllocatePoolWithTag(
-        PagedPool,
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    NewTask = (PMG_TASK_DEFINITION)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         sizeof(MG_TASK_DEFINITION),
-        MG_POOL_TAG
+        MG_TSK_POOL_TAG
         );
 
     if (NewTask == NULL) {
+        MgpReleaseReference(Generator);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -804,6 +962,7 @@ Return Value:
 
     MgInvalidateCache(Generator);
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
@@ -825,21 +984,28 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    NTSTATUS Status;
     PMG_KEYWORD_DEFINITION NewKeyword = NULL;
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized || Keyword == NULL) {
+    if (Keyword == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    NewKeyword = (PMG_KEYWORD_DEFINITION)ExAllocatePoolWithTag(
-        PagedPool,
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    NewKeyword = (PMG_KEYWORD_DEFINITION)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         sizeof(MG_KEYWORD_DEFINITION),
-        MG_POOL_TAG
+        MG_KWD_POOL_TAG
         );
 
     if (NewKeyword == NULL) {
+        MgpReleaseReference(Generator);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -861,6 +1027,7 @@ Return Value:
 
     MgInvalidateCache(Generator);
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
@@ -882,21 +1049,28 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
+    NTSTATUS Status;
     PMG_OPCODE_DEFINITION NewOpcode = NULL;
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized || Opcode == NULL) {
+    if (Opcode == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    NewOpcode = (PMG_OPCODE_DEFINITION)ExAllocatePoolWithTag(
-        PagedPool,
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    NewOpcode = (PMG_OPCODE_DEFINITION)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         sizeof(MG_OPCODE_DEFINITION),
-        MG_POOL_TAG
+        MG_OPC_POOL_TAG
         );
 
     if (NewOpcode == NULL) {
+        MgpReleaseReference(Generator);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -918,6 +1092,7 @@ Return Value:
 
     MgInvalidateCache(Generator);
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
@@ -951,13 +1126,17 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized ||
-        ManifestContent == NULL || ContentSize == NULL) {
+    if (ManifestContent == NULL || ContentSize == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *ManifestContent = NULL;
     *ContentSize = 0;
+
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
 
     //
     // Check cache first
@@ -970,8 +1149,8 @@ Return Value:
         // Return copy of cached content
         //
         OutputSize = Generator->CachedManifestSize;
-        OutputBuffer = (PCHAR)ExAllocatePoolWithTag(
-            PagedPool,
+        OutputBuffer = (PCHAR)ExAllocatePool2(
+            POOL_FLAG_PAGED,
             OutputSize + 1,
             MG_XML_POOL_TAG
             );
@@ -984,6 +1163,7 @@ Return Value:
 
             ExReleasePushLockShared(&Generator->CacheLock);
             KeLeaveCriticalRegion();
+            MgpReleaseReference(Generator);
             return STATUS_SUCCESS;
         }
     }
@@ -996,8 +1176,9 @@ Return Value:
     //
     StartTime = KeQueryPerformanceCounter(&Frequency);
 
-    Status = MgpStringBuilderInit(&Builder, MG_INITIAL_XML_BUFFER_SIZE, MG_XML_POOL_TAG);
+    Status = MgpStringBuilderInit(&Builder, MG_INITIAL_XML_BUFFER_SIZE, MG_MAX_XML_BUFFER_SIZE, MG_XML_POOL_TAG);
     if (!NT_SUCCESS(Status)) {
+        MgpReleaseReference(Generator);
         return Status;
     }
 
@@ -1026,6 +1207,14 @@ Return Value:
     }
 
     //
+    // Localization section (string table for all $(string.*) references)
+    //
+    Status = MgpGenerateStringTableSection(Generator, &Builder);
+    if (!NT_SUCCESS(Status)) {
+        goto Cleanup;
+    }
+
+    //
     // Manifest closing
     //
     Status = MgpStringBuilderAppend(&Builder, MgpManifestClose);
@@ -1036,22 +1225,13 @@ Return Value:
     EndTime = KeQueryPerformanceCounter(NULL);
 
     //
-    // Allocate output buffer
+    // Steal builder buffer as output to avoid redundant copy
     //
     OutputSize = Builder.Length;
-    OutputBuffer = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
-        OutputSize + 1,
-        MG_XML_POOL_TAG
-        );
-
-    if (OutputBuffer == NULL) {
-        Status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
-    }
-
-    RtlCopyMemory(OutputBuffer, Builder.Buffer, OutputSize);
-    OutputBuffer[OutputSize] = '\0';
+    OutputBuffer = Builder.Buffer;
+    Builder.Buffer = NULL;
+    Builder.Length = 0;
+    Builder.Capacity = 0;
 
     //
     // Update cache
@@ -1061,10 +1241,13 @@ Return Value:
 
     if (Generator->CachedManifest != NULL) {
         ExFreePoolWithTag(Generator->CachedManifest, MG_XML_POOL_TAG);
+        Generator->CachedManifest = NULL;
+        Generator->CachedManifestSize = 0;
+        Generator->ManifestCacheValid = FALSE;
     }
 
-    Generator->CachedManifest = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
+    Generator->CachedManifest = (PCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         OutputSize + 1,
         MG_XML_POOL_TAG
         );
@@ -1079,8 +1262,10 @@ Return Value:
     // Update statistics
     //
     Generator->Stats.ManifestSize = OutputSize;
-    Generator->Stats.GenerationTimeUs =
-        (ULONG64)((EndTime.QuadPart - StartTime.QuadPart) * 1000000 / Frequency.QuadPart);
+    if (Frequency.QuadPart > 0) {
+        Generator->Stats.GenerationTimeUs =
+            (ULONG64)((EndTime.QuadPart - StartTime.QuadPart) * 1000000 / Frequency.QuadPart);
+    }
 
     ExReleasePushLockExclusive(&Generator->CacheLock);
     KeLeaveCriticalRegion();
@@ -1096,6 +1281,7 @@ Cleanup:
         ExFreePoolWithTag(OutputBuffer, MG_XML_POOL_TAG);
     }
 
+    MgpReleaseReference(Generator);
     return Status;
 }
 
@@ -1127,13 +1313,17 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized ||
-        HeaderContent == NULL || ContentSize == NULL) {
+    if (HeaderContent == NULL || ContentSize == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *HeaderContent = NULL;
     *ContentSize = 0;
+
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
 
     //
     // Check cache first
@@ -1143,8 +1333,8 @@ Return Value:
 
     if (Generator->HeaderCacheValid && Generator->CachedHeader != NULL) {
         OutputSize = Generator->CachedHeaderSize;
-        OutputBuffer = (PCHAR)ExAllocatePoolWithTag(
-            PagedPool,
+        OutputBuffer = (PCHAR)ExAllocatePool2(
+            POOL_FLAG_PAGED,
             OutputSize + 1,
             MG_HDR_POOL_TAG
             );
@@ -1157,6 +1347,7 @@ Return Value:
 
             ExReleasePushLockShared(&Generator->CacheLock);
             KeLeaveCriticalRegion();
+            MgpReleaseReference(Generator);
             return STATUS_SUCCESS;
         }
     }
@@ -1167,8 +1358,9 @@ Return Value:
     //
     // Generate header
     //
-    Status = MgpStringBuilderInit(&Builder, MG_INITIAL_HDR_BUFFER_SIZE, MG_HDR_POOL_TAG);
+    Status = MgpStringBuilderInit(&Builder, MG_INITIAL_HDR_BUFFER_SIZE, MG_MAX_HDR_BUFFER_SIZE, MG_HDR_POOL_TAG);
     if (!NT_SUCCESS(Status)) {
+        MgpReleaseReference(Generator);
         return Status;
     }
 
@@ -1237,22 +1429,13 @@ Return Value:
     }
 
     //
-    // Allocate output buffer
+    // Steal builder buffer as output
     //
     OutputSize = Builder.Length;
-    OutputBuffer = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
-        OutputSize + 1,
-        MG_HDR_POOL_TAG
-        );
-
-    if (OutputBuffer == NULL) {
-        Status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
-    }
-
-    RtlCopyMemory(OutputBuffer, Builder.Buffer, OutputSize);
-    OutputBuffer[OutputSize] = '\0';
+    OutputBuffer = Builder.Buffer;
+    Builder.Buffer = NULL;
+    Builder.Length = 0;
+    Builder.Capacity = 0;
 
     //
     // Update cache
@@ -1262,10 +1445,13 @@ Return Value:
 
     if (Generator->CachedHeader != NULL) {
         ExFreePoolWithTag(Generator->CachedHeader, MG_HDR_POOL_TAG);
+        Generator->CachedHeader = NULL;
+        Generator->CachedHeaderSize = 0;
+        Generator->HeaderCacheValid = FALSE;
     }
 
-    Generator->CachedHeader = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
+    Generator->CachedHeader = (PCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         OutputSize + 1,
         MG_HDR_POOL_TAG
         );
@@ -1292,6 +1478,7 @@ Cleanup:
         ExFreePoolWithTag(OutputBuffer, MG_HDR_POOL_TAG);
     }
 
+    MgpReleaseReference(Generator);
     return Status;
 }
 
@@ -1327,16 +1514,21 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized ||
-        MessageContent == NULL || ContentSize == NULL) {
+    if (MessageContent == NULL || ContentSize == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *MessageContent = NULL;
     *ContentSize = 0;
 
-    Status = MgpStringBuilderInit(&Builder, MG_INITIAL_HDR_BUFFER_SIZE, MG_STR_POOL_TAG);
+    Status = MgpAcquireReference(Generator);
     if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    Status = MgpStringBuilderInit(&Builder, MG_INITIAL_HDR_BUFFER_SIZE, MG_MAX_HDR_BUFFER_SIZE, MG_STR_POOL_TAG);
+    if (!NT_SUCCESS(Status)) {
+        MgpReleaseReference(Generator);
         return Status;
     }
 
@@ -1564,22 +1756,13 @@ Return Value:
     }
 
     //
-    // Allocate output buffer
+    // Steal builder buffer as output
     //
     OutputSize = Builder.Length;
-    OutputBuffer = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
-        OutputSize + 1,
-        MG_STR_POOL_TAG
-        );
-
-    if (OutputBuffer == NULL) {
-        Status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
-    }
-
-    RtlCopyMemory(OutputBuffer, Builder.Buffer, OutputSize);
-    OutputBuffer[OutputSize] = '\0';
+    OutputBuffer = Builder.Buffer;
+    Builder.Buffer = NULL;
+    Builder.Length = 0;
+    Builder.Capacity = 0;
 
     *MessageContent = OutputBuffer;
     *ContentSize = OutputSize;
@@ -1592,6 +1775,7 @@ Cleanup:
         ExFreePoolWithTag(OutputBuffer, MG_STR_POOL_TAG);
     }
 
+    MgpReleaseReference(Generator);
     return Status;
 }
 
@@ -1626,7 +1810,7 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized || ErrorCount == NULL) {
+    if (ErrorCount == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1640,11 +1824,16 @@ Return Value:
         *ErrorBufferSize = 0;
     }
 
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
     //
     // Initialize error builder if needed
     //
     if (ErrorMessages != NULL) {
-        Status = MgpStringBuilderInit(&ErrorBuilder, 4096, MG_STR_POOL_TAG);
+        Status = MgpStringBuilderInit(&ErrorBuilder, 4096, MG_MAX_HDR_BUFFER_SIZE, MG_STR_POOL_TAG);
         if (NT_SUCCESS(Status)) {
             BuilderInitialized = TRUE;
         }
@@ -1729,8 +1918,8 @@ Return Value:
     //
     if (BuilderInitialized && ErrorMessages != NULL && ErrorBufferSize != NULL) {
         if (ErrorBuilder.Length > 0) {
-            PCHAR OutputBuffer = (PCHAR)ExAllocatePoolWithTag(
-                PagedPool,
+            PCHAR OutputBuffer = (PCHAR)ExAllocatePool2(
+                POOL_FLAG_PAGED,
                 ErrorBuilder.Length + 1,
                 MG_STR_POOL_TAG
                 );
@@ -1746,10 +1935,11 @@ Return Value:
         MgpStringBuilderCleanup(&ErrorBuilder);
     }
 
+    MgpReleaseReference(Generator);
     return (Errors > 0) ? STATUS_INVALID_PARAMETER : STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 MgGetStatistics(
     _In_ PMG_GENERATOR Generator,
@@ -1767,8 +1957,17 @@ Return Value:
     STATUS_SUCCESS on success.
 --*/
 {
-    if (Generator == NULL || !Generator->Initialized || Stats == NULL) {
+    NTSTATUS Status;
+
+    PAGED_CODE();
+
+    if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    Status = MgpAcquireReference(Generator);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
     }
 
     RtlCopyMemory(Stats, &Generator->Stats, sizeof(MG_GENERATION_STATS));
@@ -1782,28 +1981,50 @@ Return Value:
         Stats->EventCount = Generator->Schema->EventCount;
     }
 
+    MgpReleaseReference(Generator);
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 MgInvalidateCache(
     _In_ PMG_GENERATOR Generator
     )
 /*++
 Routine Description:
-    Invalidates cached content.
+    Invalidates cached content and frees stale buffers.
+    Acquires CacheLock exclusive to prevent races with generation.
 
 Arguments:
     Generator - Generator instance.
 --*/
 {
+    PAGED_CODE();
+
     if (Generator == NULL) {
         return;
     }
 
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Generator->CacheLock);
+
     Generator->ManifestCacheValid = FALSE;
     Generator->HeaderCacheValid = FALSE;
+
+    if (Generator->CachedManifest != NULL) {
+        ExFreePoolWithTag(Generator->CachedManifest, MG_XML_POOL_TAG);
+        Generator->CachedManifest = NULL;
+        Generator->CachedManifestSize = 0;
+    }
+
+    if (Generator->CachedHeader != NULL) {
+        ExFreePoolWithTag(Generator->CachedHeader, MG_HDR_POOL_TAG);
+        Generator->CachedHeader = NULL;
+        Generator->CachedHeaderSize = 0;
+    }
+
+    ExReleasePushLockExclusive(&Generator->CacheLock);
+    KeLeaveCriticalRegion();
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1827,7 +2048,11 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized) {
+    //
+    // No explicit MgpAcquireReference needed — MgRegisterChannel handles ref counting.
+    // Just validate the generator pointer.
+    //
+    if (Generator == NULL || !Generator->Initialized || Generator->ShuttingDown) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1903,13 +2128,9 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized) {
+    if (Generator == NULL || !Generator->Initialized || Generator->ShuttingDown) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    //
-    // Define all standard keywords
-    //
     struct {
         PCSTR Name;
         PCSTR Symbol;
@@ -1965,13 +2186,9 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Generator == NULL || !Generator->Initialized) {
+    if (Generator == NULL || !Generator->Initialized || Generator->ShuttingDown) {
         return STATUS_INVALID_PARAMETER;
     }
-
-    //
-    // Define all standard tasks
-    //
     struct {
         PCSTR Name;
         PCSTR Symbol;
@@ -2012,17 +2229,18 @@ static NTSTATUS
 MgpStringBuilderInit(
     _Out_ PMG_STRING_BUILDER Builder,
     _In_ SIZE_T InitialCapacity,
+    _In_ SIZE_T MaxCapacity,
     _In_ ULONG PoolTag
     )
 /*++
 Routine Description:
-    Initializes a string builder.
+    Initializes a string builder with bounded growth.
 --*/
 {
     RtlZeroMemory(Builder, sizeof(MG_STRING_BUILDER));
 
-    Builder->Buffer = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
+    Builder->Buffer = (PCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         InitialCapacity,
         PoolTag
         );
@@ -2033,6 +2251,7 @@ Routine Description:
 
     Builder->Buffer[0] = '\0';
     Builder->Capacity = InitialCapacity;
+    Builder->MaxCapacity = MaxCapacity;
     Builder->Length = 0;
     Builder->PoolTag = PoolTag;
     Builder->Overflow = FALSE;
@@ -2084,21 +2303,21 @@ Routine Description:
     }
 
     //
-    // Check maximum size
+    // Check maximum size using per-builder limit
     //
-    if (NewCapacity > MG_MAX_XML_BUFFER_SIZE) {
-        if (RequiredCapacity > MG_MAX_XML_BUFFER_SIZE) {
+    if (NewCapacity > Builder->MaxCapacity) {
+        if (RequiredCapacity > Builder->MaxCapacity) {
             Builder->Overflow = TRUE;
             return STATUS_BUFFER_OVERFLOW;
         }
-        NewCapacity = MG_MAX_XML_BUFFER_SIZE;
+        NewCapacity = Builder->MaxCapacity;
     }
 
     //
     // Allocate new buffer
     //
-    NewBuffer = (PCHAR)ExAllocatePoolWithTag(
-        PagedPool,
+    NewBuffer = (PCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
         NewCapacity,
         Builder->PoolTag
         );
@@ -2188,28 +2407,39 @@ MgpStringBuilderAppendFormatV(
 /*++
 Routine Description:
     Appends a formatted string using va_list.
+    Uses pool-allocated temp buffer to avoid consuming kernel stack.
 --*/
 {
     NTSTATUS Status;
-    CHAR TempBuffer[2048];
-    SIZE_T Remaining;
+    PCHAR TempBuffer;
 
     if (Builder->Overflow) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
+    TempBuffer = (PCHAR)ExAllocatePool2(
+        POOL_FLAG_PAGED,
+        MG_FORMAT_TEMP_BUFFER_SIZE,
+        Builder->PoolTag
+        );
+
+    if (TempBuffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     Status = RtlStringCchVPrintfA(
         TempBuffer,
-        sizeof(TempBuffer),
+        MG_FORMAT_TEMP_BUFFER_SIZE,
         Format,
         Args
         );
 
-    if (!NT_SUCCESS(Status)) {
-        return Status;
+    if (NT_SUCCESS(Status)) {
+        Status = MgpStringBuilderAppend(Builder, TempBuffer);
     }
 
-    return MgpStringBuilderAppend(Builder, TempBuffer);
+    ExFreePoolWithTag(TempBuffer, Builder->PoolTag);
+    return Status;
 }
 
 static NTSTATUS
@@ -2345,23 +2575,34 @@ Routine Description:
     }
 
     //
-    // Provider opening
+    // Provider opening — escape all string attributes to prevent XML injection
     //
+    Status = MgpStringBuilderAppend(Builder, "            <provider\r\n                name=\"");
+    if (!NT_SUCCESS(Status)) return Status;
+
+    Status = MgpAppendXmlEscaped(Builder, ProviderName);
+    if (!NT_SUCCESS(Status)) return Status;
+
     Status = MgpStringBuilderAppendFormat(Builder,
-        "            <provider\r\n"
-        "                name=\"%s\"\r\n"
+        "\"\r\n"
         "                guid=\"%s\"\r\n"
         "                symbol=\"%s_PROVIDER\"\r\n"
-        "                resourceFileName=\"%s\"\r\n"
-        "                messageFileName=\"%s\">\r\n"
-        "\r\n",
-        ProviderName,
+        "                resourceFileName=\"",
         GuidString,
-        Generator->ProviderSymbol,
-        Generator->ResourceFile,
-        Generator->MessageFile
+        Generator->ProviderSymbol
         );
+    if (!NT_SUCCESS(Status)) return Status;
 
+    Status = MgpAppendXmlEscaped(Builder, Generator->ResourceFile);
+    if (!NT_SUCCESS(Status)) return Status;
+
+    Status = MgpStringBuilderAppend(Builder, "\"\r\n                messageFileName=\"");
+    if (!NT_SUCCESS(Status)) return Status;
+
+    Status = MgpAppendXmlEscaped(Builder, Generator->MessageFile);
+    if (!NT_SUCCESS(Status)) return Status;
+
+    Status = MgpStringBuilderAppend(Builder, "\">\r\n\r\n");
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
@@ -2449,24 +2690,45 @@ Routine Description:
 
         Channel = CONTAINING_RECORD(Entry, MG_CHANNEL_DEFINITION, ListEntry);
 
-        Status = MgpStringBuilderAppendFormat(Builder,
+        //
+        // Defense-in-depth: bounds check enum values to prevent OOB read
+        //
+        if (Channel->Type > MG_MAX_CHANNEL_TYPE_VALUE ||
+            Channel->Isolation > MG_MAX_ISOLATION_TYPE_VALUE) {
+            Status = STATUS_INTERNAL_ERROR;
+            break;
+        }
+
+        //
+        // Build channel element with XML-escaped name attribute
+        //
+        Status = MgpStringBuilderAppend(Builder,
             "                    <channel\r\n"
-            "                        name=\"%s\"\r\n"
-            "                        chid=\"%s\"\r\n"
-            "                        symbol=\"%s_%s\"\r\n"
-            "                        type=\"%s\"\r\n"
-            "                        isolation=\"%s\"\r\n"
-            "                        enabled=\"%s\"\r\n"
-            "                        message=\"$(string.Channel.%s)\"/>\r\n",
-            Channel->Name,
-            Channel->Symbol,
-            Generator->ProviderSymbol,
-            Channel->Symbol,
-            MgpChannelTypeStrings[Channel->Type],
-            MgpIsolationTypeStrings[Channel->Isolation],
-            Channel->EnabledByDefault ? "true" : "false",
-            Channel->Symbol
+            "                        name=\""
             );
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpAppendXmlEscaped(Builder, Channel->Name);
+        }
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpStringBuilderAppendFormat(Builder,
+                "\"\r\n"
+                "                        chid=\"%s\"\r\n"
+                "                        symbol=\"%s_%s\"\r\n"
+                "                        type=\"%s\"\r\n"
+                "                        isolation=\"%s\"\r\n"
+                "                        enabled=\"%s\"\r\n"
+                "                        message=\"$(string.Channel.%s)\"/>\r\n",
+                Channel->Symbol,
+                Generator->ProviderSymbol,
+                Channel->Symbol,
+                MgpChannelTypeStrings[Channel->Type],
+                MgpIsolationTypeStrings[Channel->Isolation],
+                Channel->EnabledByDefault ? "true" : "false",
+                Channel->Symbol
+                );
+        }
 
         if (!NT_SUCCESS(Status)) {
             break;
@@ -2811,11 +3073,20 @@ Routine Description:
                 InType = MgpFieldTypeToInType[Field->Type];
             }
 
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "                        <data name=\"%s\" inType=\"%s\"/>\r\n",
-                Field->FieldName,
-                InType
+            Status = MgpStringBuilderAppend(Builder,
+                "                        <data name=\""
                 );
+
+            if (NT_SUCCESS(Status)) {
+                Status = MgpAppendXmlEscaped(Builder, Field->FieldName);
+            }
+
+            if (NT_SUCCESS(Status)) {
+                Status = MgpStringBuilderAppendFormat(Builder,
+                    "\" inType=\"%s\"/>\r\n",
+                    InType
+                    );
+            }
 
             if (!NT_SUCCESS(Status)) {
                 break;
@@ -2923,11 +3194,18 @@ Routine Description:
         //
         // Add channel reference if specified
         //
-        if (Event->Channel[0] != '\0') {
-            Status = MgpStringBuilderAppendFormat(Builder,
-                "                        channel=\"%s\"\r\n",
-                Event->Channel
+        if (Event->ChannelName[0] != '\0') {
+            Status = MgpStringBuilderAppend(Builder,
+                "                        channel=\""
                 );
+
+            if (NT_SUCCESS(Status)) {
+                Status = MgpAppendXmlEscaped(Builder, Event->ChannelName);
+            }
+
+            if (NT_SUCCESS(Status)) {
+                Status = MgpStringBuilderAppend(Builder, "\"\r\n");
+            }
 
             if (!NT_SUCCESS(Status)) {
                 break;
@@ -2968,11 +3246,269 @@ MgpGenerateStringTableSection(
     )
 /*++
 Routine Description:
-    Generates the string table section of the manifest.
+    Generates the localization/stringTable section of the manifest.
+    This section is REQUIRED for all $(string.*) references used in
+    channels, levels, tasks, opcodes, keywords, and events.
 --*/
 {
-    // String table generation is handled by the message table generator
-    return STATUS_SUCCESS;
+    NTSTATUS Status;
+    PLIST_ENTRY Entry;
+    PMG_CHANNEL_DEFINITION Channel;
+    PMG_LEVEL_DEFINITION Level;
+    PMG_TASK_DEFINITION Task;
+    PMG_OPCODE_DEFINITION Opcode;
+    PMG_KEYWORD_DEFINITION Keyword;
+    PES_EVENT_DEFINITION Event;
+
+    //
+    // Close provider and events, then open localization section
+    //
+    Status = MgpStringBuilderAppend(Builder,
+        "\r\n"
+        "    <localization>\r\n"
+        "        <resources culture=\"en-US\">\r\n"
+        "            <stringTable>\r\n"
+        );
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Channel strings
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Generator->ChannelLock);
+
+    for (Entry = Generator->ChannelList.Flink;
+         Entry != &Generator->ChannelList;
+         Entry = Entry->Flink) {
+
+        Channel = CONTAINING_RECORD(Entry, MG_CHANNEL_DEFINITION, ListEntry);
+
+        Status = MgpStringBuilderAppendFormat(Builder,
+            "                <string id=\"Channel.%s\" value=\"",
+            Channel->Symbol
+            );
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpAppendXmlEscaped(Builder, Channel->Name);
+        }
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpStringBuilderAppend(Builder, "\"/>\r\n");
+        }
+
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Generator->ChannelLock);
+    KeLeaveCriticalRegion();
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Level strings
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Generator->LevelLock);
+
+    for (Entry = Generator->LevelList.Flink;
+         Entry != &Generator->LevelList;
+         Entry = Entry->Flink) {
+
+        Level = CONTAINING_RECORD(Entry, MG_LEVEL_DEFINITION, ListEntry);
+
+        Status = MgpStringBuilderAppendFormat(Builder,
+            "                <string id=\"Level.%s\" value=\"",
+            Level->Symbol
+            );
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpAppendXmlEscaped(Builder, Level->Name);
+        }
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpStringBuilderAppend(Builder, "\"/>\r\n");
+        }
+
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Generator->LevelLock);
+    KeLeaveCriticalRegion();
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Task strings
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Generator->TaskLock);
+
+    for (Entry = Generator->TaskList.Flink;
+         Entry != &Generator->TaskList;
+         Entry = Entry->Flink) {
+
+        Task = CONTAINING_RECORD(Entry, MG_TASK_DEFINITION, ListEntry);
+
+        Status = MgpStringBuilderAppendFormat(Builder,
+            "                <string id=\"Task.%s\" value=\"",
+            Task->Symbol
+            );
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpAppendXmlEscaped(Builder, Task->Name);
+        }
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpStringBuilderAppend(Builder, "\"/>\r\n");
+        }
+
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Generator->TaskLock);
+    KeLeaveCriticalRegion();
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Opcode strings
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Generator->OpcodeLock);
+
+    for (Entry = Generator->OpcodeList.Flink;
+         Entry != &Generator->OpcodeList;
+         Entry = Entry->Flink) {
+
+        Opcode = CONTAINING_RECORD(Entry, MG_OPCODE_DEFINITION, ListEntry);
+
+        Status = MgpStringBuilderAppendFormat(Builder,
+            "                <string id=\"Opcode.%s\" value=\"",
+            Opcode->Symbol
+            );
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpAppendXmlEscaped(Builder, Opcode->Name);
+        }
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpStringBuilderAppend(Builder, "\"/>\r\n");
+        }
+
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Generator->OpcodeLock);
+    KeLeaveCriticalRegion();
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Keyword strings
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Generator->KeywordLock);
+
+    for (Entry = Generator->KeywordList.Flink;
+         Entry != &Generator->KeywordList;
+         Entry = Entry->Flink) {
+
+        Keyword = CONTAINING_RECORD(Entry, MG_KEYWORD_DEFINITION, ListEntry);
+
+        Status = MgpStringBuilderAppendFormat(Builder,
+            "                <string id=\"Keyword.%s\" value=\"",
+            Keyword->Symbol
+            );
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpAppendXmlEscaped(Builder, Keyword->Name);
+        }
+
+        if (NT_SUCCESS(Status)) {
+            Status = MgpStringBuilderAppend(Builder, "\"/>\r\n");
+        }
+
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Generator->KeywordLock);
+    KeLeaveCriticalRegion();
+
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+
+    //
+    // Event strings from schema
+    //
+    if (Generator->Schema != NULL && Generator->Schema->EventCount > 0) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&Generator->Schema->EventLock);
+
+        for (Entry = Generator->Schema->EventList.Flink;
+             Entry != &Generator->Schema->EventList;
+             Entry = Entry->Flink) {
+
+            Event = CONTAINING_RECORD(Entry, ES_EVENT_DEFINITION, ListEntry);
+
+            Status = MgpStringBuilderAppendFormat(Builder,
+                "                <string id=\"Event.%s\" value=\"",
+                Event->EventName
+                );
+
+            if (NT_SUCCESS(Status)) {
+                PCSTR Desc = (Event->Description[0] != '\0') ? Event->Description : Event->EventName;
+                Status = MgpAppendXmlEscaped(Builder, Desc);
+            }
+
+            if (NT_SUCCESS(Status)) {
+                Status = MgpStringBuilderAppend(Builder, "\"/>\r\n");
+            }
+
+            if (!NT_SUCCESS(Status)) {
+                break;
+            }
+        }
+
+        ExReleasePushLockShared(&Generator->Schema->EventLock);
+        KeLeaveCriticalRegion();
+
+        if (!NT_SUCCESS(Status)) {
+            return Status;
+        }
+    }
+
+    //
+    // Close localization section
+    //
+    Status = MgpStringBuilderAppend(Builder,
+        "            </stringTable>\r\n"
+        "        </resources>\r\n"
+        "    </localization>\r\n"
+        );
+
+    return Status;
 }
 
 static NTSTATUS
@@ -3301,6 +3837,8 @@ MgpRegisterDefaultLevels(
 /*++
 Routine Description:
     Registers the default ETW levels.
+    Called ONLY from MgInitialize before the generator is published,
+    so no lock acquisition is needed (single-threaded context).
 --*/
 {
     PMG_LEVEL_DEFINITION Level;
@@ -3318,17 +3856,16 @@ Routine Description:
     };
 
     for (ULONG i = 0; i < ARRAYSIZE(Levels); i++) {
-        Level = (PMG_LEVEL_DEFINITION)ExAllocatePoolWithTag(
-            PagedPool,
+        Level = (PMG_LEVEL_DEFINITION)ExAllocatePool2(
+            POOL_FLAG_PAGED,
             sizeof(MG_LEVEL_DEFINITION),
-            MG_POOL_TAG
+            MG_LVL_POOL_TAG
             );
 
         if (Level == NULL) {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        RtlZeroMemory(Level, sizeof(MG_LEVEL_DEFINITION));
         RtlStringCchCopyA(Level->Name, sizeof(Level->Name), Levels[i].Name);
         RtlStringCchCopyA(Level->Symbol, sizeof(Level->Symbol), Levels[i].Symbol);
         Level->Value = Levels[i].Value;
@@ -3346,10 +3883,6 @@ static VOID
 MgpFreeChannelList(
     _Inout_ PLIST_ENTRY ListHead
     )
-/*++
-Routine Description:
-    Frees all entries in a channel list.
---*/
 {
     PLIST_ENTRY Entry;
     PMG_CHANNEL_DEFINITION Channel;
@@ -3357,7 +3890,7 @@ Routine Description:
     while (!IsListEmpty(ListHead)) {
         Entry = RemoveHeadList(ListHead);
         Channel = CONTAINING_RECORD(Entry, MG_CHANNEL_DEFINITION, ListEntry);
-        ExFreePoolWithTag(Channel, MG_POOL_TAG);
+        ExFreePoolWithTag(Channel, MG_CHN_POOL_TAG);
     }
 }
 
@@ -3365,10 +3898,6 @@ static VOID
 MgpFreeTaskList(
     _Inout_ PLIST_ENTRY ListHead
     )
-/*++
-Routine Description:
-    Frees all entries in a task list.
---*/
 {
     PLIST_ENTRY Entry;
     PMG_TASK_DEFINITION Task;
@@ -3376,7 +3905,7 @@ Routine Description:
     while (!IsListEmpty(ListHead)) {
         Entry = RemoveHeadList(ListHead);
         Task = CONTAINING_RECORD(Entry, MG_TASK_DEFINITION, ListEntry);
-        ExFreePoolWithTag(Task, MG_POOL_TAG);
+        ExFreePoolWithTag(Task, MG_TSK_POOL_TAG);
     }
 }
 
@@ -3384,10 +3913,6 @@ static VOID
 MgpFreeKeywordList(
     _Inout_ PLIST_ENTRY ListHead
     )
-/*++
-Routine Description:
-    Frees all entries in a keyword list.
---*/
 {
     PLIST_ENTRY Entry;
     PMG_KEYWORD_DEFINITION Keyword;
@@ -3395,7 +3920,7 @@ Routine Description:
     while (!IsListEmpty(ListHead)) {
         Entry = RemoveHeadList(ListHead);
         Keyword = CONTAINING_RECORD(Entry, MG_KEYWORD_DEFINITION, ListEntry);
-        ExFreePoolWithTag(Keyword, MG_POOL_TAG);
+        ExFreePoolWithTag(Keyword, MG_KWD_POOL_TAG);
     }
 }
 
@@ -3403,10 +3928,6 @@ static VOID
 MgpFreeOpcodeList(
     _Inout_ PLIST_ENTRY ListHead
     )
-/*++
-Routine Description:
-    Frees all entries in an opcode list.
---*/
 {
     PLIST_ENTRY Entry;
     PMG_OPCODE_DEFINITION Opcode;
@@ -3414,7 +3935,7 @@ Routine Description:
     while (!IsListEmpty(ListHead)) {
         Entry = RemoveHeadList(ListHead);
         Opcode = CONTAINING_RECORD(Entry, MG_OPCODE_DEFINITION, ListEntry);
-        ExFreePoolWithTag(Opcode, MG_POOL_TAG);
+        ExFreePoolWithTag(Opcode, MG_OPC_POOL_TAG);
     }
 }
 
@@ -3422,10 +3943,6 @@ static VOID
 MgpFreeLevelList(
     _Inout_ PLIST_ENTRY ListHead
     )
-/*++
-Routine Description:
-    Frees all entries in a level list.
---*/
 {
     PLIST_ENTRY Entry;
     PMG_LEVEL_DEFINITION Level;
@@ -3433,6 +3950,6 @@ Routine Description:
     while (!IsListEmpty(ListHead)) {
         Entry = RemoveHeadList(ListHead);
         Level = CONTAINING_RECORD(Entry, MG_LEVEL_DEFINITION, ListEntry);
-        ExFreePoolWithTag(Level, MG_POOL_TAG);
+        ExFreePoolWithTag(Level, MG_LVL_POOL_TAG);
     }
 }

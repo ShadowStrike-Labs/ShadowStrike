@@ -108,9 +108,9 @@ typedef struct _MM_PROCESS_CONTEXT {
     PEPROCESS ProcessObject;
     UINT64 ProcessCreateTime;
     
-    // Tracked regions
+    // Tracked regions (push lock allows APC_LEVEL acquisition, no DISPATCH constraint)
     LIST_ENTRY TrackedRegions;
-    KSPIN_LOCK RegionLock;
+    EX_PUSH_LOCK RegionLock;
     UINT32 TrackedRegionCount;
     
     // Statistics
@@ -150,9 +150,12 @@ typedef struct _MM_PROCESS_CONTEXT {
  */
 typedef struct _MEMORY_MONITOR_GLOBALS {
     // Initialization state
-    BOOLEAN Initialized;
+    volatile LONG InitState;              // 0=uninit, 1=initializing, 2=initialized
+    volatile LONG ShuttingDown;
+    KEVENT ShutdownEvent;
+    volatile LONG OutstandingRefs;
     BOOLEAN Enabled;
-    UINT16 Reserved1;
+    UINT8 Reserved1[3];
     
     // Configuration
     MEMORY_MONITOR_CONFIG Config;
@@ -177,13 +180,28 @@ typedef struct _MEMORY_MONITOR_GLOBALS {
     
     // Rate limiting
     volatile LONG EventsThisSecond;
-    UINT64 CurrentSecondStart;
+    volatile LONG64 CurrentSecondStart;
     
     // Callback registrations (for hooks)
     PVOID AllocationCallbackHandle;
     PVOID ProtectionCallbackHandle;
     PVOID SectionCallbackHandle;
 } MEMORY_MONITOR_GLOBALS, *PMEMORY_MONITOR_GLOBALS;
+
+/**
+ * @brief Safe statistics output structure (no sync primitives or internal pointers).
+ */
+typedef struct _MEMORY_MONITOR_STATISTICS {
+    BOOLEAN Enabled;
+    UINT8 Reserved[3];
+    UINT32 ProcessContextCount;
+    LONG64 TotalEventsProcessed;
+    LONG64 TotalShellcodeDetections;
+    LONG64 TotalInjectionDetections;
+    LONG64 TotalHollowingDetections;
+    LONG64 EventsDropped;
+    MEMORY_MONITOR_CONFIG Config;
+} MEMORY_MONITOR_STATISTICS, *PMEMORY_MONITOR_STATISTICS;
 
 // ============================================================================
 // PUBLIC API
@@ -224,12 +242,12 @@ MmMonitorUpdateConfig(
 
 /**
  * @brief Get current memory monitor statistics.
- * @param Stats Output statistics structure.
+ * @param Stats Output statistics structure (safe copy, no internal state).
  * @return STATUS_SUCCESS on success.
  */
 NTSTATUS
 MmMonitorGetStatistics(
-    _Out_ PMEMORY_MONITOR_GLOBALS Stats
+    _Out_ PMEMORY_MONITOR_STATISTICS Stats
     );
 
 // ============================================================================

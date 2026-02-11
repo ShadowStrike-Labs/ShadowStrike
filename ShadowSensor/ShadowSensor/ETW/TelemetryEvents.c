@@ -7,28 +7,42 @@
  * @brief Enterprise-grade ETW telemetry implementation for kernel-mode EDR.
  *
  * This module implements high-performance telemetry streaming with:
- * - Lock-free event submission using per-CPU buffers
- * - Batched ETW writes for reduced syscall overhead
- * - Adaptive rate limiting and throttling
- * - Automatic memory management via lookaside lists
- * - Graceful degradation under memory pressure
+ * - Lookaside-based event allocation (prevents kernel stack overflow)
+ * - Synchronous ETW writes with atomic state management
+ * - Adaptive rate limiting and throttling with interlocked operations
+ * - Bounded string operations (wcsnlen/strnlen) for safety
+ * - Kernel-safe string formatting via ntstrsafe.h
+ * - Proper DPC draining on shutdown (KeFlushQueuedDpcs)
+ * - Atomic state machine for init/shutdown/pause/resume
+ * - RW spinlock-protected configuration for DISPATCH_LEVEL safety
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
+
+#include <initguid.h>
+
+// ============================================================================
+// ETW PROVIDER GUID DEFINITION
+// ============================================================================
+
+// {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+DEFINE_GUID(SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID,
+    0xA1B2C3D4, 0xE5F6, 0x7890, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x90);
 
 #include "TelemetryEvents.h"
 #include "../Utilities/MemoryUtils.h"
 #include "../Utilities/StringUtils.h"
 #include "../Sync/SpinLock.h"
+#include <ntstrsafe.h>
 
 // ============================================================================
 // PRIVATE CONSTANTS
 // ============================================================================
 
-#define TE_VERSION                      1
+#define TE_VERSION                      2
 #define TE_CORRELATION_SEED             0x5348414457535452ULL  // "SHADOWSTR"
 #define TE_MAX_ETW_DATA_DESCRIPTORS     16
 #define TE_FLUSH_WORK_ITEM_DELAY_MS     10
@@ -38,14 +52,8 @@
 // GLOBAL STATE
 // ============================================================================
 
-/**
- * @brief Global telemetry provider instance.
- */
 static TE_PROVIDER g_TeProvider = { 0 };
 
-/**
- * @brief Correlation ID counter for unique IDs.
- */
 static volatile LONG64 g_CorrelationCounter = 0;
 
 // ============================================================================
@@ -117,10 +125,183 @@ TepAcquireReference(
     VOID
     );
 
+static BOOLEAN
+TepTryAcquireReference(
+    VOID
+    );
+
 static VOID
 TepReleaseReference(
     VOID
     );
+
+static VOID
+TepIncrementLevelStats(
+    _In_ TE_EVENT_LEVEL Level
+    );
+
+static PVOID
+TepAllocateEvent(
+    VOID
+    );
+
+static VOID
+TepFreeEvent(
+    _In_ PVOID EventBuffer
+    );
+
+static VOID
+TepCopyUnicodeStringSafe(
+    _Out_writes_(MaxChars) PWCHAR Dest,
+    _In_ SIZE_T MaxChars,
+    _In_opt_ PCUNICODE_STRING Source
+    );
+
+static VOID
+TepCopyPcwstrSafe(
+    _Out_writes_(MaxChars) PWCHAR Dest,
+    _In_ SIZE_T MaxChars,
+    _In_opt_ PCWSTR Source
+    );
+
+static VOID
+TepCopyAnsiStringSafe(
+    _Out_writes_(MaxBytes) PCHAR Dest,
+    _In_ SIZE_T MaxBytes,
+    _In_opt_ PCSTR Source
+    );
+
+// ============================================================================
+// SAFE STRING COPY HELPERS
+// ============================================================================
+
+static VOID
+TepCopyUnicodeStringSafe(
+    _Out_writes_(MaxChars) PWCHAR Dest,
+    _In_ SIZE_T MaxChars,
+    _In_opt_ PCUNICODE_STRING Source
+    )
+{
+    SIZE_T copyChars;
+
+    if (MaxChars == 0) {
+        return;
+    }
+
+    Dest[0] = L'\0';
+
+    if (Source == NULL || Source->Buffer == NULL || Source->Length == 0) {
+        return;
+    }
+
+    copyChars = Source->Length / sizeof(WCHAR);
+    if (copyChars >= MaxChars) {
+        copyChars = MaxChars - 1;
+    }
+
+    RtlCopyMemory(Dest, Source->Buffer, copyChars * sizeof(WCHAR));
+    Dest[copyChars] = L'\0';
+}
+
+static VOID
+TepCopyPcwstrSafe(
+    _Out_writes_(MaxChars) PWCHAR Dest,
+    _In_ SIZE_T MaxChars,
+    _In_opt_ PCWSTR Source
+    )
+{
+    SIZE_T copyChars;
+
+    if (MaxChars == 0) {
+        return;
+    }
+
+    Dest[0] = L'\0';
+
+    if (Source == NULL) {
+        return;
+    }
+
+    copyChars = wcsnlen(Source, MaxChars);
+    if (copyChars >= MaxChars) {
+        copyChars = MaxChars - 1;
+    }
+
+    RtlCopyMemory(Dest, Source, copyChars * sizeof(WCHAR));
+    Dest[copyChars] = L'\0';
+}
+
+static VOID
+TepCopyAnsiStringSafe(
+    _Out_writes_(MaxBytes) PCHAR Dest,
+    _In_ SIZE_T MaxBytes,
+    _In_opt_ PCSTR Source
+    )
+{
+    SIZE_T copyBytes;
+
+    if (MaxBytes == 0) {
+        return;
+    }
+
+    Dest[0] = '\0';
+
+    if (Source == NULL) {
+        return;
+    }
+
+    copyBytes = strnlen(Source, MaxBytes);
+    if (copyBytes >= MaxBytes) {
+        copyBytes = MaxBytes - 1;
+    }
+
+    RtlCopyMemory(Dest, Source, copyBytes);
+    Dest[copyBytes] = '\0';
+}
+
+// ============================================================================
+// LOOKASIDE EVENT ALLOCATION
+// ============================================================================
+
+static PVOID
+TepAllocateEvent(
+    VOID
+    )
+{
+    PVOID buffer;
+
+    buffer = ShadowStrikeLookasideAllocate(&g_TeProvider.EventLookaside);
+    if (buffer == NULL) {
+        InterlockedIncrement64(&g_TeProvider.Stats.AllocationFailures);
+        return NULL;
+    }
+
+    return buffer;
+}
+
+static VOID
+TepFreeEvent(
+    _In_ PVOID EventBuffer
+    )
+{
+    if (EventBuffer != NULL) {
+        ShadowStrikeLookasideFree(&g_TeProvider.EventLookaside, EventBuffer);
+    }
+}
+
+// ============================================================================
+// LEVEL STATS WITH BOUNDS CHECK
+// ============================================================================
+
+static VOID
+TepIncrementLevelStats(
+    _In_ TE_EVENT_LEVEL Level
+    )
+{
+    if ((ULONG)Level < TE_MAX_EVENT_LEVELS) {
+        InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[Level]);
+    }
+}
 
 // ============================================================================
 // INITIALIZATION AND SHUTDOWN
@@ -134,64 +315,56 @@ TeInitialize(
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    ULONG cpuCount;
-    ULONG i;
     LARGE_INTEGER dueTime;
+    BOOLEAN lookasideInitialized = FALSE;
+    BOOLEAN etwRegistered = FALSE;
+    BOOLEAN workItemAllocated = FALSE;
 
     PAGED_CODE();
 
-    //
-    // Validate parameters
-    //
     if (DeviceObject == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     //
-    // Check if already initialized
+    // Atomic transition from Uninitialized to Initializing.
+    // Prevents double-initialization race.
     //
-    if (g_TeProvider.Initialized) {
+    if (InterlockedCompareExchange(
+            &g_TeProvider.State,
+            (LONG)TeState_Initializing,
+            (LONG)TeState_Uninitialized) != (LONG)TeState_Uninitialized) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
     //
-    // Set state to initializing
+    // Initialize synchronization
     //
-    g_TeProvider.State = TeState_Initializing;
+    ShadowStrikeInitializeRWSpinLock(&g_TeProvider.ConfigLock);
+    ShadowStrikeInitializeRWSpinLock(&g_TeProvider.StatsLock);
 
     //
-    // Initialize synchronization primitives
-    //
-    ShadowStrikeInitializeRWSpinLock(&g_TeProvider.StateLock);
-    ExInitializePushLock(&g_TeProvider.ConfigLock);
-
-    //
-    // Initialize shutdown event
+    // Initialize shutdown event and reference count
     //
     KeInitializeEvent(&g_TeProvider.ShutdownEvent, NotificationEvent, FALSE);
     g_TeProvider.ReferenceCount = 1;
+    g_TeProvider.HeartbeatRunning = 0;
 
-    //
-    // Store device object for work items
-    //
     g_TeProvider.DeviceObject = DeviceObject;
 
     //
-    // Apply configuration (use defaults if not provided)
+    // Apply configuration
     //
     if (Config != NULL) {
         RtlCopyMemory(&g_TeProvider.Config, Config, sizeof(TE_CONFIG));
     } else {
-        //
-        // Set default configuration
-        //
         g_TeProvider.Config.Enabled = TRUE;
-        g_TeProvider.Config.EnableBatching = TRUE;
+        g_TeProvider.Config.EnableBatching = FALSE;
         g_TeProvider.Config.EnableThrottling = TRUE;
         g_TeProvider.Config.EnableSampling = TRUE;
         g_TeProvider.Config.EnableCorrelation = TRUE;
         g_TeProvider.Config.EnableCompression = FALSE;
-        g_TeProvider.Config.MinLevel = TeLevel_Informational;
+        g_TeProvider.Config.MaxVerbosity = TeLevel_Informational;
         g_TeProvider.Config.EnabledKeywords = TeKeyword_All;
         g_TeProvider.Config.MaxEventsPerSecond = TE_MAX_EVENTS_PER_SECOND;
         g_TeProvider.Config.SamplingRate = 10;
@@ -204,64 +377,46 @@ TeInitialize(
     }
 
     //
-    // Initialize lookaside lists for event buffers
+    // Validate and clamp critical config values
+    //
+    if (g_TeProvider.Config.SamplingRate == 0) {
+        g_TeProvider.Config.SamplingRate = 1;
+    }
+    if (g_TeProvider.Config.MaxEventsPerSecond == 0) {
+        g_TeProvider.Config.MaxEventsPerSecond = TE_MAX_EVENTS_PER_SECOND;
+    }
+    if (g_TeProvider.Config.ThrottleThreshold == 0) {
+        g_TeProvider.Config.ThrottleThreshold = g_TeProvider.Config.MaxEventsPerSecond / 2;
+    }
+
+    //
+    // Populate cached config for lock-free hot-path reads.
+    //
+    InterlockedExchange(&g_TeProvider.CachedEnableThrottling,
+                        (LONG)g_TeProvider.Config.EnableThrottling);
+    InterlockedExchange(&g_TeProvider.CachedSamplingRate,
+                        (LONG)g_TeProvider.Config.SamplingRate);
+    InterlockedExchange(&g_TeProvider.CachedThrottleThreshold,
+                        (LONG)g_TeProvider.Config.ThrottleThreshold);
+    InterlockedExchange(&g_TeProvider.CachedThrottleRecoveryMs,
+                        (LONG)g_TeProvider.Config.ThrottleRecoveryMs);
+
+    //
+    // Initialize lookaside list for event buffers.
+    // TE_MAX_EVENT_DATA_SIZE (16KB) is large enough for any event struct.
     //
     status = ShadowStrikeLookasideInit(
         &g_TeProvider.EventLookaside,
         TE_MAX_EVENT_DATA_SIZE,
         TE_EVENT_TAG,
         TE_LOOKASIDE_DEPTH,
-        FALSE  // Non-paged
+        FALSE
     );
 
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
-
-    //
-    // Initialize small event lookaside for common events
-    //
-    ExInitializeNPagedLookasideList(
-        &g_TeProvider.SmallEventLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(TE_PROCESS_EVENT),
-        TE_EVENT_TAG,
-        0
-    );
-
-    //
-    // Allocate per-CPU buffers
-    //
-    cpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (cpuCount > TE_MAX_CPU_BUFFERS) {
-        cpuCount = TE_MAX_CPU_BUFFERS;
-    }
-
-    g_TeProvider.CpuBuffers = (PTE_CPU_BUFFER)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        cpuCount * sizeof(TE_CPU_BUFFER),
-        TE_POOL_TAG
-    );
-
-    if (g_TeProvider.CpuBuffers == NULL) {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        goto Cleanup;
-    }
-
-    g_TeProvider.CpuCount = cpuCount;
-
-    //
-    // Initialize per-CPU buffers
-    //
-    for (i = 0; i < cpuCount; i++) {
-        ExInitializeSListHead(&g_TeProvider.CpuBuffers[i].FreeList);
-        ExInitializeSListHead(&g_TeProvider.CpuBuffers[i].PendingList);
-        g_TeProvider.CpuBuffers[i].PendingCount = 0;
-        g_TeProvider.CpuBuffers[i].FreeCount = 0;
-        g_TeProvider.CpuBuffers[i].LastFlushTime = 0;
-    }
+    lookasideInitialized = TRUE;
 
     //
     // Register ETW provider
@@ -276,33 +431,39 @@ TeInitialize(
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
+    etwRegistered = TRUE;
 
     //
-    // Allocate and initialize flush work item
+    // Allocate flush work item
     //
     g_TeProvider.FlushWorkItem = IoAllocateWorkItem(DeviceObject);
     if (g_TeProvider.FlushWorkItem == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Cleanup;
     }
+    workItemAllocated = TRUE;
 
     //
-    // Initialize flush timer and DPC
+    // Initialize timers and DPCs
     //
     KeInitializeTimer(&g_TeProvider.FlushTimer);
     KeInitializeDpc(&g_TeProvider.FlushDpc, TepFlushDpcRoutine, &g_TeProvider);
 
-    //
-    // Initialize heartbeat timer and DPC
-    //
     KeInitializeTimer(&g_TeProvider.HeartbeatTimer);
     KeInitializeDpc(&g_TeProvider.HeartbeatDpc, TepHeartbeatDpcRoutine, &g_TeProvider);
 
     //
     // Record start time
     //
-    KeQuerySystemTime(&g_TeProvider.Stats.StartTime);
-    g_TeProvider.Stats.CurrentSecondStart = g_TeProvider.Stats.StartTime.QuadPart;
+    {
+        LARGE_INTEGER startTime;
+        KeQuerySystemTime(&startTime);
+        InterlockedExchange64(&g_TeProvider.Stats.StartTime, startTime.QuadPart);
+        InterlockedExchange64(
+            &g_TeProvider.Stats.CurrentSecondStart,
+            startTime.QuadPart
+        );
+    }
 
     //
     // Start flush timer
@@ -326,17 +487,14 @@ TeInitialize(
             g_TeProvider.Config.HeartbeatIntervalMs,
             &g_TeProvider.HeartbeatDpc
         );
+        InterlockedExchange(&g_TeProvider.HeartbeatRunning, 1);
     }
 
     //
-    // Mark as initialized and running
+    // Atomically transition to Running
     //
-    g_TeProvider.Initialized = TRUE;
-    g_TeProvider.State = TeState_Running;
+    InterlockedExchange(&g_TeProvider.State, (LONG)TeState_Running);
 
-    //
-    // Log initialization event
-    //
     TeLogOperational(
         TeEvent_DriverLoaded,
         TeLevel_Informational,
@@ -348,28 +506,21 @@ TeInitialize(
     return STATUS_SUCCESS;
 
 Cleanup:
-    //
-    // Cleanup on failure
-    //
-    if (g_TeProvider.RegistrationHandle != 0) {
+    if (etwRegistered) {
         EtwUnregister(g_TeProvider.RegistrationHandle);
         g_TeProvider.RegistrationHandle = 0;
     }
 
-    if (g_TeProvider.FlushWorkItem != NULL) {
+    if (workItemAllocated) {
         IoFreeWorkItem(g_TeProvider.FlushWorkItem);
         g_TeProvider.FlushWorkItem = NULL;
     }
 
-    if (g_TeProvider.CpuBuffers != NULL) {
-        ShadowStrikeFreePoolWithTag(g_TeProvider.CpuBuffers, TE_POOL_TAG);
-        g_TeProvider.CpuBuffers = NULL;
+    if (lookasideInitialized) {
+        ShadowStrikeLookasideCleanup(&g_TeProvider.EventLookaside);
     }
 
-    ShadowStrikeLookasideCleanup(&g_TeProvider.EventLookaside);
-    ExDeleteNPagedLookasideList(&g_TeProvider.SmallEventLookaside);
-
-    g_TeProvider.State = TeState_Error;
+    InterlockedExchange(&g_TeProvider.State, (LONG)TeState_Error);
 
     return status;
 }
@@ -384,18 +535,22 @@ TeShutdown(
 
     PAGED_CODE();
 
-    if (!g_TeProvider.Initialized) {
-        return;
+    //
+    // Atomic transition to ShuttingDown. Only proceed from Running or Paused.
+    //
+    if (InterlockedCompareExchange(
+            &g_TeProvider.State,
+            (LONG)TeState_ShuttingDown,
+            (LONG)TeState_Running) != (LONG)TeState_Running) {
+
+        if (InterlockedCompareExchange(
+                &g_TeProvider.State,
+                (LONG)TeState_ShuttingDown,
+                (LONG)TeState_Paused) != (LONG)TeState_Paused) {
+            return;
+        }
     }
 
-    //
-    // Set shutdown state
-    //
-    g_TeProvider.State = TeState_ShuttingDown;
-
-    //
-    // Log shutdown event before disabling
-    //
     TeLogOperational(
         TeEvent_DriverUnloading,
         TeLevel_Informational,
@@ -409,14 +564,21 @@ TeShutdown(
     //
     KeCancelTimer(&g_TeProvider.FlushTimer);
     KeCancelTimer(&g_TeProvider.HeartbeatTimer);
+    InterlockedExchange(&g_TeProvider.HeartbeatRunning, 0);
 
     //
-    // Flush remaining events
+    // CRITICAL: Wait for any queued DPCs to complete before freeing resources.
+    // Without this, a DPC could fire and access freed work items/state.
+    //
+    KeFlushQueuedDpcs();
+
+    //
+    // Flush remaining events (synchronous write, updates timestamp)
     //
     TeFlush();
 
     //
-    // Wait for pending operations with timeout
+    // Release init reference and wait for active operations to drain
     //
     TepReleaseReference();
     timeout.QuadPart = -((LONGLONG)TE_SHUTDOWN_TIMEOUT_MS * 10000);
@@ -429,7 +591,7 @@ TeShutdown(
     );
 
     //
-    // Free work item
+    // Free work item (safe now — DPCs are drained)
     //
     if (g_TeProvider.FlushWorkItem != NULL) {
         IoFreeWorkItem(g_TeProvider.FlushWorkItem);
@@ -445,24 +607,11 @@ TeShutdown(
     }
 
     //
-    // Free per-CPU buffers
-    //
-    if (g_TeProvider.CpuBuffers != NULL) {
-        ShadowStrikeFreePoolWithTag(g_TeProvider.CpuBuffers, TE_POOL_TAG);
-        g_TeProvider.CpuBuffers = NULL;
-    }
-
-    //
-    // Cleanup lookaside lists
+    // Cleanup lookaside list
     //
     ShadowStrikeLookasideCleanup(&g_TeProvider.EventLookaside);
-    ExDeleteNPagedLookasideList(&g_TeProvider.SmallEventLookaside);
 
-    //
-    // Mark as shutdown
-    //
-    g_TeProvider.Initialized = FALSE;
-    g_TeProvider.State = TeState_Shutdown;
+    InterlockedExchange(&g_TeProvider.State, (LONG)TeState_Shutdown);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -471,9 +620,9 @@ TeIsEnabled(
     VOID
     )
 {
-    return (g_TeProvider.Initialized &&
-            g_TeProvider.State == TeState_Running &&
-            g_TeProvider.Config.Enabled);
+    LONG state = g_TeProvider.State;
+
+    return (state == (LONG)TeState_Running && g_TeProvider.Config.Enabled);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -483,34 +632,41 @@ TeIsEventEnabled(
     _In_ UINT64 Keywords
     )
 {
+    UCHAR enableLevel;
+    ULONGLONG enableFlags;
+    TE_CONFIG config;
+    KIRQL oldIrql;
+
     if (!TeIsEnabled()) {
         return FALSE;
     }
 
     //
-    // Check level filter
+    // Check ETW consumer filter (set by TepEnableCallback, volatile reads)
     //
-    if ((UCHAR)Level > g_TeProvider.EnableLevel &&
-        g_TeProvider.EnableLevel != 0) {
+    enableLevel = g_TeProvider.EnableLevel;
+    enableFlags = g_TeProvider.EnableFlags;
+
+    if (enableLevel != 0 && (UCHAR)Level > enableLevel) {
+        return FALSE;
+    }
+
+    if (enableFlags != 0 && (Keywords & enableFlags) == 0) {
         return FALSE;
     }
 
     //
-    // Check keyword filter
+    // Check config filter (protected by spinlock for consistency)
     //
-    if ((Keywords & g_TeProvider.EnableFlags) == 0 &&
-        g_TeProvider.EnableFlags != 0) {
+    ShadowStrikeAcquireRWSpinLockShared(&g_TeProvider.ConfigLock, &oldIrql);
+    config = g_TeProvider.Config;
+    ShadowStrikeReleaseRWSpinLockShared(&g_TeProvider.ConfigLock, oldIrql);
+
+    if ((UCHAR)Level > (UCHAR)config.MaxVerbosity) {
         return FALSE;
     }
 
-    //
-    // Check config filter
-    //
-    if ((UCHAR)Level > (UCHAR)g_TeProvider.Config.MinLevel) {
-        return FALSE;
-    }
-
-    if ((Keywords & g_TeProvider.Config.EnabledKeywords) == 0) {
+    if ((Keywords & config.EnabledKeywords) == 0) {
         return FALSE;
     }
 
@@ -521,42 +677,62 @@ TeIsEventEnabled(
 // CONFIGURATION
 // ============================================================================
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeSetConfig(
     _In_ PTE_CONFIG Config
     )
 {
-    PAGED_CODE();
+    KIRQL oldIrql;
+    TE_CONFIG validated;
 
     if (Config == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_TeProvider.Initialized) {
+    if (g_TeProvider.State != (LONG)TeState_Running &&
+        g_TeProvider.State != (LONG)TeState_Paused) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
-    // Acquire config lock
+    // Copy and validate — never apply unvalidated config to global state.
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&g_TeProvider.ConfigLock);
+    RtlCopyMemory(&validated, Config, sizeof(TE_CONFIG));
+
+    if (validated.SamplingRate == 0) {
+        validated.SamplingRate = 1;
+    }
+    if (validated.MaxEventsPerSecond == 0) {
+        validated.MaxEventsPerSecond = TE_MAX_EVENTS_PER_SECOND;
+    }
+    if (validated.ThrottleThreshold == 0) {
+        validated.ThrottleThreshold = validated.MaxEventsPerSecond / 2;
+    }
+    if (validated.ThrottleRecoveryMs == 0) {
+        validated.ThrottleRecoveryMs = 1000;
+    }
+    if ((UCHAR)validated.MaxVerbosity < (UCHAR)TeLevel_Critical ||
+        (UCHAR)validated.MaxVerbosity > (UCHAR)TeLevel_Verbose) {
+        validated.MaxVerbosity = TeLevel_Informational;
+    }
+
+    ShadowStrikeAcquireRWSpinLockExclusive(&g_TeProvider.ConfigLock, &oldIrql);
+    RtlCopyMemory(&g_TeProvider.Config, &validated, sizeof(TE_CONFIG));
+    ShadowStrikeReleaseRWSpinLockExclusive(&g_TeProvider.ConfigLock, oldIrql);
 
     //
-    // Copy new configuration
+    // Update cached config atomically for lock-free hot-path reads.
     //
-    RtlCopyMemory(&g_TeProvider.Config, Config, sizeof(TE_CONFIG));
+    InterlockedExchange(&g_TeProvider.CachedEnableThrottling,
+                        (LONG)validated.EnableThrottling);
+    InterlockedExchange(&g_TeProvider.CachedSamplingRate,
+                        (LONG)validated.SamplingRate);
+    InterlockedExchange(&g_TeProvider.CachedThrottleThreshold,
+                        (LONG)validated.ThrottleThreshold);
+    InterlockedExchange(&g_TeProvider.CachedThrottleRecoveryMs,
+                        (LONG)validated.ThrottleRecoveryMs);
 
-    //
-    // Release lock
-    //
-    ExReleasePushLockExclusive(&g_TeProvider.ConfigLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Log config change
-    //
     TeLogOperational(
         TeEvent_ConfigChange,
         TeLevel_Informational,
@@ -574,18 +750,20 @@ TeGetConfig(
     _Out_ PTE_CONFIG Config
     )
 {
+    KIRQL oldIrql;
+
     if (Config == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_TeProvider.Initialized) {
+    if (g_TeProvider.State == (LONG)TeState_Uninitialized ||
+        g_TeProvider.State == (LONG)TeState_Shutdown) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    //
-    // Copy current configuration (atomic for structure copy)
-    //
+    ShadowStrikeAcquireRWSpinLockShared(&g_TeProvider.ConfigLock, &oldIrql);
     RtlCopyMemory(Config, &g_TeProvider.Config, sizeof(TE_CONFIG));
+    ShadowStrikeReleaseRWSpinLockShared(&g_TeProvider.ConfigLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -596,8 +774,15 @@ TePause(
     VOID
     )
 {
-    if (g_TeProvider.Initialized && g_TeProvider.State == TeState_Running) {
-        g_TeProvider.State = TeState_Paused;
+    if (InterlockedCompareExchange(
+            &g_TeProvider.State,
+            (LONG)TeState_Paused,
+            (LONG)TeState_Running) == (LONG)TeState_Running) {
+        //
+        // Cancel heartbeat timer to avoid wasted DPC firings while paused.
+        //
+        KeCancelTimer(&g_TeProvider.HeartbeatTimer);
+        InterlockedExchange(&g_TeProvider.HeartbeatRunning, 0);
     }
 }
 
@@ -607,8 +792,25 @@ TeResume(
     VOID
     )
 {
-    if (g_TeProvider.Initialized && g_TeProvider.State == TeState_Paused) {
-        g_TeProvider.State = TeState_Running;
+    LARGE_INTEGER dueTime;
+
+    if (InterlockedCompareExchange(
+            &g_TeProvider.State,
+            (LONG)TeState_Running,
+            (LONG)TeState_Paused) == (LONG)TeState_Paused) {
+        //
+        // Restart heartbeat timer if configured.
+        //
+        if (g_TeProvider.Config.HeartbeatIntervalMs > 0 &&
+            InterlockedCompareExchange(&g_TeProvider.HeartbeatRunning, 1, 0) == 0) {
+            dueTime.QuadPart = -((LONGLONG)g_TeProvider.Config.HeartbeatIntervalMs * 10000);
+            KeSetTimerEx(
+                &g_TeProvider.HeartbeatTimer,
+                dueTime,
+                g_TeProvider.Config.HeartbeatIntervalMs,
+                &g_TeProvider.HeartbeatDpc
+            );
+        }
     }
 }
 
@@ -632,15 +834,36 @@ TepEnableCallback(
     UNREFERENCED_PARAMETER(FilterData);
     UNREFERENCED_PARAMETER(CallbackContext);
 
-    if (IsEnabled) {
+    //
+    // IsEnabled values: EVENT_CONTROL_CODE_ENABLE_PROVIDER (1),
+    // EVENT_CONTROL_CODE_DISABLE_PROVIDER (0),
+    // EVENT_CONTROL_CODE_CAPTURE_STATE (2).
+    // Only track enable/disable — capture state must not alter consumer count.
+    //
+    if (IsEnabled == EVENT_CONTROL_CODE_ENABLE_PROVIDER) {
         g_TeProvider.EnableLevel = Level;
-        g_TeProvider.EnableFlags = MatchAnyKeyword;
+        InterlockedExchange64(
+            (volatile LONG64*)&g_TeProvider.EnableFlags,
+            (LONG64)MatchAnyKeyword
+        );
         InterlockedIncrement(&g_TeProvider.ConsumerCount);
-        g_TeProvider.Enabled = TRUE;
-    } else {
-        if (InterlockedDecrement(&g_TeProvider.ConsumerCount) == 0) {
-            g_TeProvider.Enabled = FALSE;
+        InterlockedExchange(&g_TeProvider.EtwEnabled, 1);
+    } else if (IsEnabled == EVENT_CONTROL_CODE_DISABLE_PROVIDER) {
+        if (InterlockedDecrement(&g_TeProvider.ConsumerCount) <= 0) {
+            //
+            // Clamp to zero — guard against orphaned disables
+            //
+            InterlockedExchange(&g_TeProvider.ConsumerCount, 0);
+            InterlockedExchange(&g_TeProvider.EtwEnabled, 0);
         }
+    }
+    // EVENT_CONTROL_CODE_CAPTURE_STATE: update level/keywords but not consumer count
+    else if (IsEnabled == EVENT_CONTROL_CODE_CAPTURE_STATE) {
+        g_TeProvider.EnableLevel = Level;
+        InterlockedExchange64(
+            (volatile LONG64*)&g_TeProvider.EnableFlags,
+            (LONG64)MatchAnyKeyword
+        );
     }
 }
 
@@ -659,41 +882,44 @@ TepInitializeEventHeader(
 {
     LARGE_INTEGER timestamp;
     LARGE_INTEGER perfCounter;
-
-    RtlZeroMemory(Header, sizeof(TE_EVENT_HEADER));
+    UINT64 counter;
 
     Header->Size = EventSize;
     Header->Version = TE_VERSION;
     Header->Flags = 0;
-    Header->EventId = EventId;
-    Header->Level = Level;
+    Header->EventId = (UINT32)EventId;
+    Header->Level = (UINT32)Level;
     Header->Keywords = Keywords;
 
-    //
-    // Get precise timestamp
-    //
     KeQuerySystemTime(&timestamp);
     Header->Timestamp = timestamp.QuadPart;
 
-    //
-    // Assign sequence number (atomic increment)
-    //
     Header->SequenceNumber = (UINT64)InterlockedIncrement64(&g_TeProvider.SequenceNumber);
 
-    //
-    // Capture context
-    //
     Header->ProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
     Header->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
-    Header->SessionId = 0;  // TODO: Get session ID
+
+    //
+    // Session ID: PsGetCurrentProcessSessionId internally reads from the
+    // EPROCESS. Safe at DISPATCH_LEVEL on x64 Windows 10+, but we guard
+    // with an IRQL check for maximum portability. If called above
+    // PASSIVE_LEVEL, we set session ID to 0 (unknown).
+    //
+    if (KeGetCurrentIrql() <= APC_LEVEL) {
+        Header->SessionId = PsGetCurrentProcessSessionId();
+    } else {
+        Header->SessionId = 0;
+    }
+
     Header->ProcessorNumber = KeGetCurrentProcessorNumberEx(NULL);
 
     //
-    // Generate correlation ID using counter and timestamp
+    // Generate correlation ID: mix of monotonic counter, timestamp, perf counter, and PID.
+    // Not cryptographic — provides uniqueness, not unpredictability.
     //
     perfCounter = KeQueryPerformanceCounter(NULL);
-    Header->CorrelationId = (perfCounter.QuadPart ^ timestamp.QuadPart) |
-                           ((UINT64)Header->ProcessId << 32);
+    counter = (UINT64)InterlockedIncrement64(&g_CorrelationCounter);
+    Header->CorrelationId = (TE_CORRELATION_SEED ^ perfCounter.QuadPart ^ timestamp.QuadPart) + counter;
     Header->ActivityId = Header->SequenceNumber;
 }
 
@@ -703,17 +929,18 @@ TepShouldThrottle(
     _In_ TE_PRIORITY Priority
     )
 {
-    TE_THROTTLE_ACTION action;
+    LONG action;
+    LONG samplingRate;
 
-    if (!g_TeProvider.Config.EnableThrottling) {
+    //
+    // Read cached config atomically — no lock needed on hot path.
+    //
+    if (!g_TeProvider.CachedEnableThrottling) {
         return FALSE;
     }
 
     action = g_TeProvider.ThrottleAction;
 
-    //
-    // Critical events are never throttled
-    //
     if (Priority == TePriority_Critical || Level == TeLevel_Critical) {
         return FALSE;
     }
@@ -723,12 +950,10 @@ TepShouldThrottle(
             return FALSE;
 
         case TeThrottle_Sample:
-            //
-            // Sample 1 in N events
-            //
-            if (g_TeProvider.Config.SamplingRate > 0) {
+            samplingRate = g_TeProvider.CachedSamplingRate;
+            if (samplingRate > 0) {
                 LONG counter = InterlockedIncrement(&g_TeProvider.ThrottleSampleCounter);
-                return (counter % (LONG)g_TeProvider.Config.SamplingRate) != 0;
+                return (counter % samplingRate) != 0;
             }
             return FALSE;
 
@@ -752,54 +977,82 @@ TepUpdateRateStatistics(
     )
 {
     LARGE_INTEGER currentTime;
-    UINT64 currentSecond;
+    LONG64 currentSecondTicks;
+    LONG64 storedSecondTicks;
     LONG eventsThisSecond;
+    LONG oldPeak;
+    LONG throttleThreshold;
+    LONG throttleRecoveryMs;
 
     KeQuerySystemTime(&currentTime);
-    currentSecond = currentTime.QuadPart / 10000000;  // Convert to seconds
+    currentSecondTicks = currentTime.QuadPart / 10000000;
 
-    if (currentSecond != g_TeProvider.Stats.CurrentSecondStart / 10000000) {
-        //
-        // New second - check if we need to update throttle state
-        //
-        eventsThisSecond = g_TeProvider.Stats.EventsThisSecond;
+    storedSecondTicks = InterlockedCompareExchange64(
+        &g_TeProvider.Stats.CurrentSecondStart,
+        0, 0
+    ) / 10000000;
 
+    if (currentSecondTicks != storedSecondTicks) {
         //
-        // Update peak
+        // Attempt to atomically claim the second-boundary update.
+        // Only one CPU should perform throttle state transitions.
         //
-        if (eventsThisSecond > g_TeProvider.Stats.PeakEventsPerSecond) {
-            g_TeProvider.Stats.PeakEventsPerSecond = eventsThisSecond;
-        }
+        LONG64 oldStart = InterlockedCompareExchange64(
+            &g_TeProvider.Stats.CurrentSecondStart,
+            currentTime.QuadPart,
+            storedSecondTicks * 10000000
+        );
 
-        //
-        // Check throttle threshold
-        //
-        if ((ULONG)eventsThisSecond > g_TeProvider.Config.ThrottleThreshold) {
-            if (g_TeProvider.ThrottleAction == TeThrottle_None) {
-                g_TeProvider.ThrottleAction = TeThrottle_Sample;
-                g_TeProvider.ThrottleStartTime = currentTime.QuadPart;
-                InterlockedIncrement64(&g_TeProvider.Stats.ThrottleActivations);
-            }
-        } else if (g_TeProvider.ThrottleAction != TeThrottle_None) {
+        if (oldStart / 10000000 == storedSecondTicks) {
             //
-            // Check if we should recover from throttling
+            // We won the race. Perform second-boundary work.
             //
-            UINT64 throttleDuration = currentTime.QuadPart - g_TeProvider.ThrottleStartTime;
-            if (throttleDuration > (UINT64)g_TeProvider.Config.ThrottleRecoveryMs * 10000) {
-                g_TeProvider.ThrottleAction = TeThrottle_None;
+            eventsThisSecond = InterlockedExchange(
+                &g_TeProvider.Stats.EventsThisSecond, 0
+            );
+
+            //
+            // Update peak with proper CAS loop to avoid lost updates.
+            //
+            do {
+                oldPeak = g_TeProvider.Stats.PeakEventsPerSecond;
+                if (eventsThisSecond <= oldPeak) {
+                    break;
+                }
+            } while (InterlockedCompareExchange(
+                         &g_TeProvider.Stats.PeakEventsPerSecond,
+                         eventsThisSecond,
+                         oldPeak) != oldPeak);
+
+            //
+            // Throttle decision — read cached config (lock-free).
+            //
+            throttleThreshold = g_TeProvider.CachedThrottleThreshold;
+            throttleRecoveryMs = g_TeProvider.CachedThrottleRecoveryMs;
+
+            if (eventsThisSecond > throttleThreshold) {
+                if (InterlockedCompareExchange(
+                        &g_TeProvider.ThrottleAction,
+                        (LONG)TeThrottle_Sample,
+                        (LONG)TeThrottle_None) == (LONG)TeThrottle_None) {
+                    InterlockedExchange64(
+                        &g_TeProvider.ThrottleStartTime,
+                        currentTime.QuadPart
+                    );
+                    InterlockedIncrement64(&g_TeProvider.Stats.ThrottleActivations);
+                }
+            } else if (g_TeProvider.ThrottleAction != (LONG)TeThrottle_None) {
+                LONG64 throttleStart = InterlockedCompareExchange64(
+                    &g_TeProvider.ThrottleStartTime, 0, 0
+                );
+                UINT64 throttleDuration = (UINT64)(currentTime.QuadPart - throttleStart);
+                if (throttleDuration > (UINT64)throttleRecoveryMs * 10000) {
+                    InterlockedExchange(&g_TeProvider.ThrottleAction, (LONG)TeThrottle_None);
+                }
             }
         }
-
-        //
-        // Reset counter for new second
-        //
-        InterlockedExchange(&g_TeProvider.Stats.EventsThisSecond, 0);
-        g_TeProvider.Stats.CurrentSecondStart = currentTime.QuadPart;
     }
 
-    //
-    // Increment events this second
-    //
     InterlockedIncrement(&g_TeProvider.Stats.EventsThisSecond);
 }
 
@@ -814,9 +1067,6 @@ TepWriteEventInternal(
     EVENT_DESCRIPTOR eventDescriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    //
-    // Initialize event descriptor
-    //
     RtlZeroMemory(&eventDescriptor, sizeof(EVENT_DESCRIPTOR));
     eventDescriptor.Id = (USHORT)Header->EventId;
     eventDescriptor.Version = (UCHAR)Header->Version;
@@ -826,19 +1076,13 @@ TepWriteEventInternal(
     eventDescriptor.Task = 0;
     eventDescriptor.Keyword = Header->Keywords;
 
-    //
-    // Initialize data descriptor
-    //
     EventDataDescCreate(&dataDescriptor, EventData, EventSize);
 
-    //
-    // Write to ETW
-    //
     status = EtwWrite(
         g_TeProvider.RegistrationHandle,
         &eventDescriptor,
-        NULL,  // ActivityId
-        1,     // UserDataCount
+        NULL,
+        1,
         &dataDescriptor
     );
 
@@ -859,6 +1103,30 @@ TepAcquireReference(
 {
     InterlockedIncrement(&g_TeProvider.ReferenceCount);
     InterlockedIncrement(&g_TeProvider.ActiveOperations);
+}
+
+/**
+ * @brief Try to acquire a reference for an event operation.
+ *
+ * Acquires reference FIRST, then checks state. If state is not Running,
+ * releases the reference immediately. This prevents the race where
+ * shutdown can drain references between state check and acquire.
+ *
+ * @return TRUE if reference acquired and state is Running.
+ */
+static BOOLEAN
+TepTryAcquireReference(
+    VOID
+    )
+{
+    TepAcquireReference();
+
+    if (g_TeProvider.State != (LONG)TeState_Running) {
+        TepReleaseReference();
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static VOID
@@ -890,11 +1158,8 @@ TepFlushDpcRoutine(
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    //
-    // Queue work item for flush at PASSIVE_LEVEL
-    //
     if (g_TeProvider.FlushWorkItem != NULL &&
-        g_TeProvider.State == TeState_Running &&
+        g_TeProvider.State == (LONG)TeState_Running &&
         InterlockedCompareExchange(&g_TeProvider.FlushPending, 1, 0) == 0) {
 
         IoQueueWorkItem(
@@ -915,20 +1180,13 @@ TepFlushWorkItemRoutine(
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
-    //
-    // Perform actual flush
-    //
     TeFlush();
-
-    //
-    // Clear pending flag
-    //
     InterlockedExchange(&g_TeProvider.FlushPending, 0);
-
-    //
-    // Update flush time
-    //
-    KeQuerySystemTime(&g_TeProvider.Stats.LastFlushTime);
+    {
+        LARGE_INTEGER flushTime;
+        KeQuerySystemTime(&flushTime);
+        InterlockedExchange64(&g_TeProvider.Stats.LastFlushTime, flushTime.QuadPart);
+    }
     InterlockedIncrement64(&g_TeProvider.Stats.BatchFlushes);
 }
 
@@ -945,10 +1203,7 @@ TepHeartbeatDpcRoutine(
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    //
-    // Log heartbeat event (quick, can be done at DISPATCH_LEVEL)
-    //
-    if (g_TeProvider.State == TeState_Running) {
+    if (g_TeProvider.State == (LONG)TeState_Running) {
         TeLogOperational(
             TeEvent_Heartbeat,
             TeLevel_Verbose,
@@ -975,8 +1230,7 @@ TeLogProcessCreate(
     )
 {
     NTSTATUS status;
-    TE_PROCESS_EVENT event;
-    SIZE_T copyLen;
+    PTE_PROCESS_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_Process)) {
         return STATUS_SUCCESS;
@@ -987,60 +1241,43 @@ TeLogProcessCreate(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_PROCESS_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    //
-    // Initialize event
-    //
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_PROCESS_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_ProcessCreate,
         TeLevel_Informational,
         TeKeyword_Process,
         sizeof(TE_PROCESS_EVENT)
     );
 
-    event.ParentProcessId = ParentProcessId;
-    event.CreatingProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
-    event.CreatingThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
-    event.ThreatScore = ThreatScore;
-    event.Flags = Flags;
+    event->ParentProcessId = ParentProcessId;
+    event->CreatingProcessId = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
+    event->CreatingThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
+    event->ThreatScore = ThreatScore;
+    event->Flags = Flags;
 
-    //
-    // Copy image path
-    //
-    if (ImagePath != NULL && ImagePath->Buffer != NULL && ImagePath->Length > 0) {
-        copyLen = ImagePath->Length / sizeof(WCHAR);
-        if (copyLen >= MAX_FILE_PATH_LENGTH) {
-            copyLen = MAX_FILE_PATH_LENGTH - 1;
-        }
-        RtlCopyMemory(event.ImagePath, ImagePath->Buffer, copyLen * sizeof(WCHAR));
-        event.ImagePath[copyLen] = L'\0';
-    }
+    TepCopyUnicodeStringSafe(event->ImagePath, MAX_FILE_PATH_LENGTH, ImagePath);
+    TepCopyUnicodeStringSafe(event->CommandLine, TE_MAX_COMMAND_LINE_CHARS, CommandLine);
 
-    //
-    // Copy command line
-    //
-    if (CommandLine != NULL && CommandLine->Buffer != NULL && CommandLine->Length > 0) {
-        copyLen = CommandLine->Length / sizeof(WCHAR);
-        if (copyLen >= MAX_COMMAND_LINE_LENGTH) {
-            copyLen = MAX_COMMAND_LINE_LENGTH - 1;
-        }
-        RtlCopyMemory(event.CommandLine, CommandLine->Buffer, copyLen * sizeof(WCHAR));
-        event.CommandLine[copyLen] = L'\0';
-    }
-
-    //
-    // Write event
-    //
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_PROCESS_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Informational]);
+    TepIncrementLevelStats(TeLevel_Informational);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1053,7 +1290,7 @@ TeLogProcessTerminate(
     )
 {
     NTSTATUS status;
-    TE_PROCESS_EVENT event;
+    PTE_PROCESS_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_Process)) {
         return STATUS_SUCCESS;
@@ -1064,26 +1301,36 @@ TeLogProcessTerminate(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_PROCESS_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_PROCESS_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_ProcessTerminate,
         TeLevel_Informational,
         TeKeyword_Process,
         sizeof(TE_PROCESS_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.ExitCode = ExitCode;
+    event->Header.ProcessId = ProcessId;
+    event->ExitCode = ExitCode;
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_PROCESS_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1099,51 +1346,55 @@ TeLogProcessBlocked(
     )
 {
     NTSTATUS status;
-    TE_PROCESS_EVENT event;
-    SIZE_T copyLen;
+    PTE_PROCESS_EVENT event;
 
-    //
-    // Blocked events are always logged (high priority)
-    //
     if (!TeIsEnabled()) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_PROCESS_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_PROCESS_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_ProcessBlocked,
         TeLevel_Warning,
         TeKeyword_Process | TeKeyword_Threat,
         sizeof(TE_PROCESS_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Header.Flags |= TE_FLAG_BLOCKING;
-    event.ParentProcessId = ParentProcessId;
-    event.ThreatScore = ThreatScore;
-    event.Flags = TE_PROCESS_FLAG_BLOCKED;
+    event->Header.ProcessId = ProcessId;
+    event->Header.Flags |= TE_FLAG_BLOCKING;
+    event->ParentProcessId = ParentProcessId;
+    event->ThreatScore = ThreatScore;
+    event->Flags = TE_PROCESS_FLAG_BLOCKED;
 
-    if (ImagePath != NULL && ImagePath->Buffer != NULL && ImagePath->Length > 0) {
-        copyLen = ImagePath->Length / sizeof(WCHAR);
-        if (copyLen >= MAX_FILE_PATH_LENGTH) {
-            copyLen = MAX_FILE_PATH_LENGTH - 1;
-        }
-        RtlCopyMemory(event.ImagePath, ImagePath->Buffer, copyLen * sizeof(WCHAR));
-        event.ImagePath[copyLen] = L'\0';
+    TepCopyUnicodeStringSafe(event->ImagePath, MAX_FILE_PATH_LENGTH, ImagePath);
+
+    //
+    // Store block reason in dedicated field — not repurposed from CommandLine.
+    //
+    if (Reason != NULL) {
+        TepCopyPcwstrSafe(event->BlockReason, ARRAYSIZE(event->BlockReason), Reason);
     }
 
-    UNREFERENCED_PARAMETER(Reason);
-
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_PROCESS_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Warning]);
+    TepIncrementLevelStats(TeLevel_Warning);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1161,7 +1412,7 @@ TeLogThreadCreate(
     )
 {
     NTSTATUS status;
-    TE_THREAD_EVENT event;
+    PTE_THREAD_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Verbose, TeKeyword_Thread)) {
         return STATUS_SUCCESS;
@@ -1172,29 +1423,39 @@ TeLogThreadCreate(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_THREAD_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_THREAD_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_ThreadCreate,
         TeLevel_Verbose,
         TeKeyword_Thread,
         sizeof(TE_THREAD_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Header.ThreadId = ThreadId;
-    event.TargetProcessId = ProcessId;
-    event.TargetThreadId = ThreadId;
-    event.StartAddress = StartAddress;
+    event->Header.ProcessId = ProcessId;
+    event->Header.ThreadId = ThreadId;
+    event->TargetProcessId = ProcessId;
+    event->TargetThreadId = ThreadId;
+    event->StartAddress = StartAddress;
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_THREAD_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1210,37 +1471,47 @@ TeLogRemoteThread(
     )
 {
     NTSTATUS status;
-    TE_THREAD_EVENT event;
+    PTE_THREAD_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Warning, TeKeyword_Thread | TeKeyword_Injection)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_THREAD_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_THREAD_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_RemoteThreadCreate,
         TeLevel_Warning,
         TeKeyword_Thread | TeKeyword_Injection,
         sizeof(TE_THREAD_EVENT)
     );
 
-    event.Header.ProcessId = SourceProcessId;
-    event.TargetProcessId = TargetProcessId;
-    event.TargetThreadId = ThreadId;
-    event.StartAddress = StartAddress;
-    event.ThreatScore = ThreatScore;
-    event.Flags = TE_THREAD_FLAG_REMOTE;
+    event->Header.ProcessId = SourceProcessId;
+    event->TargetProcessId = TargetProcessId;
+    event->TargetThreadId = ThreadId;
+    event->StartAddress = StartAddress;
+    event->ThreatScore = ThreatScore;
+    event->Flags = TE_THREAD_FLAG_REMOTE;
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_THREAD_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Warning]);
+    TepIncrementLevelStats(TeLevel_Warning);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1263,8 +1534,11 @@ TeLogFileEvent(
     )
 {
     NTSTATUS status;
-    TE_FILE_EVENT event;
-    SIZE_T copyLen;
+    PTE_FILE_EVENT event;
+
+    if (!TE_IS_FILE_EVENT(EventId)) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_File)) {
         return STATUS_SUCCESS;
@@ -1275,47 +1549,42 @@ TeLogFileEvent(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_FILE_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_FILE_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         EventId,
         TeLevel_Informational,
         TeKeyword_File,
         sizeof(TE_FILE_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Operation = Operation;
-    event.FileSize = FileSize;
-    event.Verdict = Verdict;
-    event.ThreatScore = ThreatScore;
+    event->Header.ProcessId = ProcessId;
+    event->Operation = Operation;
+    event->FileSize = FileSize;
+    event->Verdict = Verdict;
+    event->ThreatScore = ThreatScore;
 
-    if (FilePath != NULL && FilePath->Buffer != NULL && FilePath->Length > 0) {
-        copyLen = FilePath->Length / sizeof(WCHAR);
-        if (copyLen >= MAX_FILE_PATH_LENGTH) {
-            copyLen = MAX_FILE_PATH_LENGTH - 1;
-        }
-        RtlCopyMemory(event.FilePath, FilePath->Buffer, copyLen * sizeof(WCHAR));
-        event.FilePath[copyLen] = L'\0';
-    }
+    TepCopyUnicodeStringSafe(event->FilePath, MAX_FILE_PATH_LENGTH, FilePath);
+    TepCopyPcwstrSafe(event->ThreatName, MAX_THREAT_NAME_LENGTH, ThreatName);
 
-    if (ThreatName != NULL) {
-        copyLen = wcslen(ThreatName);
-        if (copyLen >= MAX_THREAT_NAME_LENGTH) {
-            copyLen = MAX_THREAT_NAME_LENGTH - 1;
-        }
-        RtlCopyMemory(event.ThreatName, ThreatName, copyLen * sizeof(WCHAR));
-        event.ThreatName[copyLen] = L'\0';
-    }
-
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_FILE_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1338,7 +1607,7 @@ TeLogFileBlocked(
         FilePath,
         0,
         0,
-        1,  // Blocked verdict
+        1,
         ThreatName,
         ThreatScore
     );
@@ -1362,8 +1631,12 @@ TeLogRegistryEvent(
     )
 {
     NTSTATUS status;
-    TE_REGISTRY_EVENT event;
+    PTE_REGISTRY_EVENT event;
     SIZE_T copyLen;
+
+    if (!TE_IS_REGISTRY_EVENT(EventId)) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_Registry)) {
         return STATUS_SUCCESS;
@@ -1374,55 +1647,50 @@ TeLogRegistryEvent(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_REGISTRY_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_REGISTRY_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         EventId,
         TeLevel_Informational,
         TeKeyword_Registry,
         sizeof(TE_REGISTRY_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Operation = EventId;
-    event.ValueType = ValueType;
-    event.DataSize = DataSize;
-    event.ThreatScore = ThreatScore;
+    event->Header.ProcessId = ProcessId;
+    event->Operation = EventId;
+    event->ValueType = ValueType;
+    event->DataSize = DataSize;
+    event->ThreatScore = ThreatScore;
 
-    if (KeyPath != NULL && KeyPath->Buffer != NULL && KeyPath->Length > 0) {
-        copyLen = KeyPath->Length / sizeof(WCHAR);
-        if (copyLen >= MAX_REGISTRY_KEY_LENGTH) {
-            copyLen = MAX_REGISTRY_KEY_LENGTH - 1;
-        }
-        RtlCopyMemory(event.KeyPath, KeyPath->Buffer, copyLen * sizeof(WCHAR));
-        event.KeyPath[copyLen] = L'\0';
-    }
-
-    if (ValueName != NULL && ValueName->Buffer != NULL && ValueName->Length > 0) {
-        copyLen = ValueName->Length / sizeof(WCHAR);
-        if (copyLen >= MAX_REGISTRY_VALUE_LENGTH) {
-            copyLen = MAX_REGISTRY_VALUE_LENGTH - 1;
-        }
-        RtlCopyMemory(event.ValueName, ValueName->Buffer, copyLen * sizeof(WCHAR));
-        event.ValueName[copyLen] = L'\0';
-    }
+    TepCopyUnicodeStringSafe(event->KeyPath, MAX_REGISTRY_KEY_LENGTH, KeyPath);
+    TepCopyUnicodeStringSafe(event->ValueName, MAX_REGISTRY_VALUE_LENGTH, ValueName);
 
     if (ValueData != NULL && DataSize > 0) {
         copyLen = DataSize;
-        if (copyLen > sizeof(event.ValueData)) {
-            copyLen = sizeof(event.ValueData);
+        if (copyLen > sizeof(event->ValueData)) {
+            copyLen = sizeof(event->ValueData);
         }
-        RtlCopyMemory(event.ValueData, ValueData, copyLen);
+        RtlCopyMemory(event->ValueData, ValueData, copyLen);
     }
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_REGISTRY_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1439,8 +1707,13 @@ TeLogNetworkEvent(
     )
 {
     NTSTATUS status;
+    PTE_NETWORK_EVENT localEvent;
 
     if (Event == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!TE_IS_NETWORK_EVENT(EventId)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1453,25 +1726,47 @@ TeLogNetworkEvent(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    //
+    // Copy caller's event to a local buffer so we don't mutate
+    // the caller's data when initializing the header.
+    //
+    localEvent = (PTE_NETWORK_EVENT)TepAllocateEvent();
+    if (localEvent == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(localEvent);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
     //
-    // Update header
+    // Copy caller's event safely — guard against partially valid buffers.
     //
+    __try {
+        RtlCopyMemory(localEvent, Event, sizeof(TE_NETWORK_EVENT));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TepReleaseReference();
+        TepFreeEvent(localEvent);
+        return GetExceptionCode();
+    }
+
     TepInitializeEventHeader(
-        &Event->Header,
+        &localEvent->Header,
         EventId,
         TeLevel_Informational,
         TeKeyword_Network,
         sizeof(TE_NETWORK_EVENT)
     );
 
-    status = TepWriteEventInternal(&Event->Header, Event, sizeof(TE_NETWORK_EVENT));
+    status = TepWriteEventInternal(&localEvent->Header, localEvent, sizeof(TE_NETWORK_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(localEvent);
 
     return status;
 }
@@ -1487,45 +1782,46 @@ TeLogDnsQuery(
     )
 {
     NTSTATUS status;
-    TE_NETWORK_EVENT event;
-    SIZE_T copyLen;
+    PTE_NETWORK_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_Network)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_NETWORK_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_NETWORK_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         Blocked ? TeEvent_DnsBlocked : TeEvent_DnsQuery,
         Blocked ? TeLevel_Warning : TeLevel_Informational,
         TeKeyword_Network,
         sizeof(TE_NETWORK_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.ThreatScore = ThreatScore;
-    event.Flags = Blocked ? TE_NET_FLAG_BLOCKED : 0;
+    event->Header.ProcessId = ProcessId;
+    event->ThreatScore = ThreatScore;
+    event->Flags = Blocked ? TE_NET_FLAG_BLOCKED : 0;
+    event->DnsQueryType = QueryType;
 
-    UNREFERENCED_PARAMETER(QueryType);
+    TepCopyPcwstrSafe(event->RemoteHostname, ARRAYSIZE(event->RemoteHostname), QueryName);
 
-    if (QueryName != NULL) {
-        copyLen = wcslen(QueryName);
-        if (copyLen >= ARRAYSIZE(event.RemoteHostname)) {
-            copyLen = ARRAYSIZE(event.RemoteHostname) - 1;
-        }
-        RtlCopyMemory(event.RemoteHostname, QueryName, copyLen * sizeof(WCHAR));
-        event.RemoteHostname[copyLen] = L'\0';
-    }
-
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_NETWORK_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1548,7 +1844,11 @@ TeLogMemoryEvent(
     )
 {
     NTSTATUS status;
-    TE_MEMORY_EVENT event;
+    PTE_MEMORY_EVENT event;
+
+    if (!TE_IS_MEMORY_EVENT(EventId)) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_Memory)) {
         return STATUS_SUCCESS;
@@ -1559,35 +1859,45 @@ TeLogMemoryEvent(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_MEMORY_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_MEMORY_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         EventId,
         TeLevel_Informational,
         TeKeyword_Memory,
         sizeof(TE_MEMORY_EVENT)
     );
 
-    event.Header.ProcessId = SourceProcessId;
-    event.TargetProcessId = TargetProcessId;
-    event.BaseAddress = BaseAddress;
-    event.RegionSize = RegionSize;
-    event.NewProtection = Protection;
-    event.ThreatScore = ThreatScore;
-    event.Flags = Flags;
+    event->Header.ProcessId = SourceProcessId;
+    event->TargetProcessId = TargetProcessId;
+    event->BaseAddress = BaseAddress;
+    event->RegionSize = RegionSize;
+    event->NewProtection = Protection;
+    event->ThreatScore = ThreatScore;
+    event->Flags = Flags;
 
     if (SourceProcessId != TargetProcessId) {
-        event.Flags |= TE_MEM_FLAG_CROSS_PROCESS;
+        event->Flags |= TE_MEM_FLAG_CROSS_PROCESS;
     }
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_MEMORY_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1604,42 +1914,49 @@ TeLogInjection(
     )
 {
     NTSTATUS status;
-    TE_MEMORY_EVENT event;
+    PTE_MEMORY_EVENT event;
 
-    //
-    // Injection events are high priority
-    //
     if (!TeIsEnabled()) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_MEMORY_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_MEMORY_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_InjectionDetected,
         TeLevel_Warning,
         TeKeyword_Memory | TeKeyword_Injection | TeKeyword_Threat,
         sizeof(TE_MEMORY_EVENT)
     );
 
-    event.Header.ProcessId = SourceProcessId;
-    event.Header.Flags |= TE_FLAG_HIGH_CONFIDENCE;
-    event.TargetProcessId = TargetProcessId;
-    event.BaseAddress = TargetAddress;
-    event.RegionSize = Size;
-    event.InjectionMethod = InjectionMethod;
-    event.ThreatScore = ThreatScore;
-    event.Flags = TE_MEM_FLAG_INJECTION | TE_MEM_FLAG_CROSS_PROCESS;
+    event->Header.ProcessId = SourceProcessId;
+    event->Header.Flags |= TE_FLAG_HIGH_CONFIDENCE;
+    event->TargetProcessId = TargetProcessId;
+    event->BaseAddress = TargetAddress;
+    event->RegionSize = Size;
+    event->InjectionMethod = InjectionMethod;
+    event->ThreatScore = ThreatScore;
+    event->Flags = TE_MEM_FLAG_INJECTION | TE_MEM_FLAG_CROSS_PROCESS;
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_MEMORY_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Warning]);
+    TepIncrementLevelStats(TeLevel_Warning);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1661,75 +1978,58 @@ TeLogThreatDetection(
     )
 {
     NTSTATUS status;
-    TE_DETECTION_EVENT event;
-    SIZE_T copyLen;
+    PTE_DETECTION_EVENT event;
     TE_EVENT_LEVEL level;
 
-    //
-    // Map severity to level
-    //
     switch (Severity) {
-        case ThreatSeverity_Critical:
-            level = TeLevel_Critical;
-            break;
-        case ThreatSeverity_High:
-            level = TeLevel_Error;
-            break;
-        case ThreatSeverity_Medium:
-            level = TeLevel_Warning;
-            break;
-        default:
-            level = TeLevel_Informational;
-            break;
+        case ThreatSeverity_Critical: level = TeLevel_Critical; break;
+        case ThreatSeverity_High:     level = TeLevel_Error;    break;
+        case ThreatSeverity_Medium:   level = TeLevel_Warning;  break;
+        default:                      level = TeLevel_Informational; break;
     }
 
     if (!TeIsEventEnabled(level, TeKeyword_Threat | TeKeyword_Detection)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_DETECTION_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_DETECTION_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_ThreatDetected,
         level,
         TeKeyword_Threat | TeKeyword_Detection,
         sizeof(TE_DETECTION_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Header.Flags |= TE_FLAG_HIGH_CONFIDENCE;
-    event.ThreatScore = ThreatScore;
-    event.Severity = Severity;
-    event.MitreTechnique = MitreTechnique;
-    event.ResponseAction = ResponseAction;
+    event->Header.ProcessId = ProcessId;
+    event->Header.Flags |= TE_FLAG_HIGH_CONFIDENCE;
+    event->ThreatScore = ThreatScore;
+    event->Severity = Severity;
+    event->MitreTechnique = MitreTechnique;
+    event->ResponseAction = ResponseAction;
 
-    if (ThreatName != NULL) {
-        copyLen = wcslen(ThreatName);
-        if (copyLen >= MAX_THREAT_NAME_LENGTH) {
-            copyLen = MAX_THREAT_NAME_LENGTH - 1;
-        }
-        RtlCopyMemory(event.ThreatName, ThreatName, copyLen * sizeof(WCHAR));
-        event.ThreatName[copyLen] = L'\0';
-    }
+    TepCopyPcwstrSafe(event->ThreatName, MAX_THREAT_NAME_LENGTH, ThreatName);
+    TepCopyPcwstrSafe(event->Description, ARRAYSIZE(event->Description), Description);
 
-    if (Description != NULL) {
-        copyLen = wcslen(Description);
-        if (copyLen >= ARRAYSIZE(event.Description)) {
-            copyLen = ARRAYSIZE(event.Description) - 1;
-        }
-        RtlCopyMemory(event.Description, Description, copyLen * sizeof(WCHAR));
-        event.Description[copyLen] = L'\0';
-    }
-
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_DETECTION_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[level]);
+    TepIncrementLevelStats(level);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1746,50 +2046,52 @@ TeLogBehaviorAlert(
     )
 {
     NTSTATUS status;
-    TE_DETECTION_EVENT event;
-    SIZE_T copyLen;
+    PTE_DETECTION_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Warning, TeKeyword_Behavioral | TeKeyword_Detection)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_DETECTION_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_DETECTION_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_BehaviorAlert,
         TeLevel_Warning,
         TeKeyword_Behavioral | TeKeyword_Detection,
         sizeof(TE_DETECTION_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.DetectionType = BehaviorType;
-    event.DetectionSource = Category;
-    event.ThreatScore = ThreatScore;
-    event.ChainId = ChainId;
+    event->Header.ProcessId = ProcessId;
+    event->DetectionType = BehaviorType;
+    event->DetectionSource = Category;
+    event->ThreatScore = ThreatScore;
+    event->ChainId = ChainId;
 
     if (ChainId != 0) {
-        event.Header.Flags |= TE_FLAG_CHAIN_MEMBER;
+        event->Header.Flags |= TE_FLAG_CHAIN_MEMBER;
     }
 
-    if (Description != NULL) {
-        copyLen = wcslen(Description);
-        if (copyLen >= ARRAYSIZE(event.Description)) {
-            copyLen = ARRAYSIZE(event.Description) - 1;
-        }
-        RtlCopyMemory(event.Description, Description, copyLen * sizeof(WCHAR));
-        event.Description[copyLen] = L'\0';
-    }
+    TepCopyPcwstrSafe(event->Description, ARRAYSIZE(event->Description), Description);
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_DETECTION_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Warning]);
+    TepIncrementLevelStats(TeLevel_Warning);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1806,16 +2108,13 @@ TeLogAttackChain(
     )
 {
     NTSTATUS status;
-    TE_DETECTION_EVENT event;
+    PTE_DETECTION_EVENT event;
     TE_EVENT_ID eventId;
 
     if (!TeIsEventEnabled(TeLevel_Warning, TeKeyword_Attack | TeKeyword_Detection)) {
         return STATUS_SUCCESS;
     }
 
-    //
-    // Determine event ID based on stage
-    //
     if (Stage == AttackStage_Reconnaissance) {
         eventId = TeEvent_AttackChainStart;
     } else if (Stage == AttackStage_Actions) {
@@ -1824,31 +2123,41 @@ TeLogAttackChain(
         eventId = TeEvent_AttackChainUpdate;
     }
 
-    TepAcquireReference();
+    event = (PTE_DETECTION_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_DETECTION_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         eventId,
         TeLevel_Warning,
         TeKeyword_Attack | TeKeyword_Detection,
         sizeof(TE_DETECTION_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Header.Flags |= TE_FLAG_CHAIN_MEMBER;
-    event.Header.CorrelationId = ChainId;
-    event.DetectionType = EventType;
-    event.ThreatScore = ThreatScore;
-    event.ChainId = ChainId;
-    event.MitreTechnique = MitreTechnique;
+    event->Header.ProcessId = ProcessId;
+    event->Header.Flags |= TE_FLAG_CHAIN_MEMBER;
+    event->Header.CorrelationId = ChainId;
+    event->DetectionType = EventType;
+    event->ThreatScore = ThreatScore;
+    event->ChainId = ChainId;
+    event->MitreTechnique = MitreTechnique;
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_DETECTION_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1869,51 +2178,50 @@ TeLogTamperAttempt(
     )
 {
     NTSTATUS status;
-    TE_SECURITY_EVENT event;
-    SIZE_T copyLen;
+    PTE_SECURITY_EVENT event;
 
-    //
-    // Tamper attempts are always logged
-    //
     if (!TeIsEnabled()) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_SECURITY_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_SECURITY_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_TamperAttempt,
         TeLevel_Critical,
         TeKeyword_Security | TeKeyword_SelfProtect,
         sizeof(TE_SECURITY_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Header.Flags |= TE_FLAG_URGENT | TE_FLAG_HIGH_CONFIDENCE;
-    event.AlertType = TamperType;
-    event.TargetComponent = TargetComponent;
-    event.TargetAddress = TargetAddress;
-    event.ThreatScore = 1000;  // Maximum threat score
-    event.ResponseAction = Blocked ? 1 : 0;
+    event->Header.ProcessId = ProcessId;
+    event->Header.Flags |= TE_FLAG_URGENT | TE_FLAG_HIGH_CONFIDENCE;
+    event->AlertType = TamperType;
+    event->TargetComponent = TargetComponent;
+    event->TargetAddress = TargetAddress;
+    event->ThreatScore = 1000;
+    event->ResponseAction = Blocked ? 1 : 0;
 
-    if (Description != NULL) {
-        copyLen = wcslen(Description);
-        if (copyLen >= ARRAYSIZE(event.Description)) {
-            copyLen = ARRAYSIZE(event.Description) - 1;
-        }
-        RtlCopyMemory(event.Description, Description, copyLen * sizeof(WCHAR));
-        event.Description[copyLen] = L'\0';
-    }
+    TepCopyPcwstrSafe(event->Description, ARRAYSIZE(event->Description), Description);
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_SECURITY_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Critical]);
+    TepIncrementLevelStats(TeLevel_Critical);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1929,48 +2237,79 @@ TeLogEvasionAttempt(
     )
 {
     NTSTATUS status;
-    TE_SECURITY_EVENT event;
-    SIZE_T copyLen;
+    PTE_SECURITY_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Warning, TeKeyword_Security | TeKeyword_Evasion)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_SECURITY_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_SECURITY_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_EvasionAttempt,
         TeLevel_Warning,
         TeKeyword_Security | TeKeyword_Evasion,
         sizeof(TE_SECURITY_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.AlertType = EvasionType;
-    event.ThreatScore = ThreatScore;
-
-    UNREFERENCED_PARAMETER(TargetModule);
-    UNREFERENCED_PARAMETER(TargetFunction);
+    event->Header.ProcessId = ProcessId;
+    event->AlertType = EvasionType;
+    event->ThreatScore = ThreatScore;
 
     //
-    // Build description
+    // Include target module and function in the description.
+    // These are critical forensic fields for incident response.
     //
-    copyLen = swprintf_s(
-        event.Description,
-        ARRAYSIZE(event.Description),
-        L"Evasion technique %u detected",
-        EvasionType
-    );
+    if (TargetModule != NULL && TargetFunction != NULL) {
+        RtlStringCchPrintfW(
+            event->Description,
+            ARRAYSIZE(event->Description),
+            L"Evasion technique %u: %ws!%S",
+            (UINT32)EvasionType,
+            TargetModule,
+            TargetFunction
+        );
+    } else if (TargetModule != NULL) {
+        RtlStringCchPrintfW(
+            event->Description,
+            ARRAYSIZE(event->Description),
+            L"Evasion technique %u targeting %ws",
+            (UINT32)EvasionType,
+            TargetModule
+        );
+    } else {
+        RtlStringCchPrintfW(
+            event->Description,
+            ARRAYSIZE(event->Description),
+            L"Evasion technique %u detected",
+            (UINT32)EvasionType
+        );
+    }
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    //
+    // Store target module path in AttackerProcess field for structured access
+    //
+    TepCopyPcwstrSafe(event->AttackerProcess, MAX_FILE_PATH_LENGTH, TargetModule);
+
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_SECURITY_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Warning]);
+    TepIncrementLevelStats(TeLevel_Warning);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -1987,47 +2326,57 @@ TeLogCredentialAccess(
     )
 {
     NTSTATUS status;
-    TE_SECURITY_EVENT event;
+    PTE_SECURITY_EVENT event;
 
     if (!TeIsEventEnabled(TeLevel_Warning, TeKeyword_Security | TeKeyword_Credential)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_SECURITY_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_SECURITY_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_CredentialAccess,
         TeLevel_Warning,
         TeKeyword_Security | TeKeyword_Credential,
         sizeof(TE_SECURITY_EVENT)
     );
 
-    event.Header.ProcessId = ProcessId;
-    event.Header.Flags |= TE_FLAG_HIGH_CONFIDENCE;
-    event.AlertType = AccessType;
-    event.TargetComponent = TargetProcessId;
-    event.OriginalValue = AccessMask;
-    event.ThreatScore = ThreatScore;
-    event.ResponseAction = Blocked ? 1 : 0;
+    event->Header.ProcessId = ProcessId;
+    event->Header.Flags |= TE_FLAG_HIGH_CONFIDENCE;
+    event->AlertType = AccessType;
+    event->TargetProcessId = TargetProcessId;
+    event->OriginalValue = AccessMask;
+    event->ThreatScore = ThreatScore;
+    event->ResponseAction = Blocked ? 1 : 0;
 
-    swprintf_s(
-        event.Description,
-        ARRAYSIZE(event.Description),
+    RtlStringCchPrintfW(
+        event->Description,
+        ARRAYSIZE(event->Description),
         L"Credential access type %u to process %u, mask 0x%llX",
-        AccessType,
+        (UINT32)AccessType,
         TargetProcessId,
         AccessMask
     );
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_SECURITY_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[TeLevel_Warning]);
+    TepIncrementLevelStats(TeLevel_Warning);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -2047,8 +2396,7 @@ TeLogOperational(
     )
 {
     NTSTATUS status;
-    TE_OPERATIONAL_EVENT event;
-    SIZE_T copyLen;
+    PTE_OPERATIONAL_EVENT event;
 
     if (!TeIsEventEnabled(Level, TeKeyword_Diagnostic)) {
         return STATUS_SUCCESS;
@@ -2059,36 +2407,39 @@ TeLogOperational(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_OPERATIONAL_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_OPERATIONAL_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         EventId,
         Level,
         TeKeyword_Diagnostic,
         sizeof(TE_OPERATIONAL_EVENT)
     );
 
-    event.ComponentId = ComponentId;
-    event.ErrorCode = ErrorCode;
+    event->ComponentId = ComponentId;
+    event->ErrorCode = ErrorCode;
 
-    if (Message != NULL) {
-        copyLen = wcslen(Message);
-        if (copyLen >= MAX_ERROR_MESSAGE_LENGTH) {
-            copyLen = MAX_ERROR_MESSAGE_LENGTH - 1;
-        }
-        RtlCopyMemory(event.Message, Message, copyLen * sizeof(WCHAR));
-        event.Message[copyLen] = L'\0';
-    }
+    TepCopyPcwstrSafe(event->Message, MAX_ERROR_MESSAGE_LENGTH, Message);
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_OPERATIONAL_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[Level]);
+    TepIncrementLevelStats(Level);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -2106,13 +2457,9 @@ TeLogError(
     )
 {
     NTSTATUS status;
-    TE_OPERATIONAL_EVENT event;
-    SIZE_T copyLen;
+    PTE_OPERATIONAL_EVENT event;
     TE_EVENT_LEVEL level;
 
-    //
-    // Map severity to level
-    //
     switch (Severity) {
         case ErrorSeverity_Fatal:
         case ErrorSeverity_Critical:
@@ -2133,56 +2480,43 @@ TeLogError(
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_OPERATIONAL_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_OPERATIONAL_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_Error,
         level,
         TeKeyword_Diagnostic,
         sizeof(TE_OPERATIONAL_EVENT)
     );
 
-    event.ComponentId = ComponentId;
-    event.ErrorSeverity = Severity;
-    event.ErrorCode = ErrorCode;
-    event.LineNumber = LineNumber;
+    event->ComponentId = ComponentId;
+    event->ErrorSeverity = Severity;
+    event->ErrorCode = ErrorCode;
+    event->LineNumber = LineNumber;
 
-    if (FileName != NULL) {
-        copyLen = strlen(FileName);
-        if (copyLen >= sizeof(event.FileName)) {
-            copyLen = sizeof(event.FileName) - 1;
-        }
-        RtlCopyMemory(event.FileName, FileName, copyLen);
-        event.FileName[copyLen] = '\0';
-    }
+    TepCopyAnsiStringSafe(event->FileName, sizeof(event->FileName), FileName);
+    TepCopyAnsiStringSafe(event->FunctionName, sizeof(event->FunctionName), FunctionName);
+    TepCopyPcwstrSafe(event->Message, MAX_ERROR_MESSAGE_LENGTH, Message);
 
-    if (FunctionName != NULL) {
-        copyLen = strlen(FunctionName);
-        if (copyLen >= sizeof(event.FunctionName)) {
-            copyLen = sizeof(event.FunctionName) - 1;
-        }
-        RtlCopyMemory(event.FunctionName, FunctionName, copyLen);
-        event.FunctionName[copyLen] = '\0';
-    }
-
-    if (Message != NULL) {
-        copyLen = wcslen(Message);
-        if (copyLen >= MAX_ERROR_MESSAGE_LENGTH) {
-            copyLen = MAX_ERROR_MESSAGE_LENGTH - 1;
-        }
-        RtlCopyMemory(event.Message, Message, copyLen * sizeof(WCHAR));
-        event.Message[copyLen] = L'\0';
-    }
-
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_OPERATIONAL_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[level]);
+    TepIncrementLevelStats(level);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -2198,62 +2532,55 @@ TeLogComponentHealth(
     )
 {
     NTSTATUS status;
-    TE_OPERATIONAL_EVENT event;
-    SIZE_T copyLen;
+    PTE_OPERATIONAL_EVENT event;
     TE_EVENT_LEVEL level;
 
-    //
-    // Map health to level
-    //
     switch (NewStatus) {
-        case Health_Failed:
-            level = TeLevel_Critical;
-            break;
-        case Health_Degraded:
-            level = TeLevel_Warning;
-            break;
-        default:
-            level = TeLevel_Informational;
-            break;
+        case Health_Failed:   level = TeLevel_Critical; break;
+        case Health_Degraded: level = TeLevel_Warning;  break;
+        default:              level = TeLevel_Informational; break;
     }
 
     if (!TeIsEventEnabled(level, TeKeyword_Health)) {
         return STATUS_SUCCESS;
     }
 
-    TepAcquireReference();
+    event = (PTE_OPERATIONAL_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     TepUpdateRateStatistics();
 
-    RtlZeroMemory(&event, sizeof(event));
+    RtlZeroMemory(event, sizeof(TE_OPERATIONAL_EVENT));
     TepInitializeEventHeader(
-        &event.Header,
+        &event->Header,
         TeEvent_ComponentHealth,
         level,
         TeKeyword_Health,
         sizeof(TE_OPERATIONAL_EVENT)
     );
 
-    event.ComponentId = ComponentId;
-    event.HealthStatus = NewStatus;
-    event.ErrorCode = ErrorCode;
-    event.ContextValue1 = OldStatus;
-    event.ContextValue2 = NewStatus;
+    event->ComponentId = ComponentId;
+    event->HealthStatus = NewStatus;
+    event->ErrorCode = ErrorCode;
+    event->ContextValue1 = OldStatus;
+    event->ContextValue2 = NewStatus;
 
-    if (Message != NULL) {
-        copyLen = wcslen(Message);
-        if (copyLen >= MAX_ERROR_MESSAGE_LENGTH) {
-            copyLen = MAX_ERROR_MESSAGE_LENGTH - 1;
-        }
-        RtlCopyMemory(event.Message, Message, copyLen * sizeof(WCHAR));
-        event.Message[copyLen] = L'\0';
-    }
+    TepCopyPcwstrSafe(event->Message, MAX_ERROR_MESSAGE_LENGTH, Message);
 
-    status = TepWriteEventInternal(&event.Header, &event, sizeof(event));
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_OPERATIONAL_EVENT));
 
     InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
-    InterlockedIncrement64(&g_TeProvider.Stats.EventsByLevel[level]);
+    TepIncrementLevelStats(level);
 
     TepReleaseReference();
+    TepFreeEvent(event);
 
     return status;
 }
@@ -2264,12 +2591,68 @@ TeLogPerformanceStats(
     _In_ PTELEMETRY_PERFORMANCE Stats
     )
 {
-    UNREFERENCED_PARAMETER(Stats);
+    NTSTATUS status;
+    PTE_OPERATIONAL_EVENT event;
+
+    if (Stats == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!TeIsEventEnabled(TeLevel_Informational, TeKeyword_Performance)) {
+        return STATUS_SUCCESS;
+    }
+
+    event = (PTE_OPERATIONAL_EVENT)TepAllocateEvent();
+    if (event == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!TepTryAcquireReference()) {
+        TepFreeEvent(event);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    TepUpdateRateStatistics();
+
+    RtlZeroMemory(event, sizeof(TE_OPERATIONAL_EVENT));
+    TepInitializeEventHeader(
+        &event->Header,
+        TeEvent_PerformanceStats,
+        TeLevel_Informational,
+        TeKeyword_Performance,
+        sizeof(TE_OPERATIONAL_EVENT)
+    );
+
+    event->ComponentId = Component_Telemetry;
 
     //
-    // TODO: Implement performance stats logging
+    // Encode key performance metrics into the context values for structured access.
+    // ContextValue1: filesystem latency (avg microseconds)
+    // ContextValue2: process monitor latency (avg microseconds)
+    // ContextValue3: total events processed
     //
-    return STATUS_SUCCESS;
+    event->ContextValue1 = Stats->FileSystem.AverageLatencyUs;
+    event->ContextValue2 = Stats->Process.AverageLatencyUs;
+    event->ContextValue3 = Stats->Process.TotalEventsProcessed;
+
+    RtlStringCchPrintfW(
+        event->Message,
+        MAX_ERROR_MESSAGE_LENGTH,
+        L"PerfStats: FS_lat=%lluus Proc_lat=%lluus Events=%llu",
+        Stats->FileSystem.AverageLatencyUs,
+        Stats->Process.AverageLatencyUs,
+        Stats->Process.TotalEventsProcessed
+    );
+
+    status = TepWriteEventInternal(&event->Header, event, sizeof(TE_OPERATIONAL_EVENT));
+
+    InterlockedIncrement64(&g_TeProvider.Stats.EventsGenerated);
+    TepIncrementLevelStats(TeLevel_Informational);
+
+    TepReleaseReference();
+    TepFreeEvent(event);
+
+    return status;
 }
 
 // ============================================================================
@@ -2282,18 +2665,24 @@ TeGetStatistics(
     _Out_ PTE_STATISTICS Stats
     )
 {
+    KIRQL oldIrql;
+
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_TeProvider.Initialized) {
+    if (g_TeProvider.State == (LONG)TeState_Uninitialized) {
         return STATUS_DEVICE_NOT_READY;
     }
 
     //
-    // Copy statistics (atomic for 64-bit values on x64)
+    // Snapshot under shared lock for consistent read across all fields.
+    // Individual fields are still updated via interlocked ops, so this
+    // provides a point-in-time snapshot rather than per-field atomicity.
     //
+    ShadowStrikeAcquireRWSpinLockShared(&g_TeProvider.StatsLock, &oldIrql);
     RtlCopyMemory(Stats, &g_TeProvider.Stats, sizeof(TE_STATISTICS));
+    ShadowStrikeReleaseRWSpinLockShared(&g_TeProvider.StatsLock, oldIrql);
 
     return STATUS_SUCCESS;
 }
@@ -2304,30 +2693,56 @@ TeResetStatistics(
     VOID
     )
 {
-    if (!g_TeProvider.Initialized) {
+    ULONG i;
+    LARGE_INTEGER now;
+
+    if (g_TeProvider.State == (LONG)TeState_Uninitialized) {
         return;
     }
 
-    //
-    // Reset counters
-    //
+    // Event counters
     InterlockedExchange64(&g_TeProvider.Stats.EventsGenerated, 0);
     InterlockedExchange64(&g_TeProvider.Stats.EventsWritten, 0);
     InterlockedExchange64(&g_TeProvider.Stats.EventsDropped, 0);
     InterlockedExchange64(&g_TeProvider.Stats.EventsThrottled, 0);
     InterlockedExchange64(&g_TeProvider.Stats.EventsSampled, 0);
     InterlockedExchange64(&g_TeProvider.Stats.EventsFailed, 0);
+
+    // Bytes counters
     InterlockedExchange64(&g_TeProvider.Stats.BytesGenerated, 0);
     InterlockedExchange64(&g_TeProvider.Stats.BytesWritten, 0);
+
+    // Rate tracking
     InterlockedExchange(&g_TeProvider.Stats.EventsThisSecond, 0);
     InterlockedExchange(&g_TeProvider.Stats.PeakEventsPerSecond, 0);
+
+    // Batch statistics
+    InterlockedExchange64(&g_TeProvider.Stats.BatchesWritten, 0);
+    InterlockedExchange64(&g_TeProvider.Stats.BatchFlushes, 0);
+    InterlockedExchange(&g_TeProvider.Stats.CurrentBatchSize, 0);
+    InterlockedExchange(&g_TeProvider.Stats.MaxBatchSize, 0);
+
+    // Throttling statistics
+    InterlockedExchange64(&g_TeProvider.Stats.ThrottleActivations, 0);
+    InterlockedExchange(&g_TeProvider.Stats.ThrottleCurrentLevel, 0);
+    InterlockedExchange64(&g_TeProvider.Stats.LastThrottleTime, 0);
+
+    // Error tracking
     InterlockedExchange64(&g_TeProvider.Stats.EtwWriteErrors, 0);
     InterlockedExchange64(&g_TeProvider.Stats.AllocationFailures, 0);
+    InterlockedExchange64(&g_TeProvider.Stats.SequenceGaps, 0);
 
-    //
-    // Reset start time
-    //
-    KeQuerySystemTime(&g_TeProvider.Stats.StartTime);
+    // Timing
+    KeQuerySystemTime(&now);
+    InterlockedExchange64(&g_TeProvider.Stats.StartTime, now.QuadPart);
+    InterlockedExchange64(&g_TeProvider.Stats.LastEventTime, 0);
+    InterlockedExchange64(&g_TeProvider.Stats.LastFlushTime, 0);
+    InterlockedExchange64(&g_TeProvider.Stats.CurrentSecondStart, now.QuadPart);
+
+    // Per-level counters
+    for (i = 0; i < TE_MAX_EVENT_LEVELS; i++) {
+        InterlockedExchange64(&g_TeProvider.Stats.EventsByLevel[i], 0);
+    }
 }
 
 // ============================================================================
@@ -2340,11 +2755,14 @@ TeFlush(
     VOID
     )
 {
+    LARGE_INTEGER flushTime;
+
     //
-    // Force flush is currently a no-op since we write events immediately
-    // In a batched implementation, this would flush pending batches
+    // Events are written synchronously via TepWriteEventInternal.
+    // This function updates the last flush timestamp for monitoring.
     //
-    KeQuerySystemTime(&g_TeProvider.Stats.LastFlushTime);
+    KeQuerySystemTime(&flushTime);
+    InterlockedExchange64(&g_TeProvider.Stats.LastFlushTime, flushTime.QuadPart);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2370,7 +2788,7 @@ TeGetSequenceNumber(
     VOID
     )
 {
-    return (UINT64)g_TeProvider.SequenceNumber;
+    return (UINT64)InterlockedCompareExchange64(&g_TeProvider.SequenceNumber, 0, 0);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2379,5 +2797,5 @@ TeGetState(
     VOID
     )
 {
-    return g_TeProvider.State;
+    return (TE_STATE)g_TeProvider.State;
 }

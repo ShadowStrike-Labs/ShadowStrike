@@ -27,9 +27,12 @@ extern "C" {
 // Pool Tags
 //=============================================================================
 
-#define VAD_POOL_TAG_ENTRY      'EDAV'  // VAD Tracker - Entry
-#define VAD_POOL_TAG_TREE       'TDAV'  // VAD Tracker - Tree
+#define VAD_POOL_TAG_ENTRY      'EDAV'  // VAD Tracker - Region Entry
+#define VAD_POOL_TAG_TREE       'TDAV'  // VAD Tracker - Tree/Tracker
 #define VAD_POOL_TAG_SNAPSHOT   'SDAV'  // VAD Tracker - Snapshot
+#define VAD_POOL_TAG_CHANGE     'CDAV'  // VAD Tracker - Change Event
+#define VAD_POOL_TAG_CONTEXT    'XDAV'  // VAD Tracker - Process Context
+#define VAD_POOL_TAG_HASH       'HDAV'  // VAD Tracker - Hash Chain
 
 //=============================================================================
 // Configuration Constants
@@ -109,9 +112,6 @@ typedef struct _VAD_REGION {
     //
     // Backing information
     //
-    PVOID FileObject;                   // Backing file (if any)
-    UNICODE_STRING FileName;            // Backing file name
-    ULONG64 FileOffset;                 // Offset in file
     BOOLEAN IsBacked;
     
     //
@@ -137,10 +137,9 @@ typedef struct _VAD_REGION {
     ULONG Entropy;                      // 0-100 scale
     
     //
-    // List linkage
+    // List linkage (sole ownership — no AVL copy)
     //
     LIST_ENTRY ListEntry;
-    RTL_BALANCED_NODE TreeNode;         // For AVL tree
     
 } VAD_REGION, *PVAD_REGION;
 
@@ -154,19 +153,14 @@ typedef struct _VAD_PROCESS_CONTEXT {
     //
     HANDLE ProcessId;
     PEPROCESS Process;
-    UNICODE_STRING ImageName;
     
     //
-    // VAD regions (AVL tree for fast lookup)
-    //
-    RTL_AVL_TABLE RegionTree;
-    KSPIN_LOCK TreeLock;
-    volatile LONG RegionCount;
-    
-    //
-    // Region list (for iteration)
+    // VAD regions (sorted linked list for lookup + iteration)
+    // Protected by RegionLock (push lock, <= APC_LEVEL)
     //
     LIST_ENTRY RegionList;
+    EX_PUSH_LOCK RegionLock;
+    volatile LONG RegionCount;
     
     //
     // Suspicion tracking
@@ -200,9 +194,14 @@ typedef struct _VAD_PROCESS_CONTEXT {
     volatile LONG RefCount;
     
     //
-    // List linkage
+    // Process list linkage
     //
     LIST_ENTRY ListEntry;
+    
+    //
+    // Hash chain linkage (chained hashing)
+    //
+    LIST_ENTRY HashEntry;
     
 } VAD_PROCESS_CONTEXT, *PVAD_PROCESS_CONTEXT;
 
@@ -261,24 +260,29 @@ typedef struct _VAD_CHANGE_EVENT {
 
 typedef struct _VAD_TRACKER {
     //
-    // Initialization state
+    // Initialization state (interlocked access only)
     //
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     
     //
-    // Process contexts
+    // Active operation reference count for shutdown drain
+    //
+    volatile LONG ActiveRefCount;
+    
+    //
+    // Process contexts (protected by ProcessListLock push lock)
     //
     LIST_ENTRY ProcessList;
-    KSPIN_LOCK ProcessListLock;
+    EX_PUSH_LOCK ProcessListLock;
     volatile LONG ProcessCount;
     
     //
-    // Process lookup hash table
+    // Process lookup hash table (chained — each bucket is a list head)
     //
     struct {
-        PVAD_PROCESS_CONTEXT* Buckets;
+        LIST_ENTRY* Buckets;
         ULONG BucketCount;
-        KSPIN_LOCK Lock;
+        EX_PUSH_LOCK Lock;
     } ProcessHash;
     
     //
@@ -294,7 +298,7 @@ typedef struct _VAD_TRACKER {
     //
     KTIMER SnapshotTimer;
     KDPC SnapshotDpc;
-    BOOLEAN SnapshotTimerActive;
+    volatile LONG SnapshotTimerActive;
     
     //
     // Statistics
@@ -324,6 +328,15 @@ typedef struct _VAD_TRACKER {
 // Callback Types
 //=============================================================================
 
+/**
+ * @brief VAD change notification callback.
+ *
+ * IMPORTANT: The Event pointer is only valid for the duration of the callback.
+ * Callbacks MUST NOT store the pointer or access it after returning.
+ * Callbacks are invoked at IRQL <= APC_LEVEL outside any lock.
+ * They must complete quickly and must not acquire locks that could
+ * deadlock with the tracker.
+ */
 typedef VOID (*VAD_CHANGE_CALLBACK)(
     _In_ PVAD_CHANGE_EVENT Event,
     _In_opt_ PVOID Context
@@ -338,11 +351,14 @@ typedef BOOLEAN (*VAD_REGION_FILTER)(
 // Public API - Initialization
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadInitialize(
     _Out_ PVAD_TRACKER* Tracker
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 VadShutdown(
     _Inout_ PVAD_TRACKER Tracker
@@ -352,18 +368,23 @@ VadShutdown(
 // Public API - Process Management
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadStartTracking(
     _In_ PVAD_TRACKER Tracker,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadStopTracking(
     _In_ PVAD_TRACKER Tracker,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 VadIsTracking(
     _In_ PVAD_TRACKER Tracker,
@@ -374,6 +395,8 @@ VadIsTracking(
 // Public API - VAD Scanning
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadScanProcess(
     _In_ PVAD_TRACKER Tracker,
@@ -381,11 +404,15 @@ VadScanProcess(
     _Out_opt_ PULONG SuspicionScore
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadScanAllProcesses(
     _In_ PVAD_TRACKER Tracker
     );
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadGetRegionInfo(
     _In_ PVAD_TRACKER Tracker,
@@ -398,6 +425,8 @@ VadGetRegionInfo(
 // Public API - Suspicion Analysis
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadAnalyzeRegion(
     _In_ PVAD_TRACKER Tracker,
@@ -407,12 +436,18 @@ VadAnalyzeRegion(
     _Out_ PULONG SuspicionScore
     );
 
+/**
+ * Retrieves copies of suspicious regions above a score threshold.
+ * The Regions array receives VALUE COPIES (not pointers to internal state).
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadGetSuspiciousRegions(
     _In_ PVAD_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _In_ ULONG MinScore,
-    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION* Regions,
+    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION Regions,
     _In_ ULONG MaxRegions,
     _Out_ PULONG RegionCount
     );
@@ -421,6 +456,8 @@ VadGetSuspiciousRegions(
 // Public API - Change Notification
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadRegisterChangeCallback(
     _In_ PVAD_TRACKER Tracker,
@@ -428,12 +465,15 @@ VadRegisterChangeCallback(
     _In_opt_ PVOID Context
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 VadUnregisterChangeCallback(
     _In_ PVAD_TRACKER Tracker,
     _In_ VAD_CHANGE_CALLBACK Callback
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadGetNextChange(
     _In_ PVAD_TRACKER Tracker,
@@ -445,13 +485,18 @@ VadGetNextChange(
 // Public API - Enumeration
 //=============================================================================
 
+/**
+ * Enumerates regions matching a filter. Returns VALUE COPIES.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadEnumerateRegions(
     _In_ PVAD_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _In_ VAD_REGION_FILTER Filter,
     _In_opt_ PVOID FilterContext,
-    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION* Regions,
+    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION Regions,
     _In_ ULONG MaxRegions,
     _Out_ PULONG RegionCount
     );
@@ -470,6 +515,8 @@ typedef struct _VAD_STATISTICS {
     LARGE_INTEGER UpTime;
 } VAD_STATISTICS, *PVAD_STATISTICS;
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 VadGetStatistics(
     _In_ PVAD_TRACKER Tracker,

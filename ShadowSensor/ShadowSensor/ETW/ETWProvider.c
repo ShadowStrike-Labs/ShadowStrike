@@ -8,52 +8,64 @@
 
     Architecture:
     - Kernel-mode ETW provider registration via EtwRegister
-    - Event descriptor-based event writing
-    - Rate limiting to prevent event flooding
-    - Lookaside list for efficient event buffer allocation
-    - Keywords and levels for granular event filtering
-    - Statistics tracking for monitoring and diagnostics
+    - Event descriptor-based event writing with per-event-ID descriptors
+    - Per-severity rate limiting (CRITICAL events are never dropped)
+    - Atomic enable-state snapshot for lock-free enable tracking
+    - State-machine lifecycle for safe init/shutdown under concurrency
+    - All PCWSTR parameters bounded by wcsnlen to prevent runaway scans
+    - Lookaside buffer dynamically sized to largest event struct (compile-time)
+    - In-flight writer reference counting with bounded drain timeout
+    - ReadAcquire-based state checks for ARM64 memory ordering correctness
 
-    MITRE ATT&CK Coverage:
-    - T1059: Command and Scripting Interpreter (process execution logging)
-    - T1055: Process Injection (injection detection events)
-    - T1071: Application Layer Protocol (network event logging)
+    Version: 2.1.0 — Full fix pass addressing all CRITICAL/HIGH/MEDIUM/LOW
+    issues from the v2.0.0 security review.
 
     Copyright (c) ShadowStrike Team
 --*/
 
+#include <initguid.h>
 #include "ETWProvider.h"
 #include "../Utilities/MemoryUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, EtwProviderInitialize)
+#pragma alloc_text(PAGE, EtwProviderInitialize)
 #pragma alloc_text(PAGE, EtwProviderShutdown)
 #endif
 
-//=============================================================================
+// ============================================================================
+// GUID Definition (defined here via INITGUID; header declares extern)
+// ============================================================================
+
+// {3A5E8B2C-7D4F-4E6A-9C1B-8D0F2E3A4B5C}
+DEFINE_GUID(SHADOWSTRIKE_ETW_PROVIDER_GUID,
+    0x3a5e8b2c, 0x7d4f, 0x4e6a, 0x9c, 0x1b, 0x8d, 0x0f, 0x2e, 0x3a, 0x4b, 0x5c);
+
+// ============================================================================
 // Internal Constants
-//=============================================================================
+// ============================================================================
 
-#define ETW_SIGNATURE                   'WTEZ'  // 'ZETW' reversed
-#define ETW_MAX_EVENTS_PER_SECOND       10000
-#define ETW_EVENT_BUFFER_SIZE           4096
-#define ETW_LOOKASIDE_DEPTH             256
-#define ETW_RATE_LIMIT_WINDOW_MS        1000
+#define ETW_MAX_EVENTS_PER_SECOND           10000
+#define ETW_LOOKASIDE_DEPTH                 256
+#define ETW_RATE_LIMIT_WINDOW_100NS         (10000000LL)  // 1 second in 100ns units
+#define ETW_MAX_DIAGNOSTIC_MESSAGE_CHARS    512
+#define ETW_SHUTDOWN_DRAIN_SPIN_LIMIT       1000
+#define ETW_SHUTDOWN_DRAIN_SLEEP_MS         1
+#define ETW_SHUTDOWN_MAX_DRAIN_100NS        (10000000LL * 10)  // 10 seconds max drain
 
-//=============================================================================
+// ============================================================================
 // Global State
-//=============================================================================
+// ============================================================================
 
 static ETW_PROVIDER_GLOBALS g_EtwGlobals = { 0 };
 
-//=============================================================================
+// ============================================================================
 // Forward Declarations
-//=============================================================================
+// ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 static BOOLEAN
 EtwpCheckRateLimit(
-    VOID
+    _In_ UCHAR EventLevel
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -78,6 +90,7 @@ EtwpWriteEvent(
     _In_reads_opt_(UserDataCount) PEVENT_DATA_DESCRIPTOR UserData
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID NTAPI
 EtwpEnableCallback(
     _In_ LPCGUID SourceId,
@@ -89,9 +102,42 @@ EtwpEnableCallback(
     _In_opt_ PVOID CallbackContext
     );
 
-//=============================================================================
+static BOOLEAN
+EtwpAcquireWriterRef(
+    VOID
+    );
+
+static VOID
+EtwpReleaseWriterRef(
+    VOID
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+EtwpCopyBoundedString(
+    _Out_writes_(DestChars) PWCHAR Dest,
+    _In_ ULONG DestChars,
+    _In_ PCWSTR Src,
+    _In_ ULONG MaxSrcChars
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+EtwpCopyUnicodeStringBounded(
+    _Out_writes_(DestChars) PWCHAR Dest,
+    _In_ ULONG DestChars,
+    _In_ PCUNICODE_STRING Src
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static PCEVENT_DESCRIPTOR
+EtwpGetSecurityDescriptor(
+    _In_ UINT32 AlertType
+    );
+
+// ============================================================================
 // Event Descriptors
-//=============================================================================
+// ============================================================================
 
 //
 // Process Events
@@ -157,9 +203,24 @@ static const EVENT_DESCRIPTOR EtwDescriptor_NetworkConnect = {
     0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_NETWORK
 };
 
+static const EVENT_DESCRIPTOR EtwDescriptor_NetworkListen = {
+    EtwEventId_NetworkListen,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_NETWORK
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_DnsQuery = {
+    EtwEventId_DnsQuery,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_NETWORK
+};
+
 static const EVENT_DESCRIPTOR EtwDescriptor_NetworkBlocked = {
     EtwEventId_NetworkBlocked,
     0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_NETWORK | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_ExfiltrationDetected = {
+    EtwEventId_ExfiltrationDetected,
+    0, 0, ETW_LEVEL_CRITICAL, 0, 0, ETW_KEYWORD_NETWORK | ETW_KEYWORD_THREAT | ETW_KEYWORD_SECURITY
 };
 
 static const EVENT_DESCRIPTOR EtwDescriptor_C2Detected = {
@@ -178,6 +239,16 @@ static const EVENT_DESCRIPTOR EtwDescriptor_BehaviorAlert = {
 static const EVENT_DESCRIPTOR EtwDescriptor_AttackChainStarted = {
     EtwEventId_AttackChainStarted,
     0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_AttackChainUpdated = {
+    EtwEventId_AttackChainUpdated,
+    0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_AttackChainCompleted = {
+    EtwEventId_AttackChainCompleted,
+    0, 0, ETW_LEVEL_INFORMATIONAL, 0, 0, ETW_KEYWORD_BEHAVIOR | ETW_KEYWORD_THREAT
 };
 
 static const EVENT_DESCRIPTOR EtwDescriptor_MitreDetection = {
@@ -201,6 +272,16 @@ static const EVENT_DESCRIPTOR EtwDescriptor_EvasionAttempt = {
 static const EVENT_DESCRIPTOR EtwDescriptor_DirectSyscall = {
     EtwEventId_DirectSyscall,
     0, 0, ETW_LEVEL_WARNING, 0, 0, ETW_KEYWORD_SECURITY
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_PrivilegeEscalation = {
+    EtwEventId_PrivilegeEscalation,
+    0, 0, ETW_LEVEL_CRITICAL, 0, 0, ETW_KEYWORD_SECURITY | ETW_KEYWORD_THREAT
+};
+
+static const EVENT_DESCRIPTOR EtwDescriptor_CredentialAccess = {
+    EtwEventId_CredentialAccess,
+    0, 0, ETW_LEVEL_CRITICAL, 0, 0, ETW_KEYWORD_SECURITY | ETW_KEYWORD_THREAT
 };
 
 //
@@ -236,9 +317,9 @@ static const EVENT_DESCRIPTOR EtwDescriptor_Error = {
     0, 0, ETW_LEVEL_ERROR, 0, 0, ETW_KEYWORD_DIAGNOSTIC
 };
 
-//=============================================================================
+// ============================================================================
 // Initialization / Shutdown
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -249,24 +330,50 @@ EtwProviderInitialize(
 
 Routine Description:
 
-    Initializes the ETW provider subsystem. Registers with ETW and
-    prepares event buffer infrastructure.
+    Initializes the ETW provider subsystem. Uses a state machine with
+    InterlockedCompareExchange to prevent double-initialization races.
 
 Return Value:
 
     STATUS_SUCCESS on success.
+    STATUS_ALREADY_INITIALIZED if already initialized.
+    STATUS_UNSUCCESSFUL if state transition fails.
 
 --*/
 {
     NTSTATUS status;
+    LONG previousState;
 
     PAGED_CODE();
 
-    if (g_EtwGlobals.Initialized) {
+    //
+    // Atomic state transition: UNINITIALIZED -> INITIALIZING
+    //
+    previousState = InterlockedCompareExchange(
+        &g_EtwGlobals.State,
+        EtwState_Initializing,
+        EtwState_Uninitialized
+        );
+
+    if (previousState == EtwState_Ready) {
         return STATUS_ALREADY_INITIALIZED;
     }
 
-    RtlZeroMemory(&g_EtwGlobals, sizeof(ETW_PROVIDER_GLOBALS));
+    if (previousState != EtwState_Uninitialized) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // We now own the initialization path exclusively.
+    // Zero all fields except State to avoid a window where another thread
+    // could see State transiently become EtwState_Uninitialized and race
+    // into a second initialization. State is already INITIALIZING from
+    // the CAS above and remains so throughout.
+    //
+    RtlZeroMemory(
+        (PUCHAR)&g_EtwGlobals + FIELD_OFFSET(ETW_PROVIDER_GLOBALS, Reserved0),
+        sizeof(ETW_PROVIDER_GLOBALS) - FIELD_OFFSET(ETW_PROVIDER_GLOBALS, Reserved0)
+        );
 
     //
     // Register the ETW provider
@@ -279,18 +386,21 @@ Return Value:
         );
 
     if (!NT_SUCCESS(status)) {
+        InterlockedExchange(&g_EtwGlobals.State, EtwState_Uninitialized);
         return status;
     }
 
     //
-    // Initialize lookaside list for event buffers
+    // Initialize lookaside list for event buffers.
+    // ETW_EVENT_BUFFER_SIZE is computed at compile time as the maximum
+    // of all event structure sizes, rounded up to 256-byte boundary.
     //
     ExInitializeNPagedLookasideList(
         &g_EtwGlobals.EventBufferLookaside,
         NULL,
         NULL,
         POOL_NX_ALLOCATION,
-        ETW_EVENT_BUFFER_SIZE,
+        (ULONG)ETW_EVENT_BUFFER_SIZE,
         ETW_POOL_TAG_BUFFER,
         ETW_LOOKASIDE_DEPTH
         );
@@ -299,21 +409,29 @@ Return Value:
     // Initialize rate limiting
     //
     g_EtwGlobals.MaxEventsPerSecond = ETW_MAX_EVENTS_PER_SECOND;
-    g_EtwGlobals.EventsThisSecond = 0;
-    KeQuerySystemTimePrecise((PLARGE_INTEGER)&g_EtwGlobals.CurrentSecondStart);
+    InterlockedExchange(&g_EtwGlobals.EventsThisSecond, 0);
+
+    {
+        LARGE_INTEGER now;
+        KeQuerySystemTimePrecise(&now);
+        InterlockedExchange64(&g_EtwGlobals.CurrentSecondStart, now.QuadPart);
+    }
 
     //
-    // Initialize statistics
+    // Statistics are already zeroed by RtlZeroMemory above.
+    // In-flight writer count starts at 0.
     //
-    g_EtwGlobals.EventsWritten = 0;
-    g_EtwGlobals.EventsDropped = 0;
-    g_EtwGlobals.BytesWritten = 0;
 
     //
-    // Mark as initialized
+    // Enabled = FALSE. Will be set by enable callback when a consumer attaches.
     //
-    g_EtwGlobals.Initialized = TRUE;
-    g_EtwGlobals.Enabled = FALSE;  // Will be set by enable callback
+    InterlockedExchange(&g_EtwGlobals.Enabled, FALSE);
+
+    //
+    // Transition: INITIALIZING -> READY (publish to other threads)
+    //
+    MemoryBarrier();
+    InterlockedExchange(&g_EtwGlobals.State, EtwState_Ready);
 
     return STATUS_SUCCESS;
 }
@@ -328,22 +446,70 @@ EtwProviderShutdown(
 
 Routine Description:
 
-    Shuts down the ETW provider. Unregisters from ETW and releases
-    all resources.
+    Shuts down the ETW provider. Uses state machine to prevent races.
+    Drains in-flight writers before tearing down resources.
 
 --*/
 {
+    LONG previousState;
+    ULONG spinCount;
+    LONG64 drainStartTime;
+    LARGE_INTEGER delay;
+
     PAGED_CODE();
 
-    if (!g_EtwGlobals.Initialized) {
+    //
+    // Atomic state transition: READY -> SHUTTING_DOWN
+    //
+    previousState = InterlockedCompareExchange(
+        &g_EtwGlobals.State,
+        EtwState_ShuttingDown,
+        EtwState_Ready
+        );
+
+    if (previousState != EtwState_Ready) {
         return;
     }
 
-    g_EtwGlobals.Initialized = FALSE;
-    g_EtwGlobals.Enabled = FALSE;
+    //
+    // Disable event writing immediately. New writers will see this
+    // and bail out before acquiring a writer ref.
+    //
+    InterlockedExchange(&g_EtwGlobals.Enabled, FALSE);
+    MemoryBarrier();
 
     //
-    // Unregister from ETW
+    // Drain in-flight writers. Wait for all currently executing
+    // event-writing functions to complete before tearing down.
+    // Uses ReadAcquire for ARM64 correctness and enforces a maximum
+    // drain timeout to prevent indefinite system hang on driver unload.
+    //
+    KeQuerySystemTimePrecise((PLARGE_INTEGER)&drainStartTime);
+    delay.QuadPart = -(LONGLONG)(ETW_SHUTDOWN_DRAIN_SLEEP_MS * 10000);
+    spinCount = 0;
+
+    while (ReadAcquire(&g_EtwGlobals.InFlightWriters) > 0) {
+        LONG64 now;
+        KeQuerySystemTimePrecise((PLARGE_INTEGER)&now);
+        if ((now - drainStartTime) > ETW_SHUTDOWN_MAX_DRAIN_100NS) {
+            //
+            // Drain timeout exceeded. Proceed with teardown.
+            // EtwUnregister will internally synchronize with any
+            // in-progress EtwWrite calls.
+            //
+            break;
+        }
+
+        spinCount++;
+        if (spinCount > ETW_SHUTDOWN_DRAIN_SPIN_LIMIT) {
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            spinCount = 0;
+        }
+        KeMemoryBarrier();
+    }
+
+    //
+    // All writers have drained. Unregister from ETW.
     //
     if (g_EtwGlobals.ProviderHandle != 0) {
         EtwUnregister(g_EtwGlobals.ProviderHandle);
@@ -354,6 +520,11 @@ Routine Description:
     // Cleanup lookaside list
     //
     ExDeleteNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside);
+
+    //
+    // Final state transition
+    //
+    InterlockedExchange(&g_EtwGlobals.State, EtwState_Shutdown);
 }
 
 
@@ -368,19 +539,27 @@ EtwProviderIsEnabled(
 Routine Description:
 
     Checks if the ETW provider is enabled for the specified level and keywords.
-
-Arguments:
-
-    Level - Event level to check.
-    Keywords - Event keywords to check.
-
-Return Value:
-
-    TRUE if enabled, FALSE otherwise.
+    Uses atomic reads of the enable state to avoid tearing from concurrent
+    enable callback updates.
 
 --*/
 {
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    LONG enabled;
+    UCHAR enableLevel;
+    LONGLONG enableFlags;
+
+    //
+    // Fast check: is the provider in READY state and enabled?
+    // Use ReadAcquire to enforce ordering on ARM64: subsequent reads
+    // of Enabled/EnableLevel/EnableFlags must not be reordered before
+    // this state check.
+    //
+    if (ReadAcquire(&g_EtwGlobals.State) != EtwState_Ready) {
+        return FALSE;
+    }
+
+    enabled = InterlockedOr(&g_EtwGlobals.Enabled, 0);
+    if (!enabled) {
         return FALSE;
     }
 
@@ -389,13 +568,18 @@ Return Value:
     }
 
     //
-    // Check if level and keywords match enabled settings
+    // Atomic snapshot of enable level and flags.
+    // These are written by InterlockedExchange in the enable callback.
     //
-    if (Level > g_EtwGlobals.EnableLevel) {
+    enableLevel = *((volatile UCHAR*)&g_EtwGlobals.EnableLevel);
+    MemoryBarrier();
+    enableFlags = InterlockedOr64((volatile LONG64*)&g_EtwGlobals.EnableFlags, 0);
+
+    if (Level > enableLevel) {
         return FALSE;
     }
 
-    if ((Keywords & g_EtwGlobals.EnableFlags) == 0) {
+    if ((Keywords & (ULONGLONG)enableFlags) == 0) {
         return FALSE;
     }
 
@@ -403,9 +587,146 @@ Return Value:
 }
 
 
-//=============================================================================
+// ============================================================================
+// In-Flight Writer Reference Counting
+// ============================================================================
+
+static BOOLEAN
+EtwpAcquireWriterRef(
+    VOID
+    )
+/*++
+
+Routine Description:
+
+    Acquires a writer reference. Returns FALSE if the provider is not
+    in READY state (preventing new writes during shutdown).
+
+    Uses ReadAcquire for both state checks to enforce correct ordering
+    on weakly-ordered architectures (ARM64). The re-check after
+    InterlockedIncrement ensures that if shutdown raced in, we release
+    the reference before the shutdown drain loop completes.
+
+--*/
+{
+    if (ReadAcquire(&g_EtwGlobals.State) != EtwState_Ready) {
+        return FALSE;
+    }
+
+    InterlockedIncrement(&g_EtwGlobals.InFlightWriters);
+
+    //
+    // Double-check after incrementing with acquire semantics.
+    // On ARM64, without ReadAcquire the CPU could reorder this load
+    // before the InterlockedIncrement, breaking the shutdown drain
+    // invariant and causing use-after-free of the lookaside list.
+    //
+    if (ReadAcquire(&g_EtwGlobals.State) != EtwState_Ready) {
+        InterlockedDecrement(&g_EtwGlobals.InFlightWriters);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+static VOID
+EtwpReleaseWriterRef(
+    VOID
+    )
+{
+    InterlockedDecrement(&g_EtwGlobals.InFlightWriters);
+}
+
+
+// ============================================================================
+// Bounded String Copy Helpers
+// ============================================================================
+
+_Use_decl_annotations_
+static VOID
+EtwpCopyBoundedString(
+    _Out_writes_(DestChars) PWCHAR Dest,
+    _In_ ULONG DestChars,
+    _In_ PCWSTR Src,
+    _In_ ULONG MaxSrcChars
+    )
+/*++
+
+Routine Description:
+
+    Copies a PCWSTR to a fixed-size WCHAR buffer with bounded length scan.
+    Uses wcsnlen to prevent scanning past MaxSrcChars characters.
+    Always null-terminates the destination.
+
+    TRUSTED-CALLER CONTRACT: Src must point to valid, readable kernel memory
+    of at least MaxSrcChars * sizeof(WCHAR) bytes. This function is internal
+    to the ETW provider and must NOT be called with user-mode pointers or
+    pointers to freed/paged-out memory at elevated IRQL.
+
+--*/
+{
+    size_t srcLen;
+    ULONG copyChars;
+
+    if (DestChars == 0) {
+        return;
+    }
+
+    srcLen = wcsnlen(Src, MaxSrcChars);
+    copyChars = (ULONG)min(srcLen, (size_t)(DestChars - 1));
+
+    if (copyChars > 0) {
+        RtlCopyMemory(Dest, Src, copyChars * sizeof(WCHAR));
+    }
+
+    Dest[copyChars] = L'\0';
+}
+
+
+_Use_decl_annotations_
+static VOID
+EtwpCopyUnicodeStringBounded(
+    _Out_writes_(DestChars) PWCHAR Dest,
+    _In_ ULONG DestChars,
+    _In_ PCUNICODE_STRING Src
+    )
+/*++
+
+Routine Description:
+
+    Copies a UNICODE_STRING to a fixed-size WCHAR buffer.
+    Uses the Length field (in bytes) — no unbounded string scan.
+    Always null-terminates the destination.
+
+--*/
+{
+    ULONG srcChars;
+    ULONG copyChars;
+
+    if (DestChars == 0) {
+        return;
+    }
+
+    if (Src == NULL || Src->Buffer == NULL || Src->Length == 0) {
+        Dest[0] = L'\0';
+        return;
+    }
+
+    srcChars = Src->Length / sizeof(WCHAR);
+    copyChars = min(srcChars, DestChars - 1);
+
+    if (copyChars > 0) {
+        RtlCopyMemory(Dest, Src->Buffer, copyChars * sizeof(WCHAR));
+    }
+
+    Dest[copyChars] = L'\0';
+}
+
+
+// ============================================================================
 // Event Writing - Process Events
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -416,31 +737,22 @@ EtwWriteProcessEvent(
     _In_opt_ PCUNICODE_STRING ImagePath,
     _In_opt_ PCUNICODE_STRING CommandLine,
     _In_ UINT32 ThreatScore,
-    _In_ UINT32 Flags
+    _In_ UINT32 Flags,
+    _In_ UINT32 ExitCode
     )
-/*++
-
-Routine Description:
-
-    Writes a process-related ETW event.
-
---*/
 {
     NTSTATUS status;
     PETW_PROCESS_EVENT event = NULL;
     PCEVENT_DESCRIPTOR descriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
-        return STATUS_SUCCESS;  // Silently succeed if not enabled
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
     }
 
-    //
-    // Rate limit check
-    //
-    if (!EtwpCheckRateLimit()) {
-        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
-        return STATUS_QUOTA_EXCEEDED;
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
     }
 
     //
@@ -460,6 +772,7 @@ Routine Description:
             descriptor = &EtwDescriptor_ProcessBlocked;
             break;
         default:
+            EtwpReleaseWriterRef();
             return STATUS_INVALID_PARAMETER;
     }
 
@@ -467,11 +780,21 @@ Routine Description:
     // Check if this event type is enabled
     //
     if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
     //
-    // Allocate event buffer from lookaside
+    // Per-severity rate limit check (CRITICAL events bypass)
+    //
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Allocate event buffer from lookaside (correctly sized)
     //
     event = (PETW_PROCESS_EVENT)ExAllocateFromNPagedLookasideList(
         &g_EtwGlobals.EventBufferLookaside
@@ -479,40 +802,39 @@ Routine Description:
 
     if (event == NULL) {
         InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(event, sizeof(ETW_PROCESS_EVENT));
 
     //
-    // Fill common header
+    // Fill common header (includes SessionId from PsGetCurrentProcessSessionId)
     //
     EtwpFillCommonHeader(&event->Common, ProcessId);
 
-    //
-    // Fill process-specific fields
-    //
     event->ParentProcessId = ParentProcessId;
     event->Flags = Flags;
     event->ThreatScore = ThreatScore;
-    event->ExitCode = 0;
+    event->ExitCode = ExitCode;
 
     //
-    // Copy image path (truncate if necessary)
+    // Copy strings using length-counted UNICODE_STRING — no unbounded scan
     //
-    if (ImagePath != NULL && ImagePath->Buffer != NULL && ImagePath->Length > 0) {
-        USHORT copyLen = min(ImagePath->Length, sizeof(event->ImagePath) - sizeof(WCHAR));
-        RtlCopyMemory(event->ImagePath, ImagePath->Buffer, copyLen);
-        event->ImagePath[copyLen / sizeof(WCHAR)] = L'\0';
+    if (ImagePath != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->ImagePath,
+            ETW_MAX_PATH_CHARS,
+            ImagePath
+            );
     }
 
-    //
-    // Copy command line (truncate if necessary)
-    //
-    if (CommandLine != NULL && CommandLine->Buffer != NULL && CommandLine->Length > 0) {
-        USHORT copyLen = min(CommandLine->Length, sizeof(event->CommandLine) - sizeof(WCHAR));
-        RtlCopyMemory(event->CommandLine, CommandLine->Buffer, copyLen);
-        event->CommandLine[copyLen / sizeof(WCHAR)] = L'\0';
+    if (CommandLine != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->CommandLine,
+            ETW_MAX_CMDLINE_CHARS,
+            CommandLine
+            );
     }
 
     //
@@ -526,46 +848,41 @@ Routine Description:
 
     ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
 
+    EtwpReleaseWriterRef();
+
     return status;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Event Writing - File Events
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
 EtwWriteFileEvent(
     _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
     _In_ UINT32 ProcessId,
-    _In_ PCUNICODE_STRING FilePath,
+    _In_opt_ PCUNICODE_STRING FilePath,
     _In_ UINT32 Operation,
     _In_ UINT64 FileSize,
     _In_ UINT32 Verdict,
     _In_opt_ PCWSTR ThreatName,
     _In_ UINT32 ThreatScore
     )
-/*++
-
-Routine Description:
-
-    Writes a file-related ETW event.
-
---*/
 {
     NTSTATUS status;
     PETW_FILE_EVENT event = NULL;
     PCEVENT_DESCRIPTOR descriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    if (!EtwpAcquireWriterRef()) {
         return STATUS_SUCCESS;
     }
 
-    if (!EtwpCheckRateLimit()) {
-        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
-        return STATUS_QUOTA_EXCEEDED;
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
     }
 
     //
@@ -588,11 +905,19 @@ Routine Description:
             descriptor = &EtwDescriptor_FileQuarantined;
             break;
         default:
+            EtwpReleaseWriterRef();
             return STATUS_INVALID_PARAMETER;
     }
 
     if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
+    }
+
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
     }
 
     event = (PETW_FILE_EVENT)ExAllocateFromNPagedLookasideList(
@@ -601,6 +926,7 @@ Routine Description:
 
     if (event == NULL) {
         InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -615,22 +941,26 @@ Routine Description:
     event->ThreatScore = ThreatScore;
 
     //
-    // Copy file path
+    // Copy file path using UNICODE_STRING (length-counted, safe)
     //
-    if (FilePath != NULL && FilePath->Buffer != NULL && FilePath->Length > 0) {
-        USHORT copyLen = min(FilePath->Length, sizeof(event->FilePath) - sizeof(WCHAR));
-        RtlCopyMemory(event->FilePath, FilePath->Buffer, copyLen);
-        event->FilePath[copyLen / sizeof(WCHAR)] = L'\0';
+    if (FilePath != NULL) {
+        EtwpCopyUnicodeStringBounded(
+            event->FilePath,
+            ETW_MAX_PATH_CHARS,
+            FilePath
+            );
     }
 
     //
-    // Copy threat name
+    // Copy threat name using bounded wcsnlen
     //
     if (ThreatName != NULL) {
-        size_t threatNameLen = wcslen(ThreatName);
-        SIZE_T copyLen = min(threatNameLen * sizeof(WCHAR), sizeof(event->ThreatName) - sizeof(WCHAR));
-        RtlCopyMemory(event->ThreatName, ThreatName, copyLen);
-        event->ThreatName[copyLen / sizeof(WCHAR)] = L'\0';
+        EtwpCopyBoundedString(
+            event->ThreatName,
+            ETW_MAX_THREAT_NAME_CHARS,
+            ThreatName,
+            ETW_MAX_THREAT_NAME_CHARS
+            );
     }
 
     EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_FILE_EVENT));
@@ -641,89 +971,134 @@ Routine Description:
 
     ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
 
+    EtwpReleaseWriterRef();
+
     return status;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Event Writing - Network Events
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
 EtwWriteNetworkEvent(
     _In_ SHADOWSTRIKE_ETW_EVENT_ID EventId,
-    _In_ PETW_NETWORK_EVENT Event
+    _In_ const ETW_NETWORK_EVENT* Event
     )
 /*++
 
 Routine Description:
 
-    Writes a network-related ETW event.
+    Writes a network-related ETW event. Makes an internal copy of the
+    caller's event structure to avoid mutating the caller's buffer and
+    to ensure the data resides in NonPaged pool.
+
+    TRUSTED-CALLER CONTRACT: Event must point to a fully-initialized
+    ETW_NETWORK_EVENT structure of sizeof(ETW_NETWORK_EVENT) bytes in
+    valid, readable kernel memory. This function performs a flat copy
+    of the entire structure.
 
 --*/
 {
     NTSTATUS status;
+    PETW_NETWORK_EVENT localEvent = NULL;
     PCEVENT_DESCRIPTOR descriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
     if (Event == NULL) {
+        EtwpReleaseWriterRef();
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!EtwpCheckRateLimit()) {
-        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     //
-    // Select event descriptor
+    // Select event descriptor — each event ID maps to its own descriptor
+    // so ETW consumers see the correct Id in the trace.
     //
     switch (EventId) {
         case EtwEventId_NetworkConnect:
-        case EtwEventId_NetworkListen:
-        case EtwEventId_DnsQuery:
             descriptor = &EtwDescriptor_NetworkConnect;
             break;
+        case EtwEventId_NetworkListen:
+            descriptor = &EtwDescriptor_NetworkListen;
+            break;
+        case EtwEventId_DnsQuery:
+            descriptor = &EtwDescriptor_DnsQuery;
+            break;
         case EtwEventId_NetworkBlocked:
-        case EtwEventId_ExfiltrationDetected:
             descriptor = &EtwDescriptor_NetworkBlocked;
+            break;
+        case EtwEventId_ExfiltrationDetected:
+            descriptor = &EtwDescriptor_ExfiltrationDetected;
             break;
         case EtwEventId_C2Detected:
             descriptor = &EtwDescriptor_C2Detected;
             break;
         default:
+            EtwpReleaseWriterRef();
             return STATUS_INVALID_PARAMETER;
     }
 
     if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
-    //
-    // Ensure common header is filled
-    //
-    if (Event->Common.Timestamp == 0) {
-        EtwpFillCommonHeader(&Event->Common, Event->Common.ProcessId);
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
     }
 
-    EventDataDescCreate(&dataDescriptor, Event, sizeof(ETW_NETWORK_EVENT));
+    //
+    // Allocate our own copy from the lookaside list.
+    // This prevents mutation of the caller's buffer and ensures
+    // the event data is in NonPaged pool.
+    //
+    localEvent = (PETW_NETWORK_EVENT)ExAllocateFromNPagedLookasideList(
+        &g_EtwGlobals.EventBufferLookaside
+        );
+
+    if (localEvent == NULL) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(localEvent, Event, sizeof(ETW_NETWORK_EVENT));
+
+    //
+    // Always fill the common header on our copy
+    //
+    EtwpFillCommonHeader(&localEvent->Common, Event->Common.ProcessId);
+
+    EventDataDescCreate(&dataDescriptor, localEvent, sizeof(ETW_NETWORK_EVENT));
 
     status = EtwpWriteEvent(descriptor, 1, &dataDescriptor);
 
     EtwpUpdateStatistics(sizeof(ETW_NETWORK_EVENT), NT_SUCCESS(status));
 
+    ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, localEvent);
+
+    EtwpReleaseWriterRef();
+
     return status;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Event Writing - Behavioral Events
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -734,52 +1109,60 @@ EtwWriteBehaviorEvent(
     _In_ UINT32 Category,
     _In_ UINT64 ChainId,
     _In_ UINT32 MitreTechnique,
+    _In_ UINT32 MitreTactic,
     _In_ UINT32 ThreatScore,
+    _In_ UINT32 Confidence,
     _In_opt_ PCWSTR Description
     )
-/*++
-
-Routine Description:
-
-    Writes a behavioral analysis ETW event.
-
---*/
 {
     NTSTATUS status;
     PETW_BEHAVIOR_EVENT event = NULL;
     PCEVENT_DESCRIPTOR descriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    if (!EtwpAcquireWriterRef()) {
         return STATUS_SUCCESS;
     }
 
-    if (!EtwpCheckRateLimit()) {
-        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
-        return STATUS_QUOTA_EXCEEDED;
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
+        return STATUS_SUCCESS;
     }
 
     //
-    // Select event descriptor
+    // Select event descriptor — each event ID maps to its own descriptor
+    // so ETW consumers see the correct Id in the trace.
     //
     switch (EventId) {
         case EtwEventId_BehaviorAlert:
             descriptor = &EtwDescriptor_BehaviorAlert;
             break;
         case EtwEventId_AttackChainStarted:
-        case EtwEventId_AttackChainUpdated:
-        case EtwEventId_AttackChainCompleted:
             descriptor = &EtwDescriptor_AttackChainStarted;
+            break;
+        case EtwEventId_AttackChainUpdated:
+            descriptor = &EtwDescriptor_AttackChainUpdated;
+            break;
+        case EtwEventId_AttackChainCompleted:
+            descriptor = &EtwDescriptor_AttackChainCompleted;
             break;
         case EtwEventId_MitreDetection:
             descriptor = &EtwDescriptor_MitreDetection;
             break;
         default:
+            EtwpReleaseWriterRef();
             return STATUS_INVALID_PARAMETER;
     }
 
     if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
+    }
+
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
     }
 
     event = (PETW_BEHAVIOR_EVENT)ExAllocateFromNPagedLookasideList(
@@ -788,6 +1171,7 @@ Routine Description:
 
     if (event == NULL) {
         InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -798,19 +1182,21 @@ Routine Description:
     event->BehaviorType = BehaviorType;
     event->Category = Category;
     event->ThreatScore = ThreatScore;
-    event->Confidence = 0;  // To be set by caller if needed
+    event->Confidence = Confidence;
     event->ChainId = ChainId;
     event->MitreTechnique = MitreTechnique;
-    event->MitreTactic = 0;  // Derived from technique if needed
+    event->MitreTactic = MitreTactic;
 
     //
-    // Copy description
+    // Copy description using bounded wcsnlen
     //
     if (Description != NULL) {
-        size_t descLen = wcslen(Description);
-        SIZE_T copyLen = min(descLen * sizeof(WCHAR), sizeof(event->Description) - sizeof(WCHAR));
-        RtlCopyMemory(event->Description, Description, copyLen);
-        event->Description[copyLen / sizeof(WCHAR)] = L'\0';
+        EtwpCopyBoundedString(
+            event->Description,
+            ETW_MAX_DESCRIPTION_CHARS,
+            Description,
+            ETW_MAX_DESCRIPTION_CHARS
+            );
     }
 
     EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_BEHAVIOR_EVENT));
@@ -821,13 +1207,46 @@ Routine Description:
 
     ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
 
+    EtwpReleaseWriterRef();
+
     return status;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Event Writing - Security Alerts
-//=============================================================================
+// ============================================================================
+
+_Use_decl_annotations_
+static PCEVENT_DESCRIPTOR
+EtwpGetSecurityDescriptor(
+    _In_ UINT32 AlertType
+    )
+/*++
+
+Routine Description:
+
+    Maps security alert type to event descriptor.
+    Returns NULL for unrecognized types.
+
+--*/
+{
+    switch (AlertType) {
+        case EtwEventId_TamperAttempt:
+            return &EtwDescriptor_TamperAttempt;
+        case EtwEventId_EvasionAttempt:
+            return &EtwDescriptor_EvasionAttempt;
+        case EtwEventId_DirectSyscall:
+            return &EtwDescriptor_DirectSyscall;
+        case EtwEventId_PrivilegeEscalation:
+            return &EtwDescriptor_PrivilegeEscalation;
+        case EtwEventId_CredentialAccess:
+            return &EtwDescriptor_CredentialAccess;
+        default:
+            return NULL;
+    }
+}
+
 
 _Use_decl_annotations_
 NTSTATUS
@@ -843,52 +1262,48 @@ EtwWriteSecurityAlert(
     _In_ UINT32 ThreatScore,
     _In_ UINT32 ResponseAction
     )
-/*++
-
-Routine Description:
-
-    Writes a security alert ETW event for critical detections.
-
---*/
 {
     NTSTATUS status;
     PETW_SECURITY_ALERT event = NULL;
     PCEVENT_DESCRIPTOR descriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
     if (Title == NULL || Description == NULL) {
+        EtwpReleaseWriterRef();
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!EtwpCheckRateLimit()) {
-        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     //
-    // Select descriptor based on alert type
+    // Map alert type to descriptor. Return INVALID_PARAMETER for unknown types
+    // instead of silently defaulting to TamperAttempt (prevents false positives).
     //
-    switch (AlertType) {
-        case EtwEventId_TamperAttempt:
-            descriptor = &EtwDescriptor_TamperAttempt;
-            break;
-        case EtwEventId_EvasionAttempt:
-            descriptor = &EtwDescriptor_EvasionAttempt;
-            break;
-        case EtwEventId_DirectSyscall:
-            descriptor = &EtwDescriptor_DirectSyscall;
-            break;
-        default:
-            descriptor = &EtwDescriptor_TamperAttempt;
-            break;
+    descriptor = EtwpGetSecurityDescriptor(AlertType);
+    if (descriptor == NULL) {
+        EtwpReleaseWriterRef();
+        return STATUS_INVALID_PARAMETER;
     }
 
     if (!EtwProviderIsEnabled(descriptor->Level, descriptor->Keyword)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
+    }
+
+    //
+    // Security alerts at CRITICAL level bypass rate limiting.
+    //
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
     }
 
     event = (PETW_SECURITY_ALERT)ExAllocateFromNPagedLookasideList(
@@ -897,6 +1312,7 @@ Routine Description:
 
     if (event == NULL) {
         InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -911,34 +1327,38 @@ Routine Description:
     event->ChainId = ChainId;
 
     //
-    // Copy strings with truncation
+    // All string copies bounded by wcsnlen via EtwpCopyBoundedString
     //
-    {
-        size_t len = wcslen(Title);
-        SIZE_T copyLen = min(len * sizeof(WCHAR), sizeof(event->AlertTitle) - sizeof(WCHAR));
-        RtlCopyMemory(event->AlertTitle, Title, copyLen);
-        event->AlertTitle[copyLen / sizeof(WCHAR)] = L'\0';
-    }
+    EtwpCopyBoundedString(
+        event->AlertTitle,
+        ETW_MAX_ALERT_TITLE_CHARS,
+        Title,
+        ETW_MAX_ALERT_TITLE_CHARS
+        );
 
-    {
-        size_t len = wcslen(Description);
-        SIZE_T copyLen = min(len * sizeof(WCHAR), sizeof(event->AlertDescription) - sizeof(WCHAR));
-        RtlCopyMemory(event->AlertDescription, Description, copyLen);
-        event->AlertDescription[copyLen / sizeof(WCHAR)] = L'\0';
-    }
+    EtwpCopyBoundedString(
+        event->AlertDescription,
+        ETW_MAX_ALERT_DESC_CHARS,
+        Description,
+        ETW_MAX_ALERT_DESC_CHARS
+        );
 
     if (ProcessPath != NULL) {
-        size_t len = wcslen(ProcessPath);
-        SIZE_T copyLen = min(len * sizeof(WCHAR), sizeof(event->ProcessPath) - sizeof(WCHAR));
-        RtlCopyMemory(event->ProcessPath, ProcessPath, copyLen);
-        event->ProcessPath[copyLen / sizeof(WCHAR)] = L'\0';
+        EtwpCopyBoundedString(
+            event->ProcessPath,
+            ETW_MAX_PATH_CHARS,
+            ProcessPath,
+            ETW_MAX_PATH_CHARS
+            );
     }
 
     if (TargetPath != NULL) {
-        size_t len = wcslen(TargetPath);
-        SIZE_T copyLen = min(len * sizeof(WCHAR), sizeof(event->TargetPath) - sizeof(WCHAR));
-        RtlCopyMemory(event->TargetPath, TargetPath, copyLen);
-        event->TargetPath[copyLen / sizeof(WCHAR)] = L'\0';
+        EtwpCopyBoundedString(
+            event->TargetPath,
+            ETW_MAX_PATH_CHARS,
+            TargetPath,
+            ETW_MAX_PATH_CHARS
+            );
     }
 
     EventDataDescCreate(&dataDescriptor, event, sizeof(ETW_SECURITY_ALERT));
@@ -949,13 +1369,15 @@ Routine Description:
 
     ExFreeToNPagedLookasideList(&g_EtwGlobals.EventBufferLookaside, event);
 
+    EtwpReleaseWriterRef();
+
     return status;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Event Writing - Diagnostic Events
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -966,24 +1388,25 @@ EtwWriteDiagnosticEvent(
     _In_ PCWSTR Message,
     _In_ UINT32 ErrorCode
     )
-/*++
-
-Routine Description:
-
-    Writes a diagnostic/error ETW event.
-
---*/
 {
     NTSTATUS status;
     PCEVENT_DESCRIPTOR descriptor;
     EVENT_DATA_DESCRIPTOR dataDescriptors[4];
     UINT64 timestamp;
+    size_t messageLen;
+    ULONG messageSizeBytes;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
     if (Message == NULL) {
+        EtwpReleaseWriterRef();
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1010,23 +1433,50 @@ Routine Description:
     }
 
     if (!EtwProviderIsEnabled(Level, ETW_KEYWORD_DIAGNOSTIC)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
     //
-    // Build event data
+    // Diagnostic events ARE rate-limited (fixes MEDIUM-1)
+    //
+    if (!EtwpCheckRateLimit(descriptor->Level)) {
+        InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Build event data with bounded message length
     //
     KeQuerySystemTimePrecise((PLARGE_INTEGER)&timestamp);
+
+    //
+    // Bound the message scan to prevent runaway wcslen.
+    // Only include the null terminator byte if wcsnlen actually found one
+    // within the limit. If the string is exactly ETW_MAX_DIAGNOSTIC_MESSAGE_CHARS
+    // long with no null, we must not read past the end of the buffer.
+    //
+    messageLen = wcsnlen(Message, ETW_MAX_DIAGNOSTIC_MESSAGE_CHARS);
+    if (messageLen < ETW_MAX_DIAGNOSTIC_MESSAGE_CHARS) {
+        messageSizeBytes = (ULONG)((messageLen + 1) * sizeof(WCHAR));
+    } else {
+        messageSizeBytes = (ULONG)(messageLen * sizeof(WCHAR));
+    }
 
     EventDataDescCreate(&dataDescriptors[0], &timestamp, sizeof(UINT64));
     EventDataDescCreate(&dataDescriptors[1], &ComponentId, sizeof(UINT32));
     EventDataDescCreate(&dataDescriptors[2], &ErrorCode, sizeof(UINT32));
-    EventDataDescCreate(&dataDescriptors[3], Message, (ULONG)((wcslen(Message) + 1) * sizeof(WCHAR)));
+    EventDataDescCreate(&dataDescriptors[3], Message, messageSizeBytes);
 
     status = EtwpWriteEvent(descriptor, 4, dataDescriptors);
 
-    EtwpUpdateStatistics(sizeof(UINT64) + sizeof(UINT32) * 2 + (ULONG)((wcslen(Message) + 1) * sizeof(WCHAR)),
-                         NT_SUCCESS(status));
+    EtwpUpdateStatistics(
+        sizeof(UINT64) + sizeof(UINT32) * 2 + messageSizeBytes,
+        NT_SUCCESS(status)
+        );
+
+    EtwpReleaseWriterRef();
 
     return status;
 }
@@ -1037,31 +1487,32 @@ NTSTATUS
 EtwWritePerformanceStats(
     _In_ PTELEMETRY_PERFORMANCE Stats
     )
-/*++
-
-Routine Description:
-
-    Writes performance statistics as an ETW event.
-
---*/
 {
     NTSTATUS status;
     EVENT_DATA_DESCRIPTOR dataDescriptor;
 
-    if (!g_EtwGlobals.Initialized || !g_EtwGlobals.Enabled) {
+    if (!EtwpAcquireWriterRef()) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!g_EtwGlobals.Enabled) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
     if (Stats == NULL) {
+        EtwpReleaseWriterRef();
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!EtwProviderIsEnabled(ETW_LEVEL_INFORMATIONAL, ETW_KEYWORD_TELEMETRY)) {
+        EtwpReleaseWriterRef();
         return STATUS_SUCCESS;
     }
 
-    if (!EtwpCheckRateLimit()) {
+    if (!EtwpCheckRateLimit(ETW_LEVEL_INFORMATIONAL)) {
         InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
+        EtwpReleaseWriterRef();
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -1071,13 +1522,15 @@ Routine Description:
 
     EtwpUpdateStatistics(sizeof(TELEMETRY_PERFORMANCE), NT_SUCCESS(status));
 
+    EtwpReleaseWriterRef();
+
     return status;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Statistics
-//=============================================================================
+// ============================================================================
 
 _Use_decl_annotations_
 NTSTATUS
@@ -1086,71 +1539,103 @@ EtwProviderGetStatistics(
     _Out_ PUINT64 EventsDropped,
     _Out_ PUINT64 BytesWritten
     )
-/*++
-
-Routine Description:
-
-    Retrieves ETW provider statistics.
-
---*/
 {
     if (EventsWritten == NULL || EventsDropped == NULL || BytesWritten == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    *EventsWritten = g_EtwGlobals.EventsWritten;
-    *EventsDropped = g_EtwGlobals.EventsDropped;
-    *BytesWritten = g_EtwGlobals.BytesWritten;
+    //
+    // Atomic reads: use InterlockedOr64 to ensure 64-bit atomicity
+    // on both 32-bit and 64-bit platforms.
+    //
+    *EventsWritten = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_EtwGlobals.EventsWritten, 0
+        );
+    *EventsDropped = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_EtwGlobals.EventsDropped, 0
+        );
+    *BytesWritten = (UINT64)InterlockedOr64(
+        (volatile LONG64*)&g_EtwGlobals.BytesWritten, 0
+        );
 
     return STATUS_SUCCESS;
 }
 
 
-//=============================================================================
+// ============================================================================
 // Internal Functions
-//=============================================================================
+// ============================================================================
 
 static
 _Use_decl_annotations_
 BOOLEAN
 EtwpCheckRateLimit(
-    VOID
+    _In_ UCHAR EventLevel
     )
 /*++
 
 Routine Description:
 
     Checks if we're within the rate limit for event writing.
-    Resets counter each second.
+    Resets counter each second using atomic operations to prevent torn
+    reads/writes on 32-bit platforms.
+
+    CRITICAL-level events (level <= ETW_LEVEL_CRITICAL) ALWAYS pass
+    the rate limit check. Security-critical events must never be dropped
+    in favor of verbose telemetry.
 
 Return Value:
 
-    TRUE if under rate limit, FALSE if limit exceeded.
+    TRUE if under rate limit or event is CRITICAL, FALSE if limit exceeded.
 
 --*/
 {
-    UINT64 currentTime;
-    UINT64 elapsedMs;
+    LONG64 currentTime;
+    LONG64 windowStart;
+    LONG64 elapsed;
     LONG currentCount;
+
+    //
+    // CRITICAL events bypass rate limiting entirely.
+    // Tamper attempts, C2 detections, privilege escalation — these must
+    // always be emitted regardless of event volume from other sources.
+    //
+    if (EventLevel <= ETW_LEVEL_CRITICAL) {
+        return TRUE;
+    }
 
     KeQuerySystemTimePrecise((PLARGE_INTEGER)&currentTime);
 
     //
-    // Calculate elapsed time in milliseconds
+    // Atomic read of the window start time
     //
-    elapsedMs = (currentTime - g_EtwGlobals.CurrentSecondStart) / 10000;
+    windowStart = InterlockedOr64(&g_EtwGlobals.CurrentSecondStart, 0);
 
-    if (elapsedMs >= ETW_RATE_LIMIT_WINDOW_MS) {
+    elapsed = currentTime - windowStart;
+
+    if (elapsed >= ETW_RATE_LIMIT_WINDOW_100NS) {
         //
-        // New window - reset counter
+        // Attempt to reset the window atomically.
+        // Only one thread wins the CAS; others fall through to increment.
         //
-        g_EtwGlobals.CurrentSecondStart = currentTime;
-        InterlockedExchange(&g_EtwGlobals.EventsThisSecond, 1);
-        return TRUE;
+        if (InterlockedCompareExchange64(
+                &g_EtwGlobals.CurrentSecondStart,
+                currentTime,
+                windowStart
+                ) == windowStart) {
+            //
+            // We won the race — reset the counter.
+            //
+            InterlockedExchange(&g_EtwGlobals.EventsThisSecond, 1);
+            return TRUE;
+        }
+        //
+        // Another thread reset the window. Fall through to normal increment.
+        //
     }
 
     //
-    // Increment and check
+    // Increment and check against limit
     //
     currentCount = InterlockedIncrement(&g_EtwGlobals.EventsThisSecond);
 
@@ -1165,17 +1650,10 @@ EtwpUpdateStatistics(
     _In_ ULONG EventSize,
     _In_ BOOLEAN Success
     )
-/*++
-
-Routine Description:
-
-    Updates statistics counters after event writing.
-
---*/
 {
     if (Success) {
         InterlockedIncrement64(&g_EtwGlobals.EventsWritten);
-        InterlockedAdd64((LONG64*)&g_EtwGlobals.BytesWritten, EventSize);
+        InterlockedAdd64(&g_EtwGlobals.BytesWritten, (LONG64)EventSize);
     } else {
         InterlockedIncrement64(&g_EtwGlobals.EventsDropped);
     }
@@ -1189,22 +1667,22 @@ EtwpFillCommonHeader(
     _Out_ PETW_EVENT_COMMON Common,
     _In_ UINT32 ProcessId
     )
-/*++
-
-Routine Description:
-
-    Fills the common event header fields.
-
---*/
 {
     LARGE_INTEGER timestamp;
+    ULONG sessionId = 0;
 
     KeQuerySystemTimePrecise(&timestamp);
 
     Common->Timestamp = (UINT64)timestamp.QuadPart;
     Common->ProcessId = ProcessId;
     Common->ThreadId = (UINT32)(ULONG_PTR)PsGetCurrentThreadId();
-    Common->SessionId = 0;  // Would require additional lookup
+
+    //
+    // Populate session ID. PsGetCurrentProcessSessionId is safe at
+    // any IRQL <= DISPATCH_LEVEL and does not access paged memory.
+    //
+    sessionId = PsGetCurrentProcessSessionId();
+    Common->SessionId = sessionId;
     Common->Reserved = 0;
 }
 
@@ -1217,13 +1695,6 @@ EtwpWriteEvent(
     _In_ ULONG UserDataCount,
     _In_reads_opt_(UserDataCount) PEVENT_DATA_DESCRIPTOR UserData
     )
-/*++
-
-Routine Description:
-
-    Internal wrapper for EtwWrite with error handling.
-
---*/
 {
     NTSTATUS status;
 
@@ -1244,6 +1715,7 @@ Routine Description:
 
 
 static
+_Use_decl_annotations_
 VOID NTAPI
 EtwpEnableCallback(
     _In_ LPCGUID SourceId,
@@ -1259,6 +1731,17 @@ EtwpEnableCallback(
 Routine Description:
 
     Callback invoked when an ETW session enables/disables the provider.
+    Updates enable state using interlocked operations for each field
+    to prevent tearing when read by EtwProviderIsEnabled.
+
+    Does NOT track consumer count manually. ETW does not guarantee
+    paired enable/disable calls (sessions can crash, be torn down, or
+    send redundant disables), so manual refcounting drifts over time.
+    Instead, we simply set Enabled on ENABLE and clear on DISABLE.
+
+    CAPTURE_STATE is acknowledged but does NOT call EtwWrite from
+    within this callback to avoid potential deadlock with ETW's
+    internal locks when concurrent sessions are being enabled.
 
 --*/
 {
@@ -1269,36 +1752,37 @@ Routine Description:
 
     if (IsEnabled == EVENT_CONTROL_CODE_ENABLE_PROVIDER) {
         //
-        // Provider is being enabled
+        // Provider is being enabled.
+        // Write enable state atomically per field. Order matters:
+        // set Level and Flags before setting Enabled, so that
+        // concurrent readers see consistent filter state.
         //
-        g_EtwGlobals.Enabled = TRUE;
-        g_EtwGlobals.EnableLevel = Level;
-        g_EtwGlobals.EnableFlags = MatchAnyKeyword;
-        InterlockedIncrement((LONG*)&g_EtwGlobals.ConsumerCount);
+        InterlockedExchange8((CHAR volatile*)&g_EtwGlobals.EnableLevel, (CHAR)Level);
+        MemoryBarrier();
+        InterlockedExchange64(&g_EtwGlobals.EnableFlags, (LONG64)MatchAnyKeyword);
+        MemoryBarrier();
+        InterlockedExchange(&g_EtwGlobals.Enabled, TRUE);
 
     } else if (IsEnabled == EVENT_CONTROL_CODE_DISABLE_PROVIDER) {
         //
-        // Provider is being disabled
+        // Provider is being disabled.
+        // Unconditionally disable. We do not track consumer count because
+        // ETW does not guarantee paired enable/disable callbacks.
         //
-        if (InterlockedDecrement((LONG*)&g_EtwGlobals.ConsumerCount) == 0) {
-            g_EtwGlobals.Enabled = FALSE;
-            g_EtwGlobals.EnableLevel = 0;
-            g_EtwGlobals.EnableFlags = 0;
-        }
+        InterlockedExchange(&g_EtwGlobals.Enabled, FALSE);
+        MemoryBarrier();
+        InterlockedExchange8((CHAR volatile*)&g_EtwGlobals.EnableLevel, 0);
+        InterlockedExchange64(&g_EtwGlobals.EnableFlags, 0);
 
     } else if (IsEnabled == EVENT_CONTROL_CODE_CAPTURE_STATE) {
         //
-        // Consumer requesting state capture - write current state
+        // Consumer requesting state capture.
+        // We intentionally do NOT emit an ETW event from within this
+        // callback. Calling EtwWrite here risks deadlock with ETW's
+        // internal session locks when multiple sessions are being
+        // enabled/disabled concurrently. The state is already visible
+        // to consumers via the normal event stream.
         //
-        if (g_EtwGlobals.Enabled) {
-            EtwWriteDiagnosticEvent(
-                EtwEventId_ComponentHealth,
-                ETW_LEVEL_INFORMATIONAL,
-                Component_ETWProvider,
-                L"ETW Provider state captured",
-                0
-                );
-        }
+        NOTHING;
     }
 }
-

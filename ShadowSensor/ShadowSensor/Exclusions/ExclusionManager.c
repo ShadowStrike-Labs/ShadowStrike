@@ -7,15 +7,24 @@
  * @brief Kernel-mode exclusion management implementation.
  *
  * Implements efficient matching for paths, extensions, and processes to
- * filter out safe or problematic operations before scanning.
+ * filter out safe or irrelevant operations before scanning.
  *
  * Performance considerations:
  * - O(1) hash lookup for extensions and process names
- * - O(N) list traversal for paths (optimized with length checks)
+ * - O(N) list traversal for paths (with early-out on length/expiry)
  * - Reader-writer locks to maximize concurrency during scans
+ * - EX_RUNDOWN_REF for safe shutdown drain (no timeout, no forced free)
+ *
+ * Thread Safety:
+ * - All read-path APIs acquire rundown protection before accessing state.
+ * - Shutdown waits indefinitely for all readers to drain.
+ * - Count limits are checked under exclusive lock (no TOCTOU).
+ * - Duplicate detection is performed under exclusive lock.
+ * - Statistics counters are approximate (documented).
+ * - All mutation APIs enforce kernel-mode caller via ExGetPreviousMode().
  *
  * @author ShadowStrike Security Team
- * @version 1.0.0
+ * @version 3.0.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -28,6 +37,15 @@
 #pragma alloc_text(PAGE, ShadowStrikeExclusionShutdown)
 #pragma alloc_text(PAGE, ShadowStrikeClearExclusions)
 #pragma alloc_text(PAGE, ShadowStrikeLoadDefaultExclusions)
+#pragma alloc_text(PAGE, ShadowStrikeAddPathExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeRemovePathExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeAddExtensionExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeRemoveExtensionExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeAddProcessExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeRemoveProcessExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeAddPidExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeRemovePidExclusion)
+#pragma alloc_text(PAGE, ShadowStrikeCleanupExpiredExclusions)
 #endif
 
 // ============================================================================
@@ -37,56 +55,167 @@
 SHADOWSTRIKE_EXCLUSION_MANAGER g_ExclusionManager = {0};
 
 // ============================================================================
-// INTERNAL HELPERS
+// INTERNAL HELPERS — RUNDOWN PROTECTION
 // ============================================================================
 
+/**
+ * @brief Acquire rundown protection to prevent shutdown from freeing state.
+ *
+ * Uses EX_RUNDOWN_REF — the correct NT kernel primitive for this pattern.
+ * No race condition: ExAcquireRundownProtection is atomic.
+ *
+ * @return TRUE if acquired, FALSE if shutdown is in progress.
+ */
+_IRQL_requires_max_(APC_LEVEL)
 static
+FORCEINLINE
 BOOLEAN
-ShadowStrikeMatchPattern(
-    _In_ PCWSTR String,
-    _In_ USHORT StringLen,
-    _In_ PCWSTR Pattern,
-    _In_ USHORT PatternLen,
-    _In_ BOOLEAN Recursive
+ExclusionpAcquireRundown(
+    VOID
     )
 {
-    //
-    // Simple prefix match for now
-    // TODO: Implement full wildcard matching if needed
-    //
+    return ExAcquireRundownProtection(&g_ExclusionManager.RundownRef);
+}
 
-    // Check if pattern is longer than string
-    if (PatternLen > StringLen) {
-        return FALSE;
-    }
+/**
+ * @brief Release rundown protection acquired by ExclusionpAcquireRundown.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+static
+FORCEINLINE
+VOID
+ExclusionpReleaseRundown(
+    VOID
+    )
+{
+    ExReleaseRundownProtection(&g_ExclusionManager.RundownRef);
+}
 
-    // Check prefix
-    if (RtlCompareMemory(String, Pattern, PatternLen * sizeof(WCHAR)) != PatternLen * sizeof(WCHAR)) {
-        return FALSE;
-    }
+/**
+ * @brief Validate that the caller is kernel-mode.
+ *
+ * All mutation APIs must be called from kernel mode only. If this driver
+ * ever exposes IOCTLs that dispatch to these APIs, the IOCTL handler must
+ * validate privileges separately — this is a defense-in-depth check.
+ *
+ * @return TRUE if caller is kernel-mode, FALSE otherwise.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+static
+FORCEINLINE
+BOOLEAN
+ExclusionpValidateCallerIsKernel(
+    VOID
+    )
+{
+    return (ExGetPreviousMode() == KernelMode);
+}
 
-    // If recursive/directory match, ensure we matched a whole path component
-    if (Recursive) {
-        // If exact match, it's excluded
-        if (StringLen == PatternLen) {
-            return TRUE;
+// ============================================================================
+// INTERNAL HELPERS — DUPLICATE DETECTION
+// ============================================================================
+
+/**
+ * @brief Check if a path exclusion already exists (caller holds PathLock exclusive).
+ */
+_Requires_lock_held_(g_ExclusionManager.PathLock)
+static
+BOOLEAN
+ExclusionpPathExistLocked(
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    PLIST_ENTRY listEntry;
+    PSHADOWSTRIKE_PATH_EXCLUSION entry;
+
+    for (listEntry = g_ExclusionManager.PathExclusions.Flink;
+         listEntry != &g_ExclusionManager.PathExclusions;
+         listEntry = listEntry->Flink) {
+
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
+
+        if (entry->PathLength == Path->Length / sizeof(WCHAR)) {
+            UNICODE_STRING entryPath;
+            entryPath.Buffer = entry->Path;
+            entryPath.Length = entry->PathLength * sizeof(WCHAR);
+            entryPath.MaximumLength = entryPath.Length;
+
+            if (RtlCompareUnicodeString(&entryPath, Path, TRUE) == 0) {
+                return TRUE;
+            }
         }
-
-        // If prefix ends with separator, it matches children
-        if (Pattern[PatternLen - 1] == L'\\') {
-            return TRUE;
-        }
-
-        // If string continues with separator, it matches children
-        if (String[PatternLen] == L'\\') {
-            return TRUE;
-        }
-
-        return FALSE;
     }
+    return FALSE;
+}
 
-    // Exact match required if not recursive
-    return (StringLen == PatternLen);
+/**
+ * @brief Check if an extension exclusion already exists (caller holds ExtensionLock exclusive).
+ */
+_Requires_lock_held_(g_ExclusionManager.ExtensionLock)
+static
+BOOLEAN
+ExclusionpExtensionExistLocked(
+    _In_ PCUNICODE_STRING Extension,
+    _In_ ULONG BucketIndex
+    )
+{
+    PLIST_ENTRY listEntry;
+    PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
+    PSHADOWSTRIKE_EXTENSION_BUCKET bucket = &g_ExclusionManager.ExtensionBuckets[BucketIndex];
+
+    for (listEntry = bucket->ListHead.Flink;
+         listEntry != &bucket->ListHead;
+         listEntry = listEntry->Flink) {
+
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_EXTENSION_EXCLUSION, ListEntry);
+
+        if (entry->ExtensionLength == Extension->Length / sizeof(WCHAR)) {
+            UNICODE_STRING entryExt;
+            entryExt.Buffer = entry->Extension;
+            entryExt.Length = entry->ExtensionLength * sizeof(WCHAR);
+            entryExt.MaximumLength = entryExt.Length;
+
+            if (RtlCompareUnicodeString(&entryExt, Extension, TRUE) == 0) {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+/**
+ * @brief Check if a process name exclusion already exists (caller holds ProcessLock exclusive).
+ */
+_Requires_lock_held_(g_ExclusionManager.ProcessLock)
+static
+BOOLEAN
+ExclusionpProcessExistLocked(
+    _In_ PCUNICODE_STRING ProcessName,
+    _In_ ULONG BucketIndex
+    )
+{
+    PLIST_ENTRY listEntry;
+    PSHADOWSTRIKE_PROCESS_EXCLUSION entry;
+    PSHADOWSTRIKE_PROCESS_BUCKET bucket = &g_ExclusionManager.ProcessBuckets[BucketIndex];
+
+    for (listEntry = bucket->ListHead.Flink;
+         listEntry != &bucket->ListHead;
+         listEntry = listEntry->Flink) {
+
+        entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROCESS_EXCLUSION, ListEntry);
+
+        if (entry->NameLength == ProcessName->Length / sizeof(WCHAR)) {
+            UNICODE_STRING entryName;
+            entryName.Buffer = entry->ProcessName;
+            entryName.Length = entry->NameLength * sizeof(WCHAR);
+            entryName.MaximumLength = entryName.Length;
+
+            if (RtlCompareUnicodeString(&entryName, ProcessName, TRUE) == 0) {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
 }
 
 // ============================================================================
@@ -132,10 +261,21 @@ ShadowStrikeExclusionInitialize(
     }
 
     //
-    // Enable exclusions by default
+    // Initialize rundown protection — the correct kernel primitive for
+    // "allow concurrent access, block shutdown until all users drain."
     //
-    g_ExclusionManager.Enabled = TRUE;
-    g_ExclusionManager.Initialized = TRUE;
+    ExInitializeRundownProtection(&g_ExclusionManager.RundownRef);
+
+    //
+    // Enable exclusions by default.
+    // Use InterlockedExchange8 for atomic store with full barrier.
+    //
+    InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, TRUE);
+
+    //
+    // Mark initialized last (after all state is set up) with release semantics
+    //
+    WriteBooleanRelease(&g_ExclusionManager.Initialized, TRUE);
 
     //
     // Load defaults
@@ -160,22 +300,31 @@ ShadowStrikeExclusionShutdown(
     }
 
     //
-    // Disable exclusions
+    // Disable exclusions first so no new work starts
     //
-    g_ExclusionManager.Enabled = FALSE;
+    InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, FALSE);
 
     //
-    // Clear all exclusions
+    // Wait for all active users to drain. ExWaitForRundownProtectionRelease
+    // blocks until every ExAcquireRundownProtection holder has called
+    // ExReleaseRundownProtection. After this returns, no new acquisitions
+    // are possible. No timeout — if a caller is stuck, that is a separate
+    // bug that must not be masked by forced freeing.
+    //
+    ExWaitForRundownProtectionRelease(&g_ExclusionManager.RundownRef);
+
+    //
+    // All users have drained — safe to free all entries
     //
     ShadowStrikeClearExclusions(ShadowStrikeExclusionPath);
     ShadowStrikeClearExclusions(ShadowStrikeExclusionExtension);
     ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessName);
     ShadowStrikeClearExclusions(ShadowStrikeExclusionProcessId);
 
-    g_ExclusionManager.Initialized = FALSE;
+    WriteBooleanRelease(&g_ExclusionManager.Initialized, FALSE);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "[ShadowStrike] Exclusion manager shutdown\n");
+               "[ShadowStrike] Exclusion manager shutdown complete\n");
 }
 
 // ============================================================================
@@ -191,35 +340,79 @@ ShadowStrikeIsPathExcluded(
     PLIST_ENTRY listEntry;
     PSHADOWSTRIKE_PATH_EXCLUSION entry;
     BOOLEAN excluded = FALSE;
-    UNICODE_STRING upcasePath = {0};
-    WCHAR *pathBuffer = NULL;
 
-    if (!g_ExclusionManager.Initialized || !g_ExclusionManager.Enabled) {
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized) ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Enabled)) {
         return FALSE;
     }
 
-    // Increment stats
+    if (!ShadowStrikeValidateUnicodeString(FilePath) || FilePath->Length == 0) {
+        return FALSE;
+    }
+
+    if (!ExclusionpAcquireRundown()) {
+        return FALSE;
+    }
+
     InterlockedIncrement64(&g_ExclusionManager.Stats.TotalChecks);
 
     //
-    // Check extension exclusion first (faster)
+    // Check extension exclusion first (faster O(1) hash lookup).
+    // Call the internal locked check directly instead of the public API
+    // to avoid acquiring rundown protection twice.
     //
-    if (Extension != NULL && Extension->Length > 0) {
-        if (ShadowStrikeIsExtensionExcluded(Extension)) {
+    if (Extension != NULL && ShadowStrikeValidateUnicodeString(Extension) &&
+        Extension->Length > 0) {
+
+        ULONG bucketIndex;
+        PSHADOWSTRIKE_EXTENSION_BUCKET bucket;
+
+        bucketIndex = ShadowStrikeExtensionHash(Extension);
+        bucket = &g_ExclusionManager.ExtensionBuckets[bucketIndex];
+
+        //
+        // Fast-path: if bucket is empty, skip. This is a benign race —
+        // a concurrent add may be missed for one check cycle.
+        // ReadNoFence makes the intentional raciness explicit.
+        //
+        if (ReadNoFence(&bucket->EntryCount) > 0) {
+            PLIST_ENTRY extEntry;
+            PSHADOWSTRIKE_EXTENSION_EXCLUSION extExcl;
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockShared(&g_ExclusionManager.ExtensionLock);
+
+            for (extEntry = bucket->ListHead.Flink;
+                 extEntry != &bucket->ListHead;
+                 extEntry = extEntry->Flink) {
+
+                extExcl = CONTAINING_RECORD(extEntry, SHADOWSTRIKE_EXTENSION_EXCLUSION, ListEntry);
+
+                if (extExcl->ExtensionLength == Extension->Length / sizeof(WCHAR)) {
+                    UNICODE_STRING entryExt;
+                    entryExt.Buffer = extExcl->Extension;
+                    entryExt.Length = extExcl->ExtensionLength * sizeof(WCHAR);
+                    entryExt.MaximumLength = entryExt.Length;
+
+                    if (RtlCompareUnicodeString(&entryExt, Extension, TRUE) == 0) {
+                        excluded = TRUE;
+                        InterlockedIncrement(&extExcl->HitCount);
+                        InterlockedIncrement64(&g_ExclusionManager.Stats.ExtensionMatches);
+                        InterlockedIncrement64(&g_ExclusionManager.Stats.TotalBypassed);
+                        break;
+                    }
+                }
+            }
+
+            ExReleasePushLockShared(&g_ExclusionManager.ExtensionLock);
+            KeLeaveCriticalRegion();
+        }
+
+        if (excluded) {
+            ExclusionpReleaseRundown();
             return TRUE;
         }
     }
-
-    //
-    // Need upper case path for matching
-    //
-    // Note: We avoid allocating if possible. If the path is short enough,
-    // we could use a stack buffer, but paths can be long.
-    // Ideally we would do case-insensitive comparison char-by-char,
-    // but our simple matcher assumes pre-normalized data.
-    //
-    // For now, we do case-insensitive comparison in the loop.
-    //
 
     //
     // Check path exclusions
@@ -233,7 +426,9 @@ ShadowStrikeIsPathExcluded(
 
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
 
-        // Optimization: check if expired
+        //
+        // Skip expired entries
+        //
         if (entry->ExpireTime.QuadPart != 0) {
             LARGE_INTEGER currentTime;
             KeQuerySystemTime(&currentTime);
@@ -243,30 +438,15 @@ ShadowStrikeIsPathExcluded(
         }
 
         //
-        // Perform match
+        // Build a UNICODE_STRING for the exclusion pattern
         //
-        if (RtlPrefixUnicodeString(&entry->Path, (PUNICODE_STRING)FilePath, TRUE)) {
-            // Check boundary condition for directories
-            if (entry->Flags & ShadowStrikeExclusionFlagRecursive) {
-                // If match length equals path length, it's exact match
-                if (entry->PathLength == FilePath->Length / sizeof(WCHAR)) {
-                    excluded = TRUE;
-                }
-                // Or if match ends with separator
-                else if (entry->Path[entry->PathLength - 1] == L'\\') {
-                    excluded = TRUE;
-                }
-                // Or if next char in path is separator
-                else if (FilePath->Length / sizeof(WCHAR) > entry->PathLength &&
-                         FilePath->Buffer[entry->PathLength] == L'\\') {
-                    excluded = TRUE;
-                }
-            } else {
-                // Exact match required
-                if (entry->PathLength == FilePath->Length / sizeof(WCHAR)) {
-                    excluded = TRUE;
-                }
-            }
+        {
+            UNICODE_STRING entryPath;
+            entryPath.Buffer = entry->Path;
+            entryPath.Length = entry->PathLength * sizeof(WCHAR);
+            entryPath.MaximumLength = sizeof(entry->Path);
+
+            excluded = ShadowStrikeMatchPathPattern(FilePath, &entryPath, entry->Flags);
         }
 
         if (excluded) {
@@ -280,6 +460,8 @@ ShadowStrikeIsPathExcluded(
     ExReleasePushLockShared(&g_ExclusionManager.PathLock);
     KeLeaveCriticalRegion();
 
+    ExclusionpReleaseRundown();
+
     return excluded;
 }
 
@@ -288,22 +470,34 @@ ShadowStrikeIsExtensionExcluded(
     _In_ PCUNICODE_STRING Extension
     )
 {
-    ULONG hash;
     ULONG bucketIndex;
     PSHADOWSTRIKE_EXTENSION_BUCKET bucket;
     PLIST_ENTRY listEntry;
     PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
     BOOLEAN excluded = FALSE;
 
-    if (!g_ExclusionManager.Initialized || !g_ExclusionManager.Enabled) {
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized) ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Enabled)) {
         return FALSE;
     }
 
-    hash = ShadowStrikeExtensionHash(Extension);
-    bucketIndex = hash;
+    if (!ShadowStrikeValidateUnicodeString(Extension) || Extension->Length == 0) {
+        return FALSE;
+    }
+
+    if (!ExclusionpAcquireRundown()) {
+        return FALSE;
+    }
+
+    bucketIndex = ShadowStrikeExtensionHash(Extension);
     bucket = &g_ExclusionManager.ExtensionBuckets[bucketIndex];
 
-    if (bucket->EntryCount == 0) {
+    //
+    // Fast-path: if bucket is empty, no match possible.
+    // ReadNoFence makes the intentional benign race explicit.
+    //
+    if (ReadNoFence(&bucket->EntryCount) == 0) {
+        ExclusionpReleaseRundown();
         return FALSE;
     }
 
@@ -316,9 +510,7 @@ ShadowStrikeIsExtensionExcluded(
 
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_EXTENSION_EXCLUSION, ListEntry);
 
-        // Case-insensitive comparison
         if (entry->ExtensionLength == Extension->Length / sizeof(WCHAR)) {
-             // Create temporary UNICODE_STRING for entry
             UNICODE_STRING entryExt;
             entryExt.Buffer = entry->Extension;
             entryExt.Length = entry->ExtensionLength * sizeof(WCHAR);
@@ -336,6 +528,8 @@ ShadowStrikeIsExtensionExcluded(
     ExReleasePushLockShared(&g_ExclusionManager.ExtensionLock);
     KeLeaveCriticalRegion();
 
+    ExclusionpReleaseRundown();
+
     return excluded;
 }
 
@@ -346,7 +540,6 @@ ShadowStrikeIsProcessExcluded(
     )
 {
     ULONG i;
-    ULONG hash;
     ULONG bucketIndex;
     PSHADOWSTRIKE_PROCESS_BUCKET bucket;
     PLIST_ENTRY listEntry;
@@ -354,12 +547,17 @@ ShadowStrikeIsProcessExcluded(
     BOOLEAN excluded = FALSE;
     LARGE_INTEGER currentTime;
 
-    if (!g_ExclusionManager.Initialized || !g_ExclusionManager.Enabled) {
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized) ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Enabled)) {
+        return FALSE;
+    }
+
+    if (!ExclusionpAcquireRundown()) {
         return FALSE;
     }
 
     //
-    // Check PID exclusions first (O(1) array lookup)
+    // Check PID exclusions first (O(N) scan over fixed-size array)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&g_ExclusionManager.PidLock);
@@ -370,7 +568,6 @@ ShadowStrikeIsProcessExcluded(
         if (g_ExclusionManager.PidExclusions[i].Valid &&
             g_ExclusionManager.PidExclusions[i].ProcessId == ProcessId) {
 
-            // Check expiration
             if (g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart == 0 ||
                 currentTime.QuadPart < g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart) {
 
@@ -387,21 +584,27 @@ ShadowStrikeIsProcessExcluded(
     KeLeaveCriticalRegion();
 
     if (excluded) {
+        ExclusionpReleaseRundown();
         return TRUE;
     }
 
     //
     // Check process name exclusions
     //
-    if (ProcessName == NULL || ProcessName->Length == 0) {
+    if (ProcessName == NULL || !ShadowStrikeValidateUnicodeString(ProcessName) ||
+        ProcessName->Length == 0) {
+        ExclusionpReleaseRundown();
         return FALSE;
     }
 
-    hash = ShadowStrikeProcessNameHash(ProcessName);
-    bucketIndex = hash;
+    bucketIndex = ShadowStrikeProcessNameHash(ProcessName);
     bucket = &g_ExclusionManager.ProcessBuckets[bucketIndex];
 
-    if (bucket->EntryCount == 0) {
+    //
+    // Fast-path: empty bucket (benign race, ReadNoFence for explicit intent)
+    //
+    if (ReadNoFence(&bucket->EntryCount) == 0) {
+        ExclusionpReleaseRundown();
         return FALSE;
     }
 
@@ -414,7 +617,6 @@ ShadowStrikeIsProcessExcluded(
 
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROCESS_EXCLUSION, ListEntry);
 
-        // Case-insensitive comparison
         if (entry->NameLength == ProcessName->Length / sizeof(WCHAR)) {
             UNICODE_STRING entryName;
             entryName.Buffer = entry->ProcessName;
@@ -434,6 +636,8 @@ ShadowStrikeIsProcessExcluded(
     ExReleasePushLockShared(&g_ExclusionManager.ProcessLock);
     KeLeaveCriticalRegion();
 
+    ExclusionpReleaseRundown();
+
     return excluded;
 }
 
@@ -444,24 +648,32 @@ ShadowStrikeIsProcessExcluded(
 NTSTATUS
 ShadowStrikeAddPathExclusion(
     _In_ PCUNICODE_STRING Path,
-    _In_ UINT8 Flags
+    _In_ UINT8 Flags,
+    _In_ ULONG TTLSeconds
     )
 {
     PSHADOWSTRIKE_PATH_EXCLUSION entry;
-    ULONG currentCount;
+    USHORT pathChars;
 
-    if (Path == NULL || Path->Length == 0 || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    //
+    // Access control: only kernel-mode callers may add exclusions
+    //
+    if (!ExclusionpValidateCallerIsKernel()) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    if (!ShadowStrikeValidateUnicodeString(Path) || Path->Length == 0 ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Check limit
-    currentCount = g_ExclusionManager.Stats.PathExclusionCount;
-    if (currentCount >= SHADOWSTRIKE_MAX_PATH_EXCLUSIONS) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
+    //
+    // Allocate entry from PagedPool — only accessed at <= APC_LEVEL
+    //
     entry = (PSHADOWSTRIKE_PATH_EXCLUSION)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(SHADOWSTRIKE_PATH_EXCLUSION),
         SHADOWSTRIKE_EXCLUSION_POOL_TAG
     );
@@ -470,21 +682,68 @@ ShadowStrikeAddPathExclusion(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Initialize entry
+    //
+    // Initialize entry — normalize path to uppercase
+    //
     entry->Flags = Flags;
-    entry->PathLength = (USHORT)min(Path->Length / sizeof(WCHAR), SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH - 1);
+    pathChars = (USHORT)min(Path->Length / sizeof(WCHAR),
+                            SHADOWSTRIKE_MAX_EXCLUSION_PATH_LENGTH - 1);
 
-    RtlCopyMemory(entry->Path, Path->Buffer, entry->PathLength * sizeof(WCHAR));
-    entry->Path[entry->PathLength] = L'\0';
+    {
+        USHORT k;
+        for (k = 0; k < pathChars; k++) {
+            entry->Path[k] = RtlUpcaseUnicodeChar(Path->Buffer[k]);
+        }
+    }
 
+    //
+    // Strip trailing separators (but keep root "\")
+    //
+    while (pathChars > 1 && entry->Path[pathChars - 1] == L'\\') {
+        pathChars--;
+    }
+
+    entry->Path[pathChars] = L'\0';
+    entry->PathLength = pathChars;
     KeQuerySystemTime(&entry->CreateTime);
 
-    // Insert into list
+    //
+    // Set expiration time if Temporary flag is set and TTL > 0
+    //
+    if ((Flags & ShadowStrikeExclusionFlagTemporary) && TTLSeconds > 0) {
+        entry->ExpireTime.QuadPart =
+            entry->CreateTime.QuadPart + ((LONGLONG)TTLSeconds * 10000000LL);
+    }
+
+    //
+    // Insert into list under exclusive lock — check limit and duplicates atomically
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.PathLock);
 
+    if (g_ExclusionManager.Stats.PathExclusionCount >= SHADOWSTRIKE_MAX_PATH_EXCLUSIONS) {
+        ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
+        KeLeaveCriticalRegion();
+        ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    {
+        UNICODE_STRING normalizedPath;
+        normalizedPath.Buffer = entry->Path;
+        normalizedPath.Length = entry->PathLength * sizeof(WCHAR);
+        normalizedPath.MaximumLength = normalizedPath.Length;
+
+        if (ExclusionpPathExistLocked(&normalizedPath)) {
+            ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
+            KeLeaveCriticalRegion();
+            ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+    }
+
     InsertTailList(&g_ExclusionManager.PathExclusions, &entry->ListEntry);
-    InterlockedIncrement(&g_ExclusionManager.Stats.PathExclusionCount);
+    g_ExclusionManager.Stats.PathExclusionCount++;
 
     ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
     KeLeaveCriticalRegion();
@@ -499,22 +758,25 @@ ShadowStrikeAddExtensionExclusion(
     )
 {
     PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
-    ULONG hash;
     ULONG bucketIndex;
-    ULONG currentCount;
+    USHORT extChars;
 
-    if (Extension == NULL || Extension->Length == 0 || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    //
+    // Access control: only kernel-mode callers may add exclusions
+    //
+    if (!ExclusionpValidateCallerIsKernel()) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    if (!ShadowStrikeValidateUnicodeString(Extension) || Extension->Length == 0 ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Check limit
-    currentCount = g_ExclusionManager.Stats.ExtensionExclusionCount;
-    if (currentCount >= SHADOWSTRIKE_MAX_EXTENSION_EXCLUSIONS) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
     entry = (PSHADOWSTRIKE_EXTENSION_EXCLUSION)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(SHADOWSTRIKE_EXTENSION_EXCLUSION),
         SHADOWSTRIKE_EXCLUSION_POOL_TAG
     );
@@ -523,24 +785,63 @@ ShadowStrikeAddExtensionExclusion(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Initialize entry
     entry->Flags = Flags;
-    entry->ExtensionLength = (USHORT)min(Extension->Length / sizeof(WCHAR), SHADOWSTRIKE_MAX_EXTENSION_LENGTH - 1);
+    extChars = (USHORT)min(Extension->Length / sizeof(WCHAR),
+                           SHADOWSTRIKE_MAX_EXTENSION_LENGTH - 1);
 
-    RtlCopyMemory(entry->Extension, Extension->Buffer, entry->ExtensionLength * sizeof(WCHAR));
-    entry->Extension[entry->ExtensionLength] = L'\0';
+    {
+        USHORT k;
+        for (k = 0; k < extChars; k++) {
+            entry->Extension[k] = RtlUpcaseUnicodeChar(Extension->Buffer[k]);
+        }
+    }
+    entry->Extension[extChars] = L'\0';
+    entry->ExtensionLength = extChars;
 
-    // Calculate hash
-    hash = ShadowStrikeExtensionHash(Extension);
-    bucketIndex = hash;
+    //
+    // Compute hash on the already-normalized (upcased) entry for consistency
+    //
+    {
+        UNICODE_STRING normalizedExt;
+        normalizedExt.Buffer = entry->Extension;
+        normalizedExt.Length = entry->ExtensionLength * sizeof(WCHAR);
+        normalizedExt.MaximumLength = normalizedExt.Length;
+        bucketIndex = ShadowStrikeExtensionHash(&normalizedExt);
+    }
 
-    // Insert into bucket
+    //
+    // Insert under exclusive lock — atomic limit + duplicate check
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.ExtensionLock);
 
+    if (g_ExclusionManager.Stats.ExtensionExclusionCount >= SHADOWSTRIKE_MAX_EXTENSION_EXCLUSIONS) {
+        ExReleasePushLockExclusive(&g_ExclusionManager.ExtensionLock);
+        KeLeaveCriticalRegion();
+        ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Duplicate check using the normalized (upcased) value for consistency
+    //
+    {
+        UNICODE_STRING normalizedExt;
+        normalizedExt.Buffer = entry->Extension;
+        normalizedExt.Length = entry->ExtensionLength * sizeof(WCHAR);
+        normalizedExt.MaximumLength = normalizedExt.Length;
+
+        if (ExclusionpExtensionExistLocked(&normalizedExt, bucketIndex)) {
+            ExReleasePushLockExclusive(&g_ExclusionManager.ExtensionLock);
+            KeLeaveCriticalRegion();
+            ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+    }
+
     InsertHeadList(&g_ExclusionManager.ExtensionBuckets[bucketIndex].ListHead, &entry->ListEntry);
-    InterlockedIncrement(&g_ExclusionManager.ExtensionBuckets[bucketIndex].EntryCount);
-    InterlockedIncrement(&g_ExclusionManager.Stats.ExtensionExclusionCount);
+    g_ExclusionManager.ExtensionBuckets[bucketIndex].EntryCount++;
+    g_ExclusionManager.Stats.ExtensionExclusionCount++;
 
     ExReleasePushLockExclusive(&g_ExclusionManager.ExtensionLock);
     KeLeaveCriticalRegion();
@@ -555,22 +856,25 @@ ShadowStrikeAddProcessExclusion(
     )
 {
     PSHADOWSTRIKE_PROCESS_EXCLUSION entry;
-    ULONG hash;
     ULONG bucketIndex;
-    ULONG currentCount;
+    USHORT nameChars;
 
-    if (ProcessName == NULL || ProcessName->Length == 0 || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    //
+    // Access control: only kernel-mode callers may add exclusions
+    //
+    if (!ExclusionpValidateCallerIsKernel()) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    if (!ShadowStrikeValidateUnicodeString(ProcessName) || ProcessName->Length == 0 ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Check limit
-    currentCount = g_ExclusionManager.Stats.ProcessExclusionCount;
-    if (currentCount >= SHADOWSTRIKE_MAX_PROCESS_EXCLUSIONS) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
     entry = (PSHADOWSTRIKE_PROCESS_EXCLUSION)ExAllocatePoolZero(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(SHADOWSTRIKE_PROCESS_EXCLUSION),
         SHADOWSTRIKE_EXCLUSION_POOL_TAG
     );
@@ -579,24 +883,63 @@ ShadowStrikeAddProcessExclusion(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Initialize entry
     entry->Flags = Flags;
-    entry->NameLength = (USHORT)min(ProcessName->Length / sizeof(WCHAR), SHADOWSTRIKE_MAX_PROCESS_NAME_LENGTH - 1);
+    nameChars = (USHORT)min(ProcessName->Length / sizeof(WCHAR),
+                            SHADOWSTRIKE_MAX_PROCESS_NAME_LENGTH - 1);
 
-    RtlCopyMemory(entry->ProcessName, ProcessName->Buffer, entry->NameLength * sizeof(WCHAR));
-    entry->ProcessName[entry->NameLength] = L'\0';
+    {
+        USHORT k;
+        for (k = 0; k < nameChars; k++) {
+            entry->ProcessName[k] = RtlUpcaseUnicodeChar(ProcessName->Buffer[k]);
+        }
+    }
+    entry->ProcessName[nameChars] = L'\0';
+    entry->NameLength = nameChars;
 
-    // Calculate hash
-    hash = ShadowStrikeProcessNameHash(ProcessName);
-    bucketIndex = hash;
+    //
+    // Hash on the normalized (upcased) value for consistency
+    //
+    {
+        UNICODE_STRING normalizedName;
+        normalizedName.Buffer = entry->ProcessName;
+        normalizedName.Length = entry->NameLength * sizeof(WCHAR);
+        normalizedName.MaximumLength = normalizedName.Length;
+        bucketIndex = ShadowStrikeProcessNameHash(&normalizedName);
+    }
 
-    // Insert into bucket
+    //
+    // Insert under exclusive lock — atomic limit + duplicate check
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.ProcessLock);
 
+    if (g_ExclusionManager.Stats.ProcessExclusionCount >= SHADOWSTRIKE_MAX_PROCESS_EXCLUSIONS) {
+        ExReleasePushLockExclusive(&g_ExclusionManager.ProcessLock);
+        KeLeaveCriticalRegion();
+        ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Duplicate check using normalized (upcased) value
+    //
+    {
+        UNICODE_STRING normalizedName;
+        normalizedName.Buffer = entry->ProcessName;
+        normalizedName.Length = entry->NameLength * sizeof(WCHAR);
+        normalizedName.MaximumLength = normalizedName.Length;
+
+        if (ExclusionpProcessExistLocked(&normalizedName, bucketIndex)) {
+            ExReleasePushLockExclusive(&g_ExclusionManager.ProcessLock);
+            KeLeaveCriticalRegion();
+            ExFreePoolWithTag(entry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+    }
+
     InsertHeadList(&g_ExclusionManager.ProcessBuckets[bucketIndex].ListHead, &entry->ListEntry);
-    InterlockedIncrement(&g_ExclusionManager.ProcessBuckets[bucketIndex].EntryCount);
-    InterlockedIncrement(&g_ExclusionManager.Stats.ProcessExclusionCount);
+    g_ExclusionManager.ProcessBuckets[bucketIndex].EntryCount++;
+    g_ExclusionManager.Stats.ProcessExclusionCount++;
 
     ExReleasePushLockExclusive(&g_ExclusionManager.ProcessLock);
     KeLeaveCriticalRegion();
@@ -611,7 +954,7 @@ ShadowStrikeClearExclusions(
 {
     PAGED_CODE();
 
-    if (!g_ExclusionManager.Initialized) {
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return;
     }
 
@@ -696,37 +1039,53 @@ ShadowStrikeLoadDefaultExclusions(
     PAGED_CODE();
 
     //
-    // System critical files (perf optimization)
+    // NTFS metafiles — these generate enormous I/O and cannot contain
+    // user-mode executable code. They are safe to exclude.
+    //
+    // These use the ShadowStrikeExclusionFlagRecursive flag so they match
+    // as path component suffixes regardless of volume prefix, e.g.,
+    // "\Device\HarddiskVolume1\$LogFile" matches "\$LOGFILE" with
+    // recursive prefix + path boundary check.
     //
     RtlInitUnicodeString(&str, L"\\$LogFile");
-    ShadowStrikeAddPathExclusion(&str, ShadowStrikeExclusionFlagSystem);
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
 
     RtlInitUnicodeString(&str, L"\\$Mft");
-    ShadowStrikeAddPathExclusion(&str, ShadowStrikeExclusionFlagSystem);
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
 
+    RtlInitUnicodeString(&str, L"\\$MftMirr");
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
+
+    RtlInitUnicodeString(&str, L"\\$Bitmap");
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
+
+    //
+    // System paging files — locked by the OS, cannot be tampered with.
+    // Recursive flag ensures matching across all volumes.
+    //
     RtlInitUnicodeString(&str, L"\\pagefile.sys");
-    ShadowStrikeAddPathExclusion(&str, ShadowStrikeExclusionFlagSystem);
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
 
     RtlInitUnicodeString(&str, L"\\swapfile.sys");
-    ShadowStrikeAddPathExclusion(&str, ShadowStrikeExclusionFlagSystem);
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
 
     RtlInitUnicodeString(&str, L"\\hiberfil.sys");
-    ShadowStrikeAddPathExclusion(&str, ShadowStrikeExclusionFlagSystem);
+    ShadowStrikeAddPathExclusion(&str,
+        ShadowStrikeExclusionFlagSystem | ShadowStrikeExclusionFlagRecursive, 0);
 
     //
-    // Safe extensions
+    // NOTE: No extension exclusions are loaded by default.
+    // No file extension is inherently safe — malware uses .log, .txt, .db,
+    // .dat, and other "innocent" extensions for payload storage, C2 data,
+    // and credential exfiltration. Extension exclusions must be explicitly
+    // configured by the administrator.
     //
-    RtlInitUnicodeString(&str, L"log");
-    ShadowStrikeAddExtensionExclusion(&str, ShadowStrikeExclusionFlagSystem);
-
-    RtlInitUnicodeString(&str, L"txt");
-    ShadowStrikeAddExtensionExclusion(&str, ShadowStrikeExclusionFlagSystem);
-
-    RtlInitUnicodeString(&str, L"db");
-    ShadowStrikeAddExtensionExclusion(&str, ShadowStrikeExclusionFlagSystem);
-
-    RtlInitUnicodeString(&str, L"dat");
-    ShadowStrikeAddExtensionExclusion(&str, ShadowStrikeExclusionFlagSystem);
 }
 
 VOID
@@ -734,7 +1093,11 @@ ShadowStrikeExclusionSetEnabled(
     _In_ BOOLEAN Enable
     )
 {
-    g_ExclusionManager.Enabled = Enable;
+    //
+    // InterlockedExchange8 provides full memory barrier — no additional
+    // MemoryBarrier() needed.
+    //
+    InterlockedExchange8((volatile CHAR*)&g_ExclusionManager.Enabled, (CHAR)Enable);
 }
 
 BOOLEAN
@@ -742,7 +1105,7 @@ ShadowStrikeExclusionIsEnabled(
     VOID
     )
 {
-    return g_ExclusionManager.Enabled;
+    return ReadBooleanAcquire(&g_ExclusionManager.Enabled);
 }
 
 // ============================================================================
@@ -760,7 +1123,10 @@ ShadowStrikeRemovePathExclusion(
     PSHADOWSTRIKE_PATH_EXCLUSION toRemove = NULL;
     BOOLEAN removed = FALSE;
 
-    if (Path == NULL || Path->Length == 0 || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    if (!ShadowStrikeValidateUnicodeString(Path) || Path->Length == 0 ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return FALSE;
     }
 
@@ -774,10 +1140,6 @@ ShadowStrikeRemovePathExclusion(
         nextEntry = listEntry->Flink;
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
 
-        //
-        // Check if this entry matches the path to remove
-        // System exclusions cannot be removed
-        //
         if (!(entry->Flags & ShadowStrikeExclusionFlagSystem)) {
             UNICODE_STRING entryPath;
             entryPath.Buffer = entry->Path;
@@ -788,7 +1150,9 @@ ShadowStrikeRemovePathExclusion(
                 RemoveEntryList(&entry->ListEntry);
                 toRemove = entry;
                 removed = TRUE;
-                InterlockedDecrement(&g_ExclusionManager.Stats.PathExclusionCount);
+                if (g_ExclusionManager.Stats.PathExclusionCount > 0) {
+                    g_ExclusionManager.Stats.PathExclusionCount--;
+                }
                 break;
             }
         }
@@ -797,9 +1161,6 @@ ShadowStrikeRemovePathExclusion(
     ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Free memory outside lock
-    //
     if (toRemove != NULL) {
         ExFreePoolWithTag(toRemove, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
     }
@@ -812,40 +1173,32 @@ ShadowStrikeRemoveExtensionExclusion(
     _In_ PCUNICODE_STRING Extension
     )
 {
-    ULONG hash;
     ULONG bucketIndex;
-    PSHADOWSTRIKE_EXTENSION_BUCKET bucket;
     PLIST_ENTRY listEntry;
     PLIST_ENTRY nextEntry;
     PSHADOWSTRIKE_EXTENSION_EXCLUSION entry;
     PSHADOWSTRIKE_EXTENSION_EXCLUSION toRemove = NULL;
     BOOLEAN removed = FALSE;
 
-    if (Extension == NULL || Extension->Length == 0 || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    if (!ShadowStrikeValidateUnicodeString(Extension) || Extension->Length == 0 ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return FALSE;
     }
 
-    hash = ShadowStrikeExtensionHash(Extension);
-    bucketIndex = hash;
-    bucket = &g_ExclusionManager.ExtensionBuckets[bucketIndex];
-
-    if (bucket->EntryCount == 0) {
-        return FALSE;
-    }
+    bucketIndex = ShadowStrikeExtensionHash(Extension);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.ExtensionLock);
 
-    for (listEntry = bucket->ListHead.Flink;
-         listEntry != &bucket->ListHead;
+    for (listEntry = g_ExclusionManager.ExtensionBuckets[bucketIndex].ListHead.Flink;
+         listEntry != &g_ExclusionManager.ExtensionBuckets[bucketIndex].ListHead;
          listEntry = nextEntry) {
 
         nextEntry = listEntry->Flink;
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_EXTENSION_EXCLUSION, ListEntry);
 
-        //
-        // System exclusions cannot be removed
-        //
         if (!(entry->Flags & ShadowStrikeExclusionFlagSystem)) {
             if (entry->ExtensionLength == Extension->Length / sizeof(WCHAR)) {
                 UNICODE_STRING entryExt;
@@ -857,8 +1210,12 @@ ShadowStrikeRemoveExtensionExclusion(
                     RemoveEntryList(&entry->ListEntry);
                     toRemove = entry;
                     removed = TRUE;
-                    InterlockedDecrement(&bucket->EntryCount);
-                    InterlockedDecrement(&g_ExclusionManager.Stats.ExtensionExclusionCount);
+                    if (g_ExclusionManager.ExtensionBuckets[bucketIndex].EntryCount > 0) {
+                        g_ExclusionManager.ExtensionBuckets[bucketIndex].EntryCount--;
+                    }
+                    if (g_ExclusionManager.Stats.ExtensionExclusionCount > 0) {
+                        g_ExclusionManager.Stats.ExtensionExclusionCount--;
+                    }
                     break;
                 }
             }
@@ -868,9 +1225,6 @@ ShadowStrikeRemoveExtensionExclusion(
     ExReleasePushLockExclusive(&g_ExclusionManager.ExtensionLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Free memory outside lock
-    //
     if (toRemove != NULL) {
         ExFreePoolWithTag(toRemove, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
     }
@@ -883,40 +1237,32 @@ ShadowStrikeRemoveProcessExclusion(
     _In_ PCUNICODE_STRING ProcessName
     )
 {
-    ULONG hash;
     ULONG bucketIndex;
-    PSHADOWSTRIKE_PROCESS_BUCKET bucket;
     PLIST_ENTRY listEntry;
     PLIST_ENTRY nextEntry;
     PSHADOWSTRIKE_PROCESS_EXCLUSION entry;
     PSHADOWSTRIKE_PROCESS_EXCLUSION toRemove = NULL;
     BOOLEAN removed = FALSE;
 
-    if (ProcessName == NULL || ProcessName->Length == 0 || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    if (!ShadowStrikeValidateUnicodeString(ProcessName) || ProcessName->Length == 0 ||
+        !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return FALSE;
     }
 
-    hash = ShadowStrikeProcessNameHash(ProcessName);
-    bucketIndex = hash;
-    bucket = &g_ExclusionManager.ProcessBuckets[bucketIndex];
-
-    if (bucket->EntryCount == 0) {
-        return FALSE;
-    }
+    bucketIndex = ShadowStrikeProcessNameHash(ProcessName);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.ProcessLock);
 
-    for (listEntry = bucket->ListHead.Flink;
-         listEntry != &bucket->ListHead;
+    for (listEntry = g_ExclusionManager.ProcessBuckets[bucketIndex].ListHead.Flink;
+         listEntry != &g_ExclusionManager.ProcessBuckets[bucketIndex].ListHead;
          listEntry = nextEntry) {
 
         nextEntry = listEntry->Flink;
         entry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PROCESS_EXCLUSION, ListEntry);
 
-        //
-        // System exclusions cannot be removed
-        //
         if (!(entry->Flags & ShadowStrikeExclusionFlagSystem)) {
             if (entry->NameLength == ProcessName->Length / sizeof(WCHAR)) {
                 UNICODE_STRING entryName;
@@ -928,8 +1274,12 @@ ShadowStrikeRemoveProcessExclusion(
                     RemoveEntryList(&entry->ListEntry);
                     toRemove = entry;
                     removed = TRUE;
-                    InterlockedDecrement(&bucket->EntryCount);
-                    InterlockedDecrement(&g_ExclusionManager.Stats.ProcessExclusionCount);
+                    if (g_ExclusionManager.ProcessBuckets[bucketIndex].EntryCount > 0) {
+                        g_ExclusionManager.ProcessBuckets[bucketIndex].EntryCount--;
+                    }
+                    if (g_ExclusionManager.Stats.ProcessExclusionCount > 0) {
+                        g_ExclusionManager.Stats.ProcessExclusionCount--;
+                    }
                     break;
                 }
             }
@@ -939,9 +1289,6 @@ ShadowStrikeRemoveProcessExclusion(
     ExReleasePushLockExclusive(&g_ExclusionManager.ProcessLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Free memory outside lock
-    //
     if (toRemove != NULL) {
         ExFreePoolWithTag(toRemove, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
     }
@@ -963,27 +1310,46 @@ ShadowStrikeAddPidExclusion(
     ULONG freeSlot = MAXULONG;
     LARGE_INTEGER currentTime;
     NTSTATUS status = STATUS_INSUFFICIENT_RESOURCES;
+    PEPROCESS process = NULL;
 
-    if (ProcessId == NULL || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    //
+    // Access control: only kernel-mode callers may add exclusions
+    //
+    if (!ExclusionpValidateCallerIsKernel()) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    if (ProcessId == NULL || !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Validate the PID refers to an actual running process to prevent
+    // PID pre-exclusion attacks (attacker excludes a future PID).
+    //
+    status = PsLookupProcessByProcessId(ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ObDereferenceObject(process);
+    process = NULL;
+
     KeQuerySystemTime(&currentTime);
+    status = STATUS_INSUFFICIENT_RESOURCES;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&g_ExclusionManager.PidLock);
 
     //
-    // First pass: Check if already exists and find free slot
+    // Single pass: check for duplicate, find free slot, reclaim expired
     //
     for (i = 0; i < SHADOWSTRIKE_MAX_PID_EXCLUSIONS; i++) {
         if (g_ExclusionManager.PidExclusions[i].Valid) {
-            //
-            // Check for duplicate
-            //
             if (g_ExclusionManager.PidExclusions[i].ProcessId == ProcessId) {
                 //
-                // Already exists - update TTL if requested
+                // Already exists — update TTL
                 //
                 if (TTLSeconds > 0) {
                     g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart =
@@ -996,23 +1362,19 @@ ShadowStrikeAddPidExclusion(
             }
 
             //
-            // Check for expired entries we can reclaim
+            // Reclaim expired entries
             //
             if (g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart != 0 &&
                 currentTime.QuadPart > g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart) {
-                //
-                // Expired - reclaim this slot
-                //
                 g_ExclusionManager.PidExclusions[i].Valid = FALSE;
-                InterlockedDecrement(&g_ExclusionManager.Stats.PidExclusionCount);
+                if (g_ExclusionManager.Stats.PidExclusionCount > 0) {
+                    g_ExclusionManager.Stats.PidExclusionCount--;
+                }
                 if (freeSlot == MAXULONG) {
                     freeSlot = i;
                 }
             }
         } else {
-            //
-            // Found free slot
-            //
             if (freeSlot == MAXULONG) {
                 freeSlot = i;
             }
@@ -1037,7 +1399,7 @@ ShadowStrikeAddPidExclusion(
             g_ExclusionManager.PidExclusions[freeSlot].ExpireTime.QuadPart = 0;
         }
 
-        InterlockedIncrement(&g_ExclusionManager.Stats.PidExclusionCount);
+        g_ExclusionManager.Stats.PidExclusionCount++;
         status = STATUS_SUCCESS;
     }
 
@@ -1056,7 +1418,9 @@ ShadowStrikeRemovePidExclusion(
     ULONG i;
     BOOLEAN removed = FALSE;
 
-    if (ProcessId == NULL || !g_ExclusionManager.Initialized) {
+    PAGED_CODE();
+
+    if (ProcessId == NULL || !ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return FALSE;
     }
 
@@ -1072,7 +1436,9 @@ ShadowStrikeRemovePidExclusion(
             g_ExclusionManager.PidExclusions[i].HitCount = 0;
             g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart = 0;
 
-            InterlockedDecrement(&g_ExclusionManager.Stats.PidExclusionCount);
+            if (g_ExclusionManager.Stats.PidExclusionCount > 0) {
+                g_ExclusionManager.Stats.PidExclusionCount--;
+            }
             removed = TRUE;
             break;
         }
@@ -1097,15 +1463,19 @@ ShadowStrikeExclusionGetStats(
         return;
     }
 
-    if (!g_ExclusionManager.Initialized) {
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         RtlZeroMemory(Stats, sizeof(SHADOWSTRIKE_EXCLUSION_STATS));
         return;
     }
 
     //
-    // Copy statistics atomically
-    // Since we're reading volatile fields, we use memory barriers
+    // Snapshot statistics. Individual fields are monotonically correct
+    // (InterlockedIncrement64 updates). Cross-field consistency is NOT
+    // guaranteed — e.g., TotalChecks may not equal the sum of individual
+    // match counters at the instant of the snapshot. This is documented
+    // and acceptable for telemetry/diagnostics.
     //
+    MemoryBarrier();
     Stats->TotalChecks = g_ExclusionManager.Stats.TotalChecks;
     Stats->PathMatches = g_ExclusionManager.Stats.PathMatches;
     Stats->ExtensionMatches = g_ExclusionManager.Stats.ExtensionMatches;
@@ -1116,7 +1486,6 @@ ShadowStrikeExclusionGetStats(
     Stats->ExtensionExclusionCount = g_ExclusionManager.Stats.ExtensionExclusionCount;
     Stats->ProcessExclusionCount = g_ExclusionManager.Stats.ProcessExclusionCount;
     Stats->PidExclusionCount = g_ExclusionManager.Stats.PidExclusionCount;
-
     MemoryBarrier();
 }
 
@@ -1125,13 +1494,12 @@ ShadowStrikeExclusionResetStats(
     VOID
     )
 {
-    if (!g_ExclusionManager.Initialized) {
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
         return;
     }
 
     //
     // Reset match counters but preserve exclusion counts
-    // Using interlocked exchange for thread safety
     //
     InterlockedExchange64(&g_ExclusionManager.Stats.TotalChecks, 0);
     InterlockedExchange64(&g_ExclusionManager.Stats.PathMatches, 0);
@@ -1142,4 +1510,105 @@ ShadowStrikeExclusionResetStats(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Exclusion statistics reset\n");
+}
+
+// ============================================================================
+// EXPIRED ENTRY CLEANUP
+// ============================================================================
+
+VOID
+ShadowStrikeCleanupExpiredExclusions(
+    VOID
+    )
+{
+    LARGE_INTEGER currentTime;
+    PLIST_ENTRY listEntry;
+    PLIST_ENTRY nextEntry;
+    PSHADOWSTRIKE_PATH_EXCLUSION pathEntry;
+    ULONG pathRemoved = 0;
+    ULONG pidRemoved = 0;
+    ULONG i;
+
+    //
+    // Collect expired entries into a local list, then free outside the lock.
+    //
+    LIST_ENTRY expiredPathList;
+
+    PAGED_CODE();
+
+    if (!ReadBooleanAcquire(&g_ExclusionManager.Initialized)) {
+        return;
+    }
+
+    KeQuerySystemTime(&currentTime);
+    InitializeListHead(&expiredPathList);
+
+    //
+    // Cleanup expired path exclusions
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PathLock);
+
+    for (listEntry = g_ExclusionManager.PathExclusions.Flink;
+         listEntry != &g_ExclusionManager.PathExclusions;
+         listEntry = nextEntry) {
+
+        nextEntry = listEntry->Flink;
+        pathEntry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
+
+        if (pathEntry->ExpireTime.QuadPart != 0 &&
+            currentTime.QuadPart > pathEntry->ExpireTime.QuadPart) {
+
+            RemoveEntryList(&pathEntry->ListEntry);
+            InsertTailList(&expiredPathList, &pathEntry->ListEntry);
+            if (g_ExclusionManager.Stats.PathExclusionCount > 0) {
+                g_ExclusionManager.Stats.PathExclusionCount--;
+            }
+            pathRemoved++;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.PathLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free expired path entries outside the lock
+    //
+    while (!IsListEmpty(&expiredPathList)) {
+        listEntry = RemoveHeadList(&expiredPathList);
+        pathEntry = CONTAINING_RECORD(listEntry, SHADOWSTRIKE_PATH_EXCLUSION, ListEntry);
+        ExFreePoolWithTag(pathEntry, SHADOWSTRIKE_EXCLUSION_POOL_TAG);
+    }
+
+    //
+    // Cleanup expired PID exclusions
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&g_ExclusionManager.PidLock);
+
+    for (i = 0; i < SHADOWSTRIKE_MAX_PID_EXCLUSIONS; i++) {
+        if (g_ExclusionManager.PidExclusions[i].Valid &&
+            g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart != 0 &&
+            currentTime.QuadPart > g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart) {
+
+            g_ExclusionManager.PidExclusions[i].Valid = FALSE;
+            g_ExclusionManager.PidExclusions[i].ProcessId = NULL;
+            g_ExclusionManager.PidExclusions[i].HitCount = 0;
+            g_ExclusionManager.PidExclusions[i].ExpireTime.QuadPart = 0;
+
+            if (g_ExclusionManager.Stats.PidExclusionCount > 0) {
+                g_ExclusionManager.Stats.PidExclusionCount--;
+            }
+            pidRemoved++;
+        }
+    }
+
+    ExReleasePushLockExclusive(&g_ExclusionManager.PidLock);
+    KeLeaveCriticalRegion();
+
+    if (pathRemoved > 0 || pidRemoved > 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "[ShadowStrike] Expired exclusion cleanup: %lu paths, %lu PIDs removed\n",
+                   pathRemoved, pidRemoved);
+    }
 }

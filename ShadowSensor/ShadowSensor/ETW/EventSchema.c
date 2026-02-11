@@ -281,6 +281,19 @@ EspXmlAppendIndent(
     _Inout_ PES_XML_CONTEXT Context
 );
 
+static SIZE_T
+EspXmlEscapeString(
+    _Out_writes_opt_(DestSize) PCHAR Dest,
+    _In_ SIZE_T DestSize,
+    _In_ PCSTR Src
+);
+
+static NTSTATUS
+EspXmlAppendEscaped(
+    _Inout_ PES_XML_CONTEXT Context,
+    _In_ PCSTR Str
+);
+
 static NTSTATUS
 EspXmlOpenElement(
     _Inout_ PES_XML_CONTEXT Context,
@@ -581,9 +594,10 @@ EsInitializeDefault(
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EsShutdown(
-    _Inout_ PES_SCHEMA Schema
+    _Inout_ PES_SCHEMA* SchemaPtr
 )
 {
+    PES_SCHEMA Schema;
     PLIST_ENTRY entry;
     PES_EVENT_DEFINITION event;
     PES_KEYWORD_DEFINITION keyword;
@@ -593,8 +607,15 @@ EsShutdown(
     PES_VALUE_MAP valueMap;
     PES_VALUE_MAP_ENTRY mapEntry;
     ULONG i;
+    ULONG drainIterations;
 
     PAGED_CODE();
+
+    if (SchemaPtr == NULL) {
+        return;
+    }
+
+    Schema = *SchemaPtr;
 
     if (Schema == NULL || Schema->Magic != ES_SCHEMA_MAGIC) {
         return;
@@ -606,16 +627,21 @@ EsShutdown(
     Schema->ShuttingDown = TRUE;
 
     //
-    // Wait for references to drain
+    // Wait for references to drain (bounded)
     //
+    drainIterations = 0;
     while (Schema->ReferenceCount > 1) {
         LARGE_INTEGER delay;
         delay.QuadPart = -10000; // 1ms
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+        if (++drainIterations >= ES_MAX_DRAIN_ITERATIONS) {
+            break;
+        }
     }
 
     //
-    // Free all events
+    // Free all events (remove from both hash and ordered list)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->EventLock);
@@ -624,6 +650,7 @@ EsShutdown(
         while (!IsListEmpty(&Schema->EventHashBuckets[i])) {
             entry = RemoveHeadList(&Schema->EventHashBuckets[i]);
             event = CONTAINING_RECORD(entry, ES_EVENT_DEFINITION, ListEntry);
+            RemoveEntryList(&event->OrderedEntry);
             EspFreeEventDefinition(Schema, event);
         }
     }
@@ -746,6 +773,11 @@ EsShutdown(
     Schema->Initialized = FALSE;
 
     ShadowStrikeFreePoolWithTag(Schema, ES_POOL_TAG);
+
+    //
+    // NULL out caller's pointer to prevent use-after-free
+    //
+    *SchemaPtr = NULL;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -754,7 +786,8 @@ EsAcquireReference(
     _In_ PES_SCHEMA Schema
 )
 {
-    if (Schema != NULL && Schema->Magic == ES_SCHEMA_MAGIC) {
+    if (Schema != NULL && Schema->Magic == ES_SCHEMA_MAGIC &&
+        !Schema->ShuttingDown) {
         InterlockedIncrement(&Schema->ReferenceCount);
     }
 }
@@ -766,7 +799,13 @@ EsReleaseReference(
 )
 {
     if (Schema != NULL && Schema->Magic == ES_SCHEMA_MAGIC) {
-        InterlockedDecrement(&Schema->ReferenceCount);
+        LONG newVal = InterlockedDecrement(&Schema->ReferenceCount);
+        if (newVal < 0) {
+            //
+            // Underflow detected — restore and do not go negative
+            //
+            InterlockedIncrement(&Schema->ReferenceCount);
+        }
     }
 }
 
@@ -784,6 +823,9 @@ EsRegisterEvent(
 {
     NTSTATUS status = STATUS_SUCCESS;
     PES_EVENT_DEFINITION newEvent = NULL;
+    BOOLEAN duplicateFound = FALSE;
+    ULONG bucket;
+    PLIST_ENTRY entry;
 
     PAGED_CODE();
 
@@ -803,20 +845,6 @@ EsRegisterEvent(
     }
 
     //
-    // Check if event ID already exists
-    //
-    if (EsIsEventRegistered(Schema, Event->EventId)) {
-        return STATUS_OBJECT_NAME_COLLISION;
-    }
-
-    //
-    // Check event count limit
-    //
-    if ((ULONG)Schema->EventCount >= ES_MAX_EVENTS_PER_SCHEMA) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
     // Validate field count
     //
     if (Event->FieldCount > ES_MAX_FIELDS_PER_EVENT) {
@@ -832,19 +860,38 @@ EsRegisterEvent(
     }
 
     //
-    // Copy event definition
+    // Copy only public/data fields — never copy internal fields
+    // (ListEntry, OrderedEntry, Magic, ReferenceCount, AllocatedFromPool)
     //
-    RtlCopyMemory(newEvent, Event, sizeof(ES_EVENT_DEFINITION));
+    newEvent->EventId = Event->EventId;
+    newEvent->Version = Event->Version;
+    newEvent->Channel = Event->Channel;
+    newEvent->Level = Event->Level;
+    newEvent->Opcode = Event->Opcode;
+    newEvent->Task = Event->Task;
+    newEvent->Flags = Event->Flags;
+    newEvent->Keywords = Event->Keywords;
+    newEvent->FieldCount = Event->FieldCount;
+    newEvent->MaxDataSize = Event->MaxDataSize;
+
+    RtlCopyMemory(newEvent->EventName, Event->EventName, sizeof(newEvent->EventName));
+    RtlCopyMemory(newEvent->Description, Event->Description, sizeof(newEvent->Description));
+    RtlCopyMemory(newEvent->ChannelName, Event->ChannelName, sizeof(newEvent->ChannelName));
+    RtlCopyMemory(newEvent->TaskName, Event->TaskName, sizeof(newEvent->TaskName));
+    RtlCopyMemory(newEvent->OpcodeName, Event->OpcodeName, sizeof(newEvent->OpcodeName));
+    RtlCopyMemory(newEvent->TemplateName, Event->TemplateName, sizeof(newEvent->TemplateName));
+    RtlCopyMemory(newEvent->Message, Event->Message, sizeof(newEvent->Message));
+
+    if (Event->FieldCount > 0) {
+        RtlCopyMemory(newEvent->Fields, Event->Fields,
+            Event->FieldCount * sizeof(ES_FIELD_DEFINITION));
+    }
 
     //
-    // Initialize list entries
+    // Initialize internal fields
     //
     InitializeListHead(&newEvent->ListEntry);
     InitializeListHead(&newEvent->OrderedEntry);
-
-    //
-    // Set magic and reference count
-    //
     newEvent->Magic = ES_EVENT_MAGIC;
     newEvent->ReferenceCount = 1;
 
@@ -854,23 +901,64 @@ EsRegisterEvent(
     newEvent->NameHash = EspHashEventName(newEvent->EventName);
 
     //
-    // Calculate minimum data size from fixed fields
+    // Calculate minimum data size from fixed fields (with overflow check)
     //
     newEvent->MinDataSize = 0;
     for (ULONG i = 0; i < newEvent->FieldCount; i++) {
         PCES_FIELD_DEFINITION field = &newEvent->Fields[i];
         if (!(field->Flags & EsFieldFlag_Optional)) {
             if (field->Size > 0) {
-                newEvent->MinDataSize += field->Size;
+                ULONG newSize = newEvent->MinDataSize + field->Size;
+                if (newSize < newEvent->MinDataSize) {
+                    EspFreeEventDefinition(Schema, newEvent);
+                    return STATUS_INTEGER_OVERFLOW;
+                }
+                newEvent->MinDataSize = newSize;
             }
         }
     }
 
     //
-    // Insert into hash table and ordered list
+    // Atomically check for duplicate and insert under exclusive lock
+    // (eliminates TOCTOU race between check and insert)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->EventLock);
+
+    //
+    // Check event count limit under lock
+    //
+    if ((ULONG)Schema->EventCount >= ES_MAX_EVENTS_PER_SCHEMA) {
+        ExReleasePushLockExclusive(&Schema->EventLock);
+        KeLeaveCriticalRegion();
+        EspFreeEventDefinition(Schema, newEvent);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Check for duplicate event ID under lock
+    //
+    bucket = EspHashEventId(Event->EventId);
+    for (entry = Schema->EventHashBuckets[bucket].Flink;
+         entry != &Schema->EventHashBuckets[bucket];
+         entry = entry->Flink) {
+
+        PES_EVENT_DEFINITION candidate = CONTAINING_RECORD(
+            entry, ES_EVENT_DEFINITION, ListEntry
+        );
+
+        if (candidate->EventId == Event->EventId) {
+            duplicateFound = TRUE;
+            break;
+        }
+    }
+
+    if (duplicateFound) {
+        ExReleasePushLockExclusive(&Schema->EventLock);
+        KeLeaveCriticalRegion();
+        EspFreeEventDefinition(Schema, newEvent);
+        return STATUS_OBJECT_NAME_COLLISION;
+    }
 
     EspInsertEventIntoHash(Schema, newEvent);
     InsertTailList(&Schema->EventList, &newEvent->OrderedEntry);
@@ -906,7 +994,7 @@ EsRegisterEventEx(
     _In_reads_(FieldCount) PCES_FIELD_DEFINITION Fields
 )
 {
-    ES_EVENT_DEFINITION eventDef;
+    PES_EVENT_DEFINITION eventDef;
     NTSTATUS status;
 
     PAGED_CODE();
@@ -927,25 +1015,39 @@ EsRegisterEventEx(
     }
 
     //
+    // Allocate from pool — ES_EVENT_DEFINITION is ~30KB, too large for kernel stack
+    //
+    eventDef = (PES_EVENT_DEFINITION)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(ES_EVENT_DEFINITION),
+        ES_EVENT_TAG
+    );
+
+    if (eventDef == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
     // Initialize event definition
     //
-    RtlZeroMemory(&eventDef, sizeof(eventDef));
+    RtlZeroMemory(eventDef, sizeof(ES_EVENT_DEFINITION));
 
-    eventDef.EventId = EventId;
-    eventDef.Level = Level;
-    eventDef.Keywords = Keywords;
-    eventDef.FieldCount = FieldCount;
+    eventDef->EventId = EventId;
+    eventDef->Level = Level;
+    eventDef->Keywords = Keywords;
+    eventDef->FieldCount = FieldCount;
 
     //
     // Copy event name
     //
     status = RtlStringCchCopyA(
-        eventDef.EventName,
+        eventDef->EventName,
         ES_MAX_EVENT_NAME,
         EventName
     );
 
     if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(eventDef, ES_EVENT_TAG);
         return status;
     }
 
@@ -954,13 +1056,17 @@ EsRegisterEventEx(
     //
     if (FieldCount > 0) {
         RtlCopyMemory(
-            eventDef.Fields,
+            eventDef->Fields,
             Fields,
             FieldCount * sizeof(ES_FIELD_DEFINITION)
         );
     }
 
-    return EsRegisterEvent(Schema, &eventDef);
+    status = EsRegisterEvent(Schema, eventDef);
+
+    ShadowStrikeFreePoolWithTag(eventDef, ES_EVENT_TAG);
+
+    return status;
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -1017,12 +1123,19 @@ EsUnregisterEvent(
     }
 
     //
-    // Wait for references to drain
+    // Wait for references to drain (bounded)
     //
-    while (event->ReferenceCount > 0) {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000; // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    {
+        ULONG drainIterations = 0;
+        while (event->ReferenceCount > 0) {
+            LARGE_INTEGER delay;
+            delay.QuadPart = -10000; // 1ms
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+            if (++drainIterations >= ES_MAX_DRAIN_ITERATIONS) {
+                break;
+            }
+        }
     }
 
     //
@@ -1048,7 +1161,7 @@ EsUnregisterEvent(
 // EVENT LOOKUP
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsGetEventDefinition(
@@ -1114,7 +1227,7 @@ EsGetEventDefinition(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsGetEventByName(
@@ -1198,11 +1311,14 @@ EsReleaseEventReference(
 )
 {
     if (Event != NULL && Event->Magic == ES_EVENT_MAGIC) {
-        InterlockedDecrement(&Event->ReferenceCount);
+        LONG newVal = InterlockedDecrement(&Event->ReferenceCount);
+        if (newVal < 0) {
+            InterlockedIncrement(&Event->ReferenceCount);
+        }
     }
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 EsIsEventRegistered(
     _In_ PES_SCHEMA Schema,
@@ -1289,7 +1405,7 @@ EsEnumerateEvents(
 // EVENT VALIDATION
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsValidateEvent(
@@ -1303,7 +1419,7 @@ EsValidateEvent(
     return EsValidateEventEx(Schema, EventId, EventData, DataSize, &context);
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsValidateEventEx(
@@ -1469,7 +1585,7 @@ EsValidateEventEx(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 EsGetEventMinSize(
     _In_ PES_SCHEMA Schema,
@@ -1562,10 +1678,42 @@ EsRegisterKeyword(
     }
 
     //
-    // Add to list
+    // Add to list (with duplicate and quota check under lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->KeywordLock);
+
+    //
+    // Check quota
+    //
+    if (Schema->KeywordCount >= ES_MAX_KEYWORDS) {
+        ExReleasePushLockExclusive(&Schema->KeywordLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(keyword, ES_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Check for duplicate name
+    //
+    {
+        PLIST_ENTRY dup;
+        for (dup = Schema->Keywords.Flink;
+             dup != &Schema->Keywords;
+             dup = dup->Flink) {
+
+            PES_KEYWORD_DEFINITION existing = CONTAINING_RECORD(
+                dup, ES_KEYWORD_DEFINITION, ListEntry
+            );
+
+            if (_stricmp(existing->Name, keyword->Name) == 0) {
+                ExReleasePushLockExclusive(&Schema->KeywordLock);
+                KeLeaveCriticalRegion();
+                ShadowStrikeFreePoolWithTag(keyword, ES_POOL_TAG);
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
+    }
 
     InsertTailList(&Schema->Keywords, &keyword->ListEntry);
     Schema->KeywordCount++;
@@ -1631,10 +1779,36 @@ EsRegisterTask(
     }
 
     //
-    // Add to list
+    // Add to list (with duplicate and quota check under lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->TaskLock);
+
+    if (Schema->TaskCount >= ES_MAX_TASKS) {
+        ExReleasePushLockExclusive(&Schema->TaskLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(task, ES_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    {
+        PLIST_ENTRY dup;
+        for (dup = Schema->Tasks.Flink;
+             dup != &Schema->Tasks;
+             dup = dup->Flink) {
+
+            PES_TASK_DEFINITION existing = CONTAINING_RECORD(
+                dup, ES_TASK_DEFINITION, ListEntry
+            );
+
+            if (_stricmp(existing->Name, task->Name) == 0) {
+                ExReleasePushLockExclusive(&Schema->TaskLock);
+                KeLeaveCriticalRegion();
+                ShadowStrikeFreePoolWithTag(task, ES_POOL_TAG);
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
+    }
 
     InsertTailList(&Schema->Tasks, &task->ListEntry);
     Schema->TaskCount++;
@@ -1702,10 +1876,36 @@ EsRegisterOpcode(
     }
 
     //
-    // Add to list
+    // Add to list (with duplicate and quota check under lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->OpcodeLock);
+
+    if (Schema->OpcodeCount >= ES_MAX_OPCODES) {
+        ExReleasePushLockExclusive(&Schema->OpcodeLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(opcode, ES_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    {
+        PLIST_ENTRY dup;
+        for (dup = Schema->Opcodes.Flink;
+             dup != &Schema->Opcodes;
+             dup = dup->Flink) {
+
+            PES_OPCODE_DEFINITION existing = CONTAINING_RECORD(
+                dup, ES_OPCODE_DEFINITION, ListEntry
+            );
+
+            if (_stricmp(existing->Name, opcode->Name) == 0) {
+                ExReleasePushLockExclusive(&Schema->OpcodeLock);
+                KeLeaveCriticalRegion();
+                ShadowStrikeFreePoolWithTag(opcode, ES_POOL_TAG);
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
+    }
 
     InsertTailList(&Schema->Opcodes, &opcode->ListEntry);
     Schema->OpcodeCount++;
@@ -1779,10 +1979,36 @@ EsRegisterChannel(
     }
 
     //
-    // Add to list
+    // Add to list (with duplicate and quota check under lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->ChannelLock);
+
+    if (Schema->ChannelCount >= ES_MAX_CHANNELS) {
+        ExReleasePushLockExclusive(&Schema->ChannelLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(channel, ES_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    {
+        PLIST_ENTRY dup;
+        for (dup = Schema->Channels.Flink;
+             dup != &Schema->Channels;
+             dup = dup->Flink) {
+
+            PES_CHANNEL_DEFINITION existing = CONTAINING_RECORD(
+                dup, ES_CHANNEL_DEFINITION, ListEntry
+            );
+
+            if (_stricmp(existing->Name, channel->Name) == 0) {
+                ExReleasePushLockExclusive(&Schema->ChannelLock);
+                KeLeaveCriticalRegion();
+                ShadowStrikeFreePoolWithTag(channel, ES_POOL_TAG);
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
+    }
 
     InsertTailList(&Schema->Channels, &channel->ListEntry);
     Schema->ChannelCount++;
@@ -1843,10 +2069,36 @@ EsRegisterValueMap(
     ExInitializePushLock(&valueMap->Lock);
 
     //
-    // Add to list
+    // Add to list (with duplicate and quota check under lock)
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&Schema->ValueMapLock);
+
+    if (Schema->ValueMapCount >= ES_MAX_VALUE_MAPS) {
+        ExReleasePushLockExclusive(&Schema->ValueMapLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(valueMap, ES_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    {
+        PLIST_ENTRY dup;
+        for (dup = Schema->ValueMaps.Flink;
+             dup != &Schema->ValueMaps;
+             dup = dup->Flink) {
+
+            PES_VALUE_MAP existing = CONTAINING_RECORD(
+                dup, ES_VALUE_MAP, ListEntry
+            );
+
+            if (_stricmp(existing->Name, valueMap->Name) == 0) {
+                ExReleasePushLockExclusive(&Schema->ValueMapLock);
+                KeLeaveCriticalRegion();
+                ShadowStrikeFreePoolWithTag(valueMap, ES_POOL_TAG);
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
+    }
 
     InsertTailList(&Schema->ValueMaps, &valueMap->ListEntry);
     Schema->ValueMapCount++;
@@ -1884,34 +2136,7 @@ EsAddValueMapEntry(
     }
 
     //
-    // Find value map
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Schema->ValueMapLock);
-
-    for (listEntry = Schema->ValueMaps.Flink;
-         listEntry != &Schema->ValueMaps;
-         listEntry = listEntry->Flink) {
-
-        PES_VALUE_MAP candidate = CONTAINING_RECORD(
-            listEntry, ES_VALUE_MAP, ListEntry
-        );
-
-        if (_stricmp(candidate->Name, MapName) == 0) {
-            valueMap = candidate;
-            break;
-        }
-    }
-
-    ExReleasePushLockShared(&Schema->ValueMapLock);
-    KeLeaveCriticalRegion();
-
-    if (valueMap == NULL) {
-        return STATUS_NOT_FOUND;
-    }
-
-    //
-    // Allocate entry
+    // Pre-allocate entry before taking locks
     //
     entry = (PES_VALUE_MAP_ENTRY)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
@@ -1934,15 +2159,53 @@ EsAddValueMapEntry(
     }
 
     //
-    // Add to map
+    // Hold ValueMapLock while accessing the per-map lock (correct lock ordering:
+    // ValueMapLock level 1 → per-object Lock subordinate)
     //
     KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Schema->ValueMapLock);
+
+    for (listEntry = Schema->ValueMaps.Flink;
+         listEntry != &Schema->ValueMaps;
+         listEntry = listEntry->Flink) {
+
+        PES_VALUE_MAP candidate = CONTAINING_RECORD(
+            listEntry, ES_VALUE_MAP, ListEntry
+        );
+
+        if (_stricmp(candidate->Name, MapName) == 0) {
+            valueMap = candidate;
+            break;
+        }
+    }
+
+    if (valueMap == NULL) {
+        ExReleasePushLockShared(&Schema->ValueMapLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(entry, ES_POOL_TAG);
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Check entry count limit
+    //
+    if (valueMap->EntryCount >= ES_MAX_VALUE_MAP_ENTRIES) {
+        ExReleasePushLockShared(&Schema->ValueMapLock);
+        KeLeaveCriticalRegion();
+        ShadowStrikeFreePoolWithTag(entry, ES_POOL_TAG);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Acquire per-map lock while ValueMapLock is still held
+    //
     ExAcquirePushLockExclusive(&valueMap->Lock);
 
     InsertTailList(&valueMap->Entries, &entry->ListEntry);
     valueMap->EntryCount++;
 
     ExReleasePushLockExclusive(&valueMap->Lock);
+    ExReleasePushLockShared(&Schema->ValueMapLock);
     KeLeaveCriticalRegion();
 
     EspInvalidateCachedManifest(Schema);
@@ -2087,23 +2350,30 @@ EsGenerateManifestXmlEx(
     //
     EspGuidToString(&Schema->ProviderId, guidString);
 
-    EspXmlAppendIndent(&xmlContext);
-    EspXmlAppend(&xmlContext,
-        "<provider name=\"%s\"\r\n",
-        Schema->ProviderName
-    );
+    {
+        CHAR escapedProvName[ES_MAX_PROVIDER_NAME * 6];
+        CHAR escapedProvSymbol[ES_MAX_PROVIDER_NAME * 6];
+        EspXmlEscapeString(escapedProvName, sizeof(escapedProvName), Schema->ProviderName);
+        EspXmlEscapeString(escapedProvSymbol, sizeof(escapedProvSymbol), Schema->ProviderSymbol);
 
-    xmlContext.IndentLevel += 2;
-    EspXmlAppendIndent(&xmlContext);
-    EspXmlAppend(&xmlContext,
-        "guid=\"{%s}\"\r\n",
-        guidString
-    );
-    EspXmlAppendIndent(&xmlContext);
-    EspXmlAppend(&xmlContext,
-        "symbol=\"%s\"\r\n",
-        Schema->ProviderSymbol
-    );
+        EspXmlAppendIndent(&xmlContext);
+        EspXmlAppend(&xmlContext,
+            "<provider name=\"%s\"\r\n",
+            escapedProvName
+        );
+
+        xmlContext.IndentLevel += 2;
+        EspXmlAppendIndent(&xmlContext);
+        EspXmlAppend(&xmlContext,
+            "guid=\"{%s}\"\r\n",
+            guidString
+        );
+        EspXmlAppendIndent(&xmlContext);
+        EspXmlAppend(&xmlContext,
+            "symbol=\"%s\"\r\n",
+            escapedProvSymbol
+        );
+    }
     EspXmlAppendIndent(&xmlContext);
 
     if (Options->ResourceFileName != NULL) {
@@ -2277,7 +2547,8 @@ EsFreeManifest(
     }
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EsGetCachedManifest(
     _In_ PES_SCHEMA Schema,
@@ -2285,6 +2556,8 @@ EsGetCachedManifest(
     _Out_ PSIZE_T XmlSize
 )
 {
+    PCHAR cachedCopy;
+
     if (ManifestXml == NULL || XmlSize == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -2305,7 +2578,24 @@ EsGetCachedManifest(
         return STATUS_NOT_FOUND;
     }
 
-    *ManifestXml = Schema->CachedManifest;
+    //
+    // Return a COPY so the caller does not hold a pointer to internal state
+    //
+    cachedCopy = (PCHAR)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        Schema->CachedManifestSize + 1,
+        ES_MANIFEST_TAG
+    );
+
+    if (cachedCopy == NULL) {
+        ExReleasePushLockShared(&Schema->ManifestLock);
+        KeLeaveCriticalRegion();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(cachedCopy, Schema->CachedManifest, Schema->CachedManifestSize);
+    cachedCopy[Schema->CachedManifestSize] = '\0';
+    *ManifestXml = cachedCopy;
     *XmlSize = Schema->CachedManifestSize;
 
     ExReleasePushLockShared(&Schema->ManifestLock);
@@ -2348,14 +2638,16 @@ EsSerializeSchema(
     }
 
     //
-    // Calculate total size needed
+    // Calculate total size using SERIALIZED (wire-format) structures only —
+    // these exclude LIST_ENTRY, Magic, ReferenceCount, AllocatedFromPool
+    // to prevent kernel pointer leakage.
     //
     totalSize = sizeof(ES_BINARY_HEADER);
-    totalSize += Schema->EventCount * sizeof(ES_EVENT_DEFINITION);
-    totalSize += Schema->KeywordCount * sizeof(ES_KEYWORD_DEFINITION);
-    totalSize += Schema->TaskCount * sizeof(ES_TASK_DEFINITION);
-    totalSize += Schema->OpcodeCount * sizeof(ES_OPCODE_DEFINITION);
-    totalSize += Schema->ChannelCount * sizeof(ES_CHANNEL_DEFINITION);
+    totalSize += Schema->EventCount * sizeof(ES_SERIALIZED_EVENT_DEFINITION);
+    totalSize += Schema->KeywordCount * sizeof(ES_SERIALIZED_KEYWORD_DEFINITION);
+    totalSize += Schema->TaskCount * sizeof(ES_SERIALIZED_TASK_DEFINITION);
+    totalSize += Schema->OpcodeCount * sizeof(ES_SERIALIZED_OPCODE_DEFINITION);
+    totalSize += Schema->ChannelCount * sizeof(ES_SERIALIZED_CHANNEL_DEFINITION);
 
     //
     // Check size limit
@@ -2392,6 +2684,12 @@ EsSerializeSchema(
     header->TaskCount = Schema->TaskCount;
     header->OpcodeCount = Schema->OpcodeCount;
     header->ChannelCount = Schema->ChannelCount;
+
+    //
+    // NOTE: ValueMapCount is stored in the header for informational purposes only.
+    // Value map data is NOT serialized — value maps contain runtime-only structures
+    // (LIST_ENTRY, EX_PUSH_LOCK) and must be rebuilt by the caller after deserialization.
+    //
     header->ValueMapCount = Schema->ValueMapCount;
     header->TotalSize = (ULONG)totalSize;
     RtlCopyMemory(&header->ProviderId, &Schema->ProviderId, sizeof(GUID));
@@ -2400,7 +2698,7 @@ EsSerializeSchema(
     currentPos += sizeof(ES_BINARY_HEADER);
 
     //
-    // Serialize events
+    // Serialize events — copy only public fields via ES_SERIALIZED_EVENT_DEFINITION
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->EventLock);
@@ -2413,9 +2711,33 @@ EsSerializeSchema(
             entry, ES_EVENT_DEFINITION, OrderedEntry
         );
 
-        if (currentPos + sizeof(ES_EVENT_DEFINITION) <= buffer + totalSize) {
-            RtlCopyMemory(currentPos, event, sizeof(ES_EVENT_DEFINITION));
-            currentPos += sizeof(ES_EVENT_DEFINITION);
+        if (currentPos + sizeof(ES_SERIALIZED_EVENT_DEFINITION) <= buffer + totalSize) {
+            PES_SERIALIZED_EVENT_DEFINITION ser = (PES_SERIALIZED_EVENT_DEFINITION)currentPos;
+
+            ser->EventId = event->EventId;
+            ser->Version = event->Version;
+            ser->Channel = event->Channel;
+            ser->Level = event->Level;
+            ser->Opcode = event->Opcode;
+            RtlZeroMemory(ser->Reserved, sizeof(ser->Reserved));
+            ser->Task = event->Task;
+            ser->Flags = event->Flags;
+            ser->Keywords = event->Keywords;
+            RtlCopyMemory(ser->EventName, event->EventName, sizeof(ser->EventName));
+            RtlCopyMemory(ser->Description, event->Description, sizeof(ser->Description));
+            RtlCopyMemory(ser->ChannelName, event->ChannelName, sizeof(ser->ChannelName));
+            RtlCopyMemory(ser->TaskName, event->TaskName, sizeof(ser->TaskName));
+            RtlCopyMemory(ser->OpcodeName, event->OpcodeName, sizeof(ser->OpcodeName));
+            RtlCopyMemory(ser->TemplateName, event->TemplateName, sizeof(ser->TemplateName));
+            RtlCopyMemory(ser->Message, event->Message, sizeof(ser->Message));
+            RtlCopyMemory(ser->Fields, event->Fields,
+                event->FieldCount * sizeof(ES_FIELD_DEFINITION));
+            ser->FieldCount = event->FieldCount;
+            ser->MinDataSize = event->MinDataSize;
+            ser->MaxDataSize = event->MaxDataSize;
+            ser->NameHash = event->NameHash;
+
+            currentPos += sizeof(ES_SERIALIZED_EVENT_DEFINITION);
         }
     }
 
@@ -2423,7 +2745,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize keywords
+    // Serialize keywords — exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->KeywordLock);
@@ -2436,9 +2758,12 @@ EsSerializeSchema(
             entry, ES_KEYWORD_DEFINITION, ListEntry
         );
 
-        if (currentPos + sizeof(ES_KEYWORD_DEFINITION) <= buffer + totalSize) {
-            RtlCopyMemory(currentPos, keyword, sizeof(ES_KEYWORD_DEFINITION));
-            currentPos += sizeof(ES_KEYWORD_DEFINITION);
+        if (currentPos + sizeof(ES_SERIALIZED_KEYWORD_DEFINITION) <= buffer + totalSize) {
+            PES_SERIALIZED_KEYWORD_DEFINITION ser = (PES_SERIALIZED_KEYWORD_DEFINITION)currentPos;
+            RtlCopyMemory(ser->Name, keyword->Name, sizeof(ser->Name));
+            ser->Mask = keyword->Mask;
+            RtlCopyMemory(ser->Description, keyword->Description, sizeof(ser->Description));
+            currentPos += sizeof(ES_SERIALIZED_KEYWORD_DEFINITION);
         }
     }
 
@@ -2446,7 +2771,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize tasks
+    // Serialize tasks — exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->TaskLock);
@@ -2459,9 +2784,13 @@ EsSerializeSchema(
             entry, ES_TASK_DEFINITION, ListEntry
         );
 
-        if (currentPos + sizeof(ES_TASK_DEFINITION) <= buffer + totalSize) {
-            RtlCopyMemory(currentPos, task, sizeof(ES_TASK_DEFINITION));
-            currentPos += sizeof(ES_TASK_DEFINITION);
+        if (currentPos + sizeof(ES_SERIALIZED_TASK_DEFINITION) <= buffer + totalSize) {
+            PES_SERIALIZED_TASK_DEFINITION ser = (PES_SERIALIZED_TASK_DEFINITION)currentPos;
+            RtlCopyMemory(ser->Name, task->Name, sizeof(ser->Name));
+            ser->Value = task->Value;
+            ser->Reserved = 0;
+            RtlCopyMemory(ser->Description, task->Description, sizeof(ser->Description));
+            currentPos += sizeof(ES_SERIALIZED_TASK_DEFINITION);
         }
     }
 
@@ -2469,7 +2798,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize opcodes
+    // Serialize opcodes — exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->OpcodeLock);
@@ -2482,9 +2811,14 @@ EsSerializeSchema(
             entry, ES_OPCODE_DEFINITION, ListEntry
         );
 
-        if (currentPos + sizeof(ES_OPCODE_DEFINITION) <= buffer + totalSize) {
-            RtlCopyMemory(currentPos, opcode, sizeof(ES_OPCODE_DEFINITION));
-            currentPos += sizeof(ES_OPCODE_DEFINITION);
+        if (currentPos + sizeof(ES_SERIALIZED_OPCODE_DEFINITION) <= buffer + totalSize) {
+            PES_SERIALIZED_OPCODE_DEFINITION ser = (PES_SERIALIZED_OPCODE_DEFINITION)currentPos;
+            RtlCopyMemory(ser->Name, opcode->Name, sizeof(ser->Name));
+            ser->Value = opcode->Value;
+            ser->TaskValue = opcode->TaskValue;
+            ser->Reserved = 0;
+            RtlCopyMemory(ser->Description, opcode->Description, sizeof(ser->Description));
+            currentPos += sizeof(ES_SERIALIZED_OPCODE_DEFINITION);
         }
     }
 
@@ -2492,7 +2826,7 @@ EsSerializeSchema(
     KeLeaveCriticalRegion();
 
     //
-    // Serialize channels
+    // Serialize channels — exclude LIST_ENTRY
     //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Schema->ChannelLock);
@@ -2505,9 +2839,15 @@ EsSerializeSchema(
             entry, ES_CHANNEL_DEFINITION, ListEntry
         );
 
-        if (currentPos + sizeof(ES_CHANNEL_DEFINITION) <= buffer + totalSize) {
-            RtlCopyMemory(currentPos, channel, sizeof(ES_CHANNEL_DEFINITION));
-            currentPos += sizeof(ES_CHANNEL_DEFINITION);
+        if (currentPos + sizeof(ES_SERIALIZED_CHANNEL_DEFINITION) <= buffer + totalSize) {
+            PES_SERIALIZED_CHANNEL_DEFINITION ser = (PES_SERIALIZED_CHANNEL_DEFINITION)currentPos;
+            RtlCopyMemory(ser->Name, channel->Name, sizeof(ser->Name));
+            ser->Type = channel->Type;
+            ser->Value = channel->Value;
+            ser->Enabled = channel->Enabled;
+            ser->Reserved = 0;
+            RtlCopyMemory(ser->Description, channel->Description, sizeof(ser->Description));
+            currentPos += sizeof(ES_SERIALIZED_CHANNEL_DEFINITION);
         }
     }
 
@@ -2534,6 +2874,8 @@ EsDeserializeSchema(
     PUCHAR currentPos;
     PES_SCHEMA schema = NULL;
     ULONG i;
+    SIZE_T expectedSize;
+    ULONG errorCount = 0;
 
     PAGED_CODE();
 
@@ -2564,6 +2906,25 @@ EsDeserializeSchema(
     }
 
     //
+    // Cross-validate header counts against buffer size
+    //
+    expectedSize = sizeof(ES_BINARY_HEADER);
+    expectedSize += (SIZE_T)header->EventCount * sizeof(ES_SERIALIZED_EVENT_DEFINITION);
+    expectedSize += (SIZE_T)header->KeywordCount * sizeof(ES_SERIALIZED_KEYWORD_DEFINITION);
+    expectedSize += (SIZE_T)header->TaskCount * sizeof(ES_SERIALIZED_TASK_DEFINITION);
+    expectedSize += (SIZE_T)header->OpcodeCount * sizeof(ES_SERIALIZED_OPCODE_DEFINITION);
+    expectedSize += (SIZE_T)header->ChannelCount * sizeof(ES_SERIALIZED_CHANNEL_DEFINITION);
+
+    if (expectedSize > BufferSize) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    //
+    // Force null-termination on provider name before use
+    //
+    header->ProviderName[ES_MAX_PROVIDER_NAME - 1] = '\0';
+
+    //
     // Initialize schema
     //
     status = EsInitialize(&schema, &header->ProviderId, header->ProviderName);
@@ -2577,78 +2938,193 @@ EsDeserializeSchema(
     currentPos = (PUCHAR)Buffer + sizeof(ES_BINARY_HEADER);
 
     //
-    // Deserialize events
+    // Deserialize events from wire-format structs
+    // NOTE: ES_EVENT_DEFINITION is ~30KB — must be pool-allocated, not stack.
     //
-    for (i = 0; i < header->EventCount; i++) {
-        if (currentPos + sizeof(ES_EVENT_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
-            break;
+    if (header->EventCount > 0) {
+        PES_EVENT_DEFINITION eventDef = (PES_EVENT_DEFINITION)ShadowStrikeAllocatePoolWithTag(
+            NonPagedPoolNx,
+            sizeof(ES_EVENT_DEFINITION),
+            ES_EVENT_TAG
+        );
+
+        if (eventDef == NULL) {
+            EsShutdown(&schema);
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        PES_EVENT_DEFINITION eventDef = (PES_EVENT_DEFINITION)currentPos;
-        status = EsRegisterEvent(schema, eventDef);
-        if (!NT_SUCCESS(status)) {
-            // Continue on non-fatal errors
+        for (i = 0; i < header->EventCount; i++) {
+            PES_SERIALIZED_EVENT_DEFINITION ser;
+
+            if (currentPos + sizeof(ES_SERIALIZED_EVENT_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
+                break;
+            }
+
+            ser = (PES_SERIALIZED_EVENT_DEFINITION)currentPos;
+
+            //
+            // Force null-termination on all string fields
+            //
+            ser->EventName[ES_MAX_EVENT_NAME - 1] = '\0';
+            ser->Description[ES_MAX_DESCRIPTION - 1] = '\0';
+            ser->ChannelName[ES_MAX_CHANNEL_NAME - 1] = '\0';
+            ser->TaskName[ES_MAX_TASK_NAME - 1] = '\0';
+            ser->OpcodeName[ES_MAX_OPCODE_NAME - 1] = '\0';
+            ser->TemplateName[ES_MAX_EVENT_NAME - 1] = '\0';
+            ser->Message[ES_MAX_DESCRIPTION - 1] = '\0';
+
+            //
+            // Validate field count
+            //
+            if (ser->FieldCount > ES_MAX_FIELDS_PER_EVENT) {
+                errorCount++;
+                currentPos += sizeof(ES_SERIALIZED_EVENT_DEFINITION);
+                continue;
+            }
+
+            //
+            // Build runtime struct from wire-format (never cast directly)
+            //
+            RtlZeroMemory(eventDef, sizeof(*eventDef));
+            eventDef->EventId = ser->EventId;
+            eventDef->Version = ser->Version;
+            eventDef->Channel = ser->Channel;
+            eventDef->Level = ser->Level;
+            eventDef->Opcode = ser->Opcode;
+            eventDef->Task = ser->Task;
+            eventDef->Flags = ser->Flags;
+            eventDef->Keywords = ser->Keywords;
+            eventDef->FieldCount = ser->FieldCount;
+            eventDef->MaxDataSize = ser->MaxDataSize;
+
+            RtlCopyMemory(eventDef->EventName, ser->EventName, sizeof(eventDef->EventName));
+            RtlCopyMemory(eventDef->Description, ser->Description, sizeof(eventDef->Description));
+            RtlCopyMemory(eventDef->ChannelName, ser->ChannelName, sizeof(eventDef->ChannelName));
+            RtlCopyMemory(eventDef->TaskName, ser->TaskName, sizeof(eventDef->TaskName));
+            RtlCopyMemory(eventDef->OpcodeName, ser->OpcodeName, sizeof(eventDef->OpcodeName));
+            RtlCopyMemory(eventDef->TemplateName, ser->TemplateName, sizeof(eventDef->TemplateName));
+            RtlCopyMemory(eventDef->Message, ser->Message, sizeof(eventDef->Message));
+
+            if (ser->FieldCount > 0) {
+                RtlCopyMemory(eventDef->Fields, ser->Fields,
+                    ser->FieldCount * sizeof(ES_FIELD_DEFINITION));
+
+                for (ULONG f = 0; f < ser->FieldCount; f++) {
+                    eventDef->Fields[f].FieldName[ES_MAX_FIELD_NAME - 1] = '\0';
+                    eventDef->Fields[f].Description[ES_MAX_DESCRIPTION - 1] = '\0';
+                }
+            }
+
+            status = EsRegisterEvent(schema, eventDef);
+            if (!NT_SUCCESS(status)) {
+                errorCount++;
+            }
+
+            currentPos += sizeof(ES_SERIALIZED_EVENT_DEFINITION);
         }
 
-        currentPos += sizeof(ES_EVENT_DEFINITION);
+        ShadowStrikeFreePoolWithTag(eventDef, ES_EVENT_TAG);
     }
 
     //
-    // Deserialize keywords
+    // Deserialize keywords from wire-format
     //
     for (i = 0; i < header->KeywordCount; i++) {
-        if (currentPos + sizeof(ES_KEYWORD_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
+        PES_SERIALIZED_KEYWORD_DEFINITION ser;
+
+        if (currentPos + sizeof(ES_SERIALIZED_KEYWORD_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
             break;
         }
 
-        PES_KEYWORD_DEFINITION keywordDef = (PES_KEYWORD_DEFINITION)currentPos;
-        EsRegisterKeyword(schema, keywordDef->Name, keywordDef->Mask, keywordDef->Description);
+        ser = (PES_SERIALIZED_KEYWORD_DEFINITION)currentPos;
+        ser->Name[ES_MAX_KEYWORD_NAME - 1] = '\0';
+        ser->Description[ES_MAX_DESCRIPTION - 1] = '\0';
 
-        currentPos += sizeof(ES_KEYWORD_DEFINITION);
+        status = EsRegisterKeyword(schema, ser->Name, ser->Mask, ser->Description);
+        if (!NT_SUCCESS(status)) {
+            errorCount++;
+        }
+
+        currentPos += sizeof(ES_SERIALIZED_KEYWORD_DEFINITION);
     }
 
     //
-    // Deserialize tasks
+    // Deserialize tasks from wire-format
     //
     for (i = 0; i < header->TaskCount; i++) {
-        if (currentPos + sizeof(ES_TASK_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
+        PES_SERIALIZED_TASK_DEFINITION ser;
+
+        if (currentPos + sizeof(ES_SERIALIZED_TASK_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
             break;
         }
 
-        PES_TASK_DEFINITION taskDef = (PES_TASK_DEFINITION)currentPos;
-        EsRegisterTask(schema, taskDef->Name, taskDef->Value, taskDef->Description);
+        ser = (PES_SERIALIZED_TASK_DEFINITION)currentPos;
+        ser->Name[ES_MAX_TASK_NAME - 1] = '\0';
+        ser->Description[ES_MAX_DESCRIPTION - 1] = '\0';
 
-        currentPos += sizeof(ES_TASK_DEFINITION);
+        status = EsRegisterTask(schema, ser->Name, ser->Value, ser->Description);
+        if (!NT_SUCCESS(status)) {
+            errorCount++;
+        }
+
+        currentPos += sizeof(ES_SERIALIZED_TASK_DEFINITION);
     }
 
     //
-    // Deserialize opcodes
+    // Deserialize opcodes from wire-format
     //
     for (i = 0; i < header->OpcodeCount; i++) {
-        if (currentPos + sizeof(ES_OPCODE_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
+        PES_SERIALIZED_OPCODE_DEFINITION ser;
+
+        if (currentPos + sizeof(ES_SERIALIZED_OPCODE_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
             break;
         }
 
-        PES_OPCODE_DEFINITION opcodeDef = (PES_OPCODE_DEFINITION)currentPos;
-        EsRegisterOpcode(schema, opcodeDef->Name, opcodeDef->Value,
-            opcodeDef->TaskValue, opcodeDef->Description);
+        ser = (PES_SERIALIZED_OPCODE_DEFINITION)currentPos;
+        ser->Name[ES_MAX_OPCODE_NAME - 1] = '\0';
+        ser->Description[ES_MAX_DESCRIPTION - 1] = '\0';
 
-        currentPos += sizeof(ES_OPCODE_DEFINITION);
+        status = EsRegisterOpcode(schema, ser->Name, ser->Value,
+            ser->TaskValue, ser->Description);
+        if (!NT_SUCCESS(status)) {
+            errorCount++;
+        }
+
+        currentPos += sizeof(ES_SERIALIZED_OPCODE_DEFINITION);
     }
 
     //
-    // Deserialize channels
+    // Deserialize channels from wire-format
     //
     for (i = 0; i < header->ChannelCount; i++) {
-        if (currentPos + sizeof(ES_CHANNEL_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
+        PES_SERIALIZED_CHANNEL_DEFINITION ser;
+
+        if (currentPos + sizeof(ES_SERIALIZED_CHANNEL_DEFINITION) > (PUCHAR)Buffer + BufferSize) {
             break;
         }
 
-        PES_CHANNEL_DEFINITION channelDef = (PES_CHANNEL_DEFINITION)currentPos;
-        EsRegisterChannel(schema, channelDef->Name, channelDef->Type,
-            channelDef->Value, channelDef->Enabled, channelDef->Description);
+        ser = (PES_SERIALIZED_CHANNEL_DEFINITION)currentPos;
+        ser->Name[ES_MAX_CHANNEL_NAME - 1] = '\0';
+        ser->Description[ES_MAX_DESCRIPTION - 1] = '\0';
 
-        currentPos += sizeof(ES_CHANNEL_DEFINITION);
+        if (ser->Type >= EsChannel_Max) {
+            errorCount++;
+            currentPos += sizeof(ES_SERIALIZED_CHANNEL_DEFINITION);
+            continue;
+        }
+
+        status = EsRegisterChannel(schema, ser->Name, ser->Type,
+            ser->Value, ser->Enabled, ser->Description);
+        if (!NT_SUCCESS(status)) {
+            errorCount++;
+        }
+
+        currentPos += sizeof(ES_SERIALIZED_CHANNEL_DEFINITION);
+    }
+
+    if (errorCount > 0 && schema->EventCount == 0) {
+        EsShutdown(&schema);
+        return STATUS_INVALID_PARAMETER;
     }
 
     *Schema = schema;
@@ -2677,7 +3153,19 @@ EsGetStatistics(
         return;
     }
 
-    RtlCopyMemory(Stats, &Schema->Stats, sizeof(ES_STATISTICS));
+    //
+    // Read each volatile counter atomically to prevent torn reads
+    //
+    Stats->EventsRegistered = InterlockedCompareExchange64(&Schema->Stats.EventsRegistered, 0, 0);
+    Stats->EventsUnregistered = InterlockedCompareExchange64(&Schema->Stats.EventsUnregistered, 0, 0);
+    Stats->LookupCount = InterlockedCompareExchange64(&Schema->Stats.LookupCount, 0, 0);
+    Stats->LookupHits = InterlockedCompareExchange64(&Schema->Stats.LookupHits, 0, 0);
+    Stats->LookupMisses = InterlockedCompareExchange64(&Schema->Stats.LookupMisses, 0, 0);
+    Stats->ValidationCount = InterlockedCompareExchange64(&Schema->Stats.ValidationCount, 0, 0);
+    Stats->ValidationFailures = InterlockedCompareExchange64(&Schema->Stats.ValidationFailures, 0, 0);
+    Stats->ManifestGenerations = InterlockedCompareExchange64(&Schema->Stats.ManifestGenerations, 0, 0);
+    Stats->CreateTime = Schema->Stats.CreateTime;
+    Stats->LastModifiedTime = Schema->Stats.LastModifiedTime;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2698,6 +3186,8 @@ EsResetStatistics(
     InterlockedExchange64(&Schema->Stats.ValidationCount, 0);
     InterlockedExchange64(&Schema->Stats.ValidationFailures, 0);
     InterlockedExchange64(&Schema->Stats.ManifestGenerations, 0);
+
+    KeQuerySystemTime(&Schema->Stats.LastModifiedTime);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -2798,7 +3288,8 @@ EspHashEventName(
 )
 {
     //
-    // DJB2 hash algorithm
+    // Case-insensitive DJB2 hash — normalize to lowercase to match
+    // the case-insensitive _stricmp comparison in EsGetEventByName
     //
     ULONG hash = ES_HASH_SEED;
 
@@ -2807,7 +3298,11 @@ EspHashEventName(
     }
 
     while (*EventName != '\0') {
-        hash = ((hash << 5) + hash) + (UCHAR)*EventName;
+        UCHAR c = (UCHAR)*EventName;
+        if (c >= 'A' && c <= 'Z') {
+            c = c + ('a' - 'A');
+        }
+        hash = ((hash << 5) + hash) + c;
         EventName++;
     }
 
@@ -2837,10 +3332,14 @@ EspAllocateEventDefinition(
             sizeof(ES_EVENT_DEFINITION),
             ES_EVENT_TAG
         );
-    }
 
-    if (event != NULL) {
+        if (event != NULL) {
+            RtlZeroMemory(event, sizeof(ES_EVENT_DEFINITION));
+            event->AllocatedFromPool = TRUE;
+        }
+    } else {
         RtlZeroMemory(event, sizeof(ES_EVENT_DEFINITION));
+        event->AllocatedFromPool = FALSE;
     }
 
     return event;
@@ -2858,7 +3357,7 @@ EspFreeEventDefinition(
 
     Event->Magic = 0;
 
-    if (Schema->LookasideInitialized) {
+    if (!Event->AllocatedFromPool && Schema->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&Schema->EventLookaside, Event);
     } else {
         ShadowStrikeFreePoolWithTag(Event, ES_EVENT_TAG);
@@ -3050,6 +3549,101 @@ EspXmlFreeContext(
     Context->CurrentPos = 0;
 }
 
+//
+// EspXmlEscapeString - Escape XML special characters in a string
+// Returns: number of characters written (excluding null terminator)
+// If DestSize is 0, returns the required size (excluding null terminator)
+//
+static SIZE_T
+EspXmlEscapeString(
+    _Out_writes_opt_(DestSize) PCHAR Dest,
+    _In_ SIZE_T DestSize,
+    _In_ PCSTR Src
+)
+{
+    SIZE_T needed = 0;
+    SIZE_T pos = 0;
+
+    if (Src == NULL) {
+        if (Dest != NULL && DestSize > 0) {
+            Dest[0] = '\0';
+        }
+        return 0;
+    }
+
+    while (*Src != '\0') {
+        PCSTR replacement = NULL;
+        SIZE_T repLen = 0;
+
+        switch (*Src) {
+        case '&':
+            replacement = "&amp;";
+            repLen = 5;
+            break;
+        case '<':
+            replacement = "&lt;";
+            repLen = 4;
+            break;
+        case '>':
+            replacement = "&gt;";
+            repLen = 4;
+            break;
+        case '"':
+            replacement = "&quot;";
+            repLen = 6;
+            break;
+        case '\'':
+            replacement = "&apos;";
+            repLen = 6;
+            break;
+        default:
+            replacement = NULL;
+            repLen = 1;
+            break;
+        }
+
+        if (Dest != NULL && DestSize > 0) {
+            if (pos + repLen < DestSize) {
+                if (replacement != NULL) {
+                    RtlCopyMemory(Dest + pos, replacement, repLen);
+                } else {
+                    Dest[pos] = *Src;
+                }
+            }
+        }
+
+        needed += repLen;
+        pos += repLen;
+        Src++;
+    }
+
+    if (Dest != NULL && DestSize > 0) {
+        SIZE_T termPos = (pos < DestSize) ? pos : DestSize - 1;
+        Dest[termPos] = '\0';
+    }
+
+    return needed;
+}
+
+//
+// EspXmlAppendEscaped - Append XML-escaped string to context
+//
+static NTSTATUS
+EspXmlAppendEscaped(
+    _Inout_ PES_XML_CONTEXT Context,
+    _In_ PCSTR Str
+)
+{
+    CHAR escaped[1024];
+
+    if (Str == NULL || *Str == '\0') {
+        return STATUS_SUCCESS;
+    }
+
+    EspXmlEscapeString(escaped, sizeof(escaped), Str);
+    return EspXmlAppend(Context, "%s", escaped);
+}
+
 static NTSTATUS
 EspXmlAppend(
     _Inout_ PES_XML_CONTEXT Context,
@@ -3058,6 +3652,7 @@ EspXmlAppend(
 )
 {
     va_list args;
+    va_list argsCopy;
     NTSTATUS status;
     SIZE_T remaining;
     SIZE_T written;
@@ -3067,6 +3662,7 @@ EspXmlAppend(
     }
 
     va_start(args, Format);
+    va_copy(argsCopy, args);
 
     //
     // Try to format into remaining buffer
@@ -3082,14 +3678,19 @@ EspXmlAppend(
 
     if (status == STATUS_BUFFER_OVERFLOW) {
         //
-        // Grow buffer
+        // Geometric growth: double the buffer size
         //
-        SIZE_T newSize = Context->BufferSize + ES_XML_BUFFER_INCREMENT;
+        SIZE_T newSize = Context->BufferSize * 2;
         PCHAR newBuffer;
+
+        if (newSize < Context->BufferSize + ES_XML_BUFFER_INCREMENT) {
+            newSize = Context->BufferSize + ES_XML_BUFFER_INCREMENT;
+        }
 
         if (newSize > ES_MAX_MANIFEST_SIZE) {
             Context->Error = TRUE;
             Context->ErrorStatus = STATUS_BUFFER_OVERFLOW;
+            va_end(argsCopy);
             va_end(args);
             return STATUS_BUFFER_OVERFLOW;
         }
@@ -3103,6 +3704,7 @@ EspXmlAppend(
         if (newBuffer == NULL) {
             Context->Error = TRUE;
             Context->ErrorStatus = STATUS_INSUFFICIENT_RESOURCES;
+            va_end(argsCopy);
             va_end(args);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -3113,17 +3715,18 @@ EspXmlAppend(
         Context->BufferSize = newSize;
 
         //
-        // Retry format
+        // Retry format with the saved va_list copy (original is consumed)
         //
         remaining = Context->BufferSize - Context->CurrentPos;
         status = RtlStringCchVPrintfA(
             Context->Buffer + Context->CurrentPos,
             remaining,
             Format,
-            args
+            argsCopy
         );
     }
 
+    va_end(argsCopy);
     va_end(args);
 
     if (!NT_SUCCESS(status)) {
@@ -3230,15 +3833,22 @@ EspGenerateChannelsElement(
             entry, ES_CHANNEL_DEFINITION, ListEntry
         );
 
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context,
-            "<channel name=\"%s/%s\" chid=\"%s\" type=\"%s\" enabled=\"%s\" />\r\n",
-            Schema->ProviderName,
-            channel->Name,
-            channel->Name,
-            g_ChannelTypeNames[channel->Type],
-            channel->Enabled ? "true" : "false"
-        );
+        {
+            CHAR escapedProvName[ES_MAX_PROVIDER_NAME * 6];
+            CHAR escapedChanName[ES_MAX_CHANNEL_NAME * 6];
+            EspXmlEscapeString(escapedProvName, sizeof(escapedProvName), Schema->ProviderName);
+            EspXmlEscapeString(escapedChanName, sizeof(escapedChanName), channel->Name);
+
+            EspXmlAppendIndent(Context);
+            EspXmlAppend(Context,
+                "<channel name=\"%s/%s\" chid=\"%s\" type=\"%s\" enabled=\"%s\" />\r\n",
+                escapedProvName,
+                escapedChanName,
+                escapedChanName,
+                (channel->Type < EsChannel_Max) ? g_ChannelTypeNames[channel->Type] : "Admin",
+                channel->Enabled ? "true" : "false"
+            );
+        }
     }
 
     ExReleasePushLockShared(&Schema->ChannelLock);
@@ -3247,6 +3857,10 @@ EspGenerateChannelsElement(
     Context->IndentLevel--;
     EspXmlAppendIndent(Context);
     EspXmlAppend(Context, "</channels>\r\n");
+
+    if (Context->Error) {
+        return Context->ErrorStatus;
+    }
 
     return status;
 }
@@ -3279,12 +3893,17 @@ EspGenerateKeywordsElement(
             entry, ES_KEYWORD_DEFINITION, ListEntry
         );
 
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context,
-            "<keyword name=\"%s\" mask=\"0x%I64X\" />\r\n",
-            keyword->Name,
-            keyword->Mask
-        );
+        {
+            CHAR escapedName[ES_MAX_KEYWORD_NAME * 6];
+            EspXmlEscapeString(escapedName, sizeof(escapedName), keyword->Name);
+
+            EspXmlAppendIndent(Context);
+            EspXmlAppend(Context,
+                "<keyword name=\"%s\" mask=\"0x%I64X\" />\r\n",
+                escapedName,
+                keyword->Mask
+            );
+        }
     }
 
     ExReleasePushLockShared(&Schema->KeywordLock);
@@ -3293,6 +3912,10 @@ EspGenerateKeywordsElement(
     Context->IndentLevel--;
     EspXmlAppendIndent(Context);
     EspXmlAppend(Context, "</keywords>\r\n");
+
+    if (Context->Error) {
+        return Context->ErrorStatus;
+    }
 
     return status;
 }
@@ -3325,12 +3948,17 @@ EspGenerateTasksElement(
             entry, ES_TASK_DEFINITION, ListEntry
         );
 
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context,
-            "<task name=\"%s\" value=\"%u\" />\r\n",
-            task->Name,
-            task->Value
-        );
+        {
+            CHAR escapedName[ES_MAX_TASK_NAME * 6];
+            EspXmlEscapeString(escapedName, sizeof(escapedName), task->Name);
+
+            EspXmlAppendIndent(Context);
+            EspXmlAppend(Context,
+                "<task name=\"%s\" value=\"%u\" />\r\n",
+                escapedName,
+                task->Value
+            );
+        }
     }
 
     ExReleasePushLockShared(&Schema->TaskLock);
@@ -3339,6 +3967,10 @@ EspGenerateTasksElement(
     Context->IndentLevel--;
     EspXmlAppendIndent(Context);
     EspXmlAppend(Context, "</tasks>\r\n");
+
+    if (Context->Error) {
+        return Context->ErrorStatus;
+    }
 
     return status;
 }
@@ -3372,37 +4004,44 @@ EspGenerateMapsElement(
             entry, ES_VALUE_MAP, ListEntry
         );
 
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context, "<valueMap name=\"%s\">\r\n", valueMap->Name);
-        Context->IndentLevel++;
-
-        KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&valueMap->Lock);
-
-        for (entryEntry = valueMap->Entries.Flink;
-             entryEntry != &valueMap->Entries;
-             entryEntry = entryEntry->Flink) {
-
-            PES_VALUE_MAP_ENTRY mapEntry = CONTAINING_RECORD(
-                entryEntry, ES_VALUE_MAP_ENTRY, ListEntry
-            );
+        {
+            CHAR escapedMapName[ES_MAX_VALUE_MAP_NAME * 6];
+            EspXmlEscapeString(escapedMapName, sizeof(escapedMapName), valueMap->Name);
 
             EspXmlAppendIndent(Context);
-            EspXmlAppend(Context,
-                "<map value=\"%u\" message=\"$(string.%s.%s.%u)\" />\r\n",
-                mapEntry->Value,
-                Schema->ProviderSymbol,
-                valueMap->Name,
-                mapEntry->Value
-            );
+            EspXmlAppend(Context, "<valueMap name=\"%s\">\r\n", escapedMapName);
+            Context->IndentLevel++;
+
+            //
+            // Already in critical region from outer ValueMapLock acquisition.
+            // Acquire per-map lock without redundant KeEnterCriticalRegion.
+            //
+            ExAcquirePushLockShared(&valueMap->Lock);
+
+            for (entryEntry = valueMap->Entries.Flink;
+                 entryEntry != &valueMap->Entries;
+                 entryEntry = entryEntry->Flink) {
+
+                PES_VALUE_MAP_ENTRY mapEntry = CONTAINING_RECORD(
+                    entryEntry, ES_VALUE_MAP_ENTRY, ListEntry
+                );
+
+                EspXmlAppendIndent(Context);
+                EspXmlAppend(Context,
+                    "<map value=\"%u\" message=\"$(string.%s.%s.%u)\" />\r\n",
+                    mapEntry->Value,
+                    Schema->ProviderSymbol,
+                    escapedMapName,
+                    mapEntry->Value
+                );
+            }
+
+            ExReleasePushLockShared(&valueMap->Lock);
+
+            Context->IndentLevel--;
+            EspXmlAppendIndent(Context);
+            EspXmlAppend(Context, "</valueMap>\r\n");
         }
-
-        ExReleasePushLockShared(&valueMap->Lock);
-        KeLeaveCriticalRegion();
-
-        Context->IndentLevel--;
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context, "</valueMap>\r\n");
     }
 
     ExReleasePushLockShared(&Schema->ValueMapLock);
@@ -3411,6 +4050,10 @@ EspGenerateMapsElement(
     Context->IndentLevel--;
     EspXmlAppendIndent(Context);
     EspXmlAppend(Context, "</maps>\r\n");
+
+    if (Context->Error) {
+        return Context->ErrorStatus;
+    }
 
     return status;
 }
@@ -3447,46 +4090,59 @@ EspGenerateTemplatesElement(
             continue;
         }
 
-        //
-        // Generate template
-        //
-        EspXmlAppendIndent(Context);
-        if (event->TemplateName[0] != '\0') {
-            EspXmlAppend(Context, "<template tid=\"%s\">\r\n", event->TemplateName);
-        } else {
-            EspXmlAppend(Context, "<template tid=\"%s_Template\">\r\n", event->EventName);
-        }
-        Context->IndentLevel++;
+        {
+            CHAR escapedEvtName[ES_MAX_EVENT_NAME * 6];
+            CHAR escapedTplName[ES_MAX_EVENT_NAME * 6];
+            EspXmlEscapeString(escapedEvtName, sizeof(escapedEvtName), event->EventName);
 
-        //
-        // Generate fields
-        //
-        for (ULONG i = 0; i < event->FieldCount; i++) {
-            PCES_FIELD_DEFINITION field = &event->Fields[i];
-            PCSTR typeName = EsGetFieldTypeName(field->Type);
-
+            //
+            // Generate template
+            //
             EspXmlAppendIndent(Context);
-            EspXmlAppend(Context, "<data name=\"%s\" inType=\"%s\"",
-                field->FieldName, typeName);
+            if (event->TemplateName[0] != '\0') {
+                EspXmlEscapeString(escapedTplName, sizeof(escapedTplName), event->TemplateName);
+                EspXmlAppend(Context, "<template tid=\"%s\">\r\n", escapedTplName);
+            } else {
+                EspXmlAppend(Context, "<template tid=\"%s_Template\">\r\n", escapedEvtName);
+            }
+            Context->IndentLevel++;
 
-            if (field->OutType[0] != '\0') {
-                EspXmlAppend(Context, " outType=\"%s\"", field->OutType);
+            //
+            // Generate fields
+            //
+            for (ULONG i = 0; i < event->FieldCount; i++) {
+                PCES_FIELD_DEFINITION field = &event->Fields[i];
+                PCSTR typeName = EsGetFieldTypeName(field->Type);
+                CHAR escapedFieldName[ES_MAX_FIELD_NAME * 6];
+                EspXmlEscapeString(escapedFieldName, sizeof(escapedFieldName), field->FieldName);
+
+                EspXmlAppendIndent(Context);
+                EspXmlAppend(Context, "<data name=\"%s\" inType=\"%s\"",
+                    escapedFieldName, typeName);
+
+                if (field->OutType[0] != '\0') {
+                    CHAR escapedOutType[64 * 6];
+                    EspXmlEscapeString(escapedOutType, sizeof(escapedOutType), field->OutType);
+                    EspXmlAppend(Context, " outType=\"%s\"", escapedOutType);
+                }
+
+                if (field->MapName[0] != '\0') {
+                    CHAR escapedMapRef[ES_MAX_VALUE_MAP_NAME * 6];
+                    EspXmlEscapeString(escapedMapRef, sizeof(escapedMapRef), field->MapName);
+                    EspXmlAppend(Context, " map=\"%s\"", escapedMapRef);
+                }
+
+                if (field->ArrayCount > 0) {
+                    EspXmlAppend(Context, " count=\"%u\"", field->ArrayCount);
+                }
+
+                EspXmlAppend(Context, " />\r\n");
             }
 
-            if (field->MapName[0] != '\0') {
-                EspXmlAppend(Context, " map=\"%s\"", field->MapName);
-            }
-
-            if (field->ArrayCount > 0) {
-                EspXmlAppend(Context, " count=\"%u\"", field->ArrayCount);
-            }
-
-            EspXmlAppend(Context, " />\r\n");
+            Context->IndentLevel--;
+            EspXmlAppendIndent(Context);
+            EspXmlAppend(Context, "</template>\r\n");
         }
-
-        Context->IndentLevel--;
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context, "</template>\r\n");
     }
 
     ExReleasePushLockShared(&Schema->EventLock);
@@ -3495,6 +4151,10 @@ EspGenerateTemplatesElement(
     Context->IndentLevel--;
     EspXmlAppendIndent(Context);
     EspXmlAppend(Context, "</templates>\r\n");
+
+    if (Context->Error) {
+        return Context->ErrorStatus;
+    }
 
     return status;
 }
@@ -3541,48 +4201,57 @@ EspGenerateEventsElement(
             levelName = LevelNames[event->Level];
         }
 
-        EspXmlAppendIndent(Context);
-        EspXmlAppend(Context,
-            "<event value=\"%u\" symbol=\"%s\" version=\"%u\" level=\"%s\"",
-            event->EventId,
-            event->EventName,
-            event->Version,
-            levelName
-        );
+        {
+            CHAR escapedEvtName[ES_MAX_EVENT_NAME * 6];
+            EspXmlEscapeString(escapedEvtName, sizeof(escapedEvtName), event->EventName);
 
-        if (event->Keywords != 0) {
-            EspXmlAppend(Context, " keywords=\"0x%I64X\"", event->Keywords);
-        }
-
-        if (event->Task != 0) {
-            EspXmlAppend(Context, " task=\"%u\"", event->Task);
-        }
-
-        if (event->Opcode != 0) {
-            EspXmlAppend(Context, " opcode=\"%u\"", event->Opcode);
-        }
-
-        if (event->ChannelName[0] != '\0') {
-            EspXmlAppend(Context, " channel=\"%s\"", event->ChannelName);
-        }
-
-        if (event->FieldCount > 0) {
-            if (event->TemplateName[0] != '\0') {
-                EspXmlAppend(Context, " template=\"%s\"", event->TemplateName);
-            } else {
-                EspXmlAppend(Context, " template=\"%s_Template\"", event->EventName);
-            }
-        }
-
-        if (Options->IncludeMessages && event->Message[0] != '\0') {
+            EspXmlAppendIndent(Context);
             EspXmlAppend(Context,
-                " message=\"$(string.%s.%s.Message)\"",
-                Schema->ProviderSymbol,
-                event->EventName
+                "<event value=\"%u\" symbol=\"%s\" version=\"%u\" level=\"%s\"",
+                event->EventId,
+                escapedEvtName,
+                event->Version,
+                levelName
             );
-        }
 
-        EspXmlAppend(Context, " />\r\n");
+            if (event->Keywords != 0) {
+                EspXmlAppend(Context, " keywords=\"0x%I64X\"", event->Keywords);
+            }
+
+            if (event->Task != 0) {
+                EspXmlAppend(Context, " task=\"%u\"", event->Task);
+            }
+
+            if (event->Opcode != 0) {
+                EspXmlAppend(Context, " opcode=\"%u\"", event->Opcode);
+            }
+
+            if (event->ChannelName[0] != '\0') {
+                CHAR escapedChan[ES_MAX_CHANNEL_NAME * 6];
+                EspXmlEscapeString(escapedChan, sizeof(escapedChan), event->ChannelName);
+                EspXmlAppend(Context, " channel=\"%s\"", escapedChan);
+            }
+
+            if (event->FieldCount > 0) {
+                if (event->TemplateName[0] != '\0') {
+                    CHAR escapedTpl[ES_MAX_EVENT_NAME * 6];
+                    EspXmlEscapeString(escapedTpl, sizeof(escapedTpl), event->TemplateName);
+                    EspXmlAppend(Context, " template=\"%s\"", escapedTpl);
+                } else {
+                    EspXmlAppend(Context, " template=\"%s_Template\"", escapedEvtName);
+                }
+            }
+
+            if (Options->IncludeMessages && event->Message[0] != '\0') {
+                EspXmlAppend(Context,
+                    " message=\"$(string.%s.%s.Message)\"",
+                    Schema->ProviderSymbol,
+                    escapedEvtName
+                );
+            }
+
+            EspXmlAppend(Context, " />\r\n");
+        }
     }
 
     ExReleasePushLockShared(&Schema->EventLock);
@@ -3591,6 +4260,10 @@ EspGenerateEventsElement(
     Context->IndentLevel--;
     EspXmlAppendIndent(Context);
     EspXmlAppend(Context, "</events>\r\n");
+
+    if (Context->Error) {
+        return Context->ErrorStatus;
+    }
 
     return status;
 }

@@ -1,16 +1,24 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: SectionTracker.h
-    
+
     Purpose: Section object tracking for detecting malicious
              section mapping and shared memory abuse.
-             
+
     Architecture:
     - Track NtCreateSection/NtMapViewOfSection
     - Detect transacted sections (process doppelganging)
     - Monitor cross-process section mapping
     - Identify suspicious section characteristics
-    
+
+    Locking Hierarchy (acquire in this order, never invert):
+      1. SEC_TRACKER.SectionLock       (push lock - protects list + hash)
+      2. SEC_ENTRY.MapListLock         (push lock - protects per-entry map list)
+      3. SEC_TRACKER_INTERNAL.CallbackLock (push lock - protects callback array)
+
+    All locks require KeEnterCriticalRegion before acquisition.
+    All public APIs require IRQL <= APC_LEVEL.
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -41,18 +49,24 @@ extern "C" {
 #define SEC_HASH_BUCKET_COUNT           1024
 
 //=============================================================================
+// Opaque handle for callback registration
+//=============================================================================
+
+typedef PVOID SEC_CALLBACK_HANDLE;
+
+//=============================================================================
 // Section Types
 //=============================================================================
 
 typedef enum _SEC_SECTION_TYPE {
     SecType_Unknown = 0,
-    SecType_Data,                       // Data section
-    SecType_Image,                      // Image section (PE)
-    SecType_ImageNoExecute,             // Image without execute
-    SecType_PageFile,                   // Pagefile-backed
-    SecType_Physical,                   // Physical memory
-    SecType_Reserve,                    // Reserved section
-    SecType_Commit,                     // Committed section
+    SecType_Data,
+    SecType_Image,
+    SecType_ImageNoExecute,
+    SecType_PageFile,
+    SecType_Physical,
+    SecType_Reserve,
+    SecType_Commit,
 } SEC_SECTION_TYPE;
 
 //=============================================================================
@@ -61,20 +75,20 @@ typedef enum _SEC_SECTION_TYPE {
 
 typedef enum _SEC_FLAGS {
     SecFlag_None                = 0x00000000,
-    SecFlag_Image               = 0x00000001,   // SEC_IMAGE
-    SecFlag_ImageNoExecute      = 0x00000002,   // SEC_IMAGE_NO_EXECUTE
-    SecFlag_Reserve             = 0x00000004,   // SEC_RESERVE
-    SecFlag_Commit              = 0x00000008,   // SEC_COMMIT
-    SecFlag_NoCache             = 0x00000010,   // SEC_NOCACHE
-    SecFlag_WriteCombine        = 0x00000020,   // SEC_WRITECOMBINE
-    SecFlag_LargePages          = 0x00000040,   // SEC_LARGE_PAGES
-    SecFlag_File                = 0x00000100,   // Backed by file
-    SecFlag_PageFile            = 0x00000200,   // Pagefile-backed
-    SecFlag_Physical            = 0x00000400,   // Physical memory
-    SecFlag_Based               = 0x00000800,   // Based section
-    SecFlag_Execute             = 0x00001000,   // Execute permission
-    SecFlag_Write               = 0x00002000,   // Write permission
-    SecFlag_Read                = 0x00004000,   // Read permission
+    SecFlag_Image               = 0x00000001,
+    SecFlag_ImageNoExecute      = 0x00000002,
+    SecFlag_Reserve             = 0x00000004,
+    SecFlag_Commit              = 0x00000008,
+    SecFlag_NoCache             = 0x00000010,
+    SecFlag_WriteCombine        = 0x00000020,
+    SecFlag_LargePages          = 0x00000040,
+    SecFlag_File                = 0x00000100,
+    SecFlag_PageFile            = 0x00000200,
+    SecFlag_Physical            = 0x00000400,
+    SecFlag_Based               = 0x00000800,
+    SecFlag_Execute             = 0x00001000,
+    SecFlag_Write               = 0x00002000,
+    SecFlag_Read                = 0x00004000,
 } SEC_FLAGS;
 
 //=============================================================================
@@ -83,91 +97,57 @@ typedef enum _SEC_FLAGS {
 
 typedef enum _SEC_SUSPICION {
     SecSuspicion_None               = 0x00000000,
-    SecSuspicion_Transacted         = 0x00000001,   // Transacted file
-    SecSuspicion_Deleted            = 0x00000002,   // Backing file deleted
-    SecSuspicion_CrossProcess       = 0x00000004,   // Mapped cross-process
-    SecSuspicion_UnusualPath        = 0x00000008,   // Unusual file path
-    SecSuspicion_LargeAnonymous     = 0x00000010,   // Large anonymous section
-    SecSuspicion_ExecuteAnonymous   = 0x00000020,   // Executable anonymous
-    SecSuspicion_HiddenPE           = 0x00000040,   // Contains hidden PE
-    SecSuspicion_RemoteMap          = 0x00000080,   // Remotely mapped
-    SecSuspicion_SuspiciousName     = 0x00000100,   // Suspicious section name
-    SecSuspicion_NoBackingFile      = 0x00000200,   // Image with no file
-    SecSuspicion_ModifiedImage      = 0x00000400,   // Image differs from file
-    SecSuspicion_OverlayData        = 0x00000800,   // Has overlay data
+    SecSuspicion_Transacted         = 0x00000001,
+    SecSuspicion_Deleted            = 0x00000002,
+    SecSuspicion_CrossProcess       = 0x00000004,
+    SecSuspicion_UnusualPath        = 0x00000008,
+    SecSuspicion_LargeAnonymous     = 0x00000010,
+    SecSuspicion_ExecuteAnonymous   = 0x00000020,
+    SecSuspicion_HiddenPE           = 0x00000040,
+    SecSuspicion_RemoteMap          = 0x00000080,
+    SecSuspicion_SuspiciousName     = 0x00000100,
+    SecSuspicion_NoBackingFile      = 0x00000200,
+    SecSuspicion_ModifiedImage      = 0x00000400,
+    SecSuspicion_OverlayData        = 0x00000800,
 } SEC_SUSPICION;
 
 //=============================================================================
-// Section Map Entry
+// Section Map Info - Opaque snapshot returned to callers (DESIGN-1 fix)
 //=============================================================================
 
-typedef struct _SEC_MAP_ENTRY {
-    //
-    // Mapping information
-    //
-    HANDLE ProcessId;                   // Process that mapped
-    PVOID ViewBase;                     // Base address in process
-    SIZE_T ViewSize;                    // Size of view
-    ULONG64 SectionOffset;              // Offset into section
-    
-    //
-    // Permissions
-    //
-    ULONG Protection;                   // PAGE_* protection
-    ULONG AllocationType;               // MEM_* type
-    
-    //
-    // Timing
-    //
+typedef struct _SEC_MAP_INFO {
+    HANDLE ProcessId;
+    PVOID ViewBase;
+    SIZE_T ViewSize;
+    ULONG64 SectionOffset;
+    ULONG Protection;
+    ULONG AllocationType;
     LARGE_INTEGER MapTime;
     LARGE_INTEGER UnmapTime;
     BOOLEAN IsMapped;
-    
-    //
-    // List linkage
-    //
-    LIST_ENTRY ListEntry;
-    
-} SEC_MAP_ENTRY, *PSEC_MAP_ENTRY;
+} SEC_MAP_INFO, *PSEC_MAP_INFO;
 
 //=============================================================================
-// Section Entry
+// Section Info - Opaque read-only snapshot returned to callers (DESIGN-1 fix)
 //=============================================================================
 
-typedef struct _SEC_ENTRY {
-    //
-    // Section identification
-    //
-    PVOID SectionObject;                // Kernel section object
-    HANDLE CreatorProcessId;            // Process that created section
-    ULONG SectionId;                    // Internal ID
-    
-    //
-    // Section properties
-    //
+typedef struct _SEC_SECTION_INFO {
+    ULONG SectionId;
+    HANDLE CreatorProcessId;
     SEC_SECTION_TYPE Type;
     SEC_FLAGS Flags;
     LARGE_INTEGER MaximumSize;
-    ULONG SectionPageProtection;
-    ULONG AllocationAttributes;
-    
-    //
-    // Backing file information
-    //
+
     struct {
-        PFILE_OBJECT FileObject;
         UNICODE_STRING FileName;
         ULONG64 FileSize;
         LARGE_INTEGER FileCreationTime;
-        BOOLEAN IsTransacted;           // TxF transaction
+        BOOLEAN IsTransacted;
         BOOLEAN IsDeleted;
-        UCHAR FileHash[32];             // SHA-256 of file
+        UCHAR FileHash[32];
         BOOLEAN HashValid;
     } BackingFile;
-    
-    //
-    // PE information (for image sections)
-    //
+
     struct {
         BOOLEAN IsPE;
         USHORT Machine;
@@ -177,74 +157,106 @@ typedef struct _SEC_ENTRY {
         BOOLEAN IsDotNet;
         BOOLEAN IsSigned;
     } PE;
-    
-    //
-    // Mapping tracking
-    //
-    LIST_ENTRY MapList;
-    KSPIN_LOCK MapListLock;
-    volatile LONG MapCount;
-    volatile LONG CrossProcessMapCount;
-    
-    //
-    // Suspicion tracking
-    //
+
+    LONG MapCount;
+    LONG CrossProcessMapCount;
     SEC_SUSPICION SuspicionFlags;
     ULONG SuspicionScore;
-    
-    //
-    // Timing
-    //
     LARGE_INTEGER CreateTime;
     LARGE_INTEGER LastMapTime;
-    
-    //
-    // Reference counting
-    //
+} SEC_SECTION_INFO, *PSEC_SECTION_INFO;
+
+//=============================================================================
+// Internal Map Entry (opaque to callers — only used inside .c)
+//=============================================================================
+
+typedef struct _SEC_MAP_ENTRY {
+    HANDLE ProcessId;
+    PVOID ViewBase;
+    SIZE_T ViewSize;
+    ULONG64 SectionOffset;
+    ULONG Protection;
+    ULONG AllocationType;
+    LARGE_INTEGER MapTime;
+    LARGE_INTEGER UnmapTime;
+    BOOLEAN IsMapped;
+    LIST_ENTRY ListEntry;
+} SEC_MAP_ENTRY, *PSEC_MAP_ENTRY;
+
+//=============================================================================
+// Internal Section Entry (opaque to callers — only used inside .c)
+//=============================================================================
+
+typedef struct _SEC_ENTRY {
+    PVOID SectionObject;
+    HANDLE CreatorProcessId;
+    ULONG SectionId;
+
+    SEC_SECTION_TYPE Type;
+    SEC_FLAGS Flags;
+    LARGE_INTEGER MaximumSize;
+    ULONG SectionPageProtection;
+    ULONG AllocationAttributes;
+
+    struct {
+        PFILE_OBJECT FileObject;
+        UNICODE_STRING FileName;
+        ULONG64 FileSize;
+        LARGE_INTEGER FileCreationTime;
+        BOOLEAN IsTransacted;
+        BOOLEAN IsDeleted;
+        UCHAR FileHash[32];
+        BOOLEAN HashValid;
+    } BackingFile;
+
+    struct {
+        BOOLEAN IsPE;
+        USHORT Machine;
+        USHORT Characteristics;
+        ULONG ImageSize;
+        ULONG EntryPoint;
+        BOOLEAN IsDotNet;
+        BOOLEAN IsSigned;
+    } PE;
+
+    LIST_ENTRY MapList;
+    EX_PUSH_LOCK MapListLock;              // Push lock (was spin lock)
+    volatile LONG MapCount;
+    volatile LONG CrossProcessMapCount;
+
+    volatile LONG SuspicionFlags;          // Atomically updated via InterlockedOr
+    volatile LONG SuspicionScore;          // Atomically updated via InterlockedExchange
+
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER LastMapTime;
+
     volatile LONG RefCount;
-    
-    //
-    // List linkage
-    //
+    BOOLEAN RemovedFromTracker;
+
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
-    
+
+    PSEC_TRACKER Tracker;                  // Back-pointer for ref-counted free
 } SEC_ENTRY, *PSEC_ENTRY;
 
 //=============================================================================
-// Section Tracker
+// Section Tracker (forward-declared; internal layout in .c)
 //=============================================================================
 
 typedef struct _SEC_TRACKER {
-    //
-    // Initialization state
-    //
     BOOLEAN Initialized;
-    
-    //
-    // Section list
-    //
+
     LIST_ENTRY SectionList;
-    EX_PUSH_LOCK SectionListLock;
+    EX_PUSH_LOCK SectionLock;              // Single lock: protects list + hash
     volatile LONG SectionCount;
-    
-    //
-    // Section lookup hash table (by section object)
-    //
+
     struct {
         LIST_ENTRY* Buckets;
         ULONG BucketCount;
-        EX_PUSH_LOCK Lock;
     } SectionHash;
-    
-    //
-    // ID generation
-    //
+
     volatile LONG NextSectionId;
-    
-    //
-    // Statistics
-    //
+
     struct {
         volatile LONG64 TotalCreated;
         volatile LONG64 TotalMapped;
@@ -254,31 +266,27 @@ typedef struct _SEC_TRACKER {
         volatile LONG64 TransactedDetections;
         LARGE_INTEGER StartTime;
     } Stats;
-    
-    //
-    // Configuration
-    //
+
     struct {
         ULONG MaxSections;
         BOOLEAN TrackAllSections;
         BOOLEAN EnablePEAnalysis;
         BOOLEAN EnableFileHashing;
     } Config;
-    
 } SEC_TRACKER, *PSEC_TRACKER;
 
 //=============================================================================
-// Callback Types
+// Callback Types — receive read-only snapshots, not internal pointers
 //=============================================================================
 
 typedef VOID (*SEC_CREATE_CALLBACK)(
-    _In_ PSEC_ENTRY Section,
+    _In_ const SEC_SECTION_INFO* SectionInfo,
     _In_opt_ PVOID Context
     );
 
 typedef VOID (*SEC_MAP_CALLBACK)(
-    _In_ PSEC_ENTRY Section,
-    _In_ PSEC_MAP_ENTRY Map,
+    _In_ const SEC_SECTION_INFO* SectionInfo,
+    _In_ const SEC_MAP_INFO* MapInfo,
     _In_opt_ PVOID Context
     );
 
@@ -286,11 +294,13 @@ typedef VOID (*SEC_MAP_CALLBACK)(
 // Public API - Initialization
 //=============================================================================
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS
 SecInitialize(
     _Out_ PSEC_TRACKER* Tracker
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
 VOID
 SecShutdown(
     _Inout_ PSEC_TRACKER Tracker
@@ -300,6 +310,7 @@ SecShutdown(
 // Public API - Section Tracking
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecTrackSectionCreate(
     _In_ PSEC_TRACKER Tracker,
@@ -311,6 +322,7 @@ SecTrackSectionCreate(
     _Out_opt_ PULONG SectionId
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecTrackSectionMap(
     _In_ PSEC_TRACKER Tracker,
@@ -322,6 +334,7 @@ SecTrackSectionMap(
     _In_ ULONG Protection
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecTrackSectionUnmap(
     _In_ PSEC_TRACKER Tracker,
@@ -329,6 +342,7 @@ SecTrackSectionUnmap(
     _In_ PVOID ViewBase
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecUntrackSection(
     _In_ PSEC_TRACKER Tracker,
@@ -336,42 +350,47 @@ SecUntrackSection(
     );
 
 //=============================================================================
-// Public API - Section Query
+// Public API - Section Query (returns opaque snapshots)
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecGetSectionInfo(
     _In_ PSEC_TRACKER Tracker,
     _In_ PVOID SectionObject,
-    _Out_ PSEC_ENTRY* Entry
+    _Out_ PSEC_SECTION_INFO Info
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecGetSectionById(
     _In_ PSEC_TRACKER Tracker,
     _In_ ULONG SectionId,
-    _Out_ PSEC_ENTRY* Entry
+    _Out_ PSEC_SECTION_INFO Info
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecFindSectionByFile(
     _In_ PSEC_TRACKER Tracker,
     _In_ PUNICODE_STRING FileName,
-    _Out_ PSEC_ENTRY* Entry
+    _Out_ PSEC_SECTION_INFO Info
     );
 
 //=============================================================================
 // Public API - Suspicion Analysis
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecAnalyzeSection(
     _In_ PSEC_TRACKER Tracker,
     _In_ PVOID SectionObject,
-    _Out_ PSEC_SUSPICION SuspicionFlags,
+    _Out_ SEC_SUSPICION* SuspicionFlags,
     _Out_ PULONG SuspicionScore
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecDetectDoppelganging(
     _In_ PSEC_TRACKER Tracker,
@@ -380,28 +399,31 @@ SecDetectDoppelganging(
     _Out_ PBOOLEAN FileDeleted
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecGetSuspiciousSections(
     _In_ PSEC_TRACKER Tracker,
     _In_ ULONG MinScore,
-    _Out_writes_to_(MaxEntries, *EntryCount) PSEC_ENTRY* Entries,
+    _Out_writes_to_(MaxEntries, *EntryCount) PSEC_SECTION_INFO Entries,
     _In_ ULONG MaxEntries,
     _Out_ PULONG EntryCount
     );
 
 //=============================================================================
-// Public API - Cross-Process Analysis
+// Public API - Cross-Process Analysis (returns copied snapshots)
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecGetCrossProcessMaps(
     _In_ PSEC_TRACKER Tracker,
     _In_ PVOID SectionObject,
-    _Out_writes_to_(MaxMaps, *MapCount) PSEC_MAP_ENTRY* Maps,
+    _Out_writes_to_(MaxMaps, *MapCount) PSEC_MAP_INFO Maps,
     _In_ ULONG MaxMaps,
     _Out_ PULONG MapCount
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecIsCrossProcessMapped(
     _In_ PSEC_TRACKER Tracker,
@@ -411,25 +433,37 @@ SecIsCrossProcessMapped(
     );
 
 //=============================================================================
-// Public API - Callbacks
+// Public API - Callbacks (with per-registration handle)
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecRegisterCreateCallback(
     _In_ PSEC_TRACKER Tracker,
     _In_ SEC_CREATE_CALLBACK Callback,
-    _In_opt_ PVOID Context
+    _In_opt_ PVOID Context,
+    _Out_ SEC_CALLBACK_HANDLE* Handle
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecRegisterMapCallback(
     _In_ PSEC_TRACKER Tracker,
     _In_ SEC_MAP_CALLBACK Callback,
-    _In_opt_ PVOID Context
+    _In_opt_ PVOID Context,
+    _Out_ SEC_CALLBACK_HANDLE* Handle
     );
 
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+SecUnregisterCallback(
+    _In_ PSEC_TRACKER Tracker,
+    _In_ SEC_CALLBACK_HANDLE Handle
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
 VOID
-SecUnregisterCallbacks(
+SecUnregisterAllCallbacks(
     _In_ PSEC_TRACKER Tracker
     );
 
@@ -448,24 +482,11 @@ typedef struct _SEC_STATISTICS {
     LARGE_INTEGER UpTime;
 } SEC_STATISTICS, *PSEC_STATISTICS;
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 SecGetStatistics(
     _In_ PSEC_TRACKER Tracker,
     _Out_ PSEC_STATISTICS Stats
-    );
-
-//=============================================================================
-// Public API - Reference Counting
-//=============================================================================
-
-VOID
-SecAddRef(
-    _In_ PSEC_ENTRY Entry
-    );
-
-VOID
-SecRelease(
-    _In_ PSEC_ENTRY Entry
     );
 
 #ifdef __cplusplus

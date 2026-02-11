@@ -1,16 +1,16 @@
 /*++
     ShadowStrike Next-Generation Antivirus
     Module: ROPDetector.h
-    
+
     Purpose: Return-Oriented Programming (ROP) and Jump-Oriented
              Programming (JOP) attack detection.
-             
+
     Architecture:
     - Stack frame analysis for ROP chains
     - Gadget database for known patterns
     - Call stack validation
     - Control flow integrity checking
-    
+
     Copyright (c) ShadowStrike Team
 --*/
 
@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 #include <ntddk.h>
+#include <ntstrsafe.h>
 #include "../../Shared/MemoryTypes.h"
 
 //=============================================================================
@@ -30,6 +31,12 @@ extern "C" {
 #define ROP_POOL_TAG_GADGET     'GPOR'  // ROP Detector - Gadget
 #define ROP_POOL_TAG_CHAIN      'CPOR'  // ROP Detector - Chain
 #define ROP_POOL_TAG_CONTEXT    'XPOR'  // ROP Detector - Context
+
+//=============================================================================
+// Signature for structure validation
+//=============================================================================
+
+#define ROP_DETECTOR_SIGNATURE  'DpoR'
 
 //=============================================================================
 // Configuration Constants
@@ -83,14 +90,14 @@ typedef struct _ROP_GADGET {
     PVOID Address;
     PVOID ModuleBase;
     ULONG ModuleOffset;
-    
+
     //
     // Gadget properties
     //
     ROP_GADGET_TYPE Type;
     ULONG Size;
     UCHAR Bytes[ROP_GADGET_MAX_SIZE];
-    
+
     //
     // Semantic information
     //
@@ -102,53 +109,57 @@ typedef struct _ROP_GADGET {
         ULONG RegistersModified;        // Bit mask
         ULONG RegistersRead;            // Bit mask
     } Semantics;
-    
+
     //
     // Risk assessment
     //
     ULONG DangerScore;                  // 0-100
     BOOLEAN IsPrivileged;
     BOOLEAN CouldBypassCFG;
-    
+
     //
     // List linkage
     //
     LIST_ENTRY ListEntry;
     LIST_ENTRY HashEntry;
-    
+
 } ROP_GADGET, *PROP_GADGET;
 
 //=============================================================================
-// Chain Entry
+// Chain Entry (always allocated from pool, never lookaside)
 //=============================================================================
 
 typedef struct _ROP_CHAIN_ENTRY {
     //
-    // Gadget reference
+    // Snapshot of gadget data (copied, not pointer — no lifetime dependency)
     //
     PVOID GadgetAddress;
-    PROP_GADGET Gadget;                 // May be NULL if unknown
-    
+    ROP_GADGET_TYPE GadgetType;
+    ULONG GadgetSize;
+    ULONG GadgetDangerScore;
+    BOOLEAN GadgetIsPrivileged;
+    ULONG GadgetRegistersModified;
+
     //
     // Stack position
     //
     ULONG64 StackOffset;
     ULONG64 StackValue;
-    
+
     //
     // Chain position
     //
     ULONG Index;
-    
+
     //
     // List linkage
     //
     LIST_ENTRY ListEntry;
-    
+
 } ROP_CHAIN_ENTRY, *PROP_CHAIN_ENTRY;
 
 //=============================================================================
-// Detection Result
+// Detection Result (always allocated from pool, never lookaside)
 //=============================================================================
 
 typedef struct _ROP_DETECTION_RESULT {
@@ -159,20 +170,20 @@ typedef struct _ROP_DETECTION_RESULT {
     ROP_ATTACK_TYPE AttackType;
     ULONG ConfidenceScore;
     ULONG SeverityScore;
-    
+
     //
     // Process context
     //
     HANDLE ProcessId;
     HANDLE ThreadId;
-    
+
     //
     // Stack information
     //
     PVOID StackBase;
     PVOID StackLimit;
     PVOID CurrentSp;
-    
+
     //
     // Chain details
     //
@@ -180,23 +191,23 @@ typedef struct _ROP_DETECTION_RESULT {
     ULONG ChainLength;
     ULONG UniqueGadgets;
     ULONG UnknownGadgets;
-    
+
     //
     // Pivot detection
     //
     BOOLEAN StackPivotDetected;
     PVOID PivotSource;
     PVOID PivotDestination;
-    
+
     //
-    // Module distribution
+    // Module distribution (populated during chain analysis)
     //
     struct {
-        UNICODE_STRING ModuleName;
+        WCHAR ModuleNameBuffer[64];
         ULONG GadgetCount;
     } ModuleBreakdown[16];
     ULONG ModulesUsed;
-    
+
     //
     // Inferred payload
     //
@@ -207,7 +218,7 @@ typedef struct _ROP_DETECTION_RESULT {
         BOOLEAN MayDisableDefenses;
         BOOLEAN MayEscalatePrivileges;
     } PayloadAnalysis;
-    
+
 } ROP_DETECTION_RESULT, *PROP_DETECTION_RESULT;
 
 //=============================================================================
@@ -216,10 +227,20 @@ typedef struct _ROP_DETECTION_RESULT {
 
 typedef struct _ROP_DETECTOR {
     //
-    // Initialization state
+    // Signature for CONTAINING_RECORD validation
     //
-    BOOLEAN Initialized;
-    
+    ULONG Signature;
+
+    //
+    // Initialization state (interlocked: 1=active, 0=shutdown)
+    //
+    volatile LONG Initialized;
+
+    //
+    // Rundown protection for safe shutdown
+    //
+    EX_RUNDOWN_REF RundownRef;
+
     //
     // Gadget database
     //
@@ -227,13 +248,13 @@ typedef struct _ROP_DETECTOR {
     LIST_ENTRY GadgetHash[1024];
     EX_PUSH_LOCK GadgetLock;
     volatile LONG GadgetCount;
-    
+
     //
     // Module tracking
     //
     LIST_ENTRY ScannedModules;
     EX_PUSH_LOCK ModuleLock;
-    
+
     //
     // Configuration
     //
@@ -244,7 +265,7 @@ typedef struct _ROP_DETECTOR {
         BOOLEAN ScanSystemModules;
         BOOLEAN EnableSemanticAnalysis;
     } Config;
-    
+
     //
     // Statistics
     //
@@ -254,7 +275,7 @@ typedef struct _ROP_DETECTOR {
         volatile LONG64 GadgetsIndexed;
         LARGE_INTEGER StartTime;
     } Stats;
-    
+
 } ROP_DETECTOR, *PROP_DETECTOR;
 
 //=============================================================================
@@ -306,7 +327,7 @@ NTSTATUS
 RopLookupGadget(
     _In_ PROP_DETECTOR Detector,
     _In_ PVOID Address,
-    _Out_ PROP_GADGET* Gadget
+    _Out_ PROP_GADGET GadgetCopy
     );
 
 //=============================================================================
@@ -318,7 +339,7 @@ RopAnalyzeStack(
     _In_ PROP_DETECTOR Detector,
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId,
-    _In_ PCONTEXT ThreadContext,
+    _In_opt_ PCONTEXT ThreadContext,
     _Out_ PROP_DETECTION_RESULT* Result
     );
 

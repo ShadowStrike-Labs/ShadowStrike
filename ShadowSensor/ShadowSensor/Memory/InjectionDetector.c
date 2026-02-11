@@ -61,6 +61,12 @@ Detection Techniques Covered:
 #define INJ_SUSPICION_THRESHOLD_CRITICAL 90
 
 //
+// L-2: Maximum iterations for cleanup loops to prevent unbounded
+// spin at DISPATCH_LEVEL if data structures grow unexpectedly large
+//
+#define INJ_MAX_CLEANUP_ITERATIONS      4096
+
+//
 // Operation patterns for chain detection
 //
 #define INJ_PATTERN_ALLOCATE_WRITE      0x0001
@@ -88,7 +94,10 @@ Detection Techniques Covered:
 // Callback registration entry
 //
 typedef struct _INJ_CALLBACK_ENTRY {
-    INJ_DETECTION_CALLBACK Callback;
+    union {
+        INJ_DETECTION_CALLBACK DetectionCallback;
+        INJ_BLOCK_CALLBACK BlockCallback;
+    };
     PVOID Context;
     BOOLEAN Active;
     UCHAR Reserved[7];
@@ -104,15 +113,20 @@ typedef struct _INJ_OPERATION_BUCKET {
 } INJ_OPERATION_BUCKET, *PINJ_OPERATION_BUCKET;
 
 //
-// Process hash bucket for context lookup
+// Process hash bucket for context lookup (chained — linked list per bucket)
 //
 typedef struct _INJ_PROCESS_BUCKET {
-    PINJ_PROCESS_CONTEXT Context;
+    LIST_ENTRY ContextList;
     KSPIN_LOCK Lock;
+    ULONG Count;
 } INJ_PROCESS_BUCKET, *PINJ_PROCESS_BUCKET;
 
 //
-// Extended detector with private data
+// Extended detector with private data.
+//
+// C-6: This structure is large (~300KB+ due to hash tables).
+// It MUST be pool-allocated (NonPagedPoolNx) — never stack-allocated.
+// InjInitialize is the only creator.
 //
 typedef struct _INJ_DETECTOR_INTERNAL {
     //
@@ -158,9 +172,9 @@ typedef struct _INJ_DETECTOR_INTERNAL {
     BOOLEAN LookasideInitialized;
 
     //
-    // Worker thread for chain analysis
+    // Worker thread for chain analysis (PETHREAD, not HANDLE — for KeWaitForSingleObject)
     //
-    HANDLE WorkerThread;
+    PETHREAD WorkerThread;
     KEVENT ShutdownEvent;
     KEVENT AnalysisEvent;
     BOOLEAN ShutdownRequested;
@@ -213,15 +227,6 @@ InjpInsertOperation(
     _In_ PINJ_OPERATION Operation
     );
 
-static PINJ_OPERATION
-InjpFindOperation(
-    _In_ PINJ_DETECTOR_INTERNAL Detector,
-    _In_ HANDLE SourceProcessId,
-    _In_ HANDLE TargetProcessId,
-    _In_ PVOID Address,
-    _In_ INJ_OPERATION_TYPE Type
-    );
-
 static VOID
 InjpRemoveOperation(
     _In_ PINJ_DETECTOR_INTERNAL Detector,
@@ -231,12 +236,6 @@ InjpRemoveOperation(
 //
 // Process context management
 //
-static PINJ_PROCESS_CONTEXT
-InjpAllocateProcessContext(
-    _In_ PINJ_DETECTOR_INTERNAL Detector,
-    _In_ HANDLE ProcessId
-    );
-
 static VOID
 InjpFreeProcessContext(
     _In_ PINJ_DETECTOR_INTERNAL Detector,
@@ -347,6 +346,9 @@ InjpGenerateDetectionResult(
 
 //
 // Callback notification
+// L-1: Callbacks are invoked inside __try/__except blocks to prevent
+// third-party callback faults from crashing the kernel driver.
+// The SEH handler catches all exceptions and continues to the next callback.
 //
 static VOID
 InjpNotifyDetectionCallbacks(
@@ -409,10 +411,23 @@ InjpIsWritableProtection(
     _In_ ULONG Protection
     );
 
+//
+// Process context cleanup — called when a process exits.
+// Must be registered via PsSetCreateProcessNotifyRoutineEx by the
+// driver's initialization code (e.g., DriverEntry or SensorInitialize).
+//
+static VOID
+InjpCleanupProcessContext(
+    _In_ PINJ_DETECTOR_INTERNAL Detector,
+    _In_ HANDLE ProcessId
+    );
+
 // ============================================================================
 // PUBLIC FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjInitialize(
     _In_opt_ PVAD_TRACKER VadTracker,
@@ -446,8 +461,8 @@ Return Value:
     //
     // Allocate internal detector structure
     //
-    Internal = (PINJ_DETECTOR_INTERNAL)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    Internal = (PINJ_DETECTOR_INTERNAL)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(INJ_DETECTOR_INTERNAL),
         INJ_POOL_TAG
         );
@@ -471,8 +486,9 @@ Return Value:
         KeInitializeSpinLock(&Internal->OperationBuckets[i].Lock);
         Internal->OperationBuckets[i].Count = 0;
 
-        Internal->ProcessBuckets[i].Context = NULL;
+        InitializeListHead(&Internal->ProcessBuckets[i].ContextList);
         KeInitializeSpinLock(&Internal->ProcessBuckets[i].Lock);
+        Internal->ProcessBuckets[i].Count = 0;
     }
 
     //
@@ -584,6 +600,12 @@ Return Value:
     ZwClose(ThreadHandle);
 
     if (!NT_SUCCESS(Status)) {
+        //
+        // Worker thread was created but we couldn't get PETHREAD.
+        // Signal it to exit immediately.
+        //
+        Internal->ShutdownRequested = TRUE;
+        KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
         goto Cleanup;
     }
 
@@ -625,6 +647,7 @@ Cleanup:
     return Status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 InjShutdown(
     _Inout_ PINJ_DETECTOR Detector
@@ -714,20 +737,22 @@ Arguments:
     }
 
     //
-    // Free all process contexts
+    // Free all process contexts (chained hash — walk linked list per bucket)
     //
     for (i = 0; i < INJ_HASH_BUCKET_COUNT; i++) {
         KeAcquireSpinLock(&Internal->ProcessBuckets[i].Lock, &OldIrql);
 
-        if (Internal->ProcessBuckets[i].Context != NULL) {
-            PINJ_PROCESS_CONTEXT Context = Internal->ProcessBuckets[i].Context;
-            Internal->ProcessBuckets[i].Context = NULL;
+        while (!IsListEmpty(&Internal->ProcessBuckets[i].ContextList)) {
+            PLIST_ENTRY CtxEntry = RemoveHeadList(&Internal->ProcessBuckets[i].ContextList);
+            PINJ_PROCESS_CONTEXT Context = CONTAINING_RECORD(CtxEntry, INJ_PROCESS_CONTEXT, HashEntry);
             KeReleaseSpinLock(&Internal->ProcessBuckets[i].Lock, OldIrql);
 
             InjpFreeProcessContext(Internal, Context);
-        } else {
-            KeReleaseSpinLock(&Internal->ProcessBuckets[i].Lock, OldIrql);
+
+            KeAcquireSpinLock(&Internal->ProcessBuckets[i].Lock, &OldIrql);
         }
+
+        KeReleaseSpinLock(&Internal->ProcessBuckets[i].Lock, OldIrql);
     }
 
     //
@@ -746,6 +771,8 @@ Arguments:
     ExFreePoolWithTag(Internal, INJ_POOL_TAG);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjRecordOperation(
     _In_ PINJ_DETECTOR Detector,
@@ -899,6 +926,8 @@ Return Value:
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjAnalyzeChain(
     _In_ PINJ_DETECTOR Detector,
@@ -936,7 +965,8 @@ Return Value:
     *Result = NULL;
 
     //
-    // Find matching chain
+    // Find matching chain — H-8 FIX: generate result under lock to prevent
+    // dangling chain pointer after lock release.
     //
     KeAcquireSpinLock(&Internal->ChainLock, &OldIrql);
 
@@ -957,8 +987,9 @@ Return Value:
             if (Technique != InjTechNone &&
                 ConfidenceScore >= Internal->Public.Config.MinConfidenceToAlert) {
 
-                KeReleaseSpinLock(&Internal->ChainLock, OldIrql);
-
+                //
+                // Generate result while chain is still valid (under lock)
+                //
                 Status = InjpGenerateDetectionResult(
                     Internal,
                     Chain,
@@ -966,6 +997,8 @@ Return Value:
                     ConfidenceScore,
                     Result
                     );
+
+                KeReleaseSpinLock(&Internal->ChainLock, OldIrql);
 
                 if (NT_SUCCESS(Status)) {
                     InterlockedIncrement64(&Internal->Public.Stats.DetectedInjections);
@@ -984,6 +1017,8 @@ Return Value:
     return STATUS_NOT_FOUND;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjDetectInjection(
     _In_ PINJ_DETECTOR Detector,
@@ -1032,7 +1067,8 @@ Return Value:
     }
 
     //
-    // Search all chains targeting this process
+    // Search all chains targeting this process.
+    // H-6 FIX: Generate result under lock to avoid dangling BestChain pointer.
     //
     KeAcquireSpinLock(&Internal->ChainLock, &OldIrql);
 
@@ -1077,15 +1113,12 @@ Return Value:
         }
     }
 
-    KeReleaseSpinLock(&Internal->ChainLock, OldIrql);
-
-    InjpDereferenceProcessContext(Internal, Context);
-
     //
-    // Generate result if detection found
+    // Generate result while still holding ChainLock (copies chain data safely)
     //
     if (BestTechnique != InjTechNone &&
-        BestConfidence >= Internal->Public.Config.MinConfidenceToAlert) {
+        BestConfidence >= Internal->Public.Config.MinConfidenceToAlert &&
+        BestChain != NULL) {
 
         Status = InjpGenerateDetectionResult(
             Internal,
@@ -1094,16 +1127,25 @@ Return Value:
             BestConfidence,
             Result
             );
+    }
 
-        if (NT_SUCCESS(Status)) {
-            InterlockedIncrement64(&Internal->Public.Stats.DetectedInjections);
-            InjpNotifyDetectionCallbacks(Internal, *Result);
-        }
+    KeReleaseSpinLock(&Internal->ChainLock, OldIrql);
+
+    InjpDereferenceProcessContext(Internal, Context);
+
+    //
+    // Notify callbacks outside all locks (PASSIVE_LEVEL safe)
+    //
+    if (NT_SUCCESS(Status) && *Result != NULL) {
+        InterlockedIncrement64(&Internal->Public.Stats.DetectedInjections);
+        InjpNotifyDetectionCallbacks(Internal, *Result);
     }
 
     return Status;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjGetChainInfo(
     _In_ PINJ_DETECTOR Detector,
@@ -1170,6 +1212,8 @@ Return Value:
     return Status;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjRegisterDetectionCallback(
     _In_ PINJ_DETECTOR Detector,
@@ -1201,7 +1245,7 @@ Return Value:
 
     for (i = 0; i < INJ_MAX_CALLBACKS; i++) {
         if (!Internal->DetectionCallbacks[i].Active) {
-            Internal->DetectionCallbacks[i].Callback = Callback;
+            Internal->DetectionCallbacks[i].DetectionCallback = Callback;
             Internal->DetectionCallbacks[i].Context = Context;
             Internal->DetectionCallbacks[i].Active = TRUE;
             Internal->DetectionCallbackCount++;
@@ -1214,6 +1258,7 @@ Return Value:
     return STATUS_QUOTA_EXCEEDED;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 InjUnregisterDetectionCallback(
     _In_ PINJ_DETECTOR Detector,
@@ -1240,9 +1285,9 @@ Arguments:
 
     for (i = 0; i < INJ_MAX_CALLBACKS; i++) {
         if (Internal->DetectionCallbacks[i].Active &&
-            Internal->DetectionCallbacks[i].Callback == Callback) {
+            Internal->DetectionCallbacks[i].DetectionCallback == Callback) {
             Internal->DetectionCallbacks[i].Active = FALSE;
-            Internal->DetectionCallbacks[i].Callback = NULL;
+            Internal->DetectionCallbacks[i].DetectionCallback = NULL;
             Internal->DetectionCallbacks[i].Context = NULL;
             Internal->DetectionCallbackCount--;
             break;
@@ -1252,6 +1297,8 @@ Arguments:
     KeReleaseSpinLock(&Internal->CallbackLock, OldIrql);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjRegisterBlockCallback(
     _In_ PINJ_DETECTOR Detector,
@@ -1283,7 +1330,7 @@ Return Value:
 
     for (i = 0; i < INJ_MAX_CALLBACKS; i++) {
         if (!Internal->BlockCallbacks[i].Active) {
-            Internal->BlockCallbacks[i].Callback = (INJ_DETECTION_CALLBACK)Callback;
+            Internal->BlockCallbacks[i].BlockCallback = Callback;
             Internal->BlockCallbacks[i].Context = Context;
             Internal->BlockCallbacks[i].Active = TRUE;
             Internal->BlockCallbackCount++;
@@ -1296,6 +1343,7 @@ Return Value:
     return STATUS_QUOTA_EXCEEDED;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 InjUnregisterBlockCallback(
     _In_ PINJ_DETECTOR Detector,
@@ -1322,9 +1370,9 @@ Arguments:
 
     for (i = 0; i < INJ_MAX_CALLBACKS; i++) {
         if (Internal->BlockCallbacks[i].Active &&
-            Internal->BlockCallbacks[i].Callback == (INJ_DETECTION_CALLBACK)Callback) {
+            Internal->BlockCallbacks[i].BlockCallback == Callback) {
             Internal->BlockCallbacks[i].Active = FALSE;
-            Internal->BlockCallbacks[i].Callback = NULL;
+            Internal->BlockCallbacks[i].BlockCallback = NULL;
             Internal->BlockCallbacks[i].Context = NULL;
             Internal->BlockCallbackCount--;
             break;
@@ -1334,6 +1382,8 @@ Arguments:
     KeReleaseSpinLock(&Internal->CallbackLock, OldIrql);
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjGetStatistics(
     _In_ PINJ_DETECTOR Detector,
@@ -1358,7 +1408,21 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
-    RtlCopyMemory(Stats, &Internal->Public.Stats, sizeof(INJ_STATISTICS));
+    //
+    // M-3 FIX: Use InterlockedCompareExchange64 for atomic 64-bit reads
+    // to prevent torn reads on 32-bit platforms.
+    //
+    RtlZeroMemory(Stats, sizeof(INJ_STATISTICS));
+    Stats->TotalOperations = (ULONG64)InterlockedCompareExchange64(
+        &Internal->Public.Stats.TotalOperations, 0, 0);
+    Stats->DetectedInjections = (ULONG64)InterlockedCompareExchange64(
+        &Internal->Public.Stats.DetectedInjections, 0, 0);
+    Stats->BlockedInjections = (ULONG64)InterlockedCompareExchange64(
+        &Internal->Public.Stats.BlockedInjections, 0, 0);
+    Stats->DroppedOperations = (ULONG64)InterlockedCompareExchange64(
+        &Internal->Public.Stats.DroppedOperations, 0, 0);
+    Stats->ChainsCreated = (ULONG64)InterlockedCompareExchange64(
+        &Internal->Public.Stats.ChainsCreated, 0, 0);
 
     //
     // Update current counts
@@ -1377,6 +1441,8 @@ Return Value:
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjClearChain(
     _In_ PINJ_DETECTOR Detector,
@@ -1430,6 +1496,8 @@ Return Value:
     return Status;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 InjClearAllChains(
     _In_ PINJ_DETECTOR Detector
@@ -1472,6 +1540,7 @@ Return Value:
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 InjFreeDetectionResult(
     _In_ PINJ_DETECTOR Detector,
@@ -1493,6 +1562,32 @@ Arguments:
     }
 
     InjpFreeResult(Internal, Result);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+InjNotifyProcessExit(
+    _In_ PINJ_DETECTOR Detector,
+    _In_ HANDLE ProcessId
+    )
+/*++
+Routine Description:
+    Notifies the injection detector that a process has exited.
+    Cleans up process context for the exiting process.
+    Must be called from PsSetCreateProcessNotifyRoutineEx callback.
+
+Arguments:
+    Detector - Detector instance.
+    ProcessId - Process that is exiting.
+--*/
+{
+    PINJ_DETECTOR_INTERNAL Internal = (PINJ_DETECTOR_INTERNAL)Detector;
+
+    if (Internal == NULL || !Internal->Public.Initialized) {
+        return;
+    }
+
+    InjpCleanupProcessContext(Internal, ProcessId);
 }
 
 // ============================================================================
@@ -1591,44 +1686,6 @@ InjpInsertOperation(
     return STATUS_SUCCESS;
 }
 
-static PINJ_OPERATION
-InjpFindOperation(
-    _In_ PINJ_DETECTOR_INTERNAL Detector,
-    _In_ HANDLE SourceProcessId,
-    _In_ HANDLE TargetProcessId,
-    _In_ PVOID Address,
-    _In_ INJ_OPERATION_TYPE Type
-    )
-{
-    ULONG Hash;
-    PLIST_ENTRY Entry;
-    PINJ_OPERATION Operation;
-    KIRQL OldIrql;
-
-    Hash = InjpHashOperation(SourceProcessId, TargetProcessId, Address);
-
-    KeAcquireSpinLock(&Detector->OperationBuckets[Hash].Lock, &OldIrql);
-
-    for (Entry = Detector->OperationBuckets[Hash].OperationList.Flink;
-         Entry != &Detector->OperationBuckets[Hash].OperationList;
-         Entry = Entry->Flink) {
-
-        Operation = CONTAINING_RECORD(Entry, INJ_OPERATION, HashEntry);
-
-        if (Operation->SourceProcessId == SourceProcessId &&
-            Operation->TargetProcessId == TargetProcessId &&
-            Operation->TargetAddress == Address &&
-            Operation->Type == Type) {
-
-            KeReleaseSpinLock(&Detector->OperationBuckets[Hash].Lock, OldIrql);
-            return Operation;
-        }
-    }
-
-    KeReleaseSpinLock(&Detector->OperationBuckets[Hash].Lock, OldIrql);
-    return NULL;
-}
-
 static VOID
 InjpRemoveOperation(
     _In_ PINJ_DETECTOR_INTERNAL Detector,
@@ -1656,31 +1713,6 @@ InjpRemoveOperation(
     KeReleaseSpinLock(&Detector->OperationBuckets[Hash].Lock, OldIrql);
 }
 
-static PINJ_PROCESS_CONTEXT
-InjpAllocateProcessContext(
-    _In_ PINJ_DETECTOR_INTERNAL Detector,
-    _In_ HANDLE ProcessId
-    )
-{
-    PINJ_PROCESS_CONTEXT Context;
-
-    Context = (PINJ_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
-        &Detector->ContextLookaside
-        );
-
-    if (Context != NULL) {
-        RtlZeroMemory(Context, sizeof(INJ_PROCESS_CONTEXT));
-        Context->ProcessId = ProcessId;
-        Context->RefCount = 1;
-        InitializeListHead(&Context->IncomingChains);
-        InitializeListHead(&Context->OutgoingChains);
-        KeInitializeSpinLock(&Context->Lock);
-        KeQuerySystemTime(&Context->FirstSeenTime);
-    }
-
-    return Context;
-}
-
 static VOID
 InjpFreeProcessContext(
     _In_ PINJ_DETECTOR_INTERNAL Detector,
@@ -1698,94 +1730,69 @@ InjpLookupProcessContext(
     )
 {
     ULONG Hash;
-    PINJ_PROCESS_CONTEXT Context;
+    PINJ_PROCESS_CONTEXT Context = NULL;
+    PINJ_PROCESS_CONTEXT NewContext = NULL;
     KIRQL OldIrql;
+    PLIST_ENTRY Entry;
 
     Hash = InjpHashProcessId(ProcessId);
 
+    //
+    // Search the chained hash bucket (single lock, no linear probing — no deadlock)
+    //
     KeAcquireSpinLock(&Detector->ProcessBuckets[Hash].Lock, &OldIrql);
 
-    Context = Detector->ProcessBuckets[Hash].Context;
+    for (Entry = Detector->ProcessBuckets[Hash].ContextList.Flink;
+         Entry != &Detector->ProcessBuckets[Hash].ContextList;
+         Entry = Entry->Flink) {
 
-    //
-    // Linear probe through collisions
-    //
-    while (Context != NULL && Context->ProcessId != ProcessId) {
-        ULONG NextHash = (Hash + 1) & INJ_HASH_BUCKET_MASK;
-        if (NextHash == Hash) {
-            Context = NULL;
-            break;
-        }
-        KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
-        Hash = NextHash;
-        KeAcquireSpinLock(&Detector->ProcessBuckets[Hash].Lock, &OldIrql);
-        Context = Detector->ProcessBuckets[Hash].Context;
-    }
+        Context = CONTAINING_RECORD(Entry, INJ_PROCESS_CONTEXT, HashEntry);
 
-    if (Context != NULL) {
-        InjpReferenceProcessContext(Context);
-        KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
-        return Context;
-    }
-
-    KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
-
-    if (!CreateIfNotFound) {
-        return NULL;
-    }
-
-    //
-    // Create new context
-    //
-    Context = InjpAllocateProcessContext(Detector, ProcessId);
-    if (Context == NULL) {
-        return NULL;
-    }
-
-    //
-    // Insert into hash table
-    //
-    Hash = InjpHashProcessId(ProcessId);
-
-    KeAcquireSpinLock(&Detector->ProcessBuckets[Hash].Lock, &OldIrql);
-
-    //
-    // Check for race condition
-    //
-    if (Detector->ProcessBuckets[Hash].Context == NULL) {
-        Detector->ProcessBuckets[Hash].Context = Context;
-        InterlockedIncrement(&Detector->ProcessContextCount);
-        InjpReferenceProcessContext(Context);
-        KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
-        return Context;
-    }
-
-    //
-    // Find empty slot with linear probing
-    //
-    while (Detector->ProcessBuckets[Hash].Context != NULL) {
-        if (Detector->ProcessBuckets[Hash].Context->ProcessId == ProcessId) {
-            //
-            // Another thread created it
-            //
-            PINJ_PROCESS_CONTEXT Existing = Detector->ProcessBuckets[Hash].Context;
-            InjpReferenceProcessContext(Existing);
+        if (Context->ProcessId == ProcessId) {
+            InjpReferenceProcessContext(Context);
             KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
-            InjpFreeProcessContext(Detector, Context);
-            return Existing;
+            return Context;
         }
-
-        KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
-        Hash = (Hash + 1) & INJ_HASH_BUCKET_MASK;
-        KeAcquireSpinLock(&Detector->ProcessBuckets[Hash].Lock, &OldIrql);
     }
 
-    Detector->ProcessBuckets[Hash].Context = Context;
+    //
+    // Not found
+    //
+    if (!CreateIfNotFound) {
+        KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
+        return NULL;
+    }
+
+    //
+    // Allocate under lock is OK since ExAllocateFromNPagedLookasideList is fast
+    // and we only hold one bucket lock. This prevents the TOCTOU race of
+    // releasing the lock, allocating, and re-acquiring.
+    //
+    NewContext = (PINJ_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
+        &Detector->ContextLookaside
+        );
+
+    if (NewContext == NULL) {
+        KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
+        return NULL;
+    }
+
+    RtlZeroMemory(NewContext, sizeof(INJ_PROCESS_CONTEXT));
+    NewContext->ProcessId = ProcessId;
+    NewContext->RefCount = 2;  // 1 for hash table ownership + 1 for caller
+    InitializeListHead(&NewContext->IncomingChains);
+    InitializeListHead(&NewContext->OutgoingChains);
+    InitializeListHead(&NewContext->HashEntry);
+    KeInitializeSpinLock(&NewContext->Lock);
+    KeQuerySystemTime(&NewContext->FirstSeenTime);
+
+    InsertTailList(&Detector->ProcessBuckets[Hash].ContextList, &NewContext->HashEntry);
+    Detector->ProcessBuckets[Hash].Count++;
     InterlockedIncrement(&Detector->ProcessContextCount);
-    InjpReferenceProcessContext(Context);
+
     KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
 
-    return Context;
+    return NewContext;
 }
 
 static VOID
@@ -1813,7 +1820,7 @@ InjpAllocateChain(
     )
 {
     PINJ_CHAIN Chain;
-    static volatile LONG NextChainId = 0;
+    static volatile LONG64 NextChainId = 0;
 
     Chain = (PINJ_CHAIN)ExAllocateFromNPagedLookasideList(
         &Detector->ChainLookaside
@@ -1821,7 +1828,7 @@ InjpAllocateChain(
 
     if (Chain != NULL) {
         RtlZeroMemory(Chain, sizeof(INJ_CHAIN));
-        Chain->ChainId = (ULONG)InterlockedIncrement(&NextChainId);
+        Chain->ChainId = (ULONG64)InterlockedIncrement64(&NextChainId);
         InitializeListHead(&Chain->ListEntry);
         InitializeListHead(&Chain->OperationList);
     }
@@ -1865,6 +1872,7 @@ InjpFindOrCreateChain(
 {
     PLIST_ENTRY Entry;
     PINJ_CHAIN Chain;
+    PINJ_CHAIN StaleChain = NULL;
     KIRQL OldIrql;
     LARGE_INTEGER CurrentTime;
     LARGE_INTEGER TimeoutInterval;
@@ -1895,24 +1903,28 @@ InjpFindOrCreateChain(
             }
 
             //
-            // Chain has timed out - remove and create new one
+            // Chain has timed out - remove from list, free AFTER creating new one
+            // to avoid releasing lock in the middle (C-1 TOCTOU fix)
             //
             RemoveEntryList(&Chain->ListEntry);
             InterlockedDecrement(&Detector->ActiveChainCount);
-            KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
-
-            InjpFreeChain(Detector, Chain);
-
-            KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
+            StaleChain = Chain;
             break;
         }
     }
 
     //
-    // Create new chain
+    // Create new chain (still under ChainLock — prevents duplicate creation race)
     //
     Chain = InjpAllocateChain(Detector);
     if (Chain == NULL) {
+        //
+        // If we removed a stale chain, put it back — we can't replace it
+        //
+        if (StaleChain != NULL) {
+            InsertTailList(&Detector->ActiveChains, &StaleChain->ListEntry);
+            InterlockedIncrement(&Detector->ActiveChainCount);
+        }
         KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
         return NULL;
     }
@@ -1926,6 +1938,13 @@ InjpFindOrCreateChain(
     InterlockedIncrement(&Detector->ActiveChainCount);
 
     KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
+
+    //
+    // Free the stale chain outside the lock
+    //
+    if (StaleChain != NULL) {
+        InjpFreeChain(Detector, StaleChain);
+    }
 
     InterlockedIncrement64(&Detector->Public.Stats.ChainsCreated);
 
@@ -1941,11 +1960,15 @@ InjpAddOperationToChain(
 {
     KIRQL OldIrql;
 
+    KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
+
+    //
+    // Check under lock to prevent race (H-1 fix)
+    //
     if (Chain->OperationCount >= Detector->Public.Config.MaxOperationsPerChain) {
+        KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
         return STATUS_QUOTA_EXCEEDED;
     }
-
-    KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
 
     InsertTailList(&Chain->OperationList, &Operation->ChainEntry);
     Chain->OperationCount++;
@@ -2032,9 +2055,11 @@ InjpCalculateOperationPatterns(
 
         switch (Op->Type) {
         case InjOpAllocate:
-            if (PrevOp == NULL || PrevOp->Type != InjOpAllocate) {
-                Patterns |= INJ_PATTERN_ALLOCATE_WRITE;
-            }
+            //
+            // M-5 FIX: Don't set ALLOCATE_WRITE on Allocate alone.
+            // Only set it when we see Allocate followed by Write.
+            // Just record that we saw an Allocate for the next iteration.
+            //
             break;
 
         case InjOpWrite:
@@ -2404,29 +2429,39 @@ InjpNotifyDetectionCallbacks(
 {
     KIRQL OldIrql;
     ULONG i;
+    ULONG Count = 0;
+
+    //
+    // C-3 FIX: Copy callbacks under lock, invoke outside lock at PASSIVE_LEVEL.
+    // Stack-local array avoids allocation; INJ_MAX_CALLBACKS is small (16).
+    //
+    INJ_CALLBACK_ENTRY LocalCallbacks[INJ_MAX_CALLBACKS];
 
     KeAcquireSpinLock(&Detector->CallbackLock, &OldIrql);
 
     for (i = 0; i < INJ_MAX_CALLBACKS; i++) {
         if (Detector->DetectionCallbacks[i].Active &&
-            Detector->DetectionCallbacks[i].Callback != NULL) {
-
-            KeReleaseSpinLock(&Detector->CallbackLock, OldIrql);
-
-            __try {
-                Detector->DetectionCallbacks[i].Callback(
-                    Result,
-                    Detector->DetectionCallbacks[i].Context
-                    );
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore callback exceptions
-            }
-
-            KeAcquireSpinLock(&Detector->CallbackLock, &OldIrql);
+            Detector->DetectionCallbacks[i].DetectionCallback != NULL) {
+            LocalCallbacks[Count] = Detector->DetectionCallbacks[i];
+            Count++;
         }
     }
 
     KeReleaseSpinLock(&Detector->CallbackLock, OldIrql);
+
+    //
+    // Invoke callbacks outside lock — caller must ensure PASSIVE_LEVEL
+    //
+    for (i = 0; i < Count; i++) {
+        __try {
+            LocalCallbacks[i].DetectionCallback(
+                Result,
+                LocalCallbacks[i].Context
+                );
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Log and continue — callback faults must not crash the driver
+        }
+    }
 }
 
 static BOOLEAN
@@ -2437,7 +2472,18 @@ InjpShouldBlockInjection(
 {
     KIRQL OldIrql;
     ULONG i;
+    ULONG Count = 0;
     BOOLEAN ShouldBlock = FALSE;
+
+    //
+    // Separate callback entry for block callbacks
+    //
+    typedef struct _INJ_BLOCK_CB_ENTRY {
+        INJ_BLOCK_CALLBACK Callback;
+        PVOID Context;
+    } INJ_BLOCK_CB_ENTRY;
+
+    INJ_BLOCK_CB_ENTRY LocalCallbacks[INJ_MAX_CALLBACKS];
 
     //
     // Check basic blocking conditions
@@ -2447,46 +2493,49 @@ InjpShouldBlockInjection(
     }
 
     //
-    // Consult block callbacks
+    // C-4 FIX: Copy block callbacks under lock, invoke outside lock
     //
     KeAcquireSpinLock(&Detector->CallbackLock, &OldIrql);
 
     for (i = 0; i < INJ_MAX_CALLBACKS; i++) {
         if (Detector->BlockCallbacks[i].Active &&
-            Detector->BlockCallbacks[i].Callback != NULL) {
-
-            KeReleaseSpinLock(&Detector->CallbackLock, OldIrql);
-
-            __try {
-                INJ_DETECTION_RESULT TempResult;
-                RtlZeroMemory(&TempResult, sizeof(TempResult));
-                TempResult.SourceProcessId = Operation->SourceProcessId;
-                TempResult.TargetProcessId = Operation->TargetProcessId;
-                TempResult.TargetAddress = Operation->TargetAddress;
-                TempResult.ConfidenceScore = Operation->SuspicionScore;
-
-                //
-                // Block callback returns TRUE if we should block
-                //
-                ShouldBlock = ((INJ_BLOCK_CALLBACK)Detector->BlockCallbacks[i].Callback)(
-                    Operation,
-                    Detector->BlockCallbacks[i].Context
-                    );
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Default to not blocking on exception
-            }
-
-            if (ShouldBlock) {
-                return TRUE;
-            }
-
-            KeAcquireSpinLock(&Detector->CallbackLock, &OldIrql);
+            Detector->BlockCallbacks[i].BlockCallback != NULL) {
+            LocalCallbacks[Count].Callback = Detector->BlockCallbacks[i].BlockCallback;
+            LocalCallbacks[Count].Context = Detector->BlockCallbacks[i].Context;
+            Count++;
         }
     }
 
     KeReleaseSpinLock(&Detector->CallbackLock, OldIrql);
 
-    return ShouldBlock;
+    //
+    // H-4 FIX: Build a proper INJ_DETECTION_RESULT and pass it (not the operation pointer).
+    // The callback signature expects PINJ_DETECTION_RESULT.
+    //
+    for (i = 0; i < Count; i++) {
+        __try {
+            INJ_DETECTION_RESULT TempResult;
+            RtlZeroMemory(&TempResult, sizeof(TempResult));
+            TempResult.SourceProcessId = Operation->SourceProcessId;
+            TempResult.TargetProcessId = Operation->TargetProcessId;
+            TempResult.TargetAddress = Operation->TargetAddress;
+            TempResult.Size = Operation->Size;
+            TempResult.ConfidenceScore = Operation->SuspicionScore;
+
+            ShouldBlock = LocalCallbacks[i].Callback(
+                &TempResult,
+                LocalCallbacks[i].Context
+                );
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Default to not blocking on exception
+        }
+
+        if (ShouldBlock) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static VOID
@@ -2522,9 +2571,14 @@ InjpWorkerThread(
 
         if (Status == STATUS_WAIT_1) {
             //
-            // Analyze all active chains
+            // Analyze all active chains.
+            // C-2/H-5 FIX: We must not access Chain pointers after releasing ChainLock.
+            // Strategy: Collect chains needing analysis under lock, then process them.
+            // We use a local list of chain snapshots to avoid stale pointer access.
             //
             if (Detector->Public.Initialized && !Detector->ShutdownRequested) {
+                PLIST_ENTRY SafeEntry, SafeNext;
+
                 KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
 
                 for (Entry = Detector->ActiveChains.Flink;
@@ -2538,15 +2592,24 @@ InjpWorkerThread(
 
                         INJ_TECHNIQUE Technique;
                         ULONG Confidence;
-                        PINJ_DETECTION_RESULT Result = NULL;
 
-                        KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
-
+                        //
+                        // InjpAnalyzeChain only reads chain data — safe under ChainLock
+                        //
                         Technique = InjpAnalyzeChain(Detector, Chain, &Confidence);
 
                         if (Technique != InjTechNone &&
                             Confidence >= Detector->Public.Config.MinConfidenceToAlert) {
 
+                            //
+                            // Generate result under lock (copies chain data to result)
+                            //
+                            PINJ_DETECTION_RESULT Result = NULL;
+
+                            //
+                            // InjpGenerateDetectionResult only reads chain fields
+                            // and allocates from lookaside — safe at DISPATCH_LEVEL.
+                            //
                             Status = InjpGenerateDetectionResult(
                                 Detector,
                                 Chain,
@@ -2557,12 +2620,24 @@ InjpWorkerThread(
 
                             if (NT_SUCCESS(Status) && Result != NULL) {
                                 InterlockedIncrement64(&Detector->Public.Stats.DetectedInjections);
+
+                                //
+                                // C-3/H-10 FIX: Release lock before invoking callbacks.
+                                // Worker thread runs at PASSIVE_LEVEL, so callbacks
+                                // execute at PASSIVE_LEVEL after lock release.
+                                //
+                                KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
                                 InjpNotifyDetectionCallbacks(Detector, Result);
                                 InjpFreeResult(Detector, Result);
+                                KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
+
+                                //
+                                // After re-acquiring lock, the list may have changed.
+                                // Break and re-scan on next timer/signal.
+                                //
+                                break;
                             }
                         }
-
-                        KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
                     }
                 }
 
@@ -2620,19 +2695,20 @@ InjpCleanupStaleOperations(
         KIRQL OldIrql;
         PLIST_ENTRY Entry, Next;
         PINJ_OPERATION Operation;
+        ULONG Iterations = 0;
 
         KeAcquireSpinLock(&Detector->OperationBuckets[i].Lock, &OldIrql);
 
         for (Entry = Detector->OperationBuckets[i].OperationList.Flink;
-             Entry != &Detector->OperationBuckets[i].OperationList;
-             Entry = Next) {
+             Entry != &Detector->OperationBuckets[i].OperationList && Iterations < INJ_MAX_CLEANUP_ITERATIONS;
+             Entry = Next, Iterations++) {
 
             Next = Entry->Flink;
             Operation = CONTAINING_RECORD(Entry, INJ_OPERATION, HashEntry);
 
             if ((CurrentTime.QuadPart - Operation->Timestamp.QuadPart) > TimeoutInterval.QuadPart) {
                 //
-                // Operation is stale - remove it
+                // Operation is stale - remove from hash bucket
                 //
                 RemoveEntryList(&Operation->HashEntry);
                 InitializeListHead(&Operation->HashEntry);
@@ -2640,6 +2716,47 @@ InjpCleanupStaleOperations(
                 InterlockedDecrement(&Detector->TotalOperationCount);
 
                 KeReleaseSpinLock(&Detector->OperationBuckets[i].Lock, OldIrql);
+
+                //
+                // H-7 FIX: Also remove from chain's OperationList to prevent
+                // dangling ChainEntry pointer. If the operation is linked into
+                // a chain, we must unlink it (under ChainLock).
+                //
+                if (!IsListEmpty(&Operation->ChainEntry)) {
+                    KIRQL ChainIrql;
+                    KeAcquireSpinLock(&Detector->ChainLock, &ChainIrql);
+                    if (!IsListEmpty(&Operation->ChainEntry)) {
+                        RemoveEntryList(&Operation->ChainEntry);
+                        InitializeListHead(&Operation->ChainEntry);
+
+                        //
+                        // Find parent chain and decrement its operation count.
+                        // We iterate the chain list since the operation doesn't
+                        // store a back-pointer to its parent chain.
+                        //
+                        {
+                            PLIST_ENTRY ChainEntry;
+                            for (ChainEntry = Detector->ActiveChains.Flink;
+                                 ChainEntry != &Detector->ActiveChains;
+                                 ChainEntry = ChainEntry->Flink) {
+
+                                PINJ_CHAIN ParentChain = CONTAINING_RECORD(ChainEntry, INJ_CHAIN, ListEntry);
+                                if (ParentChain->SourceProcessId == Operation->SourceProcessId &&
+                                    ParentChain->TargetProcessId == Operation->TargetProcessId) {
+                                    if (ParentChain->OperationCount > 0) {
+                                        ParentChain->OperationCount--;
+                                    }
+                                    if (Operation->Size <= ParentChain->TotalSize) {
+                                        ParentChain->TotalSize -= Operation->Size;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    KeReleaseSpinLock(&Detector->ChainLock, ChainIrql);
+                }
+
                 InjpFreeOperation(Detector, Operation);
                 KeAcquireSpinLock(&Detector->OperationBuckets[i].Lock, &OldIrql);
             }
@@ -2665,27 +2782,80 @@ InjpCleanupStaleChains(
 
     KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
 
-    for (Entry = Detector->ActiveChains.Flink;
-         Entry != &Detector->ActiveChains;
-         Entry = Next) {
+    {
+        ULONG Iterations = 0;
 
-        Next = Entry->Flink;
-        Chain = CONTAINING_RECORD(Entry, INJ_CHAIN, ListEntry);
+        for (Entry = Detector->ActiveChains.Flink;
+             Entry != &Detector->ActiveChains && Iterations < INJ_MAX_CLEANUP_ITERATIONS;
+             Entry = Next, Iterations++) {
 
-        if ((CurrentTime.QuadPart - Chain->LastOperationTime.QuadPart) > TimeoutInterval.QuadPart) {
-            //
-            // Chain is stale - remove it
-            //
-            RemoveEntryList(&Chain->ListEntry);
-            InterlockedDecrement(&Detector->ActiveChainCount);
+            Next = Entry->Flink;
+            Chain = CONTAINING_RECORD(Entry, INJ_CHAIN, ListEntry);
 
-            KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
-            InjpFreeChain(Detector, Chain);
-            KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
+            if ((CurrentTime.QuadPart - Chain->LastOperationTime.QuadPart) > TimeoutInterval.QuadPart) {
+                //
+                // Chain is stale - remove it
+                //
+                RemoveEntryList(&Chain->ListEntry);
+                InterlockedDecrement(&Detector->ActiveChainCount);
+
+                KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
+                InjpFreeChain(Detector, Chain);
+                KeAcquireSpinLock(&Detector->ChainLock, &OldIrql);
+            }
         }
     }
 
     KeReleaseSpinLock(&Detector->ChainLock, OldIrql);
+}
+
+//
+// H-9: Process context cleanup.
+// Called by the driver's process notification callback when a process exits.
+// Removes the process context from the hash table and releases it.
+// The driver must register a PsSetCreateProcessNotifyRoutineEx callback
+// that calls this function when Create==FALSE.
+//
+static VOID
+InjpCleanupProcessContext(
+    _In_ PINJ_DETECTOR_INTERNAL Detector,
+    _In_ HANDLE ProcessId
+    )
+{
+    ULONG Hash;
+    KIRQL OldIrql;
+    PLIST_ENTRY Entry;
+    PINJ_PROCESS_CONTEXT Context = NULL;
+
+    if (Detector == NULL || !Detector->Public.Initialized) {
+        return;
+    }
+
+    Hash = InjpHashProcessId(ProcessId);
+
+    KeAcquireSpinLock(&Detector->ProcessBuckets[Hash].Lock, &OldIrql);
+
+    for (Entry = Detector->ProcessBuckets[Hash].ContextList.Flink;
+         Entry != &Detector->ProcessBuckets[Hash].ContextList;
+         Entry = Entry->Flink) {
+
+        PINJ_PROCESS_CONTEXT Candidate = CONTAINING_RECORD(Entry, INJ_PROCESS_CONTEXT, HashEntry);
+
+        if (Candidate->ProcessId == ProcessId) {
+            RemoveEntryList(&Candidate->HashEntry);
+            InitializeListHead(&Candidate->HashEntry);
+            Detector->ProcessBuckets[Hash].Count--;
+            InterlockedDecrement(&Detector->ProcessContextCount);
+            Context = Candidate;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&Detector->ProcessBuckets[Hash].Lock, OldIrql);
+
+    if (Context != NULL) {
+        InjpDereferenceProcessContext(Detector, Context);
+    }
 }
 
 static BOOLEAN
@@ -2702,13 +2872,17 @@ InjpIsSuspiciousProtection(
     )
 {
     //
-    // RWX is highly suspicious
+    // M-6 FIX: PAGE_* constants are NOT bitmasks — they are mutually exclusive values.
+    // Must use equality comparison, not bitwise AND.
+    // Extract the base protection (low 8 bits, ignoring modifier flags).
     //
-    if ((Protection & PAGE_EXECUTE_READWRITE) == PAGE_EXECUTE_READWRITE) {
+    ULONG BaseProtection = Protection & 0xFF;
+
+    if (BaseProtection == PAGE_EXECUTE_READWRITE) {
         return TRUE;
     }
 
-    if ((Protection & PAGE_EXECUTE_WRITECOPY) == PAGE_EXECUTE_WRITECOPY) {
+    if (BaseProtection == PAGE_EXECUTE_WRITECOPY) {
         return TRUE;
     }
 
@@ -2720,10 +2894,12 @@ InjpIsExecutableProtection(
     _In_ ULONG Protection
     )
 {
-    return (Protection & PAGE_EXECUTE) ||
-           (Protection & PAGE_EXECUTE_READ) ||
-           (Protection & PAGE_EXECUTE_READWRITE) ||
-           (Protection & PAGE_EXECUTE_WRITECOPY);
+    ULONG BaseProtection = Protection & 0xFF;
+
+    return (BaseProtection == PAGE_EXECUTE) ||
+           (BaseProtection == PAGE_EXECUTE_READ) ||
+           (BaseProtection == PAGE_EXECUTE_READWRITE) ||
+           (BaseProtection == PAGE_EXECUTE_WRITECOPY);
 }
 
 static BOOLEAN
@@ -2731,9 +2907,11 @@ InjpIsWritableProtection(
     _In_ ULONG Protection
     )
 {
-    return (Protection & PAGE_READWRITE) ||
-           (Protection & PAGE_WRITECOPY) ||
-           (Protection & PAGE_EXECUTE_READWRITE) ||
-           (Protection & PAGE_EXECUTE_WRITECOPY);
+    ULONG BaseProtection = Protection & 0xFF;
+
+    return (BaseProtection == PAGE_READWRITE) ||
+           (BaseProtection == PAGE_WRITECOPY) ||
+           (BaseProtection == PAGE_EXECUTE_READWRITE) ||
+           (BaseProtection == PAGE_EXECUTE_WRITECOPY);
 }
 

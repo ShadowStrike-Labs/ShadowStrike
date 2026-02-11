@@ -175,18 +175,6 @@ typedef struct _PH_ANALYSIS_RESULT {
 
 typedef struct _PH_DETECTOR {
     //
-    // Initialization state
-    //
-    BOOLEAN Initialized;
-    
-    //
-    // Active analyses
-    //
-    LIST_ENTRY ActiveAnalyses;
-    KSPIN_LOCK AnalysisLock;
-    volatile LONG ActiveCount;
-    
-    //
     // Configuration
     //
     struct {
@@ -199,7 +187,8 @@ typedef struct _PH_DETECTOR {
     } Config;
     
     //
-    // Statistics
+    // Statistics (approximate — individual fields are atomic,
+    // but cross-field consistency is NOT guaranteed)
     //
     struct {
         volatile LONG64 ProcessesAnalyzed;
@@ -224,11 +213,14 @@ typedef VOID (*PH_DETECTION_CALLBACK)(
 // Public API - Initialization
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhInitialize(
     _Out_ PPH_DETECTOR* Detector
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 PhShutdown(
     _Inout_ PPH_DETECTOR Detector
@@ -238,6 +230,8 @@ PhShutdown(
 // Public API - Detection
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhAnalyzeProcess(
     _In_ PPH_DETECTOR Detector,
@@ -245,6 +239,8 @@ PhAnalyzeProcess(
     _Out_ PPH_ANALYSIS_RESULT* Result
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhAnalyzeAtCreation(
     _In_ PPH_DETECTOR Detector,
@@ -254,6 +250,8 @@ PhAnalyzeAtCreation(
     _Out_ PPH_ANALYSIS_RESULT* Result
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhQuickCheck(
     _In_ PPH_DETECTOR Detector,
@@ -267,6 +265,8 @@ PhQuickCheck(
 // Public API - Specific Checks
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhCompareImageWithFile(
     _In_ PPH_DETECTOR Detector,
@@ -275,6 +275,8 @@ PhCompareImageWithFile(
     _Out_opt_ PULONG MismatchOffset
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhValidateEntryPoint(
     _In_ PPH_DETECTOR Detector,
@@ -282,6 +284,8 @@ PhValidateEntryPoint(
     _Out_ PBOOLEAN Valid
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhCheckForDoppelganging(
     _In_ PPH_DETECTOR Detector,
@@ -289,6 +293,8 @@ PhCheckForDoppelganging(
     _Out_ PBOOLEAN IsDoppelganging
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhCheckForGhosting(
     _In_ PPH_DETECTOR Detector,
@@ -300,6 +306,8 @@ PhCheckForGhosting(
 // Public API - Callbacks
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhRegisterCallback(
     _In_ PPH_DETECTOR Detector,
@@ -307,6 +315,7 @@ PhRegisterCallback(
     _In_opt_ PVOID Context
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 PhUnregisterCallback(
     _In_ PPH_DETECTOR Detector,
@@ -317,6 +326,7 @@ PhUnregisterCallback(
 // Public API - Results
 //=============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 PhFreeResult(
     _In_ PPH_ANALYSIS_RESULT Result
@@ -334,6 +344,8 @@ typedef struct _PH_STATISTICS {
     LARGE_INTEGER UpTime;
 } PH_STATISTICS, *PPH_STATISTICS;
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 PhGetStatistics(
     _In_ PPH_DETECTOR Detector,

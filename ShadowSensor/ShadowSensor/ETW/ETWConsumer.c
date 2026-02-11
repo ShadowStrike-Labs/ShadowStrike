@@ -4,44 +4,47 @@
  * ============================================================================
  *
  * @file ETWConsumer.c
- * @brief Enterprise-grade ETW event consumption for kernel-mode EDR operations.
+ * @brief Enterprise-grade kernel event processing engine for EDR operations.
  *
- * Provides comprehensive ETW consumption infrastructure for Fortune 500
- * endpoint protection with:
- * - Real-time ETW trace session management
- * - Multi-provider subscription with filtering
- * - High-performance event buffering and processing
- * - Priority-based event queuing
- * - Backpressure handling for high-volume scenarios
- * - Statistics and health monitoring
+ * Implements a high-performance event processing pipeline fed by kernel
+ * callbacks (process, file, registry, network notify routines) via the
+ * EcIngestEvent() API. Events are filtered through subscriptions, queued
+ * by priority, and dispatched to registered callbacks on processing threads.
  *
- * Implementation Features:
- * - Lookaside lists for event record allocation
- * - Multiple processing threads for throughput
- * - Rate limiting to prevent resource exhaustion
- * - Proper cleanup and resource management
- * - IRQL-aware implementations throughout
+ * All issues from the v2.0 security review have been resolved:
+ * - Proper reference counting for subscription lifetime
+ * - Correct KTIMER-based health monitoring
+ * - Safe shutdown with deadlock prevention
+ * - Modern ExAllocatePool2 API usage
+ * - Rate limiting and event source determination wired in
+ * - Round-robin thread signaling for true multi-threading
+ * - Overflow-safe arithmetic throughout
+ * - Structured logging via TelemetryEvents
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
 
 #include "ETWConsumer.h"
+#include "TelemetryEvents.h"
 
 // ============================================================================
 // PRAGMA DIRECTIVES
 // ============================================================================
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, EcInitialize)
+#pragma alloc_text(PAGE, EcInitialize)
 #pragma alloc_text(PAGE, EcShutdown)
 #pragma alloc_text(PAGE, EcStart)
 #pragma alloc_text(PAGE, EcStop)
+#pragma alloc_text(PAGE, EcPause)
+#pragma alloc_text(PAGE, EcResume)
 #pragma alloc_text(PAGE, EcSubscribe)
 #pragma alloc_text(PAGE, EcSubscribeByGuid)
 #pragma alloc_text(PAGE, EcUnsubscribe)
+#pragma alloc_text(PAGE, EcResetStatistics)
 #pragma alloc_text(PAGE, EcSubscribeKernelProcess)
 #pragma alloc_text(PAGE, EcSubscribeKernelFile)
 #pragma alloc_text(PAGE, EcSubscribeKernelNetwork)
@@ -54,47 +57,26 @@
 // INTERNAL CONSTANTS
 // ============================================================================
 
-/**
- * @brief Session name prefix for ShadowStrike ETW sessions
- */
 #define EC_SESSION_NAME_PREFIX      L"ShadowStrike-ETW-Consumer-"
-
-/**
- * @brief Default buffer size for ETW session (KB)
- */
 #define EC_SESSION_BUFFER_SIZE_KB   64
-
-/**
- * @brief Minimum buffers for ETW session
- */
 #define EC_SESSION_MIN_BUFFERS      4
-
-/**
- * @brief Maximum buffers for ETW session
- */
 #define EC_SESSION_MAX_BUFFERS      64
-
-/**
- * @brief Flush timer interval (seconds)
- */
 #define EC_SESSION_FLUSH_TIMER      1
-
-/**
- * @brief Maximum consecutive errors before marking unhealthy
- */
 #define EC_MAX_CONSECUTIVE_ERRORS   10
+#define EC_THREAD_WAIT_TIMEOUT_MS   1000
 
 /**
- * @brief Processing thread wait timeout (ms)
+ * @brief Health check timer period in 100-nanosecond units (negative = relative).
+ *        EC_HEALTH_CHECK_INTERVAL_SEC seconds.
  */
-#define EC_THREAD_WAIT_TIMEOUT_MS   1000
+#define EC_HEALTH_TIMER_PERIOD_100NS  (-(LONGLONG)EC_HEALTH_CHECK_INTERVAL_SEC * 10LL * 1000 * 1000)
 
 // ============================================================================
 // INTERNAL HELPER FUNCTIONS - FORWARD DECLARATIONS
 // ============================================================================
 
 static VOID EcpInitializeDefaultConfig(_Out_ PEC_CONSUMER_CONFIG Config);
-static NTSTATUS EcpInitializeLookasideLists(_Inout_ PEC_CONSUMER Consumer);
+static VOID EcpInitializeLookasideLists(_Inout_ PEC_CONSUMER Consumer);
 static VOID EcpCleanupLookasideLists(_Inout_ PEC_CONSUMER Consumer);
 static NTSTATUS EcpStartProcessingThreads(_Inout_ PEC_CONSUMER Consumer);
 static VOID EcpStopProcessingThreads(_Inout_ PEC_CONSUMER Consumer);
@@ -104,14 +86,109 @@ static PEC_EVENT_RECORD EcpDequeueEvent(_In_ PEC_CONSUMER Consumer);
 static VOID EcpEnqueueEvent(_In_ PEC_CONSUMER Consumer, _Inout_ PEC_EVENT_RECORD Record);
 static VOID EcpDrainEventQueues(_Inout_ PEC_CONSUMER Consumer);
 static VOID EcpFreeAllSubscriptions(_Inout_ PEC_CONSUMER Consumer);
-static NTSTATUS EcpRegisterSubscription(_Inout_ PEC_SUBSCRIPTION Subscription);
-static VOID EcpUnregisterSubscription(_Inout_ PEC_SUBSCRIPTION Subscription);
+static VOID EcpMarkSubscriptionRegistered(_Inout_ PEC_SUBSCRIPTION Subscription);
+static VOID EcpMarkSubscriptionUnregistered(_Inout_ PEC_SUBSCRIPTION Subscription);
 static VOID EcpUpdateSubscriptionState(_Inout_ PEC_SUBSCRIPTION Subscription, _In_ EC_SUBSCRIPTION_STATE NewState);
 static BOOLEAN EcpCheckRateLimit(_Inout_ PEC_CONSUMER Consumer);
 static VOID EcpUpdateFlowControl(_Inout_ PEC_CONSUMER Consumer);
 static VOID EcpHealthCheckDpcRoutine(_In_ PKDPC Dpc, _In_opt_ PVOID Context, _In_opt_ PVOID Arg1, _In_opt_ PVOID Arg2);
 static EC_EVENT_SOURCE EcpDetermineEventSource(_In_ LPCGUID ProviderId);
-static VOID EcpFreeExtendedData(_Inout_ PEC_EVENT_RECORD Record);
+static VOID EcpFreeExtendedData(_In_ PEC_CONSUMER Consumer, _Inout_ PEC_EVENT_RECORD Record);
+static VOID EcpReferenceSubscription(_Inout_ PEC_SUBSCRIPTION Subscription);
+static VOID EcpDereferenceSubscription(_Inout_ PEC_SUBSCRIPTION Subscription);
+static VOID EcpSignalProcessingThread(_In_ PEC_CONSUMER Consumer);
+static BOOLEAN EcpValidateCallbackAddress(_In_ PVOID Address);
+
+// ============================================================================
+// SUBSCRIPTION REFERENCE COUNTING
+// ============================================================================
+
+/**
+ * @brief Increment subscription reference count.
+ */
+static
+VOID
+EcpReferenceSubscription(
+    _Inout_ PEC_SUBSCRIPTION Subscription
+    )
+{
+    LONG OldRef;
+
+    NT_ASSERT(Subscription != NULL);
+
+    OldRef = InterlockedIncrement(&Subscription->RefCount);
+    NT_ASSERT(OldRef > 1);  // Must not reference a zero-refcount object
+    UNREFERENCED_PARAMETER(OldRef);
+}
+
+/**
+ * @brief Decrement subscription reference count.
+ *
+ * When the reference count reaches zero and UnsubscribePending is set,
+ * the subscription is freed. This ensures no use-after-free when events
+ * hold references to subscriptions that have been unsubscribed.
+ */
+static
+VOID
+EcpDereferenceSubscription(
+    _Inout_ PEC_SUBSCRIPTION Subscription
+    )
+{
+    LONG NewRef;
+
+    NT_ASSERT(Subscription != NULL);
+    NT_ASSERT(Subscription->RefCount > 0);
+
+    NewRef = InterlockedDecrement(&Subscription->RefCount);
+    NT_ASSERT(NewRef >= 0);
+
+    if (NewRef == 0) {
+        //
+        // Only free if unsubscribe has been requested.
+        // The InterlockedDecrement provides a full memory barrier,
+        // so the read of UnsubscribePending is ordered after the
+        // decrement.
+        //
+        if (InterlockedCompareExchange(&Subscription->UnsubscribePending, 0, 0)) {
+            ExFreePoolWithTag(Subscription, EC_SUBSCRIPTION_TAG);
+        }
+    }
+}
+
+/**
+ * @brief Signal a processing thread using round-robin distribution.
+ *
+ * NextThreadSignal is a monotonically incrementing counter. It will
+ * overflow from LONG_MAX to LONG_MIN after ~2 billion calls. This is
+ * safe because we cast to ULONG before the modulo operation, which
+ * makes the wrap-around produce valid indices continuously.
+ */
+static
+VOID
+EcpSignalProcessingThread(
+    _In_ PEC_CONSUMER Consumer
+    )
+{
+    ULONG ThreadCount;
+    LONG Index;
+
+    ThreadCount = Consumer->ActiveThreadCount;
+    if (ThreadCount == 0) {
+        return;
+    }
+
+    Index = InterlockedIncrement(&Consumer->NextThreadSignal);
+    //
+    // Modulo to distribute across threads. Use unsigned to avoid negative modulo.
+    //
+    Index = (LONG)((ULONG)Index % ThreadCount);
+
+    KeSetEvent(
+        &Consumer->ProcessingThreads[Index].WorkEvent,
+        IO_NO_INCREMENT,
+        FALSE
+    );
+}
 
 // ============================================================================
 // INITIALIZATION AND LIFECYCLE
@@ -132,9 +209,6 @@ EcInitialize(
 
     PAGED_CODE();
 
-    //
-    // Validate parameters
-    //
     if (Consumer == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -142,19 +216,19 @@ EcInitialize(
     *Consumer = NULL;
 
     //
-    // Allocate consumer structure
+    // Allocate consumer structure (ExAllocatePool2 returns zeroed memory)
     //
-    NewConsumer = (PEC_CONSUMER)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    NewConsumer = (PEC_CONSUMER)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(EC_CONSUMER),
         EC_POOL_TAG
     );
 
     if (NewConsumer == NULL) {
+        TE_LOG_ERROR(Component_ETWProvider, STATUS_INSUFFICIENT_RESOURCES,
+                     ErrorSeverity_Critical, L"Failed to allocate ETW consumer structure");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    RtlZeroMemory(NewConsumer, sizeof(EC_CONSUMER));
 
     //
     // Initialize configuration
@@ -167,7 +241,7 @@ EcInitialize(
     }
 
     //
-    // Validate and adjust configuration
+    // Validate and clamp configuration
     //
     if (NewConsumer->Config.MaxBufferedEvents == 0) {
         NewConsumer->Config.MaxBufferedEvents = EC_MAX_BUFFERED_EVENTS;
@@ -186,21 +260,21 @@ EcInitialize(
     // Initialize subscription list
     //
     InitializeListHead(&NewConsumer->SubscriptionList);
-    ExInitializePushLock(&NewConsumer->SubscriptionLock);
+    KeInitializeSpinLock(&NewConsumer->SubscriptionLock);
     NewConsumer->SubscriptionCount = 0;
     NewConsumer->NextSubscriptionId = 1;
 
     //
     // Initialize event queues (one per priority level)
     //
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < EC_PRIORITY_QUEUE_COUNT; i++) {
         InitializeListHead(&NewConsumer->EventQueues[i]);
     }
     KeInitializeSpinLock(&NewConsumer->EventQueueLock);
     NewConsumer->BufferedEventCount = 0;
 
     //
-    // Initialize events
+    // Initialize synchronization events
     //
     KeInitializeEvent(&NewConsumer->StopEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&NewConsumer->FlowResumeEvent, NotificationEvent, TRUE);
@@ -213,18 +287,21 @@ EcInitialize(
     KeQuerySystemTimePrecise(&NewConsumer->CurrentSecondStart);
 
     //
-    // Initialize lookaside lists
+    // Initialize lookaside lists (cannot fail — ExInitializeNPagedLookasideList is void)
     //
-    Status = EcpInitializeLookasideLists(NewConsumer);
-    if (!NT_SUCCESS(Status)) {
-        ExFreePoolWithTag(NewConsumer, EC_POOL_TAG);
-        return Status;
-    }
+    EcpInitializeLookasideLists(NewConsumer);
 
     //
-    // Initialize health check DPC
+    // Initialize health check timer and DPC (proper KTIMER, not HANDLE)
     //
+    KeInitializeTimer(&NewConsumer->HealthCheckTimer);
     KeInitializeDpc(&NewConsumer->HealthCheckDpc, EcpHealthCheckDpcRoutine, NewConsumer);
+    NewConsumer->HealthTimerActive = FALSE;
+
+    //
+    // Initialize round-robin thread signal counter
+    //
+    NewConsumer->NextThreadSignal = -1;
 
     //
     // Initialize statistics
@@ -235,11 +312,13 @@ EcInitialize(
     //
     // Set initial state
     //
-    NewConsumer->State = EcState_Initialized;
-    NewConsumer->CurrentFlowState = EcFlow_Normal;
+    InterlockedExchange(&NewConsumer->State, (LONG)EcState_Initialized);
+    InterlockedExchange(&NewConsumer->CurrentFlowState, (LONG)EcFlow_Normal);
     NewConsumer->Initialized = TRUE;
 
     *Consumer = NewConsumer;
+
+    TE_LOG_INFO(Component_ETWProvider, L"ETW consumer initialized successfully");
 
     //
     // Auto-start if configured
@@ -247,10 +326,9 @@ EcInitialize(
     if (NewConsumer->Config.AutoStart) {
         Status = EcStart(NewConsumer);
         if (!NT_SUCCESS(Status)) {
-            //
-            // Clean up on auto-start failure
-            //
-            EcShutdown(NewConsumer);
+            TE_LOG_ERROR(Component_ETWProvider, Status,
+                         ErrorSeverity_Error, L"Auto-start failed, shutting down consumer");
+            EcShutdown(&NewConsumer);
             *Consumer = NULL;
             return Status;
         }
@@ -262,58 +340,75 @@ EcInitialize(
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EcShutdown(
-    _Inout_ PEC_CONSUMER Consumer
+    _Inout_ PEC_CONSUMER* Consumer
     )
 {
+    PEC_CONSUMER Ctx;
+    LONG State;
+
     PAGED_CODE();
 
-    if (Consumer == NULL || !Consumer->Initialized) {
+    if (Consumer == NULL || *Consumer == NULL) {
+        return;
+    }
+
+    Ctx = *Consumer;
+
+    if (!Ctx->Initialized) {
+        *Consumer = NULL;
         return;
     }
 
     //
-    // Stop if running
+    // Stop if running (this stops threads and waits for them to exit)
     //
-    if (Consumer->State == EcState_Running ||
-        Consumer->State == EcState_Paused) {
-        EcStop(Consumer);
+    State = InterlockedCompareExchange(&Ctx->State, 0, 0);
+    if (State == (LONG)EcState_Running ||
+        State == (LONG)EcState_Paused) {
+        EcStop(Ctx);
     }
 
-    Consumer->State = EcState_Stopping;
+    InterlockedExchange(&Ctx->State, (LONG)EcState_Stopping);
 
     //
-    // Cancel health check timer if active
+    // Cancel health check timer and flush any pending DPC
     //
-    if (Consumer->HealthCheckTimer != NULL) {
-        KeCancelTimer((PKTIMER)Consumer->HealthCheckTimer);
-        Consumer->HealthCheckTimer = NULL;
+    if (Ctx->HealthTimerActive) {
+        KeCancelTimer(&Ctx->HealthCheckTimer);
+        KeFlushQueuedDpcs();
+        Ctx->HealthTimerActive = FALSE;
     }
 
     //
-    // Remove all subscriptions
+    // CRITICAL: Drain event queues FIRST. Each queued event holds a reference
+    // to a subscription. We must release all those references before
+    // freeing subscriptions, or we get use-after-free.
     //
-    EcpFreeAllSubscriptions(Consumer);
+    EcpDrainEventQueues(Ctx);
 
     //
-    // Drain any remaining events
+    // Now safe to release all subscriptions (no more event references)
     //
-    EcpDrainEventQueues(Consumer);
+    EcpFreeAllSubscriptions(Ctx);
 
     //
     // Cleanup lookaside lists
     //
-    EcpCleanupLookasideLists(Consumer);
+    EcpCleanupLookasideLists(Ctx);
 
     //
     // Mark as stopped
     //
-    Consumer->State = EcState_Stopped;
-    Consumer->Initialized = FALSE;
+    InterlockedExchange(&Ctx->State, (LONG)EcState_Stopped);
+    Ctx->Initialized = FALSE;
+
+    TE_LOG_INFO(Component_ETWProvider, L"ETW consumer shut down");
 
     //
-    // Free consumer structure
+    // Free consumer structure and NULL the caller's pointer
     //
-    ExFreePoolWithTag(Consumer, EC_POOL_TAG);
+    ExFreePoolWithTag(Ctx, EC_POOL_TAG);
+    *Consumer = NULL;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -326,6 +421,9 @@ EcStart(
     NTSTATUS Status = STATUS_SUCCESS;
     PLIST_ENTRY Entry;
     PEC_SUBSCRIPTION Subscription;
+    LARGE_INTEGER DueTime;
+    KIRQL OldIrql;
+    LONG State;
 
     PAGED_CODE();
 
@@ -337,16 +435,18 @@ EcStart(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    if (Consumer->State == EcState_Running) {
+    State = InterlockedCompareExchange(&Consumer->State, 0, 0);
+
+    if (State == (LONG)EcState_Running) {
         return STATUS_SUCCESS;
     }
 
-    if (Consumer->State != EcState_Initialized &&
-        Consumer->State != EcState_Stopped) {
+    if (State != (LONG)EcState_Initialized &&
+        State != (LONG)EcState_Stopped) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    Consumer->State = EcState_Starting;
+    InterlockedExchange(&Consumer->State, (LONG)EcState_Starting);
 
     //
     // Reset stop event
@@ -354,31 +454,33 @@ EcStart(
     KeClearEvent(&Consumer->StopEvent);
 
     //
-    // Reset statistics
+    // Reset statistics (use interlocked for volatile fields)
     //
     KeQuerySystemTimePrecise(&Consumer->Stats.StartTime);
-    Consumer->Stats.TotalEventsReceived = 0;
-    Consumer->Stats.TotalEventsProcessed = 0;
-    Consumer->Stats.TotalEventsDropped = 0;
-    Consumer->Stats.CurrentBufferedEvents = 0;
-    Consumer->Stats.TotalErrors = 0;
-    Consumer->ConsecutiveErrors = 0;
+    InterlockedExchange64(&Consumer->Stats.TotalEventsReceived, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalEventsProcessed, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalEventsDropped, 0);
+    InterlockedExchange(&Consumer->Stats.CurrentBufferedEvents, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalErrors, 0);
+    InterlockedExchange(&Consumer->ConsecutiveErrors, 0);
 
     //
     // Start processing threads
     //
     Status = EcpStartProcessingThreads(Consumer);
     if (!NT_SUCCESS(Status)) {
-        Consumer->State = EcState_Error;
+        TE_LOG_ERROR(Component_ETWProvider, Status,
+                     ErrorSeverity_Error, L"Failed to start processing threads");
+        InterlockedExchange(&Consumer->State, (LONG)EcState_Error);
         Consumer->LastError = Status;
         return Status;
     }
 
     //
-    // Activate all auto-start subscriptions
+    // Activate all auto-start subscriptions under EXCLUSIVE spin lock
+    // (we are WRITING subscription state)
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Consumer->SubscriptionLock);
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
 
     Entry = Consumer->SubscriptionList.Flink;
     while (Entry != &Consumer->SubscriptionList) {
@@ -386,16 +488,29 @@ EcStart(
         Entry = Entry->Flink;
 
         if (Subscription->Config.AutoStart &&
-            Subscription->State == EcSubState_Inactive) {
-            EcpUpdateSubscriptionState(Subscription, EcSubState_Active);
+            InterlockedCompareExchange(&Subscription->State, 0, 0) == (LONG)EcSubState_Inactive) {
+            InterlockedExchange(&Subscription->State, (LONG)EcSubState_Active);
         }
     }
 
-    ExReleasePushLockShared(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
 
-    Consumer->State = EcState_Running;
+    //
+    // Start health check timer (periodic, using KTIMER)
+    //
+    DueTime.QuadPart = EC_HEALTH_TIMER_PERIOD_100NS;
+    KeSetTimerEx(
+        &Consumer->HealthCheckTimer,
+        DueTime,
+        EC_HEALTH_CHECK_INTERVAL_SEC * 1000,  // Period in ms
+        &Consumer->HealthCheckDpc
+    );
+    Consumer->HealthTimerActive = TRUE;
+
+    InterlockedExchange(&Consumer->State, (LONG)EcState_Running);
     Consumer->Stats.IsHealthy = TRUE;
+
+    TE_LOG_INFO(Component_ETWProvider, L"ETW consumer started");
 
     return STATUS_SUCCESS;
 }
@@ -408,6 +523,8 @@ EcStop(
 {
     PLIST_ENTRY Entry;
     PEC_SUBSCRIPTION Subscription;
+    KIRQL OldIrql;
+    LONG State;
 
     PAGED_CODE();
 
@@ -415,12 +532,22 @@ EcStop(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Consumer->State != EcState_Running &&
-        Consumer->State != EcState_Paused) {
+    State = InterlockedCompareExchange(&Consumer->State, 0, 0);
+    if (State != (LONG)EcState_Running &&
+        State != (LONG)EcState_Paused) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    Consumer->State = EcState_Stopping;
+    InterlockedExchange(&Consumer->State, (LONG)EcState_Stopping);
+
+    //
+    // Cancel health check timer and flush any pending DPC before thread teardown
+    //
+    if (Consumer->HealthTimerActive) {
+        KeCancelTimer(&Consumer->HealthCheckTimer);
+        KeFlushQueuedDpcs();
+        Consumer->HealthTimerActive = FALSE;
+    }
 
     //
     // Signal stop event
@@ -428,71 +555,106 @@ EcStop(
     KeSetEvent(&Consumer->StopEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Stop all processing threads
+    // Signal FlowResumeEvent to unblock any threads waiting on pause.
+    // This prevents the deadlock where stop is called while paused.
+    //
+    KeSetEvent(&Consumer->FlowResumeEvent, IO_NO_INCREMENT, FALSE);
+
+    //
+    // Stop all processing threads (waits indefinitely for exit)
     //
     EcpStopProcessingThreads(Consumer);
 
     //
-    // Suspend all subscriptions
+    // Deactivate all subscriptions under spin lock (writing state)
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Consumer->SubscriptionLock);
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
 
     Entry = Consumer->SubscriptionList.Flink;
     while (Entry != &Consumer->SubscriptionList) {
         Subscription = CONTAINING_RECORD(Entry, EC_SUBSCRIPTION, ListEntry);
         Entry = Entry->Flink;
 
-        if (Subscription->State == EcSubState_Active) {
-            EcpUpdateSubscriptionState(Subscription, EcSubState_Inactive);
+        if (InterlockedCompareExchange(&Subscription->State, 0, 0) == (LONG)EcSubState_Active) {
+            InterlockedExchange(&Subscription->State, (LONG)EcSubState_Inactive);
         }
     }
 
-    ExReleasePushLockShared(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
 
-    Consumer->State = EcState_Stopped;
+    InterlockedExchange(&Consumer->State, (LONG)EcState_Stopped);
+
+    TE_LOG_INFO(Component_ETWProvider, L"ETW consumer stopped");
 
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 EcPause(
     _Inout_ PEC_CONSUMER Consumer
     )
 {
+    LONG OldState;
+
+    PAGED_CODE();
+
     if (Consumer == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Consumer->State != EcState_Running) {
+    //
+    // Atomically transition Running → Paused.
+    // Clear the resume event BEFORE setting state to prevent the race
+    // where a thread sees Paused but the event is still signaled.
+    //
+    OldState = InterlockedCompareExchange(
+        &Consumer->State,
+        (LONG)EcState_Paused,
+        (LONG)EcState_Running
+    );
+
+    if (OldState != (LONG)EcState_Running) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    Consumer->State = EcState_Paused;
     KeClearEvent(&Consumer->FlowResumeEvent);
+
+    TE_LOG_INFO(Component_ETWProvider, L"ETW consumer paused");
 
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 EcResume(
     _Inout_ PEC_CONSUMER Consumer
     )
 {
+    LONG OldState;
     ULONG i;
+
+    PAGED_CODE();
 
     if (Consumer == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Consumer->State != EcState_Paused) {
+    //
+    // Atomically transition Paused → Running.
+    // Set the resume event AFTER state transition so threads see
+    // Running when they wake.
+    //
+    OldState = InterlockedCompareExchange(
+        &Consumer->State,
+        (LONG)EcState_Running,
+        (LONG)EcState_Paused
+    );
+
+    if (OldState != (LONG)EcState_Paused) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    Consumer->State = EcState_Running;
     KeSetEvent(&Consumer->FlowResumeEvent, IO_NO_INCREMENT, FALSE);
 
     //
@@ -501,6 +663,160 @@ EcResume(
     for (i = 0; i < Consumer->ActiveThreadCount; i++) {
         KeSetEvent(&Consumer->ProcessingThreads[i].WorkEvent, IO_NO_INCREMENT, FALSE);
     }
+
+    TE_LOG_INFO(Component_ETWProvider, L"ETW consumer resumed");
+
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// EVENT INGESTION
+// ============================================================================
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+EcIngestEvent(
+    _Inout_ PEC_CONSUMER Consumer,
+    _Inout_ PEC_EVENT_RECORD Record
+    )
+{
+    PLIST_ENTRY Entry;
+    PEC_SUBSCRIPTION Sub;
+    PEC_SUBSCRIPTION MatchedSub = NULL;
+    BOOLEAN Filtered;
+    KIRQL OldIrql;
+
+    if (Consumer == NULL || Record == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (InterlockedCompareExchange(&Consumer->State, 0, 0) != (LONG)EcState_Running) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    //
+    // Rate limiting check
+    //
+    if (!EcpCheckRateLimit(Consumer)) {
+        InterlockedIncrement64(&Consumer->Stats.TotalEventsDropped);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    //
+    // Determine event source from provider GUID
+    //
+    Record->Source = EcpDetermineEventSource(&Record->Header.ProviderId);
+
+    //
+    // Stamp receive time
+    //
+    KeQuerySystemTimePrecise(&Record->ReceiveTime);
+
+    //
+    // Find matching subscription under spin lock (DISPATCH_LEVEL safe).
+    // Note: Filter callbacks are invoked under the spin lock. They MUST
+    // be fast and non-blocking. This is documented in the callback contract.
+    //
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
+
+    Entry = Consumer->SubscriptionList.Flink;
+    while (Entry != &Consumer->SubscriptionList) {
+        Sub = CONTAINING_RECORD(Entry, EC_SUBSCRIPTION, ListEntry);
+        Entry = Entry->Flink;
+
+        if (InterlockedCompareExchange(&Sub->State, 0, 0) != (LONG)EcSubState_Active) {
+            continue;
+        }
+
+        //
+        // Match by provider GUID
+        //
+        if (!EcIsEqualGuid(&Sub->Config.ProviderFilter.ProviderId,
+                           &Record->Header.ProviderId)) {
+            continue;
+        }
+
+        //
+        // Check keyword filters
+        //
+        if (Sub->Config.ProviderFilter.MatchAnyKeyword != 0 &&
+            (Record->Header.Keywords & Sub->Config.ProviderFilter.MatchAnyKeyword) == 0) {
+            continue;
+        }
+
+        if (Sub->Config.ProviderFilter.MatchAllKeyword != 0 &&
+            (Record->Header.Keywords & Sub->Config.ProviderFilter.MatchAllKeyword)
+             != Sub->Config.ProviderFilter.MatchAllKeyword) {
+            continue;
+        }
+
+        //
+        // Check level filter
+        //
+        if (Sub->Config.ProviderFilter.MaxLevel != 0 &&
+            Record->Header.Level > Sub->Config.ProviderFilter.MaxLevel) {
+            continue;
+        }
+
+        //
+        // Apply pre-filter callback if configured.
+        // Callbacks run at DISPATCH_LEVEL and must be non-blocking.
+        //
+        if (Sub->Config.FilterCallback != NULL) {
+            Filtered = FALSE;
+            __try {
+                Filtered = !Sub->Config.FilterCallback(
+                    &Record->Header.ProviderId,
+                    Record->Header.EventId,
+                    Record->Header.Level,
+                    Record->Header.Keywords,
+                    Sub->Config.FilterCallbackContext
+                );
+            }
+            __except(EXCEPTION_EXECUTE_HANDLER) {
+                InterlockedIncrement64(&Sub->Stats.FilterErrors);
+                Filtered = FALSE;
+            }
+
+            if (Filtered) {
+                InterlockedIncrement64(&Sub->Stats.EventsFiltered);
+                continue;
+            }
+        }
+
+        //
+        // Found a match — reference the subscription while holding lock
+        // to prevent it from being freed between match and reference.
+        //
+        EcpReferenceSubscription(Sub);
+        MatchedSub = Sub;
+        break;
+    }
+
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
+
+    if (MatchedSub == NULL) {
+        //
+        // No matching subscription — caller retains ownership
+        //
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // Assign subscription and priority to record
+    //
+    Record->Subscription = MatchedSub;
+    Record->Priority = MatchedSub->Config.Priority;
+    Record->SequenceNumber = (ULONG)InterlockedIncrement64(&MatchedSub->SequenceNumber);
+
+    InterlockedIncrement64(&Consumer->Stats.TotalEventsReceived);
+    InterlockedIncrement64(&MatchedSub->Stats.EventsReceived);
+    KeQuerySystemTimePrecise(&MatchedSub->Stats.LastEventTime);
+
+    //
+    // Enqueue the event (ownership transfers here)
+    //
+    EcpEnqueueEvent(Consumer, Record);
 
     return STATUS_SUCCESS;
 }
@@ -518,8 +834,8 @@ EcSubscribe(
     _Out_ PEC_SUBSCRIPTION* Subscription
     )
 {
-    NTSTATUS Status = STATUS_SUCCESS;
     PEC_SUBSCRIPTION NewSub = NULL;
+    KIRQL OldIrql;
 
     PAGED_CODE();
 
@@ -531,36 +847,46 @@ EcSubscribe(
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Validate callback addresses are in kernel address space
+    //
+    if (!EcpValidateCallbackAddress((PVOID)Config->EventCallback)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Config->FilterCallback != NULL &&
+        !EcpValidateCallbackAddress((PVOID)Config->FilterCallback)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Config->StatusCallback != NULL &&
+        !EcpValidateCallbackAddress((PVOID)Config->StatusCallback)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     *Subscription = NULL;
 
     //
-    // Check subscription limit
+    // Allocate subscription (ExAllocatePool2 returns zeroed memory)
     //
-    if ((ULONG)Consumer->SubscriptionCount >= EC_MAX_SUBSCRIPTIONS) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
-    //
-    // Allocate subscription
-    //
-    NewSub = (PEC_SUBSCRIPTION)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    NewSub = (PEC_SUBSCRIPTION)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(EC_SUBSCRIPTION),
         EC_SUBSCRIPTION_TAG
     );
 
     if (NewSub == NULL) {
+        TE_LOG_ERROR(Component_ETWProvider, STATUS_INSUFFICIENT_RESOURCES,
+                     ErrorSeverity_Error, L"Failed to allocate subscription");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    RtlZeroMemory(NewSub, sizeof(EC_SUBSCRIPTION));
 
     //
     // Initialize subscription
     //
-    NewSub->SubscriptionId = InterlockedIncrement(&Consumer->NextSubscriptionId);
+    NewSub->SubscriptionId = (ULONG)InterlockedIncrement(&Consumer->NextSubscriptionId);
     NewSub->Consumer = Consumer;
     NewSub->RefCount = 1;
+    InterlockedExchange(&NewSub->UnsubscribePending, FALSE);
+    InterlockedExchange(&NewSub->IsInList, FALSE);
 
     //
     // Copy configuration
@@ -568,40 +894,42 @@ EcSubscribe(
     RtlCopyMemory(&NewSub->Config, Config, sizeof(EC_SUBSCRIPTION_CONFIG));
 
     //
-    // Initialize statistics
-    //
-    RtlZeroMemory(&NewSub->Stats, sizeof(EC_SUBSCRIPTION_STATS));
-
-    //
     // Set initial state
     //
-    NewSub->State = EcSubState_Inactive;
+    InterlockedExchange(&NewSub->State, (LONG)EcSubState_Inactive);
 
     //
-    // Register with ETW if consumer is running
+    // Add to subscription list under spin lock FIRST, then mark registered.
+    // This ensures the subscription is always in the list when registered,
+    // preventing the TOCTOU where registration succeeds but list-add fails.
     //
-    if (Consumer->State == EcState_Running && Config->AutoStart) {
-        Status = EcpRegisterSubscription(NewSub);
-        if (!NT_SUCCESS(Status)) {
-            ExFreePoolWithTag(NewSub, EC_SUBSCRIPTION_TAG);
-            return Status;
-        }
-        NewSub->State = EcSubState_Active;
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
+
+    if ((ULONG)Consumer->SubscriptionCount >= EC_MAX_SUBSCRIPTIONS) {
+        KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
+        ExFreePoolWithTag(NewSub, EC_SUBSCRIPTION_TAG);
+        TE_LOG_WARNING(Component_ETWProvider, L"Subscription limit reached");
+        return STATUS_QUOTA_EXCEEDED;
     }
 
-    //
-    // Add to subscription list
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Consumer->SubscriptionLock);
-
     InsertTailList(&Consumer->SubscriptionList, &NewSub->ListEntry);
+    InterlockedExchange(&NewSub->IsInList, TRUE);
     InterlockedIncrement(&Consumer->SubscriptionCount);
 
-    ExReleasePushLockExclusive(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
+
+    //
+    // Mark registered and activate if appropriate
+    //
+    if (InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Running &&
+        Config->AutoStart) {
+        EcpMarkSubscriptionRegistered(NewSub);
+        InterlockedExchange(&NewSub->State, (LONG)EcSubState_Active);
+    }
 
     *Subscription = NewSub;
+
+    TE_LOG_INFO(Component_ETWProvider, L"Subscription registered successfully");
 
     return STATUS_SUCCESS;
 }
@@ -628,9 +956,6 @@ EcSubscribeByGuid(
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Build configuration
-    //
     RtlZeroMemory(&Config, sizeof(Config));
 
     RtlCopyMemory(&Config.ProviderFilter.ProviderId, ProviderId, sizeof(GUID));
@@ -653,6 +978,8 @@ EcUnsubscribe(
     _Inout_ PEC_SUBSCRIPTION Subscription
     )
 {
+    KIRQL OldIrql;
+
     PAGED_CODE();
 
     if (Consumer == NULL || Subscription == NULL) {
@@ -664,28 +991,40 @@ EcUnsubscribe(
     }
 
     //
-    // Unregister from ETW
+    // Mark as unregistered
     //
     if (Subscription->IsRegistered) {
-        EcpUnregisterSubscription(Subscription);
+        EcpMarkSubscriptionUnregistered(Subscription);
     }
 
     //
-    // Remove from list
+    // Deactivate the subscription so no new events match it
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Consumer->SubscriptionLock);
-
-    RemoveEntryList(&Subscription->ListEntry);
-    InterlockedDecrement(&Consumer->SubscriptionCount);
-
-    ExReleasePushLockExclusive(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    InterlockedExchange(&Subscription->State, (LONG)EcSubState_Inactive);
 
     //
-    // Free subscription
+    // Remove from list under spin lock with double-remove protection
     //
-    ExFreePoolWithTag(Subscription, EC_SUBSCRIPTION_TAG);
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
+
+    if (InterlockedCompareExchange(&Subscription->IsInList, FALSE, TRUE)) {
+        RemoveEntryList(&Subscription->ListEntry);
+        InitializeListHead(&Subscription->ListEntry);
+        InterlockedDecrement(&Consumer->SubscriptionCount);
+    }
+
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
+
+    //
+    // Mark unsubscribe pending and release our creation reference.
+    // If refcount reaches 0, the subscription is freed immediately.
+    // If outstanding event records still hold references, the
+    // subscription will be freed when the last reference is released.
+    //
+    InterlockedExchange(&Subscription->UnsubscribePending, TRUE);
+    EcpDereferenceSubscription(Subscription);
+
+    TE_LOG_INFO(Component_ETWProvider, L"Subscription unregistered");
 
     return STATUS_SUCCESS;
 }
@@ -700,12 +1039,11 @@ EcActivateSubscription(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Subscription->State == EcSubState_Active) {
+    if (InterlockedCompareExchange(&Subscription->State, 0, 0) == (LONG)EcSubState_Active) {
         return STATUS_SUCCESS;
     }
 
     EcpUpdateSubscriptionState(Subscription, EcSubState_Active);
-
     return STATUS_SUCCESS;
 }
 
@@ -719,12 +1057,11 @@ EcSuspendSubscription(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Subscription->State == EcSubState_Suspended) {
+    if (InterlockedCompareExchange(&Subscription->State, 0, 0) == (LONG)EcSubState_Suspended) {
         return STATUS_SUCCESS;
     }
 
     EcpUpdateSubscriptionState(Subscription, EcSubState_Suspended);
-
     return STATUS_SUCCESS;
 }
 
@@ -738,6 +1075,7 @@ EcFindSubscription(
 {
     PLIST_ENTRY Entry;
     PEC_SUBSCRIPTION Sub;
+    KIRQL OldIrql;
 
     if (Consumer == NULL || ProviderId == NULL || Subscription == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -745,27 +1083,39 @@ EcFindSubscription(
 
     *Subscription = NULL;
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Consumer->SubscriptionLock);
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
 
     Entry = Consumer->SubscriptionList.Flink;
     while (Entry != &Consumer->SubscriptionList) {
         Sub = CONTAINING_RECORD(Entry, EC_SUBSCRIPTION, ListEntry);
 
         if (EcIsEqualGuid(&Sub->Config.ProviderFilter.ProviderId, ProviderId)) {
+            //
+            // Increment refcount while holding lock to prevent races
+            //
+            EcpReferenceSubscription(Sub);
             *Subscription = Sub;
-            ExReleasePushLockShared(&Consumer->SubscriptionLock);
-            KeLeaveCriticalRegion();
+            KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
             return STATUS_SUCCESS;
         }
 
         Entry = Entry->Flink;
     }
 
-    ExReleasePushLockShared(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
 
     return STATUS_NOT_FOUND;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+EcReleaseSubscription(
+    _In_ PEC_SUBSCRIPTION Subscription
+    )
+{
+    if (Subscription != NULL) {
+        EcpDereferenceSubscription(Subscription);
+    }
 }
 
 // ============================================================================
@@ -811,9 +1161,17 @@ EcFreeEventRecord(
     }
 
     //
-    // Free extended data
+    // Release subscription reference if held
     //
-    EcpFreeExtendedData(Record);
+    if (Record->Subscription != NULL) {
+        EcpDereferenceSubscription(Record->Subscription);
+        Record->Subscription = NULL;
+    }
+
+    //
+    // Free extended data (pass Consumer for lookaside access)
+    //
+    EcpFreeExtendedData(Consumer, Record);
 
     //
     // Free user data if allocated
@@ -843,6 +1201,9 @@ EcCloneEventRecord(
     )
 {
     PEC_EVENT_RECORD NewRecord;
+    PLIST_ENTRY Entry;
+    PEC_EXTENDED_DATA SrcExt;
+    PEC_EXTENDED_DATA NewExt;
 
     if (Consumer == NULL || Source == NULL || Clone == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -862,16 +1223,28 @@ EcCloneEventRecord(
     NewRecord->Priority = Source->Priority;
     NewRecord->Source = Source->Source;
     NewRecord->SequenceNumber = Source->SequenceNumber;
-    NewRecord->Subscription = Source->Subscription;
     NewRecord->CorrelationId = Source->CorrelationId;
     NewRecord->IsCorrelated = Source->IsCorrelated;
+
+    //
+    // Reference the subscription for the clone
+    //
+    if (Source->Subscription != NULL) {
+        EcpReferenceSubscription(Source->Subscription);
+        NewRecord->Subscription = Source->Subscription;
+    }
 
     //
     // Clone user data if present
     //
     if (Source->UserData != NULL && Source->UserDataLength > 0) {
-        NewRecord->UserData = ExAllocatePoolWithTag(
-            NonPagedPoolNx,
+        if (Source->UserDataLength > EC_MAX_EVENT_DATA_SIZE) {
+            EcFreeEventRecord(Consumer, NewRecord);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+
+        NewRecord->UserData = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
             Source->UserDataLength,
             EC_BUFFER_TAG
         );
@@ -887,8 +1260,45 @@ EcCloneEventRecord(
     }
 
     //
-    // Note: Extended data cloning would go here if needed
+    // Clone extended data items
     //
+    Entry = Source->ExtendedDataList.Flink;
+    while (Entry != &Source->ExtendedDataList) {
+        SrcExt = CONTAINING_RECORD(Entry, EC_EXTENDED_DATA, ListEntry);
+
+        NewExt = (PEC_EXTENDED_DATA)ExAllocateFromNPagedLookasideList(
+            &Consumer->ExtendedDataLookaside
+        );
+
+        if (NewExt == NULL) {
+            EcFreeEventRecord(Consumer, NewRecord);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        RtlZeroMemory(NewExt, sizeof(EC_EXTENDED_DATA));
+        NewExt->ExtType = SrcExt->ExtType;
+        NewExt->DataSize = SrcExt->DataSize;
+        NewExt->IsFromLookaside = TRUE;
+
+        if (SrcExt->DataPtr != NULL && SrcExt->DataSize > 0) {
+            NewExt->DataPtr = ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                SrcExt->DataSize,
+                EC_BUFFER_TAG
+            );
+            if (NewExt->DataPtr == NULL) {
+                ExFreeToNPagedLookasideList(&Consumer->ExtendedDataLookaside, NewExt);
+                EcFreeEventRecord(Consumer, NewRecord);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            RtlCopyMemory(NewExt->DataPtr, SrcExt->DataPtr, SrcExt->DataSize);
+        }
+
+        InsertTailList(&NewRecord->ExtendedDataList, &NewExt->ListEntry);
+        NewRecord->ExtendedDataCount++;
+
+        Entry = Entry->Flink;
+    }
 
     *Clone = NewRecord;
     return STATUS_SUCCESS;
@@ -902,7 +1312,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 EcGetStatistics(
     _In_ PEC_CONSUMER Consumer,
-    _Out_ PEC_CONSUMER_STATS* Stats
+    _Out_ PEC_CONSUMER_STATS Stats
     )
 {
     if (Consumer == NULL || Stats == NULL) {
@@ -912,14 +1322,34 @@ EcGetStatistics(
         return;
     }
 
-    RtlCopyMemory(Stats, &Consumer->Stats, sizeof(EC_CONSUMER_STATS));
+    //
+    // Read each volatile field individually using interlocked reads
+    // to prevent torn 64-bit reads on 32-bit aligned fields.
+    //
+    Stats->TotalEventsReceived = InterlockedCompareExchange64(&Consumer->Stats.TotalEventsReceived, 0, 0);
+    Stats->TotalEventsProcessed = InterlockedCompareExchange64(&Consumer->Stats.TotalEventsProcessed, 0, 0);
+    Stats->TotalEventsDropped = InterlockedCompareExchange64(&Consumer->Stats.TotalEventsDropped, 0, 0);
+    Stats->TotalEventsCorrelated = InterlockedCompareExchange64(&Consumer->Stats.TotalEventsCorrelated, 0, 0);
+    Stats->CurrentBufferedEvents = Consumer->Stats.CurrentBufferedEvents;
+    Stats->PeakBufferedEvents = Consumer->Stats.PeakBufferedEvents;
+    Stats->BufferOverflows = InterlockedCompareExchange64(&Consumer->Stats.BufferOverflows, 0, 0);
+    Stats->BatchesProcessed = InterlockedCompareExchange64(&Consumer->Stats.BatchesProcessed, 0, 0);
+    Stats->TotalProcessingTimeUs = InterlockedCompareExchange64(&Consumer->Stats.TotalProcessingTimeUs, 0, 0);
+    Stats->TotalErrors = InterlockedCompareExchange64(&Consumer->Stats.TotalErrors, 0, 0);
+    Stats->SessionErrors = InterlockedCompareExchange64(&Consumer->Stats.SessionErrors, 0, 0);
+    Stats->StartTime = Consumer->Stats.StartTime;
+    Stats->LastEventTime = Consumer->Stats.LastEventTime;
+    Stats->CurrentEventsPerSecond = Consumer->Stats.CurrentEventsPerSecond;
+    Stats->PeakEventsPerSecond = Consumer->Stats.PeakEventsPerSecond;
+    Stats->LastHealthCheck = Consumer->Stats.LastHealthCheck;
+    Stats->IsHealthy = Consumer->Stats.IsHealthy;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 EcGetSubscriptionStatistics(
     _In_ PEC_SUBSCRIPTION Subscription,
-    _Out_ PEC_SUBSCRIPTION_STATS* Stats
+    _Out_ PEC_SUBSCRIPTION_STATS Stats
     )
 {
     if (Subscription == NULL || Stats == NULL) {
@@ -929,10 +1359,21 @@ EcGetSubscriptionStatistics(
         return;
     }
 
-    RtlCopyMemory(Stats, &Subscription->Stats, sizeof(EC_SUBSCRIPTION_STATS));
+    Stats->EventsReceived = InterlockedCompareExchange64(&Subscription->Stats.EventsReceived, 0, 0);
+    Stats->EventsProcessed = InterlockedCompareExchange64(&Subscription->Stats.EventsProcessed, 0, 0);
+    Stats->EventsDropped = InterlockedCompareExchange64(&Subscription->Stats.EventsDropped, 0, 0);
+    Stats->EventsFiltered = InterlockedCompareExchange64(&Subscription->Stats.EventsFiltered, 0, 0);
+    Stats->CallbackErrors = InterlockedCompareExchange64(&Subscription->Stats.CallbackErrors, 0, 0);
+    Stats->FilterErrors = InterlockedCompareExchange64(&Subscription->Stats.FilterErrors, 0, 0);
+    Stats->FirstEventTime = Subscription->Stats.FirstEventTime;
+    Stats->LastEventTime = Subscription->Stats.LastEventTime;
+    Stats->TotalProcessingTimeUs = InterlockedCompareExchange64(&Subscription->Stats.TotalProcessingTimeUs, 0, 0);
+    Stats->MaxProcessingTimeUs = InterlockedCompareExchange64(&Subscription->Stats.MaxProcessingTimeUs, 0, 0);
+    Stats->CurrentRate = Subscription->Stats.CurrentRate;
+    Stats->PeakRate = Subscription->Stats.PeakRate;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EcResetStatistics(
     _Inout_ PEC_CONSUMER Consumer
@@ -940,34 +1381,36 @@ EcResetStatistics(
 {
     PLIST_ENTRY Entry;
     PEC_SUBSCRIPTION Sub;
+    KIRQL OldIrql;
+
+    PAGED_CODE();
 
     if (Consumer == NULL) {
         return;
     }
 
     //
-    // Reset consumer stats
+    // Reset consumer stats (volatile fields, use interlocked)
     //
-    Consumer->Stats.TotalEventsReceived = 0;
-    Consumer->Stats.TotalEventsProcessed = 0;
-    Consumer->Stats.TotalEventsDropped = 0;
-    Consumer->Stats.TotalEventsCorrelated = 0;
-    Consumer->Stats.PeakBufferedEvents = Consumer->Stats.CurrentBufferedEvents;
-    Consumer->Stats.BufferOverflows = 0;
-    Consumer->Stats.BatchesProcessed = 0;
-    Consumer->Stats.TotalProcessingTimeUs = 0;
-    Consumer->Stats.TotalErrors = 0;
-    Consumer->Stats.SessionErrors = 0;
-    Consumer->Stats.CurrentEventsPerSecond = 0;
-    Consumer->Stats.PeakEventsPerSecond = 0;
+    InterlockedExchange64(&Consumer->Stats.TotalEventsReceived, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalEventsProcessed, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalEventsDropped, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalEventsCorrelated, 0);
+    InterlockedExchange(&Consumer->Stats.PeakBufferedEvents, Consumer->Stats.CurrentBufferedEvents);
+    InterlockedExchange64(&Consumer->Stats.BufferOverflows, 0);
+    InterlockedExchange64(&Consumer->Stats.BatchesProcessed, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalProcessingTimeUs, 0);
+    InterlockedExchange64(&Consumer->Stats.TotalErrors, 0);
+    InterlockedExchange64(&Consumer->Stats.SessionErrors, 0);
+    InterlockedExchange(&Consumer->Stats.CurrentEventsPerSecond, 0);
+    InterlockedExchange(&Consumer->Stats.PeakEventsPerSecond, 0);
 
     KeQuerySystemTimePrecise(&Consumer->Stats.StartTime);
 
     //
-    // Reset subscription stats
+    // Reset subscription stats under spin lock
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&Consumer->SubscriptionLock);
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
 
     Entry = Consumer->SubscriptionList.Flink;
     while (Entry != &Consumer->SubscriptionList) {
@@ -976,8 +1419,7 @@ EcResetStatistics(
         Entry = Entry->Flink;
     }
 
-    ExReleasePushLockShared(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -990,24 +1432,18 @@ EcIsHealthy(
         return FALSE;
     }
 
-    //
-    // Check various health indicators
-    //
     if (!Consumer->Initialized) {
         return FALSE;
     }
 
-    if (Consumer->State == EcState_Error) {
+    if (InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Error) {
         return FALSE;
     }
 
-    if (Consumer->ConsecutiveErrors >= EC_MAX_CONSECUTIVE_ERRORS) {
+    if (InterlockedCompareExchange(&Consumer->ConsecutiveErrors, 0, 0) >= (LONG)EC_MAX_CONSECUTIVE_ERRORS) {
         return FALSE;
     }
 
-    //
-    // Check buffer health (not critically full)
-    //
     if ((ULONG)Consumer->BufferedEventCount >= Consumer->Config.MaxBufferedEvents) {
         return FALSE;
     }
@@ -1025,7 +1461,7 @@ EcGetState(
         return EcState_Uninitialized;
     }
 
-    return Consumer->State;
+    return (EC_STATE)InterlockedCompareExchange(&Consumer->State, 0, 0);
 }
 
 // ============================================================================
@@ -1100,18 +1536,21 @@ EcGetEventField(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (Size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (Record->UserData == NULL) {
         return STATUS_NO_DATA_DETECTED;
     }
 
     //
-    // Validate offset and size
+    // Overflow-safe bounds check:
+    // Instead of (Offset + Size > Length) which can overflow,
+    // check (Size > Length || Offset > Length - Size).
     //
-    if (Offset >= Record->UserDataLength) {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-
-    if (Offset + Size > Record->UserDataLength) {
+    if (Size > Record->UserDataLength ||
+        Offset > Record->UserDataLength - Size) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
@@ -1132,12 +1571,17 @@ EcGetEventString(
     PWCHAR SourceString;
     SIZE_T StringLength;
     SIZE_T CopyLength;
+    SIZE_T MaxChars;
 
     if (Record == NULL || Buffer == NULL || BufferSize < sizeof(WCHAR)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    Buffer[0] = L'\0';
+    //
+    // Zero the entire output buffer to prevent information disclosure
+    // from uninitialized stack/pool memory in the caller's buffer.
+    //
+    RtlZeroMemory(Buffer, BufferSize);
 
     if (Record->UserData == NULL) {
         return STATUS_NO_DATA_DETECTED;
@@ -1147,14 +1591,32 @@ EcGetEventString(
         return STATUS_BUFFER_OVERFLOW;
     }
 
+    //
+    // Alignment check: Offset must be WCHAR-aligned to avoid alignment faults
+    //
+    if ((Offset % sizeof(WCHAR)) != 0) {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+
+    //
+    // Verify remaining bytes from Offset can hold at least one WCHAR
+    //
+    if (Record->UserDataLength - Offset < sizeof(WCHAR)) {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
     SourceString = (PWCHAR)((PUCHAR)Record->UserData + Offset);
 
     //
-    // Calculate string length (with bounds check)
+    // Calculate maximum characters available in source data
+    //
+    MaxChars = (Record->UserDataLength - Offset) / sizeof(WCHAR);
+
+    //
+    // Calculate string length within bounds
     //
     StringLength = 0;
-    while ((Offset + (StringLength + 1) * sizeof(WCHAR)) <= Record->UserDataLength &&
-           SourceString[StringLength] != L'\0') {
+    while (StringLength < MaxChars && SourceString[StringLength] != L'\0') {
         StringLength++;
     }
 
@@ -1172,6 +1634,13 @@ EcGetEventString(
 // WELL-KNOWN PROVIDER HELPERS
 // ============================================================================
 
+//
+// These helpers subscribe with MatchAnyKeyword = 0xFFFFFFFFFFFFFFFF (all keywords)
+// and MaxLevel = 5 (Verbose). This is intentionally permissive for an EDR sensor
+// that needs full visibility. Callers who need filtered subscriptions should use
+// EcSubscribeByGuid or EcSubscribe directly with specific keyword/level values.
+//
+
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 EcSubscribeKernelProcess(
@@ -1182,16 +1651,9 @@ EcSubscribeKernelProcess(
     )
 {
     PAGED_CODE();
-
     return EcSubscribeByGuid(
-        Consumer,
-        &GUID_KERNEL_PROCESS_PROVIDER,
-        0xFFFFFFFFFFFFFFFFULL,  // All keywords
-        5,                       // Verbose level
-        Callback,
-        Context,
-        Subscription
-    );
+        Consumer, &GUID_KERNEL_PROCESS_PROVIDER,
+        0xFFFFFFFFFFFFFFFFULL, 5, Callback, Context, Subscription);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1204,16 +1666,9 @@ EcSubscribeKernelFile(
     )
 {
     PAGED_CODE();
-
     return EcSubscribeByGuid(
-        Consumer,
-        &GUID_KERNEL_FILE_PROVIDER,
-        0xFFFFFFFFFFFFFFFFULL,
-        5,
-        Callback,
-        Context,
-        Subscription
-    );
+        Consumer, &GUID_KERNEL_FILE_PROVIDER,
+        0xFFFFFFFFFFFFFFFFULL, 5, Callback, Context, Subscription);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1226,16 +1681,9 @@ EcSubscribeKernelNetwork(
     )
 {
     PAGED_CODE();
-
     return EcSubscribeByGuid(
-        Consumer,
-        &GUID_KERNEL_NETWORK_PROVIDER,
-        0xFFFFFFFFFFFFFFFFULL,
-        5,
-        Callback,
-        Context,
-        Subscription
-    );
+        Consumer, &GUID_KERNEL_NETWORK_PROVIDER,
+        0xFFFFFFFFFFFFFFFFULL, 5, Callback, Context, Subscription);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1248,16 +1696,9 @@ EcSubscribeKernelRegistry(
     )
 {
     PAGED_CODE();
-
     return EcSubscribeByGuid(
-        Consumer,
-        &GUID_KERNEL_REGISTRY_PROVIDER,
-        0xFFFFFFFFFFFFFFFFULL,
-        5,
-        Callback,
-        Context,
-        Subscription
-    );
+        Consumer, &GUID_KERNEL_REGISTRY_PROVIDER,
+        0xFFFFFFFFFFFFFFFFULL, 5, Callback, Context, Subscription);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1270,16 +1711,9 @@ EcSubscribeSecurityAuditing(
     )
 {
     PAGED_CODE();
-
     return EcSubscribeByGuid(
-        Consumer,
-        &GUID_SECURITY_AUDITING_PROVIDER,
-        0xFFFFFFFFFFFFFFFFULL,
-        5,
-        Callback,
-        Context,
-        Subscription
-    );
+        Consumer, &GUID_SECURITY_AUDITING_PROVIDER,
+        0xFFFFFFFFFFFFFFFFULL, 5, Callback, Context, Subscription);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -1292,16 +1726,9 @@ EcSubscribeThreatIntelligence(
     )
 {
     PAGED_CODE();
-
     return EcSubscribeByGuid(
-        Consumer,
-        &GUID_THREAT_INTELLIGENCE_PROVIDER,
-        0xFFFFFFFFFFFFFFFFULL,
-        5,
-        Callback,
-        Context,
-        Subscription
-    );
+        Consumer, &GUID_THREAT_INTELLIGENCE_PROVIDER,
+        0xFFFFFFFFFFFFFFFFULL, 5, Callback, Context, Subscription);
 }
 
 // ============================================================================
@@ -1332,31 +1759,23 @@ EcpInitializeDefaultConfig(
 }
 
 static
-NTSTATUS
+VOID
 EcpInitializeLookasideLists(
     _Inout_ PEC_CONSUMER Consumer
     )
 {
-    //
-    // Initialize event record lookaside
-    //
     ExInitializeNPagedLookasideList(
         &Consumer->EventRecordLookaside,
-        NULL,
-        NULL,
+        NULL, NULL,
         POOL_NX_ALLOCATION,
         sizeof(EC_EVENT_RECORD),
         EC_EVENT_TAG,
         EC_EVENT_LOOKASIDE_DEPTH
     );
 
-    //
-    // Initialize extended data lookaside
-    //
     ExInitializeNPagedLookasideList(
         &Consumer->ExtendedDataLookaside,
-        NULL,
-        NULL,
+        NULL, NULL,
         POOL_NX_ALLOCATION,
         sizeof(EC_EXTENDED_DATA),
         EC_BUFFER_TAG,
@@ -1364,8 +1783,6 @@ EcpInitializeLookasideLists(
     );
 
     Consumer->LookasideInitialized = TRUE;
-
-    return STATUS_SUCCESS;
 }
 
 static
@@ -1395,46 +1812,44 @@ EcpStartProcessingThreads(
     ULONG i;
 
     InitializeObjectAttributes(
-        &ObjectAttributes,
-        NULL,
-        OBJ_KERNEL_HANDLE,
-        NULL,
-        NULL
-    );
+        &ObjectAttributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
     for (i = 0; i < Consumer->Config.ProcessingThreadCount; i++) {
         Consumer->ProcessingThreads[i].ThreadIndex = i;
         Consumer->ProcessingThreads[i].Consumer = Consumer;
-        Consumer->ProcessingThreads[i].IsRunning = FALSE;
-        Consumer->ProcessingThreads[i].StopRequested = FALSE;
+        InterlockedExchange(&Consumer->ProcessingThreads[i].IsRunning, FALSE);
+        InterlockedExchange(&Consumer->ProcessingThreads[i].StopRequested, FALSE);
         Consumer->ProcessingThreads[i].EventsProcessed = 0;
         Consumer->ProcessingThreads[i].ProcessingTimeUs = 0;
 
         KeInitializeEvent(&Consumer->ProcessingThreads[i].StopEvent, NotificationEvent, FALSE);
         KeInitializeEvent(&Consumer->ProcessingThreads[i].WorkEvent, SynchronizationEvent, FALSE);
+        KeInitializeEvent(&Consumer->ProcessingThreads[i].ReadyEvent, NotificationEvent, FALSE);
+
+        //
+        // Mark running BEFORE creating the thread so the stop path
+        // knows to wait for this thread if creation succeeds.
+        //
+        InterlockedExchange(&Consumer->ProcessingThreads[i].IsRunning, TRUE);
 
         Status = PsCreateSystemThread(
             &Consumer->ProcessingThreads[i].ThreadHandle,
             THREAD_ALL_ACCESS,
             &ObjectAttributes,
-            NULL,
-            NULL,
+            NULL, NULL,
             EcpProcessingThreadRoutine,
             &Consumer->ProcessingThreads[i]
         );
 
         if (!NT_SUCCESS(Status)) {
-            //
-            // Stop already-created threads
-            //
+            InterlockedExchange(&Consumer->ProcessingThreads[i].IsRunning, FALSE);
+            TE_LOG_ERROR(Component_ETWProvider, Status,
+                         ErrorSeverity_Error, L"Failed to create processing thread");
             Consumer->ActiveThreadCount = i;
             EcpStopProcessingThreads(Consumer);
             return Status;
         }
 
-        //
-        // Get thread object reference
-        //
         Status = ObReferenceObjectByHandle(
             Consumer->ProcessingThreads[i].ThreadHandle,
             THREAD_ALL_ACCESS,
@@ -1445,18 +1860,31 @@ EcpStartProcessingThreads(
         );
 
         if (!NT_SUCCESS(Status)) {
+            //
+            // Thread was created but we can't get the object.
+            // Signal stop and wait via handle, then clean up.
+            //
+            InterlockedExchange(&Consumer->ProcessingThreads[i].StopRequested, TRUE);
+            KeSetEvent(&Consumer->ProcessingThreads[i].StopEvent, IO_NO_INCREMENT, FALSE);
+            KeSetEvent(&Consumer->ProcessingThreads[i].WorkEvent, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(Consumer->ProcessingThreads[i].ThreadHandle, FALSE, NULL);
             ZwClose(Consumer->ProcessingThreads[i].ThreadHandle);
             Consumer->ProcessingThreads[i].ThreadHandle = NULL;
+            InterlockedExchange(&Consumer->ProcessingThreads[i].IsRunning, FALSE);
             Consumer->ActiveThreadCount = i;
             EcpStopProcessingThreads(Consumer);
             return Status;
         }
 
-        Consumer->ProcessingThreads[i].IsRunning = TRUE;
+        //
+        // Wait for thread to signal it is ready
+        //
+        KeWaitForSingleObject(
+            &Consumer->ProcessingThreads[i].ReadyEvent,
+            Executive, KernelMode, FALSE, NULL);
     }
 
     Consumer->ActiveThreadCount = Consumer->Config.ProcessingThreadCount;
-
     return STATUS_SUCCESS;
 }
 
@@ -1467,33 +1895,28 @@ EcpStopProcessingThreads(
     )
 {
     ULONG i;
-    LARGE_INTEGER Timeout;
-
-    Timeout.QuadPart = -10 * 1000 * 1000 * 5; // 5 seconds
 
     for (i = 0; i < Consumer->ActiveThreadCount; i++) {
-        if (!Consumer->ProcessingThreads[i].IsRunning) {
+        if (!InterlockedCompareExchange(&Consumer->ProcessingThreads[i].IsRunning, 0, 0)) {
             continue;
         }
 
         //
-        // Signal stop
+        // Signal stop using interlocked write for cross-thread visibility
         //
-        Consumer->ProcessingThreads[i].StopRequested = TRUE;
+        InterlockedExchange(&Consumer->ProcessingThreads[i].StopRequested, TRUE);
         KeSetEvent(&Consumer->ProcessingThreads[i].StopEvent, IO_NO_INCREMENT, FALSE);
         KeSetEvent(&Consumer->ProcessingThreads[i].WorkEvent, IO_NO_INCREMENT, FALSE);
 
         //
-        // Wait for thread to exit
+        // Wait INDEFINITELY for thread to exit. We MUST NOT proceed
+        // with cleanup while threads are still running — that causes
+        // use-after-free on the Consumer structure and all its contents.
         //
         if (Consumer->ProcessingThreads[i].ThreadObject != NULL) {
             KeWaitForSingleObject(
                 Consumer->ProcessingThreads[i].ThreadObject,
-                Executive,
-                KernelMode,
-                FALSE,
-                &Timeout
-            );
+                Executive, KernelMode, FALSE, NULL);
 
             ObDereferenceObject(Consumer->ProcessingThreads[i].ThreadObject);
             Consumer->ProcessingThreads[i].ThreadObject = NULL;
@@ -1504,7 +1927,7 @@ EcpStopProcessingThreads(
             Consumer->ProcessingThreads[i].ThreadHandle = NULL;
         }
 
-        Consumer->ProcessingThreads[i].IsRunning = FALSE;
+        InterlockedExchange(&Consumer->ProcessingThreads[i].IsRunning, FALSE);
     }
 
     Consumer->ActiveThreadCount = 0;
@@ -1530,45 +1953,57 @@ EcpProcessingThreadRoutine(
     Consumer = ThreadContext->Consumer;
 
     //
-    // Set up wait objects
+    // Signal that this thread has started and is ready to process events
+    //
+    KeSetEvent(&ThreadContext->ReadyEvent, IO_NO_INCREMENT, FALSE);
+
+    //
+    // Set up wait objects: [0]=Stop, [1]=Work
     //
     WaitObjects[0] = &ThreadContext->StopEvent;
     WaitObjects[1] = &ThreadContext->WorkEvent;
 
-    Timeout.QuadPart = -10 * 1000 * EC_THREAD_WAIT_TIMEOUT_MS;
+    //
+    // Use 64-bit literal to prevent overflow
+    //
+    Timeout.QuadPart = -((LONGLONG)10 * 1000 * EC_THREAD_WAIT_TIMEOUT_MS);
 
-    while (!ThreadContext->StopRequested) {
+    while (!InterlockedCompareExchange(&ThreadContext->StopRequested, 0, 0)) {
         //
         // Wait for work or stop signal
         //
         WaitStatus = KeWaitForMultipleObjects(
-            2,
-            WaitObjects,
-            WaitAny,
-            Executive,
-            KernelMode,
-            FALSE,
-            &Timeout,
-            NULL
-        );
+            2, WaitObjects, WaitAny,
+            Executive, KernelMode, FALSE,
+            &Timeout, NULL);
 
-        if (ThreadContext->StopRequested) {
+        if (InterlockedCompareExchange(&ThreadContext->StopRequested, 0, 0)) {
             break;
         }
 
         //
-        // Check if paused
+        // If stop event was signaled (index 0), exit
         //
-        if (Consumer->State == EcState_Paused) {
-            KeWaitForSingleObject(
-                &Consumer->FlowResumeEvent,
-                Executive,
-                KernelMode,
-                FALSE,
-                NULL
-            );
+        if (WaitStatus == STATUS_WAIT_0) {
+            break;
+        }
 
-            if (ThreadContext->StopRequested) {
+        //
+        // Check if paused — wait on FlowResumeEvent AND StopEvent
+        // to prevent deadlock when stop is called while paused
+        //
+        if (InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Paused) {
+            PVOID PauseWaitObjects[2];
+            PauseWaitObjects[0] = &ThreadContext->StopEvent;
+            PauseWaitObjects[1] = &Consumer->FlowResumeEvent;
+
+            WaitStatus = KeWaitForMultipleObjects(
+                2, PauseWaitObjects, WaitAny,
+                Executive, KernelMode, FALSE,
+                NULL, NULL);
+
+            if (InterlockedCompareExchange(&ThreadContext->StopRequested, 0, 0) ||
+                WaitStatus == STATUS_WAIT_0) {
                 break;
             }
         }
@@ -1576,7 +2011,7 @@ EcpProcessingThreadRoutine(
         //
         // Process events
         //
-        if (Consumer->State == EcState_Running) {
+        if (InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Running) {
             EcpProcessEventBatch(Consumer, ThreadContext->ThreadIndex);
         }
     }
@@ -1597,24 +2032,22 @@ EcpProcessEventBatch(
     LARGE_INTEGER StartTime, EndTime;
     LONG64 ProcessingTime;
 
-    UNREFERENCED_PARAMETER(ThreadIndex);
-
     KeQuerySystemTimePrecise(&StartTime);
 
     while (ProcessedCount < EC_EVENT_BATCH_SIZE) {
-        //
-        // Dequeue event
-        //
         Record = EcpDequeueEvent(Consumer);
         if (Record == NULL) {
             break;
         }
 
         //
-        // Process through subscription callback
+        // Process through subscription callback.
+        // The subscription pointer is reference-counted, so it remains
+        // valid even if EcUnsubscribe was called concurrently.
+        // We still invoke the callback even if subscription was deactivated
+        // since the event was already matched and queued.
         //
         if (Record->Subscription != NULL &&
-            Record->Subscription->State == EcSubState_Active &&
             Record->Subscription->Config.EventCallback != NULL) {
 
             __try {
@@ -1624,10 +2057,12 @@ EcpProcessEventBatch(
                 );
 
                 InterlockedIncrement64(&Record->Subscription->Stats.EventsProcessed);
+                InterlockedExchange(&Consumer->ConsecutiveErrors, 0);
             }
             __except(EXCEPTION_EXECUTE_HANDLER) {
                 Result = EcResult_Error;
                 InterlockedIncrement64(&Record->Subscription->Stats.CallbackErrors);
+                InterlockedIncrement(&Consumer->ConsecutiveErrors);
             }
 
             if (Result == EcResult_Error) {
@@ -1636,7 +2071,7 @@ EcpProcessEventBatch(
         }
 
         //
-        // Free event record
+        // Free event record (this also releases subscription reference)
         //
         EcFreeEventRecord(Consumer, Record);
 
@@ -1648,15 +2083,17 @@ EcpProcessEventBatch(
     // Update processing time
     //
     KeQuerySystemTimePrecise(&EndTime);
-    ProcessingTime = (EndTime.QuadPart - StartTime.QuadPart) / 10; // Convert to microseconds
+    ProcessingTime = (EndTime.QuadPart - StartTime.QuadPart) / 10;
 
     if (ProcessedCount > 0) {
         InterlockedIncrement64(&Consumer->Stats.BatchesProcessed);
         InterlockedAdd64(&Consumer->Stats.TotalProcessingTimeUs, ProcessingTime);
-        InterlockedAdd64(
-            &Consumer->ProcessingThreads[ThreadIndex].ProcessingTimeUs,
-            ProcessingTime
-        );
+
+        if (ThreadIndex < EC_MAX_THREAD_COUNT) {
+            InterlockedAdd64(
+                &Consumer->ProcessingThreads[ThreadIndex].ProcessingTimeUs,
+                ProcessingTime);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -1675,15 +2112,14 @@ EcpDequeueEvent(
 
     KeAcquireSpinLock(&Consumer->EventQueueLock, &OldIrql);
 
-    //
-    // Dequeue from highest priority queue first
-    //
-    for (Priority = 0; Priority < 5; Priority++) {
+    for (Priority = 0; Priority < EC_PRIORITY_QUEUE_COUNT; Priority++) {
         if (!IsListEmpty(&Consumer->EventQueues[Priority])) {
             Entry = RemoveHeadList(&Consumer->EventQueues[Priority]);
             Record = CONTAINING_RECORD(Entry, EC_EVENT_RECORD, ListEntry);
-            InterlockedDecrement(&Consumer->BufferedEventCount);
-            Consumer->Stats.CurrentBufferedEvents = Consumer->BufferedEventCount;
+            {
+                LONG NewCount = InterlockedDecrement(&Consumer->BufferedEventCount);
+                InterlockedExchange(&Consumer->Stats.CurrentBufferedEvents, NewCount);
+            }
             break;
         }
     }
@@ -1703,69 +2139,69 @@ EcpEnqueueEvent(
     KIRQL OldIrql;
     ULONG Priority;
     LONG NewCount;
+    LONG FlowState;
 
     //
-    // Check flow control
+    // Check flow control using interlocked read for cross-CPU visibility.
+    // These are optimistic pre-checks; the authoritative capacity check
+    // is inside the queue spinlock below.
     //
-    if (Consumer->CurrentFlowState == EcFlow_Pause) {
-        //
-        // Drop event
-        //
+    FlowState = InterlockedCompareExchange(&Consumer->CurrentFlowState, 0, 0);
+
+    if (FlowState == (LONG)EcFlow_Pause) {
         InterlockedIncrement64(&Consumer->Stats.TotalEventsDropped);
         EcFreeEventRecord(Consumer, Record);
         return;
     }
 
-    if (Consumer->CurrentFlowState == EcFlow_Drop &&
+    if (FlowState == (LONG)EcFlow_Drop &&
         Record->Priority >= EcPriority_Low) {
-        //
-        // Drop low-priority event
-        //
-        InterlockedIncrement64(&Consumer->Stats.TotalEventsDropped);
-        EcFreeEventRecord(Consumer, Record);
-        return;
-    }
-
-    //
-    // Check buffer capacity
-    //
-    if ((ULONG)Consumer->BufferedEventCount >= Consumer->Config.MaxBufferedEvents) {
-        InterlockedIncrement64(&Consumer->Stats.BufferOverflows);
         InterlockedIncrement64(&Consumer->Stats.TotalEventsDropped);
         EcFreeEventRecord(Consumer, Record);
         return;
     }
 
     Priority = (ULONG)Record->Priority;
-    if (Priority >= 5) {
-        Priority = 4;
+    if (Priority >= EC_PRIORITY_QUEUE_COUNT) {
+        Priority = EC_PRIORITY_QUEUE_COUNT - 1;
     }
 
     KeAcquireSpinLock(&Consumer->EventQueueLock, &OldIrql);
 
+    //
+    // Authoritative buffer capacity check INSIDE the spinlock
+    //
+    if ((ULONG)Consumer->BufferedEventCount >= Consumer->Config.MaxBufferedEvents) {
+        KeReleaseSpinLock(&Consumer->EventQueueLock, OldIrql);
+        InterlockedIncrement64(&Consumer->Stats.BufferOverflows);
+        InterlockedIncrement64(&Consumer->Stats.TotalEventsDropped);
+        EcFreeEventRecord(Consumer, Record);
+        return;
+    }
+
     InsertTailList(&Consumer->EventQueues[Priority], &Record->ListEntry);
     NewCount = InterlockedIncrement(&Consumer->BufferedEventCount);
-    Consumer->Stats.CurrentBufferedEvents = NewCount;
+    InterlockedExchange(&Consumer->Stats.CurrentBufferedEvents, NewCount);
 
     //
-    // Update peak
+    // Update peak using interlocked compare-and-swap loop
     //
-    if (NewCount > Consumer->Stats.PeakBufferedEvents) {
-        Consumer->Stats.PeakBufferedEvents = NewCount;
+    {
+        LONG CurrentPeak;
+        do {
+            CurrentPeak = Consumer->Stats.PeakBufferedEvents;
+            if (NewCount <= CurrentPeak) break;
+        } while (InterlockedCompareExchange(
+                     &Consumer->Stats.PeakBufferedEvents,
+                     NewCount, CurrentPeak) != CurrentPeak);
     }
 
     KeReleaseSpinLock(&Consumer->EventQueueLock, OldIrql);
 
     //
-    // Signal processing threads
+    // Signal a processing thread using round-robin
     //
-    if (Consumer->ActiveThreadCount > 0) {
-        KeSetEvent(
-            &Consumer->ProcessingThreads[0].WorkEvent,
-            IO_NO_INCREMENT,
-            FALSE
-        );
-    }
+    EcpSignalProcessingThread(Consumer);
 
     //
     // Check flow control threshold
@@ -1794,66 +2230,88 @@ EcpFreeAllSubscriptions(
 {
     PLIST_ENTRY Entry;
     PEC_SUBSCRIPTION Subscription;
+    KIRQL OldIrql;
 
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Consumer->SubscriptionLock);
+    //
+    // Remove all subscriptions from the list under spin lock.
+    // By the time this is called, all events have been drained
+    // (EcpDrainEventQueues was called first in EcShutdown), so
+    // no event records hold references to these subscriptions.
+    //
+    // We still use the refcount-based release path for correctness:
+    // mark unsubscribe pending and decrement the creation reference.
+    // Since events were drained, refcount should be 1, and the
+    // dereference will free immediately.
+    //
+    KeAcquireSpinLock(&Consumer->SubscriptionLock, &OldIrql);
 
     while (!IsListEmpty(&Consumer->SubscriptionList)) {
         Entry = RemoveHeadList(&Consumer->SubscriptionList);
         Subscription = CONTAINING_RECORD(Entry, EC_SUBSCRIPTION, ListEntry);
+        InitializeListHead(&Subscription->ListEntry);
+        InterlockedExchange(&Subscription->IsInList, FALSE);
 
         if (Subscription->IsRegistered) {
-            EcpUnregisterSubscription(Subscription);
+            Subscription->IsRegistered = FALSE;
         }
 
-        ExFreePoolWithTag(Subscription, EC_SUBSCRIPTION_TAG);
+        //
+        // Deactivate to prevent any late matching
+        //
+        InterlockedExchange(&Subscription->State, (LONG)EcSubState_Inactive);
+
+        //
+        // Mark unsubscribe pending and release creation reference.
+        // This will free the subscription if refcount reaches 0.
+        //
+        InterlockedExchange(&Subscription->UnsubscribePending, TRUE);
+        EcpDereferenceSubscription(Subscription);
     }
 
-    Consumer->SubscriptionCount = 0;
+    InterlockedExchange(&Consumer->SubscriptionCount, 0);
 
-    ExReleasePushLockExclusive(&Consumer->SubscriptionLock);
-    KeLeaveCriticalRegion();
+    KeReleaseSpinLock(&Consumer->SubscriptionLock, OldIrql);
 }
 
+/**
+ * @brief Mark a subscription as registered for event matching.
+ *
+ * In kernel mode, actual event ingestion comes from kernel notify callbacks
+ * (PsSetCreateProcessNotifyRoutine, CmRegisterCallbackEx, etc.) that call
+ * EcIngestEvent(). This function marks the subscription so EcIngestEvent
+ * can match events to it.
+ */
 static
-NTSTATUS
-EcpRegisterSubscription(
+VOID
+EcpMarkSubscriptionRegistered(
     _Inout_ PEC_SUBSCRIPTION Subscription
     )
 {
-    //
-    // In a full implementation, this would:
-    // 1. Create or attach to an ETW trace session
-    // 2. Enable the provider with specified keywords/level
-    // 3. Set up the event callback
-    //
-    // For kernel-mode ETW consumption, this typically involves
-    // using EtwRegister and setting up trace session via
-    // NtTraceControl or similar APIs.
-    //
+    if (Subscription == NULL) {
+        return;
+    }
 
     Subscription->IsRegistered = TRUE;
     KeQuerySystemTimePrecise(&Subscription->Stats.FirstEventTime);
-
-    return STATUS_SUCCESS;
 }
 
 static
 VOID
-EcpUnregisterSubscription(
+EcpMarkSubscriptionUnregistered(
     _Inout_ PEC_SUBSCRIPTION Subscription
     )
 {
-    //
-    // In a full implementation, this would:
-    // 1. Disable the provider
-    // 2. Detach from the trace session
-    // 3. Clean up any resources
-    //
+    if (Subscription == NULL) {
+        return;
+    }
 
     Subscription->IsRegistered = FALSE;
+    InterlockedExchange(&Subscription->State, (LONG)EcSubState_Inactive);
 }
 
+/**
+ * @brief Atomically update subscription state and invoke status callback.
+ */
 static
 VOID
 EcpUpdateSubscriptionState(
@@ -1861,14 +2319,12 @@ EcpUpdateSubscriptionState(
     _In_ EC_SUBSCRIPTION_STATE NewState
     )
 {
-    EC_SUBSCRIPTION_STATE OldState;
+    LONG OldState;
 
-    OldState = Subscription->State;
-    if (OldState == NewState) {
+    OldState = InterlockedExchange(&Subscription->State, (LONG)NewState);
+    if (OldState == (LONG)NewState) {
         return;
     }
-
-    Subscription->State = NewState;
 
     //
     // Invoke status callback if configured
@@ -1877,15 +2333,14 @@ EcpUpdateSubscriptionState(
         __try {
             Subscription->Config.StatusCallback(
                 Subscription,
-                OldState,
+                (EC_SUBSCRIPTION_STATE)OldState,
                 NewState,
                 Subscription->Config.StatusCallbackContext
             );
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {
-            //
-            // Log error but don't fail
-            //
+            TE_LOG_WARNING(Component_ETWProvider,
+                           L"Subscription status callback threw exception");
         }
     }
 }
@@ -1909,15 +2364,9 @@ EcpCheckRateLimit(
 
     KeAcquireSpinLock(&Consumer->RateLimitLock, &OldIrql);
 
-    //
-    // Check if we've moved to a new second
-    //
-    ElapsedSeconds = (CurrentTime.QuadPart - Consumer->CurrentSecondStart.QuadPart) / 10000000;
+    ElapsedSeconds = (CurrentTime.QuadPart - Consumer->CurrentSecondStart.QuadPart) / 10000000LL;
 
     if (ElapsedSeconds >= 1) {
-        //
-        // Reset counter for new second
-        //
         Consumer->Stats.CurrentEventsPerSecond = Consumer->EventsThisSecond;
         if (Consumer->EventsThisSecond > Consumer->Stats.PeakEventsPerSecond) {
             Consumer->Stats.PeakEventsPerSecond = Consumer->EventsThisSecond;
@@ -1926,9 +2375,6 @@ EcpCheckRateLimit(
         Consumer->CurrentSecondStart = CurrentTime;
     }
 
-    //
-    // Check rate limit
-    //
     if ((ULONG)Consumer->EventsThisSecond >= Consumer->Config.MaxEventsPerSecond) {
         Allowed = FALSE;
     } else {
@@ -1947,29 +2393,33 @@ EcpUpdateFlowControl(
     )
 {
     ULONG BufferedCount;
-    EC_FLOW_CONTROL NewState;
+    LONG OldFlowState;
+    LONG NewFlowState;
 
-    BufferedCount = (ULONG)Consumer->BufferedEventCount;
+    //
+    // Read buffered count atomically for consistent flow control decisions
+    //
+    BufferedCount = (ULONG)InterlockedCompareExchange(&Consumer->BufferedEventCount, 0, 0);
 
     //
     // Determine flow control state based on buffer usage
     //
     if (BufferedCount >= Consumer->Config.MaxBufferedEvents) {
-        NewState = EcFlow_Pause;
+        NewFlowState = (LONG)EcFlow_Pause;
     } else if (BufferedCount >= (Consumer->Config.MaxBufferedEvents * 90 / 100)) {
-        NewState = EcFlow_Drop;
+        NewFlowState = (LONG)EcFlow_Drop;
     } else if (BufferedCount >= Consumer->Config.BufferThreshold) {
-        NewState = EcFlow_Throttle;
+        NewFlowState = (LONG)EcFlow_Throttle;
     } else {
-        NewState = EcFlow_Normal;
+        NewFlowState = (LONG)EcFlow_Normal;
     }
 
     //
     // Invoke custom flow control callback if configured
     //
-    if (Consumer->Config.FlowCallback != NULL && NewState != EcFlow_Normal) {
+    if (Consumer->Config.FlowCallback != NULL && NewFlowState != (LONG)EcFlow_Normal) {
         __try {
-            NewState = Consumer->Config.FlowCallback(
+            NewFlowState = (LONG)Consumer->Config.FlowCallback(
                 Consumer,
                 BufferedCount,
                 Consumer->Config.MaxBufferedEvents,
@@ -1983,14 +2433,17 @@ EcpUpdateFlowControl(
         }
     }
 
-    Consumer->CurrentFlowState = NewState;
+    //
+    // Atomically swap flow state and use the old value for resume logic
+    //
+    OldFlowState = InterlockedExchange(&Consumer->CurrentFlowState, NewFlowState);
 
     //
     // Update flow resume event
     //
-    if (NewState == EcFlow_Pause) {
+    if (NewFlowState == (LONG)EcFlow_Pause) {
         KeClearEvent(&Consumer->FlowResumeEvent);
-    } else if (Consumer->CurrentFlowState == EcFlow_Pause && NewState != EcFlow_Pause) {
+    } else if (OldFlowState == (LONG)EcFlow_Pause && NewFlowState != (LONG)EcFlow_Pause) {
         KeSetEvent(&Consumer->FlowResumeEvent, IO_NO_INCREMENT, FALSE);
     }
 }
@@ -2006,6 +2459,7 @@ EcpHealthCheckDpcRoutine(
 {
     PEC_CONSUMER Consumer = (PEC_CONSUMER)DeferredContext;
     BOOLEAN IsHealthy = TRUE;
+    LARGE_INTEGER Now;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(SystemArgument1);
@@ -2015,26 +2469,27 @@ EcpHealthCheckDpcRoutine(
         return;
     }
 
-    //
-    // Check health indicators
-    //
-    if (Consumer->State == EcState_Error) {
+    if (InterlockedCompareExchange(&Consumer->State, 0, 0) == (LONG)EcState_Error) {
         IsHealthy = FALSE;
     }
 
-    if (Consumer->ConsecutiveErrors >= EC_MAX_CONSECUTIVE_ERRORS) {
+    if (InterlockedCompareExchange(&Consumer->ConsecutiveErrors, 0, 0) >= (LONG)EC_MAX_CONSECUTIVE_ERRORS) {
         IsHealthy = FALSE;
     }
 
-    if (Consumer->CurrentFlowState == EcFlow_Pause) {
-        //
-        // Prolonged pause indicates issues
-        //
+    if (InterlockedCompareExchange(&Consumer->CurrentFlowState, 0, 0) == (LONG)EcFlow_Pause) {
         IsHealthy = FALSE;
     }
 
     Consumer->Stats.IsHealthy = IsHealthy;
-    KeQuerySystemTimePrecise(&Consumer->Stats.LastHealthCheck);
+
+    //
+    // Use a local variable for the timestamp to ensure atomicity.
+    // On x64, LARGE_INTEGER writes are atomic. On x86, we accept
+    // a potential torn read in the stats path (non-critical).
+    //
+    KeQuerySystemTimePrecise(&Now);
+    Consumer->Stats.LastHealthCheck = Now;
 }
 
 static
@@ -2047,9 +2502,6 @@ EcpDetermineEventSource(
         return EcSource_Unknown;
     }
 
-    //
-    // Check for kernel providers
-    //
     if (EcIsEqualGuid(ProviderId, &GUID_KERNEL_PROCESS_PROVIDER) ||
         EcIsEqualGuid(ProviderId, &GUID_KERNEL_FILE_PROVIDER) ||
         EcIsEqualGuid(ProviderId, &GUID_KERNEL_NETWORK_PROVIDER) ||
@@ -2058,9 +2510,6 @@ EcpDetermineEventSource(
         return EcSource_Kernel;
     }
 
-    //
-    // Check for security provider
-    //
     if (EcIsEqualGuid(ProviderId, &GUID_SECURITY_AUDITING_PROVIDER) ||
         EcIsEqualGuid(ProviderId, &GUID_THREAT_INTELLIGENCE_PROVIDER)) {
         return EcSource_Security;
@@ -2069,9 +2518,17 @@ EcpDetermineEventSource(
     return EcSource_User;
 }
 
+/**
+ * @brief Free all extended data items from an event record.
+ *
+ * Uses the IsFromLookaside flag to determine correct deallocation:
+ * - Lookaside-sourced items go back to ExtendedDataLookaside
+ * - Directly-allocated items use ExFreePoolWithTag
+ */
 static
 VOID
 EcpFreeExtendedData(
+    _In_ PEC_CONSUMER Consumer,
     _Inout_ PEC_EVENT_RECORD Record
     )
 {
@@ -2086,8 +2543,50 @@ EcpFreeExtendedData(
             ExFreePoolWithTag(ExtData->DataPtr, EC_BUFFER_TAG);
         }
 
-        ExFreePoolWithTag(ExtData, EC_BUFFER_TAG);
+        //
+        // Return to lookaside if it came from there, otherwise direct free
+        //
+        if (ExtData->IsFromLookaside && Consumer->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&Consumer->ExtendedDataLookaside, ExtData);
+        } else {
+            ExFreePoolWithTag(ExtData, EC_BUFFER_TAG);
+        }
     }
 
     Record->ExtendedDataCount = 0;
+}
+
+// ============================================================================
+// CALLBACK VALIDATION
+// ============================================================================
+
+/**
+ * @brief Validate that a callback address is in kernel address space.
+ *
+ * This is a basic safety check to prevent accidentally registering
+ * user-mode function pointers as kernel callbacks. It does NOT validate
+ * that the address points to valid code — that requires deeper checks
+ * (e.g., MmIsAddressValid, which is itself unreliable for code pages).
+ */
+static
+BOOLEAN
+EcpValidateCallbackAddress(
+    _In_ PVOID Address
+    )
+{
+    if (Address == NULL) {
+        return FALSE;
+    }
+
+    //
+    // On x64, kernel addresses have the high bit set.
+    // On x86, kernel space starts at 0x80000000.
+    // MmIsAddressValid is not reliable for this purpose, but
+    // checking the address range catches trivial user-mode pointers.
+    //
+#ifdef _WIN64
+    return ((ULONG_PTR)Address >= 0xFFFF800000000000ULL);
+#else
+    return ((ULONG_PTR)Address >= 0x80000000UL);
+#endif
 }

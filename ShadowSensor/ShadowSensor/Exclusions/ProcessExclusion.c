@@ -6,16 +6,14 @@
  * @file ProcessExclusion.c
  * @brief Enterprise-grade process exclusion management with trusted PID tracking.
  *
- * Implements CrowdStrike Falcon-class process exclusion with:
- * - High-performance trusted PID bitmap for O(1) lookups
- * - Hash-based trusted PID set for large PID ranges
- * - Process image path caching for exclusion decisions
+ * Implements process exclusion with:
+ * - Lock-free trusted PID bitmap for O(1) lookups (PIDs 0-65535)
+ * - Hash-based trusted PID set for large PID ranges (PIDs > 65535)
  * - Hierarchical exclusion inheritance (parent->child)
  * - Process creation callback integration
  * - Runtime exclusion management (add/remove/query)
  * - Exclusion reason tracking for audit
  * - Statistics and telemetry
- * - Thread-safe operations with minimal locking
  *
  * Strategy:
  * 1. On Process Creation (ProcessNotify callback), check if the image path
@@ -25,26 +23,15 @@
  *    the trusted set - avoiding expensive string comparisons.
  * 4. On process termination, remove PID from trusted set.
  *
- * Performance Optimizations:
- * - Bitmap for PIDs 0-65535 (O(1) lookup, 8KB memory)
- * - Hash table for PIDs > 65535 (O(1) average)
- * - Reader-writer locks for concurrent access
- * - Per-CPU caching for hot PIDs
- * - Batch operations for bulk updates
- *
- * Security Considerations:
- * - PID reuse protection via generation tracking
- * - Exclusion inheritance validation
- * - Audit logging for exclusion changes
- * - Protected process validation
- *
- * MITRE ATT&CK Coverage:
- * - T1562.001: Impair Defenses (exclusion abuse detection)
- * - T1036: Masquerading (process path validation)
- * - T1055: Process Injection (child process validation)
+ * Thread Safety:
+ * - Bitmap ops use InterlockedOr/InterlockedAnd for lock-free reads at any IRQL.
+ * - BitmapExtendedInfo and hash table use EX_PUSH_LOCK (requires <= APC_LEVEL).
+ * - All public lookup APIs callable at <= APC_LEVEL.
+ * - Race-safe initialization via InterlockedCompareExchange state machine.
+ * - Bounded shutdown drain via KeWaitForSingleObject with timeout.
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.1.0
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -89,29 +76,22 @@
 #define PE_HASH_BUCKET_COUNT                256
 
 /**
- * @brief Maximum cached process info entries
- */
-#define PE_MAX_CACHE_ENTRIES                4096
-
-/**
- * @brief Cache entry expiry time (5 minutes in 100ns units)
- */
-#define PE_CACHE_EXPIRY_TIME                (5LL * 60 * 10000000)
-
-/**
  * @brief Maximum exclusion inheritance depth
  */
 #define PE_MAX_INHERITANCE_DEPTH            8
 
 /**
- * @brief Magic value for validation
+ * @brief Shutdown drain timeout (10 seconds in 100ns units)
  */
-#define PE_CONTEXT_MAGIC                    0x50455843  // 'PEXC'
+#define PE_SHUTDOWN_TIMEOUT_100NS           (-100000000LL)
 
 /**
- * @brief Magic value for PID entry validation
+ * @brief Initialization state values for CAS-based init
  */
-#define PE_PID_ENTRY_MAGIC                  0x50494445  // 'PIDE'
+#define PE_STATE_UNINITIALIZED              0
+#define PE_STATE_INITIALIZING               1
+#define PE_STATE_READY                      2
+#define PE_STATE_SHUTTING_DOWN              3
 
 // ============================================================================
 // EXCLUSION REASON CODES
@@ -138,11 +118,10 @@ typedef enum _PE_EXCLUSION_REASON {
 // ============================================================================
 
 /**
- * @brief Trusted PID entry for hash table (PIDs > 65535)
+ * @brief Trusted PID entry for hash table (PIDs > 65535) and extended bitmap info
  */
 typedef struct _PE_PID_ENTRY {
     LIST_ENTRY ListEntry;           ///< Hash bucket linkage
-    ULONG Magic;                    ///< Validation magic
     HANDLE ProcessId;               ///< Process ID
     HANDLE ParentProcessId;         ///< Parent PID for inheritance tracking
     PE_EXCLUSION_REASON Reason;     ///< Why this process is excluded
@@ -151,6 +130,7 @@ typedef struct _PE_PID_ENTRY {
     ULONG InheritanceDepth;         ///< Inheritance chain depth
     BOOLEAN InheritToChildren;      ///< Propagate to child processes
     BOOLEAN Permanent;              ///< Cannot be removed automatically
+    UCHAR Reserved[2];
     volatile LONG HitCount;         ///< Access count for statistics
 } PE_PID_ENTRY, *PPE_PID_ENTRY;
 
@@ -163,26 +143,12 @@ typedef struct _PE_HASH_BUCKET {
 } PE_HASH_BUCKET, *PPE_HASH_BUCKET;
 
 /**
- * @brief Cached process exclusion info
- */
-typedef struct _PE_CACHE_ENTRY {
-    LIST_ENTRY ListEntry;           ///< LRU list linkage
-    HANDLE ProcessId;               ///< Process ID
-    BOOLEAN IsExcluded;             ///< Exclusion status
-    PE_EXCLUSION_REASON Reason;     ///< Exclusion reason
-    LARGE_INTEGER CacheTime;        ///< When cached
-    LARGE_INTEGER CreateTime;       ///< Process creation time
-    ULONG ImagePathHash;            ///< Hash of image path for validation
-} PE_CACHE_ENTRY, *PPE_CACHE_ENTRY;
-
-/**
  * @brief Process exclusion statistics
  */
 typedef struct _PE_STATISTICS {
     volatile LONG64 TotalLookups;           ///< Total PID lookups
     volatile LONG64 BitmapHits;             ///< Hits in bitmap
     volatile LONG64 HashHits;               ///< Hits in hash table
-    volatile LONG64 CacheHits;              ///< Hits in cache
     volatile LONG64 Misses;                 ///< Total misses
     volatile LONG64 ProcessesExcluded;      ///< Total processes excluded
     volatile LONG64 InheritedExclusions;    ///< Exclusions via inheritance
@@ -190,7 +156,6 @@ typedef struct _PE_STATISTICS {
     volatile LONG64 ManualExclusions;       ///< Manual exclusions
     volatile LONG CurrentBitmapCount;       ///< PIDs in bitmap
     volatile LONG CurrentHashCount;         ///< PIDs in hash table
-    volatile LONG CurrentCacheCount;        ///< Entries in cache
     LARGE_INTEGER StartTime;                ///< When initialized
 } PE_STATISTICS, *PPE_STATISTICS;
 
@@ -199,23 +164,21 @@ typedef struct _PE_STATISTICS {
  */
 typedef struct _PE_CONTEXT {
     //
-    // Validation
+    // Lifecycle state (CAS-based, see PE_STATE_* constants)
     //
-    ULONG Magic;
-    BOOLEAN Initialized;
-    BOOLEAN ShuttingDown;
-    UCHAR Reserved[2];
+    volatile LONG State;
 
     //
-    // Bitmap for PIDs 0-65535 (O(1) lookup)
+    // Bitmap for PIDs 0-65535 (lock-free read via InterlockedOr)
     //
     PULONG TrustedPidBitmap;
-    EX_PUSH_LOCK BitmapLock;
+    EX_PUSH_LOCK BitmapLock;         ///< Exclusive lock for bitmap WRITES only
 
     //
     // Extended info for bitmap PIDs (reasons, inheritance)
+    // Dynamically allocated array of PE_BITMAP_MAX_PID pointers.
     //
-    PPE_PID_ENTRY BitmapExtendedInfo[PE_BITMAP_MAX_PID];
+    PPE_PID_ENTRY* BitmapExtendedInfo;
     EX_PUSH_LOCK ExtendedInfoLock;
 
     //
@@ -225,17 +188,9 @@ typedef struct _PE_CONTEXT {
     EX_PUSH_LOCK HashLock;
 
     //
-    // LRU cache for recent lookups
-    //
-    LIST_ENTRY CacheList;
-    EX_PUSH_LOCK CacheLock;
-    volatile LONG CacheCount;
-
-    //
     // Lookaside lists
     //
     NPAGED_LOOKASIDE_LIST PidEntryLookaside;
-    NPAGED_LOOKASIDE_LIST CacheEntryLookaside;
     BOOLEAN LookasideInitialized;
 
     //
@@ -247,13 +202,13 @@ typedef struct _PE_CONTEXT {
     UCHAR MaxInheritanceDepth;          ///< Max inheritance chain
 
     //
-    // Reference counting
+    // Reference counting for safe shutdown
     //
     volatile LONG ReferenceCount;
     KEVENT ShutdownEvent;
 
     //
-    // Statistics
+    // Statistics (approximate — no cross-field atomicity)
     //
     PE_STATISTICS Stats;
 
@@ -309,9 +264,21 @@ PepClearPidInBitmap(
     _In_ HANDLE ProcessId
     );
 
-static PPE_PID_ENTRY
+/**
+ * @brief Find a PID in the hash table and return its data by value.
+ *
+ * Returns the exclusion metadata through output parameters so the caller
+ * does NOT receive a pointer that could become dangling after lock release.
+ *
+ * @return TRUE if found, FALSE otherwise.
+ */
+static BOOLEAN
 PepFindPidInHash(
-    _In_ HANDLE ProcessId
+    _In_ HANDLE ProcessId,
+    _Out_opt_ PE_EXCLUSION_REASON* Reason,
+    _Out_opt_ PBOOLEAN InheritToChildren,
+    _Out_opt_ PULONG InheritanceDepth,
+    _Out_opt_ PBOOLEAN Permanent
     );
 
 static NTSTATUS
@@ -338,36 +305,6 @@ PepFreePidEntry(
     _In_ PPE_PID_ENTRY Entry
     );
 
-static PPE_CACHE_ENTRY
-PepFindInCache(
-    _In_ HANDLE ProcessId
-    );
-
-static VOID
-PepAddToCache(
-    _In_ HANDLE ProcessId,
-    _In_ BOOLEAN IsExcluded,
-    _In_ PE_EXCLUSION_REASON Reason,
-    _In_ LARGE_INTEGER CreateTime,
-    _In_ ULONG ImagePathHash
-    );
-
-static VOID
-PepRemoveFromCache(
-    _In_ HANDLE ProcessId
-    );
-
-static VOID
-PepCleanupExpiredCache(
-    VOID
-    );
-
-static BOOLEAN
-PepCheckPathExclusion(
-    _In_ HANDLE ProcessId,
-    _Out_ PE_EXCLUSION_REASON* Reason
-    );
-
 static BOOLEAN
 PepCheckParentExclusion(
     _In_ HANDLE ProcessId,
@@ -375,6 +312,14 @@ PepCheckParentExclusion(
     _Out_ PE_EXCLUSION_REASON* Reason,
     _Out_ PULONG InheritanceDepth
     );
+
+static FORCEINLINE BOOLEAN
+PepIsReady(
+    VOID
+    )
+{
+    return (ReadAcquire(&g_ProcessExclusionContext.State) == PE_STATE_READY);
+}
 
 // ============================================================================
 // PAGE ALLOCATION
@@ -394,7 +339,8 @@ PepCheckParentExclusion(
 /**
  * @brief Initialize the process exclusion subsystem.
  *
- * Sets up bitmap, hash table, cache, and lookaside lists.
+ * Uses CAS-based state machine to prevent double-initialization races.
+ * Dynamically allocates bitmap and extended info array.
  *
  * @return STATUS_SUCCESS on success
  *
@@ -409,17 +355,35 @@ ShadowStrikeProcessExclusionInitialize(
 {
     NTSTATUS status = STATUS_SUCCESS;
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
+    LONG previousState;
     ULONG i;
 
     PAGED_CODE();
 
-    if (ctx->Initialized) {
-        return STATUS_SUCCESS;
+    //
+    // Atomic state transition: UNINITIALIZED -> INITIALIZING
+    //
+    previousState = InterlockedCompareExchange(
+        &ctx->State,
+        PE_STATE_INITIALIZING,
+        PE_STATE_UNINITIALIZED
+        );
+
+    if (previousState == PE_STATE_READY) {
+        return STATUS_ALREADY_INITIALIZED;
     }
 
-    RtlZeroMemory(ctx, sizeof(PE_CONTEXT));
+    if (previousState != PE_STATE_UNINITIALIZED) {
+        return STATUS_UNSUCCESSFUL;
+    }
 
-    ctx->Magic = PE_CONTEXT_MAGIC;
+    //
+    // We own initialization exclusively. Zero everything except State.
+    //
+    RtlZeroMemory(
+        (PUCHAR)ctx + sizeof(ctx->State),
+        sizeof(PE_CONTEXT) - sizeof(ctx->State)
+        );
 
     //
     // Allocate bitmap for PIDs 0-65535
@@ -436,12 +400,25 @@ ShadowStrikeProcessExclusionInitialize(
     }
 
     //
+    // Allocate extended info pointer array (C-5 fix: dynamically allocated)
+    //
+    ctx->BitmapExtendedInfo = (PPE_PID_ENTRY*)ExAllocatePoolZero(
+        NonPagedPoolNx,
+        PE_BITMAP_MAX_PID * sizeof(PPE_PID_ENTRY),
+        PE_POOL_TAG
+    );
+
+    if (ctx->BitmapExtendedInfo == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Cleanup;
+    }
+
+    //
     // Initialize locks
     //
     ExInitializePushLock(&ctx->BitmapLock);
     ExInitializePushLock(&ctx->ExtendedInfoLock);
     ExInitializePushLock(&ctx->HashLock);
-    ExInitializePushLock(&ctx->CacheLock);
 
     //
     // Initialize hash buckets
@@ -452,13 +429,7 @@ ShadowStrikeProcessExclusionInitialize(
     }
 
     //
-    // Initialize cache
-    //
-    InitializeListHead(&ctx->CacheList);
-    ctx->CacheCount = 0;
-
-    //
-    // Initialize lookaside lists
+    // Initialize lookaside list
     //
     ExInitializeNPagedLookasideList(
         &ctx->PidEntryLookaside,
@@ -470,16 +441,6 @@ ShadowStrikeProcessExclusionInitialize(
         0
     );
 
-    ExInitializeNPagedLookasideList(
-        &ctx->CacheEntryLookaside,
-        NULL,
-        NULL,
-        POOL_NX_ALLOCATION,
-        sizeof(PE_CACHE_ENTRY),
-        PE_PID_TAG,
-        0
-    );
-
     ctx->LookasideInitialized = TRUE;
 
     //
@@ -487,11 +448,12 @@ ShadowStrikeProcessExclusionInitialize(
     //
     ctx->EnableInheritance = TRUE;
     ctx->ExcludeProtectedProcesses = TRUE;
-    ctx->ExcludeMicrosoftSigned = FALSE;  // Too broad, disabled by default
+    ctx->ExcludeMicrosoftSigned = FALSE;
     ctx->MaxInheritanceDepth = PE_MAX_INHERITANCE_DEPTH;
 
     //
-    // Initialize reference counting
+    // Initialize reference counting.
+    // Start at 1 — shutdown releases the init reference.
     //
     ctx->ReferenceCount = 1;
     KeInitializeEvent(&ctx->ShutdownEvent, NotificationEvent, FALSE);
@@ -501,7 +463,11 @@ ShadowStrikeProcessExclusionInitialize(
     //
     KeQuerySystemTime(&ctx->Stats.StartTime);
 
-    ctx->Initialized = TRUE;
+    //
+    // Transition: INITIALIZING -> READY
+    //
+    MemoryBarrier();
+    InterlockedExchange(&ctx->State, PE_STATE_READY);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Process exclusion engine initialized (bitmap=%uKB)\n",
@@ -510,10 +476,17 @@ ShadowStrikeProcessExclusionInitialize(
     return STATUS_SUCCESS;
 
 Cleanup:
+    if (ctx->BitmapExtendedInfo != NULL) {
+        ExFreePoolWithTag(ctx->BitmapExtendedInfo, PE_POOL_TAG);
+        ctx->BitmapExtendedInfo = NULL;
+    }
+
     if (ctx->TrustedPidBitmap != NULL) {
         ExFreePoolWithTag(ctx->TrustedPidBitmap, PE_POOL_TAG);
         ctx->TrustedPidBitmap = NULL;
     }
+
+    InterlockedExchange(&ctx->State, PE_STATE_UNINITIALIZED);
 
     return status;
 }
@@ -521,7 +494,8 @@ Cleanup:
 /**
  * @brief Shutdown the process exclusion subsystem.
  *
- * Frees all resources and clears state.
+ * Uses state machine to prevent races. Drains references with
+ * a bounded timeout via KeWaitForSingleObject.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -534,48 +508,57 @@ ShadowStrikeProcessExclusionShutdown(
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     PLIST_ENTRY entry;
     PPE_PID_ENTRY pidEntry;
-    PPE_CACHE_ENTRY cacheEntry;
     LARGE_INTEGER timeout;
+    LONG previousState;
     ULONG i;
 
     PAGED_CODE();
 
-    if (!ctx->Initialized) {
+    //
+    // Atomic state transition: READY -> SHUTTING_DOWN
+    //
+    previousState = InterlockedCompareExchange(
+        &ctx->State,
+        PE_STATE_SHUTTING_DOWN,
+        PE_STATE_READY
+        );
+
+    if (previousState != PE_STATE_READY) {
         return;
     }
 
-    if (ctx->Magic != PE_CONTEXT_MAGIC) {
-        return;
-    }
+    //
+    // Release the init reference and wait for all other references
+    // to drain with a bounded timeout.
+    //
+    PepReleaseReference();
 
-    //
-    // Signal shutdown
-    //
-    ctx->ShuttingDown = TRUE;
-
-    //
-    // Wait for references to drain
-    //
-    timeout.QuadPart = -10000;  // 1ms
-    while (ctx->ReferenceCount > 1) {
-        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
-    }
+    timeout.QuadPart = PE_SHUTDOWN_TIMEOUT_100NS;
+    KeWaitForSingleObject(
+        &ctx->ShutdownEvent,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout
+        );
 
     //
     // Free extended info for bitmap PIDs
     //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
+    if (ctx->BitmapExtendedInfo != NULL) {
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
 
-    for (i = 0; i < PE_BITMAP_MAX_PID; i++) {
-        if (ctx->BitmapExtendedInfo[i] != NULL) {
-            PepFreePidEntry(ctx->BitmapExtendedInfo[i]);
-            ctx->BitmapExtendedInfo[i] = NULL;
+        for (i = 0; i < PE_BITMAP_MAX_PID; i++) {
+            if (ctx->BitmapExtendedInfo[i] != NULL) {
+                PepFreePidEntry(ctx->BitmapExtendedInfo[i]);
+                ctx->BitmapExtendedInfo[i] = NULL;
+            }
         }
-    }
 
-    ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
-    KeLeaveCriticalRegion();
+        ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
+        KeLeaveCriticalRegion();
+    }
 
     //
     // Free hash table entries
@@ -596,40 +579,27 @@ ShadowStrikeProcessExclusionShutdown(
     KeLeaveCriticalRegion();
 
     //
-    // Free cache entries
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&ctx->CacheLock);
-
-    while (!IsListEmpty(&ctx->CacheList)) {
-        entry = RemoveHeadList(&ctx->CacheList);
-        cacheEntry = CONTAINING_RECORD(entry, PE_CACHE_ENTRY, ListEntry);
-        ExFreeToNPagedLookasideList(&ctx->CacheEntryLookaside, cacheEntry);
-    }
-    ctx->CacheCount = 0;
-
-    ExReleasePushLockExclusive(&ctx->CacheLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Delete lookaside lists
+    // Delete lookaside list
     //
     if (ctx->LookasideInitialized) {
         ExDeleteNPagedLookasideList(&ctx->PidEntryLookaside);
-        ExDeleteNPagedLookasideList(&ctx->CacheEntryLookaside);
         ctx->LookasideInitialized = FALSE;
     }
 
     //
-    // Free bitmap
+    // Free dynamically allocated arrays
     //
+    if (ctx->BitmapExtendedInfo != NULL) {
+        ExFreePoolWithTag(ctx->BitmapExtendedInfo, PE_POOL_TAG);
+        ctx->BitmapExtendedInfo = NULL;
+    }
+
     if (ctx->TrustedPidBitmap != NULL) {
         ExFreePoolWithTag(ctx->TrustedPidBitmap, PE_POOL_TAG);
         ctx->TrustedPidBitmap = NULL;
     }
 
-    ctx->Magic = 0;
-    ctx->Initialized = FALSE;
+    InterlockedExchange(&ctx->State, PE_STATE_UNINITIALIZED);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Process exclusion engine shutdown complete\n");
@@ -670,11 +640,7 @@ ShadowStrikeOnProcessCreate(
 
     PAGED_CODE();
 
-    if (!ctx->Initialized || ctx->ShuttingDown) {
-        return FALSE;
-    }
-
-    if (ctx->Magic != PE_CONTEXT_MAGIC) {
+    if (!PepIsReady()) {
         return FALSE;
     }
 
@@ -773,10 +739,12 @@ ShadowStrikeOnProcessCreate(
                 KeEnterCriticalRegion();
                 ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
 
-                if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
-                    PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
+                if (ctx->BitmapExtendedInfo != NULL) {
+                    if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
+                        PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
+                    }
+                    ctx->BitmapExtendedInfo[pidValue] = extInfo;
                 }
-                ctx->BitmapExtendedInfo[pidValue] = extInfo;
 
                 ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
                 KeLeaveCriticalRegion();
@@ -828,11 +796,7 @@ ShadowStrikeOnProcessTerminate(
 
     PAGED_CODE();
 
-    if (!ctx->Initialized || ctx->ShuttingDown) {
-        return;
-    }
-
-    if (ctx->Magic != PE_CONTEXT_MAGIC) {
+    if (!PepIsReady()) {
         return;
     }
 
@@ -859,7 +823,8 @@ ShadowStrikeOnProcessTerminate(
         KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
 
-        if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
+        if (ctx->BitmapExtendedInfo != NULL &&
+            ctx->BitmapExtendedInfo[pidValue] != NULL) {
             PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
             ctx->BitmapExtendedInfo[pidValue] = NULL;
         }
@@ -873,11 +838,6 @@ ShadowStrikeOnProcessTerminate(
         //
         PepRemovePidFromHash(ProcessId);
     }
-
-    //
-    // Remove from cache
-    //
-    PepRemoveFromCache(ProcessId);
 
     PepReleaseReference();
 }
@@ -896,9 +856,9 @@ ShadowStrikeOnProcessTerminate(
  *
  * @return TRUE if process is excluded (trusted), FALSE otherwise
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (push locks require IRQL <= APC_LEVEL)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessTrusted(
     _In_ HANDLE ProcessId
@@ -908,11 +868,7 @@ ShadowStrikeIsProcessTrusted(
     ULONG_PTR pidValue = (ULONG_PTR)ProcessId;
     BOOLEAN trusted = FALSE;
 
-    if (!ctx->Initialized || ctx->ShuttingDown) {
-        return FALSE;
-    }
-
-    if (ctx->Magic != PE_CONTEXT_MAGIC) {
+    if (!PepIsReady()) {
         return FALSE;
     }
 
@@ -938,22 +894,28 @@ ShadowStrikeIsProcessTrusted(
             InterlockedIncrement64(&ctx->Stats.BitmapHits);
 
             //
-            // Update hit count in extended info
+            // Update hit count under ExtendedInfoLock (C-4 fix)
             //
-            if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
+            KeEnterCriticalRegion();
+            ExAcquirePushLockShared(&ctx->ExtendedInfoLock);
+
+            if (ctx->BitmapExtendedInfo != NULL &&
+                ctx->BitmapExtendedInfo[pidValue] != NULL) {
                 InterlockedIncrement(&ctx->BitmapExtendedInfo[pidValue]->HitCount);
             }
+
+            ExReleasePushLockShared(&ctx->ExtendedInfoLock);
+            KeLeaveCriticalRegion();
         }
 
     } else {
         //
         // Hash table lookup - O(1) average
+        // PepFindPidInHash returns data by value — no dangling pointer.
         //
-        PPE_PID_ENTRY entry = PepFindPidInHash(ProcessId);
-        if (entry != NULL) {
+        if (PepFindPidInHash(ProcessId, NULL, NULL, NULL, NULL)) {
             trusted = TRUE;
             InterlockedIncrement64(&ctx->Stats.HashHits);
-            InterlockedIncrement(&entry->HitCount);
         }
     }
 
@@ -974,9 +936,9 @@ ShadowStrikeIsProcessTrusted(
  *
  * @return TRUE if process is excluded (trusted), FALSE otherwise
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL (push locks require IRQL <= APC_LEVEL)
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 ShadowStrikeIsProcessTrustedEx(
     _In_ HANDLE ProcessId,
@@ -992,11 +954,7 @@ ShadowStrikeIsProcessTrustedEx(
         *Reason = PeReason_None;
     }
 
-    if (!ctx->Initialized || ctx->ShuttingDown) {
-        return FALSE;
-    }
-
-    if (ctx->Magic != PE_CONTEXT_MAGIC) {
+    if (!PepIsReady()) {
         return FALSE;
     }
 
@@ -1027,7 +985,8 @@ ShadowStrikeIsProcessTrustedEx(
             KeEnterCriticalRegion();
             ExAcquirePushLockShared(&ctx->ExtendedInfoLock);
 
-            if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
+            if (ctx->BitmapExtendedInfo != NULL &&
+                ctx->BitmapExtendedInfo[pidValue] != NULL) {
                 reason = ctx->BitmapExtendedInfo[pidValue]->Reason;
                 InterlockedIncrement(&ctx->BitmapExtendedInfo[pidValue]->HitCount);
             }
@@ -1038,14 +997,11 @@ ShadowStrikeIsProcessTrustedEx(
 
     } else {
         //
-        // Hash table lookup
+        // Hash table lookup — data returned by value
         //
-        PPE_PID_ENTRY entry = PepFindPidInHash(ProcessId);
-        if (entry != NULL) {
+        if (PepFindPidInHash(ProcessId, &reason, NULL, NULL, NULL)) {
             trusted = TRUE;
-            reason = entry->Reason;
             InterlockedIncrement64(&ctx->Stats.HashHits);
-            InterlockedIncrement(&entry->HitCount);
         }
     }
 
@@ -1085,7 +1041,7 @@ ShadowStrikeAddTrustedProcess(
     ULONG_PTR pidValue = (ULONG_PTR)ProcessId;
     NTSTATUS status = STATUS_SUCCESS;
 
-    if (!ctx->Initialized || ctx->ShuttingDown) {
+    if (!PepIsReady()) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1125,10 +1081,12 @@ ShadowStrikeAddTrustedProcess(
             KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
 
-            if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
-                PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
+            if (ctx->BitmapExtendedInfo != NULL) {
+                if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
+                    PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
+                }
+                ctx->BitmapExtendedInfo[pidValue] = extInfo;
             }
-            ctx->BitmapExtendedInfo[pidValue] = extInfo;
 
             ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
             KeLeaveCriticalRegion();
@@ -1180,7 +1138,7 @@ ShadowStrikeRemoveTrustedProcess(
     ULONG_PTR pidValue = (ULONG_PTR)ProcessId;
     BOOLEAN removed = FALSE;
 
-    if (!ctx->Initialized || ctx->ShuttingDown) {
+    if (!PepIsReady()) {
         return FALSE;
     }
 
@@ -1192,21 +1150,21 @@ ShadowStrikeRemoveTrustedProcess(
 
     if (pidValue < PE_BITMAP_MAX_PID) {
         //
-        // Check if permanent (cannot remove)
+        // Single exclusive lock acquisition for permanent check + remove (H-5 fix).
+        // The original code checked permanent under shared lock, released,
+        // then re-acquired exclusive — classic TOCTOU.
         //
-        BOOLEAN isPermanent = FALSE;
-
         KeEnterCriticalRegion();
-        ExAcquirePushLockShared(&ctx->ExtendedInfoLock);
+        ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
 
-        if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
-            isPermanent = ctx->BitmapExtendedInfo[pidValue]->Permanent;
-        }
-
-        ExReleasePushLockShared(&ctx->ExtendedInfoLock);
-        KeLeaveCriticalRegion();
-
-        if (isPermanent) {
+        if (ctx->BitmapExtendedInfo != NULL &&
+            ctx->BitmapExtendedInfo[pidValue] != NULL &&
+            ctx->BitmapExtendedInfo[pidValue]->Permanent) {
+            //
+            // Permanent entries cannot be removed
+            //
+            ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
+            KeLeaveCriticalRegion();
             PepReleaseReference();
             return FALSE;
         }
@@ -1214,7 +1172,6 @@ ShadowStrikeRemoveTrustedProcess(
         //
         // Remove from bitmap
         //
-        KeEnterCriticalRegion();
         ExAcquirePushLockExclusive(&ctx->BitmapLock);
 
         if (PepIsPidInBitmap(ProcessId)) {
@@ -1224,32 +1181,29 @@ ShadowStrikeRemoveTrustedProcess(
         }
 
         ExReleasePushLockExclusive(&ctx->BitmapLock);
-        KeLeaveCriticalRegion();
 
         //
-        // Free extended info
+        // Free extended info (still under ExtendedInfoLock)
         //
-        if (removed) {
-            KeEnterCriticalRegion();
-            ExAcquirePushLockExclusive(&ctx->ExtendedInfoLock);
-
-            if (ctx->BitmapExtendedInfo[pidValue] != NULL) {
-                PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
-                ctx->BitmapExtendedInfo[pidValue] = NULL;
-            }
-
-            ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
-            KeLeaveCriticalRegion();
+        if (removed && ctx->BitmapExtendedInfo != NULL &&
+            ctx->BitmapExtendedInfo[pidValue] != NULL) {
+            PepFreePidEntry(ctx->BitmapExtendedInfo[pidValue]);
+            ctx->BitmapExtendedInfo[pidValue] = NULL;
         }
+
+        ExReleasePushLockExclusive(&ctx->ExtendedInfoLock);
+        KeLeaveCriticalRegion();
 
     } else {
         //
-        // Remove from hash table
+        // Hash table path — check permanent and remove under single lock
         //
-        PPE_PID_ENTRY entry = PepFindPidInHash(ProcessId);
-        if (entry != NULL && !entry->Permanent) {
-            PepRemovePidFromHash(ProcessId);
-            removed = TRUE;
+        BOOLEAN isPermanent = FALSE;
+        if (PepFindPidInHash(ProcessId, NULL, NULL, NULL, &isPermanent)) {
+            if (!isPermanent) {
+                PepRemovePidFromHash(ProcessId);
+                removed = TRUE;
+            }
         }
     }
 
@@ -1265,9 +1219,13 @@ ShadowStrikeRemoveTrustedProcess(
 /**
  * @brief Get process exclusion statistics.
  *
+ * NOTE: Statistics are approximate. Individual fields are read atomically
+ * via interlocked operations, but cross-field consistency is NOT guaranteed.
+ * This is acceptable for diagnostics/telemetry.
+ *
  * @param Stats     Receives statistics
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql Any
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
@@ -1281,6 +1239,10 @@ ShadowStrikeProcessExclusionGetStats(
         return;
     }
 
+    //
+    // Each field is atomically consistent, but the snapshot
+    // as a whole is not (no cross-field lock).
+    //
     RtlCopyMemory(Stats, &ctx->Stats, sizeof(PE_STATISTICS));
 }
 
@@ -1303,7 +1265,6 @@ ShadowStrikeProcessExclusionResetStats(
     InterlockedExchange64(&ctx->Stats.TotalLookups, 0);
     InterlockedExchange64(&ctx->Stats.BitmapHits, 0);
     InterlockedExchange64(&ctx->Stats.HashHits, 0);
-    InterlockedExchange64(&ctx->Stats.CacheHits, 0);
     InterlockedExchange64(&ctx->Stats.Misses, 0);
 
     KeQuerySystemTime(&ctx->Stats.StartTime);
@@ -1324,11 +1285,18 @@ ShadowStrikeGetTrustedProcessCount(
 {
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
 
-    if (!ctx->Initialized) {
+    if (!PepIsReady()) {
         return 0;
     }
 
-    return (ULONG)(ctx->Stats.CurrentBitmapCount + ctx->Stats.CurrentHashCount);
+    //
+    // Use interlocked reads for each field individually.
+    // The sum is approximate but each operand is consistent.
+    //
+    LONG bitmapCount = ReadAcquire(&ctx->Stats.CurrentBitmapCount);
+    LONG hashCount = ReadAcquire(&ctx->Stats.CurrentHashCount);
+
+    return (ULONG)(bitmapCount + hashCount);
 }
 
 // ============================================================================
@@ -1352,7 +1320,8 @@ PepReleaseReference(
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     LONG newCount = InterlockedDecrement(&ctx->ReferenceCount);
 
-    if (newCount == 0 && ctx->ShuttingDown) {
+    if (newCount == 0 &&
+        ReadAcquire(&ctx->State) == PE_STATE_SHUTTING_DOWN) {
         KeSetEvent(&ctx->ShutdownEvent, IO_NO_INCREMENT, FALSE);
     }
 }
@@ -1468,16 +1437,20 @@ PepPidToHashBucket(
     return hash % PE_HASH_BUCKET_COUNT;
 }
 
-static PPE_PID_ENTRY
+static BOOLEAN
 PepFindPidInHash(
-    _In_ HANDLE ProcessId
+    _In_ HANDLE ProcessId,
+    _Out_opt_ PE_EXCLUSION_REASON* Reason,
+    _Out_opt_ PBOOLEAN InheritToChildren,
+    _Out_opt_ PULONG InheritanceDepth,
+    _Out_opt_ PBOOLEAN Permanent
     )
 {
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     ULONG bucket = PepPidToHashBucket(ProcessId);
     PLIST_ENTRY entry;
     PPE_PID_ENTRY pidEntry;
-    PPE_PID_ENTRY found = NULL;
+    BOOLEAN found = FALSE;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&ctx->HashLock);
@@ -1488,9 +1461,24 @@ PepFindPidInHash(
 
         pidEntry = CONTAINING_RECORD(entry, PE_PID_ENTRY, ListEntry);
 
-        if (pidEntry->Magic == PE_PID_ENTRY_MAGIC &&
-            pidEntry->ProcessId == ProcessId) {
-            found = pidEntry;
+        if (pidEntry->ProcessId == ProcessId) {
+            found = TRUE;
+
+            //
+            // Copy data out by value while still holding lock
+            //
+            if (Reason != NULL) {
+                *Reason = pidEntry->Reason;
+            }
+            if (InheritToChildren != NULL) {
+                *InheritToChildren = pidEntry->InheritToChildren;
+            }
+            if (InheritanceDepth != NULL) {
+                *InheritanceDepth = pidEntry->InheritanceDepth;
+            }
+            if (Permanent != NULL) {
+                *Permanent = pidEntry->Permanent;
+            }
             break;
         }
     }
@@ -1512,18 +1500,13 @@ PepAddPidToHash(
 {
     PPE_CONTEXT ctx = &g_ProcessExclusionContext;
     PPE_PID_ENTRY entry = NULL;
+    PLIST_ENTRY listEntry;
+    PPE_PID_ENTRY existingEntry;
     ULONG bucket;
     NTSTATUS status;
 
     //
-    // Check if already exists
-    //
-    if (PepFindPidInHash(ProcessId) != NULL) {
-        return STATUS_OBJECT_NAME_COLLISION;
-    }
-
-    //
-    // Allocate entry
+    // Pre-allocate entry BEFORE taking lock to minimize hold time
     //
     status = PepAllocatePidEntry(&entry);
     if (!NT_SUCCESS(status)) {
@@ -1539,13 +1522,30 @@ PepAddPidToHash(
     entry->HitCount = 0;
     KeQuerySystemTime(&entry->ExclusionTime);
 
-    //
-    // Insert into bucket
-    //
     bucket = PepPidToHashBucket(ProcessId);
 
+    //
+    // Duplicate check + insert under single exclusive lock (C-3 TOCTOU fix)
+    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&ctx->HashLock);
+
+    for (listEntry = ctx->HashBuckets[bucket].ListHead.Flink;
+         listEntry != &ctx->HashBuckets[bucket].ListHead;
+         listEntry = listEntry->Flink) {
+
+        existingEntry = CONTAINING_RECORD(listEntry, PE_PID_ENTRY, ListEntry);
+
+        if (existingEntry->ProcessId == ProcessId) {
+            //
+            // Already exists — release lock, free pre-allocated entry
+            //
+            ExReleasePushLockExclusive(&ctx->HashLock);
+            KeLeaveCriticalRegion();
+            PepFreePidEntry(entry);
+            return STATUS_OBJECT_NAME_COLLISION;
+        }
+    }
 
     InsertHeadList(&ctx->HashBuckets[bucket].ListHead, &entry->ListEntry);
     InterlockedIncrement(&ctx->HashBuckets[bucket].EntryCount);
@@ -1576,8 +1576,7 @@ PepRemovePidFromHash(
 
         pidEntry = CONTAINING_RECORD(entry, PE_PID_ENTRY, ListEntry);
 
-        if (pidEntry->Magic == PE_PID_ENTRY_MAGIC &&
-            pidEntry->ProcessId == ProcessId) {
+        if (pidEntry->ProcessId == ProcessId) {
             toRemove = pidEntry;
             RemoveEntryList(&pidEntry->ListEntry);
             InterlockedDecrement(&ctx->HashBuckets[bucket].EntryCount);
@@ -1627,7 +1626,6 @@ PepAllocatePidEntry(
     }
 
     RtlZeroMemory(entry, sizeof(PE_PID_ENTRY));
-    entry->Magic = PE_PID_ENTRY_MAGIC;
     InitializeListHead(&entry->ListEntry);
 
     *Entry = entry;
@@ -1646,196 +1644,10 @@ PepFreePidEntry(
         return;
     }
 
-    Entry->Magic = 0;
-
     if (ctx->LookasideInitialized) {
         ExFreeToNPagedLookasideList(&ctx->PidEntryLookaside, Entry);
     } else {
         ExFreePoolWithTag(Entry, PE_PID_TAG);
-    }
-}
-
-// ============================================================================
-// PRIVATE IMPLEMENTATION - CACHE OPERATIONS
-// ============================================================================
-
-static PPE_CACHE_ENTRY
-PepFindInCache(
-    _In_ HANDLE ProcessId
-    )
-{
-    PPE_CONTEXT ctx = &g_ProcessExclusionContext;
-    PLIST_ENTRY entry;
-    PPE_CACHE_ENTRY cacheEntry;
-    PPE_CACHE_ENTRY found = NULL;
-    LARGE_INTEGER currentTime;
-    LARGE_INTEGER expiryThreshold;
-
-    KeQuerySystemTime(&currentTime);
-    expiryThreshold.QuadPart = currentTime.QuadPart - PE_CACHE_EXPIRY_TIME;
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&ctx->CacheLock);
-
-    for (entry = ctx->CacheList.Flink;
-         entry != &ctx->CacheList;
-         entry = entry->Flink) {
-
-        cacheEntry = CONTAINING_RECORD(entry, PE_CACHE_ENTRY, ListEntry);
-
-        if (cacheEntry->ProcessId == ProcessId) {
-            //
-            // Check if expired
-            //
-            if (cacheEntry->CacheTime.QuadPart >= expiryThreshold.QuadPart) {
-                found = cacheEntry;
-                InterlockedIncrement64(&ctx->Stats.CacheHits);
-            }
-            break;
-        }
-    }
-
-    ExReleasePushLockShared(&ctx->CacheLock);
-    KeLeaveCriticalRegion();
-
-    return found;
-}
-
-static VOID
-PepAddToCache(
-    _In_ HANDLE ProcessId,
-    _In_ BOOLEAN IsExcluded,
-    _In_ PE_EXCLUSION_REASON Reason,
-    _In_ LARGE_INTEGER CreateTime,
-    _In_ ULONG ImagePathHash
-    )
-{
-    PPE_CONTEXT ctx = &g_ProcessExclusionContext;
-    PPE_CACHE_ENTRY entry;
-
-    //
-    // Check cache limit
-    //
-    if (ctx->CacheCount >= PE_MAX_CACHE_ENTRIES) {
-        PepCleanupExpiredCache();
-
-        if (ctx->CacheCount >= PE_MAX_CACHE_ENTRIES) {
-            return;  // Still at limit
-        }
-    }
-
-    //
-    // Allocate from lookaside
-    //
-    entry = (PPE_CACHE_ENTRY)ExAllocateFromNPagedLookasideList(
-        &ctx->CacheEntryLookaside
-    );
-
-    if (entry == NULL) {
-        return;
-    }
-
-    RtlZeroMemory(entry, sizeof(PE_CACHE_ENTRY));
-    entry->ProcessId = ProcessId;
-    entry->IsExcluded = IsExcluded;
-    entry->Reason = Reason;
-    entry->CreateTime = CreateTime;
-    entry->ImagePathHash = ImagePathHash;
-    KeQuerySystemTime(&entry->CacheTime);
-
-    //
-    // Insert at head (MRU)
-    //
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&ctx->CacheLock);
-
-    InsertHeadList(&ctx->CacheList, &entry->ListEntry);
-    InterlockedIncrement(&ctx->CacheCount);
-
-    ExReleasePushLockExclusive(&ctx->CacheLock);
-    KeLeaveCriticalRegion();
-}
-
-static VOID
-PepRemoveFromCache(
-    _In_ HANDLE ProcessId
-    )
-{
-    PPE_CONTEXT ctx = &g_ProcessExclusionContext;
-    PLIST_ENTRY entry;
-    PPE_CACHE_ENTRY cacheEntry;
-    PPE_CACHE_ENTRY toRemove = NULL;
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&ctx->CacheLock);
-
-    for (entry = ctx->CacheList.Flink;
-         entry != &ctx->CacheList;
-         entry = entry->Flink) {
-
-        cacheEntry = CONTAINING_RECORD(entry, PE_CACHE_ENTRY, ListEntry);
-
-        if (cacheEntry->ProcessId == ProcessId) {
-            toRemove = cacheEntry;
-            RemoveEntryList(&cacheEntry->ListEntry);
-            InterlockedDecrement(&ctx->CacheCount);
-            break;
-        }
-    }
-
-    ExReleasePushLockExclusive(&ctx->CacheLock);
-    KeLeaveCriticalRegion();
-
-    if (toRemove != NULL) {
-        ExFreeToNPagedLookasideList(&ctx->CacheEntryLookaside, toRemove);
-    }
-}
-
-static VOID
-PepCleanupExpiredCache(
-    VOID
-    )
-{
-    PPE_CONTEXT ctx = &g_ProcessExclusionContext;
-    PLIST_ENTRY entry;
-    PLIST_ENTRY nextEntry;
-    PPE_CACHE_ENTRY cacheEntry;
-    LARGE_INTEGER currentTime;
-    LARGE_INTEGER expiryThreshold;
-    LIST_ENTRY expiredList;
-
-    InitializeListHead(&expiredList);
-
-    KeQuerySystemTime(&currentTime);
-    expiryThreshold.QuadPart = currentTime.QuadPart - PE_CACHE_EXPIRY_TIME;
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&ctx->CacheLock);
-
-    for (entry = ctx->CacheList.Flink;
-         entry != &ctx->CacheList;
-         entry = nextEntry) {
-
-        nextEntry = entry->Flink;
-        cacheEntry = CONTAINING_RECORD(entry, PE_CACHE_ENTRY, ListEntry);
-
-        if (cacheEntry->CacheTime.QuadPart < expiryThreshold.QuadPart) {
-            RemoveEntryList(&cacheEntry->ListEntry);
-            InsertTailList(&expiredList, &cacheEntry->ListEntry);
-            InterlockedDecrement(&ctx->CacheCount);
-        }
-    }
-
-    ExReleasePushLockExclusive(&ctx->CacheLock);
-    KeLeaveCriticalRegion();
-
-    //
-    // Free expired entries outside lock
-    //
-    while (!IsListEmpty(&expiredList)) {
-        entry = RemoveHeadList(&expiredList);
-        cacheEntry = CONTAINING_RECORD(entry, PE_CACHE_ENTRY, ListEntry);
-        ExFreeToNPagedLookasideList(&ctx->CacheEntryLookaside, cacheEntry);
     }
 }
 
@@ -1881,7 +1693,9 @@ PepCheckParentExclusion(
             KeEnterCriticalRegion();
             ExAcquirePushLockShared(&ctx->ExtendedInfoLock);
 
-            PPE_PID_ENTRY extInfo = ctx->BitmapExtendedInfo[parentPidValue];
+            PPE_PID_ENTRY extInfo = (ctx->BitmapExtendedInfo != NULL)
+                ? ctx->BitmapExtendedInfo[parentPidValue]
+                : NULL;
             if (extInfo != NULL && extInfo->InheritToChildren) {
                 *Reason = extInfo->Reason;
                 *InheritanceDepth = extInfo->InheritanceDepth;
@@ -1895,13 +1709,18 @@ PepCheckParentExclusion(
 
     } else {
         //
-        // Check hash table
+        // Check hash table — data returned by value
         //
-        PPE_PID_ENTRY entry = PepFindPidInHash(ParentProcessId);
-        if (entry != NULL && entry->InheritToChildren) {
-            parentExcluded = TRUE;
-            *Reason = entry->Reason;
-            *InheritanceDepth = entry->InheritanceDepth;
+        PE_EXCLUSION_REASON hashReason = PeReason_None;
+        BOOLEAN hashInherit = FALSE;
+        ULONG hashDepth = 0;
+
+        if (PepFindPidInHash(ParentProcessId, &hashReason, &hashInherit, &hashDepth, NULL)) {
+            if (hashInherit) {
+                parentExcluded = TRUE;
+                *Reason = hashReason;
+                *InheritanceDepth = hashDepth;
+            }
         }
     }
 

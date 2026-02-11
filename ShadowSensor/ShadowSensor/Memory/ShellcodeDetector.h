@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 #include <ntddk.h>
+#include <ntstrsafe.h>
 #include "../../Shared/MemoryTypes.h"
 
 //=============================================================================
@@ -32,13 +33,14 @@ extern "C" {
 #define SD_POOL_TAG_CONTEXT     'CXDS'  // Shellcode Detector - Context
 #define SD_POOL_TAG_RESULT      'ERDS'  // Shellcode Detector - Result
 #define SD_POOL_TAG_PATTERN     'TPDS'  // Shellcode Detector - Pattern
+#define SD_POOL_TAG_BUFFER      'FBDS'  // Shellcode Detector - Temp Buffer
 
 //=============================================================================
 // Configuration Constants
 //=============================================================================
 
 #define SD_MIN_SCAN_SIZE                64
-#define SD_MAX_SCAN_SIZE                (64 * 1024 * 1024)  // 64 MB
+#define SD_MAX_SCAN_SIZE                (4 * 1024 * 1024)   // 4 MB (C-3: was 64MB)
 #define SD_NOP_SLED_MIN_LENGTH          16
 #define SD_EGG_HUNTER_MAX_SIZE          128
 #define SD_ENCODER_LOOP_MAX_SIZE        256
@@ -62,7 +64,7 @@ typedef enum _SD_SHELLCODE_TYPE {
     SdShellcode_DirectSyscall,          // Direct syscall stub
     SdShellcode_HeavensGate,            // WoW64 Heaven's Gate
     SdShellcode_StackPivot,             // Stack pivot gadget
-    SdShellcode_Position Independent,   // Position-independent code
+    SdShellcode_PositionIndependent,    // Position-independent code
     SdShellcode_Staged,                 // Staged shellcode loader
     SdShellcode_Meterpreter,            // Meterpreter patterns
     SdShellcode_CobaltStrike,           // Cobalt Strike patterns
@@ -333,15 +335,16 @@ typedef struct _SD_CONFIG {
 
 typedef struct _SD_DETECTOR {
     //
-    // Initialization state
+    // C-2 fix: CAS-based state machine replaces plain BOOLEAN
     //
-    BOOLEAN Initialized;
-    
+    volatile LONG State;
+
     //
-    // Configuration
+    // Configuration (H-3: protected by ConfigLock)
     //
     SD_CONFIG Config;
-    
+    EX_PUSH_LOCK ConfigLock;
+
     //
     // Known API hashes database
     //
@@ -350,7 +353,7 @@ typedef struct _SD_DETECTOR {
         ULONG HashCount;
         EX_PUSH_LOCK Lock;
     } ApiHashes;
-    
+
     //
     // Known shellcode signatures
     //
@@ -359,7 +362,13 @@ typedef struct _SD_DETECTOR {
         ULONG SignatureCount;
         EX_PUSH_LOCK Lock;
     } Signatures;
-    
+
+    //
+    // Lifecycle (C-2: reference counting for safe shutdown)
+    //
+    volatile LONG ActiveOperations;
+    KEVENT ShutdownEvent;
+
     //
     // Statistics
     //
@@ -373,7 +382,7 @@ typedef struct _SD_DETECTOR {
         volatile LONG64 SyscallsFound;
         LARGE_INTEGER StartTime;
     } Stats;
-    
+
 } SD_DETECTOR, *PSD_DETECTOR;
 
 //=============================================================================
@@ -389,17 +398,20 @@ typedef VOID (*SD_DETECTION_CALLBACK)(
 // Public API - Initialization
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdInitialize(
     _Out_ PSD_DETECTOR* Detector,
     _In_opt_ PSD_CONFIG Config
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 SdShutdown(
     _Inout_ PSD_DETECTOR Detector
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdSetConfig(
     _Inout_ PSD_DETECTOR Detector,
@@ -410,6 +422,7 @@ SdSetConfig(
 // Public API - Detection
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdAnalyzeBuffer(
     _In_ PSD_DETECTOR Detector,
@@ -418,6 +431,7 @@ SdAnalyzeBuffer(
     _Out_ PSD_DETECTION_RESULT* Result
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdAnalyzeRegion(
     _In_ PSD_DETECTOR Detector,
@@ -427,6 +441,7 @@ SdAnalyzeRegion(
     _Out_ PSD_DETECTION_RESULT* Result
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdScanProcess(
     _In_ PSD_DETECTOR Detector,
@@ -440,6 +455,7 @@ SdScanProcess(
 // Public API - Specific Detections
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdDetectNopSled(
     _In_ PSD_DETECTOR Detector,
@@ -450,6 +466,7 @@ SdDetectNopSled(
     _Out_opt_ PULONG Length
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdDetectEncoder(
     _In_ PSD_DETECTOR Detector,
@@ -458,6 +475,7 @@ SdDetectEncoder(
     _Out_ PSD_ENCODER_INFO EncoderInfo
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdDetectApiHashing(
     _In_ PSD_DETECTOR Detector,
@@ -466,6 +484,7 @@ SdDetectApiHashing(
     _Out_ PSD_API_HASH_INFO ApiHashInfo
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdDetectDirectSyscall(
     _In_ PSD_DETECTOR Detector,
@@ -480,6 +499,7 @@ SdDetectDirectSyscall(
 // Public API - API Hash Database
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdAddApiHash(
     _In_ PSD_DETECTOR Detector,
@@ -488,6 +508,7 @@ SdAddApiHash(
     _In_ PCSTR DllName
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdLookupApiHash(
     _In_ PSD_DETECTOR Detector,
@@ -498,6 +519,7 @@ SdLookupApiHash(
     _In_ ULONG DllNameSize
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdLoadApiHashDatabase(
     _In_ PSD_DETECTOR Detector,
@@ -508,6 +530,7 @@ SdLoadApiHashDatabase(
 // Public API - Results
 //=============================================================================
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 SdFreeResult(
     _In_ PSD_DETECTION_RESULT Result
@@ -530,6 +553,7 @@ typedef struct _SD_STATISTICS {
     LARGE_INTEGER UpTime;
 } SD_STATISTICS, *PSD_STATISTICS;
 
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 SdGetStatistics(
     _In_ PSD_DETECTOR Detector,

@@ -6,15 +6,14 @@
  * @file TelemetryEvents.h
  * @brief Enterprise-grade ETW telemetry for kernel-mode EDR operations.
  *
- * Provides CrowdStrike Falcon-level telemetry streaming with:
- * - High-performance ETW event emission (10M+ events/sec capable)
- * - Lock-free event buffering with batch processing
- * - Automatic rate limiting and throttling
+ * Provides high-performance telemetry streaming with:
+ * - Lookaside-based event allocation (zero stack overflow risk)
+ * - Synchronous ETW event emission with atomic state management
+ * - Adaptive rate limiting and throttling
  * - SIEM-ready event schemas (ECS compatible)
  * - Attack chain correlation and MITRE ATT&CK mapping
  * - Real-time behavioral telemetry streaming
  * - Configurable verbosity levels per category
- * - Secure event serialization with integrity checks
  * - Memory-efficient lookaside-based event allocation
  * - Graceful degradation under memory pressure
  *
@@ -22,14 +21,12 @@
  * - No sensitive data logged (PII/credentials filtered)
  * - Tamper-evident event sequencing
  * - Rate limiting prevents DoS via event flooding
- * - All events include cryptographic correlation IDs
+ * - All events include unique correlation IDs
  *
  * Performance Guarantees:
- * - Lock-free event submission path
- * - Batched ETW writes reduce syscall overhead
  * - Lookaside lists for zero-allocation hot path
- * - Per-CPU event buffers eliminate contention
  * - Adaptive throttling preserves system stability
+ * - Bounded string operations prevent runaway scans
  *
  * MITRE ATT&CK Coverage:
  * - Full technique ID embedding in events
@@ -37,7 +34,7 @@
  * - Attack chain correlation across events
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 3.0.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -52,6 +49,7 @@ extern "C" {
 #include <fltKernel.h>
 #include <evntrace.h>
 #include <evntprov.h>
+#include <ntstrsafe.h>
 #include "ETWProvider.h"
 #include "EventSchema.h"
 #include "../Utilities/MemoryUtils.h"
@@ -68,9 +66,12 @@ extern "C" {
 /**
  * @brief ShadowStrike Telemetry ETW Provider GUID.
  * {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+ *
+ * EXTERN_C declaration here; actual definition in TelemetryEvents.c
+ * via INITGUID + DEFINE_GUID. Placing DEFINE_GUID in a header causes
+ * multiple-definition linker errors when included by more than one TU.
  */
-DEFINE_GUID(SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID,
-    0xA1B2C3D4, 0xE5F6, 0x7890, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x90);
+EXTERN_C const GUID SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID;
 
 /**
  * @brief Provider name for ETW registration.
@@ -81,11 +82,11 @@ DEFINE_GUID(SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID,
 // POOL TAGS
 // ============================================================================
 
-#define TE_POOL_TAG                 'ETET'  // Telemetry Events Tag
-#define TE_EVENT_TAG                'vEET'  // Event buffer tag
-#define TE_BATCH_TAG                'bEET'  // Batch buffer tag
-#define TE_CONTEXT_TAG              'cEET'  // Context tag
-#define TE_STRING_TAG               'sEET'  // String buffer tag
+#define TE_POOL_TAG                 'ETle'  // "elTE" in debugger
+#define TE_EVENT_TAG                'ETve'  // "evTE" in debugger
+#define TE_BATCH_TAG                'ETba'  // "abTE" in debugger
+#define TE_CONTEXT_TAG              'ETcx'  // "xcTE" in debugger
+#define TE_STRING_TAG               'ETst'  // "stTE" in debugger
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -117,12 +118,21 @@ DEFINE_GUID(SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID,
 #define TE_MAX_PENDING_EVENTS               10000
 
 /**
- * @brief Maximum string length in events.
+ * @brief Maximum string length in events (characters).
+ * Used as a safety bound for unbounded PCWSTR inputs.
  */
 #define TE_MAX_STRING_LENGTH                2048
 
 /**
+ * @brief Maximum command line length for telemetry events (characters).
+ * Capped to keep TE_PROCESS_EVENT within TE_MAX_EVENT_DATA_SIZE.
+ * Full command lines exceeding this are truncated in telemetry.
+ */
+#define TE_MAX_COMMAND_LINE_CHARS           4096
+
+/**
  * @brief Maximum event data size.
+ * Must be >= sizeof(largest event struct). Validated by C_ASSERT below.
  */
 #define TE_MAX_EVENT_DATA_SIZE              (16 * 1024)
 
@@ -137,9 +147,10 @@ DEFINE_GUID(SHADOWSTRIKE_TELEMETRY_PROVIDER_GUID,
 #define TE_STATS_INTERVAL_MS                60000
 
 /**
- * @brief Number of per-CPU event buffers.
+ * @brief Maximum number of ETW event levels tracked in statistics.
+ * Levels range from 1 (Critical) to 5 (Verbose). Index 0 is unused.
  */
-#define TE_MAX_CPU_BUFFERS                  64
+#define TE_MAX_EVENT_LEVELS                 6
 
 // ============================================================================
 // EVENT LEVELS AND KEYWORDS
@@ -319,6 +330,22 @@ typedef enum _TE_EVENT_ID {
 } TE_EVENT_ID;
 
 // ============================================================================
+// EVENT ID RANGE VALIDATION HELPERS
+// ============================================================================
+
+#define TE_IS_PROCESS_EVENT(id)     ((id) >= 1 && (id) <= 99)
+#define TE_IS_THREAD_EVENT(id)      ((id) >= 100 && (id) <= 199)
+#define TE_IS_IMAGE_EVENT(id)       ((id) >= 200 && (id) <= 299)
+#define TE_IS_FILE_EVENT(id)        ((id) >= 300 && (id) <= 399)
+#define TE_IS_REGISTRY_EVENT(id)    ((id) >= 400 && (id) <= 499)
+#define TE_IS_NETWORK_EVENT(id)     ((id) >= 500 && (id) <= 599)
+#define TE_IS_MEMORY_EVENT(id)      ((id) >= 600 && (id) <= 699)
+#define TE_IS_DETECTION_EVENT(id)   ((id) >= 700 && (id) <= 799)
+#define TE_IS_SECURITY_EVENT(id)    ((id) >= 800 && (id) <= 899)
+#define TE_IS_OPERATIONAL_EVENT(id) ((id) >= 900 && (id) <= 999)
+#define TE_IS_VALID_EVENT(id)       ((id) >= 1 && (id) < TeEvent_Max)
+
+// ============================================================================
 // TELEMETRY STATE ENUMERATIONS
 // ============================================================================
 
@@ -361,17 +388,25 @@ typedef enum _TE_THROTTLE_ACTION {
 // EVENT DATA STRUCTURES
 // ============================================================================
 
-#pragma pack(push, 1)
+/*
+ * NOTE: Event structures use natural alignment for internal use.
+ * The ETW wire format is the raw struct written via EtwWrite.
+ * Natural alignment ensures interlocked and atomic operations
+ * on 64-bit fields function correctly on all architectures.
+ */
 
 /**
  * @brief Common event header for all telemetry events.
+ *
+ * Uses fixed-width integer types (not enums) to guarantee stable wire format
+ * regardless of compiler enum size settings.
  */
 typedef struct _TE_EVENT_HEADER {
     UINT32 Size;                        ///< Total event size including header
     UINT16 Version;                     ///< Event structure version
     UINT16 Flags;                       ///< Event flags
-    TE_EVENT_ID EventId;                ///< Event identifier
-    TE_EVENT_LEVEL Level;               ///< Event level
+    UINT32 EventId;                     ///< Event identifier (TE_EVENT_ID)
+    UINT32 Level;                       ///< Event level (TE_EVENT_LEVEL)
     UINT64 Keywords;                    ///< Event keywords
     UINT64 Timestamp;                   ///< Event timestamp (FILETIME)
     UINT64 SequenceNumber;              ///< Monotonic sequence number
@@ -382,6 +417,8 @@ typedef struct _TE_EVENT_HEADER {
     UINT64 CorrelationId;               ///< Correlation ID for event chaining
     UINT64 ActivityId;                  ///< Activity ID for tracing
 } TE_EVENT_HEADER, *PTE_EVENT_HEADER;
+
+C_ASSERT(sizeof(TE_EVENT_HEADER) == 80);
 
 // Event header flags
 #define TE_FLAG_BLOCKING            0x0001  ///< Event can block operation
@@ -395,6 +432,10 @@ typedef struct _TE_EVENT_HEADER {
 
 /**
  * @brief Process telemetry event.
+ *
+ * CommandLine is capped at TE_MAX_COMMAND_LINE_CHARS to stay within
+ * TE_MAX_EVENT_DATA_SIZE. Full command lines are truncated with
+ * null-termination preserved.
  */
 typedef struct _TE_PROCESS_EVENT {
     TE_EVENT_HEADER Header;
@@ -412,9 +453,12 @@ typedef struct _TE_PROCESS_EVENT {
     UINT64 ImageSize;
     UINT8 ImageHash[32];                ///< SHA-256
     WCHAR ImagePath[MAX_FILE_PATH_LENGTH];
-    WCHAR CommandLine[MAX_COMMAND_LINE_LENGTH];
+    WCHAR CommandLine[TE_MAX_COMMAND_LINE_CHARS];
     WCHAR UserSid[256];
+    WCHAR BlockReason[256];             ///< Reason for block (if blocked)
 } TE_PROCESS_EVENT, *PTE_PROCESS_EVENT;
+
+C_ASSERT(sizeof(TE_PROCESS_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 // Process flags
 #define TE_PROCESS_FLAG_ELEVATED        0x00000001
@@ -440,6 +484,8 @@ typedef struct _TE_THREAD_EVENT {
     UINT32 Flags;
     WCHAR TargetProcessPath[MAX_FILE_PATH_LENGTH];
 } TE_THREAD_EVENT, *PTE_THREAD_EVENT;
+
+C_ASSERT(sizeof(TE_THREAD_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 // Thread flags
 #define TE_THREAD_FLAG_REMOTE           0x00000001
@@ -468,6 +514,8 @@ typedef struct _TE_FILE_EVENT {
     WCHAR ThreatName[MAX_THREAT_NAME_LENGTH];
 } TE_FILE_EVENT, *PTE_FILE_EVENT;
 
+C_ASSERT(sizeof(TE_FILE_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
+
 // File flags
 #define TE_FILE_FLAG_EXECUTABLE         0x00000001
 #define TE_FILE_FLAG_SCRIPT             0x00000002
@@ -493,6 +541,8 @@ typedef struct _TE_REGISTRY_EVENT {
     WCHAR ValueName[MAX_REGISTRY_VALUE_LENGTH];
     UINT8 ValueData[256];               ///< First 256 bytes of value
 } TE_REGISTRY_EVENT, *PTE_REGISTRY_EVENT;
+
+C_ASSERT(sizeof(TE_REGISTRY_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 // Registry flags
 #define TE_REG_FLAG_PERSISTENCE         0x00000001
@@ -520,10 +570,13 @@ typedef struct _TE_NETWORK_EVENT {
     UINT32 ThreatScore;
     UINT32 ThreatType;
     UINT32 Flags;
-    UINT32 Reserved;
+    UINT16 DnsQueryType;                ///< DNS query type (A=1, AAAA=28, TXT=16, etc.)
+    UINT16 Reserved;
     WCHAR RemoteHostname[260];
     WCHAR ProcessPath[MAX_FILE_PATH_LENGTH];
 } TE_NETWORK_EVENT, *PTE_NETWORK_EVENT;
+
+C_ASSERT(sizeof(TE_NETWORK_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 // Network flags
 #define TE_NET_FLAG_BLOCKED             0x00000001
@@ -553,6 +606,8 @@ typedef struct _TE_MEMORY_EVENT {
     UINT8 ContentHash[32];              ///< SHA-256 of content sample
     WCHAR TargetProcessPath[MAX_FILE_PATH_LENGTH];
 } TE_MEMORY_EVENT, *PTE_MEMORY_EVENT;
+
+C_ASSERT(sizeof(TE_MEMORY_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 // Memory flags
 #define TE_MEM_FLAG_RWX                 0x00000001
@@ -587,6 +642,8 @@ typedef struct _TE_DETECTION_EVENT {
     WCHAR TargetPath[MAX_FILE_PATH_LENGTH];
 } TE_DETECTION_EVENT, *PTE_DETECTION_EVENT;
 
+C_ASSERT(sizeof(TE_DETECTION_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
+
 /**
  * @brief Security alert telemetry event.
  */
@@ -594,16 +651,20 @@ typedef struct _TE_SECURITY_EVENT {
     TE_EVENT_HEADER Header;
     UINT32 AlertType;
     UINT32 TargetComponent;
+    UINT32 TargetProcessId;             ///< Target process (e.g., credential access target)
+    UINT32 Reserved;
     UINT64 TargetAddress;
     UINT64 OriginalValue;
     UINT64 AttemptedValue;
     UINT32 ThreatScore;
     UINT32 ResponseAction;
     UINT32 Flags;
-    UINT32 Reserved;
+    UINT32 Reserved2;
     WCHAR AttackerProcess[MAX_FILE_PATH_LENGTH];
     WCHAR Description[512];
 } TE_SECURITY_EVENT, *PTE_SECURITY_EVENT;
+
+C_ASSERT(sizeof(TE_SECURITY_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 /**
  * @brief Operational/diagnostic telemetry event.
@@ -624,7 +685,7 @@ typedef struct _TE_OPERATIONAL_EVENT {
     UINT32 Reserved;
 } TE_OPERATIONAL_EVENT, *PTE_OPERATIONAL_EVENT;
 
-#pragma pack(pop)
+C_ASSERT(sizeof(TE_OPERATIONAL_EVENT) <= TE_MAX_EVENT_DATA_SIZE);
 
 // ============================================================================
 // TELEMETRY STATISTICS
@@ -649,7 +710,7 @@ typedef struct _TE_STATISTICS {
     // Rate tracking
     volatile LONG EventsThisSecond;
     volatile LONG PeakEventsPerSecond;
-    UINT64 CurrentSecondStart;
+    volatile LONG64 CurrentSecondStart;
 
     // Batch statistics
     volatile LONG64 BatchesWritten;
@@ -660,20 +721,20 @@ typedef struct _TE_STATISTICS {
     // Throttling statistics
     volatile LONG64 ThrottleActivations;
     volatile LONG ThrottleCurrentLevel;
-    UINT64 LastThrottleTime;
+    volatile LONG64 LastThrottleTime;
 
     // Error tracking
     volatile LONG64 EtwWriteErrors;
     volatile LONG64 AllocationFailures;
     volatile LONG64 SequenceGaps;
 
-    // Timing
-    LARGE_INTEGER StartTime;
-    LARGE_INTEGER LastEventTime;
-    LARGE_INTEGER LastFlushTime;
+    // Timing (use LONG64 for interlocked access)
+    volatile LONG64 StartTime;
+    volatile LONG64 LastEventTime;
+    volatile LONG64 LastFlushTime;
 
-    // Per-level counters
-    volatile LONG64 EventsByLevel[6];
+    // Per-level counters (indexed by TE_EVENT_LEVEL, 0=unused, 1-5=levels)
+    volatile LONG64 EventsByLevel[TE_MAX_EVENT_LEVELS];
 
     // Reserved for future use
     UINT64 Reserved[8];
@@ -697,7 +758,13 @@ typedef struct _TE_CONFIG {
     UINT16 Reserved1;
 
     // Filtering
-    TE_EVENT_LEVEL MinLevel;
+    //
+    // MaxVerbosity: Maximum ETW level to log. Events with a level numerically
+    // greater than this value are filtered. ETW levels: 1=Critical, 2=Error,
+    // 3=Warning, 4=Informational, 5=Verbose. Setting to 4 (Informational)
+    // filters out Verbose events.
+    //
+    TE_EVENT_LEVEL MaxVerbosity;
     UINT32 Reserved2;
     UINT64 EnabledKeywords;
 
@@ -726,41 +793,28 @@ typedef struct _TE_CONFIG {
 // ============================================================================
 
 /**
- * @brief Per-CPU event buffer.
- */
-typedef struct _TE_CPU_BUFFER {
-    SLIST_HEADER FreeList;              ///< Free event buffers
-    SLIST_HEADER PendingList;           ///< Pending events to write
-    volatile LONG PendingCount;
-    volatile LONG FreeCount;
-    UINT64 LastFlushTime;
-    UCHAR Padding[40];                  ///< Cache line padding
-} TE_CPU_BUFFER, *PTE_CPU_BUFFER;
-
-/**
  * @brief Telemetry provider global state.
  */
 typedef struct _TE_PROVIDER {
-    // State
-    volatile TE_STATE State;
-    BOOLEAN Initialized;
-    UINT8 Reserved1[3];
+    // State (atomically managed via InterlockedCompareExchange)
+    volatile LONG State;
+    UINT8 Reserved0[4];
 
     // ETW registration
     REGHANDLE RegistrationHandle;
-    UCHAR EnableLevel;
+    volatile UCHAR EnableLevel;
     UINT8 Reserved2[3];
-    ULONGLONG EnableFlags;
+    volatile ULONGLONG EnableFlags;
     volatile LONG ConsumerCount;
+    volatile LONG EtwEnabled;
 
     // Sequence tracking
     volatile LONG64 SequenceNumber;
 
     // Synchronization
-    SHADOWSTRIKE_RWSPINLOCK StateLock;
-    EX_PUSH_LOCK ConfigLock;
+    SHADOWSTRIKE_RWSPINLOCK ConfigLock;
 
-    // Configuration
+    // Configuration (protected by ConfigLock)
     TE_CONFIG Config;
 
     // Statistics
@@ -768,14 +822,8 @@ typedef struct _TE_PROVIDER {
 
     // Memory management
     SHADOWSTRIKE_LOOKASIDE EventLookaside;
-    NPAGED_LOOKASIDE_LIST SmallEventLookaside;
 
-    // Per-CPU buffers
-    PTE_CPU_BUFFER CpuBuffers;
-    ULONG CpuCount;
-    UINT32 Reserved3;
-
-    // Batching
+    // Batching/Flush
     KTIMER FlushTimer;
     KDPC FlushDpc;
     PIO_WORKITEM FlushWorkItem;
@@ -787,17 +835,32 @@ typedef struct _TE_PROVIDER {
     KDPC HeartbeatDpc;
 
     // Throttling
-    volatile TE_THROTTLE_ACTION ThrottleAction;
+    volatile LONG ThrottleAction;
     volatile LONG ThrottleSampleCounter;
-    UINT64 ThrottleStartTime;
+    volatile LONG64 ThrottleStartTime;
+
+    //
+    // Cached throttle config for lock-free hot-path reads.
+    // Updated atomically under ConfigLock whenever config changes.
+    //
+    volatile LONG CachedEnableThrottling;
+    volatile LONG CachedSamplingRate;
+    volatile LONG CachedThrottleThreshold;
+    volatile LONG CachedThrottleRecoveryMs;
 
     // Activity tracking
-    UINT64 LastActivityTime;
+    volatile LONG64 LastActivityTime;
     volatile LONG ActiveOperations;
 
     // Reference counting for shutdown
     volatile LONG ReferenceCount;
     KEVENT ShutdownEvent;
+
+    // Heartbeat running state (for pause/resume)
+    volatile LONG HeartbeatRunning;
+
+    // Statistics snapshot lock
+    SHADOWSTRIKE_RWSPINLOCK StatsLock;
 
     // Reserved
     UINT64 Reserved4[4];
@@ -810,8 +873,8 @@ typedef struct _TE_PROVIDER {
 /**
  * @brief Initialize the telemetry subsystem.
  *
- * Must be called during driver initialization. Sets up ETW provider,
- * allocates buffers, and starts background threads.
+ * Must be called during driver initialization at PASSIVE_LEVEL.
+ * Uses atomic state transition to prevent double-initialization.
  *
  * @param DeviceObject  Device object for work items
  * @param Config        Optional initial configuration (NULL for defaults)
@@ -830,8 +893,8 @@ TeInitialize(
 /**
  * @brief Shutdown the telemetry subsystem.
  *
- * Flushes pending events, unregisters ETW provider, and releases resources.
- * Blocks until all pending operations complete.
+ * Cancels timers, waits for DPCs to drain, unregisters ETW provider,
+ * and releases all resources. Blocks until all pending operations complete.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -882,9 +945,9 @@ TeIsEventEnabled(
  *
  * @return STATUS_SUCCESS on success
  *
- * @irql <= APC_LEVEL
+ * @irql <= DISPATCH_LEVEL
  */
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeSetConfig(
     _In_ PTE_CONFIG Config
@@ -908,6 +971,8 @@ TeGetConfig(
 /**
  * @brief Pause telemetry event collection.
  *
+ * Uses atomic state transition. Will not override a shutdown in progress.
+ *
  * @irql <= DISPATCH_LEVEL
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -918,6 +983,8 @@ TePause(
 
 /**
  * @brief Resume telemetry event collection.
+ *
+ * Uses atomic state transition. Only resumes from Paused state.
  *
  * @irql <= DISPATCH_LEVEL
  */
@@ -931,20 +998,6 @@ TeResume(
 // EVENT LOGGING - PROCESS
 // ============================================================================
 
-/**
- * @brief Log process creation event.
- *
- * @param ProcessId         Process ID
- * @param ParentProcessId   Parent process ID
- * @param ImagePath         Process image path
- * @param CommandLine       Command line (optional)
- * @param ThreatScore       Threat score (0-1000)
- * @param Flags             Process flags
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogProcessCreate(
@@ -956,16 +1009,6 @@ TeLogProcessCreate(
     _In_ UINT32 Flags
     );
 
-/**
- * @brief Log process termination event.
- *
- * @param ProcessId     Process ID
- * @param ExitCode      Exit code
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogProcessTerminate(
@@ -973,19 +1016,6 @@ TeLogProcessTerminate(
     _In_ UINT32 ExitCode
     );
 
-/**
- * @brief Log process blocked event.
- *
- * @param ProcessId         Process ID
- * @param ParentProcessId   Parent process ID
- * @param ImagePath         Process image path
- * @param ThreatScore       Threat score
- * @param Reason            Block reason
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogProcessBlocked(
@@ -1000,17 +1030,6 @@ TeLogProcessBlocked(
 // EVENT LOGGING - THREAD
 // ============================================================================
 
-/**
- * @brief Log thread creation event.
- *
- * @param ProcessId         Process ID
- * @param ThreadId          Thread ID
- * @param StartAddress      Thread start address
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogThreadCreate(
@@ -1019,19 +1038,6 @@ TeLogThreadCreate(
     _In_ UINT64 StartAddress
     );
 
-/**
- * @brief Log remote thread creation (injection).
- *
- * @param SourceProcessId   Source process ID
- * @param TargetProcessId   Target process ID
- * @param ThreadId          Created thread ID
- * @param StartAddress      Thread start address
- * @param ThreatScore       Threat score
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogRemoteThread(
@@ -1046,22 +1052,6 @@ TeLogRemoteThread(
 // EVENT LOGGING - FILE
 // ============================================================================
 
-/**
- * @brief Log file operation event.
- *
- * @param EventId       Event ID (create, read, write, etc.)
- * @param ProcessId     Process ID
- * @param FilePath      File path
- * @param Operation     File operation type
- * @param FileSize      File size
- * @param Verdict       Scan verdict
- * @param ThreatName    Threat name (if malware)
- * @param ThreatScore   Threat score
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogFileEvent(
@@ -1075,19 +1065,6 @@ TeLogFileEvent(
     _In_ UINT32 ThreatScore
     );
 
-/**
- * @brief Log file blocked/quarantined event.
- *
- * @param ProcessId     Process ID
- * @param FilePath      File path
- * @param ThreatName    Threat name
- * @param ThreatScore   Threat score
- * @param Quarantined   TRUE if quarantined
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogFileBlocked(
@@ -1102,22 +1079,6 @@ TeLogFileBlocked(
 // EVENT LOGGING - REGISTRY
 // ============================================================================
 
-/**
- * @brief Log registry operation event.
- *
- * @param EventId       Event ID
- * @param ProcessId     Process ID
- * @param KeyPath       Registry key path
- * @param ValueName     Value name (optional)
- * @param ValueType     Value type
- * @param ValueData     Value data (optional)
- * @param DataSize      Data size
- * @param ThreatScore   Threat score
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogRegistryEvent(
@@ -1135,16 +1096,6 @@ TeLogRegistryEvent(
 // EVENT LOGGING - NETWORK
 // ============================================================================
 
-/**
- * @brief Log network connection event.
- *
- * @param EventId       Event ID
- * @param Event         Pre-filled network event structure
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogNetworkEvent(
@@ -1152,19 +1103,6 @@ TeLogNetworkEvent(
     _In_ PTE_NETWORK_EVENT Event
     );
 
-/**
- * @brief Log DNS query event.
- *
- * @param ProcessId     Process ID
- * @param QueryName     DNS query name
- * @param QueryType     Query type
- * @param Blocked       TRUE if blocked
- * @param ThreatScore   Threat score
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogDnsQuery(
@@ -1179,22 +1117,6 @@ TeLogDnsQuery(
 // EVENT LOGGING - MEMORY
 // ============================================================================
 
-/**
- * @brief Log memory operation event.
- *
- * @param EventId           Event ID
- * @param SourceProcessId   Source process ID
- * @param TargetProcessId   Target process ID
- * @param BaseAddress       Memory base address
- * @param RegionSize        Region size
- * @param Protection        Memory protection
- * @param ThreatScore       Threat score
- * @param Flags             Memory flags
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogMemoryEvent(
@@ -1208,20 +1130,6 @@ TeLogMemoryEvent(
     _In_ UINT32 Flags
     );
 
-/**
- * @brief Log injection detection event.
- *
- * @param SourceProcessId   Injector process ID
- * @param TargetProcessId   Target process ID
- * @param InjectionMethod   Detected injection method
- * @param TargetAddress     Injection target address
- * @param Size              Injection size
- * @param ThreatScore       Threat score
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogInjection(
@@ -1237,21 +1145,6 @@ TeLogInjection(
 // EVENT LOGGING - DETECTION
 // ============================================================================
 
-/**
- * @brief Log threat detection event.
- *
- * @param ProcessId         Process ID
- * @param ThreatName        Threat name
- * @param ThreatScore       Threat score
- * @param Severity          Threat severity
- * @param MitreTechnique    MITRE ATT&CK technique ID
- * @param Description       Detection description
- * @param ResponseAction    Response action taken
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogThreatDetection(
@@ -1264,20 +1157,6 @@ TeLogThreatDetection(
     _In_ UINT32 ResponseAction
     );
 
-/**
- * @brief Log behavioral alert event.
- *
- * @param ProcessId         Process ID
- * @param BehaviorType      Behavior type
- * @param Category          Behavior category
- * @param ThreatScore       Threat score
- * @param ChainId           Attack chain ID (0 if none)
- * @param Description       Alert description
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogBehaviorAlert(
@@ -1289,20 +1168,6 @@ TeLogBehaviorAlert(
     _In_opt_ PCWSTR Description
     );
 
-/**
- * @brief Log attack chain event.
- *
- * @param ChainId           Chain ID
- * @param Stage             Attack stage
- * @param ProcessId         Current process ID
- * @param EventType         Behavior event type
- * @param ThreatScore       Cumulative threat score
- * @param MitreTechnique    MITRE technique ID
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogAttackChain(
@@ -1318,20 +1183,6 @@ TeLogAttackChain(
 // EVENT LOGGING - SECURITY
 // ============================================================================
 
-/**
- * @brief Log tamper attempt event.
- *
- * @param TamperType        Type of tamper attempt
- * @param ProcessId         Attacker process ID
- * @param TargetComponent   Targeted component
- * @param TargetAddress     Target address (if applicable)
- * @param Blocked           TRUE if blocked
- * @param Description       Description
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogTamperAttempt(
@@ -1343,19 +1194,6 @@ TeLogTamperAttempt(
     _In_opt_ PCWSTR Description
     );
 
-/**
- * @brief Log evasion attempt event.
- *
- * @param EvasionType       Evasion technique
- * @param ProcessId         Process ID
- * @param TargetModule      Target module name
- * @param TargetFunction    Target function name
- * @param ThreatScore       Threat score
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogEvasionAttempt(
@@ -1366,20 +1204,6 @@ TeLogEvasionAttempt(
     _In_ UINT32 ThreatScore
     );
 
-/**
- * @brief Log credential access attempt.
- *
- * @param ProcessId             Attacker process ID
- * @param TargetProcessId       Target process ID (e.g., lsass)
- * @param AccessType            Credential access type
- * @param AccessMask            Requested access mask
- * @param ThreatScore           Threat score
- * @param Blocked               TRUE if blocked
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogCredentialAccess(
@@ -1395,19 +1219,6 @@ TeLogCredentialAccess(
 // EVENT LOGGING - OPERATIONAL
 // ============================================================================
 
-/**
- * @brief Log driver operational event.
- *
- * @param EventId       Event ID
- * @param Level         Event level
- * @param ComponentId   Source component
- * @param Message       Event message
- * @param ErrorCode     Error code (0 if none)
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogOperational(
@@ -1418,21 +1229,6 @@ TeLogOperational(
     _In_ UINT32 ErrorCode
     );
 
-/**
- * @brief Log error event with source location.
- *
- * @param ComponentId   Source component
- * @param ErrorCode     Error code (NTSTATUS)
- * @param Severity      Error severity
- * @param FileName      Source file name
- * @param FunctionName  Function name
- * @param LineNumber    Line number
- * @param Message       Error message
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogError(
@@ -1445,19 +1241,6 @@ TeLogError(
     _In_ PCWSTR Message
     );
 
-/**
- * @brief Log component health status change.
- *
- * @param ComponentId   Component ID
- * @param NewStatus     New health status
- * @param OldStatus     Previous health status
- * @param ErrorCode     Associated error code
- * @param Message       Status message
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogComponentHealth(
@@ -1468,15 +1251,6 @@ TeLogComponentHealth(
     _In_opt_ PCWSTR Message
     );
 
-/**
- * @brief Log performance statistics.
- *
- * @param Stats     Performance statistics structure
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeLogPerformanceStats(
@@ -1487,26 +1261,12 @@ TeLogPerformanceStats(
 // STATISTICS
 // ============================================================================
 
-/**
- * @brief Get telemetry statistics.
- *
- * @param Stats     Receives statistics
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 TeGetStatistics(
     _Out_ PTE_STATISTICS Stats
     );
 
-/**
- * @brief Reset telemetry statistics.
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 TeResetStatistics(
@@ -1520,7 +1280,8 @@ TeResetStatistics(
 /**
  * @brief Flush pending telemetry events.
  *
- * Forces immediate write of all buffered events.
+ * Currently events are written synchronously, so this updates
+ * the last flush timestamp. Present for API completeness.
  *
  * @irql <= DISPATCH_LEVEL
  */
@@ -1530,39 +1291,18 @@ TeFlush(
     VOID
     );
 
-/**
- * @brief Generate new correlation ID.
- *
- * @return Unique correlation ID
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 UINT64
 TeGenerateCorrelationId(
     VOID
     );
 
-/**
- * @brief Get current sequence number.
- *
- * @return Current sequence number
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 UINT64
 TeGetSequenceNumber(
     VOID
     );
 
-/**
- * @brief Get telemetry subsystem state.
- *
- * @return Current state
- *
- * @irql <= DISPATCH_LEVEL
- */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 TE_STATE
 TeGetState(
@@ -1573,27 +1313,15 @@ TeGetState(
 // CONVENIENCE MACROS
 // ============================================================================
 
-/**
- * @brief Log error with automatic source location.
- */
 #define TE_LOG_ERROR(comp, status, sev, msg) \
     TeLogError(comp, status, sev, __FILE__, __FUNCTION__, __LINE__, msg)
 
-/**
- * @brief Log warning with automatic source location.
- */
 #define TE_LOG_WARNING(comp, msg) \
     TeLogOperational(TeEvent_Warning, TeLevel_Warning, comp, msg, 0)
 
-/**
- * @brief Log info message.
- */
 #define TE_LOG_INFO(comp, msg) \
     TeLogOperational(TeEvent_Debug, TeLevel_Informational, comp, msg, 0)
 
-/**
- * @brief Log debug message (verbose only).
- */
 #define TE_LOG_DEBUG(comp, msg) \
     do { \
         if (TeIsEventEnabled(TeLevel_Verbose, TeKeyword_Debug)) { \
@@ -1601,27 +1329,15 @@ TeGetState(
         } \
     } while(0)
 
-/**
- * @brief Check if process events are enabled.
- */
 #define TE_PROCESS_ENABLED() \
     TeIsEventEnabled(TeLevel_Informational, TeKeyword_Process)
 
-/**
- * @brief Check if file events are enabled.
- */
 #define TE_FILE_ENABLED() \
     TeIsEventEnabled(TeLevel_Informational, TeKeyword_File)
 
-/**
- * @brief Check if threat events are enabled.
- */
 #define TE_THREAT_ENABLED() \
     TeIsEventEnabled(TeLevel_Warning, TeKeyword_Threat)
 
-/**
- * @brief Check if security events are enabled.
- */
 #define TE_SECURITY_ENABLED() \
     TeIsEventEnabled(TeLevel_Warning, TeKeyword_Security)
 

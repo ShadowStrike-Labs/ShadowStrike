@@ -27,10 +27,14 @@ extern "C" {
 // Pool Tags
 //=============================================================================
 
-#define MS_POOL_TAG_PATTERN     'PMSM'  // Memory Scanner - Pattern
-#define MS_POOL_TAG_CONTEXT     'CMSM'  // Memory Scanner - Context
-#define MS_POOL_TAG_RESULT      'RMSM'  // Memory Scanner - Result
-#define MS_POOL_TAG_BUFFER      'BMSM'  // Memory Scanner - Buffer
+//
+// Pool tags read naturally in WinDbg (stored little-endian, displayed reversed).
+// 'MScP' displays as "PcSM" — "Pattern, context, Scanner, Memory"
+//
+#define MS_POOL_TAG_PATTERN     'MScP'  // Memory Scanner - Pattern
+#define MS_POOL_TAG_CONTEXT     'MScC'  // Memory Scanner - Context
+#define MS_POOL_TAG_RESULT      'MScR'  // Memory Scanner - Result
+#define MS_POOL_TAG_BUFFER      'MScB'  // Memory Scanner - Buffer
 
 //=============================================================================
 // Configuration Constants
@@ -146,7 +150,7 @@ typedef struct _MS_PATTERN {
     // Statistics
     //
     volatile LONG64 MatchCount;
-    LARGE_INTEGER LastMatchTime;
+    volatile LONG64 LastMatchTime;      // KeQuerySystemTime as LONG64 for atomic writes
     
     //
     // List linkage
@@ -291,9 +295,9 @@ typedef struct _MS_SCAN_RESULT {
 
 typedef struct _MS_SCANNER {
     //
-    // Initialization state
+    // Initialization state (volatile LONG for interlocked access)
     //
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     
     //
     // Pattern database
@@ -307,7 +311,7 @@ typedef struct _MS_SCANNER {
     // Aho-Corasick automaton (for multi-pattern)
     //
     PVOID AhoCorasickState;
-    BOOLEAN AhoCorasickReady;
+    volatile LONG AhoCorasickReady;
     EX_PUSH_LOCK AhoCorasickLock;
     
     //
@@ -365,6 +369,7 @@ typedef VOID (*MS_SCAN_COMPLETE_CALLBACK)(
 
 NTSTATUS
 MsInitialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PMS_SCANNER* Scanner
     );
 
@@ -479,6 +484,7 @@ MsCancelScan(
 
 VOID
 MsFreeScanResult(
+    _In_ PMS_SCANNER Scanner,
     _In_ PMS_SCAN_RESULT Result
     );
 
@@ -493,6 +499,15 @@ MsGetNextMatch(
 // Public API - Entropy Analysis
 //=============================================================================
 
+/**
+ * @brief Result entry for high-entropy region discovery.
+ */
+typedef struct _MS_ENTROPY_REGION {
+    PVOID BaseAddress;                  // Address in target process VA space
+    SIZE_T RegionSize;
+    ULONG EntropyPercent;
+} MS_ENTROPY_REGION, *PMS_ENTROPY_REGION;
+
 NTSTATUS
 MsCalculateEntropy(
     _In_reads_bytes_(Size) PVOID Buffer,
@@ -505,7 +520,7 @@ MsFindHighEntropyRegions(
     _In_ PMS_SCANNER Scanner,
     _In_ HANDLE ProcessId,
     _In_ ULONG EntropyThreshold,
-    _Out_writes_to_(MaxResults, *ResultCount) PVOID* Results,
+    _Out_writes_to_(MaxResults, *ResultCount) PMS_ENTROPY_REGION Results,
     _In_ ULONG MaxResults,
     _Out_ PULONG ResultCount
     );

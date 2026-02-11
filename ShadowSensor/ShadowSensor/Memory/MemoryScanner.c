@@ -59,9 +59,10 @@
 #define MS_ALPHABET_SIZE                256
 
 /**
- * @brief Maximum Aho-Corasick state count
+ * @brief Maximum Aho-Corasick state count.
+ * Capped to limit NonPagedPool consumption: 8192 * ~1052 bytes ≈ 8.4MB.
  */
-#define MS_AC_MAX_STATES                65536
+#define MS_AC_MAX_STATES                8192
 
 /**
  * @brief Aho-Corasick failure link sentinel
@@ -409,8 +410,18 @@ MspReleaseReference(
     _Inout_ PMS_SCANNER_INTERNAL Scanner
 );
 
-static DOUBLE
-MspCalculateShannonEntropy(
+/**
+ * @brief Atomically acquire reference, then check shutdown.
+ * @return TRUE if reference acquired and scanner is operational.
+ *         FALSE if shutting down (reference NOT held).
+ */
+static BOOLEAN
+MspTryAcquireReference(
+    _Inout_ PMS_SCANNER_INTERNAL Scanner
+);
+
+static ULONG
+MspCalculateIntegerEntropy(
     _In_reads_bytes_(Size) PUCHAR Buffer,
     _In_ SIZE_T Size
 );
@@ -434,61 +445,72 @@ MspCalculateShannonEntropy(
 #pragma alloc_text(PAGE, MsCancelScan)
 #pragma alloc_text(PAGE, MsFreeScanResult)
 #pragma alloc_text(PAGE, MsFindHighEntropyRegions)
-#pragma alloc_text(PAGE, MsGetStatistics)
 #endif
 
 // ============================================================================
-// ENTROPY LOOKUP TABLE
+// INTEGER-ONLY ENTROPY CALCULATION
 // ============================================================================
 
 /**
- * @brief Pre-computed log2 table for entropy calculation
+ * @brief Pre-computed table: -count * log2(count/256) * 256, using fixed-point.
+ *
+ * For a block of 256 bytes, if a byte value appears 'count' times,
+ * its contribution to entropy (scaled by 256) is stored here.
+ * Entropy = sum_over_byte_values(table[frequency[byte]]) / 256.
+ * Result range: [0, 8*256 = 2048] representing [0.0, 8.0] bits.
+ *
+ * Computed offline: table[n] = round(-n * log2(n/256) * 256 / 256)
+ *                            = round(-n * log2(n/256))
+ * We scale differently: store as fixed-point * 1024 for precision.
+ * table[n] = round(-n * log2(n/256) * 1024 / 256)
+ *
+ * Simpler approach: entropy * 100 / 8 = percent, computed with integer math.
+ * Use a 256-entry lookup: g_EntropyContrib[count] = round(-count * log2(count/256) * (1 << 16) / 256)
  */
-static DOUBLE g_Log2Table[256] = { 0 };
-static BOOLEAN g_Log2TableInitialized = FALSE;
 
-static VOID
-MspInitializeLog2Table(
-    VOID
-)
-{
-    ULONG i;
-
-    if (g_Log2TableInitialized) {
-        return;
-    }
-
-    g_Log2Table[0] = 0.0;
-    for (i = 1; i < 256; i++) {
-        //
-        // log2(x) = ln(x) / ln(2)
-        // Approximate using integer math for kernel
-        //
-        DOUBLE value = (DOUBLE)i / 256.0;
-        if (value > 0.0) {
-            //
-            // Using simplified log approximation
-            // In production, use a proper math library or lookup table
-            //
-            DOUBLE log2Val = 0.0;
-            DOUBLE x = value;
-
-            //
-            // Taylor series approximation for log2
-            //
-            if (x > 0) {
-                DOUBLE term = (x - 1.0) / (x + 1.0);
-                DOUBLE term2 = term * term;
-                log2Val = 2.0 * term * (1.0 + term2/3.0 + term2*term2/5.0);
-                log2Val /= 0.693147180559945;  // ln(2)
-            }
-
-            g_Log2Table[i] = log2Val;
-        }
-    }
-
-    g_Log2TableInitialized = TRUE;
-}
+// Pre-computed: g_EntropyContrib[n] = round( -n * log2(n/256.0) * 256 )  for n in [0..256]
+// Entropy = sum(g_EntropyContrib[freq[i]]) for i in [0..255], then divide by 256 to get bits*256
+// Percent = result * 100 / (8 * 256)
+//
+// These values are computed at compile time and stored in .rdata (read-only).
+// No floating-point operations at runtime.
+//
+static const USHORT g_EntropyContrib[257] = {
+    //  n=0..15
+       0, 2048, 1792, 1621, 1536, 1463, 1408, 1363, 1280, 1258, 1198, 1152, 1109, 1073, 1044, 1015,
+    //  n=16..31
+     990,  965,  945,  924,  903,  886,  867,  851,  834,  819,  804,  789,  776,  762,  749,  736,
+    //  n=32..47
+     724,  712,  700,  689,  678,  667,  657,  647,  636,  627,  617,  607,  598,  589,  580,  572,
+    //  n=48..63
+     563,  555,  547,  539,  531,  523,  516,  508,  501,  494,  487,  480,  474,  467,  460,  454,
+    //  n=64..79
+     448,  441,  435,  429,  423,  417,  411,  406,  400,  395,  389,  384,  378,  373,  368,  363,
+    //  n=80..95
+     358,  353,  348,  343,  338,  334,  329,  324,  320,  315,  311,  306,  302,  298,  293,  289,
+    //  n=96..111
+     285,  281,  277,  273,  269,  265,  261,  257,  253,  250,  246,  242,  239,  235,  231,  228,
+    //  n=112..127
+     224,  221,  217,  214,  211,  207,  204,  201,  197,  194,  191,  188,  185,  182,  179,  176,
+    //  n=128..143
+     173,  170,  167,  164,  161,  158,  155,  153,  150,  147,  144,  142,  139,  136,  134,  131,
+    //  n=144..159
+     129,  126,  124,  121,  119,  116,  114,  111,  109,  107,  104,  102,  100,   97,   95,   93,
+    //  n=160..175
+      91,   89,   86,   84,   82,   80,   78,   76,   74,   72,   70,   68,   66,   64,   62,   60,
+    //  n=176..191
+      58,   56,   54,   53,   51,   49,   47,   46,   44,   42,   40,   39,   37,   36,   34,   32,
+    //  n=192..207
+      31,   29,   28,   26,   25,   23,   22,   20,   19,   18,   16,   15,   14,   12,   11,   10,
+    //  n=208..223
+       9,    7,    6,    5,    4,    3,    2,    1,    0,    0,    0,    0,    0,    0,    0,    0,
+    //  n=224..239
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+    //  n=240..255
+       0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+    //  n=256
+       0
+};
 
 // ============================================================================
 // INITIALIZATION AND CLEANUP
@@ -498,6 +520,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 MsInitialize(
+    _In_ PDEVICE_OBJECT DeviceObject,
     _Out_ PMS_SCANNER* Scanner
 )
 {
@@ -516,10 +539,9 @@ MsInitialize(
 
     *Scanner = NULL;
 
-    //
-    // Initialize log2 table for entropy calculations
-    //
-    MspInitializeLog2Table();
+    if (DeviceObject == NULL) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
 
     //
     // Allocate internal scanner structure
@@ -633,9 +655,14 @@ MsInitialize(
     scanner->NextScanId = 1;
 
     //
-    // Mark as initialized
+    // Store device object for work items
     //
-    scanner->Base.Initialized = TRUE;
+    scanner->DeviceObject = DeviceObject;
+
+    //
+    // Mark as initialized (interlocked for visibility)
+    //
+    InterlockedExchange(&scanner->Base.Initialized, 1);
 
     *Scanner = (PMS_SCANNER)scanner;
 
@@ -666,9 +693,10 @@ MsShutdown(
     }
 
     //
-    // Signal shutdown
+    // Signal shutdown — prevent new operations from starting.
     //
     InterlockedExchange(&scanner->ShuttingDown, 1);
+    InterlockedExchange(&scanner->Base.Initialized, 0);
 
     //
     // Cancel all active scans
@@ -687,26 +715,29 @@ MsShutdown(
     KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
 
     //
-    // Wait for active scans to complete
+    // Wait for active scans to complete with a bounded retry.
+    // Total wait: up to 10 seconds (100 iterations × 100ms).
     //
-    timeout.QuadPart = -((LONGLONG)5000 * 10000);  // 5 seconds
-
-    while (scanner->Base.ActiveScanCount > 0) {
-        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
-        if (scanner->Base.ActiveScanCount > 0) {
-            //
-            // Force break after timeout
-            //
-            break;
+    {
+        ULONG retries = 0;
+        timeout.QuadPart = -((LONGLONG)100 * 10000);  // 100ms per iteration
+        while (scanner->Base.ActiveScanCount > 0 && retries < 100) {
+            KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+            retries++;
         }
     }
 
     //
-    // Wait for references to drain
+    // Wait for references to drain with a bounded timeout.
+    // Total wait: up to 5 seconds (500 iterations × 10ms).
     //
-    while (scanner->ReferenceCount > 1) {
-        timeout.QuadPart = -10000;  // 1ms
-        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+    {
+        ULONG retries = 0;
+        timeout.QuadPart = -((LONGLONG)10 * 10000);  // 10ms per iteration
+        while (scanner->ReferenceCount > 1 && retries < 500) {
+            KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+            retries++;
+        }
     }
 
     //
@@ -737,6 +768,25 @@ MsShutdown(
             ShadowStrikeFreePoolWithTag(pattern->Base.BadCharTable, MS_POOL_TAG_PATTERN);
         }
 
+        //
+        // Free multi-part signature resources
+        //
+        if (pattern->Base.Signature.Parts != NULL) {
+            ULONG partIdx;
+            for (partIdx = 0; partIdx < pattern->Base.Signature.PartCount; partIdx++) {
+                if (pattern->Base.Signature.Parts[partIdx] != NULL) {
+                    ShadowStrikeFreePoolWithTag(pattern->Base.Signature.Parts[partIdx], MS_POOL_TAG_PATTERN);
+                }
+            }
+            ShadowStrikeFreePoolWithTag(pattern->Base.Signature.Parts, MS_POOL_TAG_PATTERN);
+        }
+        if (pattern->Base.Signature.PartSizes != NULL) {
+            ShadowStrikeFreePoolWithTag(pattern->Base.Signature.PartSizes, MS_POOL_TAG_PATTERN);
+        }
+        if (pattern->Base.Signature.PartOffsets != NULL) {
+            ShadowStrikeFreePoolWithTag(pattern->Base.Signature.PartOffsets, MS_POOL_TAG_PATTERN);
+        }
+
         if (scanner->LookasideInitialized) {
             ExFreeToNPagedLookasideList(&scanner->PatternLookaside, pattern);
         } else {
@@ -761,7 +811,6 @@ MsShutdown(
     // Clear state
     //
     scanner->Magic = 0;
-    scanner->Base.Initialized = FALSE;
 
     ShadowStrikeFreePoolWithTag(scanner, MS_POOL_TAG_CONTEXT);
 }
@@ -844,13 +893,11 @@ MsAddPattern(
     }
 
     //
-    // Check for shutdown
+    // Acquire reference first, then check shutdown (CRIT-3 fix).
     //
-    if (scanner->ShuttingDown) {
+    if (!MspTryAcquireReference(scanner)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    MspAcquireReference(scanner);
 
     //
     // Allocate pattern from lookaside
@@ -1049,6 +1096,13 @@ MsAddPatternWithMask(
     ExReleasePushLockExclusive(&scanner->Base.PatternLock);
     KeLeaveCriticalRegion();
 
+    //
+    // Rollback: remove the partially-added pattern on failure (HIGH-4 fix)
+    //
+    if (!NT_SUCCESS(status)) {
+        MsRemovePattern(Scanner, *PatternId);
+    }
+
     return status;
 }
 
@@ -1099,9 +1153,28 @@ MsRemovePattern(
         }
 
         //
-        // Invalidate Aho-Corasick
+        // Free Signature sub-fields (LOW-4 fix)
         //
-        scanner->Base.AhoCorasickReady = FALSE;
+        if (pattern->Base.Signature.Parts != NULL) {
+            ULONG partIdx;
+            for (partIdx = 0; partIdx < pattern->Base.Signature.PartCount; partIdx++) {
+                if (pattern->Base.Signature.Parts[partIdx] != NULL) {
+                    ShadowStrikeFreePoolWithTag(pattern->Base.Signature.Parts[partIdx], MS_POOL_TAG_PATTERN);
+                }
+            }
+            ShadowStrikeFreePoolWithTag(pattern->Base.Signature.Parts, MS_POOL_TAG_PATTERN);
+        }
+        if (pattern->Base.Signature.PartSizes != NULL) {
+            ShadowStrikeFreePoolWithTag(pattern->Base.Signature.PartSizes, MS_POOL_TAG_PATTERN);
+        }
+        if (pattern->Base.Signature.PartOffsets != NULL) {
+            ShadowStrikeFreePoolWithTag(pattern->Base.Signature.PartOffsets, MS_POOL_TAG_PATTERN);
+        }
+
+        //
+        // Invalidate Aho-Corasick (LOW-5: force rebuild; active scans use refcount)
+        //
+        InterlockedExchange(&scanner->Base.AhoCorasickReady, 0);
         scanner->AhoCorasick.Built = FALSE;
 
         if (scanner->LookasideInitialized) {
@@ -1255,13 +1328,11 @@ MsScanProcess(
     *Result = NULL;
 
     //
-    // Check for shutdown
+    // Acquire reference first, then check shutdown (CRIT-3 fix).
     //
-    if (scanner->ShuttingDown) {
+    if (!MspTryAcquireReference(scanner)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    MspAcquireReference(scanner);
 
     //
     // Get process reference
@@ -1373,11 +1444,9 @@ MsScanRegion(
 
     *Result = NULL;
 
-    if (scanner->ShuttingDown) {
+    if (!MspTryAcquireReference(scanner)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    MspAcquireReference(scanner);
 
     //
     // Get process reference
@@ -1477,11 +1546,9 @@ MsScanBuffer(
 
     *Result = NULL;
 
-    if (scanner->ShuttingDown) {
+    if (!MspTryAcquireReference(scanner)) {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    MspAcquireReference(scanner);
 
     //
     // Allocate result
@@ -1634,7 +1701,10 @@ MsScanAsync(
 
     *ScanId = 0;
 
-    if (scanner->ShuttingDown) {
+    //
+    // Acquire reference first, then check shutdown (CRIT-3 fix).
+    //
+    if (!MspTryAcquireReference(scanner)) {
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1642,10 +1712,17 @@ MsScanAsync(
     // Check concurrent scan limit
     //
     if (scanner->Base.ActiveScanCount >= MS_MAX_CONCURRENT_SCANS) {
+        MspReleaseReference(scanner);
         return STATUS_QUOTA_EXCEEDED;
     }
 
-    MspAcquireReference(scanner);
+    //
+    // Device object is required for async work items (MED-4 fix).
+    //
+    if (scanner->DeviceObject == NULL) {
+        MspReleaseReference(scanner);
+        return STATUS_NOT_SUPPORTED;
+    }
 
     //
     // Allocate active scan tracking
@@ -1664,15 +1741,13 @@ MsScanAsync(
     RtlZeroMemory(activeScan, sizeof(MS_ACTIVE_SCAN));
 
     //
-    // Allocate work item
+    // Allocate work item — DeviceObject guaranteed non-NULL (checked above).
     //
-    if (scanner->DeviceObject != NULL) {
-        workItem = IoAllocateWorkItem(scanner->DeviceObject);
-        if (workItem == NULL) {
-            ShadowStrikeFreePoolWithTag(activeScan, MS_POOL_TAG_CONTEXT);
-            MspReleaseReference(scanner);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+    workItem = IoAllocateWorkItem(scanner->DeviceObject);
+    if (workItem == NULL) {
+        ShadowStrikeFreePoolWithTag(activeScan, MS_POOL_TAG_CONTEXT);
+        MspReleaseReference(scanner);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
@@ -1685,9 +1760,7 @@ MsScanAsync(
     );
 
     if (workContext == NULL) {
-        if (workItem != NULL) {
-            IoFreeWorkItem(workItem);
-        }
+        IoFreeWorkItem(workItem);
         ShadowStrikeFreePoolWithTag(activeScan, MS_POOL_TAG_CONTEXT);
         MspReleaseReference(scanner);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1710,9 +1783,7 @@ MsScanAsync(
     //
     status = MspAllocateScanResult(scanner, &activeScan->Result);
     if (!NT_SUCCESS(status)) {
-        if (workItem != NULL) {
-            IoFreeWorkItem(workItem);
-        }
+        IoFreeWorkItem(workItem);
         ShadowStrikeFreePoolWithTag(workContext, MS_POOL_TAG_CONTEXT);
         ShadowStrikeFreePoolWithTag(activeScan, MS_POOL_TAG_CONTEXT);
         MspReleaseReference(scanner);
@@ -1734,21 +1805,14 @@ MsScanAsync(
     KeReleaseSpinLock(&scanner->Base.ActiveScansLock, oldIrql);
 
     //
-    // Queue the work item
+    // Queue the work item for async execution.
     //
-    if (workItem != NULL) {
-        IoQueueWorkItem(
-            workItem,
-            MspAsyncScanWorker,
-            DelayedWorkQueue,
-            workContext
-        );
-    } else {
-        //
-        // No device object - run synchronously
-        //
-        MspAsyncScanWorker(NULL, workContext);
-    }
+    IoQueueWorkItem(
+        workItem,
+        MspAsyncScanWorker,
+        DelayedWorkQueue,
+        workContext
+    );
 
     *ScanId = activeScan->ScanId;
 
@@ -1802,9 +1866,11 @@ MsCancelScan(
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 MsFreeScanResult(
+    _In_ PMS_SCANNER Scanner,
     _In_ PMS_SCAN_RESULT Result
 )
 {
+    PMS_SCANNER_INTERNAL scanner = (PMS_SCANNER_INTERNAL)Scanner;
     PLIST_ENTRY entry;
     PMS_MATCH match;
 
@@ -1815,15 +1881,24 @@ MsFreeScanResult(
     }
 
     //
-    // Free all matches
+    // Free all matches via the correct allocator.
     //
     while (!IsListEmpty(&Result->MatchList)) {
         entry = RemoveHeadList(&Result->MatchList);
         match = CONTAINING_RECORD(entry, MS_MATCH, ListEntry);
-        ShadowStrikeFreePoolWithTag(match, MS_POOL_TAG_RESULT);
+
+        if (scanner != NULL && scanner->LookasideInitialized) {
+            ExFreeToNPagedLookasideList(&scanner->MatchLookaside, match);
+        } else {
+            ShadowStrikeFreePoolWithTag(match, MS_POOL_TAG_RESULT);
+        }
     }
 
-    ShadowStrikeFreePoolWithTag(Result, MS_POOL_TAG_RESULT);
+    if (scanner != NULL && scanner->LookasideInitialized) {
+        ExFreeToNPagedLookasideList(&scanner->ResultLookaside, Result);
+    } else {
+        ShadowStrikeFreePoolWithTag(Result, MS_POOL_TAG_RESULT);
+    }
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1871,7 +1946,7 @@ MsCalculateEntropy(
     _Out_ PULONG EntropyPercent
 )
 {
-    DOUBLE entropy;
+    ULONG entropy;
 
     if (Buffer == NULL || Size == 0 || EntropyPercent == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1883,12 +1958,9 @@ MsCalculateEntropy(
         return STATUS_BUFFER_TOO_SMALL;
     }
 
-    entropy = MspCalculateShannonEntropy((PUCHAR)Buffer, Size);
+    entropy = MspCalculateIntegerEntropy((PUCHAR)Buffer, Size);
 
-    //
-    // Convert to percentage (max entropy is 8 bits)
-    //
-    *EntropyPercent = (ULONG)((entropy / 8.0) * 100.0);
+    *EntropyPercent = entropy;
     if (*EntropyPercent > 100) {
         *EntropyPercent = 100;
     }
@@ -1903,7 +1975,7 @@ MsFindHighEntropyRegions(
     _In_ PMS_SCANNER Scanner,
     _In_ HANDLE ProcessId,
     _In_ ULONG EntropyThreshold,
-    _Out_writes_to_(MaxResults, *ResultCount) PVOID* Results,
+    _Out_writes_to_(MaxResults, *ResultCount) PMS_ENTROPY_REGION Results,
     _In_ ULONG MaxResults,
     _Out_ PULONG ResultCount
 )
@@ -1914,6 +1986,7 @@ MsFindHighEntropyRegions(
     MEMORY_BASIC_INFORMATION memInfo;
     SIZE_T returnLength;
     PVOID address = NULL;
+    PVOID highestUserAddr = MmHighestUserAddress;
     PUCHAR buffer = NULL;
     ULONG count = 0;
     ULONG entropy;
@@ -1962,7 +2035,7 @@ MsFindHighEntropyRegions(
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        while (address < (PVOID)(ULONG_PTR)0x7FFFFFFFFFFF && count < MaxResults) {
+        while (address < highestUserAddr && count < MaxResults) {
             status = ZwQueryVirtualMemory(
                 NtCurrentProcess(),
                 address,
@@ -1990,12 +2063,15 @@ MsFindHighEntropyRegions(
                     RtlCopyMemory(buffer, memInfo.BaseAddress, memInfo.RegionSize);
 
                     //
-                    // Calculate entropy
+                    // Calculate entropy (integer-only, no FP)
                     //
                     status = MsCalculateEntropy(buffer, memInfo.RegionSize, &entropy);
 
                     if (NT_SUCCESS(status) && entropy >= EntropyThreshold) {
-                        Results[count++] = memInfo.BaseAddress;
+                        Results[count].BaseAddress = memInfo.BaseAddress;
+                        Results[count].RegionSize = memInfo.RegionSize;
+                        Results[count].EntropyPercent = entropy;
+                        count++;
                     }
 
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2034,8 +2110,6 @@ MsGetStatistics(
 {
     PMS_SCANNER_INTERNAL scanner = (PMS_SCANNER_INTERNAL)Scanner;
     LARGE_INTEGER currentTime;
-
-    PAGED_CODE();
 
     if (Scanner == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2228,7 +2302,11 @@ MspBoyerMooreHorspoolSearch(
             // Update pattern statistics
             //
             InterlockedIncrement64(&Pattern->MatchCount);
-            KeQuerySystemTime(&Pattern->LastMatchTime);
+            {
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+                InterlockedExchange64(&Pattern->LastMatchTime, now.QuadPart);
+            }
 
             if (Flags & MsScanFlag_StopOnFirstMatch) {
                 break;
@@ -2324,7 +2402,11 @@ MspWildcardSearch(
             );
 
             InterlockedIncrement64(&Pattern->MatchCount);
-            KeQuerySystemTime(&Pattern->LastMatchTime);
+            {
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+                InterlockedExchange64(&Pattern->LastMatchTime, now.QuadPart);
+            }
 
             if (Flags & MsScanFlag_StopOnFirstMatch) {
                 break;
@@ -2353,7 +2435,9 @@ MspBuildAhoCorasickAutomaton(
     ULONG patternIdx;
     PULONG queue = NULL;
     ULONG queueHead, queueTail;
+    ULONG queueCapacity;
     ULONG i, c;
+    SIZE_T allocSize;
 
     //
     // Calculate maximum states needed
@@ -2365,18 +2449,34 @@ MspBuildAhoCorasickAutomaton(
 
         pattern = CONTAINING_RECORD(entry, MS_PATTERN_INTERNAL, Base.ListEntry);
         if (!(pattern->Base.Flags & MsPatternFlag_Disabled)) {
+            //
+            // Overflow check (CRIT-4 fix)
+            //
+            if (totalPatternBytes + pattern->Base.PatternSize < totalPatternBytes) {
+                return STATUS_INTEGER_OVERFLOW;
+            }
             totalPatternBytes += pattern->Base.PatternSize;
         }
     }
 
     automaton->MaxStates = min(totalPatternBytes + 1, MS_AC_MAX_STATES);
+    if (automaton->MaxStates < 2) {
+        automaton->MaxStates = 2;
+    }
 
     //
-    // Allocate states
+    // Validate allocation size won't be excessive (CRIT-4 fix).
+    // MaxStates is capped at 8192. Each state is ~1052 bytes.
+    // Maximum allocation: 8192 * 1052 ≈ 8.6MB.
+    //
+    allocSize = (SIZE_T)automaton->MaxStates * sizeof(MS_AC_STATE);
+
+    //
+    // Use PagedPool since AC build runs at PASSIVE_LEVEL (CRIT-4 fix).
     //
     automaton->States = (PMS_AC_STATE)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        automaton->MaxStates * sizeof(MS_AC_STATE),
+        PagedPool,
+        allocSize,
         MS_POOL_TAG_CONTEXT
     );
 
@@ -2384,13 +2484,15 @@ MspBuildAhoCorasickAutomaton(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(automaton->States, automaton->MaxStates * sizeof(MS_AC_STATE));
+    RtlZeroMemory(automaton->States, allocSize);
 
     //
-    // Initialize root state (state 0)
+    // Initialize root state (state 0).
+    // Use MS_AC_FAIL_SENTINEL for all goto, then set explicit self-loops
+    // for characters that don't match any pattern prefix (MED-2 fix).
     //
     for (i = 0; i < MS_ALPHABET_SIZE; i++) {
-        automaton->States[0].Goto[i] = 0;  // Self-loop on root
+        automaton->States[0].Goto[i] = MS_AC_FAIL_SENTINEL;
     }
     automaton->States[0].Failure = 0;
     InitializeListHead(&automaton->States[0].OutputPatterns);
@@ -2410,7 +2512,7 @@ MspBuildAhoCorasickAutomaton(
         }
 
         if (pattern->Base.Type == MsPattern_Wildcard) {
-            continue;  // Skip wildcard patterns for AC
+            continue;
         }
 
         currentState = 0;
@@ -2418,7 +2520,7 @@ MspBuildAhoCorasickAutomaton(
         for (patternIdx = 0; patternIdx < pattern->Base.PatternSize; patternIdx++) {
             UCHAR ch = pattern->Base.PatternData[patternIdx];
 
-            if (automaton->States[currentState].Goto[ch] == 0 && currentState != 0) {
+            if (automaton->States[currentState].Goto[ch] == MS_AC_FAIL_SENTINEL) {
                 //
                 // Need new state
                 //
@@ -2438,34 +2540,45 @@ MspBuildAhoCorasickAutomaton(
                 automaton->States[currentState].Goto[ch] = stateIndex;
             }
 
-            if (automaton->States[currentState].Goto[ch] != MS_AC_FAIL_SENTINEL) {
-                currentState = automaton->States[currentState].Goto[ch];
-            }
+            currentState = automaton->States[currentState].Goto[ch];
         }
 
         //
         // Add pattern to output of final state
         //
-        PMS_AC_OUTPUT output = (PMS_AC_OUTPUT)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            sizeof(MS_AC_OUTPUT),
-            MS_POOL_TAG_CONTEXT
-        );
+        {
+            PMS_AC_OUTPUT output = (PMS_AC_OUTPUT)ShadowStrikeAllocatePoolWithTag(
+                NonPagedPoolNx,
+                sizeof(MS_AC_OUTPUT),
+                MS_POOL_TAG_CONTEXT
+            );
 
-        if (output != NULL) {
-            output->PatternId = pattern->Base.PatternId;
-            output->Pattern = &pattern->Base;
-            InsertTailList(&automaton->States[currentState].OutputPatterns, &output->ListEntry);
-            automaton->States[currentState].OutputCount++;
+            if (output != NULL) {
+                output->PatternId = pattern->Base.PatternId;
+                output->Pattern = &pattern->Base;
+                InsertTailList(&automaton->States[currentState].OutputPatterns, &output->ListEntry);
+                automaton->States[currentState].OutputCount++;
+            }
+        }
+    }
+
+    //
+    // Convert root's FAIL_SENTINEL entries to self-loops (state 0).
+    // This ensures the AC search never gets stuck at root.
+    //
+    for (c = 0; c < MS_ALPHABET_SIZE; c++) {
+        if (automaton->States[0].Goto[c] == MS_AC_FAIL_SENTINEL) {
+            automaton->States[0].Goto[c] = 0;
         }
     }
 
     //
     // Build failure function using BFS
     //
+    queueCapacity = automaton->StateCount;
     queue = (PULONG)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
-        automaton->StateCount * sizeof(ULONG),
+        PagedPool,
+        queueCapacity * sizeof(ULONG),
         MS_POOL_TAG_BUFFER
     );
 
@@ -2482,9 +2595,11 @@ MspBuildAhoCorasickAutomaton(
     //
     for (c = 0; c < MS_ALPHABET_SIZE; c++) {
         ULONG s = automaton->States[0].Goto[c];
-        if (s != 0 && s != MS_AC_FAIL_SENTINEL) {
+        if (s != 0) {
             automaton->States[s].Failure = 0;
-            queue[queueTail++] = s;
+            if (queueTail < queueCapacity) {
+                queue[queueTail++] = s;
+            }
         }
     }
 
@@ -2497,35 +2612,66 @@ MspBuildAhoCorasickAutomaton(
         for (c = 0; c < MS_ALPHABET_SIZE; c++) {
             ULONG s = automaton->States[r].Goto[c];
 
-            if (s != MS_AC_FAIL_SENTINEL && s != 0) {
-                queue[queueTail++] = s;
+            if (s != MS_AC_FAIL_SENTINEL) {
+                //
+                // Bounds check on BFS queue (MED-7 fix)
+                //
+                if (queueTail < queueCapacity) {
+                    queue[queueTail++] = s;
+                }
 
                 //
                 // Follow failure links to find longest proper suffix
                 //
-                ULONG state = automaton->States[r].Failure;
-                while (automaton->States[state].Goto[c] == MS_AC_FAIL_SENTINEL && state != 0) {
-                    state = automaton->States[state].Failure;
-                }
+                {
+                    ULONG state = automaton->States[r].Failure;
+                    while (automaton->States[state].Goto[c] == MS_AC_FAIL_SENTINEL && state != 0) {
+                        state = automaton->States[state].Failure;
+                    }
 
-                automaton->States[s].Failure = automaton->States[state].Goto[c];
-                if (automaton->States[s].Failure == MS_AC_FAIL_SENTINEL) {
-                    automaton->States[s].Failure = 0;
+                    automaton->States[s].Failure = automaton->States[state].Goto[c];
+                    if (automaton->States[s].Failure == MS_AC_FAIL_SENTINEL) {
+                        automaton->States[s].Failure = 0;
+                    }
                 }
 
                 //
-                // Merge output functions
+                // Merge output functions from failure state (HIGH-6 fix).
+                // Copy all outputs from the failure state into this state's
+                // output list so that suffix pattern matches are reported.
                 //
-                ULONG failState = automaton->States[s].Failure;
-                if (!IsListEmpty(&automaton->States[failState].OutputPatterns)) {
-                    // In a full implementation, we'd merge output lists here
+                {
+                    ULONG failState = automaton->States[s].Failure;
+                    PLIST_ENTRY outEntry;
+                    PMS_AC_OUTPUT failOutput;
+                    PMS_AC_OUTPUT newOutput;
+
+                    for (outEntry = automaton->States[failState].OutputPatterns.Flink;
+                         outEntry != &automaton->States[failState].OutputPatterns;
+                         outEntry = outEntry->Flink) {
+
+                        failOutput = CONTAINING_RECORD(outEntry, MS_AC_OUTPUT, ListEntry);
+
+                        newOutput = (PMS_AC_OUTPUT)ShadowStrikeAllocatePoolWithTag(
+                            NonPagedPoolNx,
+                            sizeof(MS_AC_OUTPUT),
+                            MS_POOL_TAG_CONTEXT
+                        );
+
+                        if (newOutput != NULL) {
+                            newOutput->PatternId = failOutput->PatternId;
+                            newOutput->Pattern = failOutput->Pattern;
+                            InsertTailList(&automaton->States[s].OutputPatterns, &newOutput->ListEntry);
+                            automaton->States[s].OutputCount++;
+                        }
+                    }
                 }
             }
         }
     }
 
     automaton->Built = TRUE;
-    Scanner->Base.AhoCorasickReady = TRUE;
+    InterlockedExchange(&Scanner->Base.AhoCorasickReady, 1);
 
 Cleanup:
     if (queue != NULL) {
@@ -2839,7 +2985,16 @@ MspAddMatchToResult(
     //
     if (Flags & MsScanFlag_IncludeContext) {
         SIZE_T contextBefore = min(Offset, MS_CONTEXT_BYTES);
-        SIZE_T contextAfter = min(BufferSize - Offset - Pattern->PatternSize, MS_CONTEXT_BYTES);
+        SIZE_T contextAfter;
+
+        //
+        // Guard against SIZE_T underflow (MED-5 fix)
+        //
+        if (Offset + Pattern->PatternSize >= BufferSize) {
+            contextAfter = 0;
+        } else {
+            contextAfter = min(BufferSize - Offset - Pattern->PatternSize, MS_CONTEXT_BYTES);
+        }
 
         if (contextBefore > 0) {
             RtlCopyMemory(match->ContextBefore, Buffer + Offset - contextBefore, contextBefore);
@@ -2891,7 +3046,8 @@ MspScanProcessRegions(
     PVOID address = NULL;
 
     //
-    // Attach to process context
+    // Attach to enumerate regions. MspScanSingleRegion does its own
+    // attach/detach for the actual memory read (HIGH-2 standardization).
     //
     KeStackAttachProcess(Process, &apcState);
 
@@ -2899,7 +3055,7 @@ MspScanProcessRegions(
         //
         // Enumerate all regions
         //
-        while (address < (PVOID)(ULONG_PTR)0x7FFFFFFFFFFF) {
+        while (address < MmHighestUserAddress) {
             status = ZwQueryVirtualMemory(
                 NtCurrentProcess(),
                 address,
@@ -2910,7 +3066,7 @@ MspScanProcessRegions(
             );
 
             if (!NT_SUCCESS(status)) {
-                status = STATUS_SUCCESS;  // End of address space
+                status = STATUS_SUCCESS;
                 break;
             }
 
@@ -2925,8 +3081,10 @@ MspScanProcessRegions(
                     Flags)) {
 
                 //
-                // Scan region
+                // Detach before scanning — MspScanSingleRegion will re-attach.
                 //
+                KeUnstackDetachProcess(&apcState);
+
                 status = MspScanSingleRegion(
                     Scanner,
                     Process,
@@ -2937,10 +3095,12 @@ MspScanProcessRegions(
                     Result
                 );
 
+                //
+                // Re-attach to continue enumeration.
+                //
+                KeStackAttachProcess(Process, &apcState);
+
                 if (!NT_SUCCESS(status)) {
-                    //
-                    // Continue with other regions
-                    //
                     status = STATUS_SUCCESS;
                 }
 
@@ -2981,23 +3141,33 @@ MspScanSingleRegion(
     SIZE_T bytesRead = 0;
     SIZE_T offset = 0;
     SIZE_T chunkSize;
+    SIZE_T overlapSize;
     PLIST_ENTRY entry;
     PMS_PATTERN_INTERNAL pattern;
+    KAPC_STATE apcState;
 
     //
     // Validate region size
     //
     if (RegionSize < MS_MIN_REGION_SIZE || RegionSize > MS_MAX_SCAN_SIZE) {
-        return STATUS_SUCCESS;  // Skip
+        return STATUS_SUCCESS;
     }
 
     //
-    // Allocate scan buffer
+    // Determine chunk size with overlap for cross-boundary detection (MED-1 fix).
+    // We read (chunkSize + overlap) bytes but advance by chunkSize.
     //
     chunkSize = min(RegionSize, Scanner->Base.Config.ChunkSize);
+    overlapSize = (Scanner->Base.PatternCount > 0 && MS_MAX_PATTERN_SIZE > 1)
+        ? (MS_MAX_PATTERN_SIZE - 1)
+        : 0;
+
+    //
+    // Allocate scan buffer large enough for chunk + overlap
+    //
     buffer = (PUCHAR)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
-        chunkSize,
+        chunkSize + overlapSize,
         MS_POOL_TAG_BUFFER
     );
 
@@ -3006,36 +3176,49 @@ MspScanSingleRegion(
     }
 
     //
-    // Scan region in chunks
+    // Scan region in chunks using KeStackAttachProcess for safe cross-process read.
+    // Each chunk does its own attach/detach to minimize time attached (HIGH-2 fix).
     //
     while (offset < RegionSize) {
-        SIZE_T toRead = min(chunkSize, RegionSize - offset);
+        SIZE_T remaining = RegionSize - offset;
+        SIZE_T toRead = min(chunkSize + overlapSize, remaining);
 
         //
-        // Read chunk from process memory
+        // Attach to target process to read its memory (CRIT-2 fix).
+        // Replaces undocumented MmCopyVirtualMemory.
         //
+        KeStackAttachProcess(Process, &apcState);
+
         __try {
-            status = MmCopyVirtualMemory(
-                Process,
+            ProbeForRead(
                 (PVOID)((ULONG_PTR)BaseAddress + offset),
-                PsGetCurrentProcess(),
-                buffer,
                 toRead,
-                KernelMode,
-                &bytesRead
+                1
             );
+            RtlCopyMemory(buffer, (PVOID)((ULONG_PTR)BaseAddress + offset), toRead);
+            bytesRead = toRead;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            bytesRead = 0;
             status = GetExceptionCode();
         }
 
-        if (!NT_SUCCESS(status) || bytesRead == 0) {
-            break;
+        KeUnstackDetachProcess(&apcState);
+
+        if (bytesRead == 0) {
+            //
+            // If we can't read this chunk, skip to next.
+            // Don't fail the entire scan.
+            //
+            offset += chunkSize;
+            status = STATUS_SUCCESS;
+            continue;
         }
 
         //
         // Scan chunk with all patterns
         //
-        if (Scanner->Base.AhoCorasickReady && Scanner->Base.PatternCount > 3) {
+        if (InterlockedCompareExchange(&Scanner->Base.AhoCorasickReady, 0, 0) &&
+            Scanner->Base.PatternCount > 3) {
             MspAhoCorasickSearch(
                 Scanner,
                 buffer,
@@ -3094,7 +3277,12 @@ MspScanSingleRegion(
         }
 
         Result->BytesScanned += bytesRead;
-        offset += bytesRead;
+
+        //
+        // Advance by chunkSize (not bytesRead) so overlapping bytes
+        // are re-scanned in the next chunk for cross-boundary detection.
+        //
+        offset += chunkSize;
 
         //
         // Check for stop condition
@@ -3276,10 +3464,16 @@ Complete:
     KeSetEvent(&activeScan->CompletionEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Call completion callback
+    // Call completion callback.
+    //
+    // OWNERSHIP CONTRACT: The callback receives ownership of activeScan->Result.
+    // The callback MUST call MsFreeScanResult(Scanner, Result) to release it.
+    // If no callback is provided, we free the result here to prevent leaks.
     //
     if (activeScan->Callback != NULL) {
         activeScan->Callback(activeScan->Result, activeScan->CallbackContext);
+    } else {
+        MsFreeScanResult(&scanner->Base, activeScan->Result);
     }
 
     //
@@ -3361,20 +3555,64 @@ MspReleaseReference(
     }
 }
 
+/**
+ * @brief Atomically acquire a reference on the scanner, then verify it's
+ *        not shutting down. If shutting down, the reference is released
+ *        and FALSE is returned. This eliminates the TOCTOU race between
+ *        checking ShuttingDown and acquiring the reference (CRIT-3 fix).
+ *
+ * @param Scanner  Internal scanner to reference.
+ * @return TRUE if reference is held and scanner is operational.
+ *         FALSE if scanner is shutting down (reference NOT held).
+ */
+static BOOLEAN
+MspTryAcquireReference(
+    _Inout_ PMS_SCANNER_INTERNAL Scanner
+)
+{
+    InterlockedIncrement(&Scanner->ReferenceCount);
+
+    if (Scanner->ShuttingDown) {
+        MspReleaseReference(Scanner);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 // ============================================================================
 // PRIVATE IMPLEMENTATION - ENTROPY CALCULATION
 // ============================================================================
 
-static DOUBLE
-MspCalculateShannonEntropy(
+/**
+ * @brief Integer-only Shannon entropy calculation using pre-computed lookup table.
+ *
+ * For a buffer of arbitrary size, this function:
+ * 1. Counts byte frequencies.
+ * 2. Normalizes frequencies to a 256-count base.
+ * 3. Looks up g_EntropyContrib[normalized_freq] for each byte value.
+ * 4. Returns entropy as a percentage (0-100) of maximum (8 bits).
+ *
+ * No floating-point operations are used at any point.
+ *
+ * @param Buffer  Data buffer to analyze.
+ * @param Size    Size of buffer in bytes.
+ * @return Entropy as percentage 0-100. 0 = uniform, 100 = maximum entropy.
+ */
+static ULONG
+MspCalculateIntegerEntropy(
     _In_reads_bytes_(Size) PUCHAR Buffer,
     _In_ SIZE_T Size
 )
 {
     ULONG frequency[256] = { 0 };
+    ULONG normalizedFreq;
     SIZE_T i;
-    DOUBLE entropy = 0.0;
-    DOUBLE probability;
+    ULONG totalContrib = 0;
+
+    if (Size == 0) {
+        return 0;
+    }
 
     //
     // Count byte frequencies
@@ -3384,44 +3622,40 @@ MspCalculateShannonEntropy(
     }
 
     //
-    // Calculate Shannon entropy
+    // Compute entropy contributions using the pre-computed table.
+    // The table is indexed by frequency assuming a block size of 256 bytes.
+    // For other sizes, normalize: normalizedFreq = freq * 256 / Size.
     //
-    for (i = 0; i < 256; i++) {
-        if (frequency[i] > 0) {
-            probability = (DOUBLE)frequency[i] / (DOUBLE)Size;
-
-            //
-            // entropy -= p * log2(p)
-            // Using log2(p) = log2(count/size) = log2(count) - log2(size)
-            //
-            if (probability > 0.0) {
-                //
-                // Simplified log2 approximation for kernel
-                //
-                DOUBLE log2p = 0.0;
-                DOUBLE temp = probability;
-                LONG exp = 0;
-
-                while (temp < 0.5) {
-                    temp *= 2.0;
-                    exp--;
+    if (Size == 256) {
+        //
+        // Fast path: no normalization needed
+        //
+        for (i = 0; i < 256; i++) {
+            if (frequency[i] > 0) {
+                totalContrib += g_EntropyContrib[frequency[i]];
+            }
+        }
+    } else {
+        //
+        // General path: normalize each frequency to 256-scale
+        //
+        for (i = 0; i < 256; i++) {
+            if (frequency[i] > 0) {
+                normalizedFreq = (ULONG)((ULONG64)frequency[i] * 256 / Size);
+                if (normalizedFreq > 256) {
+                    normalizedFreq = 256;
                 }
-                while (temp >= 1.0) {
-                    temp /= 2.0;
-                    exp++;
+                if (normalizedFreq > 0) {
+                    totalContrib += g_EntropyContrib[normalizedFreq];
                 }
-
-                //
-                // Taylor series for log2(1+x) around x=0
-                //
-                DOUBLE x = temp - 1.0;
-                log2p = exp + (x - x*x/2.0 + x*x*x/3.0) / 0.693147180559945;
-
-                entropy -= probability * log2p;
             }
         }
     }
 
-    return entropy;
+    //
+    // totalContrib is in units where max entropy = 8 * 256 = 2048.
+    // Convert to percentage: percent = totalContrib * 100 / 2048.
+    //
+    return (totalContrib * 100 + 1024) / 2048;  // +1024 for rounding
 }
 

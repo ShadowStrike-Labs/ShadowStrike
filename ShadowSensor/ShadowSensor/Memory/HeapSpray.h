@@ -121,10 +121,9 @@ typedef struct _HS_SPRAY_RESULT {
     ULONG ConfidenceScore;
     
     //
-    // Process context
+    // Process context (ProcessId only — callbacks can resolve name if needed)
     //
     HANDLE ProcessId;
-    UNICODE_STRING ProcessName;
     
     //
     // Spray metrics
@@ -171,31 +170,31 @@ typedef struct _HS_PROCESS_CONTEXT {
     PEPROCESS Process;
     
     //
-    // Allocation tracking
+    // Allocation tracking (protected by AllocationLock)
     //
     LIST_ENTRY AllocationList;
-    KSPIN_LOCK AllocationLock;
+    EX_PUSH_LOCK AllocationLock;
     volatile LONG AllocationCount;
     
     //
-    // Pattern hash table
+    // Pattern hash table (protected by AllocationLock)
     //
     LIST_ENTRY PatternBuckets[256];
     volatile LONG UniquePatterns;
     
     //
-    // Spray metrics
+    // Spray metrics (protected by AllocationLock)
     //
     SIZE_T TotalAllocatedSize;
-    ULONG AllocationsInWindow;
+    volatile LONG AllocationsInWindow;
     LARGE_INTEGER WindowStartTime;
     
     //
-    // Spray state
+    // Spray state (interlocked access, no lock required)
     //
-    BOOLEAN SprayInProgress;
-    HS_SPRAY_TYPE SuspectedType;
-    ULONG SprayScore;
+    volatile LONG SprayInProgress;
+    volatile LONG SuspectedType;          // HS_SPRAY_TYPE stored as LONG for interlocked
+    volatile LONG SprayScore;
     
     //
     // Reference counting
@@ -215,9 +214,9 @@ typedef struct _HS_PROCESS_CONTEXT {
 
 typedef struct _HS_DETECTOR {
     //
-    // Initialization state
+    // Initialization state (interlocked for cross-CPU visibility)
     //
-    BOOLEAN Initialized;
+    volatile LONG Initialized;
     
     //
     // Process tracking
@@ -257,6 +256,13 @@ typedef struct _HS_DETECTOR {
         volatile LONG64 ProcessesMonitored;
         LARGE_INTEGER StartTime;
     } Stats;
+
+    //
+    // Active operation reference count for safe shutdown drain.
+    // Incremented by each API call, decremented on exit.
+    // Shutdown waits for count to reach 0 before freeing resources.
+    //
+    volatile LONG ActiveRefCount;
     
 } HS_DETECTOR, *PHS_DETECTOR;
 
@@ -264,6 +270,17 @@ typedef struct _HS_DETECTOR {
 // Callback Types
 //=============================================================================
 
+/**
+ * @brief Spray detection callback.
+ *
+ * IMPORTANT: The Result pointer is only valid for the duration of the callback.
+ * Callbacks MUST NOT store the pointer or access it after returning.
+ * If deferred processing is needed, copy the HS_SPRAY_RESULT by value.
+ *
+ * Callbacks are invoked at IRQL <= APC_LEVEL under a shared push lock.
+ * They must complete quickly and must not block or acquire exclusive locks
+ * that could deadlock with the detector.
+ */
 typedef VOID (*HS_SPRAY_CALLBACK)(
     _In_ PHS_SPRAY_RESULT Result,
     _In_opt_ PVOID Context
@@ -273,11 +290,14 @@ typedef VOID (*HS_SPRAY_CALLBACK)(
 // Public API - Initialization
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsInitialize(
     _Out_ PHS_DETECTOR* Detector
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 HsShutdown(
     _Inout_ PHS_DETECTOR Detector
@@ -287,12 +307,16 @@ HsShutdown(
 // Public API - Process Tracking
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsStartTracking(
     _In_ PHS_DETECTOR Detector,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsStopTracking(
     _In_ PHS_DETECTOR Detector,
@@ -303,6 +327,8 @@ HsStopTracking(
 // Public API - Allocation Monitoring
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsRecordAllocation(
     _In_ PHS_DETECTOR Detector,
@@ -313,6 +339,8 @@ HsRecordAllocation(
     _In_opt_ PVOID ReturnAddress
     );
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsRecordDeallocation(
     _In_ PHS_DETECTOR Detector,
@@ -324,6 +352,8 @@ HsRecordDeallocation(
 // Public API - Detection
 //=============================================================================
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsAnalyzeProcess(
     _In_ PHS_DETECTOR Detector,
@@ -331,6 +361,8 @@ HsAnalyzeProcess(
     _Out_ PHS_SPRAY_RESULT* Result
     );
 
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsCheckForSpray(
     _In_ PHS_DETECTOR Detector,
@@ -344,6 +376,8 @@ HsCheckForSpray(
 // Public API - Callbacks
 //=============================================================================
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 HsRegisterCallback(
     _In_ PHS_DETECTOR Detector,
@@ -351,6 +385,7 @@ HsRegisterCallback(
     _In_opt_ PVOID Context
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 HsUnregisterCallback(
     _In_ PHS_DETECTOR Detector,
@@ -377,6 +412,7 @@ typedef struct _HS_STATISTICS {
     LARGE_INTEGER UpTime;
 } HS_STATISTICS, *PHS_STATISTICS;
 
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 HsGetStatistics(
     _In_ PHS_DETECTOR Detector,

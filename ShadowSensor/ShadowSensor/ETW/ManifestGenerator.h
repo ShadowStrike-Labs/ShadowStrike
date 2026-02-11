@@ -80,6 +80,31 @@ extern "C" {
  */
 #define MG_STR_POOL_TAG                 'rtSM'
 
+/**
+ * @brief Pool tag for channel definition allocations
+ */
+#define MG_CHN_POOL_TAG                 'nhCM'
+
+/**
+ * @brief Pool tag for level definition allocations
+ */
+#define MG_LVL_POOL_TAG                 'lvLM'
+
+/**
+ * @brief Pool tag for task definition allocations
+ */
+#define MG_TSK_POOL_TAG                 'ksTE'
+
+/**
+ * @brief Pool tag for opcode definition allocations
+ */
+#define MG_OPC_POOL_TAG                 'cpOM'
+
+/**
+ * @brief Pool tag for keyword definition allocations
+ */
+#define MG_KWD_POOL_TAG                 'dwKM'
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -175,34 +200,15 @@ extern "C" {
 
 /**
  * @brief Manifest generation flags
+ *
+ * Only flags with active implementations are defined.
  */
 typedef enum _MG_GENERATION_FLAGS {
     /// No special flags
     MgFlagNone                  = 0x00000000,
 
-    /// Include verbose comments in output
+    /// Include verbose comments in output (currently active)
     MgFlagIncludeComments       = 0x00000001,
-
-    /// Generate compact XML (no formatting)
-    MgFlagCompactXml            = 0x00000002,
-
-    /// Include deprecated events (for backwards compatibility)
-    MgFlagIncludeDeprecated     = 0x00000004,
-
-    /// Generate message table resources
-    MgFlagGenerateMessages      = 0x00000008,
-
-    /// Include debug/verbose events
-    MgFlagIncludeDebugEvents    = 0x00000010,
-
-    /// Use strict schema validation
-    MgFlagStrictValidation      = 0x00000020,
-
-    /// Include localization placeholders
-    MgFlagLocalization          = 0x00000040,
-
-    /// Generate ETW MOF for legacy consumers
-    MgFlagLegacyMof             = 0x00000080
 
 } MG_GENERATION_FLAGS;
 
@@ -271,6 +277,16 @@ typedef enum _MG_GENERATION_STATUS {
 // ============================================================================
 
 /**
+ * @brief Maximum valid channel type value
+ */
+#define MG_MAX_CHANNEL_TYPE_VALUE       MgChannelDebug
+
+/**
+ * @brief Maximum valid isolation type value
+ */
+#define MG_MAX_ISOLATION_TYPE_VALUE     MgIsolationCustom
+
+/**
  * @brief Channel definition for manifest
  */
 typedef struct _MG_CHANNEL_DEFINITION {
@@ -289,11 +305,11 @@ typedef struct _MG_CHANNEL_DEFINITION {
     /// Is channel enabled by default
     BOOLEAN EnabledByDefault;
 
-    /// Reserved for alignment
-    UCHAR Reserved[3];
-
     /// Channel value (unique identifier)
     UCHAR Value;
+
+    /// Reserved for alignment
+    UCHAR Reserved[2];
 
     /// Message ID for channel name
     ULONG MessageId;
@@ -412,6 +428,9 @@ typedef struct _MG_STRING_BUILDER {
     /// Buffer capacity
     SIZE_T Capacity;
 
+    /// Maximum allowed capacity (prevents unbounded growth)
+    SIZE_T MaxCapacity;
+
     /// Pool tag for allocations
     ULONG PoolTag;
 
@@ -466,13 +485,21 @@ typedef struct _MG_GENERATOR {
     /// Initialization flag
     BOOLEAN Initialized;
 
+    /// Shutdown in progress - prevents new operations
+    volatile BOOLEAN ShuttingDown;
+
     /// Reserved for alignment
-    UCHAR Reserved1[3];
+    UCHAR Reserved1[2];
+
+    /// Reference count for safe concurrent access.
+    /// Starts at 1 on init. Each public API call increments on entry,
+    /// decrements on exit. Shutdown waits for count to reach 0.
+    volatile LONG ReferenceCount;
 
     /// Generation flags
     ULONG Flags;
 
-    /// Source schema
+    /// Source schema (reference counted via EsAcquireReference/EsReleaseReference)
     PES_SCHEMA Schema;
 
     /// Provider symbol name (for C header)
@@ -527,12 +554,12 @@ typedef struct _MG_GENERATOR {
     /// Generation statistics
     MG_GENERATION_STATS Stats;
 
-    /// Cached manifest content
+    /// Cached manifest content (protected by CacheLock)
     PCHAR CachedManifest;
     SIZE_T CachedManifestSize;
     BOOLEAN ManifestCacheValid;
 
-    /// Cached header content
+    /// Cached header content (protected by CacheLock)
     PCHAR CachedHeader;
     SIZE_T CachedHeaderSize;
     BOOLEAN HeaderCacheValid;
@@ -542,6 +569,9 @@ typedef struct _MG_GENERATOR {
 
     /// Lock for cache operations
     EX_PUSH_LOCK CacheLock;
+
+    /// Shutdown completion event — signaled when ReferenceCount reaches 0
+    KEVENT ShutdownEvent;
 
 } MG_GENERATOR, *PMG_GENERATOR;
 
@@ -884,9 +914,9 @@ MgValidateSchema(
  *
  * @return STATUS_SUCCESS on success
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql PASSIVE_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 MgGetStatistics(
     _In_ PMG_GENERATOR Generator,
@@ -897,13 +927,13 @@ MgGetStatistics(
  * @brief Invalidate cached content.
  *
  * Forces regeneration on next manifest/header request.
- * Call after schema changes.
+ * Call after schema changes. Acquires CacheLock exclusive internally.
  *
  * @param Generator     Generator instance
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql PASSIVE_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 MgInvalidateCache(
     _In_ PMG_GENERATOR Generator

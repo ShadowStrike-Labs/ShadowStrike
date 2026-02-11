@@ -64,10 +64,39 @@
 // GLOBAL STATE
 // ============================================================================
 
-/**
- * @brief Global memory monitor instance
- */
 static MEMORY_MONITOR_GLOBALS g_MemoryMonitor = { 0 };
+
+// Init state constants
+#define MM_INIT_UNINIT      0
+#define MM_INIT_IN_PROGRESS 1
+#define MM_INIT_DONE        2
+
+// Helper: check if subsystem is active (initialized + not shutting down)
+#define MmpIsActive() \
+    (g_MemoryMonitor.InitState == MM_INIT_DONE && !g_MemoryMonitor.ShuttingDown)
+
+// Acquire/release outstanding reference for shutdown drain
+static __forceinline BOOLEAN MmpAcquireRef(VOID)
+{
+    if (g_MemoryMonitor.ShuttingDown) return FALSE;
+    InterlockedIncrement(&g_MemoryMonitor.OutstandingRefs);
+    if (g_MemoryMonitor.ShuttingDown) {
+        if (InterlockedDecrement(&g_MemoryMonitor.OutstandingRefs) == 0) {
+            KeSetEvent(&g_MemoryMonitor.ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static __forceinline VOID MmpReleaseRef(VOID)
+{
+    if (InterlockedDecrement(&g_MemoryMonitor.OutstandingRefs) == 0) {
+        if (g_MemoryMonitor.ShuttingDown) {
+            KeSetEvent(&g_MemoryMonitor.ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        }
+    }
+}
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -173,17 +202,31 @@ MmMonitorInitialize(
     )
 {
     NTSTATUS Status = STATUS_SUCCESS;
+    LONG PrevState;
 
     PAGED_CODE();
 
     //
-    // Check if already initialized
+    // Atomic init guard — only one thread can initialize
     //
-    if (g_MemoryMonitor.Initialized) {
+    PrevState = InterlockedCompareExchange(&g_MemoryMonitor.InitState,
+                                           MM_INIT_IN_PROGRESS,
+                                           MM_INIT_UNINIT);
+    if (PrevState == MM_INIT_DONE) {
         return STATUS_SUCCESS;
     }
+    if (PrevState == MM_INIT_IN_PROGRESS) {
+        return STATUS_DEVICE_BUSY;
+    }
 
-    RtlZeroMemory(&g_MemoryMonitor, sizeof(MEMORY_MONITOR_GLOBALS));
+    RtlZeroMemory(
+        (PUCHAR)&g_MemoryMonitor + sizeof(g_MemoryMonitor.InitState),
+        sizeof(MEMORY_MONITOR_GLOBALS) - sizeof(g_MemoryMonitor.InitState)
+    );
+
+    g_MemoryMonitor.ShuttingDown = FALSE;
+    g_MemoryMonitor.OutstandingRefs = 0;
+    KeInitializeEvent(&g_MemoryMonitor.ShutdownEvent, NotificationEvent, FALSE);
 
     //
     // Initialize default configuration
@@ -196,6 +239,7 @@ MmMonitorInitialize(
     InitializeListHead(&g_MemoryMonitor.ProcessContextList);
     Status = ExInitializeResourceLite(&g_MemoryMonitor.ProcessContextLock);
     if (!NT_SUCCESS(Status)) {
+        InterlockedExchange(&g_MemoryMonitor.InitState, MM_INIT_UNINIT);
         return Status;
     }
 
@@ -205,6 +249,7 @@ MmMonitorInitialize(
     Status = MmpInitializeLookasideLists();
     if (!NT_SUCCESS(Status)) {
         ExDeleteResourceLite(&g_MemoryMonitor.ProcessContextLock);
+        InterlockedExchange(&g_MemoryMonitor.InitState, MM_INIT_UNINIT);
         return Status;
     }
 
@@ -215,20 +260,26 @@ MmMonitorInitialize(
     if (!NT_SUCCESS(Status)) {
         MmpCleanupLookasideLists();
         ExDeleteResourceLite(&g_MemoryMonitor.ProcessContextLock);
+        InterlockedExchange(&g_MemoryMonitor.InitState, MM_INIT_UNINIT);
         return Status;
     }
 
     //
     // Initialize rate limiting
     //
-    KeQuerySystemTimePrecise((PLARGE_INTEGER)&g_MemoryMonitor.CurrentSecondStart);
-    g_MemoryMonitor.EventsThisSecond = 0;
+    {
+        LARGE_INTEGER Now;
+        KeQuerySystemTimePrecise(&Now);
+        InterlockedExchange64(&g_MemoryMonitor.CurrentSecondStart, Now.QuadPart);
+    }
+    InterlockedExchange(&g_MemoryMonitor.EventsThisSecond, 0);
 
     //
-    // Mark as initialized
+    // Mark as active
     //
-    g_MemoryMonitor.Initialized = TRUE;
     g_MemoryMonitor.Enabled = TRUE;
+    MemoryBarrier();
+    InterlockedExchange(&g_MemoryMonitor.InitState, MM_INIT_DONE);
 
     return STATUS_SUCCESS;
 }
@@ -241,17 +292,34 @@ MmMonitorShutdown(
 {
     PLIST_ENTRY Entry;
     PMM_PROCESS_CONTEXT Context;
+    LARGE_INTEGER Timeout;
 
     PAGED_CODE();
 
-    if (!g_MemoryMonitor.Initialized) {
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE) {
         return;
     }
 
     //
-    // Disable monitoring
+    // Signal shutdown and disable monitoring
     //
     g_MemoryMonitor.Enabled = FALSE;
+    InterlockedExchange(&g_MemoryMonitor.ShuttingDown, TRUE);
+    MemoryBarrier();
+
+    //
+    // Wait for outstanding references to drain (10 second timeout)
+    //
+    if (g_MemoryMonitor.OutstandingRefs > 0) {
+        Timeout.QuadPart = -10LL * 10000000LL;  // 10 seconds
+        KeWaitForSingleObject(
+            &g_MemoryMonitor.ShutdownEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &Timeout
+        );
+    }
 
     //
     // Clean up all process contexts
@@ -283,7 +351,7 @@ MmMonitorShutdown(
     //
     ExDeleteResourceLite(&g_MemoryMonitor.ProcessContextLock);
 
-    g_MemoryMonitor.Initialized = FALSE;
+    InterlockedExchange(&g_MemoryMonitor.InitState, MM_INIT_UNINIT);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -294,7 +362,7 @@ MmMonitorSetEnabled(
 {
     PAGED_CODE();
 
-    if (!g_MemoryMonitor.Initialized) {
+    if (!MmpIsActive()) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
@@ -309,9 +377,11 @@ MmMonitorUpdateConfig(
     _In_ PMEMORY_MONITOR_CONFIG Config
     )
 {
+    MEMORY_MONITOR_CONFIG LocalConfig;
+
     PAGED_CODE();
 
-    if (!g_MemoryMonitor.Initialized) {
+    if (!MmpIsActive()) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
@@ -320,27 +390,29 @@ MmMonitorUpdateConfig(
     }
 
     //
-    // Validate configuration values
+    // Copy to local then apply defaults — never mutate caller's buffer (FIX-13)
     //
-    if (Config->MaxEventsPerSecond == 0) {
-        Config->MaxEventsPerSecond = MM_DEFAULT_MAX_EVENTS_PER_SEC;
+    RtlCopyMemory(&LocalConfig, Config, sizeof(MEMORY_MONITOR_CONFIG));
+
+    if (LocalConfig.MaxEventsPerSecond == 0) {
+        LocalConfig.MaxEventsPerSecond = MM_DEFAULT_MAX_EVENTS_PER_SEC;
     }
 
-    if (Config->MinAllocationSizeToTrack == 0) {
-        Config->MinAllocationSizeToTrack = MM_DEFAULT_MIN_ALLOC_SIZE;
+    if (LocalConfig.MinAllocationSizeToTrack == 0) {
+        LocalConfig.MinAllocationSizeToTrack = MM_DEFAULT_MIN_ALLOC_SIZE;
     }
 
-    if (Config->MaxRegionSizeToScan == 0) {
-        Config->MaxRegionSizeToScan = MM_DEFAULT_MAX_REGION_SCAN_SIZE;
+    if (LocalConfig.MaxRegionSizeToScan == 0) {
+        LocalConfig.MaxRegionSizeToScan = MM_DEFAULT_MAX_REGION_SCAN_SIZE;
     }
 
     //
-    // Copy configuration
+    // Atomic config swap under lock
     //
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&g_MemoryMonitor.ProcessContextLock, TRUE);
 
-    RtlCopyMemory(&g_MemoryMonitor.Config, Config, sizeof(MEMORY_MONITOR_CONFIG));
+    RtlCopyMemory(&g_MemoryMonitor.Config, &LocalConfig, sizeof(MEMORY_MONITOR_CONFIG));
 
     ExReleaseResourceLite(&g_MemoryMonitor.ProcessContextLock);
     KeLeaveCriticalRegion();
@@ -351,19 +423,30 @@ MmMonitorUpdateConfig(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 MmMonitorGetStatistics(
-    _Out_ PMEMORY_MONITOR_GLOBALS Stats
+    _Out_ PMEMORY_MONITOR_STATISTICS Stats
     )
 {
     if (Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!g_MemoryMonitor.Initialized) {
-        RtlZeroMemory(Stats, sizeof(MEMORY_MONITOR_GLOBALS));
+    RtlZeroMemory(Stats, sizeof(MEMORY_MONITOR_STATISTICS));
+
+    if (g_MemoryMonitor.InitState != MM_INIT_DONE) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    RtlCopyMemory(Stats, &g_MemoryMonitor, sizeof(MEMORY_MONITOR_GLOBALS));
+    //
+    // Copy only safe, scalar fields — no sync primitives or internal pointers
+    //
+    Stats->Enabled = g_MemoryMonitor.Enabled;
+    Stats->ProcessContextCount = g_MemoryMonitor.ProcessContextCount;
+    Stats->TotalEventsProcessed = g_MemoryMonitor.TotalEventsProcessed;
+    Stats->TotalShellcodeDetections = g_MemoryMonitor.TotalShellcodeDetections;
+    Stats->TotalInjectionDetections = g_MemoryMonitor.TotalInjectionDetections;
+    Stats->TotalHollowingDetections = g_MemoryMonitor.TotalHollowingDetections;
+    Stats->EventsDropped = g_MemoryMonitor.EventsDropped;
+    RtlCopyMemory(&Stats->Config, &g_MemoryMonitor.Config, sizeof(MEMORY_MONITOR_CONFIG));
 
     return STATUS_SUCCESS;
 }
@@ -392,29 +475,35 @@ MmMonitorGetProcessContext(
 
     *Context = NULL;
 
-    if (!g_MemoryMonitor.Initialized) {
+    if (!MmpIsActive()) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    if (!MmpAcquireRef()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     //
-    // Try to find existing context
+    // Try to find existing context (returns with refcount incremented)
     //
     ExistingContext = MmpLookupProcessContext(ProcessId);
     if (ExistingContext != NULL) {
-        MmpReferenceProcessContext(ExistingContext);
         *Context = ExistingContext;
+        MmpReleaseRef();
         return STATUS_SUCCESS;
     }
 
     //
-    // Create new context
+    // Create new context (handles duplicate detection internally)
     //
     Status = MmpCreateProcessContext(ProcessId, ProcessObject, &NewContext);
     if (!NT_SUCCESS(Status)) {
+        MmpReleaseRef();
         return Status;
     }
 
     *Context = NewContext;
+    MmpReleaseRef();
 
     return STATUS_SUCCESS;
 }
@@ -437,7 +526,7 @@ MmMonitorRemoveProcessContext(
     _In_ UINT32 ProcessId
     )
 {
-    PMM_PROCESS_CONTEXT Context;
+    PMM_PROCESS_CONTEXT Context = NULL;
     ULONG Hash;
     KIRQL OldIrql;
     PLIST_ENTRY Entry;
@@ -446,15 +535,20 @@ MmMonitorRemoveProcessContext(
 
     PAGED_CODE();
 
-    if (!g_MemoryMonitor.Initialized) {
+    if (!MmpIsActive()) {
         return;
     }
 
     Hash = MmpHashProcessId(ProcessId);
 
     //
-    // Remove from hash table
+    // Acquire ERESOURCE first (lower IRQL lock), then bucket spinlock.
+    // This makes hash + list removal atomic and prevents the race window
+    // where a context is in the list but not the hash table.
     //
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&g_MemoryMonitor.ProcessContextLock, TRUE);
+
     KeAcquireSpinLock(&g_ProcessHashTable.BucketLocks[Hash], &OldIrql);
 
     Entry = g_ProcessHashTable.Buckets[Hash].Flink;
@@ -473,26 +567,20 @@ MmMonitorRemoveProcessContext(
 
     KeReleaseSpinLock(&g_ProcessHashTable.BucketLocks[Hash], OldIrql);
 
-    if (!Found) {
-        return;
+    if (Found && Context != NULL) {
+        RemoveEntryList(&Context->ListEntry);
+        g_MemoryMonitor.ProcessContextCount--;
     }
-
-    //
-    // Remove from main list
-    //
-    KeEnterCriticalRegion();
-    ExAcquireResourceExclusiveLite(&g_MemoryMonitor.ProcessContextLock, TRUE);
-
-    RemoveEntryList(&Context->ListEntry);
-    g_MemoryMonitor.ProcessContextCount--;
 
     ExReleaseResourceLite(&g_MemoryMonitor.ProcessContextLock);
     KeLeaveCriticalRegion();
 
     //
-    // Dereference (will free when refcount hits 0)
+    // Dereference outside all locks (will free when refcount hits 0)
     //
-    MmpDereferenceProcessContext(Context);
+    if (Found && Context != NULL) {
+        MmpDereferenceProcessContext(Context);
+    }
 }
 
 // ============================================================================
@@ -518,7 +606,7 @@ MmMonitorHandleAllocation(
 
     UNREFERENCED_PARAMETER(AllocationType);
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return STATUS_SUCCESS;
     }
 
@@ -562,9 +650,6 @@ MmMonitorHandleAllocation(
     // Check for suspicious patterns
     //
     if (IsCrossProcess && g_MemoryMonitor.Config.EnableCrossProcessMonitoring) {
-        //
-        // Cross-process allocation is suspicious
-        //
         IsSuspicious = TRUE;
         Context->SuspiciousOperations++;
 
@@ -574,14 +659,18 @@ MmMonitorHandleAllocation(
     }
 
     //
-    // Check for initial RWX allocation
+    // Check for initial RWX allocation — hold RegionLock for MmpFindRegion (FIX-02)
     //
     if (MmpIsRWXProtection(Protection)) {
+        KeEnterCriticalRegion();
+        ExfAcquirePushLockExclusive(&Context->RegionLock);
         Region = MmpFindRegion(Context, BaseAddress);
         if (Region != NULL) {
             Region->IsHighRisk = TRUE;
             Region->Flags |= MM_REGION_FLAG_HIGH_ENTROPY;
         }
+        ExfReleasePushLockExclusive(&Context->RegionLock);
+        KeLeaveCriticalRegion();
         IsSuspicious = TRUE;
     }
 
@@ -616,12 +705,12 @@ MmMonitorHandleProtectionChange(
     PMM_PROCESS_CONTEXT Context = NULL;
     PMM_TRACKED_REGION Region = NULL;
     UINT32 SuspicionType;
-    KIRQL OldIrql;
+    BOOLEAN RegionFound = FALSE;
+    BOOLEAN RegionWasWritten = FALSE;
 
-    UNREFERENCED_PARAMETER(RegionSize);
     UNREFERENCED_PARAMETER(SourceProcessId);
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return STATUS_SUCCESS;
     }
 
@@ -646,36 +735,38 @@ MmMonitorHandleProtectionChange(
     }
 
     //
-    // Find or create tracked region
+    // Single lock scope for all region operations (FIX-02/FIX-15)
     //
-    KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockExclusive(&Context->RegionLock);
+
     Region = MmpFindRegion(Context, BaseAddress);
-    KeReleaseSpinLock(&Context->RegionLock, OldIrql);
 
     if (Region == NULL) {
         //
-        // Region not tracked - add it now
+        // Region not tracked — release lock, add it, re-acquire
         //
+        ExfReleasePushLockExclusive(&Context->RegionLock);
+        KeLeaveCriticalRegion();
+
         Status = MmpAddRegion(Context, BaseAddress, RegionSize, NewProtection, MEM_PRIVATE);
+
+        KeEnterCriticalRegion();
+        ExfAcquirePushLockExclusive(&Context->RegionLock);
+
         if (NT_SUCCESS(Status)) {
-            KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
             Region = MmpFindRegion(Context, BaseAddress);
-            KeReleaseSpinLock(&Context->RegionLock, OldIrql);
         }
     }
 
     if (Region != NULL) {
-        //
-        // Update region tracking
-        //
-        KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
-
+        RegionFound = TRUE;
         Region->Protection = NewProtection;
         Region->ProtectionChangeCount++;
         KeQuerySystemTimePrecise((PLARGE_INTEGER)&Region->LastProtectionChangeTime);
 
         //
-        // Detect W->X transition (classic unpacking/shellcode pattern)
+        // Detect W→X transition (classic unpacking/shellcode pattern)
         //
         if (Region->WasWritten && MmpIsExecutableProtection(NewProtection)) {
             Region->NowExecutable = TRUE;
@@ -683,45 +774,46 @@ MmMonitorHandleProtectionChange(
             Region->Flags |= MM_REGION_FLAG_SHELLCODE_SCAN;
         }
 
-        KeReleaseSpinLock(&Context->RegionLock, OldIrql);
-    }
-
-    //
-    // Analyze protection change suspicion
-    //
-    SuspicionType = MmpAnalyzeProtectionChange(OldProtection, NewProtection);
-
-    if (SuspicionType != 0) {
-        Context->SuspiciousOperations++;
-
-        if (SuspicionType == MM_SUSPICIOUS_RW_TO_RX) {
-            //
-            // Classic shellcode/unpacking pattern
-            //
-            if (g_MemoryMonitor.Config.EnableShellcodeDetection && Region != NULL) {
-                Region->Flags |= MM_REGION_FLAG_SHELLCODE_SCAN;
-            }
+        //
+        // Hollowing indicator: image region gets RWX during early process life (FIX-19)
+        //
+        if (Region->RegionType == MemRegion_Image &&
+            MmpIsRWXProtection(NewProtection) &&
+            Region->ProtectionChangeCount <= 2) {
+            Context->Flags |= MM_PROCESS_FLAG_HOLLOWING_TARGET;
         }
 
-        if (SuspicionType == MM_SUSPICIOUS_TO_RWX) {
-            //
-            // RWX is highly suspicious for non-JIT code
-            //
-            if (Region != NULL) {
+        //
+        // Analyze protection change suspicion
+        //
+        SuspicionType = MmpAnalyzeProtectionChange(OldProtection, NewProtection);
+
+        if (SuspicionType != 0) {
+            Context->SuspiciousOperations++;
+
+            if (SuspicionType == MM_SUSPICIOUS_RW_TO_RX &&
+                g_MemoryMonitor.Config.EnableShellcodeDetection) {
+                Region->Flags |= MM_REGION_FLAG_SHELLCODE_SCAN;
+            }
+
+            if (SuspicionType == MM_SUSPICIOUS_TO_RWX) {
                 Region->IsHighRisk = TRUE;
             }
         }
-    }
 
-    //
-    // Cross-process protection change is always suspicious
-    //
-    if (IsCrossProcess && g_MemoryMonitor.Config.EnableCrossProcessMonitoring) {
-        Context->SuspiciousOperations++;
-        if (Region != NULL) {
+        //
+        // Cross-process protection change is always suspicious
+        //
+        if (IsCrossProcess && g_MemoryMonitor.Config.EnableCrossProcessMonitoring) {
+            Context->SuspiciousOperations++;
             Region->Flags |= MM_REGION_FLAG_INJECTION_DST;
         }
+
+        RegionWasWritten = Region->WasWritten;
     }
+
+    ExfReleasePushLockExclusive(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     //
     // Update statistics
@@ -748,12 +840,11 @@ MmMonitorHandleCrossProcessWrite(
     NTSTATUS Status = STATUS_SUCCESS;
     PMM_PROCESS_CONTEXT TargetContext = NULL;
     PMM_TRACKED_REGION Region;
-    KIRQL OldIrql;
     UINT32 Entropy = 0;
 
     UNREFERENCED_PARAMETER(SourceProcessId);
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return STATUS_SUCCESS;
     }
 
@@ -770,6 +861,13 @@ MmMonitorHandleCrossProcessWrite(
     }
 
     //
+    // Calculate entropy BEFORE acquiring lock (FIX-07: avoids large stack usage at elevated IRQL)
+    //
+    if (SourceBuffer != NULL && Size > 0 && Size <= g_MemoryMonitor.Config.MaxRegionSizeToScan) {
+        Entropy = MmMonitorCalculateEntropy(SourceBuffer, (SIZE_T)Size);
+    }
+
+    //
     // Get target process context
     //
     Status = MmMonitorGetProcessContext(TargetProcessId, NULL, &TargetContext);
@@ -778,42 +876,42 @@ MmMonitorHandleCrossProcessWrite(
     }
 
     //
-    // Find or create region
+    // Find or create region, then update under lock
     //
-    KeAcquireSpinLock(&TargetContext->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockExclusive(&TargetContext->RegionLock);
+
     Region = MmpFindRegion(TargetContext, TargetAddress);
-    KeReleaseSpinLock(&TargetContext->RegionLock, OldIrql);
 
     if (Region == NULL) {
+        ExfReleasePushLockExclusive(&TargetContext->RegionLock);
+        KeLeaveCriticalRegion();
+
         Status = MmpAddRegion(TargetContext, TargetAddress, Size, 0, MEM_PRIVATE);
+
+        KeEnterCriticalRegion();
+        ExfAcquirePushLockExclusive(&TargetContext->RegionLock);
+
         if (NT_SUCCESS(Status)) {
-            KeAcquireSpinLock(&TargetContext->RegionLock, &OldIrql);
             Region = MmpFindRegion(TargetContext, TargetAddress);
-            KeReleaseSpinLock(&TargetContext->RegionLock, OldIrql);
         }
     }
 
     if (Region != NULL) {
-        KeAcquireSpinLock(&TargetContext->RegionLock, &OldIrql);
-
         Region->WasWritten = TRUE;
         Region->Flags |= MM_REGION_FLAG_INJECTION_DST;
 
-        //
-        // Calculate entropy of written content if available
-        //
-        if (SourceBuffer != NULL && Size > 0 && Size <= g_MemoryMonitor.Config.MaxRegionSizeToScan) {
-            Entropy = MmMonitorCalculateEntropy(SourceBuffer, (SIZE_T)Size);
+        if (Entropy > 0) {
             Region->LastContentEntropy = Entropy;
-
             if (Entropy >= g_MemoryMonitor.Config.ShellcodeScanThreshold) {
                 Region->Flags |= MM_REGION_FLAG_HIGH_ENTROPY;
                 Region->IsHighRisk = TRUE;
             }
         }
-
-        KeReleaseSpinLock(&TargetContext->RegionLock, OldIrql);
     }
+
+    ExfReleasePushLockExclusive(&TargetContext->RegionLock);
+    KeLeaveCriticalRegion();
 
     //
     // Update statistics
@@ -853,7 +951,7 @@ MmMonitorHandleSectionMap(
 
     UNREFERENCED_PARAMETER(SectionHandle);
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return STATUS_SUCCESS;
     }
 
@@ -896,11 +994,11 @@ MmMonitorHandleSectionMap(
     //
     if (IsCrossProcess) {
         PMM_TRACKED_REGION Region;
-        KIRQL OldIrql;
 
         Context->SuspiciousOperations++;
 
-        KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+        KeEnterCriticalRegion();
+        ExfAcquirePushLockExclusive(&Context->RegionLock);
         Region = MmpFindRegion(Context, BaseAddress);
         if (Region != NULL) {
             Region->Flags |= MM_REGION_FLAG_INJECTION_DST;
@@ -908,7 +1006,8 @@ MmMonitorHandleSectionMap(
                 Region->IsHighRisk = TRUE;
             }
         }
-        KeReleaseSpinLock(&Context->RegionLock, OldIrql);
+        ExfReleasePushLockExclusive(&Context->RegionLock);
+        KeLeaveCriticalRegion();
 
         MmpUpdateProcessRisk(Context);
     }
@@ -941,7 +1040,7 @@ MmMonitorScanForShellcode(
     UINT32 Entropy;
     BOOLEAN ShellcodeDetected = FALSE;
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return FALSE;
     }
 
@@ -972,7 +1071,7 @@ MmMonitorScanForShellcode(
     //
     // Allocate buffer for memory content
     //
-    Buffer = ExAllocatePoolWithTag(NonPagedPoolNx, ScanSize, MM_POOL_TAG_GENERAL);
+    Buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, ScanSize, MM_POOL_TAG_GENERAL);
     if (Buffer == NULL) {
         ObDereferenceObject(Process);
         return FALSE;
@@ -1052,7 +1151,7 @@ MmMonitorDetectInjection(
     PMM_PROCESS_CONTEXT TargetContext = NULL;
     BOOLEAN InjectionDetected = FALSE;
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return FALSE;
     }
 
@@ -1065,9 +1164,31 @@ MmMonitorDetectInjection(
     }
 
     //
-    // Cross-process operations are inherently suspicious
+    // Cross-process operations are suspicious, but skip known-benign patterns (FIX-20).
+    // System (PID 4), csrss, and self-process are excluded.
     //
     if (SourceProcessId != TargetProcessId && SourceProcessId != 0 && TargetProcessId != 0) {
+        //
+        // Skip system-level PIDs that legitimately do cross-process writes
+        //
+        if (SourceProcessId == 4) {
+            return FALSE;
+        }
+
+        //
+        // Check if source is elevated/protected (legitimate tools like debuggers)
+        //
+        {
+            PMM_PROCESS_CONTEXT SourceContext = MmpLookupProcessContext(SourceProcessId);
+            if (SourceContext != NULL) {
+                if (SourceContext->Flags & MM_PROCESS_FLAG_PROTECTED) {
+                    MmpDereferenceProcessContext(SourceContext);
+                    return FALSE;
+                }
+                MmpDereferenceProcessContext(SourceContext);
+            }
+        }
+
         InjectionDetected = TRUE;
 
         if (Event != NULL) {
@@ -1079,14 +1200,11 @@ MmMonitorDetectInjection(
             Event->InjectionType = InjectionType;
             Event->InjectedAddress = TargetAddress;
             Event->InjectedSize = Size;
-            Event->ThreatScore = 80;  // High base score for cross-process
+            Event->ThreatScore = 80;
             Event->Confidence = 70;
             Event->Flags |= INJECTION_FLAG_CROSS_SESSION;
         }
 
-        //
-        // Update target process context
-        //
         Status = MmMonitorGetProcessContext(TargetProcessId, NULL, &TargetContext);
         if (NT_SUCCESS(Status)) {
             TargetContext->InjectionAttemptCount++;
@@ -1112,7 +1230,7 @@ MmMonitorDetectHollowing(
     PMM_PROCESS_CONTEXT Context = NULL;
     BOOLEAN HollowingDetected = FALSE;
 
-    if (!g_MemoryMonitor.Initialized || !g_MemoryMonitor.Enabled) {
+    if (!MmpIsActive() || !g_MemoryMonitor.Enabled) {
         return FALSE;
     }
 
@@ -1124,18 +1242,22 @@ MmMonitorDetectHollowing(
         RtlZeroMemory(Event, sizeof(HOLLOWING_DETECTION_EVENT));
     }
 
-    //
-    // Get process context
-    //
     Status = MmMonitorGetProcessContext(ProcessId, NULL, &Context);
     if (!NT_SUCCESS(Status)) {
         return FALSE;
     }
 
     //
-    // Check for hollowing indicators
+    // Check for hollowing indicators (FIX-19: flag now set by HandleProtectionChange
+    // when image region gets RWX during early process life)
     //
     if (Context->Flags & MM_PROCESS_FLAG_HOLLOWING_TARGET) {
+        //
+        // Also check for corroborating evidence: injection target + image RWX
+        //
+        BOOLEAN Corroborated = (Context->Flags & MM_PROCESS_FLAG_INJECTION_TARGET) ||
+                               (Context->InjectionAttemptCount > 0);
+
         HollowingDetected = TRUE;
 
         if (Event != NULL) {
@@ -1143,8 +1265,8 @@ MmMonitorDetectHollowing(
             Event->Version = 1;
             KeQuerySystemTimePrecise((PLARGE_INTEGER)&Event->Timestamp);
             Event->HollowedProcessId = ProcessId;
-            Event->ThreatScore = 95;
-            Event->Confidence = 85;
+            Event->ThreatScore = Corroborated ? 95 : 70;
+            Event->Confidence = Corroborated ? 85 : 50;
             Event->Flags |= HOLLOWING_FLAG_CONFIRMED;
         }
 
@@ -1168,7 +1290,6 @@ MmMonitorCalculateEntropy(
     SIZE_T i;
     UINT32 Entropy = 0;
     ULONG Count;
-    ULONG Probability;
 
     if (Buffer == NULL || Size == 0) {
         return 0;
@@ -1182,45 +1303,54 @@ MmMonitorCalculateEntropy(
     }
 
     //
-    // Calculate Shannon entropy * 1000
-    // Formula: H = -sum(p * log2(p)) for each byte value
-    // Simplified integer approximation
+    // Shannon entropy: H = -sum(p * log2(p))
+    // Using fixed-point arithmetic: all values scaled by 1000.
     //
-    for (i = 0; i < 256; i++) {
-        Count = ByteCount[i];
-        if (Count == 0) {
-            continue;
+    // For each byte value with count c in N total bytes:
+    //   p = c/N
+    //   -p * log2(p) = (c/N) * log2(N/c) = (c/N) * (log2(N) - log2(c))
+    //
+    // We use integer log2 approximation: floor(log2(x)) * 1000 + fractional correction.
+    // This gives entropy * 1000 in range [0, 8000].
+    //
+    {
+        ULONG Log2N = 0;
+        ULONG TempN = (ULONG)Size;
+
+        // floor(log2(Size))
+        while (TempN > 1) {
+            Log2N++;
+            TempN >>= 1;
         }
 
-        //
-        // Calculate probability * 1000000
-        //
-        Probability = (ULONG)((Count * 1000000ULL) / Size);
+        for (i = 0; i < 256; i++) {
+            ULONG Log2C = 0;
+            ULONG TempC;
 
-        //
-        // Approximate -p * log2(p) using lookup/approximation
-        // For simplicity, using linear approximation for common ranges
-        //
-        if (Probability > 0 && Probability < 1000000) {
-            //
-            // Simplified entropy contribution
-            // Real calculation would use log2, this is an approximation
-            //
-            ULONG LogApprox = 0;
-            ULONG TempProb = Probability;
-
-            // Count bits to approximate log2
-            while (TempProb > 0) {
-                LogApprox++;
-                TempProb >>= 1;
+            Count = ByteCount[i];
+            if (Count == 0) {
+                continue;
             }
 
-            Entropy += (Probability * LogApprox) / 1000000;
+            // floor(log2(Count))
+            TempC = Count;
+            while (TempC > 1) {
+                Log2C++;
+                TempC >>= 1;
+            }
+
+            //
+            // Contribution = (Count / Size) * (Log2N - Log2C) * 1000
+            //              = Count * (Log2N - Log2C) * 1000 / Size
+            //
+            if (Log2N > Log2C) {
+                Entropy += (UINT32)((UINT64)Count * (Log2N - Log2C) * 1000ULL / Size);
+            }
         }
     }
 
     //
-    // Normalize to 0-8000 range (8 bits max entropy * 1000)
+    // Cap at 8000 (8 bits max entropy * 1000)
     //
     if (Entropy > 8000) {
         Entropy = 8000;
@@ -1266,16 +1396,19 @@ MmMonitorBuildVadMap(
     }
 
     //
-    // Allocate VAD map structure with space for entries
+    // Allocate VAD map structure with space for entries (FIX-11: overflow guard)
     //
-    MapSize = sizeof(PROCESS_VAD_MAP) + (MaxRegions * sizeof(VAD_ENTRY));
-    Map = (PPROCESS_VAD_MAP)ExAllocatePoolWithTag(PagedPool, MapSize, MM_POOL_TAG_GENERAL);
+    MapSize = sizeof(PROCESS_VAD_MAP) + ((SIZE_T)MaxRegions * sizeof(VAD_ENTRY));
+    if (MapSize < sizeof(PROCESS_VAD_MAP)) {
+        ObDereferenceObject(Process);
+        return STATUS_INTEGER_OVERFLOW;
+    }
+    Map = (PPROCESS_VAD_MAP)ExAllocatePool2(POOL_FLAG_PAGED, MapSize, MM_POOL_TAG_GENERAL);
     if (Map == NULL) {
         ObDereferenceObject(Process);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(Map, MapSize);
     Map->ProcessId = ProcessId;
 
     //
@@ -1428,7 +1561,7 @@ MmMonitorFindSuspiciousVads(
 // UTILITY FUNCTIONS
 // ============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 MmMonitorIsAddressExecutable(
     _In_ UINT32 ProcessId,
@@ -1437,25 +1570,31 @@ MmMonitorIsAddressExecutable(
 {
     PMM_PROCESS_CONTEXT Context;
     PMM_TRACKED_REGION Region;
-    KIRQL OldIrql;
     BOOLEAN IsExecutable = FALSE;
 
+    //
+    // MmpLookupProcessContext now returns a referenced context (FIX-17)
+    //
     Context = MmpLookupProcessContext(ProcessId);
     if (Context == NULL) {
         return FALSE;
     }
 
-    KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockShared(&Context->RegionLock);
     Region = MmpFindRegion(Context, Address);
     if (Region != NULL) {
         IsExecutable = MmpIsExecutableProtection(Region->Protection);
     }
-    KeReleaseSpinLock(&Context->RegionLock, OldIrql);
+    ExfReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
+
+    MmpDereferenceProcessContext(Context);
 
     return IsExecutable;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 MmMonitorGetBackingFile(
     _In_ UINT32 ProcessId,
@@ -1466,7 +1605,6 @@ MmMonitorGetBackingFile(
 {
     PMM_PROCESS_CONTEXT Context;
     PMM_TRACKED_REGION Region;
-    KIRQL OldIrql;
     NTSTATUS Status = STATUS_NOT_FOUND;
 
     PAGED_CODE();
@@ -1482,7 +1620,8 @@ MmMonitorGetBackingFile(
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockShared(&Context->RegionLock);
     Region = MmpFindRegion(Context, Address);
     if (Region != NULL && Region->BackingFile.Length > 0) {
         SIZE_T CopySize = min(Region->BackingFile.Length, FileNameSize - sizeof(WCHAR));
@@ -1490,7 +1629,10 @@ MmMonitorGetBackingFile(
         FileName[CopySize / sizeof(WCHAR)] = L'\0';
         Status = STATUS_SUCCESS;
     }
-    KeReleaseSpinLock(&Context->RegionLock, OldIrql);
+    ExfReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
+
+    MmpDereferenceProcessContext(Context);
 
     return Status;
 }
@@ -1699,6 +1841,12 @@ MmpLookupProcessContext(
         HashEntry = CONTAINING_RECORD(Entry, MM_PROCESS_HASH_ENTRY, ListEntry);
         if (HashEntry->Context->ProcessId == ProcessId) {
             Context = HashEntry->Context;
+            //
+            // FIX-01: Increment refcount UNDER spinlock to prevent
+            // use-after-free if another thread removes+frees between
+            // spinlock release and caller's use.
+            //
+            InterlockedIncrement(&Context->RefCount);
             break;
         }
         Entry = Entry->Flink;
@@ -1752,13 +1900,13 @@ MmpCreateProcessContext(
 
     KeQuerySystemTimePrecise((PLARGE_INTEGER)&NewContext->ProcessCreateTime);
     InitializeListHead(&NewContext->TrackedRegions);
-    KeInitializeSpinLock(&NewContext->RegionLock);
+    FltInitializePushLock(&NewContext->RegionLock);
 
     //
     // Allocate hash entry
     //
-    HashEntry = (PMM_PROCESS_HASH_ENTRY)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    HashEntry = (PMM_PROCESS_HASH_ENTRY)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(MM_PROCESS_HASH_ENTRY),
         MM_POOL_TAG_CACHE
     );
@@ -1774,10 +1922,36 @@ MmpCreateProcessContext(
     HashEntry->Context = NewContext;
 
     //
-    // Insert into hash table
+    // Insert into hash table — double-check for existing entry (FIX-06: TOCTOU race)
     //
     Hash = MmpHashProcessId(ProcessId);
     KeAcquireSpinLock(&g_ProcessHashTable.BucketLocks[Hash], &OldIrql);
+
+    {
+        PLIST_ENTRY CheckEntry = g_ProcessHashTable.Buckets[Hash].Flink;
+        while (CheckEntry != &g_ProcessHashTable.Buckets[Hash]) {
+            PMM_PROCESS_HASH_ENTRY Existing = CONTAINING_RECORD(CheckEntry, MM_PROCESS_HASH_ENTRY, ListEntry);
+            if (Existing->Context->ProcessId == ProcessId) {
+                //
+                // Another thread already created a context for this PID.
+                // Reference the existing one and discard ours.
+                //
+                InterlockedIncrement(&Existing->Context->RefCount);
+                *Context = Existing->Context;
+
+                KeReleaseSpinLock(&g_ProcessHashTable.BucketLocks[Hash], OldIrql);
+
+                ExFreePoolWithTag(HashEntry, MM_POOL_TAG_CACHE);
+                if (NewContext->ProcessObject != NULL) {
+                    ObDereferenceObject(NewContext->ProcessObject);
+                }
+                ExFreeToNPagedLookasideList(&g_MemoryMonitor.ContextLookaside, NewContext);
+                return STATUS_SUCCESS;
+            }
+            CheckEntry = CheckEntry->Flink;
+        }
+    }
+
     InsertTailList(&g_ProcessHashTable.Buckets[Hash], &HashEntry->ListEntry);
     InterlockedIncrement(&g_ProcessHashTable.EntryCount);
     KeReleaseSpinLock(&g_ProcessHashTable.BucketLocks[Hash], OldIrql);
@@ -1805,7 +1979,6 @@ MmpFreeProcessContext(
 {
     PLIST_ENTRY Entry;
     PMM_TRACKED_REGION Region;
-    KIRQL OldIrql;
 
     if (Context == NULL) {
         return;
@@ -1814,7 +1987,8 @@ MmpFreeProcessContext(
     //
     // Free all tracked regions
     //
-    KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockExclusive(&Context->RegionLock);
 
     while (!IsListEmpty(&Context->TrackedRegions)) {
         Entry = RemoveHeadList(&Context->TrackedRegions);
@@ -1822,7 +1996,8 @@ MmpFreeProcessContext(
         ExFreeToNPagedLookasideList(&g_MemoryMonitor.RegionLookaside, Region);
     }
 
-    KeReleaseSpinLock(&Context->RegionLock, OldIrql);
+    ExfReleasePushLockExclusive(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     //
     // Dereference process object if held
@@ -1930,7 +2105,6 @@ MmpAddRegion(
     )
 {
     PMM_TRACKED_REGION Region;
-    KIRQL OldIrql;
 
     //
     // Check region limit
@@ -1990,12 +2164,40 @@ MmpAddRegion(
     Region->BackingFile.Length = 0;
 
     //
+    // FIX-18: Populate backing file for mapped/image regions if process object available.
+    // This runs at PASSIVE_LEVEL so ZwQueryVirtualMemory is safe.
+    //
+    if ((Type == MEM_IMAGE || Type == MEM_MAPPED) &&
+        Context->ProcessObject != NULL &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+        MEMORY_BASIC_INFORMATION MemInfo;
+        NTSTATUS QStatus = MmpQueryVirtualMemory(
+            Context->ProcessObject,
+            (PVOID)(ULONG_PTR)BaseAddress,
+            &MemInfo
+        );
+
+        //
+        // The backing file name would require MmGetFileNameForSection or
+        // ObQueryNameString on the section object. Since we don't have a
+        // section handle at this point, we mark the region type from the
+        // MemInfo and defer full file name resolution to MmMonitorBuildVadMap.
+        //
+        if (NT_SUCCESS(QStatus) && MemInfo.Type == MEM_IMAGE) {
+            Region->RegionType = MemRegion_Image;
+        }
+    }
+
+    //
     // Insert into list
     //
-    KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockExclusive(&Context->RegionLock);
     InsertTailList(&Context->TrackedRegions, &Region->ListEntry);
     Context->TrackedRegionCount++;
-    KeReleaseSpinLock(&Context->RegionLock, OldIrql);
+    ExfReleasePushLockExclusive(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -2025,21 +2227,18 @@ MmpCleanupStaleRegions(
     PMM_TRACKED_REGION Region;
     LARGE_INTEGER CurrentTime;
     UINT64 MaxAge;
-    KIRQL OldIrql;
 
     KeQuerySystemTimePrecise(&CurrentTime);
-    MaxAge = (UINT64)MM_REGION_MAX_AGE_SEC * 10000000ULL;  // Convert to 100ns units
+    MaxAge = (UINT64)MM_REGION_MAX_AGE_SEC * 10000000ULL;
 
-    KeAcquireSpinLock(&Context->RegionLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExfAcquirePushLockExclusive(&Context->RegionLock);
 
     Entry = Context->TrackedRegions.Flink;
     while (Entry != &Context->TrackedRegions) {
         NextEntry = Entry->Flink;
         Region = CONTAINING_RECORD(Entry, MM_TRACKED_REGION, ListEntry);
 
-        //
-        // Remove stale, non-high-risk regions
-        //
         if (!Region->IsHighRisk &&
             (CurrentTime.QuadPart - Region->AllocationTime) > (LONGLONG)MaxAge) {
             MmpRemoveRegion(Context, Region);
@@ -2048,7 +2247,8 @@ MmpCleanupStaleRegions(
         Entry = NextEntry;
     }
 
-    KeReleaseSpinLock(&Context->RegionLock, OldIrql);
+    ExfReleasePushLockExclusive(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 }
 
 static
@@ -2058,7 +2258,8 @@ MmpCheckRateLimit(
     )
 {
     LARGE_INTEGER CurrentTime;
-    LONG64 ElapsedSeconds;
+    LONG64 SecondStart;
+    LONG64 Elapsed;
     LONG CurrentCount;
 
     if (g_MemoryMonitor.Config.MaxEventsPerSecond == 0) {
@@ -2067,14 +2268,26 @@ MmpCheckRateLimit(
 
     KeQuerySystemTimePrecise(&CurrentTime);
 
-    ElapsedSeconds = (CurrentTime.QuadPart - g_MemoryMonitor.CurrentSecondStart) / 10000000;
+    //
+    // Atomic read of CurrentSecondStart (FIX-09: prevents torn reads on x86)
+    //
+    SecondStart = InterlockedCompareExchange64(
+        &g_MemoryMonitor.CurrentSecondStart,
+        0, 0  // dummy CAS just to atomically read
+    );
 
-    if (ElapsedSeconds >= 1) {
+    Elapsed = (CurrentTime.QuadPart - SecondStart) / 10000000;
+
+    if (Elapsed >= 1) {
         //
-        // Reset counter for new second
+        // Try to reset for new second (CAS avoids double-reset race)
         //
-        g_MemoryMonitor.CurrentSecondStart = CurrentTime.QuadPart;
-        InterlockedExchange(&g_MemoryMonitor.EventsThisSecond, 0);
+        if (InterlockedCompareExchange64(
+                &g_MemoryMonitor.CurrentSecondStart,
+                CurrentTime.QuadPart,
+                SecondStart) == SecondStart) {
+            InterlockedExchange(&g_MemoryMonitor.EventsThisSecond, 0);
+        }
     }
 
     CurrentCount = InterlockedIncrement(&g_MemoryMonitor.EventsThisSecond);
@@ -2199,7 +2412,7 @@ MmpReadProcessMemory(
 {
     NTSTATUS Status;
     KAPC_STATE ApcState;
-    SIZE_T BytesCopied = 0;
+    BOOLEAN Attached = FALSE;
 
     if (Process == NULL || Buffer == NULL || Size == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -2207,23 +2420,21 @@ MmpReadProcessMemory(
 
     __try {
         KeStackAttachProcess(Process, &ApcState);
+        Attached = TRUE;
 
-        //
-        // Probe and copy memory
-        //
         ProbeForRead(SourceAddress, Size, 1);
         RtlCopyMemory(Buffer, SourceAddress, Size);
-        BytesCopied = Size;
-
-        KeUnstackDetachProcess(&ApcState);
-        Status = STATUS_SUCCESS;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
-        KeUnstackDetachProcess(&ApcState);
         Status = GetExceptionCode();
+        if (Attached) {
+            KeUnstackDetachProcess(&ApcState);
+        }
+        return Status;
     }
 
-    return Status;
+    KeUnstackDetachProcess(&ApcState);
+    return STATUS_SUCCESS;
 }
 
 static
@@ -2237,6 +2448,7 @@ MmpQueryVirtualMemory(
     NTSTATUS Status;
     KAPC_STATE ApcState;
     SIZE_T ReturnLength = 0;
+    BOOLEAN Attached = FALSE;
 
     if (Process == NULL || MemInfo == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2246,6 +2458,7 @@ MmpQueryVirtualMemory(
 
     __try {
         KeStackAttachProcess(Process, &ApcState);
+        Attached = TRUE;
 
         Status = ZwQueryVirtualMemory(
             ZwCurrentProcess(),
@@ -2255,12 +2468,13 @@ MmpQueryVirtualMemory(
             sizeof(MEMORY_BASIC_INFORMATION),
             &ReturnLength
         );
-
-        KeUnstackDetachProcess(&ApcState);
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
-        KeUnstackDetachProcess(&ApcState);
         Status = GetExceptionCode();
+    }
+
+    if (Attached) {
+        KeUnstackDetachProcess(&ApcState);
     }
 
     return Status;

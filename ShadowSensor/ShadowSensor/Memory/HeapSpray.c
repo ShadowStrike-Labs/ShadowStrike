@@ -34,7 +34,7 @@
 #include "../Utilities/MemoryUtils.h"
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, HsInitialize)
+#pragma alloc_text(PAGE, HsInitialize)
 #pragma alloc_text(PAGE, HsShutdown)
 #pragma alloc_text(PAGE, HsStartTracking)
 #pragma alloc_text(PAGE, HsStopTracking)
@@ -53,6 +53,8 @@
 #define HS_PATTERN_HASH_BUCKETS         256
 #define HS_MAX_CALLBACKS                8
 #define HS_ALLOCATION_POOL_SIZE         4096
+#define HS_SHUTDOWN_DRAIN_MAX_WAIT      30000   // 30s at 1ms each
+#define HS_POOL_TAG_RESULT              'RSHI'  // Heap Spray - Result
 
 #define HS_FNV_OFFSET_BASIS             0x811C9DC5
 #define HS_FNV_PRIME                    0x01000193
@@ -99,9 +101,9 @@ typedef struct _HS_DETECTOR_INTERNAL {
     NPAGED_LOOKASIDE_LIST ProcessContextLookaside;
 
     //
-    // Shutdown flag
+    // Shutdown flag (interlocked for cross-CPU visibility)
     //
-    volatile BOOLEAN ShuttingDown;
+    volatile LONG ShuttingDown;
 
 } HS_DETECTOR_INTERNAL, *PHS_DETECTOR_INTERNAL;
 
@@ -109,7 +111,21 @@ typedef struct _HS_DETECTOR_INTERNAL {
 // Forward Declarations
 //=============================================================================
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+//
+// Detector-level reference counting for safe shutdown
+//
+static FORCEINLINE BOOLEAN
+HspAcquireDetectorRef(
+    _In_ PHS_DETECTOR Detector,
+    _In_ PHS_DETECTOR_INTERNAL DetectorInternal
+    );
+
+static FORCEINLINE VOID
+HspReleaseDetectorRef(
+    _In_ PHS_DETECTOR Detector
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
 static PHS_PROCESS_CONTEXT
 HspFindProcessContext(
     _In_ PHS_DETECTOR Detector,
@@ -117,54 +133,54 @@ HspFindProcessContext(
     _In_ BOOLEAN CreateIfNotFound
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspReferenceProcessContext(
     _Inout_ PHS_PROCESS_CONTEXT Context
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspDereferenceProcessContext(
     _In_ PHS_DETECTOR_INTERNAL* DetectorInternal,
     _Inout_ PHS_PROCESS_CONTEXT Context
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspDestroyProcessContext(
     _In_ PHS_DETECTOR_INTERNAL* DetectorInternal,
     _Inout_ PHS_PROCESS_CONTEXT Context
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static PHS_ALLOCATION_RECORD
 HspAllocateRecord(
     _In_ PHS_DETECTOR Detector
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspFreeRecord(
     _In_ PHS_DETECTOR Detector,
     _Inout_ PHS_ALLOCATION_RECORD Record
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static ULONG
 HspCalculatePatternHash(
     _In_reads_bytes_(Size) PUCHAR Data,
     _In_ ULONG Size
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static ULONG
 HspCalculateRepetitionScore(
     _In_reads_bytes_(Size) PUCHAR Data,
     _In_ ULONG Size
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static HS_SPRAY_TYPE
 HspDetectSprayType(
     _In_ PHS_PROCESS_CONTEXT Context,
@@ -172,14 +188,14 @@ HspDetectSprayType(
     _In_ ULONG SampleSize
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static ULONG
 HspCalculateSprayScore(
     _In_ PHS_PROCESS_CONTEXT Context,
     _In_ PHS_ALLOCATION_RECORD Record
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspPruneOldAllocations(
     _Inout_ PHS_PROCESS_CONTEXT Context,
@@ -187,33 +203,73 @@ HspPruneOldAllocations(
     _In_ PHS_DETECTOR Detector
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 HspInvokeCallbacks(
     _In_ PHS_DETECTOR_INTERNAL DetectorInternal,
     _In_ PHS_SPRAY_RESULT Result
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
 HspIsKnownSprayPattern(
     _In_reads_bytes_(Size) PUCHAR Data,
     _In_ ULONG Size
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
 HspContainsNopSled(
     _In_reads_bytes_(Size) PUCHAR Data,
     _In_ ULONG Size
     );
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
 HspContainsShellcodeSignatures(
     _In_reads_bytes_(Size) PUCHAR Data,
     _In_ ULONG Size
     );
+
+//=============================================================================
+// Detector Reference Counting (for shutdown drain)
+//=============================================================================
+
+/**
+ * @brief Acquires a reference to the detector, preventing shutdown
+ *        from freeing resources while an operation is in progress.
+ * @return TRUE if acquired, FALSE if shutting down.
+ */
+static FORCEINLINE BOOLEAN
+HspAcquireDetectorRef(
+    _In_ PHS_DETECTOR Detector,
+    _In_ PHS_DETECTOR_INTERNAL DetectorInternal
+    )
+{
+    if (InterlockedCompareExchange(&DetectorInternal->ShuttingDown, 0, 0)) {
+        return FALSE;
+    }
+    InterlockedIncrement(&Detector->ActiveRefCount);
+    //
+    // Double-check after increment to handle race with shutdown
+    //
+    if (InterlockedCompareExchange(&DetectorInternal->ShuttingDown, 0, 0)) {
+        InterlockedDecrement(&Detector->ActiveRefCount);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/**
+ * @brief Releases a detector reference acquired by HspAcquireDetectorRef.
+ */
+static FORCEINLINE VOID
+HspReleaseDetectorRef(
+    _In_ PHS_DETECTOR Detector
+    )
+{
+    InterlockedDecrement(&Detector->ActiveRefCount);
+}
 
 //=============================================================================
 // Initialization / Shutdown
@@ -276,7 +332,7 @@ Return Value:
     // Initialize process list
     //
     InitializeListHead(&detector->ProcessList);
-    FltInitializePushLock(&detector->ProcessListLock);
+    ExInitializePushLock(&detector->ProcessListLock);
     detector->ProcessCount = 0;
 
     //
@@ -329,7 +385,7 @@ Return Value:
     //
     // Initialize callbacks
     //
-    FltInitializePushLock(&detectorInternal->CallbackLock);
+    ExInitializePushLock(&detectorInternal->CallbackLock);
     detectorInternal->CallbackCount = 0;
 
     for (i = 0; i < HS_MAX_CALLBACKS; i++) {
@@ -353,8 +409,13 @@ Return Value:
     detector->Stats.SpraysDetected = 0;
     detector->Stats.ProcessesMonitored = 0;
 
-    detector->Initialized = TRUE;
-    detectorInternal->ShuttingDown = FALSE;
+    //
+    // Initialize reference counting for safe shutdown
+    //
+    detector->ActiveRefCount = 0;
+
+    InterlockedExchange(&detector->Initialized, TRUE);
+    InterlockedExchange(&detectorInternal->ShuttingDown, FALSE);
 
     *Detector = detector;
 
@@ -384,10 +445,12 @@ Arguments:
     PHS_PROCESS_CONTEXT context;
     PLIST_ENTRY entry;
     LIST_ENTRY contextsToFree;
+    ULONG drainWait;
+    LARGE_INTEGER drainInterval;
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0)) {
         return;
     }
 
@@ -397,16 +460,33 @@ Arguments:
         return;
     }
 
-    detectorInternal->ShuttingDown = TRUE;
-    Detector->Initialized = FALSE;
+    //
+    // Set shutting down first, then clear initialized.
+    // This prevents new operations from starting.
+    //
+    InterlockedExchange(&detectorInternal->ShuttingDown, TRUE);
+    InterlockedExchange(&Detector->Initialized, FALSE);
     KeMemoryBarrier();
+
+    //
+    // Drain active references — wait for in-flight operations to complete
+    //
+    drainInterval.QuadPart = -10000; // 1ms relative
+    for (drainWait = 0; drainWait < HS_SHUTDOWN_DRAIN_MAX_WAIT; drainWait++) {
+        if (InterlockedCompareExchange(&Detector->ActiveRefCount, 0, 0) == 0) {
+            break;
+        }
+
+        KeDelayExecutionThread(KernelMode, FALSE, &drainInterval);
+    }
 
     //
     // Collect all process contexts for cleanup
     //
     InitializeListHead(&contextsToFree);
 
-    FltAcquirePushLockExclusive(&Detector->ProcessListLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
 
     while (!IsListEmpty(&Detector->ProcessList)) {
         entry = RemoveHeadList(&Detector->ProcessList);
@@ -416,7 +496,8 @@ Arguments:
 
     Detector->ProcessCount = 0;
 
-    FltReleasePushLock(&Detector->ProcessListLock);
+    ExReleasePushLockExclusive(&Detector->ProcessListLock);
+    KeLeaveCriticalRegion();
 
     //
     // Destroy all process contexts
@@ -482,7 +563,7 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -540,7 +621,7 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -549,7 +630,8 @@ Return Value:
     //
     // Find and remove the process context
     //
-    FltAcquirePushLockExclusive(&Detector->ProcessListLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
 
     for (entry = Detector->ProcessList.Flink;
          entry != &Detector->ProcessList;
@@ -565,10 +647,16 @@ Return Value:
         }
     }
 
-    FltReleasePushLock(&Detector->ProcessListLock);
+    ExReleasePushLockExclusive(&Detector->ProcessListLock);
+    KeLeaveCriticalRegion();
 
     if (found) {
-        HspDestroyProcessContext(detectorInternal, context);
+        //
+        // Use dereference instead of direct destroy — another thread
+        // may hold a reference from HspFindProcessContext. The context
+        // will be destroyed when the last reference is released.
+        //
+        HspDereferenceProcessContext(detectorInternal, context);
     }
 
     return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
@@ -615,12 +703,14 @@ Return Value:
     PHS_ALLOCATION_RECORD record = NULL;
     LARGE_INTEGER currentTime;
     ULONG bucketIndex;
-    KIRQL oldIrql;
     ULONG sprayScore;
     BOOLEAN sprayDetected = FALSE;
     HS_SPRAY_RESULT sprayResult;
+    SIZE_T totalAllocatedSize;
+    LONG allocationCount;
+    LONG allocationsInWindow;
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -630,7 +720,7 @@ Return Value:
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
-    if (detectorInternal->ShuttingDown) {
+    if (!HspAcquireDetectorRef(Detector, detectorInternal)) {
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
 
@@ -639,6 +729,7 @@ Return Value:
     //
     context = HspFindProcessContext(Detector, ProcessId, TRUE);
     if (context == NULL) {
+        HspReleaseDetectorRef(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -654,6 +745,7 @@ Return Value:
     //
     if ((ULONG)context->AllocationCount >= HS_MAX_TRACKED_ALLOCATIONS) {
         HspDereferenceProcessContext(detectorInternal, context);
+        HspReleaseDetectorRef(Detector);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -663,6 +755,7 @@ Return Value:
     record = HspAllocateRecord(Detector);
     if (record == NULL) {
         HspDereferenceProcessContext(detectorInternal, context);
+        HspReleaseDetectorRef(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -677,14 +770,22 @@ Return Value:
     record->ThreadId = PsGetCurrentThreadId();
 
     //
-    // Sample pattern from memory if accessible
+    // Sample pattern from user-mode memory safely.
+    // We must be at <= APC_LEVEL and must use ProbeForRead instead of
+    // MmIsAddressValid (which is unreliable and can return stale results).
     //
     RtlZeroMemory(record->PatternSample, HS_PATTERN_SAMPLE_SIZE);
 
     __try {
         SIZE_T sampleSize = min(Size, HS_PATTERN_SAMPLE_SIZE);
 
-        if (MmIsAddressValid(Address)) {
+        //
+        // Validate that the address is in user-mode range
+        //
+        if ((ULONG_PTR)Address <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS &&
+            ((ULONG_PTR)Address + sampleSize - 1) <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS) {
+
+            ProbeForRead(Address, sampleSize, sizeof(UCHAR));
             RtlCopyMemory(record->PatternSample, Address, sampleSize);
             record->PatternHash = HspCalculatePatternHash(record->PatternSample, (ULONG)sampleSize);
             record->RepetitionScore = HspCalculateRepetitionScore(record->PatternSample, (ULONG)sampleSize);
@@ -698,14 +799,15 @@ Return Value:
     }
 
     //
-    // Add to allocation list
+    // Add to allocation list and compute spray state under a single lock hold
     //
-    KeAcquireSpinLock(&context->AllocationLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&context->AllocationLock);
 
     InsertTailList(&context->AllocationList, &record->ListEntry);
-    InterlockedIncrement(&context->AllocationCount);
+    context->AllocationCount++;
     context->TotalAllocatedSize += Size;
-    context->AllocationsInWindow++;
+    InterlockedIncrement(&context->AllocationsInWindow);
 
     //
     // Add to pattern hash bucket
@@ -713,7 +815,22 @@ Return Value:
     bucketIndex = record->PatternHash % HS_PATTERN_HASH_BUCKETS;
     InsertTailList(&context->PatternBuckets[bucketIndex], &record->HashEntry);
 
-    KeReleaseSpinLock(&context->AllocationLock, oldIrql);
+    //
+    // Calculate spray score while holding the lock so TotalAllocatedSize
+    // and AllocationCount are consistent (CRITICAL-05 fix).
+    //
+    sprayScore = HspCalculateSprayScore(context, record);
+    InterlockedExchange(&context->SprayScore, (LONG)sprayScore);
+
+    //
+    // Capture state under lock for spray detection check
+    //
+    totalAllocatedSize = context->TotalAllocatedSize;
+    allocationCount = context->AllocationCount;
+    allocationsInWindow = InterlockedCompareExchange(&context->AllocationsInWindow, 0, 0);
+
+    ExReleasePushLockExclusive(&context->AllocationLock);
+    KeLeaveCriticalRegion();
 
     //
     // Update statistics
@@ -721,25 +838,19 @@ Return Value:
     InterlockedIncrement64(&Detector->Stats.TotalAllocationsTracked);
 
     //
-    // Calculate spray score
-    //
-    sprayScore = HspCalculateSprayScore(context, record);
-    context->SprayScore = sprayScore;
-
-    //
-    // Check if spray threshold exceeded
+    // Check if spray threshold exceeded (using captured state)
     //
     if (sprayScore >= HS_MIN_SCORE_FOR_SPRAY &&
-        context->TotalAllocatedSize >= Detector->Config.MinSpraySizeBytes &&
-        (ULONG)context->AllocationCount >= Detector->Config.MinAllocationCount) {
+        totalAllocatedSize >= Detector->Config.MinSpraySizeBytes &&
+        (ULONG)allocationCount >= Detector->Config.MinAllocationCount) {
 
         sprayDetected = TRUE;
-        context->SprayInProgress = TRUE;
-        context->SuspectedType = HspDetectSprayType(
+        InterlockedExchange(&context->SprayInProgress, TRUE);
+        InterlockedExchange(&context->SuspectedType, (LONG)HspDetectSprayType(
             context,
             record->PatternSample,
             HS_PATTERN_SAMPLE_SIZE
-            );
+            ));
 
         InterlockedIncrement64(&Detector->Stats.SpraysDetected);
     }
@@ -751,17 +862,17 @@ Return Value:
         RtlZeroMemory(&sprayResult, sizeof(sprayResult));
 
         sprayResult.SprayDetected = TRUE;
-        sprayResult.Type = context->SuspectedType;
+        sprayResult.Type = (HS_SPRAY_TYPE)InterlockedCompareExchange(&context->SuspectedType, 0, 0);
         sprayResult.ConfidenceScore = min(sprayScore, 1000);
         sprayResult.ProcessId = ProcessId;
-        sprayResult.AllocationCount = (ULONG)context->AllocationCount;
-        sprayResult.TotalSize = context->TotalAllocatedSize;
-        sprayResult.AverageSize = context->TotalAllocatedSize / max((ULONG)context->AllocationCount, 1);
+        sprayResult.AllocationCount = (ULONG)allocationCount;
+        sprayResult.TotalSize = totalAllocatedSize;
+        sprayResult.AverageSize = totalAllocatedSize / max((ULONG)allocationCount, 1);
 
         //
         // Set detection flags
         //
-        if (context->AllocationsInWindow > HS_HIGH_ALLOC_RATE_THRESHOLD) {
+        if (allocationsInWindow > HS_HIGH_ALLOC_RATE_THRESHOLD) {
             sprayResult.Flags |= HsFlag_HighAllocationRate;
         }
         if (record->RepetitionScore > HS_REPETITION_THRESHOLD) {
@@ -803,6 +914,7 @@ Return Value:
     }
 
     HspDereferenceProcessContext(detectorInternal, context);
+    HspReleaseDetectorRef(Detector);
 
     return STATUS_SUCCESS;
 }
@@ -837,10 +949,9 @@ Return Value:
     PHS_PROCESS_CONTEXT context;
     PHS_ALLOCATION_RECORD record = NULL;
     PLIST_ENTRY entry;
-    KIRQL oldIrql;
     BOOLEAN found = FALSE;
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -850,7 +961,7 @@ Return Value:
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
-    if (detectorInternal->ShuttingDown) {
+    if (!HspAcquireDetectorRef(Detector, detectorInternal)) {
         return STATUS_SHUTDOWN_IN_PROGRESS;
     }
 
@@ -859,13 +970,15 @@ Return Value:
     //
     context = HspFindProcessContext(Detector, ProcessId, FALSE);
     if (context == NULL) {
+        HspReleaseDetectorRef(Detector);
         return STATUS_NOT_FOUND;
     }
 
     //
     // Find and remove the allocation record
     //
-    KeAcquireSpinLock(&context->AllocationLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&context->AllocationLock);
 
     for (entry = context->AllocationList.Flink;
          entry != &context->AllocationList;
@@ -876,20 +989,22 @@ Return Value:
         if (record->Address == Address) {
             RemoveEntryList(&record->ListEntry);
             RemoveEntryList(&record->HashEntry);
-            InterlockedDecrement(&context->AllocationCount);
+            context->AllocationCount--;
             context->TotalAllocatedSize -= record->Size;
             found = TRUE;
             break;
         }
     }
 
-    KeReleaseSpinLock(&context->AllocationLock, oldIrql);
+    ExReleasePushLockExclusive(&context->AllocationLock);
+    KeLeaveCriticalRegion();
 
     if (found && record != NULL) {
         HspFreeRecord(Detector, record);
     }
 
     HspDereferenceProcessContext(detectorInternal, context);
+    HspReleaseDetectorRef(Detector);
 
     return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
@@ -929,7 +1044,6 @@ Return Value:
     PHS_SPRAY_RESULT result = NULL;
     PHS_ALLOCATION_RECORD record;
     PLIST_ENTRY entry;
-    KIRQL oldIrql;
     LARGE_INTEGER currentTime;
     ULONG patternCounts[HS_PATTERN_HASH_BUCKETS] = {0};
     ULONG maxPatternCount = 0;
@@ -941,7 +1055,7 @@ Return Value:
     SIZE_T totalSize = 0;
     ULONG allocCount = 0;
 
-    if (Detector == NULL || !Detector->Initialized || Result == NULL) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0) || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -949,27 +1063,33 @@ Return Value:
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
+    if (!HspAcquireDetectorRef(Detector, detectorInternal)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
     //
     // Find process context
     //
     context = HspFindProcessContext(Detector, ProcessId, FALSE);
     if (context == NULL) {
+        HspReleaseDetectorRef(Detector);
         return STATUS_NOT_FOUND;
     }
 
     KeQuerySystemTimePrecise(&currentTime);
 
     //
-    // Allocate result structure
+    // Allocate result structure (distinct pool tag for results)
     //
     result = (PHS_SPRAY_RESULT)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(HS_SPRAY_RESULT),
-        HS_POOL_TAG_CONTEXT
+        HS_POOL_TAG_RESULT
         );
 
     if (result == NULL) {
         HspDereferenceProcessContext(detectorInternal, context);
+        HspReleaseDetectorRef(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -978,9 +1098,10 @@ Return Value:
     result->ProcessId = ProcessId;
 
     //
-    // Analyze all allocations
+    // Analyze all allocations under push lock (no IRQL raise, safe for O(N))
     //
-    KeAcquireSpinLock(&context->AllocationLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&context->AllocationLock);
 
     for (entry = context->AllocationList.Flink;
          entry != &context->AllocationList;
@@ -1055,7 +1176,8 @@ Return Value:
         }
     }
 
-    KeReleaseSpinLock(&context->AllocationLock, oldIrql);
+    ExReleasePushLockShared(&context->AllocationLock);
+    KeLeaveCriticalRegion();
 
     //
     // Calculate confidence score
@@ -1109,12 +1231,12 @@ Return Value:
 
     result->ConfidenceScore = min(confidenceScore, 1000);
     result->SprayDetected = (confidenceScore >= HS_MIN_SCORE_FOR_SPRAY);
-    result->Type = context->SuspectedType;
+    result->Type = (HS_SPRAY_TYPE)InterlockedCompareExchange(&context->SuspectedType, 0, 0);
 
     //
     // Set flags
     //
-    if (context->AllocationsInWindow > HS_HIGH_ALLOC_RATE_THRESHOLD) {
+    if (InterlockedCompareExchange(&context->AllocationsInWindow, 0, 0) > (LONG)HS_HIGH_ALLOC_RATE_THRESHOLD) {
         result->Flags |= HsFlag_HighAllocationRate;
     }
     if (maxPatternCount > allocCount / 2) {
@@ -1143,6 +1265,7 @@ Return Value:
     }
 
     HspDereferenceProcessContext(detectorInternal, context);
+    HspReleaseDetectorRef(Detector);
 
     *Result = result;
 
@@ -1182,7 +1305,7 @@ Return Value:
     PHS_DETECTOR_INTERNAL detectorInternal;
     PHS_PROCESS_CONTEXT context;
 
-    if (Detector == NULL || !Detector->Initialized || SprayDetected == NULL) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0) || SprayDetected == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1192,26 +1315,32 @@ Return Value:
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
+    if (!HspAcquireDetectorRef(Detector, detectorInternal)) {
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+
     //
     // Find process context
     //
     context = HspFindProcessContext(Detector, ProcessId, FALSE);
     if (context == NULL) {
+        HspReleaseDetectorRef(Detector);
         return STATUS_NOT_FOUND;
     }
 
-    *SprayDetected = context->SprayInProgress;
+    *SprayDetected = (BOOLEAN)InterlockedCompareExchange(&context->SprayInProgress, 0, 0);
 
-    if (context->SprayInProgress) {
+    if (*SprayDetected) {
         if (Type != NULL) {
-            *Type = context->SuspectedType;
+            *Type = (HS_SPRAY_TYPE)InterlockedCompareExchange(&context->SuspectedType, 0, 0);
         }
         if (Score != NULL) {
-            *Score = context->SprayScore;
+            *Score = (ULONG)InterlockedCompareExchange(&context->SprayScore, 0, 0);
         }
     }
 
     HspDereferenceProcessContext(detectorInternal, context);
+    HspReleaseDetectorRef(Detector);
 
     return STATUS_SUCCESS;
 }
@@ -1235,13 +1364,14 @@ HsRegisterCallback(
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0) || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
-    FltAcquirePushLockExclusive(&detectorInternal->CallbackLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&detectorInternal->CallbackLock);
 
     for (i = 0; i < HS_MAX_CALLBACKS; i++) {
         if (!detectorInternal->Callbacks[i].Active) {
@@ -1254,7 +1384,8 @@ HsRegisterCallback(
         }
     }
 
-    FltReleasePushLock(&detectorInternal->CallbackLock);
+    ExReleasePushLockExclusive(&detectorInternal->CallbackLock);
+    KeLeaveCriticalRegion();
 
     return registered ? STATUS_SUCCESS : STATUS_QUOTA_EXCEEDED;
 }
@@ -1272,13 +1403,14 @@ HsUnregisterCallback(
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0) || Callback == NULL) {
         return;
     }
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
-    FltAcquirePushLockExclusive(&detectorInternal->CallbackLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&detectorInternal->CallbackLock);
 
     for (i = 0; i < HS_MAX_CALLBACKS; i++) {
         if (detectorInternal->Callbacks[i].Active &&
@@ -1291,7 +1423,8 @@ HsUnregisterCallback(
         }
     }
 
-    FltReleasePushLock(&detectorInternal->CallbackLock);
+    ExReleasePushLockExclusive(&detectorInternal->CallbackLock);
+    KeLeaveCriticalRegion();
 }
 
 
@@ -1306,7 +1439,7 @@ HsFreeResult(
     )
 {
     if (Result != NULL) {
-        ShadowStrikeFreePoolWithTag(Result, HS_POOL_TAG_CONTEXT);
+        ShadowStrikeFreePoolWithTag(Result, HS_POOL_TAG_RESULT);
     }
 }
 
@@ -1324,7 +1457,7 @@ HsGetStatistics(
 {
     LARGE_INTEGER currentTime;
 
-    if (Detector == NULL || !Detector->Initialized || Stats == NULL) {
+    if (Detector == NULL || !InterlockedCompareExchange(&Detector->Initialized, 0, 0) || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1357,36 +1490,42 @@ HspFindProcessContext(
 
 Routine Description:
 
-    Finds or creates a process context.
+    Finds or creates a process context. Uses double-check pattern under
+    exclusive lock to prevent TOCTOU race creating duplicate contexts.
 
 --*/
 {
     PHS_DETECTOR_INTERNAL detectorInternal;
     PHS_PROCESS_CONTEXT context = NULL;
+    PHS_PROCESS_CONTEXT existingContext = NULL;
     PLIST_ENTRY entry;
     ULONG i;
+    NTSTATUS status;
 
     detectorInternal = CONTAINING_RECORD(Detector, HS_DETECTOR_INTERNAL, Detector);
 
     //
-    // Search existing contexts
+    // Search existing contexts under shared lock
     //
-    FltAcquirePushLockShared(&Detector->ProcessListLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->ProcessListLock);
 
     for (entry = Detector->ProcessList.Flink;
          entry != &Detector->ProcessList;
          entry = entry->Flink) {
 
-        context = CONTAINING_RECORD(entry, HS_PROCESS_CONTEXT, ListEntry);
+        existingContext = CONTAINING_RECORD(entry, HS_PROCESS_CONTEXT, ListEntry);
 
-        if (context->ProcessId == ProcessId) {
-            HspReferenceProcessContext(context);
-            FltReleasePushLock(&Detector->ProcessListLock);
-            return context;
+        if (existingContext->ProcessId == ProcessId) {
+            HspReferenceProcessContext(existingContext);
+            ExReleasePushLockShared(&Detector->ProcessListLock);
+            KeLeaveCriticalRegion();
+            return existingContext;
         }
     }
 
-    FltReleasePushLock(&Detector->ProcessListLock);
+    ExReleasePushLockShared(&Detector->ProcessListLock);
+    KeLeaveCriticalRegion();
 
     //
     // Not found, create if requested
@@ -1409,18 +1548,21 @@ Routine Description:
     RtlZeroMemory(context, sizeof(HS_PROCESS_CONTEXT));
 
     context->ProcessId = ProcessId;
-    context->Process = NULL;  // Could be obtained if needed
+    context->Process = NULL;
 
     //
-    // Try to get EPROCESS
+    // Try to get EPROCESS — check return value (HIGH-01)
     //
-    PsLookupProcessByProcessId(ProcessId, &context->Process);
+    status = PsLookupProcessByProcessId(ProcessId, &context->Process);
+    if (!NT_SUCCESS(status)) {
+        context->Process = NULL;
+    }
 
     //
-    // Initialize allocation list
+    // Initialize allocation list with push lock (not spin lock)
     //
     InitializeListHead(&context->AllocationList);
-    KeInitializeSpinLock(&context->AllocationLock);
+    ExInitializePushLock(&context->AllocationLock);
     context->AllocationCount = 0;
 
     //
@@ -1435,29 +1577,63 @@ Routine Description:
     // Initialize metrics
     //
     context->TotalAllocatedSize = 0;
-    context->AllocationsInWindow = 0;
+    InterlockedExchange(&context->AllocationsInWindow, 0);
     KeQuerySystemTimePrecise(&context->WindowStartTime);
 
     //
     // Initialize spray state
     //
-    context->SprayInProgress = FALSE;
-    context->SuspectedType = HsSprayType_Unknown;
-    context->SprayScore = 0;
+    InterlockedExchange(&context->SprayInProgress, FALSE);
+    InterlockedExchange(&context->SuspectedType, (LONG)HsSprayType_Unknown);
+    InterlockedExchange(&context->SprayScore, 0);
 
     //
-    // Reference count: 1 for creation, will increment for caller
+    // Reference count: 1 for list membership + 1 for caller
     //
     context->RefCount = 2;
 
     //
-    // Add to list
+    // TOCTOU fix: re-check under exclusive lock before inserting.
+    // Another thread may have created this context between our shared
+    // lock release and now.
     //
-    FltAcquirePushLockExclusive(&Detector->ProcessListLock);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->ProcessListLock);
+
+    for (entry = Detector->ProcessList.Flink;
+         entry != &Detector->ProcessList;
+         entry = entry->Flink) {
+
+        existingContext = CONTAINING_RECORD(entry, HS_PROCESS_CONTEXT, ListEntry);
+
+        if (existingContext->ProcessId == ProcessId) {
+            //
+            // Another thread created it — use theirs, discard ours
+            //
+            HspReferenceProcessContext(existingContext);
+            ExReleasePushLockExclusive(&Detector->ProcessListLock);
+            KeLeaveCriticalRegion();
+
+            //
+            // Clean up our unused context
+            //
+            if (context->Process != NULL) {
+                ObDereferenceObject(context->Process);
+            }
+            ExFreeToNPagedLookasideList(
+                &detectorInternal->ProcessContextLookaside,
+                context
+                );
+            return existingContext;
+        }
+    }
+
     InsertTailList(&Detector->ProcessList, &context->ListEntry);
     InterlockedIncrement(&Detector->ProcessCount);
     InterlockedIncrement64(&Detector->Stats.ProcessesMonitored);
-    FltReleasePushLock(&Detector->ProcessListLock);
+
+    ExReleasePushLockExclusive(&Detector->ProcessListLock);
+    KeLeaveCriticalRegion();
 
     return context;
 }
@@ -1509,15 +1685,15 @@ Routine Description:
 {
     PHS_ALLOCATION_RECORD record;
     PLIST_ENTRY entry;
-    KIRQL oldIrql;
     LIST_ENTRY recordsToFree;
 
     InitializeListHead(&recordsToFree);
 
     //
-    // Collect all allocation records
+    // Collect all allocation records under push lock
     //
-    KeAcquireSpinLock(&Context->AllocationLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Context->AllocationLock);
 
     while (!IsListEmpty(&Context->AllocationList)) {
         entry = RemoveHeadList(&Context->AllocationList);
@@ -1526,7 +1702,8 @@ Routine Description:
 
     Context->AllocationCount = 0;
 
-    KeReleaseSpinLock(&Context->AllocationLock, oldIrql);
+    ExReleasePushLockExclusive(&Context->AllocationLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free all records
@@ -1568,7 +1745,7 @@ HspAllocateRecord(
     if (!IsListEmpty(&Detector->AllocationPool.FreeList)) {
         entry = RemoveHeadList(&Detector->AllocationPool.FreeList);
         record = CONTAINING_RECORD(entry, HS_ALLOCATION_RECORD, ListEntry);
-        InterlockedDecrement(&Detector->AllocationPool.FreeCount);
+        Detector->AllocationPool.FreeCount--;
     }
 
     KeReleaseSpinLock(&Detector->AllocationPool.Lock, oldIrql);
@@ -1596,7 +1773,7 @@ HspFreeRecord(
     KeAcquireSpinLock(&Detector->AllocationPool.Lock, &oldIrql);
 
     InsertTailList(&Detector->AllocationPool.FreeList, &Record->ListEntry);
-    InterlockedIncrement(&Detector->AllocationPool.FreeCount);
+    Detector->AllocationPool.FreeCount++;
 
     KeReleaseSpinLock(&Detector->AllocationPool.Lock, oldIrql);
 }
@@ -1760,7 +1937,8 @@ Routine Description:
     // Check for DWORD patterns
     //
     for (i = 0; i < SampleSize - 3; i += 4) {
-        ULONG dword = *(PULONG)&PatternSample[i];
+        ULONG dword;
+        RtlCopyMemory(&dword, &PatternSample[i], sizeof(ULONG));
 
         if ((dword & 0x00FFFFFF) == (HS_JIT_XOR_PATTERN & 0x00FFFFFF)) {
             hasJitPattern = TRUE;
@@ -1801,7 +1979,8 @@ Routine Description:
     // Check for BSTR-like patterns (length prefixed)
     //
     if (SampleSize >= 4) {
-        ULONG potentialLength = *(PULONG)PatternSample;
+        ULONG potentialLength;
+        RtlCopyMemory(&potentialLength, PatternSample, sizeof(ULONG));
         if (potentialLength > 0 && potentialLength < 0x10000) {
             return HsSprayType_StringSpray;
         }
@@ -1812,11 +1991,12 @@ Routine Description:
     //
     ULONG ptrCount = 0;
     for (i = 0; i < SampleSize - sizeof(PVOID) + 1; i += sizeof(PVOID)) {
-        ULONG_PTR ptr = *(PULONG_PTR)&PatternSample[i];
+        ULONG_PTR ptr;
+        RtlCopyMemory(&ptr, &PatternSample[i], sizeof(ULONG_PTR));
         //
         // Check if it looks like a valid user-mode pointer
         //
-        if (ptr > 0x10000 && ptr < 0x7FFFFFFFFFFF) {
+        if (ptr > 0x10000 && ptr <= (ULONG_PTR)MM_HIGHEST_USER_ADDRESS) {
             ptrCount++;
         }
     }
@@ -1856,8 +2036,8 @@ Routine Description:
     //
     // Score from allocation count
     //
-    if (Context->AllocationCount > HS_MIN_SIMILAR_ALLOCATIONS) {
-        score += 100 + min((Context->AllocationCount - HS_MIN_SIMILAR_ALLOCATIONS) * 2, 200);
+    if ((ULONG)Context->AllocationCount > HS_MIN_SIMILAR_ALLOCATIONS) {
+        score += 100 + min(((ULONG)Context->AllocationCount - HS_MIN_SIMILAR_ALLOCATIONS) * 2, 200);
     }
 
     //
@@ -1873,7 +2053,8 @@ Routine Description:
     //
     windowDuration.QuadPart = Record->Timestamp.QuadPart - Context->WindowStartTime.QuadPart;
     if (windowDuration.QuadPart > 0) {
-        allocsPerSecond = (ULONG)(((LONG64)Context->AllocationsInWindow * 10000000LL) /
+        LONG aiw = InterlockedCompareExchange(&Context->AllocationsInWindow, 0, 0);
+        allocsPerSecond = (ULONG)(((LONG64)aiw * 10000000LL) /
                                   windowDuration.QuadPart);
         if (allocsPerSecond > HS_HIGH_ALLOC_RATE_THRESHOLD) {
             score += 150;
@@ -1939,9 +2120,11 @@ Routine Description:
     PHS_ALLOCATION_RECORD record;
     PLIST_ENTRY entry;
     PLIST_ENTRY next;
-    KIRQL oldIrql;
     LARGE_INTEGER windowStart;
     LIST_ENTRY recordsToFree;
+    LONG pruneCount = 0;
+    LONG current;
+    LONG newVal;
 
     InitializeListHead(&recordsToFree);
 
@@ -1951,7 +2134,8 @@ Routine Description:
     windowStart.QuadPart = CurrentTime->QuadPart -
                            ((LONGLONG)Detector->Config.AllocationWindowMs * 10000LL);
 
-    KeAcquireSpinLock(&Context->AllocationLock, &oldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Context->AllocationLock);
 
     //
     // Find and remove old allocations
@@ -1966,10 +2150,22 @@ Routine Description:
         if (record->Timestamp.QuadPart < windowStart.QuadPart) {
             RemoveEntryList(&record->ListEntry);
             RemoveEntryList(&record->HashEntry);
-            InterlockedDecrement(&Context->AllocationCount);
+            Context->AllocationCount--;
             Context->TotalAllocatedSize -= record->Size;
+            pruneCount++;
             InsertTailList(&recordsToFree, &record->ListEntry);
         }
+    }
+
+    //
+    // Decrement AllocationsInWindow by the number pruned (HIGH-07 fix)
+    //
+    if (pruneCount > 0) {
+        do {
+            current = InterlockedCompareExchange(&Context->AllocationsInWindow, 0, 0);
+            newVal = current - pruneCount;
+            if (newVal < 0) newVal = 0;
+        } while (InterlockedCompareExchange(&Context->AllocationsInWindow, newVal, current) != current);
     }
 
     //
@@ -1977,12 +2173,13 @@ Routine Description:
     //
     if (IsListEmpty(&Context->AllocationList)) {
         Context->WindowStartTime = *CurrentTime;
-        Context->AllocationsInWindow = 0;
-        Context->SprayInProgress = FALSE;
-        Context->SprayScore = 0;
+        InterlockedExchange(&Context->AllocationsInWindow, 0);
+        InterlockedExchange(&Context->SprayInProgress, FALSE);
+        InterlockedExchange(&Context->SprayScore, 0);
     }
 
-    KeReleaseSpinLock(&Context->AllocationLock, oldIrql);
+    ExReleasePushLockExclusive(&Context->AllocationLock);
+    KeLeaveCriticalRegion();
 
     //
     // Free collected records
@@ -2002,23 +2199,47 @@ HspInvokeCallbacks(
     _In_ PHS_DETECTOR_INTERNAL DetectorInternal,
     _In_ PHS_SPRAY_RESULT Result
     )
+/*++
+
+Routine Description:
+
+    Invokes all registered callbacks. Snapshots the callback array
+    under the lock and invokes outside the lock to prevent deadlock.
+
+--*/
 {
     ULONG i;
+    ULONG snapshotCount = 0;
+    struct {
+        HS_SPRAY_CALLBACK Callback;
+        PVOID Context;
+    } snapshot[HS_MAX_CALLBACKS];
 
-    FltAcquirePushLockShared(&DetectorInternal->CallbackLock);
+    //
+    // Snapshot active callbacks under shared lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&DetectorInternal->CallbackLock);
 
     for (i = 0; i < HS_MAX_CALLBACKS; i++) {
         if (DetectorInternal->Callbacks[i].Active &&
             DetectorInternal->Callbacks[i].Callback != NULL) {
 
-            DetectorInternal->Callbacks[i].Callback(
-                Result,
-                DetectorInternal->Callbacks[i].Context
-                );
+            snapshot[snapshotCount].Callback = DetectorInternal->Callbacks[i].Callback;
+            snapshot[snapshotCount].Context = DetectorInternal->Callbacks[i].Context;
+            snapshotCount++;
         }
     }
 
-    FltReleasePushLock(&DetectorInternal->CallbackLock);
+    ExReleasePushLockShared(&DetectorInternal->CallbackLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Invoke callbacks outside the lock
+    //
+    for (i = 0; i < snapshotCount; i++) {
+        snapshot[i].Callback(Result, snapshot[i].Context);
+    }
 }
 
 
@@ -2047,7 +2268,8 @@ Routine Description:
     // Check for repeated DWORD patterns
     //
     for (i = 0; i < Size - 3; i += 4) {
-        ULONG dword = *(PULONG)&Data[i];
+        ULONG dword;
+        RtlCopyMemory(&dword, &Data[i], sizeof(ULONG));
 
         if (dword == HS_NOP_SLIDE_12 ||
             dword == HS_NOP_SLIDE_0D ||

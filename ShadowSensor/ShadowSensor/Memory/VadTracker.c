@@ -58,7 +58,7 @@ MITRE ATT&CK Coverage:
 #define VAD_PAGE_SHIFT                  12
 #define VAD_LARGE_REGION_THRESHOLD      (16 * 1024 * 1024)  // 16 MB
 #define VAD_SUSPICIOUS_BASE_LOW         0x10000
-#define VAD_SUSPICIOUS_BASE_HIGH        0x7FFE0000
+#define VAD_SHUTDOWN_DRAIN_MAX_WAIT     30000    // 30s at 1ms each
 
 //
 // Windows internal VAD types (from ntddk)
@@ -96,19 +96,19 @@ typedef struct _VAD_TRACKER_INTERNAL {
     VAD_TRACKER Public;
 
     //
-    // Callback registrations
+    // Callback registrations (protected by CallbackLock push lock)
     //
     VAD_CALLBACK_ENTRY Callbacks[VAD_MAX_CALLBACKS];
-    KSPIN_LOCK CallbackLock;
+    EX_PUSH_LOCK CallbackLock;
     ULONG CallbackCount;
 
     //
     // Worker thread for snapshot processing
     //
-    HANDLE WorkerThread;
+    PETHREAD WorkerThread;
     KEVENT ShutdownEvent;
     KEVENT WorkAvailableEvent;
-    BOOLEAN ShutdownRequested;
+    volatile LONG ShutdownRequested;
 
     //
     // Lookaside lists for frequent allocations
@@ -116,7 +116,7 @@ typedef struct _VAD_TRACKER_INTERNAL {
     NPAGED_LOOKASIDE_LIST RegionLookaside;
     NPAGED_LOOKASIDE_LIST ChangeLookaside;
     NPAGED_LOOKASIDE_LIST ContextLookaside;
-    BOOLEAN LookasideInitialized;
+    volatile LONG LookasideInitialized;
 
 } VAD_TRACKER_INTERNAL, *PVAD_TRACKER_INTERNAL;
 
@@ -125,42 +125,36 @@ typedef struct _VAD_TRACKER_INTERNAL {
 // ============================================================================
 
 //
-// AVL tree comparison routines
+// Ref acquire/release for shutdown drain
 //
-static RTL_GENERIC_COMPARE_RESULTS NTAPI
-VadpCompareRegions(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_ PVOID FirstStruct,
-    _In_ PVOID SecondStruct
+static BOOLEAN
+VadpAcquireRef(
+    _In_ PVAD_TRACKER_INTERNAL Tracker
     );
 
-static PVOID NTAPI
-VadpAllocateRoutine(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_ CLONG ByteSize
-    );
-
-static VOID NTAPI
-VadpFreeRoutine(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_ PVOID Buffer
+static VOID
+VadpReleaseRef(
+    _In_ PVAD_TRACKER_INTERNAL Tracker
     );
 
 //
 // Process context management
 //
+_IRQL_requires_(PASSIVE_LEVEL)
 static PVAD_PROCESS_CONTEXT
 VadpAllocateProcessContext(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 VadpFreeProcessContext(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static PVAD_PROCESS_CONTEXT
 VadpLookupProcessContext(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
@@ -172,6 +166,7 @@ VadpReferenceProcessContext(
     _Inout_ PVAD_PROCESS_CONTEXT Context
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 VadpDereferenceProcessContext(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
@@ -192,18 +187,21 @@ VadpFreeRegion(
     _In_ PVAD_REGION Region
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS
 VadpInsertRegion(
     _In_ PVAD_PROCESS_CONTEXT Context,
     _In_ PVAD_REGION Region
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static PVAD_REGION
 VadpFindRegion(
     _In_ PVAD_PROCESS_CONTEXT Context,
     _In_ PVOID Address
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 VadpRemoveAllRegions(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
@@ -213,12 +211,14 @@ VadpRemoveAllRegions(
 //
 // VAD scanning
 //
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 VadpScanProcessVad(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS
 VadpQueryMemoryRegions(
     _In_ PEPROCESS Process,
@@ -253,6 +253,7 @@ VadpQueueChangeEvent(
     _In_ PVAD_CHANGE_EVENT Event
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 VadpNotifyCallbacks(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
@@ -293,19 +294,21 @@ VadpCompareSnapshots(
     );
 
 //
-// Hash table helpers
+// Hash table helpers (chained hashing)
 //
 static ULONG
 VadpHashProcessId(
     _In_ HANDLE ProcessId
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS
 VadpInsertProcessHash(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 static VOID
 VadpRemoveProcessHash(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
@@ -336,6 +339,9 @@ Return Value:
     LARGE_INTEGER DueTime;
     HANDLE ThreadHandle = NULL;
     OBJECT_ATTRIBUTES ObjectAttributes;
+    ULONG i;
+
+    PAGED_CODE();
 
     if (Tracker == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -346,8 +352,8 @@ Return Value:
     //
     // Allocate internal tracker structure
     //
-    Internal = (PVAD_TRACKER_INTERNAL)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
+    Internal = (PVAD_TRACKER_INTERNAL)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
         sizeof(VAD_TRACKER_INTERNAL),
         VAD_POOL_TAG_TREE
         );
@@ -356,26 +362,28 @@ Return Value:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(Internal, sizeof(VAD_TRACKER_INTERNAL));
+    //
+    // ExAllocatePool2 zero-initializes by default
+    //
 
     //
-    // Initialize public structure
+    // Initialize public structure (push locks instead of spin locks)
     //
     InitializeListHead(&Internal->Public.ProcessList);
-    KeInitializeSpinLock(&Internal->Public.ProcessListLock);
+    ExInitializePushLock(&Internal->Public.ProcessListLock);
 
     InitializeListHead(&Internal->Public.ChangeQueue);
     KeInitializeSpinLock(&Internal->Public.ChangeQueueLock);
     KeInitializeEvent(&Internal->Public.ChangeAvailableEvent, SynchronizationEvent, FALSE);
 
     //
-    // Initialize hash table
+    // Initialize hash table (chained — each bucket is a LIST_ENTRY head)
     //
     Internal->Public.ProcessHash.BucketCount = VAD_HASH_BUCKET_COUNT;
-    Internal->Public.ProcessHash.Buckets = (PVAD_PROCESS_CONTEXT*)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(PVAD_PROCESS_CONTEXT) * VAD_HASH_BUCKET_COUNT,
-        VAD_POOL_TAG_TREE
+    Internal->Public.ProcessHash.Buckets = (LIST_ENTRY*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(LIST_ENTRY) * VAD_HASH_BUCKET_COUNT,
+        VAD_POOL_TAG_HASH
         );
 
     if (Internal->Public.ProcessHash.Buckets == NULL) {
@@ -383,14 +391,13 @@ Return Value:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlZeroMemory(
-        Internal->Public.ProcessHash.Buckets,
-        sizeof(PVAD_PROCESS_CONTEXT) * VAD_HASH_BUCKET_COUNT
-        );
-    KeInitializeSpinLock(&Internal->Public.ProcessHash.Lock);
+    for (i = 0; i < VAD_HASH_BUCKET_COUNT; i++) {
+        InitializeListHead(&Internal->Public.ProcessHash.Buckets[i]);
+    }
+    ExInitializePushLock(&Internal->Public.ProcessHash.Lock);
 
     //
-    // Initialize lookaside lists
+    // Initialize lookaside lists (distinct pool tags)
     //
     ExInitializeNPagedLookasideList(
         &Internal->RegionLookaside,
@@ -408,7 +415,7 @@ Return Value:
         NULL,
         POOL_NX_ALLOCATION,
         sizeof(VAD_CHANGE_EVENT),
-        VAD_POOL_TAG_ENTRY,
+        VAD_POOL_TAG_CHANGE,
         0
         );
 
@@ -418,16 +425,16 @@ Return Value:
         NULL,
         POOL_NX_ALLOCATION,
         sizeof(VAD_PROCESS_CONTEXT),
-        VAD_POOL_TAG_ENTRY,
+        VAD_POOL_TAG_CONTEXT,
         0
         );
 
-    Internal->LookasideInitialized = TRUE;
+    InterlockedExchange(&Internal->LookasideInitialized, 1);
 
     //
-    // Initialize callback infrastructure
+    // Initialize callback infrastructure (push lock)
     //
-    KeInitializeSpinLock(&Internal->CallbackLock);
+    ExInitializePushLock(&Internal->CallbackLock);
 
     //
     // Initialize default configuration
@@ -450,7 +457,7 @@ Return Value:
     KeInitializeEvent(&Internal->WorkAvailableEvent, SynchronizationEvent, FALSE);
 
     //
-    // Create worker thread
+    // Create worker thread — get PETHREAD reference
     //
     InitializeObjectAttributes(&ObjectAttributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -478,8 +485,15 @@ Return Value:
         );
 
     ZwClose(ThreadHandle);
+    ThreadHandle = NULL;
 
     if (!NT_SUCCESS(Status)) {
+        //
+        // Thread is running but we can't get a reference.
+        // Signal shutdown and wait for thread to exit via handle.
+        //
+        InterlockedExchange(&Internal->ShutdownRequested, 1);
+        KeSetEvent(&Internal->ShutdownEvent, IO_NO_INCREMENT, FALSE);
         goto Cleanup;
     }
 
@@ -499,25 +513,26 @@ Return Value:
         Internal->Public.Config.SnapshotIntervalMs,
         &Internal->Public.SnapshotDpc
         );
-    Internal->Public.SnapshotTimerActive = TRUE;
+    InterlockedExchange(&Internal->Public.SnapshotTimerActive, 1);
 
     //
-    // Mark as initialized
+    // Initialize ref count and mark initialized (interlocked)
     //
-    Internal->Public.Initialized = TRUE;
+    InterlockedExchange(&Internal->Public.ActiveRefCount, 0);
+    InterlockedExchange(&Internal->Public.Initialized, 1);
     *Tracker = (PVAD_TRACKER)Internal;
 
     return STATUS_SUCCESS;
 
 Cleanup:
-    if (Internal->LookasideInitialized) {
+    if (InterlockedCompareExchange(&Internal->LookasideInitialized, 0, 0) != 0) {
         ExDeleteNPagedLookasideList(&Internal->RegionLookaside);
         ExDeleteNPagedLookasideList(&Internal->ChangeLookaside);
         ExDeleteNPagedLookasideList(&Internal->ContextLookaside);
     }
 
     if (Internal->Public.ProcessHash.Buckets != NULL) {
-        ExFreePoolWithTag(Internal->Public.ProcessHash.Buckets, VAD_POOL_TAG_TREE);
+        ExFreePoolWithTag(Internal->Public.ProcessHash.Buckets, VAD_POOL_TAG_HASH);
     }
 
     ExFreePoolWithTag(Internal, VAD_POOL_TAG_TREE);
@@ -541,20 +556,29 @@ Arguments:
     PVAD_PROCESS_CONTEXT Context;
     PVAD_CHANGE_EVENT ChangeEvent;
     KIRQL OldIrql;
+    LARGE_INTEGER Interval;
+    LONG DrainWait;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    PAGED_CODE();
+
+    if (Internal == NULL) {
         return;
     }
 
-    Internal->Public.Initialized = FALSE;
-    Internal->ShutdownRequested = TRUE;
+    //
+    // Atomically mark as not-initialized to reject new operations
+    //
+    if (InterlockedExchange(&Internal->Public.Initialized, 0) == 0) {
+        return;
+    }
+
+    InterlockedExchange(&Internal->ShutdownRequested, 1);
 
     //
     // Cancel snapshot timer
     //
-    if (Internal->Public.SnapshotTimerActive) {
+    if (InterlockedExchange(&Internal->Public.SnapshotTimerActive, 0) != 0) {
         KeCancelTimer(&Internal->Public.SnapshotTimer);
-        Internal->Public.SnapshotTimerActive = FALSE;
     }
 
     //
@@ -576,22 +600,26 @@ Arguments:
     }
 
     //
-    // Free all process contexts
+    // Drain active references — wait up to 30 seconds
     //
-    KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
+    Interval.QuadPart = -10000;  // 1ms
+    for (DrainWait = 0; DrainWait < VAD_SHUTDOWN_DRAIN_MAX_WAIT; DrainWait++) {
+        if (InterlockedCompareExchange(&Internal->Public.ActiveRefCount, 0, 0) == 0) {
+            break;
+        }
+        KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+    }
 
+    //
+    // Free all process contexts — single-threaded at this point
+    //
     while (!IsListEmpty(&Internal->Public.ProcessList)) {
         Entry = RemoveHeadList(&Internal->Public.ProcessList);
         Context = CONTAINING_RECORD(Entry, VAD_PROCESS_CONTEXT, ListEntry);
-        KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
 
         VadpRemoveAllRegions(Internal, Context);
         VadpFreeProcessContext(Internal, Context);
-
-        KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
     }
-
-    KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
 
     //
     // Free all pending change events
@@ -613,7 +641,7 @@ Arguments:
     //
     // Delete lookaside lists
     //
-    if (Internal->LookasideInitialized) {
+    if (InterlockedCompareExchange(&Internal->LookasideInitialized, 0, 0) != 0) {
         ExDeleteNPagedLookasideList(&Internal->RegionLookaside);
         ExDeleteNPagedLookasideList(&Internal->ChangeLookaside);
         ExDeleteNPagedLookasideList(&Internal->ContextLookaside);
@@ -623,7 +651,7 @@ Arguments:
     // Free hash table
     //
     if (Internal->Public.ProcessHash.Buckets != NULL) {
-        ExFreePoolWithTag(Internal->Public.ProcessHash.Buckets, VAD_POOL_TAG_TREE);
+        ExFreePoolWithTag(Internal->Public.ProcessHash.Buckets, VAD_POOL_TAG_HASH);
     }
 
     //
@@ -640,6 +668,7 @@ VadStartTracking(
 /*++
 Routine Description:
     Starts tracking VAD for a process.
+    Uses TOCTOU-safe double-check: allocate outside lock, verify under lock.
 
 Arguments:
     Tracker - Tracker instance.
@@ -651,70 +680,79 @@ Return Value:
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
+    PVAD_PROCESS_CONTEXT Existing;
     NTSTATUS Status;
-    KIRQL OldIrql;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    PAGED_CODE();
+
+    if (Internal == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Check if already tracking
-    //
-    Context = VadpLookupProcessContext(Internal, ProcessId);
-    if (Context != NULL) {
-        VadpDereferenceProcessContext(Internal, Context);
-        return STATUS_ALREADY_REGISTERED;
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     //
     // Check process limit
     //
-    if ((ULONG)Internal->Public.ProcessCount >= Internal->Public.Config.MaxTrackedProcesses) {
+    if ((ULONG)InterlockedCompareExchange(&Internal->Public.ProcessCount, 0, 0) 
+        >= Internal->Public.Config.MaxTrackedProcesses) {
+        VadpReleaseRef(Internal);
         return STATUS_QUOTA_EXCEEDED;
     }
 
     //
-    // Allocate new process context
+    // Allocate new process context outside any lock
     //
     Context = VadpAllocateProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Add to process list
+    // TOCTOU double-check: re-check under exclusive lock before insert
     //
-    KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->Public.ProcessListLock);
+
+    Existing = VadpLookupProcessContext(Internal, ProcessId);
+    if (Existing != NULL) {
+        VadpDereferenceProcessContext(Internal, Existing);
+        ExReleasePushLockExclusive(&Internal->Public.ProcessListLock);
+        KeLeaveCriticalRegion();
+        VadpFreeProcessContext(Internal, Context);
+        VadpReleaseRef(Internal);
+        return STATUS_ALREADY_REGISTERED;
+    }
+
+    //
+    // Add to process list and hash table under the same lock
+    //
     InsertTailList(&Internal->Public.ProcessList, &Context->ListEntry);
     InterlockedIncrement(&Internal->Public.ProcessCount);
-    KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
 
-    //
-    // Add to hash table
-    //
     Status = VadpInsertProcessHash(Internal, Context);
     if (!NT_SUCCESS(Status)) {
-        KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
         RemoveEntryList(&Context->ListEntry);
         InterlockedDecrement(&Internal->Public.ProcessCount);
-        KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
-
+        ExReleasePushLockExclusive(&Internal->Public.ProcessListLock);
+        KeLeaveCriticalRegion();
         VadpFreeProcessContext(Internal, Context);
+        VadpReleaseRef(Internal);
         return Status;
     }
 
-    //
-    // Perform initial VAD scan
-    //
-    Status = VadpScanProcessVad(Internal, Context);
-    if (!NT_SUCCESS(Status)) {
-        //
-        // Non-fatal - process may have exited
-        //
-        Status = STATUS_SUCCESS;
-    }
+    ExReleasePushLockExclusive(&Internal->Public.ProcessListLock);
+    KeLeaveCriticalRegion();
 
+    //
+    // Perform initial VAD scan — non-fatal if process already exited
+    //
+    VadpScanProcessVad(Internal, Context);
+
+    VadpReleaseRef(Internal);
     return STATUS_SUCCESS;
 }
 
@@ -726,6 +764,7 @@ VadStopTracking(
 /*++
 Routine Description:
     Stops tracking VAD for a process.
+    Removes from list + hash atomically under a single lock hold.
 
 Arguments:
     Tracker - Tracker instance.
@@ -736,41 +775,76 @@ Return Value:
 --*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
-    PVAD_PROCESS_CONTEXT Context;
-    KIRQL OldIrql;
+    PVAD_PROCESS_CONTEXT Context = NULL;
+    PLIST_ENTRY Entry;
+    ULONG Bucket;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    PAGED_CODE();
+
+    if (Internal == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Find and remove from hash table
-    //
-    Context = VadpLookupProcessContext(Internal, ProcessId);
-    if (Context == NULL) {
-        return STATUS_NOT_FOUND;
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
-    VadpRemoveProcessHash(Internal, Context);
+    //
+    // Find and atomically remove from both list and hash under exclusive lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->Public.ProcessListLock);
+
+    //
+    // Walk the process list to find the context
+    //
+    for (Entry = Internal->Public.ProcessList.Flink;
+         Entry != &Internal->Public.ProcessList;
+         Entry = Entry->Flink) {
+
+        PVAD_PROCESS_CONTEXT Candidate = CONTAINING_RECORD(Entry, VAD_PROCESS_CONTEXT, ListEntry);
+        if (Candidate->ProcessId == ProcessId) {
+            Context = Candidate;
+            break;
+        }
+    }
+
+    if (Context == NULL) {
+        ExReleasePushLockExclusive(&Internal->Public.ProcessListLock);
+        KeLeaveCriticalRegion();
+        VadpReleaseRef(Internal);
+        return STATUS_NOT_FOUND;
+    }
 
     //
     // Remove from process list
     //
-    KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
     RemoveEntryList(&Context->ListEntry);
     InterlockedDecrement(&Internal->Public.ProcessCount);
-    KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
 
     //
-    // Free all regions
+    // Remove from hash chain
+    //
+    Bucket = VadpHashProcessId(Context->ProcessId);
+    RemoveEntryList(&Context->HashEntry);
+    UNREFERENCED_PARAMETER(Bucket);
+
+    ExReleasePushLockExclusive(&Internal->Public.ProcessListLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Free all regions (safe at PASSIVE_LEVEL outside lock)
     //
     VadpRemoveAllRegions(Internal, Context);
 
     //
-    // Release our reference and the lookup reference
+    // Single dereference — context was never re-referenced by lookup here
     //
     VadpDereferenceProcessContext(Internal, Context);
-    VadpDereferenceProcessContext(Internal, Context);
+
+    VadpReleaseRef(Internal);
+    return STATUS_SUCCESS;
+}
 
     return STATUS_SUCCESS;
 }
@@ -780,31 +854,26 @@ VadIsTracking(
     _In_ PVAD_TRACKER Tracker,
     _In_ HANDLE ProcessId
     )
-/*++
-Routine Description:
-    Checks if a process is being tracked.
-
-Arguments:
-    Tracker - Tracker instance.
-    ProcessId - Process to check.
-
-Return Value:
-    TRUE if tracking, FALSE otherwise.
---*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    if (Internal == NULL) {
+        return FALSE;
+    }
+
+    if (!VadpAcquireRef(Internal)) {
         return FALSE;
     }
 
     Context = VadpLookupProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return FALSE;
     }
 
     VadpDereferenceProcessContext(Internal, Context);
+    VadpReleaseRef(Internal);
     return TRUE;
 }
 
@@ -814,29 +883,24 @@ VadScanProcess(
     _In_ HANDLE ProcessId,
     _Out_opt_ PULONG SuspicionScore
     )
-/*++
-Routine Description:
-    Scans a process's VAD tree for suspicious regions.
-
-Arguments:
-    Tracker - Tracker instance.
-    ProcessId - Process to scan.
-    SuspicionScore - Receives total suspicion score.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
     NTSTATUS Status;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    PAGED_CODE();
+
+    if (Internal == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     Context = VadpLookupProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return STATUS_NOT_FOUND;
     }
 
@@ -847,9 +911,9 @@ Return Value:
     }
 
     VadpDereferenceProcessContext(Internal, Context);
-
     InterlockedIncrement64(&Internal->Public.Stats.TotalScans);
 
+    VadpReleaseRef(Internal);
     return Status;
 }
 
@@ -859,44 +923,79 @@ VadScanAllProcesses(
     )
 /*++
 Routine Description:
-    Scans all tracked processes.
-
-Arguments:
-    Tracker - Tracker instance.
-
-Return Value:
-    STATUS_SUCCESS on success.
+    Scans all tracked processes. Snapshots the process list under lock,
+    then iterates outside the lock to avoid holding it during I/O.
 --*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PLIST_ENTRY Entry;
-    PVAD_PROCESS_CONTEXT Context;
-    KIRQL OldIrql;
-    NTSTATUS Status = STATUS_SUCCESS;
+    PVAD_PROCESS_CONTEXT* SnapArray = NULL;
+    LONG Count;
+    LONG i;
+    ULONG AllocSize;
 
-    if (Internal == NULL || !Internal->Public.Initialized) {
+    PAGED_CODE();
+
+    if (Internal == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
-
-    for (Entry = Internal->Public.ProcessList.Flink;
-         Entry != &Internal->Public.ProcessList;
-         Entry = Entry->Flink) {
-
-        Context = CONTAINING_RECORD(Entry, VAD_PROCESS_CONTEXT, ListEntry);
-        VadpReferenceProcessContext(Context);
-        KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
-
-        VadpScanProcessVad(Internal, Context);
-        VadpDereferenceProcessContext(Internal, Context);
-
-        KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
-    KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
+    //
+    // Snapshot process context pointers under shared lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Internal->Public.ProcessListLock);
 
-    return Status;
+    Count = InterlockedCompareExchange(&Internal->Public.ProcessCount, 0, 0);
+    if (Count <= 0) {
+        ExReleasePushLockShared(&Internal->Public.ProcessListLock);
+        KeLeaveCriticalRegion();
+        VadpReleaseRef(Internal);
+        return STATUS_SUCCESS;
+    }
+
+    AllocSize = (ULONG)Count * sizeof(PVAD_PROCESS_CONTEXT);
+    SnapArray = (PVAD_PROCESS_CONTEXT*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        AllocSize,
+        VAD_POOL_TAG_TREE
+        );
+
+    if (SnapArray == NULL) {
+        ExReleasePushLockShared(&Internal->Public.ProcessListLock);
+        KeLeaveCriticalRegion();
+        VadpReleaseRef(Internal);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    i = 0;
+    for (Entry = Internal->Public.ProcessList.Flink;
+         Entry != &Internal->Public.ProcessList && i < Count;
+         Entry = Entry->Flink) {
+
+        PVAD_PROCESS_CONTEXT Ctx = CONTAINING_RECORD(Entry, VAD_PROCESS_CONTEXT, ListEntry);
+        VadpReferenceProcessContext(Ctx);
+        SnapArray[i++] = Ctx;
+    }
+
+    ExReleasePushLockShared(&Internal->Public.ProcessListLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Scan each process outside the lock
+    //
+    for (Count = 0; Count < i; Count++) {
+        VadpScanProcessVad(Internal, SnapArray[Count]);
+        VadpDereferenceProcessContext(Internal, SnapArray[Count]);
+    }
+
+    ExFreePoolWithTag(SnapArray, VAD_POOL_TAG_TREE);
+    VadpReleaseRef(Internal);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -906,42 +1005,40 @@ VadGetRegionInfo(
     _In_ PVOID Address,
     _Out_ PVAD_REGION RegionInfo
     )
-/*++
-Routine Description:
-    Gets information about a memory region.
-
-Arguments:
-    Tracker - Tracker instance.
-    ProcessId - Process ID.
-    Address - Address within region.
-    RegionInfo - Receives region information.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
     PVAD_REGION Region;
-    KIRQL OldIrql;
 
-    if (Internal == NULL || !Internal->Public.Initialized || RegionInfo == NULL) {
+    if (Internal == NULL || RegionInfo == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     Context = VadpLookupProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Context->RegionLock);
     Region = VadpFindRegion(Context, Address);
     if (Region != NULL) {
         RtlCopyMemory(RegionInfo, Region, sizeof(VAD_REGION));
+        //
+        // Clear ListEntry in the copy — caller must not use linkage
+        //
+        InitializeListHead(&RegionInfo->ListEntry);
     }
-    KeReleaseSpinLock(&Context->TreeLock, OldIrql);
+    ExReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     VadpDereferenceProcessContext(Internal, Context);
+    VadpReleaseRef(Internal);
 
     return (Region != NULL) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
@@ -972,20 +1069,24 @@ Return Value:
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
     PVAD_REGION Region;
-    KIRQL OldIrql;
     NTSTATUS Status = STATUS_NOT_FOUND;
 
-    if (Internal == NULL || !Internal->Public.Initialized ||
-        SuspicionFlags == NULL || SuspicionScore == NULL) {
+    if (Internal == NULL || SuspicionFlags == NULL || SuspicionScore == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     Context = VadpLookupProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Context->RegionLock);
     Region = VadpFindRegion(Context, Address);
     if (Region != NULL) {
         Region->SuspicionFlags = VadpAnalyzeRegionSuspicion(Region, Context);
@@ -994,9 +1095,11 @@ Return Value:
         *SuspicionScore = Region->SuspicionScore;
         Status = STATUS_SUCCESS;
     }
-    KeReleaseSpinLock(&Context->TreeLock, OldIrql);
+    ExReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     VadpDereferenceProcessContext(Internal, Context);
+    VadpReleaseRef(Internal);
 
     return Status;
 }
@@ -1006,46 +1109,40 @@ VadGetSuspiciousRegions(
     _In_ PVAD_TRACKER Tracker,
     _In_ HANDLE ProcessId,
     _In_ ULONG MinScore,
-    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION* Regions,
+    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION Regions,
     _In_ ULONG MaxRegions,
     _Out_ PULONG RegionCount
     )
 /*++
 Routine Description:
-    Gets all suspicious regions above a threshold.
-
-Arguments:
-    Tracker - Tracker instance.
-    ProcessId - Process ID.
-    MinScore - Minimum suspicion score.
-    Regions - Array to receive region pointers.
-    MaxRegions - Maximum regions to return.
-    RegionCount - Receives actual count.
-
-Return Value:
-    STATUS_SUCCESS on success.
+    Gets VALUE COPIES of suspicious regions above a threshold.
+    Regions array receives copies, not pointers to internal data.
 --*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
     PLIST_ENTRY Entry;
     PVAD_REGION Region;
-    KIRQL OldIrql;
     ULONG Count = 0;
 
-    if (Internal == NULL || !Internal->Public.Initialized ||
-        Regions == NULL || RegionCount == NULL) {
+    if (Internal == NULL || Regions == NULL || RegionCount == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *RegionCount = 0;
 
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     Context = VadpLookupProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Context->RegionLock);
 
     for (Entry = Context->RegionList.Flink;
          Entry != &Context->RegionList && Count < MaxRegions;
@@ -1054,14 +1151,18 @@ Return Value:
         Region = CONTAINING_RECORD(Entry, VAD_REGION, ListEntry);
 
         if (Region->SuspicionScore >= MinScore) {
-            Regions[Count++] = Region;
+            RtlCopyMemory(&Regions[Count], Region, sizeof(VAD_REGION));
+            InitializeListHead(&Regions[Count].ListEntry);
+            Count++;
         }
     }
 
-    KeReleaseSpinLock(&Context->TreeLock, OldIrql);
+    ExReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     *RegionCount = Count;
     VadpDereferenceProcessContext(Internal, Context);
+    VadpReleaseRef(Internal);
 
     return STATUS_SUCCESS;
 }
@@ -1072,44 +1173,39 @@ VadRegisterChangeCallback(
     _In_ VAD_CHANGE_CALLBACK Callback,
     _In_opt_ PVOID Context
     )
-/*++
-Routine Description:
-    Registers a callback for VAD change notifications.
-
-Arguments:
-    Tracker - Tracker instance.
-    Callback - Callback function.
-    Context - User context.
-
-Return Value:
-    STATUS_SUCCESS on success.
---*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
-    KIRQL OldIrql;
     ULONG i;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Callback == NULL) {
+    PAGED_CODE();
+
+    if (Internal == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeAcquireSpinLock(&Internal->CallbackLock, &OldIrql);
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
-    //
-    // Find empty slot
-    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->CallbackLock);
+
     for (i = 0; i < VAD_MAX_CALLBACKS; i++) {
         if (!Internal->Callbacks[i].Active) {
             Internal->Callbacks[i].Callback = Callback;
             Internal->Callbacks[i].Context = Context;
             Internal->Callbacks[i].Active = TRUE;
             Internal->CallbackCount++;
-            KeReleaseSpinLock(&Internal->CallbackLock, OldIrql);
+            ExReleasePushLockExclusive(&Internal->CallbackLock);
+            KeLeaveCriticalRegion();
+            VadpReleaseRef(Internal);
             return STATUS_SUCCESS;
         }
     }
 
-    KeReleaseSpinLock(&Internal->CallbackLock, OldIrql);
+    ExReleasePushLockExclusive(&Internal->CallbackLock);
+    KeLeaveCriticalRegion();
+    VadpReleaseRef(Internal);
     return STATUS_QUOTA_EXCEEDED;
 }
 
@@ -1118,24 +1214,18 @@ VadUnregisterChangeCallback(
     _In_ PVAD_TRACKER Tracker,
     _In_ VAD_CHANGE_CALLBACK Callback
     )
-/*++
-Routine Description:
-    Unregisters a change callback.
-
-Arguments:
-    Tracker - Tracker instance.
-    Callback - Callback to unregister.
---*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
-    KIRQL OldIrql;
     ULONG i;
+
+    PAGED_CODE();
 
     if (Internal == NULL || Callback == NULL) {
         return;
     }
 
-    KeAcquireSpinLock(&Internal->CallbackLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Internal->CallbackLock);
 
     for (i = 0; i < VAD_MAX_CALLBACKS; i++) {
         if (Internal->Callbacks[i].Active &&
@@ -1148,7 +1238,8 @@ Arguments:
         }
     }
 
-    KeReleaseSpinLock(&Internal->CallbackLock, OldIrql);
+    ExReleasePushLockExclusive(&Internal->CallbackLock);
+    KeLeaveCriticalRegion();
 }
 
 NTSTATUS
@@ -1157,19 +1248,6 @@ VadGetNextChange(
     _Out_ PVAD_CHANGE_EVENT Event,
     _In_ ULONG TimeoutMs
     )
-/*++
-Routine Description:
-    Gets the next change event from the queue.
-
-Arguments:
-    Tracker - Tracker instance.
-    Event - Receives change event.
-    TimeoutMs - Timeout in milliseconds.
-
-Return Value:
-    STATUS_SUCCESS if event retrieved.
-    STATUS_TIMEOUT if timeout expired.
---*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     LARGE_INTEGER Timeout;
@@ -1178,8 +1256,14 @@ Return Value:
     PVAD_CHANGE_EVENT QueuedEvent;
     KIRQL OldIrql;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Event == NULL) {
+    PAGED_CODE();
+
+    if (Internal == NULL || Event == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     Timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
@@ -1193,6 +1277,7 @@ Return Value:
         );
 
     if (Status == STATUS_TIMEOUT) {
+        VadpReleaseRef(Internal);
         return STATUS_TIMEOUT;
     }
 
@@ -1208,10 +1293,12 @@ Return Value:
         KeReleaseSpinLock(&Internal->Public.ChangeQueueLock, OldIrql);
 
         VadpFreeChangeEvent(Internal, QueuedEvent);
+        VadpReleaseRef(Internal);
         return STATUS_SUCCESS;
     }
 
     KeReleaseSpinLock(&Internal->Public.ChangeQueueLock, OldIrql);
+    VadpReleaseRef(Internal);
     return STATUS_NO_MORE_ENTRIES;
 }
 
@@ -1221,47 +1308,39 @@ VadEnumerateRegions(
     _In_ HANDLE ProcessId,
     _In_ VAD_REGION_FILTER Filter,
     _In_opt_ PVOID FilterContext,
-    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION* Regions,
+    _Out_writes_to_(MaxRegions, *RegionCount) PVAD_REGION Regions,
     _In_ ULONG MaxRegions,
     _Out_ PULONG RegionCount
     )
 /*++
 Routine Description:
-    Enumerates regions matching a filter.
-
-Arguments:
-    Tracker - Tracker instance.
-    ProcessId - Process ID.
-    Filter - Filter function.
-    FilterContext - Filter context.
-    Regions - Array to receive regions.
-    MaxRegions - Maximum regions.
-    RegionCount - Receives actual count.
-
-Return Value:
-    STATUS_SUCCESS on success.
+    Enumerates regions matching a filter. Returns VALUE COPIES.
 --*/
 {
     PVAD_TRACKER_INTERNAL Internal = (PVAD_TRACKER_INTERNAL)Tracker;
     PVAD_PROCESS_CONTEXT Context;
     PLIST_ENTRY Entry;
     PVAD_REGION Region;
-    KIRQL OldIrql;
     ULONG Count = 0;
 
-    if (Internal == NULL || !Internal->Public.Initialized ||
-        Filter == NULL || Regions == NULL || RegionCount == NULL) {
+    if (Internal == NULL || Filter == NULL || Regions == NULL || RegionCount == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *RegionCount = 0;
 
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     Context = VadpLookupProcessContext(Internal, ProcessId);
     if (Context == NULL) {
+        VadpReleaseRef(Internal);
         return STATUS_NOT_FOUND;
     }
 
-    KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Context->RegionLock);
 
     for (Entry = Context->RegionList.Flink;
          Entry != &Context->RegionList && Count < MaxRegions;
@@ -1270,14 +1349,18 @@ Return Value:
         Region = CONTAINING_RECORD(Entry, VAD_REGION, ListEntry);
 
         if (Filter(Region, FilterContext)) {
-            Regions[Count++] = Region;
+            RtlCopyMemory(&Regions[Count], Region, sizeof(VAD_REGION));
+            InitializeListHead(&Regions[Count].ListEntry);
+            Count++;
         }
     }
 
-    KeReleaseSpinLock(&Context->TreeLock, OldIrql);
+    ExReleasePushLockShared(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     *RegionCount = Count;
     VadpDereferenceProcessContext(Internal, Context);
+    VadpReleaseRef(Internal);
 
     return STATUS_SUCCESS;
 }
@@ -1303,38 +1386,41 @@ Return Value:
     LARGE_INTEGER CurrentTime;
     PLIST_ENTRY Entry;
     PVAD_PROCESS_CONTEXT Context;
-    KIRQL OldIrql;
 
-    if (Internal == NULL || !Internal->Public.Initialized || Stats == NULL) {
+    if (Internal == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!VadpAcquireRef(Internal)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(Stats, sizeof(VAD_STATISTICS));
 
-    Stats->TrackedProcesses = (ULONG)Internal->Public.ProcessCount;
+    Stats->TrackedProcesses = (ULONG)InterlockedCompareExchange(&Internal->Public.ProcessCount, 0, 0);
     Stats->TotalScans = Internal->Public.Stats.TotalScans;
     Stats->SuspiciousDetections = Internal->Public.Stats.SuspiciousRegions;
     Stats->RWXDetections = Internal->Public.Stats.RWXDetections;
     Stats->ProtectionChanges = Internal->Public.Stats.ProtectionChanges;
 
     //
-    // Count total regions
+    // Count total regions under shared push lock
     //
-    KeAcquireSpinLock(&Internal->Public.ProcessListLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Internal->Public.ProcessListLock);
     for (Entry = Internal->Public.ProcessList.Flink;
          Entry != &Internal->Public.ProcessList;
          Entry = Entry->Flink) {
         Context = CONTAINING_RECORD(Entry, VAD_PROCESS_CONTEXT, ListEntry);
-        Stats->TotalRegions += Context->RegionCount;
+        Stats->TotalRegions += (ULONG64)InterlockedCompareExchange(&Context->RegionCount, 0, 0);
     }
-    KeReleaseSpinLock(&Internal->Public.ProcessListLock, OldIrql);
+    ExReleasePushLockShared(&Internal->Public.ProcessListLock);
+    KeLeaveCriticalRegion();
 
-    //
-    // Calculate uptime
-    //
     KeQuerySystemTime(&CurrentTime);
     Stats->UpTime.QuadPart = CurrentTime.QuadPart - Internal->Public.Stats.StartTime.QuadPart;
 
+    VadpReleaseRef(Internal);
     return STATUS_SUCCESS;
 }
 
@@ -1342,59 +1428,31 @@ Return Value:
 // PRIVATE FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
-static RTL_GENERIC_COMPARE_RESULTS NTAPI
-VadpCompareRegions(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_ PVOID FirstStruct,
-    _In_ PVOID SecondStruct
+//
+// Ref acquire/release for shutdown drain (CRITICAL-07)
+//
+static BOOLEAN
+VadpAcquireRef(
+    _In_ PVAD_TRACKER_INTERNAL Tracker
     )
-/*++
-Routine Description:
-    AVL tree comparison routine for regions.
---*/
 {
-    PVAD_REGION First = (PVAD_REGION)FirstStruct;
-    PVAD_REGION Second = (PVAD_REGION)SecondStruct;
-
-    UNREFERENCED_PARAMETER(Table);
-
-    if ((ULONG_PTR)First->BaseAddress < (ULONG_PTR)Second->BaseAddress) {
-        return GenericLessThan;
+    if (InterlockedCompareExchange(&Tracker->Public.Initialized, 0, 0) == 0) {
+        return FALSE;
     }
-    if ((ULONG_PTR)First->BaseAddress > (ULONG_PTR)Second->BaseAddress) {
-        return GenericGreaterThan;
+    InterlockedIncrement(&Tracker->Public.ActiveRefCount);
+    if (InterlockedCompareExchange(&Tracker->Public.Initialized, 0, 0) == 0) {
+        InterlockedDecrement(&Tracker->Public.ActiveRefCount);
+        return FALSE;
     }
-    return GenericEqual;
+    return TRUE;
 }
 
-static PVOID NTAPI
-VadpAllocateRoutine(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_ CLONG ByteSize
+static VOID
+VadpReleaseRef(
+    _In_ PVAD_TRACKER_INTERNAL Tracker
     )
-/*++
-Routine Description:
-    AVL tree allocation routine.
---*/
 {
-    UNREFERENCED_PARAMETER(Table);
-
-    return ExAllocatePoolWithTag(NonPagedPoolNx, ByteSize, VAD_POOL_TAG_TREE);
-}
-
-static VOID NTAPI
-VadpFreeRoutine(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_ PVOID Buffer
-    )
-/*++
-Routine Description:
-    AVL tree free routine.
---*/
-{
-    UNREFERENCED_PARAMETER(Table);
-
-    ExFreePoolWithTag(Buffer, VAD_POOL_TAG_TREE);
+    InterlockedDecrement(&Tracker->Public.ActiveRefCount);
 }
 
 static PVAD_PROCESS_CONTEXT
@@ -1405,47 +1463,39 @@ VadpAllocateProcessContext(
 /*++
 Routine Description:
     Allocates and initializes a process context.
+    Fails if PsLookupProcessByProcessId fails — no dangling contexts.
 --*/
 {
     PVAD_PROCESS_CONTEXT Context;
     NTSTATUS Status;
-    PEPROCESS Process;
+    PEPROCESS Process = NULL;
+
+    //
+    // Validate the process exists before allocating
+    //
+    Status = PsLookupProcessByProcessId(ProcessId, &Process);
+    if (!NT_SUCCESS(Status)) {
+        return NULL;
+    }
 
     Context = (PVAD_PROCESS_CONTEXT)ExAllocateFromNPagedLookasideList(
         &Tracker->ContextLookaside
         );
 
     if (Context == NULL) {
+        ObDereferenceObject(Process);
         return NULL;
     }
 
     RtlZeroMemory(Context, sizeof(VAD_PROCESS_CONTEXT));
 
     Context->ProcessId = ProcessId;
+    Context->Process = Process;  // Transfer ownership of the reference
     Context->RefCount = 1;
 
-    //
-    // Get process object
-    //
-    Status = PsLookupProcessByProcessId(ProcessId, &Process);
-    if (NT_SUCCESS(Status)) {
-        Context->Process = Process;
-        // Note: We keep a reference to the process
-    }
-
-    //
-    // Initialize AVL tree
-    //
-    RtlInitializeGenericTableAvl(
-        &Context->RegionTree,
-        VadpCompareRegions,
-        VadpAllocateRoutine,
-        VadpFreeRoutine,
-        NULL
-        );
-
-    KeInitializeSpinLock(&Context->TreeLock);
+    ExInitializePushLock(&Context->RegionLock);
     InitializeListHead(&Context->RegionList);
+    InitializeListHead(&Context->HashEntry);
 
     return Context;
 }
@@ -1455,21 +1505,15 @@ VadpFreeProcessContext(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     )
-/*++
-Routine Description:
-    Frees a process context.
---*/
 {
     if (Context->Process != NULL) {
         ObDereferenceObject(Context->Process);
-    }
-
-    if (Context->ImageName.Buffer != NULL) {
-        ExFreePoolWithTag(Context->ImageName.Buffer, VAD_POOL_TAG_ENTRY);
+        Context->Process = NULL;
     }
 
     if (Context->Snapshot.SnapshotBuffer != NULL) {
         ExFreePoolWithTag(Context->Snapshot.SnapshotBuffer, VAD_POOL_TAG_SNAPSHOT);
+        Context->Snapshot.SnapshotBuffer = NULL;
     }
 
     ExFreeToNPagedLookasideList(&Tracker->ContextLookaside, Context);
@@ -1482,30 +1526,34 @@ VadpLookupProcessContext(
     )
 /*++
 Routine Description:
-    Looks up a process context by process ID.
+    Looks up a process context by process ID using chained hashing.
+    Returns with an added reference on success.
 --*/
 {
     ULONG Hash;
+    PLIST_ENTRY Bucket;
+    PLIST_ENTRY Entry;
     PVAD_PROCESS_CONTEXT Context;
-    KIRQL OldIrql;
 
     Hash = VadpHashProcessId(ProcessId);
 
-    KeAcquireSpinLock(&Tracker->Public.ProcessHash.Lock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Tracker->Public.ProcessHash.Lock);
 
-    Context = Tracker->Public.ProcessHash.Buckets[Hash];
-    while (Context != NULL) {
+    Bucket = &Tracker->Public.ProcessHash.Buckets[Hash];
+
+    for (Entry = Bucket->Flink; Entry != Bucket; Entry = Entry->Flink) {
+        Context = CONTAINING_RECORD(Entry, VAD_PROCESS_CONTEXT, HashEntry);
         if (Context->ProcessId == ProcessId) {
             VadpReferenceProcessContext(Context);
-            KeReleaseSpinLock(&Tracker->Public.ProcessHash.Lock, OldIrql);
+            ExReleasePushLockShared(&Tracker->Public.ProcessHash.Lock);
+            KeLeaveCriticalRegion();
             return Context;
         }
-        // Simple linear probing for collision
-        Hash = (Hash + 1) & VAD_HASH_BUCKET_MASK;
-        Context = Tracker->Public.ProcessHash.Buckets[Hash];
     }
 
-    KeReleaseSpinLock(&Tracker->Public.ProcessHash.Lock, OldIrql);
+    ExReleasePushLockShared(&Tracker->Public.ProcessHash.Lock);
+    KeLeaveCriticalRegion();
     return NULL;
 }
 
@@ -1550,10 +1598,6 @@ VadpFreeRegion(
     _In_ PVAD_REGION Region
     )
 {
-    if (Region->FileName.Buffer != NULL) {
-        ExFreePoolWithTag(Region->FileName.Buffer, VAD_POOL_TAG_ENTRY);
-    }
-
     ExFreeToNPagedLookasideList(&Tracker->RegionLookaside, Region);
 }
 
@@ -1562,23 +1606,45 @@ VadpInsertRegion(
     _In_ PVAD_PROCESS_CONTEXT Context,
     _In_ PVAD_REGION Region
     )
+/*++
+Routine Description:
+    Inserts a region into the process context's sorted region list.
+    Caller must hold RegionLock exclusive.
+    Regions are sorted by BaseAddress for efficient lookup.
+--*/
 {
-    BOOLEAN NewElement;
+    PLIST_ENTRY Entry;
+    PVAD_REGION Existing;
 
-    RtlInsertElementGenericTableAvl(
-        &Context->RegionTree,
-        Region,
-        sizeof(VAD_REGION),
-        &NewElement
-        );
+    //
+    // Check for duplicate
+    //
+    for (Entry = Context->RegionList.Flink;
+         Entry != &Context->RegionList;
+         Entry = Entry->Flink) {
 
-    if (NewElement) {
-        InsertTailList(&Context->RegionList, &Region->ListEntry);
-        InterlockedIncrement(&Context->RegionCount);
-        return STATUS_SUCCESS;
+        Existing = CONTAINING_RECORD(Entry, VAD_REGION, ListEntry);
+
+        if (Existing->BaseAddress == Region->BaseAddress) {
+            return STATUS_DUPLICATE_OBJECTID;
+        }
+
+        //
+        // Insert before the first region with a higher base address (sorted insert)
+        //
+        if ((ULONG_PTR)Existing->BaseAddress > (ULONG_PTR)Region->BaseAddress) {
+            InsertTailList(Entry, &Region->ListEntry);
+            InterlockedIncrement(&Context->RegionCount);
+            return STATUS_SUCCESS;
+        }
     }
 
-    return STATUS_DUPLICATE_OBJECTID;
+    //
+    // Append at end (largest address)
+    //
+    InsertTailList(&Context->RegionList, &Region->ListEntry);
+    InterlockedIncrement(&Context->RegionCount);
+    return STATUS_SUCCESS;
 }
 
 static PVAD_REGION
@@ -1590,9 +1656,6 @@ VadpFindRegion(
     PLIST_ENTRY Entry;
     PVAD_REGION Region;
 
-    //
-    // Linear search through region list to find containing region
-    //
     for (Entry = Context->RegionList.Flink;
          Entry != &Context->RegionList;
          Entry = Entry->Flink) {
@@ -1602,6 +1665,13 @@ VadpFindRegion(
         if ((ULONG_PTR)Address >= (ULONG_PTR)Region->BaseAddress &&
             (ULONG_PTR)Address < (ULONG_PTR)Region->BaseAddress + Region->RegionSize) {
             return Region;
+        }
+
+        //
+        // Sorted list — if we're past the address, stop early
+        //
+        if ((ULONG_PTR)Region->BaseAddress > (ULONG_PTR)Address) {
+            break;
         }
     }
 
@@ -1616,23 +1686,20 @@ VadpRemoveAllRegions(
 {
     PLIST_ENTRY Entry;
     PVAD_REGION Region;
-    KIRQL OldIrql;
 
-    KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Context->RegionLock);
 
     while (!IsListEmpty(&Context->RegionList)) {
         Entry = RemoveHeadList(&Context->RegionList);
         Region = CONTAINING_RECORD(Entry, VAD_REGION, ListEntry);
-
-        RtlDeleteElementGenericTableAvl(&Context->RegionTree, Region);
         InterlockedDecrement(&Context->RegionCount);
 
-        KeReleaseSpinLock(&Context->TreeLock, OldIrql);
         VadpFreeRegion(Tracker, Region);
-        KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
     }
 
-    KeReleaseSpinLock(&Context->TreeLock, OldIrql);
+    ExReleasePushLockExclusive(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 }
 
 static NTSTATUS
@@ -1681,7 +1748,6 @@ VadpQueryMemoryRegions(
     SIZE_T ReturnLength;
     PVOID Address = NULL;
     PVAD_REGION Region;
-    KIRQL OldIrql;
     ULONG RegionCount = 0;
 
     UNREFERENCED_PARAMETER(Process);
@@ -1702,6 +1768,12 @@ VadpQueryMemoryRegions(
     Context->SuspiciousRegionCount = 0;
     Context->RWXRegionCount = 0;
     Context->UnbackedExecuteCount = 0;
+
+    //
+    // Acquire region lock once for the entire batch insert
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Context->RegionLock);
 
     //
     // Query all memory regions
@@ -1787,13 +1859,14 @@ VadpQueryMemoryRegions(
             }
 
             //
-            // Insert into tree
+            // Insert into region list (already under exclusive lock)
             //
-            KeAcquireSpinLock(&Context->TreeLock, &OldIrql);
-            VadpInsertRegion(Context, Region);
-            KeReleaseSpinLock(&Context->TreeLock, OldIrql);
-
-            RegionCount++;
+            Status = VadpInsertRegion(Context, Region);
+            if (!NT_SUCCESS(Status)) {
+                VadpFreeRegion(Tracker, Region);
+            } else {
+                RegionCount++;
+            }
         }
 
         //
@@ -1801,10 +1874,12 @@ VadpQueryMemoryRegions(
         //
         Address = (PVOID)((ULONG_PTR)MemInfo.BaseAddress + MemInfo.RegionSize);
         if ((ULONG_PTR)Address < (ULONG_PTR)MemInfo.BaseAddress) {
-            // Overflow - reached end of address space
             break;
         }
     }
+
+    ExReleasePushLockExclusive(&Context->RegionLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -1817,6 +1892,7 @@ VadpProtectionToFlags(
     )
 {
     VAD_FLAGS Flags = VadFlag_None;
+    ULONG BaseProtection;
 
     //
     // Type flags
@@ -1839,31 +1915,40 @@ VadpProtectionToFlags(
     }
 
     //
-    // Protection flags
+    // Extract base protection (mask off modifier bits)
     //
-    if (Protection & PAGE_EXECUTE ||
-        Protection & PAGE_EXECUTE_READ ||
-        Protection & PAGE_EXECUTE_READWRITE ||
-        Protection & PAGE_EXECUTE_WRITECOPY) {
+    BaseProtection = Protection & 0xFF;
+
+    switch (BaseProtection) {
+    case PAGE_EXECUTE:
         Flags |= VadFlag_Execute;
-    }
-
-    if (Protection & PAGE_READWRITE ||
-        Protection & PAGE_WRITECOPY ||
-        Protection & PAGE_EXECUTE_READWRITE ||
-        Protection & PAGE_EXECUTE_WRITECOPY) {
-        Flags |= VadFlag_Write;
-    }
-
-    if (Protection & PAGE_READONLY ||
-        Protection & PAGE_READWRITE ||
-        Protection & PAGE_WRITECOPY ||
-        Protection & PAGE_EXECUTE_READ ||
-        Protection & PAGE_EXECUTE_READWRITE ||
-        Protection & PAGE_EXECUTE_WRITECOPY) {
+        break;
+    case PAGE_EXECUTE_READ:
+        Flags |= VadFlag_Execute | VadFlag_Read;
+        break;
+    case PAGE_EXECUTE_READWRITE:
+        Flags |= VadFlag_Execute | VadFlag_Read | VadFlag_Write;
+        break;
+    case PAGE_EXECUTE_WRITECOPY:
+        Flags |= VadFlag_Execute | VadFlag_Read | VadFlag_Write;
+        break;
+    case PAGE_READONLY:
         Flags |= VadFlag_Read;
+        break;
+    case PAGE_READWRITE:
+        Flags |= VadFlag_Read | VadFlag_Write;
+        break;
+    case PAGE_WRITECOPY:
+        Flags |= VadFlag_Read | VadFlag_Write;
+        break;
+    case PAGE_NOACCESS:
+    default:
+        break;
     }
 
+    //
+    // Modifier flags (high bits)
+    //
     if (Protection & PAGE_GUARD) {
         Flags |= VadFlag_Guard;
     }
@@ -2011,10 +2096,6 @@ VadpQueueChangeEvent(
     PVAD_CHANGE_EVENT QueuedEvent;
     KIRQL OldIrql;
 
-    if ((ULONG)Tracker->Public.ChangeCount >= VAD_CHANGE_QUEUE_MAX) {
-        return STATUS_QUOTA_EXCEEDED;
-    }
-
     QueuedEvent = VadpAllocateChangeEvent(Tracker);
     if (QueuedEvent == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -2023,7 +2104,18 @@ VadpQueueChangeEvent(
     RtlCopyMemory(QueuedEvent, Event, sizeof(VAD_CHANGE_EVENT));
     InitializeListHead(&QueuedEvent->ListEntry);
 
+    //
+    // Check count under the lock to avoid TOCTOU
+    //
     KeAcquireSpinLock(&Tracker->Public.ChangeQueueLock, &OldIrql);
+
+    if ((ULONG)InterlockedCompareExchange(&Tracker->Public.ChangeCount, 0, 0)
+        >= VAD_CHANGE_QUEUE_MAX) {
+        KeReleaseSpinLock(&Tracker->Public.ChangeQueueLock, OldIrql);
+        VadpFreeChangeEvent(Tracker, QueuedEvent);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
     InsertTailList(&Tracker->Public.ChangeQueue, &QueuedEvent->ListEntry);
     InterlockedIncrement(&Tracker->Public.ChangeCount);
     KeReleaseSpinLock(&Tracker->Public.ChangeQueueLock, OldIrql);
@@ -2031,7 +2123,7 @@ VadpQueueChangeEvent(
     KeSetEvent(&Tracker->Public.ChangeAvailableEvent, IO_NO_INCREMENT, FALSE);
 
     //
-    // Notify callbacks
+    // Notify callbacks (uses snapshot pattern)
     //
     VadpNotifyCallbacks(Tracker, QueuedEvent);
 
@@ -2043,27 +2135,43 @@ VadpNotifyCallbacks(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_CHANGE_EVENT Event
     )
+/*++
+Routine Description:
+    Notifies registered callbacks. Snapshots the callback array under the
+    push lock, then invokes each callback OUTSIDE the lock to prevent
+    deadlock and allow callbacks to unregister themselves.
+--*/
 {
-    KIRQL OldIrql;
+    VAD_CALLBACK_ENTRY SnapCallbacks[VAD_MAX_CALLBACKS];
+    ULONG SnapCount = 0;
     ULONG i;
 
-    KeAcquireSpinLock(&Tracker->CallbackLock, &OldIrql);
+    //
+    // Snapshot callbacks under shared lock
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Tracker->CallbackLock);
 
     for (i = 0; i < VAD_MAX_CALLBACKS; i++) {
         if (Tracker->Callbacks[i].Active && Tracker->Callbacks[i].Callback != NULL) {
-            KeReleaseSpinLock(&Tracker->CallbackLock, OldIrql);
-
-            __try {
-                Tracker->Callbacks[i].Callback(Event, Tracker->Callbacks[i].Context);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore callback exceptions
-            }
-
-            KeAcquireSpinLock(&Tracker->CallbackLock, &OldIrql);
+            SnapCallbacks[SnapCount] = Tracker->Callbacks[i];
+            SnapCount++;
         }
     }
 
-    KeReleaseSpinLock(&Tracker->CallbackLock, OldIrql);
+    ExReleasePushLockShared(&Tracker->CallbackLock);
+    KeLeaveCriticalRegion();
+
+    //
+    // Invoke callbacks outside lock
+    //
+    for (i = 0; i < SnapCount; i++) {
+        __try {
+            SnapCallbacks[i].Callback(Event, SnapCallbacks[i].Context);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Ignore callback exceptions
+        }
+    }
 }
 
 static PVAD_CHANGE_EVENT
@@ -2106,13 +2214,11 @@ VadpSnapshotTimerDpc(
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    if (Tracker == NULL || Tracker->ShutdownRequested) {
+    if (Tracker == NULL ||
+        InterlockedCompareExchange(&Tracker->ShutdownRequested, 0, 0) != 0) {
         return;
     }
 
-    //
-    // Signal worker thread to perform snapshot comparison
-    //
     KeSetEvent(&Tracker->WorkAvailableEvent, IO_NO_INCREMENT, FALSE);
 }
 
@@ -2128,7 +2234,7 @@ VadpWorkerThread(
     WaitObjects[0] = &Tracker->ShutdownEvent;
     WaitObjects[1] = &Tracker->WorkAvailableEvent;
 
-    while (!Tracker->ShutdownRequested) {
+    while (InterlockedCompareExchange(&Tracker->ShutdownRequested, 0, 0) == 0) {
         Status = KeWaitForMultipleObjects(
             2,
             WaitObjects,
@@ -2140,16 +2246,14 @@ VadpWorkerThread(
             NULL
             );
 
-        if (Status == STATUS_WAIT_0 || Tracker->ShutdownRequested) {
-            // Shutdown requested
+        if (Status == STATUS_WAIT_0 ||
+            InterlockedCompareExchange(&Tracker->ShutdownRequested, 0, 0) != 0) {
             break;
         }
 
         if (Status == STATUS_WAIT_1) {
-            //
-            // Work available - scan all processes
-            //
-            if (Tracker->Public.Initialized && !Tracker->ShutdownRequested) {
+            if (InterlockedCompareExchange(&Tracker->Public.Initialized, 0, 0) != 0 &&
+                InterlockedCompareExchange(&Tracker->ShutdownRequested, 0, 0) == 0) {
                 VadScanAllProcesses((PVAD_TRACKER)Tracker);
             }
         }
@@ -2163,15 +2267,17 @@ VadpCompareSnapshots(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    NOT YET IMPLEMENTED — snapshot comparison for drift detection.
+    This is a design placeholder for future change-detection work.
+    It currently does nothing and returns STATUS_NOT_IMPLEMENTED.
+--*/
 {
-    // Snapshot comparison for drift detection
-    // This would compare current VAD state with previous snapshot
-    // and generate change events for any differences
-
     UNREFERENCED_PARAMETER(Tracker);
     UNREFERENCED_PARAMETER(Context);
 
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 static ULONG
@@ -2181,7 +2287,6 @@ VadpHashProcessId(
 {
     ULONG_PTR Value = (ULONG_PTR)ProcessId;
 
-    // Simple hash function for process IDs
     Value ^= (Value >> 16);
     Value *= 0x85ebca6b;
     Value ^= (Value >> 13);
@@ -2196,29 +2301,16 @@ VadpInsertProcessHash(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    Inserts a process context into the chained hash table.
+    Caller must hold ProcessListLock or ProcessHash.Lock exclusive.
+--*/
 {
     ULONG Hash;
-    ULONG OriginalHash;
-    KIRQL OldIrql;
 
     Hash = VadpHashProcessId(Context->ProcessId);
-    OriginalHash = Hash;
-
-    KeAcquireSpinLock(&Tracker->Public.ProcessHash.Lock, &OldIrql);
-
-    //
-    // Find empty slot using linear probing
-    //
-    while (Tracker->Public.ProcessHash.Buckets[Hash] != NULL) {
-        Hash = (Hash + 1) & VAD_HASH_BUCKET_MASK;
-        if (Hash == OriginalHash) {
-            KeReleaseSpinLock(&Tracker->Public.ProcessHash.Lock, OldIrql);
-            return STATUS_QUOTA_EXCEEDED;
-        }
-    }
-
-    Tracker->Public.ProcessHash.Buckets[Hash] = Context;
-    KeReleaseSpinLock(&Tracker->Public.ProcessHash.Lock, OldIrql);
+    InsertTailList(&Tracker->Public.ProcessHash.Buckets[Hash], &Context->HashEntry);
 
     return STATUS_SUCCESS;
 }
@@ -2228,26 +2320,14 @@ VadpRemoveProcessHash(
     _In_ PVAD_TRACKER_INTERNAL Tracker,
     _In_ PVAD_PROCESS_CONTEXT Context
     )
+/*++
+Routine Description:
+    Removes a process context from the chained hash table.
+    Caller must hold ProcessListLock or ProcessHash.Lock exclusive.
+--*/
 {
-    ULONG Hash;
-    ULONG OriginalHash;
-    KIRQL OldIrql;
+    UNREFERENCED_PARAMETER(Tracker);
 
-    Hash = VadpHashProcessId(Context->ProcessId);
-    OriginalHash = Hash;
-
-    KeAcquireSpinLock(&Tracker->Public.ProcessHash.Lock, &OldIrql);
-
-    while (Tracker->Public.ProcessHash.Buckets[Hash] != NULL) {
-        if (Tracker->Public.ProcessHash.Buckets[Hash] == Context) {
-            Tracker->Public.ProcessHash.Buckets[Hash] = NULL;
-            break;
-        }
-        Hash = (Hash + 1) & VAD_HASH_BUCKET_MASK;
-        if (Hash == OriginalHash) {
-            break;
-        }
-    }
-
-    KeReleaseSpinLock(&Tracker->Public.ProcessHash.Lock, OldIrql);
+    RemoveEntryList(&Context->HashEntry);
+    InitializeListHead(&Context->HashEntry);
 }

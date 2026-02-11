@@ -19,6 +19,8 @@
     - Thread-safe gadget database operations
     - Rate limiting to prevent resource exhaustion
     - Secure memory handling for sensitive data
+    - Rundown protection for safe shutdown
+    - Signature validation on all public API entries
 
     Copyright (c) ShadowStrike Team
 --*/
@@ -32,10 +34,15 @@
 #pragma alloc_text(INIT, RopInitialize)
 #pragma alloc_text(PAGE, RopShutdown)
 #pragma alloc_text(PAGE, RopScanModuleForGadgets)
+#pragma alloc_text(PAGE, RopAddGadget)
+#pragma alloc_text(PAGE, RopLookupGadget)
 #pragma alloc_text(PAGE, RopAnalyzeStack)
+#pragma alloc_text(PAGE, RopAnalyzeStackBuffer)
 #pragma alloc_text(PAGE, RopValidateCallStack)
+#pragma alloc_text(PAGE, RopFreeResult)
 #pragma alloc_text(PAGE, RopRegisterCallback)
 #pragma alloc_text(PAGE, RopUnregisterCallback)
+#pragma alloc_text(PAGE, RopGetStatistics)
 #endif
 
 //=============================================================================
@@ -51,8 +58,7 @@
 #define ROP_ANALYSIS_TIMEOUT_MS         5000
 #define ROP_MAX_MODULES_TRACKED         256
 #define ROP_GADGET_LOOKASIDE_DEPTH      512
-#define ROP_CHAIN_LOOKASIDE_DEPTH       128
-#define ROP_RESULT_LOOKASIDE_DEPTH      64
+#define ROP_KERNEL_STACK_SIZE_ESTIMATE  (24 * 1024)  // Conservative kernel stack estimate
 
 //
 // x86/x64 instruction opcodes for gadget detection
@@ -129,6 +135,7 @@ typedef struct _ROP_CALLBACK_ENTRY {
     ROP_DETECTION_CALLBACK Callback;
     PVOID Context;
     volatile LONG Active;
+    EX_RUNDOWN_REF RundownRef;
 } ROP_CALLBACK_ENTRY, *PROP_CALLBACK_ENTRY;
 
 //
@@ -148,11 +155,9 @@ typedef struct _ROP_DETECTOR_INTERNAL {
     volatile LONG CallbackCount;
 
     //
-    // Lookaside lists for performance
+    // Lookaside list for gadgets only (chain entries and results use pool)
     //
     SHADOWSTRIKE_LOOKASIDE GadgetLookaside;
-    SHADOWSTRIKE_LOOKASIDE ChainEntryLookaside;
-    SHADOWSTRIKE_LOOKASIDE ResultLookaside;
 
     //
     // Rate limiting
@@ -198,6 +203,7 @@ typedef struct _ROP_ANALYSIS_CONTEXT {
         PVOID Base;
         SIZE_T Size;
         BOOLEAN IsExecutable;
+        WCHAR Name[64];
     } ModuleCache[64];
     ULONG ModuleCacheCount;
 
@@ -207,6 +213,7 @@ typedef struct _ROP_ANALYSIS_CONTEXT {
     ULONG ConsecutiveGadgets;
     ULONG TotalGadgets;
     ULONG UnknownAddresses;
+    ULONG NonExecutableAddresses;
     ROP_ATTACK_TYPE DetectedType;
 
     //
@@ -216,6 +223,61 @@ typedef struct _ROP_ANALYSIS_CONTEXT {
     ULONG TimeoutMs;
 
 } ROP_ANALYSIS_CONTEXT, *PROP_ANALYSIS_CONTEXT;
+
+//=============================================================================
+// Internal Helpers
+//=============================================================================
+
+//
+// Validates detector signature. Returns internal pointer or NULL on failure.
+//
+static
+FORCEINLINE
+PROP_DETECTOR_INTERNAL
+RoppValidateDetector(
+    _In_opt_ PROP_DETECTOR Detector
+    )
+{
+    PROP_DETECTOR_INTERNAL internal;
+
+    if (Detector == NULL) {
+        return NULL;
+    }
+
+    if (Detector->Signature != ROP_DETECTOR_SIGNATURE) {
+        return NULL;
+    }
+
+    if (InterlockedCompareExchange(&Detector->Initialized, 1, 1) != 1) {
+        return NULL;
+    }
+
+    internal = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
+    return internal;
+}
+
+//
+// Acquires rundown protection. Must be released with ExReleaseRundownProtection.
+//
+static
+FORCEINLINE
+BOOLEAN
+RoppAcquireRundown(
+    _In_ PROP_DETECTOR Detector
+    )
+{
+    return ExAcquireRundownProtection(&Detector->RundownRef);
+}
+
+static
+FORCEINLINE
+VOID
+RoppReleaseRundown(
+    _In_ PROP_DETECTOR Detector
+    )
+{
+    ExReleaseRundownProtection(&Detector->RundownRef);
+}
 
 //=============================================================================
 // Forward Declarations
@@ -244,21 +306,18 @@ RoppFreeGadget(
 static
 NTSTATUS
 RoppAllocateChainEntry(
-    _In_ PROP_DETECTOR_INTERNAL Detector,
     _Out_ PROP_CHAIN_ENTRY* Entry
     );
 
 static
 VOID
 RoppFreeChainEntry(
-    _In_ PROP_DETECTOR_INTERNAL Detector,
     _In_ PROP_CHAIN_ENTRY Entry
     );
 
 static
 NTSTATUS
 RoppAllocateResult(
-    _In_ PROP_DETECTOR_INTERNAL Detector,
     _Out_ PROP_DETECTION_RESULT* Result
     );
 
@@ -268,6 +327,13 @@ RoppClassifyGadget(
     _In_reads_bytes_(Size) PUCHAR Bytes,
     _In_ ULONG Size,
     _Out_ PULONG GadgetSize
+    );
+
+static
+ULONG
+RoppDecodeModRMLength(
+    _In_reads_bytes_(MaxSize) PUCHAR Bytes,
+    _In_ ULONG MaxSize
     );
 
 static
@@ -371,6 +437,21 @@ RoppInitializeDangerousPatterns(
     _Inout_ PROP_DETECTOR_INTERNAL Detector
     );
 
+static
+BOOLEAN
+RoppIsModuleAlreadyScanned(
+    _In_ PROP_DETECTOR Detector,
+    _In_ PVOID ModuleBase
+    );
+
+static
+BOOLEAN
+RoppValidatePeHeaders(
+    _In_ PVOID ModuleBase,
+    _In_ SIZE_T ModuleSize,
+    _Out_ PIMAGE_NT_HEADERS* NtHeaders
+    );
+
 //=============================================================================
 // Public API - Initialization
 //=============================================================================
@@ -384,8 +465,7 @@ RopInitialize(
 
 Routine Description:
 
-    Initializes the ROP/JOP detection engine with enterprise-grade
-    gadget database and analysis capabilities.
+    Initializes the ROP/JOP detection engine.
 
 Arguments:
 
@@ -427,6 +507,16 @@ Return Value:
     RtlZeroMemory(internalDetector, sizeof(ROP_DETECTOR_INTERNAL));
 
     //
+    // Set signature for validation
+    //
+    internalDetector->Public.Signature = ROP_DETECTOR_SIGNATURE;
+
+    //
+    // Initialize rundown protection
+    //
+    ExInitializeRundownProtection(&internalDetector->Public.RundownRef);
+
+    //
     // Initialize gadget hash table
     //
     for (i = 0; i < ROP_GADGET_HASH_BUCKETS; i++) {
@@ -448,38 +538,16 @@ Return Value:
     ExInitializePushLock(&internalDetector->CallbackLock);
 
     //
-    // Initialize lookaside lists for high-performance allocation
+    // Initialize gadget lookaside list only.
+    // Chain entries and results use direct pool allocation to avoid
+    // allocator/deallocator mismatch issues.
     //
     status = ShadowStrikeLookasideInit(
         &internalDetector->GadgetLookaside,
         sizeof(ROP_GADGET),
         ROP_POOL_TAG_GADGET,
         ROP_GADGET_LOOKASIDE_DEPTH,
-        FALSE   // Non-paged for DISPATCH_LEVEL access
-        );
-
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-
-    status = ShadowStrikeLookasideInit(
-        &internalDetector->ChainEntryLookaside,
-        sizeof(ROP_CHAIN_ENTRY),
-        ROP_POOL_TAG_CHAIN,
-        ROP_CHAIN_LOOKASIDE_DEPTH,
-        FALSE
-        );
-
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-
-    status = ShadowStrikeLookasideInit(
-        &internalDetector->ResultLookaside,
-        sizeof(ROP_DETECTION_RESULT),
-        ROP_POOL_TAG_CONTEXT,
-        ROP_RESULT_LOOKASIDE_DEPTH,
-        FALSE
+        FALSE   // Non-paged
         );
 
     if (!NT_SUCCESS(status)) {
@@ -512,9 +580,9 @@ Return Value:
     KeQuerySystemTime(&internalDetector->Public.Stats.StartTime);
 
     //
-    // Mark as initialized
+    // Mark as initialized (interlocked store)
     //
-    internalDetector->Public.Initialized = TRUE;
+    InterlockedExchange(&internalDetector->Public.Initialized, 1);
 
     *Detector = &internalDetector->Public;
     return STATUS_SUCCESS;
@@ -523,12 +591,6 @@ Cleanup:
     if (internalDetector != NULL) {
         if (internalDetector->GadgetLookaside.Initialized) {
             ShadowStrikeLookasideCleanup(&internalDetector->GadgetLookaside);
-        }
-        if (internalDetector->ChainEntryLookaside.Initialized) {
-            ShadowStrikeLookasideCleanup(&internalDetector->ChainEntryLookaside);
-        }
-        if (internalDetector->ResultLookaside.Initialized) {
-            ShadowStrikeLookasideCleanup(&internalDetector->ResultLookaside);
         }
 
         ShadowStrikeFreePoolWithTag(internalDetector, ROP_POOL_TAG_CONTEXT);
@@ -548,6 +610,7 @@ RopShutdown(
 Routine Description:
 
     Shuts down the ROP detector and releases all resources.
+    Uses rundown protection to wait for all in-flight operations.
 
 Arguments:
 
@@ -563,13 +626,24 @@ Arguments:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL || Detector->Signature != ROP_DETECTOR_SIGNATURE) {
         return;
     }
 
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
+    //
+    // Atomically mark as not initialized. If it was already 0, bail.
+    //
+    if (InterlockedExchange(&Detector->Initialized, 0) == 0) {
+        return;
+    }
 
-    Detector->Initialized = FALSE;
+    //
+    // Wait for all in-flight operations to complete.
+    // After this returns, no new rundown acquisitions will succeed.
+    //
+    ExWaitForRundownProtectionRelease(&Detector->RundownRef);
+
+    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
 
     //
     // Free all gadgets
@@ -621,11 +695,14 @@ Arguments:
     KeLeaveCriticalRegion();
 
     //
-    // Cleanup lookaside lists
+    // Cleanup lookaside list
     //
     ShadowStrikeLookasideCleanup(&internalDetector->GadgetLookaside);
-    ShadowStrikeLookasideCleanup(&internalDetector->ChainEntryLookaside);
-    ShadowStrikeLookasideCleanup(&internalDetector->ResultLookaside);
+
+    //
+    // Invalidate signature before freeing
+    //
+    Detector->Signature = 0;
 
     //
     // Free detector structure
@@ -650,20 +727,7 @@ RopScanModuleForGadgets(
 Routine Description:
 
     Scans a loaded module for ROP/JOP gadgets and adds them to the
-    gadget database. This enables detection of gadget chains.
-
-Arguments:
-
-    Detector - Initialized detector
-    ModuleBase - Base address of the module
-    ModuleSize - Size of the module in bytes
-    ModuleName - Name of the module
-
-Return Value:
-
-    STATUS_SUCCESS on success
-    STATUS_INVALID_PARAMETER on invalid input
-    STATUS_INSUFFICIENT_RESOURCES on allocation failure
+    gadget database. Validates PE structure and checks for duplicates.
 
 --*/
 {
@@ -671,20 +735,22 @@ Return Value:
     PROP_DETECTOR_INTERNAL internalDetector;
     PROP_SCANNED_MODULE moduleEntry = NULL;
     PUCHAR currentByte;
-    PUCHAR moduleEnd;
+    PUCHAR sectionEnd;
     ULONG gadgetCount = 0;
     ULONG offset;
     ROP_GADGET_TYPE gadgetType;
     ULONG gadgetSize;
-    PIMAGE_DOS_HEADER dosHeader;
-    PIMAGE_NT_HEADERS ntHeaders;
+    PIMAGE_NT_HEADERS ntHeaders = NULL;
     PIMAGE_SECTION_HEADER sectionHeader;
     ULONG sectionIndex;
     BOOLEAN isExecutable;
+    ULONG sectionVa;
+    ULONG sectionSize;
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    internalDetector = RoppValidateDetector(Detector);
+    if (internalDetector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -692,24 +758,24 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
-
-    //
-    // Validate PE structure
-    //
-    __try {
-        dosHeader = (PIMAGE_DOS_HEADER)ModuleBase;
-        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-            return STATUS_INVALID_IMAGE_FORMAT;
-        }
-
-        ntHeaders = (PIMAGE_NT_HEADERS)((PUCHAR)ModuleBase + dosHeader->e_lfanew);
-        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-            return STATUS_INVALID_IMAGE_FORMAT;
-        }
+    if (!RoppAcquireRundown(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return STATUS_ACCESS_VIOLATION;
+
+    //
+    // Check for duplicate module scan
+    //
+    if (RoppIsModuleAlreadyScanned(Detector, ModuleBase)) {
+        RoppReleaseRundown(Detector);
+        return STATUS_OBJECTID_EXISTS;
+    }
+
+    //
+    // Validate PE structure with bounds checking
+    //
+    if (!RoppValidatePeHeaders(ModuleBase, ModuleSize, &ntHeaders)) {
+        RoppReleaseRundown(Detector);
+        return STATUS_INVALID_IMAGE_FORMAT;
     }
 
     //
@@ -722,6 +788,7 @@ Return Value:
         );
 
     if (moduleEntry == NULL) {
+        RoppReleaseRundown(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -732,7 +799,7 @@ Return Value:
     //
     // Clone module name
     //
-    if (ModuleName != NULL && ModuleName->Length > 0) {
+    if (ModuleName != NULL && ModuleName->Length > 0 && ModuleName->Buffer != NULL) {
         moduleEntry->ModuleName.Length = ModuleName->Length;
         moduleEntry->ModuleName.MaximumLength = ModuleName->Length + sizeof(WCHAR);
         moduleEntry->ModuleName.Buffer = (PWCH)ShadowStrikeAllocatePoolWithTag(
@@ -764,24 +831,32 @@ Return Value:
             continue;
         }
 
+        sectionVa = sectionHeader[sectionIndex].VirtualAddress;
+        sectionSize = sectionHeader[sectionIndex].Misc.VirtualSize;
+
+        //
+        // Bounds-check section against module size
+        //
+        if (sectionVa >= ModuleSize ||
+            sectionSize == 0 ||
+            sectionVa + sectionSize > ModuleSize ||
+            sectionVa + sectionSize < sectionVa) {
+            continue;
+        }
+
         __try {
-            currentByte = (PUCHAR)ModuleBase + sectionHeader[sectionIndex].VirtualAddress;
-            moduleEnd = currentByte + sectionHeader[sectionIndex].Misc.VirtualSize;
+            currentByte = (PUCHAR)ModuleBase + sectionVa;
+            sectionEnd = currentByte + sectionSize;
 
-            //
-            // Scan for gadget-ending instructions
-            //
-            for (offset = 0; currentByte + offset < moduleEnd && offset < sectionHeader[sectionIndex].Misc.VirtualSize; offset++) {
+            for (offset = 0; offset < sectionSize; offset++) {
 
-                //
-                // Look for RET, JMP reg, CALL reg, SYSCALL patterns
-                //
-                gadgetType = RoppClassifyGadget(currentByte + offset, (ULONG)(moduleEnd - (currentByte + offset)), &gadgetSize);
+                gadgetType = RoppClassifyGadget(
+                    currentByte + offset,
+                    sectionSize - offset,
+                    &gadgetSize
+                    );
 
                 if (gadgetType != GadgetType_Unknown && gadgetSize > 0) {
-                    //
-                    // Found a potential gadget ending - scan backwards for useful gadgets
-                    //
                     ULONG backScan;
                     ULONG maxBackScan = min(ROP_GADGET_MAX_SIZE, offset);
 
@@ -790,9 +865,6 @@ Return Value:
                         ULONG totalSize = backScan + gadgetSize;
 
                         if (totalSize >= 2 && totalSize <= ROP_GADGET_MAX_SIZE) {
-                            //
-                            // Add this gadget to the database
-                            //
                             status = RopAddGadget(
                                 Detector,
                                 gadgetAddr,
@@ -804,10 +876,6 @@ Return Value:
 
                             if (NT_SUCCESS(status)) {
                                 gadgetCount++;
-
-                                //
-                                // Limit gadgets per module to prevent excessive memory use
-                                //
                                 if (gadgetCount >= ROP_MAX_GADGETS_PER_MODULE) {
                                     goto ScanComplete;
                                 }
@@ -818,9 +886,6 @@ Return Value:
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            //
-            // Section access failed, continue with next section
-            //
             continue;
         }
     }
@@ -839,11 +904,9 @@ ScanComplete:
     ExReleasePushLockExclusive(&Detector->ModuleLock);
     KeLeaveCriticalRegion();
 
-    //
-    // Update statistics
-    //
     InterlockedAdd64(&Detector->Stats.GadgetsIndexed, gadgetCount);
 
+    RoppReleaseRundown(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -864,19 +927,6 @@ Routine Description:
 
     Adds a gadget to the detection database.
 
-Arguments:
-
-    Detector - Initialized detector
-    Address - Address of the gadget
-    ModuleBase - Base of containing module
-    Bytes - Gadget bytes
-    Size - Size in bytes
-    Type - Gadget type
-
-Return Value:
-
-    STATUS_SUCCESS on success
-
 --*/
 {
     NTSTATUS status;
@@ -884,7 +934,10 @@ Return Value:
     PROP_GADGET gadget = NULL;
     ULONG hashBucket;
 
-    if (Detector == NULL || !Detector->Initialized) {
+    PAGED_CODE();
+
+    internalDetector = RoppValidateDetector(Detector);
+    if (internalDetector == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -892,10 +945,8 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
-
     //
-    // Allocate gadget structure from lookaside
+    // Allocate gadget from lookaside
     //
     status = RoppAllocateGadget(internalDetector, &gadget);
     if (!NT_SUCCESS(status)) {
@@ -913,20 +964,14 @@ Return Value:
 
     RtlCopyMemory(gadget->Bytes, Bytes, Size);
 
-    //
-    // Perform semantic analysis if enabled
-    //
     if (Detector->Config.EnableSemanticAnalysis) {
         RoppAnalyzeGadgetSemantics(gadget);
     }
 
-    //
-    // Calculate danger score
-    //
     gadget->DangerScore = RoppCalculateDangerScore(internalDetector, gadget);
 
     //
-    // Add to hash table and list
+    // Add to hash table and global list under exclusive lock
     //
     hashBucket = RoppHashAddress(Address) % ROP_GADGET_HASH_BUCKETS;
 
@@ -949,19 +994,21 @@ NTSTATUS
 RopLookupGadget(
     PROP_DETECTOR Detector,
     PVOID Address,
-    PROP_GADGET* Gadget
+    PROP_GADGET GadgetCopy
     )
 /*++
 
 Routine Description:
 
-    Looks up a gadget by address in the database.
+    Looks up a gadget by address. Copies the gadget data out to avoid
+    lifetime issues (the caller does not hold a reference to the internal
+    gadget after this call returns).
 
 Arguments:
 
     Detector - Initialized detector
     Address - Gadget address to find
-    Gadget - Receives gadget pointer if found
+    GadgetCopy - Receives a COPY of the gadget data if found
 
 Return Value:
 
@@ -973,12 +1020,16 @@ Return Value:
     ULONG hashBucket;
     PLIST_ENTRY entry;
     PROP_GADGET current;
+    NTSTATUS status = STATUS_NOT_FOUND;
 
-    if (Detector == NULL || !Detector->Initialized || Address == NULL || Gadget == NULL) {
+    PAGED_CODE();
+
+    if (Detector == NULL || Detector->Signature != ROP_DETECTOR_SIGNATURE ||
+        Address == NULL || GadgetCopy == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    *Gadget = NULL;
+    RtlZeroMemory(GadgetCopy, sizeof(ROP_GADGET));
 
     hashBucket = RoppHashAddress(Address) % ROP_GADGET_HASH_BUCKETS;
 
@@ -992,17 +1043,20 @@ Return Value:
         current = CONTAINING_RECORD(entry, ROP_GADGET, HashEntry);
 
         if (current->Address == Address) {
-            *Gadget = current;
-            ExReleasePushLockShared(&Detector->GadgetLock);
-            KeLeaveCriticalRegion();
-            return STATUS_SUCCESS;
+            //
+            // Copy gadget data out. The list linkage fields in the copy
+            // are meaningless but harmless.
+            //
+            RtlCopyMemory(GadgetCopy, current, sizeof(ROP_GADGET));
+            status = STATUS_SUCCESS;
+            break;
         }
     }
 
     ExReleasePushLockShared(&Detector->GadgetLock);
     KeLeaveCriticalRegion();
 
-    return STATUS_NOT_FOUND;
+    return status;
 }
 
 //=============================================================================
@@ -1022,21 +1076,7 @@ RopAnalyzeStack(
 
 Routine Description:
 
-    Analyzes a thread's stack for ROP/JOP chains. This is the primary
-    detection entry point.
-
-Arguments:
-
-    Detector - Initialized detector
-    ProcessId - Target process
-    ThreadId - Target thread
-    ThreadContext - Optional thread context
-    Result - Receives detection result
-
-Return Value:
-
-    STATUS_SUCCESS on successful analysis
-    STATUS_NOT_FOUND if no chain detected
+    Analyzes a thread's stack for ROP/JOP chains.
 
 --*/
 {
@@ -1047,18 +1087,22 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Result == NULL) {
+    internalDetector = RoppValidateDetector(Detector);
+    if (internalDetector == NULL || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
+    if (!RoppAcquireRundown(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
 
     //
     // Check rate limit
     //
     if (!RoppCheckRateLimit(internalDetector)) {
+        RoppReleaseRundown(Detector);
         return STATUS_QUOTA_EXCEEDED;
     }
 
@@ -1074,21 +1118,20 @@ Return Value:
         );
 
     if (!NT_SUCCESS(status)) {
+        RoppReleaseRundown(Detector);
         return status;
     }
 
     //
-    // Allocate result structure
+    // Allocate result structure (pool, not lookaside)
     //
-    status = RoppAllocateResult(internalDetector, &result);
+    status = RoppAllocateResult(&result);
     if (!NT_SUCCESS(status)) {
         RoppCleanupAnalysisContext(&context);
+        RoppReleaseRundown(Detector);
         return status;
     }
 
-    //
-    // Initialize result
-    //
     result->ProcessId = ProcessId;
     result->ThreadId = ThreadId;
     result->StackBase = context.StackBase;
@@ -1161,10 +1204,16 @@ Return Value:
         RoppNotifyCallbacks(internalDetector, result);
     }
 
+    //
+    // Transfer ownership to caller
+    //
     *Result = result;
     result = NULL;
-    status = result != NULL ? STATUS_SUCCESS :
-             ((*Result)->ChainDetected ? STATUS_SUCCESS : STATUS_NOT_FOUND);
+
+    RoppCleanupAnalysisContext(&context);
+    RoppReleaseRundown(Detector);
+
+    return (*Result)->ChainDetected ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 
 Cleanup:
     RoppCleanupAnalysisContext(&context);
@@ -1173,7 +1222,8 @@ Cleanup:
         RopFreeResult(result);
     }
 
-    return (*Result != NULL && (*Result)->ChainDetected) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+    RoppReleaseRundown(Detector);
+    return status;
 }
 
 
@@ -1192,19 +1242,6 @@ Routine Description:
 
     Analyzes a pre-captured stack buffer for ROP/JOP chains.
 
-Arguments:
-
-    Detector - Initialized detector
-    StackBuffer - Buffer containing stack data
-    Size - Size of buffer
-    StackBase - Original stack base address
-    Result - Receives detection result
-
-Return Value:
-
-    STATUS_SUCCESS if chain detected
-    STATUS_NOT_FOUND if no chain
-
 --*/
 {
     NTSTATUS status;
@@ -1215,37 +1252,37 @@ Return Value:
     SIZE_T i;
     ULONG consecutiveGadgets = 0;
     ULONG totalGadgets = 0;
-    PROP_GADGET gadget;
+    ROP_GADGET gadgetCopy;
     PROP_CHAIN_ENTRY chainEntry;
 
-    if (Detector == NULL || !Detector->Initialized ||
+    PAGED_CODE();
+
+    internalDetector = RoppValidateDetector(Detector);
+    if (internalDetector == NULL ||
         StackBuffer == NULL || Size == 0 || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
-    //
-    // Validate buffer alignment
-    //
     if (!ShadowStrikeIsAligned(StackBuffer, ROP_STACK_ALIGNMENT)) {
         return STATUS_DATATYPE_MISALIGNMENT;
     }
 
-    //
-    // Validate size
-    //
     if (Size > ROP_STACK_SAMPLE_SIZE || Size < sizeof(ULONG_PTR)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
+    if (!RoppAcquireRundown(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
 
     //
-    // Allocate result
+    // Allocate result (pool, not lookaside)
     //
-    status = RoppAllocateResult(internalDetector, &result);
+    status = RoppAllocateResult(&result);
     if (!NT_SUCCESS(status)) {
+        RoppReleaseRundown(Detector);
         return status;
     }
 
@@ -1261,33 +1298,31 @@ Return Value:
     for (i = 0; i < slotCount; i++) {
         ULONG_PTR value = stackPtr[i];
 
-        //
-        // Skip NULL and small values (not code addresses)
-        //
         if (value < 0x10000) {
             consecutiveGadgets = 0;
             continue;
         }
 
         //
-        // Look up in gadget database
+        // Look up in gadget database (copy-out)
         //
-        status = RopLookupGadget(Detector, (PVOID)value, &gadget);
+        status = RopLookupGadget(Detector, (PVOID)value, &gadgetCopy);
 
         if (NT_SUCCESS(status)) {
-            //
-            // Found a known gadget
-            //
             totalGadgets++;
             consecutiveGadgets++;
 
             //
-            // Allocate chain entry
+            // Allocate chain entry (pool, not lookaside)
             //
-            status = RoppAllocateChainEntry(internalDetector, &chainEntry);
+            status = RoppAllocateChainEntry(&chainEntry);
             if (NT_SUCCESS(status)) {
                 chainEntry->GadgetAddress = (PVOID)value;
-                chainEntry->Gadget = gadget;
+                chainEntry->GadgetType = gadgetCopy.Type;
+                chainEntry->GadgetSize = gadgetCopy.Size;
+                chainEntry->GadgetDangerScore = gadgetCopy.DangerScore;
+                chainEntry->GadgetIsPrivileged = gadgetCopy.IsPrivileged;
+                chainEntry->GadgetRegistersModified = gadgetCopy.Semantics.RegistersModified;
                 chainEntry->StackOffset = i * sizeof(ULONG_PTR);
                 chainEntry->StackValue = value;
                 chainEntry->Index = result->ChainLength;
@@ -1296,20 +1331,13 @@ Return Value:
                 result->ChainLength++;
             }
 
-            //
-            // Check for chain detection threshold
-            //
             if (consecutiveGadgets >= Detector->Config.MinChainLength) {
                 result->ChainDetected = TRUE;
             }
         } else {
-            //
-            // Not a known gadget - reset consecutive count
-            //
             if (consecutiveGadgets > 0 && consecutiveGadgets < Detector->Config.MinChainLength) {
                 consecutiveGadgets = 0;
             }
-            result->UnknownGadgets++;
         }
     }
 
@@ -1321,10 +1349,12 @@ Return Value:
         RoppInferPayload(internalDetector, result);
 
         *Result = result;
+        RoppReleaseRundown(Detector);
         return STATUS_SUCCESS;
     }
 
     RopFreeResult(result);
+    RoppReleaseRundown(Detector);
     return STATUS_NOT_FOUND;
 }
 
@@ -1342,23 +1372,7 @@ RopValidateCallStack(
 
 Routine Description:
 
-    Validates a thread's call stack for integrity. Checks for:
-    - Valid return addresses
-    - Proper stack frame linkage
-    - Executable backing for return addresses
-    - Known gadget patterns
-
-Arguments:
-
-    Detector - Initialized detector
-    ProcessId - Target process
-    ThreadId - Target thread
-    IsValid - Receives TRUE if stack appears valid
-    SuspicionScore - Optional suspicion score (0-100)
-
-Return Value:
-
-    STATUS_SUCCESS on successful validation
+    Validates a thread's call stack for integrity.
 
 --*/
 {
@@ -1368,7 +1382,7 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || IsValid == NULL) {
+    if (RoppValidateDetector(Detector) == NULL || IsValid == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1377,16 +1391,23 @@ Return Value:
         *SuspicionScore = 0;
     }
 
-    //
-    // Perform stack analysis
-    //
     status = RopAnalyzeStack(Detector, ProcessId, ThreadId, NULL, &result);
 
     if (status == STATUS_NOT_FOUND) {
-        //
-        // No chain detected - stack appears valid
-        //
         *IsValid = TRUE;
+        if (result != NULL) {
+            //
+            // Even when no chain is detected, check pivot
+            //
+            if (result->StackPivotDetected) {
+                *IsValid = FALSE;
+                score = 70;
+            }
+            RopFreeResult(result);
+        }
+        if (SuspicionScore != NULL) {
+            *SuspicionScore = score;
+        }
         return STATUS_SUCCESS;
     }
 
@@ -1394,20 +1415,12 @@ Return Value:
         return status;
     }
 
-    //
-    // Evaluate results
-    //
     if (result->ChainDetected) {
         *IsValid = FALSE;
         score = result->ConfidenceScore;
     } else if (result->StackPivotDetected) {
         *IsValid = FALSE;
         score = 70;
-    } else if (result->UnknownGadgets > 10) {
-        //
-        // Many unknown potential gadgets - suspicious
-        //
-        score = min(50, result->UnknownGadgets * 3);
     }
 
     if (SuspicionScore != NULL) {
@@ -1433,42 +1446,32 @@ RopFreeResult(
 Routine Description:
 
     Frees a detection result and all chain entries.
-
-Arguments:
-
-    Result - Result to free
+    All allocations are from pool (not lookaside), so we use
+    ShadowStrikeFreePoolWithTag consistently.
 
 --*/
 {
     PLIST_ENTRY entry;
     PROP_CHAIN_ENTRY chainEntry;
-    ULONG i;
+
+    PAGED_CODE();
 
     if (Result == NULL) {
         return;
     }
 
     //
-    // Free chain entries
+    // Free chain entries (all allocated from pool via RoppAllocateChainEntry)
     //
     while (!IsListEmpty(&Result->ChainEntries)) {
         entry = RemoveHeadList(&Result->ChainEntries);
         chainEntry = CONTAINING_RECORD(entry, ROP_CHAIN_ENTRY, ListEntry);
-        ShadowStrikeFreePoolWithTag(chainEntry, ROP_POOL_TAG_CHAIN);
+        RoppFreeChainEntry(chainEntry);
     }
 
     //
-    // Free module name buffers
+    // Free result (allocated from pool via RoppAllocateResult)
     //
-    for (i = 0; i < Result->ModulesUsed; i++) {
-        if (Result->ModuleBreakdown[i].ModuleName.Buffer != NULL) {
-            ShadowStrikeFreePoolWithTag(
-                Result->ModuleBreakdown[i].ModuleName.Buffer,
-                ROP_POOL_TAG_CONTEXT
-                );
-        }
-    }
-
     ShadowStrikeFreePoolWithTag(Result, ROP_POOL_TAG_CONTEXT);
 }
 
@@ -1488,16 +1491,7 @@ RopRegisterCallback(
 Routine Description:
 
     Registers a callback for ROP chain detection notifications.
-
-Arguments:
-
-    Detector - Initialized detector
-    Callback - Callback function
-    Context - User context for callback
-
-Return Value:
-
-    STATUS_SUCCESS on success
+    Each callback gets its own rundown ref for safe unregistration.
 
 --*/
 {
@@ -1506,22 +1500,20 @@ Return Value:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    internalDetector = RoppValidateDetector(Detector);
+    if (internalDetector == NULL || Callback == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
+    if (!RoppAcquireRundown(Detector)) {
+        return STATUS_DELETE_PENDING;
+    }
 
-    //
-    // Check callback limit
-    //
     if (internalDetector->CallbackCount >= ROP_MAX_CALLBACKS) {
+        RoppReleaseRundown(Detector);
         return STATUS_QUOTA_EXCEEDED;
     }
 
-    //
-    // Allocate callback entry
-    //
     callbackEntry = (PROP_CALLBACK_ENTRY)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(ROP_CALLBACK_ENTRY),
@@ -1529,12 +1521,15 @@ Return Value:
         );
 
     if (callbackEntry == NULL) {
+        RoppReleaseRundown(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    RtlZeroMemory(callbackEntry, sizeof(ROP_CALLBACK_ENTRY));
     callbackEntry->Callback = Callback;
     callbackEntry->Context = Context;
-    callbackEntry->Active = TRUE;
+    InterlockedExchange(&callbackEntry->Active, TRUE);
+    ExInitializeRundownProtection(&callbackEntry->RundownRef);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&internalDetector->CallbackLock);
@@ -1545,6 +1540,7 @@ Return Value:
     ExReleasePushLockExclusive(&internalDetector->CallbackLock);
     KeLeaveCriticalRegion();
 
+    RoppReleaseRundown(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1560,11 +1556,8 @@ RopUnregisterCallback(
 Routine Description:
 
     Unregisters a previously registered callback.
-
-Arguments:
-
-    Detector - Initialized detector
-    Callback - Callback to unregister
+    Uses per-callback rundown protection to ensure no in-flight
+    invocations exist before freeing the entry.
 
 --*/
 {
@@ -1575,11 +1568,10 @@ Arguments:
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Callback == NULL) {
+    internalDetector = RoppValidateDetector(Detector);
+    if (internalDetector == NULL || Callback == NULL) {
         return;
     }
-
-    internalDetector = CONTAINING_RECORD(Detector, ROP_DETECTOR_INTERNAL, Public);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&internalDetector->CallbackLock);
@@ -1591,6 +1583,10 @@ Arguments:
         callbackEntry = CONTAINING_RECORD(entry, ROP_CALLBACK_ENTRY, ListEntry);
 
         if (callbackEntry->Callback == Callback) {
+            //
+            // Mark inactive so no new invocations start
+            //
+            InterlockedExchange(&callbackEntry->Active, FALSE);
             RemoveEntryList(&callbackEntry->ListEntry);
             InterlockedDecrement(&internalDetector->CallbackCount);
             foundEntry = callbackEntry;
@@ -1603,9 +1599,9 @@ Arguments:
 
     if (foundEntry != NULL) {
         //
-        // Mark inactive and wait for any in-progress callbacks
+        // Wait for any in-flight callback invocations to complete
         //
-        InterlockedExchange(&foundEntry->Active, FALSE);
+        ExWaitForRundownProtectionRelease(&foundEntry->RundownRef);
         ShadowStrikeFreePoolWithTag(foundEntry, ROP_POOL_TAG_CONTEXT);
     }
 }
@@ -1626,32 +1622,26 @@ Routine Description:
 
     Retrieves detector statistics.
 
-Arguments:
-
-    Detector - Initialized detector
-    Stats - Receives statistics
-
-Return Value:
-
-    STATUS_SUCCESS on success
-
 --*/
 {
     LARGE_INTEGER currentTime;
     PLIST_ENTRY entry;
     ULONG moduleCount = 0;
 
-    if (Detector == NULL || !Detector->Initialized || Stats == NULL) {
+    PAGED_CODE();
+
+    if (RoppValidateDetector(Detector) == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!RoppAcquireRundown(Detector)) {
+        return STATUS_DELETE_PENDING;
     }
 
     Stats->GadgetCount = (ULONG)Detector->GadgetCount;
     Stats->StacksAnalyzed = Detector->Stats.StacksAnalyzed;
     Stats->ChainsDetected = Detector->Stats.ChainsDetected;
 
-    //
-    // Count scanned modules
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&Detector->ModuleLock);
 
@@ -1666,12 +1656,10 @@ Return Value:
 
     Stats->ModulesScanned = moduleCount;
 
-    //
-    // Calculate uptime
-    //
     KeQuerySystemTime(&currentTime);
     Stats->UpTime.QuadPart = currentTime.QuadPart - Detector->Stats.StartTime.QuadPart;
 
+    RoppReleaseRundown(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -1684,19 +1672,8 @@ ULONG
 RoppHashAddress(
     PVOID Address
     )
-/*++
-
-Routine Description:
-
-    Computes hash for address lookup.
-
---*/
 {
     ULONG_PTR addr = (ULONG_PTR)Address;
-
-    //
-    // FNV-1a inspired hash
-    //
     ULONG hash = 2166136261;
 
     while (addr != 0) {
@@ -1744,30 +1721,26 @@ RoppFreeGadget(
 }
 
 
+//
+// Chain entries and results are ALWAYS allocated from pool (never lookaside)
+// so that RopFreeResult can safely use ShadowStrikeFreePoolWithTag.
+//
 static
 NTSTATUS
 RoppAllocateChainEntry(
-    PROP_DETECTOR_INTERNAL Detector,
     PROP_CHAIN_ENTRY* Entry
     )
 {
     PROP_CHAIN_ENTRY entry;
 
-    entry = (PROP_CHAIN_ENTRY)ShadowStrikeLookasideAllocate(&Detector->ChainEntryLookaside);
+    entry = (PROP_CHAIN_ENTRY)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(ROP_CHAIN_ENTRY),
+        ROP_POOL_TAG_CHAIN
+        );
 
     if (entry == NULL) {
-        //
-        // Fallback to direct allocation
-        //
-        entry = (PROP_CHAIN_ENTRY)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            sizeof(ROP_CHAIN_ENTRY),
-            ROP_POOL_TAG_CHAIN
-            );
-
-        if (entry == NULL) {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(entry, sizeof(ROP_CHAIN_ENTRY));
@@ -1780,12 +1753,11 @@ RoppAllocateChainEntry(
 static
 VOID
 RoppFreeChainEntry(
-    PROP_DETECTOR_INTERNAL Detector,
     PROP_CHAIN_ENTRY Entry
     )
 {
     if (Entry != NULL) {
-        ShadowStrikeLookasideFree(&Detector->ChainEntryLookaside, Entry);
+        ShadowStrikeFreePoolWithTag(Entry, ROP_POOL_TAG_CHAIN);
     }
 }
 
@@ -1793,24 +1765,19 @@ RoppFreeChainEntry(
 static
 NTSTATUS
 RoppAllocateResult(
-    PROP_DETECTOR_INTERNAL Detector,
     PROP_DETECTION_RESULT* Result
     )
 {
     PROP_DETECTION_RESULT result;
 
-    result = (PROP_DETECTION_RESULT)ShadowStrikeLookasideAllocate(&Detector->ResultLookaside);
+    result = (PROP_DETECTION_RESULT)ShadowStrikeAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(ROP_DETECTION_RESULT),
+        ROP_POOL_TAG_CONTEXT
+        );
 
     if (result == NULL) {
-        result = (PROP_DETECTION_RESULT)ShadowStrikeAllocatePoolWithTag(
-            NonPagedPoolNx,
-            sizeof(ROP_DETECTION_RESULT),
-            ROP_POOL_TAG_CONTEXT
-            );
-
-        if (result == NULL) {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(result, sizeof(ROP_DETECTION_RESULT));
@@ -1819,9 +1786,201 @@ RoppAllocateResult(
     return STATUS_SUCCESS;
 }
 
+
+//=============================================================================
+// Private Functions - PE Validation
+//=============================================================================
+
+static
+BOOLEAN
+RoppValidatePeHeaders(
+    PVOID ModuleBase,
+    SIZE_T ModuleSize,
+    PIMAGE_NT_HEADERS* NtHeaders
+    )
+/*++
+
+Routine Description:
+
+    Validates PE headers with full bounds checking against ModuleSize.
+
+--*/
+{
+    PIMAGE_DOS_HEADER dosHeader;
+    PIMAGE_NT_HEADERS ntHeaders;
+    ULONG e_lfanew;
+    SIZE_T ntHeaderEnd;
+    SIZE_T sectionTableEnd;
+
+    *NtHeaders = NULL;
+
+    if (ModuleSize < sizeof(IMAGE_DOS_HEADER)) {
+        return FALSE;
+    }
+
+    __try {
+        dosHeader = (PIMAGE_DOS_HEADER)ModuleBase;
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+            return FALSE;
+        }
+
+        e_lfanew = (ULONG)dosHeader->e_lfanew;
+
+        //
+        // Bounds check e_lfanew
+        //
+        if (e_lfanew >= ModuleSize) {
+            return FALSE;
+        }
+
+        ntHeaderEnd = (SIZE_T)e_lfanew + sizeof(IMAGE_NT_HEADERS);
+        if (ntHeaderEnd > ModuleSize || ntHeaderEnd < (SIZE_T)e_lfanew) {
+            return FALSE;
+        }
+
+        ntHeaders = (PIMAGE_NT_HEADERS)((PUCHAR)ModuleBase + e_lfanew);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+            return FALSE;
+        }
+
+        //
+        // Validate NumberOfSections won't overflow the section table
+        //
+        if (ntHeaders->FileHeader.NumberOfSections > 96) {
+            return FALSE;
+        }
+
+        sectionTableEnd = (SIZE_T)e_lfanew +
+                          FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) +
+                          ntHeaders->FileHeader.SizeOfOptionalHeader +
+                          ((SIZE_T)ntHeaders->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER));
+
+        if (sectionTableEnd > ModuleSize) {
+            return FALSE;
+        }
+
+        *NtHeaders = ntHeaders;
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+
+static
+BOOLEAN
+RoppIsModuleAlreadyScanned(
+    PROP_DETECTOR Detector,
+    PVOID ModuleBase
+    )
+/*++
+
+Routine Description:
+
+    Checks if a module has already been scanned (deduplication).
+
+--*/
+{
+    PLIST_ENTRY entry;
+    PROP_SCANNED_MODULE module;
+    BOOLEAN found = FALSE;
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->ModuleLock);
+
+    for (entry = Detector->ScannedModules.Flink;
+         entry != &Detector->ScannedModules;
+         entry = entry->Flink) {
+
+        module = CONTAINING_RECORD(entry, ROP_SCANNED_MODULE, ListEntry);
+        if (module->ModuleBase == ModuleBase) {
+            found = TRUE;
+            break;
+        }
+    }
+
+    ExReleasePushLockShared(&Detector->ModuleLock);
+    KeLeaveCriticalRegion();
+
+    return found;
+}
+
 //=============================================================================
 // Private Functions - Gadget Analysis
 //=============================================================================
+
+static
+ULONG
+RoppDecodeModRMLength(
+    PUCHAR Bytes,
+    ULONG MaxSize
+    )
+/*++
+
+Routine Description:
+
+    Decodes the total length of a ModR/M-addressed instruction suffix
+    (ModR/M byte + optional SIB + optional displacement).
+    Returns the number of bytes consumed starting from the ModR/M byte.
+
+--*/
+{
+    UCHAR modrm;
+    UCHAR mod;
+    UCHAR rm;
+    ULONG length = 1;  // ModR/M byte itself
+
+    if (MaxSize < 1) {
+        return 0;
+    }
+
+    modrm = Bytes[0];
+    mod = (modrm & MODRM_MOD_MASK) >> 6;
+    rm = modrm & MODRM_RM_MASK;
+
+    if (mod == 3) {
+        //
+        // Register direct — no SIB, no displacement
+        //
+        return 1;
+    }
+
+    //
+    // Check for SIB byte (rm == 4 and mod != 3)
+    //
+    if (rm == 4) {
+        length++;  // SIB byte
+        if (length > MaxSize) return 0;
+    }
+
+    //
+    // Displacement size
+    //
+    if (mod == 0) {
+        if (rm == 5) {
+            length += 4;  // disp32 (RIP-relative on x64)
+        }
+        // rm == 4 with SIB: check SIB base
+        if (rm == 4 && length >= 2) {
+            UCHAR sib = Bytes[1];
+            if ((sib & 0x07) == 5) {
+                length += 4;  // disp32
+            }
+        }
+    } else if (mod == 1) {
+        length += 1;  // disp8
+    } else if (mod == 2) {
+        length += 4;  // disp32
+    }
+
+    if (length > MaxSize) {
+        return 0;
+    }
+
+    return length;
+}
+
 
 static
 ROP_GADGET_TYPE
@@ -1835,12 +1994,15 @@ RoppClassifyGadget(
 Routine Description:
 
     Classifies a potential gadget based on its terminating instruction.
+    Properly decodes ModR/M + SIB + displacement for FF-prefix instructions.
 
 --*/
 {
     UCHAR opcode;
     UCHAR modrm;
     UCHAR reg;
+    UCHAR mod;
+    ULONG modrmLen;
 
     if (Bytes == NULL || Size == 0 || GadgetSize == NULL) {
         return GadgetType_Unknown;
@@ -1849,83 +2011,57 @@ Routine Description:
     *GadgetSize = 0;
     opcode = Bytes[0];
 
-    //
-    // Check for RET (C3)
-    //
     if (opcode == OPCODE_RET) {
         *GadgetSize = 1;
         return GadgetType_Ret;
     }
 
-    //
-    // Check for RET imm16 (C2 xx xx)
-    //
     if (opcode == OPCODE_RET_IMM16 && Size >= 3) {
         *GadgetSize = 3;
         return GadgetType_RetN;
     }
 
-    //
-    // Check for SYSCALL (0F 05)
-    //
     if (opcode == OPCODE_SYSCALL_0F && Size >= 2 && Bytes[1] == OPCODE_SYSCALL_05) {
         *GadgetSize = 2;
         return GadgetType_Syscall;
     }
 
-    //
-    // Check for SYSENTER (0F 34)
-    //
     if (opcode == OPCODE_SYSENTER_0F && Size >= 2 && Bytes[1] == OPCODE_SYSENTER_34) {
         *GadgetSize = 2;
         return GadgetType_Syscall;
     }
 
-    //
-    // Check for INT xx (CD xx)
-    //
     if (opcode == OPCODE_INT && Size >= 2) {
         *GadgetSize = 2;
         return GadgetType_Int;
     }
 
     //
-    // Check for JMP/CALL reg/mem (FF /4, FF /5, FF /2, FF /3)
+    // FF-prefix: JMP/CALL reg/mem with proper ModR/M decoding
     //
     if (opcode == OPCODE_FF_PREFIX && Size >= 2) {
         modrm = Bytes[1];
         reg = (modrm & MODRM_REG_MASK) >> MODRM_REG_SHIFT;
+        mod = (modrm & MODRM_MOD_MASK) >> 6;
+
+        modrmLen = RoppDecodeModRMLength(Bytes + 1, Size - 1);
+        if (modrmLen == 0) {
+            return GadgetType_Unknown;
+        }
+
+        *GadgetSize = 1 + modrmLen;  // opcode + modrm+sib+disp
 
         switch (reg) {
         case FF_CALL_REG:
-            //
-            // CALL r/m - determine size based on ModR/M
-            //
-            if ((modrm & MODRM_MOD_MASK) == 0xC0) {
-                // Direct register
-                *GadgetSize = 2;
-                return GadgetType_CallReg;
-            } else {
-                // Memory reference - need to calculate full size
-                *GadgetSize = 2;  // Minimum
-                return GadgetType_CallMem;
-            }
+            return (mod == 3) ? GadgetType_CallReg : GadgetType_CallMem;
 
         case FF_JMP_REG:
-            if ((modrm & MODRM_MOD_MASK) == 0xC0) {
-                *GadgetSize = 2;
-                return GadgetType_JmpReg;
-            } else {
-                *GadgetSize = 2;
-                return GadgetType_JmpMem;
-            }
+            return (mod == 3) ? GadgetType_JmpReg : GadgetType_JmpMem;
 
         case FF_CALL_MEM:
-            *GadgetSize = 2;
             return GadgetType_CallMem;
 
         case FF_JMP_MEM:
-            *GadgetSize = 2;
             return GadgetType_JmpMem;
         }
     }
@@ -1944,7 +2080,9 @@ RoppAnalyzeGadgetSemantics(
 Routine Description:
 
     Performs semantic analysis on a gadget to determine what
-    registers and memory it affects.
+    registers and memory it affects. Correct PUSH/POP semantics:
+    - PUSH reads the source register, modifies RSP
+    - POP writes the destination register, modifies RSP
 
 --*/
 {
@@ -1961,46 +2099,52 @@ Routine Description:
     bytes = Gadget->Bytes;
     size = Gadget->Size;
 
-    //
-    // Simple heuristic analysis - not full disassembly
-    //
-    for (i = 0; i < size - 1; i++) {
+    for (i = 0; i < size; i++) {
         opcode = bytes[i];
 
         //
-        // Check for stack-modifying operations
+        // PUSH r64 (0x50-0x57): reads source register, modifies RSP
         //
-        if (opcode == 0x50 || opcode == 0x58) {
-            // PUSH/POP rAX
+        if (opcode >= 0x50 && opcode <= 0x57) {
             Gadget->Semantics.ModifiesStack = TRUE;
-            Gadget->Semantics.RegistersModified |= REG_RAX;
+            Gadget->Semantics.RegistersModified |= REG_RSP;
+            Gadget->Semantics.RegistersRead |= (1 << (opcode - 0x50));
         }
-        else if (opcode >= 0x50 && opcode <= 0x57) {
-            // PUSH r64
-            Gadget->Semantics.ModifiesStack = TRUE;
-        }
+        //
+        // POP r64 (0x58-0x5F): writes destination register, modifies RSP
+        //
         else if (opcode >= 0x58 && opcode <= 0x5F) {
-            // POP r64
             Gadget->Semantics.ModifiesStack = TRUE;
+            Gadget->Semantics.RegistersModified |= REG_RSP;
             Gadget->Semantics.RegistersModified |= (1 << (opcode - 0x58));
         }
-        else if (opcode == 0x89 || opcode == 0x8B) {
-            // MOV r/m, r or MOV r, r/m
-            if (i + 1 < size) {
-                modrm = bytes[i + 1];
-                if ((modrm & MODRM_MOD_MASK) != 0xC0) {
-                    if (opcode == 0x89) {
-                        Gadget->Semantics.WritesMemory = TRUE;
-                    } else {
-                        Gadget->Semantics.ReadsMemory = TRUE;
-                    }
+        //
+        // MOV r/m, r (0x89) or MOV r, r/m (0x8B)
+        //
+        else if ((opcode == 0x89 || opcode == 0x8B) && (i + 1 < size)) {
+            modrm = bytes[i + 1];
+            if ((modrm & MODRM_MOD_MASK) != 0xC0) {
+                if (opcode == 0x89) {
+                    Gadget->Semantics.WritesMemory = TRUE;
+                } else {
+                    Gadget->Semantics.ReadsMemory = TRUE;
                 }
             }
+            i++;  // skip ModR/M
         }
+        //
+        // XCHG rAX, rSP (0x94) — stack pivot
+        //
         else if (opcode == 0x94) {
-            // XCHG rAX, rSP - stack pivot!
             Gadget->Semantics.ModifiesStack = TRUE;
             Gadget->Semantics.RegistersModified |= (REG_RAX | REG_RSP);
+        }
+        //
+        // RET/RETF/RETN — terminal, stop analysis
+        //
+        else if (opcode == OPCODE_RET || opcode == OPCODE_RET_IMM16 ||
+                 opcode == OPCODE_RETF || opcode == OPCODE_RETF_IMM16) {
+            break;
         }
     }
 }
@@ -2012,13 +2156,6 @@ RoppCalculateDangerScore(
     PROP_DETECTOR_INTERNAL Detector,
     PROP_GADGET Gadget
     )
-/*++
-
-Routine Description:
-
-    Calculates a danger score for a gadget based on its capabilities.
-
---*/
 {
     ULONG score = 0;
     ULONG i;
@@ -2027,50 +2164,41 @@ Routine Description:
         return 0;
     }
 
-    //
-    // Base score by gadget type
-    //
     switch (Gadget->Type) {
     case GadgetType_Syscall:
-        score += 80;  // Direct syscall - very dangerous
+        score += 80;
         Gadget->IsPrivileged = TRUE;
         break;
     case GadgetType_Ret:
     case GadgetType_RetN:
-        score += 10;  // Common gadget ending
+        score += 10;
         break;
     case GadgetType_JmpReg:
     case GadgetType_CallReg:
-        score += 30;  // Can redirect execution
+        score += 30;
         Gadget->CouldBypassCFG = TRUE;
         break;
     case GadgetType_JmpMem:
     case GadgetType_CallMem:
-        score += 40;  // Memory-based redirection
+        score += 40;
         break;
     case GadgetType_Int:
-        score += 50;  // Interrupt - could be syscall
+        score += 50;
         break;
     default:
         break;
     }
 
-    //
-    // Add score for semantics
-    //
     if (Gadget->Semantics.ModifiesStack) {
-        score += 20;  // Stack manipulation
+        score += 20;
     }
     if (Gadget->Semantics.WritesMemory) {
-        score += 15;  // Memory write capability
+        score += 15;
     }
     if (Gadget->Semantics.RegistersModified & REG_RSP) {
-        score += 40;  // Stack pointer modification - pivot capable
+        score += 40;
     }
 
-    //
-    // Check against dangerous patterns
-    //
     for (i = 0; i < Detector->DangerousPatternCount; i++) {
         if (Gadget->Size >= Detector->DangerousPatterns[i].PatternSize) {
             if (RtlCompareMemory(
@@ -2092,28 +2220,17 @@ VOID
 RoppInitializeDangerousPatterns(
     PROP_DETECTOR_INTERNAL Detector
     )
-/*++
-
-Routine Description:
-
-    Initializes the database of dangerous gadget patterns.
-
---*/
 {
     ULONG idx = 0;
 
-    //
-    // XCHG EAX, ESP / XCHG RAX, RSP - stack pivot
-    //
+    // XCHG EAX, ESP / XCHG RAX, RSP — stack pivot
     Detector->DangerousPatterns[idx].Pattern[0] = 0x94;
     Detector->DangerousPatterns[idx].PatternSize = 1;
     Detector->DangerousPatterns[idx].DangerScore = 50;
     Detector->DangerousPatterns[idx].Description = "Stack pivot XCHG";
     idx++;
 
-    //
-    // MOV ESP, EAX / MOV RSP, RAX - stack pivot
-    //
+    // MOV ESP, EAX / MOV RSP, RAX — stack pivot
     Detector->DangerousPatterns[idx].Pattern[0] = 0x89;
     Detector->DangerousPatterns[idx].Pattern[1] = 0xC4;
     Detector->DangerousPatterns[idx].PatternSize = 2;
@@ -2121,66 +2238,55 @@ Routine Description:
     Detector->DangerousPatterns[idx].Description = "Stack pivot MOV";
     idx++;
 
-    //
-    // LEAVE; RET - frame cleanup, common in ROP
-    //
-    Detector->DangerousPatterns[idx].Pattern[0] = 0xC9;  // LEAVE
-    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;  // RET
+    // LEAVE; RET
+    Detector->DangerousPatterns[idx].Pattern[0] = 0xC9;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 25;
     Detector->DangerousPatterns[idx].Description = "LEAVE; RET sequence";
     idx++;
 
-    //
-    // POP RDI; RET - common argument setup
-    //
-    Detector->DangerousPatterns[idx].Pattern[0] = 0x5F;  // POP RDI
-    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;  // RET
+    // POP RDI; RET
+    Detector->DangerousPatterns[idx].Pattern[0] = 0x5F;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 15;
     Detector->DangerousPatterns[idx].Description = "POP RDI; RET";
     idx++;
 
-    //
-    // POP RSI; RET - common argument setup
-    //
-    Detector->DangerousPatterns[idx].Pattern[0] = 0x5E;  // POP RSI
-    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;  // RET
+    // POP RSI; RET
+    Detector->DangerousPatterns[idx].Pattern[0] = 0x5E;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 15;
     Detector->DangerousPatterns[idx].Description = "POP RSI; RET";
     idx++;
 
-    //
-    // POP RDX; RET - common argument setup
-    //
-    Detector->DangerousPatterns[idx].Pattern[0] = 0x5A;  // POP RDX
-    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;  // RET
+    // POP RDX; RET
+    Detector->DangerousPatterns[idx].Pattern[0] = 0x5A;
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xC3;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 15;
     Detector->DangerousPatterns[idx].Description = "POP RDX; RET";
     idx++;
 
-    //
-    // JMP RSP / CALL RSP - shellcode execution
-    //
+    // JMP RSP
     Detector->DangerousPatterns[idx].Pattern[0] = 0xFF;
-    Detector->DangerousPatterns[idx].Pattern[1] = 0xE4;  // JMP RSP
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xE4;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 60;
     Detector->DangerousPatterns[idx].Description = "JMP RSP";
     idx++;
 
+    // CALL RSP
     Detector->DangerousPatterns[idx].Pattern[0] = 0xFF;
-    Detector->DangerousPatterns[idx].Pattern[1] = 0xD4;  // CALL RSP
+    Detector->DangerousPatterns[idx].Pattern[1] = 0xD4;
     Detector->DangerousPatterns[idx].PatternSize = 2;
     Detector->DangerousPatterns[idx].DangerScore = 60;
     Detector->DangerousPatterns[idx].Description = "CALL RSP";
     idx++;
 
-    //
-    // ADD RSP, imm8; RET - stack adjustment
-    //
+    // ADD RSP, imm8
     Detector->DangerousPatterns[idx].Pattern[0] = 0x48;
     Detector->DangerousPatterns[idx].Pattern[1] = 0x83;
     Detector->DangerousPatterns[idx].Pattern[2] = 0xC4;
@@ -2205,12 +2311,20 @@ RoppInitializeAnalysisContext(
     PCONTEXT ThreadContext,
     PROP_ANALYSIS_CONTEXT Context
     )
+/*++
+
+Routine Description:
+
+    Initializes analysis context with real stack information.
+    Retrieves stack base/limit from the target thread's TEB.
+
+--*/
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
     PETHREAD thread = NULL;
-
-    UNREFERENCED_PARAMETER(ThreadContext);
+    KAPC_STATE apcState;
+    PTEB teb = NULL;
 
     RtlZeroMemory(Context, sizeof(ROP_ANALYSIS_CONTEXT));
 
@@ -2222,16 +2336,13 @@ RoppInitializeAnalysisContext(
     KeQuerySystemTime(&Context->StartTime);
 
     //
-    // Get process object
+    // Get process and thread objects
     //
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    //
-    // Get thread object
-    //
     status = PsLookupThreadByThreadId(ThreadId, &thread);
     if (!NT_SUCCESS(status)) {
         ObDereferenceObject(process);
@@ -2239,17 +2350,84 @@ RoppInitializeAnalysisContext(
     }
 
     //
-    // Get stack limits from thread
-    // Note: In a real implementation, we'd read the TEB or use
-    // IoGetStackLimits for kernel threads
+    // Use ThreadContext if provided (contains Rsp)
     //
-    // For now, use reasonable defaults
+    if (ThreadContext != NULL) {
+#ifdef _AMD64_
+        Context->CurrentSp = (PVOID)ThreadContext->Rsp;
+#else
+        Context->CurrentSp = (PVOID)ThreadContext->Esp;
+#endif
+    }
+
     //
-    Context->StackBase = NULL;
-    Context->StackLimit = NULL;
+    // Get stack limits from TEB by attaching to the target process.
+    // For kernel threads, use IoGetStackLimits.
+    //
+    if (PsIsSystemThread(thread)) {
+        //
+        // Kernel thread: use IoGetStackLimits (only valid for current thread)
+        //
+        if (thread == PsGetCurrentThread()) {
+            ULONG_PTR lowLimit, highLimit;
+            IoGetStackLimits(&lowLimit, &highLimit);
+            Context->StackLimit = (PVOID)lowLimit;
+            Context->StackBase = (PVOID)highLimit;
+        } else {
+            //
+            // Cannot directly read another kernel thread's stack limits.
+            // Use a conservative estimate from the initial stack.
+            //
+            PVOID initialStack = IoGetInitialStack();
+            if (initialStack != NULL) {
+                Context->StackBase = initialStack;
+                Context->StackLimit = (PVOID)((ULONG_PTR)initialStack - ROP_KERNEL_STACK_SIZE_ESTIMATE);
+            }
+        }
+    } else {
+        //
+        // User-mode thread: read stack limits from TEB
+        //
+        KeStackAttachProcess(process, &apcState);
+
+        __try {
+            teb = (PTEB)PsGetThreadTeb(thread);
+            if (teb != NULL) {
+                ProbeForRead(teb, sizeof(TEB), sizeof(UCHAR));
+                Context->StackBase = teb->NtTib.StackBase;
+                Context->StackLimit = teb->NtTib.StackLimit;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            //
+            // TEB read failed — will be caught later as NULL stack bounds
+            //
+        }
+
+        KeUnstackDetachProcess(&apcState);
+    }
+
+    //
+    // If we still don't have a CurrentSp but we do have stack bounds,
+    // default to StackLimit (top of committed stack, low address).
+    //
+    if (Context->CurrentSp == NULL && Context->StackLimit != NULL) {
+        Context->CurrentSp = Context->StackLimit;
+    }
 
     ObDereferenceObject(thread);
     ObDereferenceObject(process);
+
+    //
+    // Validate we have enough information to proceed
+    //
+    if (Context->StackBase == NULL || Context->CurrentSp == NULL) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if ((ULONG_PTR)Context->CurrentSp >= (ULONG_PTR)Context->StackBase) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -2292,17 +2470,32 @@ Routine Description:
     NTSTATUS status;
     PEPROCESS process = NULL;
     KAPC_STATE apcState;
+    SIZE_T availableStack;
     SIZE_T bytesToCopy;
     SIZE_T bytesCopied = 0;
 
-    if (Context->CurrentSp == NULL) {
+    if (Context->CurrentSp == NULL || Context->StackBase == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Calculate available stack size with overflow check
+    //
+    if ((ULONG_PTR)Context->StackBase <= (ULONG_PTR)Context->CurrentSp) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    availableStack = (SIZE_T)((PUCHAR)Context->StackBase - (PUCHAR)Context->CurrentSp);
+    bytesToCopy = min(ROP_STACK_SAMPLE_SIZE, availableStack);
+
+    if (bytesToCopy == 0 || bytesToCopy < sizeof(ULONG_PTR)) {
+        return STATUS_NO_DATA_DETECTED;
     }
 
     //
     // Allocate stack buffer
     //
-    Context->StackBufferSize = ROP_STACK_SAMPLE_SIZE;
+    Context->StackBufferSize = bytesToCopy;
     Context->StackBuffer = (PULONG_PTR)ShadowStrikeAllocatePoolWithTag(
         NonPagedPoolNx,
         Context->StackBufferSize,
@@ -2310,32 +2503,27 @@ Routine Description:
         );
 
     if (Context->StackBuffer == NULL) {
+        Context->StackBufferSize = 0;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     //
-    // Attach to target process
+    // Attach to target process and copy stack
     //
     status = PsLookupProcessByProcessId(Context->ProcessId, &process);
     if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(Context->StackBuffer, ROP_POOL_TAG_CONTEXT);
+        Context->StackBuffer = NULL;
+        Context->StackBufferSize = 0;
         return status;
     }
 
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        //
-        // Probe and copy stack
-        //
-        bytesToCopy = min(Context->StackBufferSize,
-                         (SIZE_T)((PUCHAR)Context->StackBase - (PUCHAR)Context->CurrentSp));
-
-        if (bytesToCopy > 0 && bytesToCopy <= Context->StackBufferSize) {
-            ProbeForRead(Context->CurrentSp, bytesToCopy, sizeof(UCHAR));
-            RtlCopyMemory(Context->StackBuffer, Context->CurrentSp, bytesToCopy);
-            bytesCopied = bytesToCopy;
-        }
-
+        ProbeForRead(Context->CurrentSp, bytesToCopy, sizeof(UCHAR));
+        RtlCopyMemory(Context->StackBuffer, Context->CurrentSp, bytesToCopy);
+        bytesCopied = bytesToCopy;
         status = STATUS_SUCCESS;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2367,16 +2555,111 @@ RoppBuildModuleCache(
 Routine Description:
 
     Builds a cache of loaded modules for fast executable address lookups.
+    Enumerates the target process's loaded module list via PEB->Ldr.
 
 --*/
 {
-    //
-    // In a full implementation, we would enumerate loaded modules
-    // using PsGetProcessPeb or similar mechanisms.
-    // For now, initialize empty cache.
-    //
+    NTSTATUS status;
+    PEPROCESS process = NULL;
+    KAPC_STATE apcState;
+    PPEB peb = NULL;
+    PPEB_LDR_DATA ldr = NULL;
+    PLIST_ENTRY head = NULL;
+    PLIST_ENTRY current = NULL;
+    PLDR_DATA_TABLE_ENTRY ldrEntry = NULL;
+    ULONG count = 0;
+    ULONG maxModules = ARRAYSIZE(Context->ModuleCache);
+
     Context->ModuleCacheCount = 0;
-    return STATUS_SUCCESS;
+
+    status = PsLookupProcessByProcessId(Context->ProcessId, &process);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // For system process, populate from kernel module list
+    //
+    if (PsGetProcessId(process) == (HANDLE)(ULONG_PTR)4) {
+        ObDereferenceObject(process);
+        //
+        // Kernel-mode addresses are validated via ShadowStrikeIsKernelAddress
+        // which covers system-loaded drivers. Process-specific module enumeration
+        // is not applicable to the System process (PID 4) since it has no PEB.
+        //
+        return STATUS_SUCCESS;
+    }
+
+    KeStackAttachProcess(process, &apcState);
+
+    __try {
+        peb = PsGetProcessPeb(process);
+        if (peb == NULL) {
+            status = STATUS_UNSUCCESSFUL;
+            __leave;
+        }
+
+        ProbeForRead(peb, sizeof(PEB), sizeof(UCHAR));
+        ldr = peb->Ldr;
+        if (ldr == NULL) {
+            status = STATUS_UNSUCCESSFUL;
+            __leave;
+        }
+
+        ProbeForRead(ldr, sizeof(PEB_LDR_DATA), sizeof(UCHAR));
+        head = &ldr->InMemoryOrderModuleList;
+        current = head->Flink;
+
+        while (current != head && count < maxModules) {
+            ProbeForRead(current, sizeof(LIST_ENTRY), sizeof(UCHAR));
+
+            ldrEntry = CONTAINING_RECORD(current, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+            ProbeForRead(ldrEntry, sizeof(LDR_DATA_TABLE_ENTRY), sizeof(UCHAR));
+
+            if (ldrEntry->DllBase != NULL && ldrEntry->SizeOfImage > 0) {
+                Context->ModuleCache[count].Base = ldrEntry->DllBase;
+                Context->ModuleCache[count].Size = ldrEntry->SizeOfImage;
+                Context->ModuleCache[count].IsExecutable = TRUE;
+
+                //
+                // Copy a truncated module name for diagnostics
+                //
+                if (ldrEntry->BaseDllName.Buffer != NULL &&
+                    ldrEntry->BaseDllName.Length > 0) {
+                    USHORT copyLen = min(
+                        ldrEntry->BaseDllName.Length,
+                        (USHORT)(sizeof(Context->ModuleCache[count].Name) - sizeof(WCHAR))
+                        );
+                    ProbeForRead(ldrEntry->BaseDllName.Buffer, copyLen, sizeof(UCHAR));
+                    RtlCopyMemory(
+                        Context->ModuleCache[count].Name,
+                        ldrEntry->BaseDllName.Buffer,
+                        copyLen
+                        );
+                    Context->ModuleCache[count].Name[copyLen / sizeof(WCHAR)] = L'\0';
+                }
+
+                count++;
+            }
+
+            current = current->Flink;
+        }
+
+        Context->ModuleCacheCount = count;
+        status = STATUS_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        //
+        // Partial cache is still useful — use what we got
+        //
+        Context->ModuleCacheCount = count;
+        status = STATUS_SUCCESS;
+    }
+
+    KeUnstackDetachProcess(&apcState);
+    ObDereferenceObject(process);
+
+    return status;
 }
 
 
@@ -2390,15 +2673,13 @@ RoppIsExecutableAddress(
 
 Routine Description:
 
-    Checks if an address is in an executable region.
+    Checks if an address falls within a known executable module.
+    Returns FALSE for addresses not in any known module.
 
 --*/
 {
     ULONG i;
 
-    //
-    // Check module cache first
-    //
     for (i = 0; i < Context->ModuleCacheCount; i++) {
         if ((ULONG_PTR)Address >= (ULONG_PTR)Context->ModuleCache[i].Base &&
             (ULONG_PTR)Address < (ULONG_PTR)Context->ModuleCache[i].Base +
@@ -2408,11 +2689,19 @@ Routine Description:
     }
 
     //
-    // Not in cache - assume executable for kernel addresses
+    // For kernel-mode addresses, check against kernel module range.
+    // User-mode addresses not in any cached module are NOT executable.
     //
-    return ShadowStrikeIsKernelAddress(Address);
+    if (ShadowStrikeIsKernelAddress(Address)) {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
+//=============================================================================
+// Private Functions - Chain Detection
+//=============================================================================
 
 static
 NTSTATUS
@@ -2425,6 +2714,8 @@ RoppDetectChain(
 Routine Description:
 
     Analyzes captured stack for gadget chains.
+    Only increments UnknownGadgets for addresses that ARE in executable
+    modules but are NOT in the gadget database (not every random stack value).
 
 --*/
 {
@@ -2433,7 +2724,7 @@ Routine Description:
     SIZE_T slotCount;
     SIZE_T i;
     ULONG_PTR value;
-    PROP_GADGET gadget;
+    ROP_GADGET gadgetCopy;
     PROP_CHAIN_ENTRY chainEntry;
     ULONG consecutiveGadgets = 0;
     ULONG maxConsecutive = 0;
@@ -2448,9 +2739,6 @@ Routine Description:
     for (i = 0; i < slotCount; i++) {
         value = stackPtr[i];
 
-        //
-        // Skip invalid addresses
-        //
         if (value < 0x10000 || value == (ULONG_PTR)-1) {
             if (consecutiveGadgets > 0) {
                 maxConsecutive = max(maxConsecutive, consecutiveGadgets);
@@ -2460,32 +2748,35 @@ Routine Description:
         }
 
         //
-        // Check if this is an executable address
+        // Check if this address is in an executable module
         //
         if (!RoppIsExecutableAddress(Context, (PVOID)value)) {
+            Context->NonExecutableAddresses++;
             consecutiveGadgets = 0;
             continue;
         }
 
         //
-        // Look up in gadget database
+        // Look up in gadget database (copy-out, no lifetime issue)
         //
-        status = RopLookupGadget(&Context->Detector->Public, (PVOID)value, &gadget);
+        status = RopLookupGadget(
+            &Context->Detector->Public,
+            (PVOID)value,
+            &gadgetCopy
+            );
 
         if (NT_SUCCESS(status)) {
-            //
-            // Found known gadget
-            //
             consecutiveGadgets++;
             Context->TotalGadgets++;
 
-            //
-            // Add to chain
-            //
-            status = RoppAllocateChainEntry(Context->Detector, &chainEntry);
+            status = RoppAllocateChainEntry(&chainEntry);
             if (NT_SUCCESS(status)) {
                 chainEntry->GadgetAddress = (PVOID)value;
-                chainEntry->Gadget = gadget;
+                chainEntry->GadgetType = gadgetCopy.Type;
+                chainEntry->GadgetSize = gadgetCopy.Size;
+                chainEntry->GadgetDangerScore = gadgetCopy.DangerScore;
+                chainEntry->GadgetIsPrivileged = gadgetCopy.IsPrivileged;
+                chainEntry->GadgetRegistersModified = gadgetCopy.Semantics.RegistersModified;
                 chainEntry->StackOffset = i * sizeof(ULONG_PTR);
                 chainEntry->StackValue = value;
                 chainEntry->Index = Result->ChainLength;
@@ -2495,28 +2786,23 @@ Routine Description:
             }
         } else {
             //
-            // Unknown address - could still be a gadget
+            // Address is in an executable module but not in our gadget DB.
+            // This is a real "unknown executable address" (legitimate
+            // return address or unindexed gadget).
             //
             Context->UnknownAddresses++;
 
-            //
-            // Reset consecutive count if too many unknowns
-            //
-            if (Context->UnknownAddresses > 5) {
+            if (consecutiveGadgets > 0 &&
+                consecutiveGadgets < Context->Detector->Public.Config.MinChainLength) {
+                maxConsecutive = max(maxConsecutive, consecutiveGadgets);
                 consecutiveGadgets = 0;
             }
         }
 
-        //
-        // Check for chain detection
-        //
         if (consecutiveGadgets >= Context->Detector->Public.Config.MinChainLength) {
             Result->ChainDetected = TRUE;
         }
 
-        //
-        // Limit chain length
-        //
         if (Result->ChainLength >= Context->Detector->Public.Config.MaxChainLength) {
             break;
         }
@@ -2537,18 +2823,10 @@ RoppDetectStackPivot(
     PPVOID PivotSource,
     PPVOID PivotDestination
     )
-/*++
-
-Routine Description:
-
-    Detects stack pivot by comparing current SP with expected stack range.
-
---*/
 {
     ULONG_PTR currentSp;
     ULONG_PTR stackBase;
     ULONG_PTR stackLimit;
-    ULONG_PTR distance;
 
     if (Context->CurrentSp == NULL || Context->StackBase == NULL) {
         return FALSE;
@@ -2559,12 +2837,9 @@ Routine Description:
     stackLimit = (ULONG_PTR)Context->StackLimit;
 
     //
-    // Check if SP is outside normal stack bounds
+    // SP outside normal stack bounds indicates a pivot
     //
-    if (currentSp < stackLimit || currentSp > stackBase) {
-        //
-        // SP is outside stack - likely pivoted
-        //
+    if (stackLimit != 0 && (currentSp < stackLimit || currentSp > stackBase)) {
         if (PivotSource != NULL) {
             *PivotSource = Context->StackBase;
         }
@@ -2572,17 +2847,6 @@ Routine Description:
             *PivotDestination = Context->CurrentSp;
         }
         return TRUE;
-    }
-
-    //
-    // Check for large unexpected change in SP
-    //
-    distance = stackBase - currentSp;
-    if (distance > ROP_PIVOT_DISTANCE_THRESHOLD) {
-        //
-        // Unusually deep stack - suspicious but not definitive
-        //
-        return FALSE;
     }
 
     return FALSE;
@@ -2594,13 +2858,6 @@ ROP_ATTACK_TYPE
 RoppClassifyAttack(
     PROP_DETECTION_RESULT Result
     )
-/*++
-
-Routine Description:
-
-    Classifies the type of attack based on detected chain characteristics.
-
---*/
 {
     PLIST_ENTRY entry;
     PROP_CHAIN_ENTRY chainEntry;
@@ -2613,41 +2870,33 @@ Routine Description:
         return RopAttack_Unknown;
     }
 
-    //
-    // Count gadget types in chain
-    //
     for (entry = Result->ChainEntries.Flink;
          entry != &Result->ChainEntries;
          entry = entry->Flink) {
 
         chainEntry = CONTAINING_RECORD(entry, ROP_CHAIN_ENTRY, ListEntry);
 
-        if (chainEntry->Gadget != NULL) {
-            switch (chainEntry->Gadget->Type) {
-            case GadgetType_Ret:
-            case GadgetType_RetN:
-                retCount++;
-                break;
-            case GadgetType_JmpReg:
-            case GadgetType_JmpMem:
-                jmpCount++;
-                break;
-            case GadgetType_CallReg:
-            case GadgetType_CallMem:
-                callCount++;
-                break;
-            case GadgetType_Syscall:
-                syscallCount++;
-                break;
-            default:
-                break;
-            }
+        switch (chainEntry->GadgetType) {
+        case GadgetType_Ret:
+        case GadgetType_RetN:
+            retCount++;
+            break;
+        case GadgetType_JmpReg:
+        case GadgetType_JmpMem:
+            jmpCount++;
+            break;
+        case GadgetType_CallReg:
+        case GadgetType_CallMem:
+            callCount++;
+            break;
+        case GadgetType_Syscall:
+            syscallCount++;
+            break;
+        default:
+            break;
         }
     }
 
-    //
-    // Classify based on dominant gadget type
-    //
     if (Result->StackPivotDetected) {
         return RopAttack_StackPivot;
     }
@@ -2681,13 +2930,6 @@ VOID
 RoppCalculateConfidence(
     PROP_DETECTION_RESULT Result
     )
-/*++
-
-Routine Description:
-
-    Calculates confidence and severity scores for detection.
-
---*/
 {
     ULONG confidence = 0;
     ULONG severity = 0;
@@ -2702,9 +2944,6 @@ Routine Description:
         return;
     }
 
-    //
-    // Base confidence on chain length
-    //
     if (Result->ChainLength >= 10) {
         confidence = 90;
     } else if (Result->ChainLength >= 5) {
@@ -2713,51 +2952,34 @@ Routine Description:
         confidence = 50;
     }
 
-    //
-    // Adjust for stack pivot
-    //
     if (Result->StackPivotDetected) {
         confidence = min(100, confidence + 20);
     }
 
-    //
-    // Calculate severity based on gadget danger scores
-    //
     for (entry = Result->ChainEntries.Flink;
          entry != &Result->ChainEntries;
          entry = entry->Flink) {
 
         chainEntry = CONTAINING_RECORD(entry, ROP_CHAIN_ENTRY, ListEntry);
 
-        if (chainEntry->Gadget != NULL) {
-            totalDangerScore += chainEntry->Gadget->DangerScore;
+        totalDangerScore += chainEntry->GadgetDangerScore;
 
-            if (chainEntry->Gadget->DangerScore >= 50) {
-                dangerousGadgets++;
-            }
-            if (chainEntry->Gadget->IsPrivileged) {
-                severity = max(severity, 80);
-            }
+        if (chainEntry->GadgetDangerScore >= 50) {
+            dangerousGadgets++;
+        }
+        if (chainEntry->GadgetIsPrivileged) {
+            severity = max(severity, 80);
         }
     }
 
-    //
-    // Average danger score
-    //
     if (Result->ChainLength > 0) {
         severity = max(severity, totalDangerScore / Result->ChainLength);
     }
 
-    //
-    // Boost severity for many dangerous gadgets
-    //
     if (dangerousGadgets >= 3) {
         severity = min(100, severity + 20);
     }
 
-    //
-    // Attack type affects severity
-    //
     switch (Result->AttackType) {
     case RopAttack_SROP:
         severity = max(severity, 90);
@@ -2773,6 +2995,9 @@ Routine Description:
     Result->SeverityScore = min(severity, 100);
 }
 
+//=============================================================================
+// Private Functions - Payload Inference
+//=============================================================================
 
 static
 VOID
@@ -2784,16 +3009,19 @@ RoppInferPayload(
 
 Routine Description:
 
-    Attempts to infer what the ROP chain payload might do.
+    Infers what the ROP chain payload might do based on gadget characteristics.
+    Detects VirtualProtect/VirtualAlloc patterns by checking for sequences that
+    set up multiple argument registers (typical of Windows API calls).
 
 --*/
 {
     PLIST_ENTRY entry;
     PROP_CHAIN_ENTRY chainEntry;
-    BOOLEAN hasVirtualProtect = FALSE;
-    BOOLEAN hasVirtualAlloc = FALSE;
     BOOLEAN hasSyscall = FALSE;
     BOOLEAN hasStackPivot = FALSE;
+    BOOLEAN hasMultiArgSetup = FALSE;
+    ULONG argRegistersSet = 0;
+    ULONG consecutiveArgSetups = 0;
 
     UNREFERENCED_PARAMETER(Detector);
 
@@ -2804,7 +3032,7 @@ Routine Description:
     Result->PayloadAnalysis.PayloadInferred = FALSE;
 
     //
-    // Analyze chain for common payload patterns
+    // Analyze chain for payload patterns
     //
     for (entry = Result->ChainEntries.Flink;
          entry != &Result->ChainEntries;
@@ -2812,19 +3040,53 @@ Routine Description:
 
         chainEntry = CONTAINING_RECORD(entry, ROP_CHAIN_ENTRY, ListEntry);
 
-        if (chainEntry->Gadget != NULL) {
-            if (chainEntry->Gadget->Type == GadgetType_Syscall) {
-                hasSyscall = TRUE;
-            }
-            if (chainEntry->Gadget->Semantics.RegistersModified & REG_RSP) {
-                hasStackPivot = TRUE;
-            }
+        if (chainEntry->GadgetType == GadgetType_Syscall) {
+            hasSyscall = TRUE;
+        }
+
+        if (chainEntry->GadgetRegistersModified & REG_RSP) {
+            hasStackPivot = TRUE;
+        }
+
+        //
+        // Detect API argument setup:
+        // Windows x64 calling convention uses RCX, RDX, R8, R9.
+        // If the chain sets up 3+ of these, it is likely calling a
+        // function like VirtualProtect(addr, size, protect, &old).
+        //
+        if (chainEntry->GadgetRegistersModified & REG_RCX) {
+            argRegistersSet |= REG_RCX;
+            consecutiveArgSetups++;
+        }
+        if (chainEntry->GadgetRegistersModified & REG_RDX) {
+            argRegistersSet |= REG_RDX;
+            consecutiveArgSetups++;
+        }
+        if (chainEntry->GadgetRegistersModified & REG_R8) {
+            argRegistersSet |= REG_R8;
+            consecutiveArgSetups++;
+        }
+        if (chainEntry->GadgetRegistersModified & REG_R9) {
+            argRegistersSet |= REG_R9;
+            consecutiveArgSetups++;
         }
     }
 
     //
-    // Build description
+    // Count how many x64 calling convention arg registers are set
     //
+    {
+        ULONG argCount = 0;
+        if (argRegistersSet & REG_RCX) argCount++;
+        if (argRegistersSet & REG_RDX) argCount++;
+        if (argRegistersSet & REG_R8)  argCount++;
+        if (argRegistersSet & REG_R9)  argCount++;
+
+        if (argCount >= 3) {
+            hasMultiArgSetup = TRUE;
+        }
+    }
+
     Result->PayloadAnalysis.PayloadInferred = TRUE;
 
     if (hasSyscall) {
@@ -2835,18 +3097,27 @@ Routine Description:
             );
         Result->PayloadAnalysis.MayExecuteCode = TRUE;
         Result->PayloadAnalysis.MayDisableDefenses = TRUE;
+        Result->PayloadAnalysis.MayEscalatePrivileges = TRUE;
+    } else if (hasStackPivot && hasMultiArgSetup) {
+        RtlStringCchCopyA(
+            Result->PayloadAnalysis.Description,
+            sizeof(Result->PayloadAnalysis.Description),
+            "Stack pivot with API argument setup - likely VirtualProtect/VirtualAlloc for shellcode"
+            );
+        Result->PayloadAnalysis.MayExecuteCode = TRUE;
+        Result->PayloadAnalysis.MayDisableDefenses = TRUE;
+    } else if (hasMultiArgSetup) {
+        RtlStringCchCopyA(
+            Result->PayloadAnalysis.Description,
+            sizeof(Result->PayloadAnalysis.Description),
+            "Multi-argument API call chain - possible memory manipulation (VirtualProtect/VirtualAlloc)"
+            );
+        Result->PayloadAnalysis.MayExecuteCode = TRUE;
     } else if (hasStackPivot) {
         RtlStringCchCopyA(
             Result->PayloadAnalysis.Description,
             sizeof(Result->PayloadAnalysis.Description),
             "Stack pivot detected - execution flow hijacked to attacker-controlled memory"
-            );
-        Result->PayloadAnalysis.MayExecuteCode = TRUE;
-    } else if (hasVirtualProtect || hasVirtualAlloc) {
-        RtlStringCchCopyA(
-            Result->PayloadAnalysis.Description,
-            sizeof(Result->PayloadAnalysis.Description),
-            "Memory manipulation chain - likely preparing shellcode execution"
             );
         Result->PayloadAnalysis.MayExecuteCode = TRUE;
     } else {
@@ -2857,11 +3128,12 @@ Routine Description:
             );
         Result->PayloadAnalysis.MayExecuteCode = TRUE;
     }
-
-    UNREFERENCED_PARAMETER(hasVirtualProtect);
-    UNREFERENCED_PARAMETER(hasVirtualAlloc);
 }
 
+
+//=============================================================================
+// Private Functions - Callback Notification
+//=============================================================================
 
 static
 VOID
@@ -2874,6 +3146,8 @@ RoppNotifyCallbacks(
 Routine Description:
 
     Notifies all registered callbacks of a detection.
+    Uses per-callback rundown protection so callbacks can be safely
+    unregistered even while notification is in progress.
 
 --*/
 {
@@ -2890,13 +3164,20 @@ Routine Description:
         callbackEntry = CONTAINING_RECORD(entry, ROP_CALLBACK_ENTRY, ListEntry);
 
         if (callbackEntry->Active) {
-            __try {
-                callbackEntry->Callback(Result, callbackEntry->Context);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                //
-                // Callback threw exception - log but continue
-                //
+            //
+            // Acquire per-callback rundown protection.
+            // If unregister is pending, this will fail and we skip.
+            //
+            if (ExAcquireRundownProtection(&callbackEntry->RundownRef)) {
+                __try {
+                    callbackEntry->Callback(Result, callbackEntry->Context);
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                    //
+                    // Callback threw exception — continue with remaining
+                    //
+                }
+                ExReleaseRundownProtection(&callbackEntry->RundownRef);
             }
         }
     }
@@ -2905,6 +3186,10 @@ Routine Description:
     KeLeaveCriticalRegion();
 }
 
+
+//=============================================================================
+// Private Functions - Rate Limiting
+//=============================================================================
 
 static
 BOOLEAN
@@ -2916,23 +3201,35 @@ RoppCheckRateLimit(
 Routine Description:
 
     Checks if analysis rate limit allows another analysis.
+    Uses compare-exchange to avoid TOCTOU on the reset.
 
 --*/
 {
     LARGE_INTEGER currentTime;
+    LONG64 lastReset;
     LONG64 elapsed;
     LONG64 count;
 
     KeQuerySystemTime(&currentTime);
 
-    elapsed = (currentTime.QuadPart - Detector->LastResetTime) / 10000000;  // Convert to seconds
+    lastReset = InterlockedCompareExchange64(
+        &Detector->LastResetTime,
+        0, 0  // Just read
+        );
+
+    elapsed = (currentTime.QuadPart - lastReset) / 10000000;
 
     if (elapsed >= 1) {
         //
-        // Reset counter every second
+        // Attempt atomic reset. Only one thread wins the CAS.
         //
-        InterlockedExchange64(&Detector->AnalysisCount, 0);
-        InterlockedExchange64(&Detector->LastResetTime, currentTime.QuadPart);
+        if (InterlockedCompareExchange64(
+                &Detector->LastResetTime,
+                currentTime.QuadPart,
+                lastReset
+                ) == lastReset) {
+            InterlockedExchange64(&Detector->AnalysisCount, 0);
+        }
     }
 
     count = InterlockedIncrement64(&Detector->AnalysisCount);

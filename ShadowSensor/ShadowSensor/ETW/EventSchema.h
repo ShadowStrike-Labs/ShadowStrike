@@ -18,13 +18,30 @@
  * - Memory-efficient field pooling
  * - Thread-safe schema operations
  *
- * Security Hardened v2.0.0:
+ * Security Hardened v2.2.0:
  * - All input parameters validated before use
  * - Integer overflow protection on size calculations
  * - Safe string handling with length limits
- * - Reference counting for thread safety
+ * - Reference counting with underflow protection
  * - Proper cleanup on all error paths
- * - Lock ordering to prevent deadlocks
+ * - Lock ordering enforced to prevent deadlocks
+ * - Serialization sanitized to prevent kernel pointer leaks
+ * - XML entity escaping in manifest generation
+ * - Bounded spin-waits with timeout
+ * - Duplicate metadata detection
+ * - Atomic statistics read/write
+ *
+ * Lock Ordering (MANDATORY - acquire in this order, never reverse):
+ *   Level 0: ManifestLock   (lowest, acquired last)
+ *   Level 1: ValueMapLock
+ *   Level 2: ChannelLock
+ *   Level 3: OpcodeLock
+ *   Level 4: TaskLock
+ *   Level 5: KeywordLock
+ *   Level 6: EventLock      (highest, acquired first)
+ *
+ *   Per-object locks (ES_VALUE_MAP.Lock) are subordinate to ValueMapLock
+ *   and must only be acquired while ValueMapLock is already held.
  *
  * Performance Optimizations:
  * - Hash-based event ID lookup O(1)
@@ -32,6 +49,7 @@
  * - Zero-copy field access where possible
  * - IRQL-aware operation selection
  * - Cached schema validation results
+ * - Geometric buffer growth for XML generation
  *
  * MITRE ATT&CK Coverage:
  * - T1562.002: Disable Windows Event Logging (schema integrity)
@@ -39,7 +57,7 @@
  * - T1036: Masquerading (event field validation)
  *
  * @author ShadowStrike Security Team
- * @version 2.0.0 (Enterprise Edition)
+ * @version 2.2.0 (Enterprise Edition)
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  * ============================================================================
  */
@@ -53,6 +71,7 @@ extern "C" {
 
 #include <ntddk.h>
 #include <evntrace.h>
+#include <ntstrsafe.h>
 
 // ============================================================================
 // POOL TAGS
@@ -171,7 +190,25 @@ extern "C" {
  * @brief Schema version for serialization
  */
 #define ES_SCHEMA_VERSION_MAJOR         2
-#define ES_SCHEMA_VERSION_MINOR         0
+#define ES_SCHEMA_VERSION_MINOR         2
+
+/**
+ * @brief Maximum metadata entries per category (keywords, tasks, etc.)
+ */
+#define ES_MAX_KEYWORDS                 256
+#define ES_MAX_TASKS                    256
+#define ES_MAX_OPCODES                  256
+#define ES_MAX_CHANNELS                 32
+#define ES_MAX_VALUE_MAPS               128
+#define ES_MAX_VALUE_MAP_ENTRIES        1024
+
+/**
+ * @brief Maximum iterations for reference drain spin-wait.
+ *
+ * At 1ms per iteration, this gives a 10-second maximum wait
+ * before declaring a leaked reference and proceeding.
+ */
+#define ES_MAX_DRAIN_ITERATIONS         10000
 
 // ============================================================================
 // ENUMERATIONS
@@ -220,6 +257,8 @@ typedef enum _ES_FIELD_TYPE {
 
 /**
  * @brief Field attribute flags
+ *
+ * Stored as ULONG in ES_FIELD_DEFINITION.Flags to accommodate all values.
  */
 typedef enum _ES_FIELD_FLAGS {
     EsFieldFlag_None            = 0x00000000,
@@ -289,6 +328,8 @@ typedef enum _ES_VALIDATION_RESULT {
 
 /**
  * @brief Field definition structure
+ *
+ * Note: Flags field is ULONG to match ES_FIELD_FLAGS enum width.
  */
 typedef struct _ES_FIELD_DEFINITION {
     /// Field name (ANSI for ETW compatibility)
@@ -306,8 +347,11 @@ typedef struct _ES_FIELD_DEFINITION {
     /// Array element count (0 for non-array)
     USHORT ArrayCount;
 
-    /// Field flags
-    USHORT Flags;
+    /// Reserved for alignment
+    USHORT Reserved1;
+
+    /// Field flags (ULONG to match ES_FIELD_FLAGS enum)
+    ULONG Flags;
 
     /// For array types, the element type
     ES_FIELD_TYPE ElementType;
@@ -315,7 +359,7 @@ typedef struct _ES_FIELD_DEFINITION {
     /// Field ordinal (position in event)
     UCHAR Ordinal;
 
-    /// Alignment requirement
+    /// Alignment requirement (must be power of 2)
     UCHAR Alignment;
 
     /// Reserved
@@ -382,19 +426,29 @@ typedef struct _ES_CHANNEL_DEFINITION {
 
 /**
  * @brief Event definition structure
+ *
+ * Internal runtime structure. Contains LIST_ENTRY fields for hash/ordered
+ * linkage that must NOT be serialized (see ES_SERIALIZED_EVENT_DEFINITION
+ * for the wire format).
  */
 typedef struct _ES_EVENT_DEFINITION {
-    /// List entry for hash bucket
+    /// List entry for hash bucket (INTERNAL - never serialize)
     LIST_ENTRY ListEntry;
 
-    /// List entry for ordered enumeration
+    /// List entry for ordered enumeration (INTERNAL - never serialize)
     LIST_ENTRY OrderedEntry;
 
-    /// Magic value for validation
+    /// Magic value for validation (INTERNAL)
     ULONG Magic;
 
-    /// Reference count
+    /// Reference count (INTERNAL)
     volatile LONG ReferenceCount;
+
+    /// TRUE if allocated from pool (not lookaside). INTERNAL - never serialize.
+    BOOLEAN AllocatedFromPool;
+
+    /// Reserved padding
+    UCHAR InternalReserved[3];
 
     /// Event ID
     USHORT EventId;
@@ -462,6 +516,79 @@ typedef struct _ES_EVENT_DEFINITION {
 } ES_EVENT_DEFINITION, *PES_EVENT_DEFINITION;
 
 typedef const ES_EVENT_DEFINITION *PCES_EVENT_DEFINITION;
+
+/**
+ * @brief Serialized event definition - wire format WITHOUT internal fields.
+ *
+ * This structure is used for binary serialization/deserialization.
+ * It excludes LIST_ENTRY, Magic, ReferenceCount, AllocatedFromPool
+ * to prevent kernel pointer leakage (KASLR bypass) and stale state.
+ */
+typedef struct _ES_SERIALIZED_EVENT_DEFINITION {
+    USHORT EventId;
+    UCHAR Version;
+    UCHAR Channel;
+    UCHAR Level;
+    UCHAR Opcode;
+    UCHAR Reserved[2];
+    USHORT Task;
+    USHORT Flags;
+    ULONGLONG Keywords;
+    CHAR EventName[ES_MAX_EVENT_NAME];
+    CHAR Description[ES_MAX_DESCRIPTION];
+    CHAR ChannelName[ES_MAX_CHANNEL_NAME];
+    CHAR TaskName[ES_MAX_TASK_NAME];
+    CHAR OpcodeName[ES_MAX_OPCODE_NAME];
+    CHAR TemplateName[ES_MAX_EVENT_NAME];
+    CHAR Message[ES_MAX_DESCRIPTION];
+    ES_FIELD_DEFINITION Fields[ES_MAX_FIELDS_PER_EVENT];
+    ULONG FieldCount;
+    ULONG MinDataSize;
+    ULONG MaxDataSize;
+    ULONG NameHash;
+} ES_SERIALIZED_EVENT_DEFINITION, *PES_SERIALIZED_EVENT_DEFINITION;
+
+/**
+ * @brief Serialized keyword definition - wire format WITHOUT LIST_ENTRY.
+ */
+typedef struct _ES_SERIALIZED_KEYWORD_DEFINITION {
+    CHAR Name[ES_MAX_KEYWORD_NAME];
+    ULONGLONG Mask;
+    CHAR Description[ES_MAX_DESCRIPTION];
+} ES_SERIALIZED_KEYWORD_DEFINITION, *PES_SERIALIZED_KEYWORD_DEFINITION;
+
+/**
+ * @brief Serialized task definition - wire format WITHOUT LIST_ENTRY.
+ */
+typedef struct _ES_SERIALIZED_TASK_DEFINITION {
+    CHAR Name[ES_MAX_TASK_NAME];
+    USHORT Value;
+    USHORT Reserved;
+    CHAR Description[ES_MAX_DESCRIPTION];
+} ES_SERIALIZED_TASK_DEFINITION, *PES_SERIALIZED_TASK_DEFINITION;
+
+/**
+ * @brief Serialized opcode definition - wire format WITHOUT LIST_ENTRY.
+ */
+typedef struct _ES_SERIALIZED_OPCODE_DEFINITION {
+    CHAR Name[ES_MAX_OPCODE_NAME];
+    UCHAR Value;
+    UCHAR TaskValue;
+    USHORT Reserved;
+    CHAR Description[ES_MAX_DESCRIPTION];
+} ES_SERIALIZED_OPCODE_DEFINITION, *PES_SERIALIZED_OPCODE_DEFINITION;
+
+/**
+ * @brief Serialized channel definition - wire format WITHOUT LIST_ENTRY.
+ */
+typedef struct _ES_SERIALIZED_CHANNEL_DEFINITION {
+    CHAR Name[ES_MAX_CHANNEL_NAME];
+    ES_CHANNEL_TYPE Type;
+    UCHAR Value;
+    BOOLEAN Enabled;
+    UCHAR Reserved;
+    CHAR Description[ES_MAX_DESCRIPTION];
+} ES_SERIALIZED_CHANNEL_DEFINITION, *PES_SERIALIZED_CHANNEL_DEFINITION;
 
 /**
  * @brief Value map entry (for enumeration display)
@@ -538,7 +665,7 @@ typedef struct _ES_SCHEMA {
     /// Ordered event list (for enumeration)
     LIST_ENTRY EventList;
 
-    /// Event list lock
+    /// Event list lock (Lock Level 6 - highest)
     EX_PUSH_LOCK EventLock;
 
     /// Number of registered events
@@ -547,27 +674,27 @@ typedef struct _ES_SCHEMA {
     /// Keyword definitions
     LIST_ENTRY Keywords;
     ULONG KeywordCount;
-    EX_PUSH_LOCK KeywordLock;
+    EX_PUSH_LOCK KeywordLock;       ///< Lock Level 5
 
     /// Task definitions
     LIST_ENTRY Tasks;
     ULONG TaskCount;
-    EX_PUSH_LOCK TaskLock;
+    EX_PUSH_LOCK TaskLock;          ///< Lock Level 4
 
     /// Opcode definitions
     LIST_ENTRY Opcodes;
     ULONG OpcodeCount;
-    EX_PUSH_LOCK OpcodeLock;
+    EX_PUSH_LOCK OpcodeLock;        ///< Lock Level 3
 
     /// Channel definitions
     LIST_ENTRY Channels;
     ULONG ChannelCount;
-    EX_PUSH_LOCK ChannelLock;
+    EX_PUSH_LOCK ChannelLock;       ///< Lock Level 2
 
     /// Value maps
     LIST_ENTRY ValueMaps;
     ULONG ValueMapCount;
-    EX_PUSH_LOCK ValueMapLock;
+    EX_PUSH_LOCK ValueMapLock;      ///< Lock Level 1
 
     /// Lookaside list for event definitions
     NPAGED_LOOKASIDE_LIST EventLookaside;
@@ -580,7 +707,7 @@ typedef struct _ES_SCHEMA {
     PCHAR CachedManifest;
     SIZE_T CachedManifestSize;
     BOOLEAN ManifestDirty;
-    EX_PUSH_LOCK ManifestLock;
+    EX_PUSH_LOCK ManifestLock;      ///< Lock Level 0 - lowest
 
 } ES_SCHEMA, *PES_SCHEMA;
 
@@ -633,7 +760,7 @@ typedef struct _ES_MANIFEST_OPTIONS {
  * Creates a new event schema with the specified provider information.
  *
  * @param Schema        Receives pointer to initialized schema
- * @param ProviderId    Provider GUID (NULL to auto-generate)
+ * @param ProviderId    Provider GUID (NULL to use ExUuidCreate)
  * @param ProviderName  Provider name (required)
  *
  * @return STATUS_SUCCESS on success
@@ -668,14 +795,17 @@ EsInitializeDefault(
 /**
  * @brief Shutdown and free an event schema.
  *
- * @param Schema    Schema to shutdown
+ * Sets *Schema to NULL after freeing to prevent use-after-free.
+ * Waits up to ES_MAX_DRAIN_ITERATIONS for references to drain.
+ *
+ * @param Schema    Pointer to schema pointer (set to NULL on return)
  *
  * @irql PASSIVE_LEVEL
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 EsShutdown(
-    _Inout_ PES_SCHEMA Schema
+    _Inout_ PES_SCHEMA* Schema
     );
 
 /**
@@ -710,6 +840,9 @@ EsReleaseReference(
 
 /**
  * @brief Register an event definition.
+ *
+ * Thread-safe: duplicate check and insertion are performed atomically
+ * under the event lock.
  *
  * @param Schema    Schema to register event with
  * @param Event     Event definition (copied internally)
@@ -778,17 +911,19 @@ EsUnregisterEvent(
 /**
  * @brief Get event definition by ID.
  *
+ * Push locks require <= APC_LEVEL. Do NOT call at DISPATCH_LEVEL.
+ *
  * @param Schema    Schema to search
  * @param EventId   Event ID to find
  * @param Event     Receives pointer to event definition
  *
  * @return STATUS_SUCCESS on success
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  *
  * @note Caller must release reference with EsReleaseEventReference
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsGetEventDefinition(
@@ -800,15 +935,17 @@ EsGetEventDefinition(
 /**
  * @brief Get event definition by name.
  *
+ * Uses case-insensitive comparison.
+ *
  * @param Schema    Schema to search
  * @param EventName Event name to find
  * @param Event     Receives pointer to event definition
  *
  * @return STATUS_SUCCESS on success
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsGetEventByName(
@@ -838,9 +975,9 @@ EsReleaseEventReference(
  *
  * @return TRUE if registered
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 EsIsEventRegistered(
     _In_ PES_SCHEMA Schema,
@@ -886,9 +1023,9 @@ EsEnumerateEvents(
  *
  * @return STATUS_SUCCESS if valid
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsValidateEvent(
@@ -909,9 +1046,9 @@ EsValidateEvent(
  *
  * @return STATUS_SUCCESS if valid
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 EsValidateEventEx(
@@ -931,9 +1068,9 @@ EsValidateEventEx(
  *
  * @return STATUS_SUCCESS on success
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS
 EsGetEventMinSize(
     _In_ PES_SCHEMA Schema,
@@ -954,6 +1091,8 @@ EsGetEventMinSize(
  * @param Description   Keyword description
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_OBJECT_NAME_COLLISION if duplicate name
+ *         STATUS_QUOTA_EXCEEDED if limit reached
  *
  * @irql <= APC_LEVEL
  */
@@ -975,6 +1114,8 @@ EsRegisterKeyword(
  * @param Description   Task description
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_OBJECT_NAME_COLLISION if duplicate name
+ *         STATUS_QUOTA_EXCEEDED if limit reached
  *
  * @irql <= APC_LEVEL
  */
@@ -997,6 +1138,8 @@ EsRegisterTask(
  * @param Description   Opcode description
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_OBJECT_NAME_COLLISION if duplicate name
+ *         STATUS_QUOTA_EXCEEDED if limit reached
  *
  * @irql <= APC_LEVEL
  */
@@ -1021,6 +1164,8 @@ EsRegisterOpcode(
  * @param Description   Channel description
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_OBJECT_NAME_COLLISION if duplicate name
+ *         STATUS_QUOTA_EXCEEDED if limit reached
  *
  * @irql <= APC_LEVEL
  */
@@ -1042,6 +1187,8 @@ EsRegisterChannel(
  * @param MapName   Map name
  *
  * @return STATUS_SUCCESS on success
+ *         STATUS_OBJECT_NAME_COLLISION if duplicate name
+ *         STATUS_QUOTA_EXCEEDED if limit reached
  *
  * @irql <= APC_LEVEL
  */
@@ -1137,15 +1284,18 @@ EsFreeManifest(
 /**
  * @brief Get cached manifest if available.
  *
+ * Returns a COPY of the cached manifest. Caller must free with EsFreeManifest.
+ *
  * @param Schema        Schema to get manifest for
- * @param ManifestXml   Receives pointer to cached manifest
+ * @param ManifestXml   Receives allocated copy of cached manifest
  * @param XmlSize       Receives manifest size
  *
  * @return STATUS_SUCCESS if cached manifest available
  *
- * @irql <= DISPATCH_LEVEL
+ * @irql <= APC_LEVEL
  */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
 NTSTATUS
 EsGetCachedManifest(
     _In_ PES_SCHEMA Schema,
@@ -1159,6 +1309,9 @@ EsGetCachedManifest(
 
 /**
  * @brief Serialize schema to binary format.
+ *
+ * Uses sanitized wire-format structures that exclude kernel pointers
+ * and internal state.
  *
  * @param Schema        Schema to serialize
  * @param Buffer        Receives allocated buffer
@@ -1179,6 +1332,9 @@ EsSerializeSchema(
 
 /**
  * @brief Deserialize schema from binary format.
+ *
+ * Validates all string fields for null-termination and cross-validates
+ * header counts against buffer size before processing.
  *
  * @param Buffer        Serialized schema buffer
  * @param BufferSize    Buffer size
@@ -1203,6 +1359,8 @@ EsDeserializeSchema(
 
 /**
  * @brief Get schema statistics.
+ *
+ * Reads each counter atomically to prevent torn reads.
  *
  * @param Schema    Schema to get stats for
  * @param Stats     Receives statistics
@@ -1250,6 +1408,12 @@ EsGetEventCount(
 
 /**
  * @brief Check if schema is valid.
+ *
+ * WARNING: This function checks magic/initialized fields on the provided
+ * pointer. It provides NO protection against use-after-free - if Schema
+ * points to freed memory, the read itself is undefined behavior. Callers
+ * are responsible for ensuring the schema pointer is valid (i.e., the
+ * schema has not been shut down via EsShutdown).
  *
  * @param Schema    Schema to validate
  *
@@ -1309,9 +1473,9 @@ EsGetValidationResultName(
  * @brief Calculate field offset for alignment.
  *
  * @param CurrentOffset Current offset
- * @param Alignment     Required alignment
+ * @param Alignment     Required alignment (MUST be power of 2)
  *
- * @return Aligned offset
+ * @return Aligned offset, or CurrentOffset if alignment is invalid
  *
  * @irql Any
  */
@@ -1322,10 +1486,28 @@ EsAlignOffset(
     _In_ UCHAR Alignment
     )
 {
+    ULONG aligned;
+
     if (Alignment == 0 || Alignment == 1) {
         return CurrentOffset;
     }
-    return (USHORT)((CurrentOffset + Alignment - 1) & ~(Alignment - 1));
+
+    //
+    // Validate alignment is a power of 2
+    //
+    if ((Alignment & (Alignment - 1)) != 0) {
+        return CurrentOffset;
+    }
+
+    //
+    // Compute in ULONG to detect overflow, then clamp to USHORT max
+    //
+    aligned = ((ULONG)CurrentOffset + Alignment - 1) & ~((ULONG)Alignment - 1);
+    if (aligned > 0xFFFF) {
+        return 0xFFFF;
+    }
+
+    return (USHORT)aligned;
 }
 
 /**
@@ -1346,7 +1528,7 @@ EsInitField(
     _In_ ES_FIELD_TYPE Type,
     _In_ USHORT Offset,
     _In_ USHORT Size,
-    _In_ USHORT Flags
+    _In_ ULONG Flags
     )
 {
     RtlZeroMemory(Field, sizeof(ES_FIELD_DEFINITION));

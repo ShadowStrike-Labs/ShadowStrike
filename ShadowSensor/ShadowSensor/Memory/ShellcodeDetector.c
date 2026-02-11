@@ -43,9 +43,10 @@
 
 #include "ShellcodeDetector.h"
 #include "../Utilities/MemoryUtils.h"
+#include <ntstrsafe.h>
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(INIT, SdInitialize)
+#pragma alloc_text(PAGE, SdInitialize)
 #pragma alloc_text(PAGE, SdShutdown)
 #pragma alloc_text(PAGE, SdSetConfig)
 #pragma alloc_text(PAGE, SdAddApiHash)
@@ -56,29 +57,26 @@
 // Internal Constants
 //=============================================================================
 
-#define SD_SIGNATURE                    'TCDS'  // 'SDCT' reversed
+//
+// CAS state machine constants (C-2 fix)
+//
+#define SD_STATE_UNINITIALIZED      0
+#define SD_STATE_INITIALIZING       1
+#define SD_STATE_READY              2
+#define SD_STATE_SHUTTING_DOWN      3
+
+//
+// Bounded shutdown timeout (10 seconds in 100ns units)
+//
+#define SD_SHUTDOWN_TIMEOUT_100NS   ((LONGLONG)(-10 * 10 * 1000 * 1000))
+
 #define SD_MAX_PATTERN_SIZE             256
 #define SD_ENTROPY_THRESHOLD_DEFAULT    70      // 70% = high entropy
 #define SD_MIN_CONFIDENCE_DEFAULT       50      // Minimum confidence to report
 #define SD_DEFAULT_TIMEOUT_MS           5000    // 5 second timeout
 
 //
-// Common NOP-equivalent bytes
-//
-static const UCHAR g_NopEquivalents[] = {
-    0x90,       // NOP
-    0x89, 0xC0, // MOV EAX, EAX
-    0x89, 0xDB, // MOV EBX, EBX
-    0x89, 0xC9, // MOV ECX, ECX
-    0x89, 0xD2, // MOV EDX, EDX
-    0x89, 0xED, // MOV EBP, EBP
-    0x89, 0xF6, // MOV ESI, ESI
-    0x89, 0xFF, // MOV EDI, EDI
-    0x87, 0xC0, // XCHG EAX, EAX
-    0x87, 0xDB, // XCHG EBX, EBX
-    0x66, 0x90, // 66 NOP (2-byte)
-    0x0F, 0x1F, // Multi-byte NOP prefix
-};
+// M-2: Removed dead g_NopEquivalents array (was never referenced by detection logic)
 
 //
 // Egg hunter signatures
@@ -313,10 +311,9 @@ SdpIsTimeout(
     _In_ PSD_SCAN_CONTEXT Context
     );
 
-static FORCEINLINE ULONG
-SdpRor13Hash(
-    _In_z_ PCSTR String
-    );
+//
+// L-1: Removed dead SdpRor13Hash forward declaration (function removed below)
+//
 
 static FORCEINLINE BOOLEAN
 SdpSafeMemoryCompare(
@@ -324,6 +321,105 @@ SdpSafeMemoryCompare(
     _In_reads_bytes_(Size) const VOID* Buffer2,
     _In_ SIZE_T Size
     );
+
+/**
+ * @brief C-2: Lifecycle helpers — increment-then-check reference pattern.
+ */
+static FORCEINLINE BOOLEAN
+SdpAcquireReference(
+    _In_ PSD_DETECTOR Detector
+    )
+{
+    InterlockedIncrement(&Detector->ActiveOperations);
+    if (ReadAcquire(&Detector->State) == SD_STATE_READY) {
+        return TRUE;
+    }
+    if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
+        KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+    }
+    return FALSE;
+}
+
+static FORCEINLINE VOID
+SdpReleaseReference(
+    _In_ PSD_DETECTOR Detector
+    )
+{
+    if (InterlockedDecrement(&Detector->ActiveOperations) == 0) {
+        if (ReadAcquire(&Detector->State) == SD_STATE_SHUTTING_DOWN) {
+            KeSetEvent(&Detector->ShutdownEvent, IO_NO_INCREMENT, FALSE);
+        }
+    }
+}
+
+static FORCEINLINE BOOLEAN
+SdpIsReady(
+    _In_ PSD_DETECTOR Detector
+    )
+{
+    return (ReadAcquire(&Detector->State) == SD_STATE_READY);
+}
+
+/**
+ * @brief L-2: Safely read a ULONG from a potentially unaligned address.
+ */
+static FORCEINLINE ULONG
+SdpReadUnalignedUlong(
+    _In_reads_bytes_(4) const VOID* Address
+    )
+{
+    ULONG value;
+    RtlCopyMemory(&value, Address, sizeof(ULONG));
+    return value;
+}
+
+/**
+ * @brief H-3: Snapshot current config under lock for torn-read safety.
+ */
+static FORCEINLINE VOID
+SdpSnapshotConfig(
+    _In_ PSD_DETECTOR Detector,
+    _Out_ PSD_CONFIG ConfigOut
+    )
+{
+    KeEnterCriticalRegion();
+    ExAcquirePushLockShared(&Detector->ConfigLock);
+    RtlCopyMemory(ConfigOut, &Detector->Config, sizeof(SD_CONFIG));
+    ExReleasePushLockShared(&Detector->ConfigLock);
+    KeLeaveCriticalRegion();
+}
+
+/**
+ * @brief H-2: Kernel-safe substring search (replaces CRT strstr).
+ */
+static BOOLEAN
+SdpContainsSubstring(
+    _In_z_ const CHAR* Haystack,
+    _In_z_ const CHAR* Needle
+    )
+{
+    SIZE_T needleLen;
+    SIZE_T i;
+
+    if (Needle == NULL || Needle[0] == '\0') return TRUE;
+    if (Haystack == NULL) return FALSE;
+
+    needleLen = 0;
+    while (Needle[needleLen] != '\0') needleLen++;
+
+    for (i = 0; Haystack[i] != '\0'; i++) {
+        SIZE_T j;
+        BOOLEAN match = TRUE;
+        for (j = 0; j < needleLen; j++) {
+            if (Haystack[i + j] == '\0' || Haystack[i + j] != Needle[j]) {
+                match = FALSE;
+                break;
+            }
+        }
+        if (match) return TRUE;
+    }
+    return FALSE;
+}
 
 //=============================================================================
 // Initialization / Shutdown
@@ -354,6 +450,7 @@ Return Value:
 {
     PSD_DETECTOR detector = NULL;
     NTSTATUS status = STATUS_SUCCESS;
+    LONG prevState;
 
     PAGED_CODE();
 
@@ -379,8 +476,19 @@ Return Value:
     RtlZeroMemory(detector, sizeof(SD_DETECTOR));
 
     //
-    // Initialize configuration
+    // C-2 fix: CAS-based initialization — prevent double-init
     //
+    prevState = InterlockedCompareExchange(
+        &detector->State, SD_STATE_INITIALIZING, SD_STATE_UNINITIALIZED);
+    if (prevState != SD_STATE_UNINITIALIZED) {
+        ShadowStrikeFreePoolWithTag(detector, SD_POOL_TAG_CONTEXT);
+        return STATUS_ALREADY_INITIALIZED;
+    }
+
+    //
+    // Initialize configuration (H-3: config protected by lock)
+    //
+    ExInitializePushLock(&detector->ConfigLock);
     if (Config != NULL) {
         RtlCopyMemory(&detector->Config, Config, sizeof(SD_CONFIG));
     } else {
@@ -402,23 +510,25 @@ Return Value:
     detector->Signatures.SignatureCount = 0;
 
     //
-    // Populate default API hashes
+    // C-2 fix: Initialize lifecycle primitives
+    //
+    KeInitializeEvent(&detector->ShutdownEvent, NotificationEvent, FALSE);
+    detector->ActiveOperations = 1;  // Init reference — released by SdShutdown
+
+    //
+    // Populate default API hashes (H-6: failures are non-fatal but logged)
     //
     SdpInitializeApiHashDatabase(detector);
 
     //
     // Initialize statistics
     //
-    detector->Stats.TotalScans = 0;
-    detector->Stats.DetectionsFound = 0;
-    detector->Stats.NopSledsFound = 0;
-    detector->Stats.EggHuntersFound = 0;
-    detector->Stats.EncodersFound = 0;
-    detector->Stats.ApiHashingFound = 0;
-    detector->Stats.SyscallsFound = 0;
     KeQuerySystemTime(&detector->Stats.StartTime);
 
-    detector->Initialized = TRUE;
+    //
+    // C-2: Transition INITIALIZING → READY
+    //
+    InterlockedExchange(&detector->State, SD_STATE_READY);
 
     *Detector = detector;
 
@@ -436,30 +546,52 @@ SdShutdown(
 Routine Description:
 
     Shuts down the shellcode detector and frees all resources.
+    C-2 fix: CAS state machine with bounded drain wait.
 
 --*/
 {
+    LONG prevState;
+    LARGE_INTEGER timeout;
+
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
         return;
     }
 
-    Detector->Initialized = FALSE;
+    //
+    // C-2: Transition READY → SHUTTING_DOWN via CAS
+    //
+    prevState = InterlockedCompareExchange(
+        &Detector->State, SD_STATE_SHUTTING_DOWN, SD_STATE_READY);
+    if (prevState != SD_STATE_READY) {
+        return;  // Not initialized or already shutting down
+    }
 
     //
-    // Cleanup API hash database
+    // Release the init reference, then wait for active operations to drain
+    //
+    if (InterlockedDecrement(&Detector->ActiveOperations) > 0) {
+        timeout.QuadPart = SD_SHUTDOWN_TIMEOUT_100NS;
+        KeWaitForSingleObject(
+            &Detector->ShutdownEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            &timeout
+        );
+    }
+
+    //
+    // Cleanup databases
     //
     SdpCleanupApiHashDatabase(Detector);
-
-    //
-    // Cleanup signature database
-    //
     SdpCleanupSignatureDatabase(Detector);
 
     //
-    // Free detector
+    // Final state transition and free
     //
+    InterlockedExchange(&Detector->State, SD_STATE_UNINITIALIZED);
     ShadowStrikeFreePoolWithTag(Detector, SD_POOL_TAG_CONTEXT);
 }
 
@@ -473,11 +605,22 @@ SdSetConfig(
 {
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized || Config == NULL) {
+    if (Detector == NULL || Config == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // H-3 fix: Update config under exclusive lock to prevent torn reads
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Detector->ConfigLock);
     RtlCopyMemory(&Detector->Config, Config, sizeof(SD_CONFIG));
+    ExReleasePushLockExclusive(&Detector->ConfigLock);
+    KeLeaveCriticalRegion();
 
     return STATUS_SUCCESS;
 }
@@ -516,28 +659,37 @@ Return Value:
 {
     PSD_DETECTION_RESULT result = NULL;
     SD_SCAN_CONTEXT context;
+    SD_CONFIG config;
     NTSTATUS status = STATUS_SUCCESS;
 
-    if (Detector == NULL || !Detector->Initialized) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (Buffer == NULL || Size == 0 || Result == NULL) {
+    if (Detector == NULL || Buffer == NULL || Size == 0 || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
     //
+    // C-2 fix: Acquire reference (atomic check-after-increment)
+    //
+    if (!SdpAcquireReference(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // H-3 fix: Snapshot config under lock to prevent torn reads
+    //
+    SdpSnapshotConfig(Detector, &config);
+
+    //
     // Validate size limits
     //
     if (Size < SD_MIN_SCAN_SIZE) {
+        SdpReleaseReference(Detector);
         return STATUS_BUFFER_TOO_SMALL;
     }
 
-    if (Size > Detector->Config.MaxScanSizeBytes &&
-        Detector->Config.MaxScanSizeBytes > 0) {
-        Size = Detector->Config.MaxScanSizeBytes;
+    if (config.MaxScanSizeBytes > 0 && Size > config.MaxScanSizeBytes) {
+        Size = config.MaxScanSizeBytes;
     }
 
     if (Size > SD_MAX_SCAN_SIZE) {
@@ -545,30 +697,32 @@ Return Value:
     }
 
     //
-    // Allocate result structure
+    // H-4 fix: Use PagedPool — all callers at PASSIVE_LEVEL.
+    // SD_DETECTION_RESULT is ~3.5KB, no reason for NonPaged.
     //
     result = (PSD_DETECTION_RESULT)ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         sizeof(SD_DETECTION_RESULT),
         SD_POOL_TAG_RESULT
     );
 
     if (result == NULL) {
+        SdpReleaseReference(Detector);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     RtlZeroMemory(result, sizeof(SD_DETECTION_RESULT));
 
     //
-    // Initialize scan context
+    // Initialize scan context with snapshotted config
     //
     RtlZeroMemory(&context, sizeof(context));
     context.Detector = Detector;
     context.Buffer = (PUCHAR)Buffer;
     context.Size = Size;
     context.Result = result;
-    context.TimeoutMs = Detector->Config.ScanTimeoutMs > 0 ?
-        Detector->Config.ScanTimeoutMs : SD_DEFAULT_TIMEOUT_MS;
+    context.TimeoutMs = config.ScanTimeoutMs > 0 ?
+        config.ScanTimeoutMs : SD_DEFAULT_TIMEOUT_MS;
     context.Cancelled = FALSE;
     KeQuerySystemTime(&context.StartTime);
 
@@ -580,15 +734,15 @@ Return Value:
     KeQuerySystemTime(&result->DetectionTime);
 
     //
-    // Run detection pipeline
+    // Run detection pipeline (using snapshotted config)
     //
 
     //
     // 1. Entropy analysis
     //
-    if (Detector->Config.EnableEntropyAnalysis) {
+    if (config.EnableEntropyAnalysis) {
         result->EntropyPercent = SdpCalculateEntropy(context.Buffer, context.Size);
-        result->HighEntropy = (result->EntropyPercent >= Detector->Config.EntropyThreshold);
+        result->HighEntropy = (result->EntropyPercent >= config.EntropyThreshold);
 
         if (result->HighEntropy) {
             result->Flags |= SdFlag_HighEntropy;
@@ -598,7 +752,7 @@ Return Value:
     //
     // 2. NOP sled detection
     //
-    if (Detector->Config.EnableNopSledDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableNopSledDetection && !SdpIsTimeout(&context)) {
         ULONG offset = 0;
         ULONG length = 0;
         UCHAR nopByte = 0;
@@ -616,7 +770,7 @@ Return Value:
     //
     // 3. Egg hunter detection
     //
-    if (Detector->Config.EnableEggHunterDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableEggHunterDetection && !SdpIsTimeout(&context)) {
         if (SdpDetectEggHunter(&context)) {
             result->EggHunter.Found = TRUE;
             result->Flags |= SdFlag_EggHunter;
@@ -627,7 +781,7 @@ Return Value:
     //
     // 4. Encoder detection
     //
-    if (Detector->Config.EnableEncoderDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableEncoderDetection && !SdpIsTimeout(&context)) {
         if (SdpDetectEncoderLoop(&context, &result->Encoder)) {
             result->Flags |= SdFlag_Encoder;
             InterlockedIncrement64(&Detector->Stats.EncodersFound);
@@ -637,7 +791,7 @@ Return Value:
     //
     // 5. API hashing detection
     //
-    if (Detector->Config.EnableApiHashDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableApiHashDetection && !SdpIsTimeout(&context)) {
         if (SdpDetectApiHashing(&context, &result->ApiHashing)) {
             result->Flags |= SdFlag_APIHashing;
             InterlockedIncrement64(&Detector->Stats.ApiHashingFound);
@@ -647,7 +801,7 @@ Return Value:
     //
     // 6. Direct syscall detection
     //
-    if (Detector->Config.EnableSyscallDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableSyscallDetection && !SdpIsTimeout(&context)) {
         if (SdpDetectDirectSyscalls(&context)) {
             result->Flags |= SdFlag_DirectSyscall;
             InterlockedIncrement64(&Detector->Stats.SyscallsFound);
@@ -657,7 +811,7 @@ Return Value:
     //
     // 7. Heaven's Gate detection
     //
-    if (Detector->Config.EnableSyscallDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableSyscallDetection && !SdpIsTimeout(&context)) {
         if (SdpDetectHeavensGate(&context)) {
             result->Flags |= SdFlag_HeavensGate;
         }
@@ -666,7 +820,7 @@ Return Value:
     //
     // 8. Stack pivot detection
     //
-    if (Detector->Config.EnableStackPivotDetection && !SdpIsTimeout(&context)) {
+    if (config.EnableStackPivotDetection && !SdpIsTimeout(&context)) {
         if (SdpDetectStackPivot(&context)) {
             result->Flags |= SdFlag_StackPivot;
         }
@@ -675,7 +829,7 @@ Return Value:
     //
     // 9. Signature matching
     //
-    if (Detector->Config.EnableSignatureMatching && !SdpIsTimeout(&context)) {
+    if (config.EnableSignatureMatching && !SdpIsTimeout(&context)) {
         if (SdpMatchSignatures(&context)) {
             result->Flags |= SdFlag_KnownSignature;
         }
@@ -689,9 +843,9 @@ Return Value:
     result->Type = SdpDeterminePrimaryType(result);
 
     //
-    // Determine if this is shellcode
+    // Determine if this is shellcode (use snapshotted threshold)
     //
-    result->IsShellcode = (result->ConfidenceScore >= Detector->Config.MinConfidenceScore);
+    result->IsShellcode = (result->ConfidenceScore >= config.MinConfidenceScore);
 
     //
     // Calculate analysis duration
@@ -712,6 +866,7 @@ Return Value:
 
     *Result = result;
 
+    SdpReleaseReference(Detector);
     return STATUS_SUCCESS;
 }
 
@@ -739,18 +894,21 @@ Routine Description:
     PVOID buffer = NULL;
     SIZE_T copiedSize = 0;
 
-    if (Detector == NULL || !Detector->Initialized) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (Address == NULL || Size == 0 || Result == NULL) {
+    if (Detector == NULL || Address == NULL || Size == 0 || Result == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *Result = NULL;
 
     //
-    // Cap size
+    // C-2: Lifecycle check (SdAnalyzeBuffer also acquires its own reference)
+    //
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // Cap size (C-3: max 4MB)
     //
     if (Size > SD_MAX_SCAN_SIZE) {
         Size = SD_MAX_SCAN_SIZE;
@@ -765,12 +923,13 @@ Routine Description:
     }
 
     //
-    // Allocate temporary buffer
+    // C-3 fix: Use PagedPool — buffer only used at PASSIVE_LEVEL.
+    // L-3 fix: Use SD_POOL_TAG_BUFFER for temp allocations.
     //
     buffer = ShadowStrikeAllocatePoolWithTag(
-        NonPagedPoolNx,
+        PagedPool,
         Size,
-        SD_POOL_TAG_CONTEXT
+        SD_POOL_TAG_BUFFER
     );
 
     if (buffer == NULL) {
@@ -800,7 +959,7 @@ Routine Description:
     ObDereferenceObject(process);
 
     if (!NT_SUCCESS(status)) {
-        ShadowStrikeFreePoolWithTag(buffer, SD_POOL_TAG_CONTEXT);
+        ShadowStrikeFreePoolWithTag(buffer, SD_POOL_TAG_BUFFER);
         return status;
     }
 
@@ -817,7 +976,7 @@ Routine Description:
     //
     // Free temporary buffer
     //
-    ShadowStrikeFreePoolWithTag(buffer, SD_POOL_TAG_CONTEXT);
+    ShadowStrikeFreePoolWithTag(buffer, SD_POOL_TAG_BUFFER);
 
     return status;
 }
@@ -837,6 +996,8 @@ SdScanProcess(
 Routine Description:
 
     Scans all executable memory regions in a process.
+    H-1 fix: Collects region descriptors while attached, analyzes AFTER detaching.
+    This prevents the double-KeStackAttachProcess BSOD.
 
 --*/
 {
@@ -847,38 +1008,68 @@ Routine Description:
     SIZE_T returnLength;
     PVOID currentAddress = NULL;
     ULONG foundCount = 0;
+    ULONG regionCount = 0;
+    ULONG i;
 
-    if (Detector == NULL || !Detector->Initialized) {
+    //
+    // Region descriptor for collecting regions while attached
+    //
+    typedef struct _SD_REGION_DESC {
+        PVOID BaseAddress;
+        SIZE_T RegionSize;
+        ULONG Protect;
+    } SD_REGION_DESC, *PSD_REGION_DESC;
+
+    #define SD_MAX_REGIONS_TO_SCAN 256
+
+    PSD_REGION_DESC regions = NULL;
+
+    if (Detector == NULL || Results == NULL || ResultCount == NULL || MaxResults == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (Results == NULL || ResultCount == NULL || MaxResults == 0) {
-        return STATUS_INVALID_PARAMETER;
+    if (!SdpAcquireReference(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     *ResultCount = 0;
     RtlZeroMemory(Results, MaxResults * sizeof(PSD_DETECTION_RESULT));
 
     //
+    // Allocate array to collect region descriptors (PagedPool)
+    //
+    regions = (PSD_REGION_DESC)ShadowStrikeAllocatePoolWithTag(
+        PagedPool,
+        SD_MAX_REGIONS_TO_SCAN * sizeof(SD_REGION_DESC),
+        SD_POOL_TAG_BUFFER
+    );
+
+    if (regions == NULL) {
+        SdpReleaseReference(Detector);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(regions, SD_MAX_REGIONS_TO_SCAN * sizeof(SD_REGION_DESC));
+
+    //
     // Get process reference
     //
     status = PsLookupProcessByProcessId(ProcessId, &process);
     if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(regions, SD_POOL_TAG_BUFFER);
+        SdpReleaseReference(Detector);
         return status;
     }
 
     //
-    // Attach to process
+    // Phase 1: Attach and collect executable region descriptors only
     //
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        //
-        // Walk process memory
-        //
         currentAddress = NULL;
 
-        while (foundCount < MaxResults) {
+        while (regionCount < SD_MAX_REGIONS_TO_SCAN) {
             status = ZwQueryVirtualMemory(
                 ZwCurrentProcess(),
                 currentAddress,
@@ -892,51 +1083,61 @@ Routine Description:
                 break;
             }
 
-            //
-            // Check if this is an executable region worth scanning
-            //
             if (memInfo.State == MEM_COMMIT &&
                 (memInfo.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
                 memInfo.RegionSize >= SD_MIN_SCAN_SIZE &&
-                memInfo.Type == MEM_PRIVATE) {  // Focus on private (unbacked) regions
+                memInfo.Type == MEM_PRIVATE) {
 
-                PSD_DETECTION_RESULT result = NULL;
-
-                status = SdAnalyzeRegion(
-                    Detector,
-                    ProcessId,
-                    memInfo.BaseAddress,
-                    memInfo.RegionSize,
-                    &result
-                );
-
-                if (NT_SUCCESS(status) && result != NULL) {
-                    if (result->IsShellcode) {
-                        result->Protection = memInfo.Protect;
-                        Results[foundCount] = result;
-                        foundCount++;
-                    } else {
-                        SdFreeResult(result);
-                    }
-                }
+                regions[regionCount].BaseAddress = memInfo.BaseAddress;
+                regions[regionCount].RegionSize = memInfo.RegionSize;
+                regions[regionCount].Protect = memInfo.Protect;
+                regionCount++;
             }
 
-            //
-            // Move to next region
-            //
             currentAddress = (PUCHAR)memInfo.BaseAddress + memInfo.RegionSize;
-
             if ((ULONG_PTR)currentAddress < (ULONG_PTR)memInfo.BaseAddress) {
-                break;  // Overflow, we're done
+                break;  // Address overflow
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
     }
 
+    //
+    // Detach BEFORE analyzing — SdAnalyzeRegion attaches on its own
+    //
     KeUnstackDetachProcess(&apcState);
     ObDereferenceObject(process);
+    process = NULL;
+
+    //
+    // Phase 2: Analyze collected regions (detached — no double-attach)
+    //
+    for (i = 0; i < regionCount && foundCount < MaxResults; i++) {
+        PSD_DETECTION_RESULT result = NULL;
+
+        status = SdAnalyzeRegion(
+            Detector,
+            ProcessId,
+            regions[i].BaseAddress,
+            regions[i].RegionSize,
+            &result
+        );
+
+        if (NT_SUCCESS(status) && result != NULL) {
+            if (result->IsShellcode) {
+                result->Protection = regions[i].Protect;
+                Results[foundCount] = result;
+                foundCount++;
+            } else {
+                SdFreeResult(result);
+            }
+        }
+    }
+
+    ShadowStrikeFreePoolWithTag(regions, SD_POOL_TAG_BUFFER);
+    SdpReleaseReference(Detector);
 
     *ResultCount = foundCount;
 
@@ -966,6 +1167,10 @@ SdDetectNopSled(
 
     if (Detector == NULL || Buffer == NULL || Found == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     *Found = FALSE;
@@ -1006,6 +1211,10 @@ SdDetectEncoder(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     RtlZeroMemory(EncoderInfo, sizeof(SD_ENCODER_INFO));
 
     if (Size < 16) {
@@ -1036,6 +1245,10 @@ SdDetectApiHashing(
 
     if (Detector == NULL || Buffer == NULL || ApiHashInfo == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(ApiHashInfo, sizeof(SD_API_HASH_INFO));
@@ -1074,6 +1287,10 @@ SdDetectDirectSyscall(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     *SyscallCount = 0;
     RtlZeroMemory(Syscalls, MaxSyscalls * sizeof(SD_SYSCALL_INFO));
 
@@ -1091,7 +1308,7 @@ SdDetectDirectSyscall(
         if (RtlCompareMemory(&buffer[i], g_SyscallPatternX64,
                              sizeof(g_SyscallPatternX64)) == sizeof(g_SyscallPatternX64)) {
 
-            ULONG syscallNum = *(PULONG)(&buffer[i + sizeof(g_SyscallPatternX64)]);
+            ULONG syscallNum = SdpReadUnalignedUlong(&buffer[i + sizeof(g_SyscallPatternX64)]);
 
             //
             // Validate syscall number (reasonable range)
@@ -1163,17 +1380,18 @@ SdAddApiHash(
 
     PAGED_CODE();
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     if (ApiName == NULL || DllName == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    //
-    // Check limit
-    //
     if (Detector->ApiHashes.HashCount >= SD_MAX_API_HASHES) {
         return STATUS_QUOTA_EXCEEDED;
     }
@@ -1249,8 +1467,12 @@ SdLookupApiHash(
     PLIST_ENTRY entry;
     NTSTATUS status = STATUS_NOT_FOUND;
 
-    if (Detector == NULL || !Detector->Initialized) {
+    if (Detector == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     if (ApiName == NULL || DllName == NULL) {
@@ -1294,8 +1516,14 @@ SdLoadApiHashDatabase(
     PAGED_CODE();
 
     //
-    // TODO: Implement file-based hash database loading
-    // For now, use the built-in database
+    // M-1 LIMITATION: File-based API hash database loading is NOT implemented.
+    // The detector uses a hardcoded built-in database (SdpInitializeApiHashDatabase).
+    // To add custom hash entries at runtime, use SdAddApiHash() directly.
+    // A future implementation should:
+    //   1. Open FilePath with ZwCreateFile
+    //   2. Parse a structured format (JSON/binary) with hash → API name mappings
+    //   3. Call SdAddApiHash for each entry
+    //   4. Validate file integrity (signature/checksum) before loading
     //
 
     UNREFERENCED_PARAMETER(Detector);
@@ -1335,8 +1563,12 @@ SdGetStatistics(
 {
     LARGE_INTEGER currentTime;
 
-    if (Detector == NULL || !Detector->Initialized || Stats == NULL) {
+    if (Detector == NULL || Stats == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!SdpIsReady(Detector)) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     RtlZeroMemory(Stats, sizeof(SD_STATISTICS));
@@ -1396,66 +1628,97 @@ SdpInitializeApiHashDatabase(
 Routine Description:
 
     Populates the API hash database with common shellcode API hashes.
+    Called during initialization (state=INITIALIZING), so bypasses SdAddApiHash
+    public API which requires state=READY. Adds entries directly to the list.
 
 --*/
 {
-    //
-    // Add common ROR13 hashes used by shellcode
-    //
-    SdAddApiHash(Detector, ROR13_LOADLIBRARYA, "LoadLibraryA", "kernel32.dll");
-    SdAddApiHash(Detector, ROR13_GETPROCADDRESS, "GetProcAddress", "kernel32.dll");
-    SdAddApiHash(Detector, ROR13_VIRTUALALLOC, "VirtualAlloc", "kernel32.dll");
-    SdAddApiHash(Detector, ROR13_VIRTUALPROTECT, "VirtualProtect", "kernel32.dll");
-    SdAddApiHash(Detector, ROR13_CREATETHREAD, "CreateThread", "kernel32.dll");
-    SdAddApiHash(Detector, ROR13_NTFLUSHINSTRUCTIONCACHE, "NtFlushInstructionCache", "ntdll.dll");
+    NTSTATUS status;
 
     //
+    // Internal helper to add a hash entry without the SdpIsReady check.
+    // During initialization, the state is INITIALIZING, not READY.
+    //
+    #define SD_ADD_HASH_INTERNAL(hash, api, dll) \
+        do { \
+            PSD_API_HASH_ENTRY _entry = (PSD_API_HASH_ENTRY)ShadowStrikeAllocatePoolWithTag( \
+                NonPagedPoolNx, sizeof(SD_API_HASH_ENTRY), SD_POOL_TAG_PATTERN); \
+            if (_entry != NULL) { \
+                RtlZeroMemory(_entry, sizeof(SD_API_HASH_ENTRY)); \
+                _entry->Hash = (hash); \
+                RtlStringCchCopyA(_entry->ApiName, sizeof(_entry->ApiName), (api)); \
+                RtlStringCchCopyA(_entry->DllName, sizeof(_entry->DllName), (dll)); \
+                if (Detector->ApiHashes.HashTable == NULL) { \
+                    Detector->ApiHashes.HashTable = ShadowStrikeAllocatePoolWithTag( \
+                        NonPagedPoolNx, sizeof(LIST_ENTRY), SD_POOL_TAG_PATTERN); \
+                    if (Detector->ApiHashes.HashTable == NULL) { \
+                        ShadowStrikeFreePoolWithTag(_entry, SD_POOL_TAG_PATTERN); \
+                        return; \
+                    } \
+                    InitializeListHead((PLIST_ENTRY)Detector->ApiHashes.HashTable); \
+                } \
+                InsertTailList((PLIST_ENTRY)Detector->ApiHashes.HashTable, &_entry->ListEntry); \
+                Detector->ApiHashes.HashCount++; \
+            } \
+        } while (0)
+
+    //
+    // H-6 fix: If first allocation fails, hash table cannot be created — return early.
+    //
+
+    // Common ROR13 hashes used by shellcode
+    SD_ADD_HASH_INTERNAL(ROR13_LOADLIBRARYA, "LoadLibraryA", "kernel32.dll");
+    if (Detector->ApiHashes.HashTable == NULL) {
+        return;  // First alloc failed — no point continuing
+    }
+    
+    SD_ADD_HASH_INTERNAL(ROR13_GETPROCADDRESS, "GetProcAddress", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(ROR13_VIRTUALALLOC, "VirtualAlloc", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(ROR13_VIRTUALPROTECT, "VirtualProtect", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(ROR13_CREATETHREAD, "CreateThread", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(ROR13_NTFLUSHINSTRUCTIONCACHE, "NtFlushInstructionCache", "ntdll.dll");
+
     // Additional common hashes
-    //
-    SdAddApiHash(Detector, 0xEC0E4E8E, "LoadLibraryW", "kernel32.dll");
-    SdAddApiHash(Detector, 0x7802F749, "GetProcAddressForCaller", "kernel32.dll");
-    SdAddApiHash(Detector, 0xE449F330, "VirtualAllocEx", "kernel32.dll");
-    SdAddApiHash(Detector, 0xE7BDD8C5, "VirtualProtectEx", "kernel32.dll");
-    SdAddApiHash(Detector, 0x799AACC6, "CreateRemoteThread", "kernel32.dll");
-    SdAddApiHash(Detector, 0xE035F044, "Sleep", "kernel32.dll");
-    SdAddApiHash(Detector, 0x876F8B31, "WinExec", "kernel32.dll");
-    SdAddApiHash(Detector, 0x56A2B5F0, "ExitProcess", "kernel32.dll");
-    SdAddApiHash(Detector, 0x5DE2C5AA, "GetLastError", "kernel32.dll");
-    SdAddApiHash(Detector, 0x4FDAF6DA, "CloseHandle", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xEC0E4E8E, "LoadLibraryW", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x7802F749, "GetProcAddressForCaller", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xE449F330, "VirtualAllocEx", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xE7BDD8C5, "VirtualProtectEx", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x799AACC6, "CreateRemoteThread", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xE035F044, "Sleep", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x876F8B31, "WinExec", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x56A2B5F0, "ExitProcess", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x5DE2C5AA, "GetLastError", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x4FDAF6DA, "CloseHandle", "kernel32.dll");
 
-    //
     // Network APIs (common in reverse shells)
-    //
-    SdAddApiHash(Detector, 0x6174A599, "WSAStartup", "ws2_32.dll");
-    SdAddApiHash(Detector, 0xE0DF0FEA, "WSASocketA", "ws2_32.dll");
-    SdAddApiHash(Detector, 0x6737DBC2, "connect", "ws2_32.dll");
-    SdAddApiHash(Detector, 0x33604C84, "recv", "ws2_32.dll");
-    SdAddApiHash(Detector, 0x5FC8D902, "send", "ws2_32.dll");
-    SdAddApiHash(Detector, 0x614D6E75, "closesocket", "ws2_32.dll");
+    SD_ADD_HASH_INTERNAL(0x6174A599, "WSAStartup", "ws2_32.dll");
+    SD_ADD_HASH_INTERNAL(0xE0DF0FEA, "WSASocketA", "ws2_32.dll");
+    SD_ADD_HASH_INTERNAL(0x6737DBC2, "connect", "ws2_32.dll");
+    SD_ADD_HASH_INTERNAL(0x33604C84, "recv", "ws2_32.dll");
+    SD_ADD_HASH_INTERNAL(0x5FC8D902, "send", "ws2_32.dll");
+    SD_ADD_HASH_INTERNAL(0x614D6E75, "closesocket", "ws2_32.dll");
 
-    //
     // Process/Thread APIs
-    //
-    SdAddApiHash(Detector, 0xAFC98D6F, "CreateProcessA", "kernel32.dll");
-    SdAddApiHash(Detector, 0x16B3FE72, "CreateProcessW", "kernel32.dll");
-    SdAddApiHash(Detector, 0x863FCC79, "OpenProcess", "kernel32.dll");
-    SdAddApiHash(Detector, 0x1E380A6E, "WriteProcessMemory", "kernel32.dll");
-    SdAddApiHash(Detector, 0xDBD95D5C, "ReadProcessMemory", "kernel32.dll");
-    SdAddApiHash(Detector, 0xCB72D9E8, "ResumeThread", "kernel32.dll");
-    SdAddApiHash(Detector, 0x1D1C1CAC, "SuspendThread", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xAFC98D6F, "CreateProcessA", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x16B3FE72, "CreateProcessW", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x863FCC79, "OpenProcess", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x1E380A6E, "WriteProcessMemory", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xDBD95D5C, "ReadProcessMemory", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0xCB72D9E8, "ResumeThread", "kernel32.dll");
+    SD_ADD_HASH_INTERNAL(0x1D1C1CAC, "SuspendThread", "kernel32.dll");
 
-    //
     // Ntdll APIs (for direct syscall detection)
-    //
-    SdAddApiHash(Detector, 0x3CFA685D, "NtAllocateVirtualMemory", "ntdll.dll");
-    SdAddApiHash(Detector, 0x50E92888, "NtProtectVirtualMemory", "ntdll.dll");
-    SdAddApiHash(Detector, 0xE3BD6D35, "NtWriteVirtualMemory", "ntdll.dll");
-    SdAddApiHash(Detector, 0x4FFF8B29, "NtReadVirtualMemory", "ntdll.dll");
-    SdAddApiHash(Detector, 0x4B82F718, "NtCreateThreadEx", "ntdll.dll");
-    SdAddApiHash(Detector, 0xE9DAEE4C, "NtQueueApcThread", "ntdll.dll");
-    SdAddApiHash(Detector, 0x7299EAF9, "NtCreateSection", "ntdll.dll");
-    SdAddApiHash(Detector, 0x3B2E55EB, "NtMapViewOfSection", "ntdll.dll");
-    SdAddApiHash(Detector, 0x6AA412CD, "NtUnmapViewOfSection", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x3CFA685D, "NtAllocateVirtualMemory", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x50E92888, "NtProtectVirtualMemory", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0xE3BD6D35, "NtWriteVirtualMemory", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x4FFF8B29, "NtReadVirtualMemory", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x4B82F718, "NtCreateThreadEx", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0xE9DAEE4C, "NtQueueApcThread", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x7299EAF9, "NtCreateSection", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x3B2E55EB, "NtMapViewOfSection", "ntdll.dll");
+    SD_ADD_HASH_INTERNAL(0x6AA412CD, "NtUnmapViewOfSection", "ntdll.dll");
+
+    #undef SD_ADD_HASH_INTERNAL
 }
 
 
@@ -1532,14 +1795,21 @@ SdpCalculateEntropy(
 
 Routine Description:
 
-    Calculates Shannon entropy of a buffer as a percentage (0-100).
-    High entropy indicates compressed/encrypted/random data.
+    M-3 fix: Calculates Shannon entropy of a buffer as a percentage (0-100).
+    Uses correct formula: H = -sum(p * log2(p)) where p = freq[i] / N.
+    
+    Integer approximation:
+      H = log2(N) - (1/N) * sum(freq[i] * log2(freq[i])) for freq[i] > 0
+    
+    Scaled: result = H * 100 / 8 (max entropy = 8 bits/byte = 100%)
 
 --*/
 {
     ULONG frequency[256] = {0};
     SIZE_T i;
-    ULONG64 entropy = 0;
+    ULONG64 sumFLogF = 0;
+    ULONG log2N;
+    ULONG64 entropyScaled;
 
     if (Size == 0) {
         return 0;
@@ -1553,53 +1823,64 @@ Routine Description:
     }
 
     //
-    // Calculate entropy (simplified integer math)
-    // Entropy = -sum(p * log2(p)) where p = frequency/size
-    // We use a lookup table approximation for log2
+    // Integer log2 approximation via bit-scan
     //
-    for (i = 0; i < 256; i++) {
-        if (frequency[i] > 0) {
-            //
-            // p = frequency[i] / Size
-            // -p * log2(p) ≈ (frequency * (log2(Size) - log2(frequency))) / Size
-            // Simplified: contribution based on frequency deviation from uniform
-            //
-            ULONG f = frequency[i];
-            ULONG expected = (ULONG)(Size / 256);
-
-            if (expected == 0) expected = 1;
-
-            //
-            // Add contribution to entropy estimate
-            // Higher deviation from uniform = lower entropy contribution
-            //
-            if (f > 0) {
-                ULONG logApprox = 0;
-                ULONG temp = f;
-                while (temp > 1) {
-                    temp >>= 1;
-                    logApprox++;
-                }
-                entropy += ((ULONG64)f * logApprox);
-            }
-        }
-    }
+    #define SD_ILOG2(val, result) \
+        do { \
+            ULONG _t = (val); \
+            (result) = 0; \
+            while (_t > 1) { _t >>= 1; (result)++; } \
+        } while (0)
 
     //
-    // Normalize to percentage (0-100)
-    // Max entropy for random data is ~8 bits per byte
-    // We scale to percentage
+    // Compute log2(N)
     //
     {
-        ULONG maxEntropy = (ULONG)(Size * 8);  // 8 bits per byte
-        if (maxEntropy > 0) {
-            ULONG64 normalized = (entropy * 100) / maxEntropy;
-            if (normalized > 100) normalized = 100;
-            return (ULONG)normalized;
-        }
+        ULONG tempN = (ULONG)min(Size, (SIZE_T)MAXULONG);
+        SD_ILOG2(tempN, log2N);
     }
 
-    return 0;
+    //
+    // Compute sum(f * log2(f)) for all f > 0
+    //
+    for (i = 0; i < 256; i++) {
+        if (frequency[i] > 1) {  // log2(1) = 0, so skip freq=1
+            ULONG log2F;
+            SD_ILOG2(frequency[i], log2F);
+            sumFLogF += (ULONG64)frequency[i] * log2F;
+        }
+        // freq=0 contributes 0, freq=1 contributes 1*0=0
+    }
+
+    //
+    // H = log2(N) - (1/N) * sumFLogF
+    // Scale to percentage: result = H * 100 / 8
+    // Combined: result = (log2(N) * 100 / 8) - (sumFLogF * 100) / (N * 8)
+    //
+    // To avoid truncation, multiply first:
+    //   result = (log2(N) * 100 * N - sumFLogF * 100) / (N * 8)
+    //          = 100 * (log2(N) * N - sumFLogF) / (N * 8)
+    //
+    {
+        ULONG64 n64 = (ULONG64)Size;
+        ULONG64 numerator;
+
+        if (n64 == 0) return 0;
+
+        // log2(N) * N might be small enough to fit easily
+        if ((ULONG64)log2N * n64 < sumFLogF) {
+            return 0;  // Shouldn't happen with valid data, but safety check
+        }
+
+        numerator = ((ULONG64)log2N * n64) - sumFLogF;
+        entropyScaled = (numerator * 100) / (n64 * 8);
+
+        if (entropyScaled > 100) entropyScaled = 100;
+    }
+
+    #undef SD_ILOG2
+
+    return (ULONG)entropyScaled;
 }
 
 
@@ -1625,6 +1906,8 @@ Routine Description:
     ULONG maxConsecutive = 0;
     SIZE_T maxOffset = 0;
     UCHAR maxNopByte = 0x90;
+    SIZE_T currentRunOffset = 0;
+    UCHAR currentRunByte = 0x90;
     ULONG minLength = Context->Detector->Config.NopSledMinLength;
 
     *Offset = 0;
@@ -1671,13 +1954,15 @@ Routine Description:
 
         if (isNop) {
             if (consecutiveNops == 0) {
-                maxOffset = i;
-                maxNopByte = buffer[i];
+                currentRunOffset = i;
+                currentRunByte = buffer[i];
             }
             consecutiveNops++;
         } else {
             if (consecutiveNops > maxConsecutive) {
                 maxConsecutive = consecutiveNops;
+                maxOffset = currentRunOffset;
+                maxNopByte = currentRunByte;
             }
             consecutiveNops = 0;
         }
@@ -1688,6 +1973,8 @@ Routine Description:
     //
     if (consecutiveNops > maxConsecutive) {
         maxConsecutive = consecutiveNops;
+        maxOffset = currentRunOffset;
+        maxNopByte = currentRunByte;
     }
 
     if (maxConsecutive >= minLength) {
@@ -1939,10 +2226,7 @@ Routine Description:
         //
         if (buffer[i] == 0xB8 || buffer[i] == 0xB9 || buffer[i] == 0xBA) {
             if (i + 5 <= size) {
-                ULONG potentialHash = *(PULONG)(&buffer[i + 1]);
-
-                //
-                // Try to resolve this hash
+                ULONG potentialHash = SdpReadUnalignedUlong(&buffer[i + 1]);
                 //
                 CHAR apiName[64] = {0};
                 CHAR dllName[32] = {0};
@@ -1975,7 +2259,7 @@ Routine Description:
         // 68 xx xx xx xx
         //
         if (buffer[i] == 0x68 && i + 5 <= size) {
-            ULONG potentialHash = *(PULONG)(&buffer[i + 1]);
+            ULONG potentialHash = SdpReadUnalignedUlong(&buffer[i + 1]);
 
             CHAR apiName[64] = {0};
             CHAR dllName[32] = {0};
@@ -2033,11 +2317,11 @@ Routine Description:
             // Check for SYSCALL instruction within next 20 bytes
             //
             SIZE_T j;
-            for (j = i + sizeof(g_SyscallPatternX64); j < min(i + 20, size - 1); j++) {
+            for (j = i + sizeof(g_SyscallPatternX64); j < min(i + 20, size - 2); j++) {
                 if (buffer[j] == 0x0F && buffer[j + 1] == 0x05) {
                     SD_SYSCALL_INFO* syscallInfo = &Context->Result->Syscalls.Syscalls[syscallCount];
 
-                    syscallInfo->SyscallNumber = *(PULONG)(&buffer[i + sizeof(g_SyscallPatternX64)]);
+                    syscallInfo->SyscallNumber = SdpReadUnalignedUlong(&buffer[i + sizeof(g_SyscallPatternX64)]);
                     syscallInfo->StubAddress = (ULONG64)&buffer[i];
                     syscallInfo->StubSize = (ULONG)(j + 2 - i);
                     syscallInfo->Type = StubType_Direct;
@@ -2119,7 +2403,8 @@ Routine Description:
             //
             // Check if segment is 0x33 (64-bit code segment)
             //
-            USHORT segment = *(PUSHORT)(&buffer[i + 5]);
+            USHORT segment;
+            RtlCopyMemory(&segment, &buffer[i + 5], sizeof(USHORT));
             if (segment == 0x33 || segment == 0x23) {
                 return TRUE;
             }
@@ -2226,7 +2511,8 @@ Routine Description:
                 // Check for large value
                 //
                 if (buffer[i] == 0x81 && i + 6 <= size) {
-                    LONG value = *(PLONG)(&buffer[i + 2]);
+                    LONG value;
+                    RtlCopyMemory(&value, &buffer[i + 2], sizeof(LONG));
                     if (value > 0x1000 || value < -0x1000) {
                         isGadget = TRUE;
                         gadgetSize = 6;
@@ -2493,11 +2779,11 @@ Routine Description:
     // Priority order: most specific/dangerous first
     //
     if (Result->Signature.Matched) {
-        if (strstr(Result->Signature.ThreatFamily, "Meterpreter") != NULL) {
+        if (SdpContainsSubstring(Result->Signature.ThreatFamily, "Meterpreter")) {
             return SdShellcode_Meterpreter;
         }
-        if (strstr(Result->Signature.ThreatFamily, "CobaltStrike") != NULL ||
-            strstr(Result->Signature.ThreatFamily, "Beacon") != NULL) {
+        if (SdpContainsSubstring(Result->Signature.ThreatFamily, "CobaltStrike") ||
+            SdpContainsSubstring(Result->Signature.ThreatFamily, "Beacon")) {
             return SdShellcode_CobaltStrike;
         }
         return SdShellcode_Generic;
@@ -2546,7 +2832,7 @@ Routine Description:
     }
 
     if (Result->Flags & SdFlag_PIC) {
-        return SdShellcode_Position Independent;
+        return SdShellcode_PositionIndependent;
     }
 
     return SdShellcode_Generic;
@@ -2572,27 +2858,9 @@ SdpIsTimeout(
 }
 
 
-static FORCEINLINE ULONG
-SdpRor13Hash(
-    _In_z_ PCSTR String
-    )
-/*++
-
-Routine Description:
-
-    Computes ROR13 hash commonly used for API hashing in shellcode.
-
---*/
-{
-    ULONG hash = 0;
-
-    while (*String) {
-        hash = ((hash >> 13) | (hash << 19)) + (UCHAR)*String;
-        String++;
-    }
-
-    return hash;
-}
+//
+// L-1: Dead SdpRor13Hash function removed — hash values are hardcoded constants.
+//
 
 
 static FORCEINLINE BOOLEAN
